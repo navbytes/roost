@@ -17,6 +17,7 @@ pub enum Action {
     /// Grow (+) or shrink (−) the focused pane along an axis.
     Resize { horizontal: bool, grow: bool },
     RenamePane,
+    RenameTab,
     QuickLaunch,
     ScrollMode,
 }
@@ -45,7 +46,9 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('w') => Some(Action::ClosePane),
             KeyCode::Char('t') => Some(Action::NewTab),
             KeyCode::Char('s') => Some(Action::ToggleStack),
-            KeyCode::Char('r') => Some(Action::RenamePane),
+            // Alt+r renames the pane; Alt+Shift+r (or Alt+R) renames the tab.
+            KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::RenamePane }),
+            KeyCode::Char('R') => Some(Action::RenameTab),
             KeyCode::Enter => Some(Action::QuickLaunch),
             KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
@@ -118,6 +121,23 @@ mod tests {
         assert!(matches!(
             translate(alt(KeyCode::Char('3'))),
             InputResult::Action(Action::GoToTab(2))
+        ));
+    }
+
+    #[test]
+    fn alt_r_renames_pane_alt_shift_r_renames_tab() {
+        assert!(matches!(
+            translate(alt(KeyCode::Char('r'))),
+            InputResult::Action(Action::RenamePane)
+        ));
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('r'))),
+            InputResult::Action(Action::RenameTab)
+        ));
+        // some terminals deliver Alt+Shift+r as an uppercase 'R'
+        assert!(matches!(
+            translate(alt(KeyCode::Char('R'))),
+            InputResult::Action(Action::RenameTab)
         ));
     }
 

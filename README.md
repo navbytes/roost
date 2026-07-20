@@ -30,6 +30,7 @@ change, atomic writes). Delete it to start clean.
 | `Alt+Shift+arrow` | resize along that axis |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
 | `Alt+r` | rename pane |
+| `Alt+Shift+r` | rename tab (e.g. one tab per project) |
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
 | `Alt+t`, `Alt+1..9` | new tab / go to tab |
 | `Alt+w` | close pane |

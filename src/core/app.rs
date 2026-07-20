@@ -29,10 +29,17 @@ const MIN_SPLIT_ROWS: u16 = 10; // two ~3-row inner panes + borders
 /// Adapters offered by the quick-launch picker (Alt+Enter).
 pub const PICKER_ITEMS: [&str; 3] = ["pi", "claude", "shell"];
 
+/// What a rename overlay is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameTarget {
+    Pane,
+    Tab,
+}
+
 /// UI mode: non-Normal modes capture all keys (see handle_mode_key).
 pub enum Mode {
     Normal,
-    Rename { buffer: String },
+    Rename { buffer: String, target: RenameTarget },
     Picker { selection: usize },
     Scroll { offset: usize },
 }
@@ -340,7 +347,11 @@ impl<B: PaneBackend> App<B> {
                     .find_spec(self.focused)
                     .and_then(|s| s.title.clone())
                     .unwrap_or_default();
-                self.mode = Mode::Rename { buffer: current };
+                self.mode = Mode::Rename { buffer: current, target: RenameTarget::Pane };
+            }
+            Action::RenameTab => {
+                let current = self.ws.active_tab().name.clone();
+                self.mode = Mode::Rename { buffer: current, target: RenameTarget::Tab };
             }
             Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
             Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
@@ -466,17 +477,29 @@ impl<B: PaneBackend> App<B> {
         }
         match &mut self.mode {
             Mode::Normal => false,
-            Mode::Rename { buffer } => {
+            Mode::Rename { buffer, target } => {
+                let target = *target;
                 match key.code {
                     KeyCode::Char(c) => buffer.push(c),
                     KeyCode::Backspace => {
                         buffer.pop();
                     }
                     KeyCode::Enter => {
-                        let title = buffer.trim().to_string();
-                        let focused = self.focused;
-                        if let Some(spec) = self.find_spec_mut(focused) {
-                            spec.title = if title.is_empty() { None } else { Some(title) };
+                        let text = buffer.trim().to_string();
+                        match target {
+                            RenameTarget::Pane => {
+                                let focused = self.focused;
+                                if let Some(spec) = self.find_spec_mut(focused) {
+                                    // Empty clears back to the adapter name.
+                                    spec.title = if text.is_empty() { None } else { Some(text) };
+                                }
+                            }
+                            RenameTarget::Tab => {
+                                // A tab always needs a name; ignore an empty one.
+                                if !text.is_empty() {
+                                    self.ws.active_tab_mut().name = text;
+                                }
+                            }
                         }
                         self.save();
                         self.mode = Mode::Normal;
@@ -727,5 +750,37 @@ mod tests {
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes[&1].title.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn rename_tab_sets_name_and_persists() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, store) = mk_app(shell_ws());
+        assert_eq!(app.ws.active_tab().name, "main");
+        app.apply(Action::RenameTab);
+        // overlay prefills the current name ("main") for editing — clear it
+        for _ in 0..4 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        for c in "roost-repo".chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.ws.active_tab().name, "roost-repo");
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert_eq!(saved.tabs[0].name, "roost-repo");
+    }
+
+    #[test]
+    fn rename_tab_ignores_empty_name() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::RenameTab);
+        // clear the prefilled "main" then commit empty
+        for _ in 0..8 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.ws.active_tab().name, "main"); // unchanged
     }
 }

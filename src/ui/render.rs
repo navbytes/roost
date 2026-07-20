@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::core::app::{App, Mode, PICKER_ITEMS};
+use crate::core::app::{App, Mode, RenameTarget, PICKER_ITEMS};
 use crate::core::status::AgentStatus;
 use crate::core::layout::{compute_rects, PaneRect};
 use crate::ports::PaneBackend;
@@ -45,11 +45,15 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect) {
     match &app.mode {
         Mode::Normal | Mode::Scroll { .. } => {}
-        Mode::Rename { buffer } => {
+        Mode::Rename { buffer, target } => {
             let rect = centered(body, 44, 3);
             f.render_widget(Clear, rect);
+            let heading = match target {
+                RenameTarget::Pane => " rename pane ",
+                RenameTarget::Tab => " rename tab ",
+            };
             let block = Block::bordered()
-                .title(" rename pane ")
+                .title(heading)
                 .border_style(Style::default().fg(Color::Yellow));
             let inner = block.inner(rect);
             f.render_widget(block, rect);
