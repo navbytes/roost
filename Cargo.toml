@@ -1,0 +1,20 @@
+[package]
+name = "roost"
+version = "0.1.0"
+edition = "2021"
+description = "A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, ...). No daemon: layouts and session IDs persist; processes are disposable."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+dirs = "5"
+portable-pty = "0.8"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vt100 = "0.15"
+
+[profile.release]
+lto = true
+strip = true

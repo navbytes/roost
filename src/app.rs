@@ -1,0 +1,270 @@
+//! App state + actions: the glue between workspace (precious) and pane
+//! runtimes (disposable).
+
+use anyhow::Result;
+use ratatui::layout::{Rect, Size};
+use std::collections::HashMap;
+use std::sync::mpsc::Sender;
+
+use crate::adapters::Registry;
+use crate::event::AppEvent;
+use crate::input::Action;
+use crate::pane::PaneRuntime;
+use crate::workspace::{
+    self, compute_rects, LayoutNode, PaneId, PaneRect, PaneSpec, SplitDir, Tab, Workspace,
+};
+
+pub struct App {
+    pub ws: Workspace,
+    pub runtimes: HashMap<PaneId, PaneRuntime>,
+    pub registry: Registry,
+    pub focused: PaneId,
+    pub quit: bool,
+    tx: Sender<AppEvent>,
+    term_size: Size,
+}
+
+impl App {
+    /// Restore the workspace (design doc §5): rebuild the tree and spawn
+    /// every pane via its adapter — resume when a session id is known,
+    /// fresh launch otherwise. A failed spawn degrades to a dead pane, it
+    /// never aborts restore.
+    pub fn new(registry: Registry, tx: Sender<AppEvent>, term_size: Size) -> Result<Self> {
+        let ws = Workspace::load_or_default()?;
+        let mut app = Self {
+            focused: 0,
+            ws,
+            runtimes: HashMap::new(),
+            registry,
+            quit: false,
+            tx,
+            term_size,
+        };
+        app.spawn_active_tab();
+        app.focused = app.pane_order().first().copied().unwrap_or(0);
+        Ok(app)
+    }
+
+    fn body_area(&self) -> Rect {
+        Rect::new(0, 1, self.term_size.width, self.term_size.height.saturating_sub(1))
+    }
+
+    fn rects(&self) -> Vec<PaneRect> {
+        let mut v = Vec::new();
+        compute_rects(&self.ws.active_tab().layout, self.body_area(), &mut v);
+        v
+    }
+
+    pub fn pane_order(&self) -> Vec<PaneId> {
+        let mut v = Vec::new();
+        workspace::pane_order(&self.ws.active_tab().layout, &mut v);
+        v
+    }
+
+    /// Spawn runtimes for every pane in the active tab that doesn't have one.
+    /// (Scaffold spawns per-tab lazily; all panes in a tab spawn eagerly.)
+    pub fn spawn_active_tab(&mut self) {
+        for pr in self.rects() {
+            if self.runtimes.contains_key(&pr.id) {
+                continue;
+            }
+            let Some(spec) = self.ws.active_tab().panes.get(&pr.id).cloned() else { continue };
+            self.spawn_pane(pr.id, &spec, pr.rect);
+        }
+    }
+
+    fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
+        let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
+        let cmd = adapter.command_for(spec);
+        let (rows, cols) = inner_dims(rect);
+        match PaneRuntime::spawn(id, &cmd, rows, cols, self.tx.clone()) {
+            Ok(rt) => {
+                self.runtimes.insert(id, rt);
+            }
+            Err(_) => {
+                // Dead pane placeholder: rendered as Exited. TODO(M2): show
+                // the spawn error in the pane body + offer fresh launch.
+            }
+        }
+    }
+
+    // -- event handling ----------------------------------------------------
+
+    pub fn on_pty_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.process_output(bytes);
+        }
+    }
+
+    pub fn on_pty_exit(&mut self, id: PaneId) {
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.status.on_exit();
+        }
+    }
+
+    pub fn forward_bytes(&mut self, bytes: &[u8]) {
+        let id = self.focused;
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.write_input(bytes);
+        }
+    }
+
+    pub fn on_resize(&mut self, size: Size) {
+        self.term_size = size;
+        self.relayout();
+    }
+
+    /// Recompute rects and push new sizes to every PTY.
+    pub fn relayout(&mut self) {
+        for pr in self.rects() {
+            if pr.collapsed {
+                continue;
+            }
+            let (rows, cols) = inner_dims(pr.rect);
+            if let Some(rt) = self.runtimes.get_mut(&pr.id) {
+                rt.resize(rows, cols);
+            }
+        }
+    }
+
+    // -- actions -----------------------------------------------------------
+
+    pub fn apply(&mut self, action: Action) {
+        match action {
+            Action::Quit => self.quit = true,
+            Action::NewPane => self.new_pane(),
+            Action::ClosePane => self.close_pane(),
+            Action::FocusNext => self.cycle_focus(1),
+            Action::FocusPrev => self.cycle_focus(-1),
+            Action::NewTab => self.new_tab(),
+            Action::GoToTab(i) => self.go_to_tab(i),
+        }
+        self.relayout();
+        // Debounced in the design; scaffold saves eagerly on every mutation.
+        let _ = self.ws.save();
+    }
+
+    fn cycle_focus(&mut self, dir: i64) {
+        let order = self.pane_order();
+        if order.is_empty() {
+            return;
+        }
+        let cur = order.iter().position(|&p| p == self.focused).unwrap_or(0) as i64;
+        let next = (cur + dir).rem_euclid(order.len() as i64) as usize;
+        self.focused = order[next];
+        // Focusing a collapsed stack member expands it.
+        expand_in_stacks(&mut self.ws.active_tab_mut().layout, self.focused);
+    }
+
+    fn new_pane(&mut self) {
+        let id = self.ws.next_pane_id();
+        let cwd = self
+            .ws
+            .active_tab()
+            .panes
+            .get(&self.focused)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let spec = PaneSpec { adapter: "shell".into(), cwd, session: None, title: None };
+
+        // Split in the widest direction of the focused pane's rect.
+        let dir = self
+            .rects()
+            .iter()
+            .find(|pr| pr.id == self.focused)
+            .map(|pr| {
+                if pr.rect.width >= pr.rect.height * 3 {
+                    SplitDir::Vertical
+                } else {
+                    SplitDir::Horizontal
+                }
+            })
+            .unwrap_or(SplitDir::Vertical);
+
+        let focused = self.focused;
+        let tab = self.ws.active_tab_mut();
+        tab.panes.insert(id, spec.clone());
+        if !workspace::split_pane(&mut tab.layout, focused, id, dir) {
+            tab.layout = LayoutNode::Pane(id); // empty tab fallback
+        }
+        self.focused = id;
+        // Spawn with a placeholder size; relayout() in apply() fixes it up.
+        if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
+            self.spawn_pane(id, &spec, pr.rect);
+        }
+    }
+
+    fn close_pane(&mut self) {
+        let id = self.focused;
+        if let Some(mut rt) = self.runtimes.remove(&id) {
+            rt.kill();
+        }
+        let tab = self.ws.active_tab_mut();
+        tab.panes.remove(&id);
+        let empty = workspace::remove_pane(&mut tab.layout, id);
+        if empty {
+            if self.ws.tabs.len() > 1 {
+                let i = self.ws.active_tab;
+                self.ws.tabs.remove(i);
+                self.ws.active_tab = i.saturating_sub(1);
+                self.spawn_active_tab();
+            } else {
+                self.quit = true;
+                return;
+            }
+        }
+        self.focused = self.pane_order().first().copied().unwrap_or(0);
+    }
+
+    fn new_tab(&mut self) {
+        let id = self.ws.next_pane_id();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let mut panes = HashMap::new();
+        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None });
+        self.ws.tabs.push(Tab {
+            name: format!("tab{}", self.ws.tabs.len() + 1),
+            layout: LayoutNode::Pane(id),
+            panes,
+        });
+        self.ws.active_tab = self.ws.tabs.len() - 1;
+        self.spawn_active_tab();
+        self.focused = id;
+    }
+
+    fn go_to_tab(&mut self, i: usize) {
+        if i < self.ws.tabs.len() {
+            self.ws.active_tab = i;
+            self.spawn_active_tab();
+            self.focused = self.pane_order().first().copied().unwrap_or(self.focused);
+        }
+    }
+
+    /// Clean shutdown: save workspace, kill children (their sessions live on).
+    pub fn shutdown(&mut self) {
+        let _ = self.ws.save();
+        for rt in self.runtimes.values_mut() {
+            rt.kill();
+        }
+    }
+}
+
+fn inner_dims(rect: Rect) -> (u16, u16) {
+    (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
+}
+
+/// If `target` is a collapsed member of any stack, expand it.
+fn expand_in_stacks(node: &mut LayoutNode, target: PaneId) {
+    match node {
+        LayoutNode::Pane(_) => {}
+        LayoutNode::Stack { children, expanded } => {
+            if let Some(pos) = children.iter().position(|&c| c == target) {
+                *expanded = pos;
+            }
+        }
+        LayoutNode::Split { children, .. } => {
+            for c in children {
+                expand_in_stacks(c, target);
+            }
+        }
+    }
+}

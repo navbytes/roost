@@ -1,0 +1,156 @@
+//! Rendering: tab bar + pane borders + vt100 grid blit (design doc §8).
+
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Paragraph};
+use ratatui::Frame;
+
+use crate::app::App;
+use crate::status::AgentStatus;
+use crate::workspace::{compute_rects, PaneRect};
+
+pub fn draw(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    if area.height < 2 {
+        return;
+    }
+    let tab_bar = Rect::new(area.x, area.y, area.width, 1);
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+
+    draw_tab_bar(f, app, tab_bar);
+
+    let mut rects: Vec<PaneRect> = Vec::new();
+    compute_rects(&app.ws.active_tab().layout, body, &mut rects);
+    for pr in rects {
+        draw_pane(f, app, pr);
+    }
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans: Vec<Span> = vec![Span::styled(
+        " roost ",
+        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )];
+    for (i, tab) in app.ws.tabs.iter().enumerate() {
+        let style = if i == app.ws.active_tab {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!("  {} {}", i + 1, tab.name), style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn status_color(s: AgentStatus) -> Color {
+    match s {
+        AgentStatus::Working => Color::Green,
+        AgentStatus::NeedsInput => Color::Magenta,
+        AgentStatus::Waiting => Color::Yellow,
+        AgentStatus::Idle => Color::DarkGray,
+        AgentStatus::Exited => Color::Red,
+    }
+}
+
+fn draw_pane(f: &mut Frame, app: &mut App, pr: PaneRect) {
+    let focused = app.focused == pr.id;
+    let (title, status) = {
+        let spec = app.ws.active_tab().panes.get(&pr.id);
+        let status = app
+            .runtimes
+            .get(&pr.id)
+            .map(|rt| rt.status.current())
+            .unwrap_or(AgentStatus::Exited);
+        let name = spec
+            .and_then(|s| s.title.clone())
+            .or_else(|| spec.map(|s| s.adapter.clone()))
+            .unwrap_or_else(|| "?".into());
+        (format!(" {} {} ", status.badge(), name), status)
+    };
+
+    if pr.collapsed {
+        // Collapsed stack member: a single-row title bar (the fleet view).
+        let style = if focused {
+            Style::default().fg(Color::Black).bg(status_color(status))
+        } else {
+            Style::default().fg(status_color(status))
+        };
+        f.render_widget(Paragraph::new(title).style(style), pr.rect);
+        return;
+    }
+
+    let border_style = if focused {
+        Style::default().fg(status_color(status)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::bordered().title(title).border_style(border_style);
+    let inner = block.inner(pr.rect);
+    f.render_widget(block, pr.rect);
+
+    if let Some(rt) = app.runtimes.get(&pr.id) {
+        blit_screen(f, rt.parser.screen(), inner);
+        if focused {
+            let (cr, cc) = rt.parser.screen().cursor_position();
+            let x = inner.x.saturating_add(cc);
+            let y = inner.y.saturating_add(cr);
+            if x < inner.x + inner.width && y < inner.y + inner.height {
+                f.set_cursor_position(Position::new(x, y));
+            }
+        }
+    }
+}
+
+/// Copy the vt100 grid into the ratatui buffer.
+/// NOTE: wide-char (CJK/emoji) handling is approximate in the scaffold.
+fn blit_screen(f: &mut Frame, screen: &vt100::Screen, inner: Rect) {
+    let (rows, cols) = screen.size();
+    let buf = f.buffer_mut();
+    for row in 0..inner.height.min(rows) {
+        for col in 0..inner.width.min(cols) {
+            let Some(cell) = screen.cell(row, col) else { continue };
+            let x = inner.x + col;
+            let y = inner.y + row;
+            let Some(out) = buf.cell_mut((x, y)) else { continue };
+            let contents = cell.contents();
+            if contents.is_empty() {
+                out.set_symbol(" ");
+            } else {
+                out.set_symbol(&contents);
+            }
+            out.set_style(cell_style(cell));
+        }
+    }
+}
+
+fn conv_color(c: vt100::Color) -> Option<Color> {
+    match c {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
+}
+
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default();
+    if let Some(fg) = conv_color(cell.fgcolor()) {
+        style = style.fg(fg);
+    }
+    if let Some(bg) = conv_color(cell.bgcolor()) {
+        style = style.bg(bg);
+    }
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if cell.inverse() {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
