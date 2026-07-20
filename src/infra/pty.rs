@@ -12,7 +12,8 @@ use crate::agents::CommandSpec;
 use crate::core::event::AppEvent;
 use crate::core::status::{AgentStatus, StatusTracker};
 use crate::core::workspace::PaneId;
-use crate::ports::{MouseProto, PaneBackend};
+use crate::infra::inspect;
+use crate::ports::{MouseProto, Observation, PaneBackend};
 
 const SCROLLBACK_LINES: usize = 5000;
 
@@ -24,6 +25,8 @@ pub struct PtyPane {
     status: StatusTracker,
     /// Roost-side scrollback offset (wheel / scroll mode).
     scroll: usize,
+    /// The pane's child pid, for OS observation (live cwd / running agent).
+    pid: Option<u32>,
 }
 
 impl PaneBackend for PtyPane {
@@ -58,6 +61,7 @@ impl PaneBackend for PtyPane {
             .slave
             .spawn_command(cmd)
             .with_context(|| format!("spawning {}", spec.program))?;
+        let pid = child.process_id();
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
@@ -87,6 +91,7 @@ impl PaneBackend for PtyPane {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
             status: StatusTracker::new(),
             scroll: 0,
+            pid,
         })
     }
 
@@ -160,5 +165,9 @@ impl PaneBackend for PtyPane {
             vt100::MouseProtocolEncoding::Sgr => MouseProto::Sgr,
             _ => MouseProto::None,
         }
+    }
+
+    fn observe(&self, known: &[String]) -> Option<Observation> {
+        inspect::observe(self.pid?, known)
     }
 }

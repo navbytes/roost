@@ -11,12 +11,22 @@
 //! Fakes return `None` and the renderer must tolerate that.
 
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crate::agents::CommandSpec;
 use crate::core::event::AppEvent;
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneId, Workspace};
+
+/// What a pane is actually running, read from the OS — its live working
+/// directory and any known agent CLI in its process subtree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observation {
+    pub cwd: Option<PathBuf>,
+    /// Adapter id of a known agent running in the pane, if any.
+    pub agent: Option<String>,
+}
 
 /// What the pane's inner application asked for, mouse-wise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +69,14 @@ pub trait PaneBackend: Sized {
     /// Wheel scrolling: positive = further into history.
     fn scroll_by(&mut self, delta: i32);
     fn mouse_proto(&self) -> MouseProto;
+
+    /// Observe the pane's live working directory and any known agent running
+    /// in it (`known_agents` are adapter ids). None = not inspectable (dead
+    /// process / unsupported platform); the caller then leaves persisted
+    /// state untouched. Default None for backends that can't inspect.
+    fn observe(&self, _known_agents: &[String]) -> Option<Observation> {
+        None
+    }
 }
 
 /// Workspace persistence. Implemented by `infra::store::FsStore`.
@@ -87,6 +105,8 @@ pub mod fakes {
         ext: Option<AgentStatus>,
         exited: bool,
         pub proto: MouseProto,
+        /// Test-settable observation returned by `observe`.
+        pub observation: Option<Observation>,
     }
 
     impl PaneBackend for FakePane {
@@ -108,6 +128,7 @@ pub mod fakes {
                 ext: None,
                 exited: false,
                 proto: MouseProto::None,
+                observation: None,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -151,6 +172,9 @@ pub mod fakes {
         }
         fn mouse_proto(&self) -> MouseProto {
             self.proto
+        }
+        fn observe(&self, _known: &[String]) -> Option<Observation> {
+            self.observation.clone()
         }
     }
 

@@ -15,7 +15,7 @@ use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
-use crate::ports::{PaneBackend, StateStore};
+use crate::ports::{Observation, PaneBackend, StateStore};
 use crate::ui::input::Action;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
@@ -221,10 +221,15 @@ impl<B: PaneBackend> App<B> {
     /// Periodic housekeeping: filesystem-based session detection (design doc
     /// §6.1 fallback). Called from the main loop; self-throttled.
     pub fn tick(&mut self) {
-        if self.last_detect.elapsed() < DETECT_INTERVAL || self.pending_detect.is_empty() {
+        if self.last_detect.elapsed() < DETECT_INTERVAL {
             return;
         }
         self.last_detect = Instant::now();
+        // Persist what each pane is actually running (live cwd, typed agent).
+        self.observe_panes();
+        if self.pending_detect.is_empty() {
+            return;
+        }
         let mut pending: Vec<(PaneId, SystemTime)> =
             self.pending_detect.iter().map(|(k, v)| (*k, *v)).collect();
         // Newest spawn first: two panes launched into the same cwd share one
@@ -248,6 +253,59 @@ impl<B: PaneBackend> App<B> {
             if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
                 self.set_session(id, session);
             }
+        }
+    }
+
+    /// Persist what each pane is *actually* running — its live working
+    /// directory (after `cd`) and any known agent CLI started inside it
+    /// (typed `pi` at a shell prompt, not just picker-launched) — so a
+    /// restart brings back reality, not merely what roost first launched.
+    /// A backend that can't inspect its process returns None and is left
+    /// untouched (so a momentarily-unreadable pane is never clobbered).
+    fn observe_panes(&mut self) {
+        let known: Vec<String> =
+            self.registry.keys().filter(|k| **k != "shell").map(|k| k.to_string()).collect();
+        if known.is_empty() {
+            return;
+        }
+        let observations: Vec<(PaneId, Observation)> = self
+            .runtimes
+            .iter()
+            .filter_map(|(id, rt)| rt.observe(&known).map(|o| (*id, o)))
+            .collect();
+
+        let mut dirty = false;
+        let mut promoted: Vec<PaneId> = Vec::new();
+        for (id, o) in observations {
+            let Some(spec) = self.find_spec_mut(id) else { continue };
+            if let Some(cwd) = o.cwd {
+                if spec.cwd != cwd {
+                    spec.cwd = cwd;
+                    dirty = true;
+                }
+            }
+            // Reflect the running agent: promote a shell that's now running pi
+            // to the pi adapter; demote back to shell when the agent exits.
+            let want = o.agent.unwrap_or_else(|| "shell".to_string());
+            if spec.adapter != want {
+                let demoting = want == "shell";
+                spec.adapter = want;
+                if demoting {
+                    spec.session = None;
+                } else {
+                    promoted.push(id);
+                }
+                dirty = true;
+            }
+        }
+        // A newly-recognized agent needs its already-created session file
+        // located; a wide window (epoch) plus the taken-set finds it without
+        // cross-wiring against other panes.
+        for id in promoted {
+            self.pending_detect.entry(id).or_insert(SystemTime::UNIX_EPOCH);
+        }
+        if dirty {
+            self.save();
         }
     }
 
@@ -973,6 +1031,46 @@ mod tests {
         app.apply(Action::NewPane); // focus = 2
         assert!(app.on_pty_exit(1).is_some()); // pane 1 exits, unfocused
         assert!(app.on_pty_exit(2).is_none()); // pane 2 exits, focused
+    }
+
+    #[test]
+    fn observe_promotes_shell_to_agent_and_tracks_cwd() {
+        let (mut app, store) = mk_app(shell_ws());
+        // pane 1: user cd'd to /work/proj and typed `pi`
+        app.runtimes.get_mut(&1).unwrap().observation = Some(Observation {
+            cwd: Some(PathBuf::from("/work/proj")),
+            agent: Some("pi".into()),
+        });
+        app.observe_panes();
+        let spec = app.find_spec(1).unwrap();
+        assert_eq!(spec.adapter, "pi");
+        assert_eq!(spec.cwd, PathBuf::from("/work/proj"));
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert_eq!(saved.tabs[0].panes[&1].adapter, "pi"); // persisted
+        assert!(app.pending_detect.contains_key(&1)); // queued for session detection
+    }
+
+    #[test]
+    fn observe_demotes_to_shell_when_agent_exits() {
+        let mut ws = shell_ws();
+        ws.tabs[0].panes.get_mut(&1).unwrap().adapter = "pi".into();
+        let (mut app, _) = mk_app(ws);
+        // pi exited; the pane is a plain shell again
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(Observation { cwd: None, agent: None });
+        app.observe_panes();
+        assert_eq!(app.find_spec(1).unwrap().adapter, "shell");
+    }
+
+    #[test]
+    fn observe_none_leaves_pane_untouched() {
+        // A momentarily-unreadable process must not clobber persisted state.
+        let mut ws = shell_ws();
+        ws.tabs[0].panes.get_mut(&1).unwrap().adapter = "pi".into();
+        let (mut app, _) = mk_app(ws);
+        app.runtimes.get_mut(&1).unwrap().observation = None;
+        app.observe_panes();
+        assert_eq!(app.find_spec(1).unwrap().adapter, "pi");
     }
 
     #[test]
