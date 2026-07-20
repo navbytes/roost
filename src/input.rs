@@ -12,7 +12,12 @@ pub enum Action {
     FocusPrev,
     NewTab,
     GoToTab(usize),
-    // TODO(M4): ToggleStack, Resize, RenamePane, QuickLaunch
+    ToggleStack,
+    /// Grow (+) or shrink (−) the focused pane along an axis.
+    Resize { horizontal: bool, grow: bool },
+    RenamePane,
+    QuickLaunch,
+    ScrollMode,
 }
 
 pub enum InputResult {
@@ -27,11 +32,21 @@ pub fn translate(key: KeyEvent) -> InputResult {
     }
 
     if key.modifiers.contains(KeyModifiers::ALT) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let action = match key.code {
+            // Alt+Shift+arrows: resize
+            KeyCode::Right if shift => Some(Action::Resize { horizontal: true, grow: true }),
+            KeyCode::Left if shift => Some(Action::Resize { horizontal: true, grow: false }),
+            KeyCode::Down if shift => Some(Action::Resize { horizontal: false, grow: true }),
+            KeyCode::Up if shift => Some(Action::Resize { horizontal: false, grow: false }),
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Char('n') => Some(Action::NewPane),
             KeyCode::Char('w') => Some(Action::ClosePane),
             KeyCode::Char('t') => Some(Action::NewTab),
+            KeyCode::Char('s') => Some(Action::ToggleStack),
+            KeyCode::Char('r') => Some(Action::RenamePane),
+            KeyCode::Enter => Some(Action::QuickLaunch),
+            KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
             KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
                 Some(Action::FocusNext)

@@ -19,6 +19,17 @@ use crate::workspace::{
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Adapters offered by the quick-launch picker (Alt+Enter).
+pub const PICKER_ITEMS: [&str; 3] = ["pi", "claude", "shell"];
+
+/// UI mode: non-Normal modes capture all keys (see handle_mode_key).
+pub enum Mode {
+    Normal,
+    Rename { buffer: String },
+    Picker { selection: usize },
+    Scroll { offset: usize },
+}
+
 pub struct App {
     pub ws: Workspace,
     pub runtimes: HashMap<PaneId, PaneRuntime>,
@@ -27,6 +38,7 @@ pub struct App {
     pub quit: bool,
     /// Spawn errors for panes whose process never started.
     pub dead: HashMap<PaneId, String>,
+    pub mode: Mode,
     tx: Sender<AppEvent>,
     term_size: Size,
     /// Freshly launched agent panes we still owe a session id.
@@ -54,6 +66,7 @@ impl App {
             registry,
             quit: false,
             dead: HashMap::new(),
+            mode: Mode::Normal,
             tx,
             term_size,
             pending_detect: HashMap::new(),
@@ -260,6 +273,25 @@ impl App {
             Action::FocusPrev => self.cycle_focus(-1),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
+            Action::ToggleStack => {
+                let focused = self.focused;
+                workspace::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
+            }
+            Action::Resize { horizontal, grow } => {
+                let delta = if grow { 0.04 } else { -0.04 };
+                let axis = if horizontal { SplitDir::Vertical } else { SplitDir::Horizontal };
+                let focused = self.focused;
+                workspace::resize_pane(&mut self.ws.active_tab_mut().layout, focused, axis, delta);
+            }
+            Action::RenamePane => {
+                let current = self
+                    .find_spec(self.focused)
+                    .and_then(|s| s.title.clone())
+                    .unwrap_or_default();
+                self.mode = Mode::Rename { buffer: current };
+            }
+            Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
+            Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
         }
         self.relayout();
         // Debounced in the design; scaffold saves eagerly on every mutation.
@@ -279,6 +311,10 @@ impl App {
     }
 
     fn new_pane(&mut self) {
+        self.new_pane_with("shell");
+    }
+
+    fn new_pane_with(&mut self, adapter: &str) {
         let id = self.ws.next_pane_id();
         let cwd = self
             .ws
@@ -287,7 +323,7 @@ impl App {
             .get(&self.focused)
             .map(|s| s.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let spec = PaneSpec { adapter: "shell".into(), cwd, session: None, title: None };
+        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None };
 
         // Split in the widest direction of the focused pane's rect.
         let dir = self
@@ -358,6 +394,89 @@ impl App {
             self.ws.active_tab = i;
             self.spawn_active_tab();
             self.focused = self.pane_order().first().copied().unwrap_or(self.focused);
+        }
+    }
+
+    /// Keys while in a non-Normal mode. Returns true when consumed.
+    pub fn handle_mode_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+        // Alt-chords always reach the global bindings (Alt+q must quit from
+        // anywhere). Overlay modes cancel; scroll mode survives.
+        if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            if !matches!(self.mode, Mode::Scroll { .. }) {
+                self.mode = Mode::Normal;
+            }
+            return false;
+        }
+        match &mut self.mode {
+            Mode::Normal => false,
+            Mode::Rename { buffer } => {
+                match key.code {
+                    KeyCode::Char(c) => buffer.push(c),
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Enter => {
+                        let title = buffer.trim().to_string();
+                        let focused = self.focused;
+                        if let Some(spec) = self.find_spec_mut(focused) {
+                            spec.title = if title.is_empty() { None } else { Some(title) };
+                        }
+                        let _ = self.ws.save();
+                        self.mode = Mode::Normal;
+                    }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                true
+            }
+            Mode::Picker { selection } => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selection = selection.checked_sub(1).unwrap_or(PICKER_ITEMS.len() - 1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selection = (*selection + 1) % PICKER_ITEMS.len()
+                    }
+                    KeyCode::Enter => {
+                        let adapter = PICKER_ITEMS[*selection];
+                        self.mode = Mode::Normal;
+                        self.new_pane_with(adapter);
+                        self.relayout();
+                        let _ = self.ws.save();
+                    }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                true
+            }
+            Mode::Scroll { offset } => {
+                let page = (self.term_size.height / 2).max(1) as usize;
+                let new_offset = match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => Some(*offset + 1),
+                    KeyCode::Down | KeyCode::Char('j') => Some(offset.saturating_sub(1)),
+                    KeyCode::PageUp => Some(*offset + page),
+                    KeyCode::PageDown => Some(offset.saturating_sub(page)),
+                    KeyCode::Esc | KeyCode::Char('q') => None,
+                    _ => return true,
+                };
+                let focused = self.focused;
+                match new_offset {
+                    Some(n) => {
+                        *offset = n;
+                        if let Some(rt) = self.runtimes.get_mut(&focused) {
+                            rt.parser.set_scrollback(n);
+                        }
+                    }
+                    None => {
+                        if let Some(rt) = self.runtimes.get_mut(&focused) {
+                            rt.parser.set_scrollback(0);
+                        }
+                        self.mode = Mode::Normal;
+                    }
+                }
+                true
+            }
         }
     }
 

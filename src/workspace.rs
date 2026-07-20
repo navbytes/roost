@@ -217,6 +217,82 @@ pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
     empty
 }
 
+fn subtree_contains(node: &LayoutNode, target: PaneId) -> bool {
+    let mut v = Vec::new();
+    pane_order(node, &mut v);
+    v.contains(&target)
+}
+
+/// Alt+s: if `target` is in a stack, explode the stack back into an even
+/// split; otherwise collapse the innermost split that directly contains
+/// `target` into a stack of all its leaf panes (with `target` expanded).
+pub fn toggle_stack(node: &mut LayoutNode, target: PaneId) -> bool {
+    match node {
+        LayoutNode::Pane(_) => false,
+        LayoutNode::Stack { children, .. } => {
+            if !children.contains(&target) {
+                return false;
+            }
+            let n = children.len();
+            let panes: Vec<LayoutNode> = children.iter().map(|id| LayoutNode::Pane(*id)).collect();
+            *node = LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![1.0 / n as f32; n],
+                children: panes,
+            };
+            true
+        }
+        LayoutNode::Split { children, .. } => {
+            // Deeper matches win (innermost split collapses).
+            for c in children.iter_mut() {
+                if toggle_stack(c, target) {
+                    return true;
+                }
+            }
+            let direct = children
+                .iter()
+                .any(|c| matches!(c, LayoutNode::Pane(id) if *id == target));
+            if !direct {
+                return false;
+            }
+            let mut panes = Vec::new();
+            for c in children.iter() {
+                pane_order(c, &mut panes);
+            }
+            let expanded = panes.iter().position(|&p| p == target).unwrap_or(0);
+            *node = LayoutNode::Stack { children: panes, expanded };
+            true
+        }
+    }
+}
+
+/// Alt+Shift+arrows: grow/shrink the subtree containing `target` along the
+/// given axis by `delta` (fraction of the parent split). Innermost matching
+/// split wins.
+pub fn resize_pane(node: &mut LayoutNode, target: PaneId, axis: SplitDir, delta: f32) -> bool {
+    let LayoutNode::Split { dir, ratios, children } = node else {
+        return false;
+    };
+    let Some(i) = children.iter().position(|c| subtree_contains(c, target)) else {
+        return false;
+    };
+    if resize_pane(&mut children[i], target, axis, delta) {
+        return true;
+    }
+    if *dir != axis || children.len() < 2 || ratios.len() != children.len() {
+        return false;
+    }
+    let j = if i + 1 < children.len() { i + 1 } else { i - 1 };
+    let new_i = (ratios[i] + delta).clamp(0.1, 0.9);
+    let diff = new_i - ratios[i];
+    if ratios[j] - diff < 0.1 {
+        return true; // at the limit; handled, no change
+    }
+    ratios[i] += diff;
+    ratios[j] -= diff;
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
@@ -263,6 +339,49 @@ mod tests {
                 assert_eq!(*expanded, 2);
             }
             _ => panic!("stack expected"),
+        }
+    }
+
+    #[test]
+    fn toggle_stack_roundtrip() {
+        // split(1, 2) --Alt+s on 2--> stack[1,2] expanded=1 --Alt+s--> split
+        let mut root = tree();
+        assert!(toggle_stack(&mut root, 2));
+        match &root {
+            LayoutNode::Stack { children, expanded } => {
+                assert_eq!(children, &vec![1, 2]);
+                assert_eq!(*expanded, 1);
+            }
+            _ => panic!("expected stack"),
+        }
+        assert!(toggle_stack(&mut root, 2));
+        assert!(matches!(root, LayoutNode::Split { .. }));
+        let mut order = vec![];
+        pane_order(&root, &mut order);
+        assert_eq!(order, vec![1, 2]);
+    }
+
+    #[test]
+    fn resize_adjusts_matching_axis_only() {
+        let mut root = tree(); // vertical split, 0.5/0.5
+        // wrong axis: no change
+        assert!(!resize_pane(&mut root, 1, SplitDir::Horizontal, 0.05));
+        // right axis: pane 1 grows, pane 2 shrinks
+        assert!(resize_pane(&mut root, 1, SplitDir::Vertical, 0.05));
+        match &root {
+            LayoutNode::Split { ratios, .. } => {
+                assert!((ratios[0] - 0.55).abs() < 1e-6);
+                assert!((ratios[1] - 0.45).abs() < 1e-6);
+            }
+            _ => panic!(),
+        }
+        // clamp: can't shrink neighbor below 0.1
+        for _ in 0..20 {
+            resize_pane(&mut root, 1, SplitDir::Vertical, 0.05);
+        }
+        match &root {
+            LayoutNode::Split { ratios, .. } => assert!(ratios[1] >= 0.1 - 1e-6),
+            _ => panic!(),
         }
     }
 

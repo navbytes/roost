@@ -3,10 +3,10 @@
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, Mode, PICKER_ITEMS};
 use crate::status::AgentStatus;
 use crate::workspace::{compute_rects, PaneRect};
 
@@ -24,6 +24,58 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     compute_rects(&app.ws.active_tab().layout, body, &mut rects);
     for pr in rects {
         draw_pane(f, app, pr);
+    }
+
+    draw_mode_overlay(f, app, body);
+}
+
+/// Centered floating rect of the given size, clamped to `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+fn draw_mode_overlay(f: &mut Frame, app: &App, body: Rect) {
+    match &app.mode {
+        Mode::Normal | Mode::Scroll { .. } => {}
+        Mode::Rename { buffer } => {
+            let rect = centered(body, 44, 3);
+            f.render_widget(Clear, rect);
+            let block = Block::bordered()
+                .title(" rename pane ")
+                .border_style(Style::default().fg(Color::Yellow));
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            f.render_widget(Paragraph::new(format!("{buffer}▏")), inner);
+        }
+        Mode::Picker { selection } => {
+            let rect = centered(body, 32, PICKER_ITEMS.len() as u16 + 2);
+            f.render_widget(Clear, rect);
+            let block = Block::bordered()
+                .title(" new pane — pick agent ")
+                .border_style(Style::default().fg(Color::Yellow));
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let lines: Vec<Line> = PICKER_ITEMS
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let style = if i == *selection {
+                        Style::default().fg(Color::Black).bg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(format!("  {item:<28}"), style))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), inner);
+        }
     }
 }
 
@@ -66,7 +118,12 @@ fn draw_pane(f: &mut Frame, app: &mut App, pr: PaneRect) {
             .and_then(|s| s.title.clone())
             .or_else(|| spec.map(|s| s.adapter.clone()))
             .unwrap_or_else(|| "?".into());
-        (format!(" {} {} ", status.badge(), name), status)
+        let scroll_tag = if focused && matches!(app.mode, Mode::Scroll { .. }) {
+            " [scroll]"
+        } else {
+            ""
+        };
+        (format!(" {} {}{} ", status.badge(), name, scroll_tag), status)
     };
 
     if pr.collapsed {

@@ -45,6 +45,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if crossterm::event::poll(Duration::from_millis(33))? {
             match crossterm::event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if app.handle_mode_key(key) {
+                        continue;
+                    }
                     match input::translate(key) {
                         InputResult::Action(a) => app.apply(a),
                         InputResult::Forward(bytes) if app.focused_dead() => {
