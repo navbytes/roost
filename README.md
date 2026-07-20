@@ -34,7 +34,13 @@ change, atomic writes). Delete it to start clean.
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
 | `Alt+t`, `Alt+1..9` | new tab / go to tab |
 | `Alt+w` | close pane |
+| `Alt+/` | toggle the shortcut hint bar |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
+
+A **shortcut hint bar** runs along the bottom (on by default), zellij-style,
+showing the keys you can press right now — and it changes with context, so
+rename / picker / scroll / dead-pane modes each show their own keys. `Alt+/`
+hides it to reclaim the row.
 
 Everything else passes through to the focused pane untouched.
 

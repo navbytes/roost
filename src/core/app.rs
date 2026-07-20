@@ -53,6 +53,9 @@ pub struct App<B: PaneBackend> {
     /// Spawn errors for panes whose process never started.
     pub dead: HashMap<PaneId, String>,
     pub mode: Mode,
+    /// Zellij-style shortcut hint bar at the bottom; on by default so keys
+    /// are always discoverable. Session-only (not persisted).
+    hints: bool,
     store: Box<dyn StateStore>,
     tx: Sender<AppEvent>,
     term_size: Size,
@@ -83,6 +86,7 @@ impl<B: PaneBackend> App<B> {
             quit: false,
             dead: HashMap::new(),
             mode: Mode::Normal,
+            hints: true,
             store,
             tx,
             term_size,
@@ -99,8 +103,18 @@ impl<B: PaneBackend> App<B> {
         let _ = self.store.save(&self.ws);
     }
 
-    fn body_area(&self) -> Rect {
-        Rect::new(0, 1, self.term_size.width, self.term_size.height.saturating_sub(1))
+    /// The pane area: below the tab bar (row 0), above the hint bar (last
+    /// row) when it's shown. Single source of truth for both layout/PTY
+    /// sizing and rendering.
+    pub fn body_area(&self) -> Rect {
+        let reserved = 1 + if self.hints_shown() { 1 } else { 0 };
+        Rect::new(0, 1, self.term_size.width, self.term_size.height.saturating_sub(reserved))
+    }
+
+    /// Whether the hint bar is actually drawn: enabled, and the terminal is
+    /// tall enough to spare the row (tab + hint + at least one body row).
+    pub fn hints_shown(&self) -> bool {
+        self.hints && self.term_size.height >= 3
     }
 
     /// Pane rectangles of the active tab (border-inclusive).
@@ -355,6 +369,7 @@ impl<B: PaneBackend> App<B> {
             }
             Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
             Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
+            Action::ToggleHints => self.hints = !self.hints,
         }
         self.relayout();
         self.save();
@@ -750,6 +765,26 @@ mod tests {
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes[&1].title.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn hint_bar_reserves_one_body_row_and_toggles() {
+        let (mut app, _) = mk_app(shell_ws()); // 100x30, hints on by default
+        assert!(app.hints_shown());
+        let with = app.body_area().height;
+        app.apply(Action::ToggleHints);
+        assert!(!app.hints_shown());
+        let without = app.body_area().height;
+        assert_eq!(without, with + 1); // reclaimed the hint row
+    }
+
+    #[test]
+    fn hint_bar_hidden_on_tiny_terminal() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(80, 2)); // no room for tab + hint + body
+        assert!(!app.hints_shown());
+        // body_area must not underflow
+        assert!(app.body_area().height <= 2);
     }
 
     #[test]

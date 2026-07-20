@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::core::app::{App, Mode, RenameTarget, PICKER_ITEMS};
 use crate::core::status::AgentStatus;
-use crate::core::layout::{compute_rects, PaneRect};
+use crate::core::layout::PaneRect;
 use crate::ports::PaneBackend;
 
 pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
@@ -17,17 +17,60 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
         return;
     }
     let tab_bar = Rect::new(area.x, area.y, area.width, 1);
-    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    // Body comes from the app so pane rects, PTY sizing, and rendering all
+    // agree on where the hint bar's reserved row is.
+    let body = app.body_area();
 
     draw_tab_bar(f, app, tab_bar);
 
-    let mut rects: Vec<PaneRect> = Vec::new();
-    compute_rects(&app.ws.active_tab().layout, body, &mut rects);
-    for pr in rects {
+    for pr in app.rects() {
         draw_pane(f, app, pr);
     }
 
+    if app.hints_shown() {
+        let hint_bar = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+        draw_hint_bar(f, app, hint_bar);
+    }
+
     draw_mode_overlay(f, app, body);
+}
+
+/// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
+/// actually press right now.
+fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
+    // (key, what it does) pairs for the current context.
+    let hints: Vec<(&str, &str)> = match &app.mode {
+        Mode::Rename { .. } => vec![("type", "name"), ("↵", "save"), ("Esc", "cancel")],
+        Mode::Picker { .. } => vec![("↑↓", "choose"), ("↵", "open"), ("Esc", "cancel")],
+        Mode::Scroll { .. } => {
+            vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
+        }
+        Mode::Normal if app.focused_dead() => {
+            vec![("↵", "relaunch"), ("f", "fresh"), ("Alt+q", "quit")]
+        }
+        Mode::Normal => vec![
+            ("Alt+n", "split"),
+            ("Alt+↵", "launch"),
+            ("Alt+s", "stack"),
+            ("Alt+t", "tab"),
+            ("Alt+r", "rename"),
+            ("Alt+←↓↑→", "focus"),
+            ("Alt+w", "close"),
+            ("Alt+/", "hide"),
+            ("Alt+q", "quit"),
+        ],
+    };
+
+    let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 3);
+    for (key, label) in hints {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}   "), Style::default().fg(Color::Gray)));
+    }
+    // Paragraph truncates (no wrap) so a narrow terminal just clips the tail.
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Centered floating rect of the given size, clamped to `area`.
