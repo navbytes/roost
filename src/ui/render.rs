@@ -3,7 +3,7 @@
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::core::app::{App, Mode, RenameTarget, PICKER_ITEMS};
@@ -23,8 +23,9 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 
     draw_tab_bar(f, app, tab_bar);
 
-    for pr in app.rects() {
-        draw_pane(f, app, pr);
+    let rects = app.rects();
+    for pr in &rects {
+        draw_pane(f, app, *pr);
     }
 
     if app.hints_shown() {
@@ -32,12 +33,26 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
         draw_hint_bar(f, app, hint_bar);
     }
 
-    draw_mode_overlay(f, app, body);
+    // Anchor floating dialogs near the focused pane rather than dead-center
+    // of the whole screen, so it's visually obvious which pane they affect.
+    let anchor = rects.iter().find(|pr| pr.id == app.focused).map(|pr| pr.rect).unwrap_or(body);
+    draw_mode_overlay(f, app, body, anchor);
 }
 
 /// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
 /// actually press right now.
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
+    if app.show_alt_hint() {
+        f.render_widget(
+            Paragraph::new(
+                " Alt keys aren't reaching roost? Enable \"Use Option as Meta Key\" in Terminal > Settings > Profiles > Keyboard ",
+            )
+            .style(Style::default().fg(Color::Black).bg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
+
     // (key, what it does) pairs for the current context.
     let hints: Vec<(&str, &str)> = match &app.mode {
         Mode::Rename { target, .. } => {
@@ -79,23 +94,51 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Centered floating rect of the given size, clamped to `area`.
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    )
+/// Floating rect of the given size, centered on `anchor` (the focused pane)
+/// but clamped to fully fit inside `bounds` — so a dialog near the screen
+/// edge still lands on-screen instead of centering blindly on the whole
+/// terminal.
+fn centered_near(anchor: Rect, bounds: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(bounds.width);
+    let h = height.min(bounds.height);
+    let cx = anchor.x + anchor.width / 2;
+    let cy = anchor.y + anchor.height / 2;
+    let x = cx.saturating_sub(w / 2).clamp(bounds.x, bounds.x + bounds.width - w);
+    let y = cy.saturating_sub(h / 2).clamp(bounds.y, bounds.y + bounds.height - h);
+    Rect::new(x, y, w, h)
 }
 
-fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect) {
+/// Dim every cell in `body` outside `dialog` so a floating overlay reads as a
+/// distinct modal layer sitting on top of the panes, not more pane chrome.
+fn dim_backdrop(f: &mut Frame, body: Rect, dialog: Rect) {
+    let buf = f.buffer_mut();
+    for y in body.y..body.y + body.height {
+        for x in body.x..body.x + body.width {
+            let inside_dialog =
+                x >= dialog.x && x < dialog.x + dialog.width && y >= dialog.y && y < dialog.y + dialog.height;
+            if inside_dialog {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                let style = cell.style().add_modifier(Modifier::DIM);
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// Border style for floating dialogs: a fixed color + double border, so it
+/// never blends with a pane's own (status-colored, single-line) border.
+fn dialog_border_style() -> Style {
+    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+
+fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
     match &app.mode {
         Mode::Normal | Mode::Scroll { .. } => {}
         Mode::Rename { buffer, target } => {
-            let rect = centered(body, 44, 3);
+            let rect = centered_near(anchor, body, 44, 3);
+            dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let heading = match target {
                 RenameTarget::Pane => " rename pane ",
@@ -103,17 +146,20 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect) {
             };
             let block = Block::bordered()
                 .title(heading)
-                .border_style(Style::default().fg(Color::Yellow));
+                .border_type(BorderType::Double)
+                .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             f.render_widget(Paragraph::new(format!("{buffer}▏")), inner);
         }
         Mode::Picker { selection } => {
-            let rect = centered(body, 32, PICKER_ITEMS.len() as u16 + 2);
+            let rect = centered_near(anchor, body, 32, PICKER_ITEMS.len() as u16 + 2);
+            dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
                 .title(" new pane — pick agent ")
-                .border_style(Style::default().fg(Color::Yellow));
+                .border_type(BorderType::Double)
+                .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             let lines: Vec<Line> = PICKER_ITEMS
@@ -162,23 +208,43 @@ fn status_color(s: AgentStatus) -> Color {
 
 fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
     let focused = app.focused == pr.id;
-    let (title, status, name) = {
+    let (title, title_line, status, name) = {
         let spec = app.ws.active_tab().panes.get(&pr.id);
         let status = app
             .runtimes
             .get(&pr.id)
             .map(|rt| rt.status())
             .unwrap_or(AgentStatus::Exited);
-        let name = spec
-            .and_then(|s| s.title.clone())
-            .or_else(|| spec.map(|s| s.adapter.clone()))
-            .unwrap_or_else(|| "?".into());
+        // Untitled panes on the same adapter are otherwise indistinguishable
+        // (same badge, same idle glyph) — tag them with the cwd's last path
+        // component so a bank of fresh shells can be told apart at a glance.
+        let name = spec.and_then(|s| s.title.clone()).unwrap_or_else(|| {
+            let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
+            let cwd_tag = spec
+                .and_then(|s| s.cwd.file_name())
+                .and_then(|f| f.to_str())
+                .map(|f| format!(" · {f}"))
+                .unwrap_or_default();
+            format!("{adapter}{cwd_tag}")
+        });
         let scroll_tag = if focused && matches!(app.mode, Mode::Scroll { .. }) {
             " [scroll]"
         } else {
             ""
         };
-        (format!(" {} {}{} ", status.badge(), name, scroll_tag), status, name)
+        let title = format!(" {} {}{} ", status.badge(), name, scroll_tag);
+        // Color the status glyph itself (not just the focused border) so
+        // idle vs. waiting vs. needs-input reads at a glance on every pane,
+        // not only the one currently focused.
+        let title_line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                status.badge(),
+                Style::default().fg(status_color(status)).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {name}{scroll_tag} ")),
+        ]);
+        (title, title_line, status, name)
     };
 
     if pr.collapsed {
@@ -197,7 +263,7 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let block = Block::bordered().title(title).border_style(border_style);
+    let block = Block::bordered().title(title_line).border_style(border_style);
     let inner = block.inner(pr.rect);
     f.render_widget(block, pr.rect);
 
@@ -319,8 +385,31 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::corner_badge;
+    use super::{centered_near, corner_badge};
     use ratatui::layout::Rect;
+
+    #[test]
+    fn dialog_centers_on_focused_pane_not_whole_screen() {
+        // Body is a wide 3-pane screen; anchor is the rightmost pane only.
+        let body = Rect::new(0, 1, 120, 30);
+        let anchor = Rect::new(80, 1, 40, 30);
+        let rect = centered_near(anchor, body, 32, 5);
+        // Centered within the anchor pane, not the full 120-wide body.
+        assert_eq!(rect.x, anchor.x + (anchor.width - rect.width) / 2);
+        assert_eq!(rect.width, 32);
+        assert_eq!(rect.height, 5);
+    }
+
+    #[test]
+    fn dialog_stays_on_screen_when_anchor_is_near_the_edge() {
+        // Anchor pane hugs the right edge; a dialog centered on it alone
+        // would spill off-screen — must clamp back inside `body`.
+        let body = Rect::new(0, 1, 60, 20);
+        let anchor = Rect::new(50, 1, 10, 20);
+        let rect = centered_near(anchor, body, 32, 5);
+        assert!(rect.x + rect.width <= body.x + body.width);
+        assert!(rect.x >= body.x);
+    }
 
     #[test]
     fn badge_is_right_aligned_on_top_row() {

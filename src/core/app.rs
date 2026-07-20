@@ -20,6 +20,10 @@ use crate::ui::input::Action;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long the "Alt keys aren't reaching roost" hint stays up on a fresh
+/// launch before we assume the user isn't going to press one / already saw it.
+const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
+
 /// A pane must stay usable after a split. These are the smallest *outer*
 /// rects (borders included) we allow a split to produce; below them the new
 /// pane would be a sliver, so the split is refused.
@@ -63,6 +67,11 @@ pub struct App<B: PaneBackend> {
     pending_detect: HashMap<PaneId, SystemTime>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
+    started: Instant,
+    /// Set the first time an Alt-modified key event arrives, so the
+    /// "Alt keys aren't reaching roost" startup hint can stop once we know
+    /// they are (or the window has simply run out).
+    alt_seen: bool,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -93,6 +102,8 @@ impl<B: PaneBackend> App<B> {
             pending_detect: HashMap::new(),
             last_detect: Instant::now(),
             sock_path,
+            started: Instant::now(),
+            alt_seen: false,
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -115,6 +126,25 @@ impl<B: PaneBackend> App<B> {
     /// tall enough to spare the row (tab + hint + at least one body row).
     pub fn hints_shown(&self) -> bool {
         self.hints && self.term_size.height >= 3
+    }
+
+    /// Record that an Alt-modified key actually arrived, so the startup hint
+    /// (below) knows it doesn't need to warn.
+    pub fn note_alt_seen(&mut self) {
+        self.alt_seen = true;
+    }
+
+    /// Stock Terminal.app doesn't send Alt as a modifier until the user turns
+    /// on "Use Option as Meta Key" — with it off, every Alt+key roost relies
+    /// on silently does nothing, and there's no other signal to tell the user
+    /// why. `TERM_PROGRAM` reliably names Terminal.app, so nudge for the first
+    /// few seconds unless an Alt key has already gotten through.
+    pub fn show_alt_hint(&self) -> bool {
+        wants_alt_hint(
+            self.alt_seen,
+            self.started.elapsed(),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+        )
     }
 
     /// Pane rectangles of the active tab (border-inclusive).
@@ -247,9 +277,22 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    pub fn on_pty_exit(&mut self, id: PaneId) {
+    /// Returns a notification message when a *non-focused* pane exits — an
+    /// exited pane is as attention-worthy as one needing input, but its
+    /// recovery hint is only visible inside its own borders, so it otherwise
+    /// gets no pull toward it (regression: same fix as `on_status`).
+    pub fn on_pty_exit(&mut self, id: PaneId) -> Option<String> {
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.on_exit();
+        }
+        if id != self.focused {
+            let name = self
+                .find_spec(id)
+                .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
+                .unwrap_or_else(|| format!("pane {id}"));
+            Some(format!("{name} exited"))
+        } else {
+            None
         }
     }
 
@@ -612,6 +655,12 @@ fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
 }
 
+/// Pure decision behind `App::show_alt_hint`, split out so it's testable
+/// without depending on process env vars or wall-clock time.
+fn wants_alt_hint(alt_seen: bool, elapsed: Duration, term_program: Option<&str>) -> bool {
+    !alt_seen && elapsed < ALT_HINT_WINDOW && term_program == Some("Apple_Terminal")
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — the whole app core runs against fakes, no PTYs involved.
 // ---------------------------------------------------------------------------
@@ -835,6 +884,23 @@ mod tests {
         assert_eq!(app.ws.active_tab().name, "roost-repo");
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].name, "roost-repo");
+    }
+
+    #[test]
+    fn exit_notifies_only_when_unfocused() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2
+        assert!(app.on_pty_exit(1).is_some()); // pane 1 exits, unfocused
+        assert!(app.on_pty_exit(2).is_none()); // pane 2 exits, focused
+    }
+
+    #[test]
+    fn alt_hint_gates_on_seen_time_and_terminal() {
+        assert!(wants_alt_hint(false, Duration::from_secs(1), Some("Apple_Terminal")));
+        assert!(!wants_alt_hint(true, Duration::from_secs(1), Some("Apple_Terminal")));
+        assert!(!wants_alt_hint(false, ALT_HINT_WINDOW, Some("Apple_Terminal")));
+        assert!(!wants_alt_hint(false, Duration::from_secs(1), Some("iTerm.app")));
+        assert!(!wants_alt_hint(false, Duration::from_secs(1), None));
     }
 
     #[test]

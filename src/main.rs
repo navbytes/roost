@@ -117,6 +117,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             loop {
                 match crossterm::event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+                            app.note_alt_seen();
+                        }
                         if !app.handle_mode_key(key) {
                             handle_key(&mut app, key);
                         }
@@ -145,7 +148,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 AppEvent::Output(id, bytes) => app.on_pty_output(id, &bytes),
-                AppEvent::Exit(id) => app.on_pty_exit(id),
+                AppEvent::Exit(id) => {
+                    if let Some(msg) = app.on_pty_exit(id) {
+                        notifier.notify(&msg);
+                    }
+                }
                 AppEvent::Session(id, s) => app.on_session(id, s),
                 AppEvent::Status(id, s) => {
                     if let Some(msg) = app.on_status(id, s) {
