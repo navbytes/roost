@@ -13,6 +13,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Whether a stored session id still resolves to a resumable session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    /// The session file is present — resume it.
+    Exists,
+    /// The session is definitively gone (dir readable, id absent) — launch
+    /// fresh and clear the dead id.
+    Gone,
+    /// Can't tell (no session root, or the root is momentarily unreadable) —
+    /// attempt resume but do NOT clear the id.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
     pub program: String,
@@ -88,17 +101,28 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
-    /// Does a resumable session with this id still exist on disk? Used to
-    /// avoid resuming into a session the CLI can no longer find (e.g. one it
-    /// handed out an id for but never persisted, or the user deleted). The
-    /// default reuses `session_root` + `session_id_from_path`, so pi and
-    /// claude get it for free; adapters without a session root (shell) always
-    /// return true since they have nothing to validate.
-    fn session_exists(&self, cwd: &Path, id: &str) -> bool {
-        let Some(root) = self.session_root(cwd) else { return true };
-        session_files_since(&root, SystemTime::UNIX_EPOCH).iter().any(|p| {
+    /// Is a resumable session with this id still on disk? Distinguishes
+    /// "definitely gone" from "can't tell" so a transient read error never
+    /// discards a still-valid resume pointer. The default reuses
+    /// `session_root` + `session_id_from_path`, so pi and claude get it for
+    /// free; adapters without a session root (shell) return Unknown.
+    fn session_state(&self, cwd: &Path, id: &str) -> SessionState {
+        let Some(root) = self.session_root(cwd) else { return SessionState::Unknown };
+        // A missing sessions dir means the session is truly gone; an
+        // *unreadable* one (permission/transient) means we simply don't know.
+        match std::fs::read_dir(&root) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SessionState::Gone,
+            Err(_) => return SessionState::Unknown,
+        }
+        let exists = session_files_since(&root, SystemTime::UNIX_EPOCH).iter().any(|p| {
             self.owns_session_file(p, cwd) && self.session_id_from_path(p).as_deref() == Some(id)
-        })
+        });
+        if exists {
+            SessionState::Exists
+        } else {
+            SessionState::Gone
+        }
     }
 
 }
@@ -139,4 +163,60 @@ pub fn registry() -> Registry {
         m.insert(a.id(), a);
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Adapter whose session root is a caller-supplied path, so session_state
+    /// branches can be exercised deterministically against a temp dir.
+    struct RootAdapter(Option<PathBuf>);
+    impl AgentAdapter for RootAdapter {
+        fn id(&self) -> &'static str {
+            "root"
+        }
+        fn launch(&self, cwd: &Path) -> CommandSpec {
+            CommandSpec::new("true", cwd)
+        }
+        fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
+            CommandSpec::new("true", cwd).arg(session)
+        }
+        fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn session_state_unknown_without_a_root() {
+        assert_eq!(RootAdapter(None).session_state(Path::new("/x"), "id"), SessionState::Unknown);
+    }
+
+    #[test]
+    fn session_state_gone_when_dir_missing() {
+        let d = std::env::temp_dir().join(format!("roost-ss-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(
+            RootAdapter(Some(d)).session_state(Path::new("/x"), "id"),
+            SessionState::Gone
+        );
+    }
+
+    #[test]
+    fn session_state_exists_when_file_present() {
+        let d = std::env::temp_dir().join(format!("roost-ss-present-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("the-id.jsonl"), "").unwrap();
+        // default session_id_from_path = file stem = "the-id"
+        assert_eq!(
+            RootAdapter(Some(d.clone())).session_state(Path::new("/x"), "the-id"),
+            SessionState::Exists
+        );
+        assert_eq!(
+            RootAdapter(Some(d.clone())).session_state(Path::new("/x"), "other"),
+            SessionState::Gone
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

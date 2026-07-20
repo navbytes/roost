@@ -45,6 +45,14 @@ mod platform {
         if !PathBuf::from(format!("/proc/{pid}")).exists() {
             return None; // process gone / not inspectable
         }
+        // An empty cmdline means the process is mid-execve (or a kernel
+        // thread) — a live shell/agent always has a non-empty one. Don't
+        // trust such a sample; returning None leaves persisted state alone
+        // rather than briefly mis-classifying the pane as a bare shell.
+        match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(c) if !c.iter().all(|b| *b == 0) => {}
+            _ => return None,
+        }
         let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
         let agent = find_agent(pid, known);
         Some(Observation { cwd, agent })
@@ -96,14 +104,15 @@ mod platform {
     use std::process::Command;
 
     pub fn observe(pid: u32, known: &[String]) -> Option<Observation> {
-        // `ps` on the pid tells us the process exists; if it doesn't, bail so
-        // we don't clobber persisted state.
-        let alive = Command::new("ps")
-            .args(["-o", "pid=", "-p", &pid.to_string()])
+        // The process's own command; empty means gone or mid-exec — either
+        // way don't trust the sample (leaves persisted state untouched).
+        let own = Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
             .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if !alive {
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if own.is_empty() {
             return None;
         }
         let cwd = cwd_of(pid);

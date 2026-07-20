@@ -110,7 +110,7 @@ enum LayoutNode {
 }
 ```
 
-Write policy: debounce-save 2s after any mutation (layout change, session ID learned, title change) **and** on clean quit. Crash-safety = atomic write (temp file + rename). Because saves happen continuously, even a hard kill or kernel panic loses at most the last 2 seconds of *layout* changes — never agent state, which the agents own.
+Write policy: save synchronously on every mutation (layout change, session ID learned, title/name change, observed cwd/adapter change) **and** on clean quit. Crash-safety = atomic write (temp file + rename). Writes are small and cheap, so saving on each change rather than debouncing loses *nothing* on a hard kill or kernel panic — strictly safer than the originally-planned 2s debounce, and agent state is the agents' own anyway. (The periodic pane observation is itself throttled to ~2s, so status/observe churn doesn't cause pathological write amplification.)
 
 **Restore policy** on launch: rebuild the tree, then for each pane ask its adapter for the resume command:
 

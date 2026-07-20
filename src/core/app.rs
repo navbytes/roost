@@ -174,15 +174,18 @@ impl<B: PaneBackend> App<B> {
     fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
         let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
 
-        // Validate a stored session id: if the CLI can no longer resolve it
-        // (it handed out the id but never persisted a resumable session, or
-        // the user deleted it), launch fresh instead of resuming into a dead
-        // pane. All adapter queries happen here, before we borrow self mut.
-        let session = match &spec.session {
-            Some(s) if adapter.session_exists(&spec.cwd, s) => Some(s.clone()),
-            _ => None,
+        // Validate a stored session id: only launch fresh + clear it when the
+        // session is *definitively* gone. If we can't tell (root momentarily
+        // unreadable), attempt resume and keep the id — a transient error must
+        // not discard a still-valid resume pointer. All adapter queries happen
+        // here, before we borrow self mut.
+        let (session, stale) = match &spec.session {
+            None => (None, false),
+            Some(s) => match adapter.session_state(&spec.cwd, s) {
+                crate::agents::SessionState::Gone => (None, true),
+                _ => (Some(s.clone()), false), // Exists or Unknown → try resume
+            },
         };
-        let stale = spec.session.is_some() && session.is_none();
         let mut cmd = match &session {
             Some(s) => adapter.resume(&spec.cwd, s),
             None => adapter.launch(&spec.cwd),
@@ -375,8 +378,14 @@ impl<B: PaneBackend> App<B> {
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.set_extension_status(status);
         }
-        let became_needy = matches!(status, AgentStatus::NeedsInput | AgentStatus::Waiting)
-            && prev == Some(AgentStatus::Working);
+        // NeedsInput is an explicit "I need you" and always pulls attention;
+        // Waiting is softer (turn ended) — only notify when it follows active
+        // work, so a resume that lands straight on Waiting doesn't nag.
+        let became_needy = match status {
+            AgentStatus::NeedsInput => true,
+            AgentStatus::Waiting => prev == Some(AgentStatus::Working),
+            _ => false,
+        };
         if became_needy && id != self.focused {
             let name = self
                 .find_spec(id)
@@ -841,6 +850,17 @@ mod tests {
         assert!(app.on_status(2, AgentStatus::NeedsInput).is_none());
         // Idle → waiting (no working phase) doesn't notify.
         assert!(app.on_status(1, AgentStatus::Waiting).is_none());
+    }
+
+    #[test]
+    fn needs_input_notifies_even_without_a_prior_working_phase() {
+        // An agent that asks for you immediately on resume (straight to
+        // NeedsInput, no Working) must still pull attention when unfocused.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2, pane 1 unfocused & idle
+        assert!(app.on_status(1, AgentStatus::NeedsInput).is_some());
+        // ...but still never for the focused pane.
+        assert!(app.on_status(2, AgentStatus::NeedsInput).is_none());
     }
 
     #[test]
