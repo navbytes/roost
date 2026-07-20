@@ -313,10 +313,11 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    /// Forward an encoded mouse event to a mouse-aware pane app.
-    pub fn wheel_forward(&mut self, id: PaneId, bytes: &[u8]) {
+    /// Forward an encoded mouse event (wheel / click / drag) to a mouse-aware
+    /// pane app.
+    pub fn forward_mouse(&mut self, id: PaneId, bytes: &[u8]) {
         if let Some(rt) = self.runtimes.get_mut(&id) {
-            // Not write_input(): a forwarded wheel event must not snap the
+            // Not write_input(): a forwarded mouse event must not snap the
             // pane's scrollback to the live tail.
             rt.write_input_raw(bytes);
         }

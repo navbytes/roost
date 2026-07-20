@@ -1,14 +1,18 @@
 //! Mouse routing — pure decisions, no I/O, fully unit-tested.
 //!
-//! The scroll bug this module fixes: without mouse capture the terminal
-//! emulator consumes wheel events itself and scrolls its *own* buffer —
-//! visually "scrolling to content outside the TUI". With capture enabled,
-//! wheel events arrive here and are routed per hovered pane:
+//! Two jobs:
+//! 1. Wheel over a pane → forward to the inner app when it speaks SGR mouse
+//!    reporting (pi/claude TUIs, vim, less…), else scroll roost's own
+//!    scrollback for that pane. Without mouse capture the hosting terminal
+//!    would scroll its *own* buffer — content outside the TUI.
+//! 2. Clicks/drags over a mouse-aware pane are forwarded too, so you can
+//!    actually interact with an agent's TUI (menus, buttons, selection).
+//!    Over a plain app only the wheel does anything; roost keeps the click
+//!    for focus.
 //!
-//! - inner app enabled SGR mouse reporting (pi/claude TUIs, vim, less…)
-//!   → encode the event and forward it to the PTY; the app scrolls itself.
-//! - plain apps (shells) → scroll roost's own scrollback for that pane.
+//! The tab bar row is handled separately (click to switch tabs).
 
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::core::layout::PaneRect;
@@ -16,14 +20,17 @@ use crate::ports::MouseProto;
 
 /// Lines per wheel notch for roost-side scrolling (tmux uses 3).
 pub const WHEEL_LINES: i32 = 3;
+/// The tab bar's fixed left label; its width offsets tab hit-testing.
+pub const TABBAR_PREFIX: &str = " roost ";
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum WheelRoute {
+pub enum MouseAction {
     /// Forward these bytes to the pane's PTY (mouse-aware app).
     Forward(Vec<u8>),
     /// Scroll roost's scrollback by this delta (positive = into history).
     Scroll(i32),
-    Ignore,
+    /// Nothing to send to the pane (focus is handled by the caller).
+    None,
 }
 
 /// Which pane is under (col, row)? Collapsed stack bars count too.
@@ -39,18 +46,42 @@ pub fn hit_test(rects: &[PaneRect], col: u16, row: u16) -> Option<PaneRect> {
         .copied()
 }
 
-/// Route a wheel event over a pane.
-pub fn route_wheel(proto: MouseProto, pane: &PaneRect, col: u16, row: u16, up: bool) -> WheelRoute {
+/// The tab bar label for a tab — shared with the renderer so click
+/// hit-testing lines up exactly with what's drawn.
+pub fn tab_label(index: usize, name: &str) -> String {
+    format!("  {} {}", index + 1, name)
+}
+
+/// Which tab (if any) sits at column `x` on the tab bar row.
+pub fn tab_at_x(names: &[String], x: u16) -> Option<usize> {
+    let mut cur = TABBAR_PREFIX.chars().count() as u16;
+    for (i, name) in names.iter().enumerate() {
+        let w = tab_label(i, name).chars().count() as u16;
+        if x >= cur && x < cur + w {
+            return Some(i);
+        }
+        cur += w;
+    }
+    None
+}
+
+/// Route a mouse event over a pane to either the inner app or roost's
+/// scrollback. Focus (a roost concern) is decided by the caller.
+pub fn route_mouse(proto: MouseProto, pane: &PaneRect, me: &MouseEvent) -> MouseAction {
     if pane.collapsed {
-        // A collapsed stack bar has no scrollable content.
-        return WheelRoute::Ignore;
+        // A collapsed stack bar has no scrollable content and no inner app.
+        return MouseAction::None;
     }
     match proto {
-        MouseProto::Sgr => {
-            let (cx, cy) = cell_in_pane(pane.rect, col, row);
-            WheelRoute::Forward(sgr_wheel(up, cx, cy))
-        }
-        MouseProto::None => WheelRoute::Scroll(if up { WHEEL_LINES } else { -WHEEL_LINES }),
+        MouseProto::Sgr => match encode_sgr(pane.rect, me) {
+            Some(bytes) => MouseAction::Forward(bytes),
+            None => MouseAction::None,
+        },
+        MouseProto::None => match me.kind {
+            MouseEventKind::ScrollUp => MouseAction::Scroll(WHEEL_LINES),
+            MouseEventKind::ScrollDown => MouseAction::Scroll(-WHEEL_LINES),
+            _ => MouseAction::None, // plain app: clicks are roost's (focus)
+        },
     }
 }
 
@@ -62,10 +93,48 @@ fn cell_in_pane(rect: Rect, col: u16, row: u16) -> (u16, u16) {
     (col.saturating_sub(inner_x).saturating_add(1), row.saturating_sub(inner_y).saturating_add(1))
 }
 
-/// SGR-encoded wheel event: `ESC [ < 64|65 ; x ; y M`.
-fn sgr_wheel(up: bool, cx: u16, cy: u16) -> Vec<u8> {
-    let btn = if up { 64 } else { 65 };
-    format!("\x1b[<{btn};{cx};{cy}M").into_bytes()
+fn button_code(b: MouseButton) -> u16 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn modifier_bits(m: KeyModifiers) -> u16 {
+    let mut b = 0;
+    if m.contains(KeyModifiers::SHIFT) {
+        b += 4;
+    }
+    if m.contains(KeyModifiers::ALT) {
+        b += 8;
+    }
+    if m.contains(KeyModifiers::CONTROL) {
+        b += 16;
+    }
+    b
+}
+
+/// Encode a mouse event in SGR form: `ESC [ < Cb ; x ; y (M|m)`.
+/// Bare motion (no button) is dropped — crossterm's capture doesn't request
+/// it, and forwarding it would just spam apps that didn't ask.
+fn encode_sgr(rect: Rect, me: &MouseEvent) -> Option<Vec<u8>> {
+    let (base, release) = match me.kind {
+        MouseEventKind::Down(b) => (button_code(b), false),
+        MouseEventKind::Up(b) => (button_code(b), false), // SGR marks release via trailing 'm'
+        MouseEventKind::Drag(b) => (button_code(b) + 32, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        MouseEventKind::Moved => return None,
+    };
+    let is_up = matches!(me.kind, MouseEventKind::Up(_));
+    let _ = release;
+    let cb = base + modifier_bits(me.modifiers);
+    let (cx, cy) = cell_in_pane(rect, me.column, me.row);
+    let terminator = if is_up { 'm' } else { 'M' };
+    Some(format!("\x1b[<{cb};{cx};{cy}{terminator}").into_bytes())
 }
 
 #[cfg(test)]
@@ -74,6 +143,10 @@ mod tests {
 
     fn pr(id: crate::core::layout::PaneId, x: u16, y: u16, w: u16, h: u16, collapsed: bool) -> PaneRect {
         PaneRect { id, rect: Rect::new(x, y, w, h), collapsed }
+    }
+
+    fn ev(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE }
     }
 
     #[test]
@@ -88,12 +161,21 @@ mod tests {
     fn wheel_over_plain_app_scrolls_roost_side() {
         let pane = pr(1, 0, 1, 50, 29, false);
         assert_eq!(
-            route_wheel(MouseProto::None, &pane, 5, 5, true),
-            WheelRoute::Scroll(WHEEL_LINES)
+            route_mouse(MouseProto::None, &pane, &ev(MouseEventKind::ScrollUp, 5, 5)),
+            MouseAction::Scroll(WHEEL_LINES)
         );
         assert_eq!(
-            route_wheel(MouseProto::None, &pane, 5, 5, false),
-            WheelRoute::Scroll(-WHEEL_LINES)
+            route_mouse(MouseProto::None, &pane, &ev(MouseEventKind::ScrollDown, 5, 5)),
+            MouseAction::Scroll(-WHEEL_LINES)
+        );
+    }
+
+    #[test]
+    fn click_on_plain_app_is_not_forwarded() {
+        let pane = pr(1, 0, 1, 50, 29, false);
+        assert_eq!(
+            route_mouse(MouseProto::None, &pane, &ev(MouseEventKind::Down(MouseButton::Left), 5, 5)),
+            MouseAction::None
         );
     }
 
@@ -101,29 +183,63 @@ mod tests {
     fn wheel_over_mouse_aware_app_forwards_sgr() {
         let pane = pr(1, 10, 5, 40, 20, false);
         // screen (12, 7) → inner cell (2, 2), 1-based
-        match route_wheel(MouseProto::Sgr, &pane, 12, 7, true) {
-            WheelRoute::Forward(bytes) => assert_eq!(bytes, b"\x1b[<64;2;2M"),
-            other => panic!("expected forward, got {other:?}"),
-        }
-        match route_wheel(MouseProto::Sgr, &pane, 12, 7, false) {
-            WheelRoute::Forward(bytes) => assert_eq!(bytes, b"\x1b[<65;2;2M"),
+        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::ScrollUp, 12, 7)) {
+            MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<64;2;2M"),
             other => panic!("expected forward, got {other:?}"),
         }
     }
 
     #[test]
-    fn collapsed_bars_ignore_wheel() {
-        let pane = pr(1, 0, 1, 50, 1, true);
-        assert_eq!(route_wheel(MouseProto::Sgr, &pane, 5, 1, true), WheelRoute::Ignore);
-    }
-
-    #[test]
-    fn coords_clamp_on_borders() {
-        let pane = pr(1, 0, 1, 50, 20, false);
-        // click exactly on the border still yields cell (1,1)
-        match route_wheel(MouseProto::Sgr, &pane, 0, 1, true) {
-            WheelRoute::Forward(bytes) => assert_eq!(bytes, b"\x1b[<64;1;1M"),
+    fn click_and_drag_forward_to_mouse_aware_app() {
+        let pane = pr(1, 10, 5, 40, 20, false);
+        // left press at inner (2,2)
+        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::Down(MouseButton::Left), 12, 7))
+        {
+            MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<0;2;2M"),
             other => panic!("{other:?}"),
         }
+        // release → trailing 'm'
+        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::Up(MouseButton::Left), 12, 7)) {
+            MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<0;2;2m"),
+            other => panic!("{other:?}"),
+        }
+        // left drag → button + motion flag (0 + 32)
+        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::Drag(MouseButton::Left), 13, 8))
+        {
+            MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<32;3;3M"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_click_with_modifiers_encodes_button_and_mods() {
+        let pane = pr(1, 0, 0, 40, 20, false);
+        let mut e = ev(MouseEventKind::Down(MouseButton::Right), 5, 5);
+        e.modifiers = KeyModifiers::CONTROL; // +16, right button = 2 → 18
+        // pane at (0,0): inner origin (1,1), so screen (5,5) → inner cell (5,5)
+        match route_mouse(MouseProto::Sgr, &pane, &e) {
+            MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<18;5;5M"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn collapsed_bars_forward_nothing() {
+        let pane = pr(1, 0, 1, 50, 1, true);
+        assert_eq!(
+            route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::ScrollUp, 5, 1)),
+            MouseAction::None
+        );
+    }
+
+    #[test]
+    fn tab_hit_testing_matches_labels() {
+        let names = vec!["main".to_string(), "api".to_string()];
+        // prefix " roost " is 7 cols → tab 0 "  1 main" starts at 7
+        assert_eq!(tab_at_x(&names, 3), None); // in the prefix
+        assert_eq!(tab_at_x(&names, 7), Some(0));
+        assert_eq!(tab_at_x(&names, 12), Some(0)); // within "  1 main" (width 8: cols 7..15)
+        assert_eq!(tab_at_x(&names, 15), Some(1)); // "  2 api" starts at 15
+        assert_eq!(tab_at_x(&names, 200), None); // past the end
     }
 }

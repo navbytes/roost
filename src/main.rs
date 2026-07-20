@@ -15,9 +15,7 @@ mod ports;
 mod ui;
 
 use anyhow::Result;
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
-};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -29,7 +27,7 @@ use crate::infra::pty::PtyPane;
 use crate::infra::store::FsStore;
 use crate::ports::{Notifier, PaneBackend, StateStore};
 use crate::ui::input::{self, InputResult};
-use crate::ui::mouse::{self, WheelRoute};
+use crate::ui::mouse::{self, MouseAction};
 
 fn main() -> Result<()> {
     // One roost per state dir: two instances sharing a workspace.json race
@@ -184,26 +182,39 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
     }
 }
 
-/// Route mouse events: wheel scrolls the hovered pane (forwarded to
-/// mouse-aware apps, roost-side scrollback otherwise); left click focuses.
+/// Route mouse events. Tab-bar clicks switch tabs. Over a pane: a left press
+/// focuses it; wheel and (for mouse-aware apps) clicks/drags are forwarded to
+/// the inner app, otherwise the wheel scrolls roost's own scrollback.
 fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEvent) {
-    let rects = app.rects();
-    let Some(pane) = mouse::hit_test(&rects, me.column, me.row) else { return };
-    match me.kind {
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let up = me.kind == MouseEventKind::ScrollUp;
-            let proto = app
-                .runtimes
-                .get(&pane.id)
-                .map(|rt| rt.mouse_proto())
-                .unwrap_or(ports::MouseProto::None);
-            match mouse::route_wheel(proto, &pane, me.column, me.row, up) {
-                WheelRoute::Forward(bytes) => app.wheel_forward(pane.id, &bytes),
-                WheelRoute::Scroll(delta) => app.wheel_scroll(pane.id, delta),
-                WheelRoute::Ignore => {}
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    // Tab bar (top row): click a tab to switch to it.
+    if me.row == 0 {
+        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
+            if let Some(i) = mouse::tab_at_x(&names, me.column) {
+                app.apply(input::Action::GoToTab(i));
             }
         }
-        MouseEventKind::Down(crossterm::event::MouseButton::Left) => app.on_click(pane.id),
-        _ => {}
+        return;
+    }
+
+    let rects = app.rects();
+    let Some(pane) = mouse::hit_test(&rects, me.column, me.row) else { return };
+
+    // A left press focuses the pane under the cursor (expands stack members).
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+        app.on_click(pane.id);
+    }
+
+    let proto = app
+        .runtimes
+        .get(&pane.id)
+        .map(|rt| rt.mouse_proto())
+        .unwrap_or(ports::MouseProto::None);
+    match mouse::route_mouse(proto, &pane, &me) {
+        MouseAction::Forward(bytes) => app.forward_mouse(pane.id, &bytes),
+        MouseAction::Scroll(delta) => app.wheel_scroll(pane.id, delta),
+        MouseAction::None => {}
     }
 }

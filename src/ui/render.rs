@@ -135,7 +135,7 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect) {
 
 fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     let mut spans: Vec<Span> = vec![Span::styled(
-        " roost ",
+        crate::ui::mouse::TABBAR_PREFIX,
         Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
     )];
     for (i, tab) in app.ws.tabs.iter().enumerate() {
@@ -144,7 +144,8 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        spans.push(Span::styled(format!("  {} {}", i + 1, tab.name), style));
+        // Shared label with the mouse hit-tester so clicks land on the right tab.
+        spans.push(Span::styled(crate::ui::mouse::tab_label(i, &tab.name), style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

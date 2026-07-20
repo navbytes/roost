@@ -63,8 +63,11 @@ Everything else passes through to the focused pane untouched.
 **Mouse**: the wheel scrolls the pane under the cursor — forwarded to the
 inner app when it has mouse reporting enabled (pi/claude TUIs, vim, less),
 otherwise it scrolls roost's own scrollback for that pane; typing snaps back
-to the live tail. Left click focuses a pane (and expands collapsed stack
-members).
+to the live tail. A left click focuses a pane (and expands collapsed stack
+members). Over a mouse-aware app, clicks and drags are forwarded too, so you
+can interact with an agent's TUI directly (menus, buttons, selection). Click
+a tab in the tab bar to switch to it. (On a plain shell pane, use Shift+drag
+for your terminal's native text selection, since roost holds mouse capture.)
 
 In a **dead pane** (process exited or spawn failed): `Enter` relaunches /
 resumes, `f` starts a fresh session (drops the stored session id).
