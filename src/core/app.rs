@@ -1,5 +1,7 @@
-//! App state + actions: the glue between workspace (precious) and pane
-//! runtimes (disposable).
+//! App core: orchestrates workspace (precious) and pane backends
+//! (disposable) purely through ports — no PTY, filesystem, or terminal
+//! specifics here. Generic over `PaneBackend` so every behavior below is
+//! unit-tested with fakes (see tests at the bottom).
 
 use anyhow::Result;
 use ratatui::layout::{Rect, Size};
@@ -8,14 +10,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::adapters::Registry;
-use crate::event::AppEvent;
-use crate::input::Action;
-use crate::pane::PaneRuntime;
-use crate::status::AgentStatus;
-use crate::workspace::{
-    self, compute_rects, LayoutNode, PaneId, PaneRect, PaneSpec, SplitDir, Tab, Workspace,
-};
+use crate::agents::Registry;
+use crate::core::event::AppEvent;
+use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
+use crate::core::status::AgentStatus;
+use crate::core::workspace::{PaneSpec, Tab, Workspace};
+use crate::ports::{PaneBackend, StateStore};
+use crate::ui::input::Action;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -30,15 +31,16 @@ pub enum Mode {
     Scroll { offset: usize },
 }
 
-pub struct App {
+pub struct App<B: PaneBackend> {
     pub ws: Workspace,
-    pub runtimes: HashMap<PaneId, PaneRuntime>,
+    pub runtimes: HashMap<PaneId, B>,
     pub registry: Registry,
     pub focused: PaneId,
     pub quit: bool,
     /// Spawn errors for panes whose process never started.
     pub dead: HashMap<PaneId, String>,
     pub mode: Mode,
+    store: Box<dyn StateStore>,
     tx: Sender<AppEvent>,
     term_size: Size,
     /// Freshly launched agent panes we still owe a session id.
@@ -47,18 +49,19 @@ pub struct App {
     sock_path: Option<PathBuf>,
 }
 
-impl App {
+impl<B: PaneBackend> App<B> {
     /// Restore the workspace (design doc §5): rebuild the tree and spawn
     /// every pane via its adapter — resume when a session id is known,
     /// fresh launch otherwise. A failed spawn degrades to a dead pane, it
     /// never aborts restore.
     pub fn new(
+        ws: Workspace,
         registry: Registry,
+        store: Box<dyn StateStore>,
         tx: Sender<AppEvent>,
         term_size: Size,
         sock_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let ws = Workspace::load_or_default()?;
         let mut app = Self {
             focused: 0,
             ws,
@@ -67,6 +70,7 @@ impl App {
             quit: false,
             dead: HashMap::new(),
             mode: Mode::Normal,
+            store,
             tx,
             term_size,
             pending_detect: HashMap::new(),
@@ -78,24 +82,28 @@ impl App {
         Ok(app)
     }
 
+    fn save(&self) {
+        let _ = self.store.save(&self.ws);
+    }
+
     fn body_area(&self) -> Rect {
         Rect::new(0, 1, self.term_size.width, self.term_size.height.saturating_sub(1))
     }
 
-    fn rects(&self) -> Vec<PaneRect> {
+    /// Pane rectangles of the active tab (border-inclusive).
+    pub fn rects(&self) -> Vec<PaneRect> {
         let mut v = Vec::new();
-        compute_rects(&self.ws.active_tab().layout, self.body_area(), &mut v);
+        layout::compute_rects(&self.ws.active_tab().layout, self.body_area(), &mut v);
         v
     }
 
     pub fn pane_order(&self) -> Vec<PaneId> {
         let mut v = Vec::new();
-        workspace::pane_order(&self.ws.active_tab().layout, &mut v);
+        layout::pane_order(&self.ws.active_tab().layout, &mut v);
         v
     }
 
     /// Spawn runtimes for every pane in the active tab that doesn't have one.
-    /// (Scaffold spawns per-tab lazily; all panes in a tab spawn eagerly.)
     pub fn spawn_active_tab(&mut self) {
         for pr in self.rects() {
             if self.runtimes.contains_key(&pr.id) {
@@ -113,12 +121,12 @@ impl App {
             cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
         }
         let (rows, cols) = inner_dims(rect);
-        match PaneRuntime::spawn(id, &cmd, rows, cols, self.tx.clone()) {
+        match B::spawn(id, &cmd, rows, cols, self.tx.clone()) {
             Ok(rt) => {
                 self.runtimes.insert(id, rt);
                 self.dead.remove(&id);
                 // Owe this pane a session id? Watch for one (socket reports
-                // it exactly; the filesystem scan below is the fallback).
+                // it exactly; the filesystem scan in tick() is the fallback).
                 if spec.session.is_none() && adapter.session_root(&spec.cwd).is_some() {
                     self.pending_detect.insert(id, SystemTime::now());
                 }
@@ -151,7 +159,7 @@ impl App {
         }
     }
 
-    fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
+    pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
         self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
     }
 
@@ -163,7 +171,21 @@ impl App {
         if let Some(spec) = self.find_spec_mut(id) {
             spec.session = Some(session);
             self.pending_detect.remove(&id);
-            let _ = self.ws.save();
+            self.save();
+        }
+    }
+
+    // -- event handling ----------------------------------------------------
+
+    pub fn on_pty_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.process_output(bytes);
+        }
+    }
+
+    pub fn on_pty_exit(&mut self, id: PaneId) {
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.on_exit();
         }
     }
 
@@ -175,9 +197,9 @@ impl App {
     /// Exact status from an agent-side extension. Returns a notification
     /// message when a *non-focused* pane starts needing the user.
     pub fn on_status(&mut self, id: PaneId, status: AgentStatus) -> Option<String> {
-        let prev = self.runtimes.get(&id).map(|rt| rt.status.current());
+        let prev = self.runtimes.get(&id).map(|rt| rt.status());
         if let Some(rt) = self.runtimes.get_mut(&id) {
-            rt.status.set_extension_status(status);
+            rt.set_extension_status(status);
         }
         let became_needy = matches!(status, AgentStatus::NeedsInput | AgentStatus::Waiting)
             && prev == Some(AgentStatus::Working);
@@ -192,6 +214,57 @@ impl App {
         }
     }
 
+    pub fn forward_bytes(&mut self, bytes: &[u8]) {
+        let id = self.focused;
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.write_input(bytes);
+        }
+    }
+
+    pub fn on_resize(&mut self, size: Size) {
+        self.term_size = size;
+        self.relayout();
+    }
+
+    /// Recompute rects and push new sizes to every pane backend.
+    pub fn relayout(&mut self) {
+        for pr in self.rects() {
+            if pr.collapsed {
+                continue;
+            }
+            let (rows, cols) = inner_dims(pr.rect);
+            if let Some(rt) = self.runtimes.get_mut(&pr.id) {
+                rt.resize(rows, cols);
+            }
+        }
+    }
+
+    // -- mouse -------------------------------------------------------------
+
+    /// Left click: focus the pane under the cursor (expanding stack members).
+    pub fn on_click(&mut self, id: PaneId) {
+        self.focused = id;
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
+        self.relayout();
+        self.save();
+    }
+
+    /// Forward an encoded mouse event to a mouse-aware pane app.
+    pub fn wheel_forward(&mut self, id: PaneId, bytes: &[u8]) {
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            // Not write_input(): a forwarded wheel event must not snap the
+            // pane's scrollback to the live tail.
+            rt.write_input_raw(bytes);
+        }
+    }
+
+    /// Scroll roost's own scrollback for a pane (mouse-unaware app).
+    pub fn wheel_scroll(&mut self, id: PaneId, delta: i32) {
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.scroll_by(delta);
+        }
+    }
+
     // -- dead panes --------------------------------------------------------
 
     /// True when the focused pane has no live process (spawn failed or the
@@ -199,7 +272,7 @@ impl App {
     pub fn focused_dead(&self) -> bool {
         match self.runtimes.get(&self.focused) {
             None => true,
-            Some(rt) => rt.status.current() == AgentStatus::Exited,
+            Some(rt) => rt.status() == AgentStatus::Exited,
         }
     }
 
@@ -220,46 +293,7 @@ impl App {
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
-        let _ = self.ws.save();
-    }
-
-    // -- event handling ----------------------------------------------------
-
-    pub fn on_pty_output(&mut self, id: PaneId, bytes: &[u8]) {
-        if let Some(rt) = self.runtimes.get_mut(&id) {
-            rt.process_output(bytes);
-        }
-    }
-
-    pub fn on_pty_exit(&mut self, id: PaneId) {
-        if let Some(rt) = self.runtimes.get_mut(&id) {
-            rt.status.on_exit();
-        }
-    }
-
-    pub fn forward_bytes(&mut self, bytes: &[u8]) {
-        let id = self.focused;
-        if let Some(rt) = self.runtimes.get_mut(&id) {
-            rt.write_input(bytes);
-        }
-    }
-
-    pub fn on_resize(&mut self, size: Size) {
-        self.term_size = size;
-        self.relayout();
-    }
-
-    /// Recompute rects and push new sizes to every PTY.
-    pub fn relayout(&mut self) {
-        for pr in self.rects() {
-            if pr.collapsed {
-                continue;
-            }
-            let (rows, cols) = inner_dims(pr.rect);
-            if let Some(rt) = self.runtimes.get_mut(&pr.id) {
-                rt.resize(rows, cols);
-            }
-        }
+        self.save();
     }
 
     // -- actions -----------------------------------------------------------
@@ -267,7 +301,7 @@ impl App {
     pub fn apply(&mut self, action: Action) {
         match action {
             Action::Quit => self.quit = true,
-            Action::NewPane => self.new_pane(),
+            Action::NewPane => self.new_pane_with("shell"),
             Action::ClosePane => self.close_pane(),
             Action::FocusNext => self.cycle_focus(1),
             Action::FocusPrev => self.cycle_focus(-1),
@@ -275,13 +309,13 @@ impl App {
             Action::GoToTab(i) => self.go_to_tab(i),
             Action::ToggleStack => {
                 let focused = self.focused;
-                workspace::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
+                layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
             }
             Action::Resize { horizontal, grow } => {
                 let delta = if grow { 0.04 } else { -0.04 };
                 let axis = if horizontal { SplitDir::Vertical } else { SplitDir::Horizontal };
                 let focused = self.focused;
-                workspace::resize_pane(&mut self.ws.active_tab_mut().layout, focused, axis, delta);
+                layout::resize_pane(&mut self.ws.active_tab_mut().layout, focused, axis, delta);
             }
             Action::RenamePane => {
                 let current = self
@@ -294,8 +328,7 @@ impl App {
             Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
         }
         self.relayout();
-        // Debounced in the design; scaffold saves eagerly on every mutation.
-        let _ = self.ws.save();
+        self.save();
     }
 
     fn cycle_focus(&mut self, dir: i64) {
@@ -306,12 +339,7 @@ impl App {
         let cur = order.iter().position(|&p| p == self.focused).unwrap_or(0) as i64;
         let next = (cur + dir).rem_euclid(order.len() as i64) as usize;
         self.focused = order[next];
-        // Focusing a collapsed stack member expands it.
-        expand_in_stacks(&mut self.ws.active_tab_mut().layout, self.focused);
-    }
-
-    fn new_pane(&mut self) {
-        self.new_pane_with("shell");
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, self.focused);
     }
 
     fn new_pane_with(&mut self, adapter: &str) {
@@ -342,11 +370,10 @@ impl App {
         let focused = self.focused;
         let tab = self.ws.active_tab_mut();
         tab.panes.insert(id, spec.clone());
-        if !workspace::split_pane(&mut tab.layout, focused, id, dir) {
+        if !layout::split_pane(&mut tab.layout, focused, id, dir) {
             tab.layout = LayoutNode::Pane(id); // empty tab fallback
         }
         self.focused = id;
-        // Spawn with a placeholder size; relayout() in apply() fixes it up.
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
@@ -359,7 +386,7 @@ impl App {
         }
         let tab = self.ws.active_tab_mut();
         tab.panes.remove(&id);
-        let empty = workspace::remove_pane(&mut tab.layout, id);
+        let empty = layout::remove_pane(&mut tab.layout, id);
         if empty {
             if self.ws.tabs.len() > 1 {
                 let i = self.ws.active_tab;
@@ -397,6 +424,8 @@ impl App {
         }
     }
 
+    // -- modes -------------------------------------------------------------
+
     /// Keys while in a non-Normal mode. Returns true when consumed.
     pub fn handle_mode_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::KeyCode;
@@ -422,7 +451,7 @@ impl App {
                         if let Some(spec) = self.find_spec_mut(focused) {
                             spec.title = if title.is_empty() { None } else { Some(title) };
                         }
-                        let _ = self.ws.save();
+                        self.save();
                         self.mode = Mode::Normal;
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
@@ -443,7 +472,7 @@ impl App {
                         self.mode = Mode::Normal;
                         self.new_pane_with(adapter);
                         self.relayout();
-                        let _ = self.ws.save();
+                        self.save();
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
@@ -465,12 +494,12 @@ impl App {
                     Some(n) => {
                         *offset = n;
                         if let Some(rt) = self.runtimes.get_mut(&focused) {
-                            rt.parser.set_scrollback(n);
+                            rt.set_scrollback(n);
                         }
                     }
                     None => {
                         if let Some(rt) = self.runtimes.get_mut(&focused) {
-                            rt.parser.set_scrollback(0);
+                            rt.set_scrollback(0);
                         }
                         self.mode = Mode::Normal;
                     }
@@ -482,7 +511,7 @@ impl App {
 
     /// Clean shutdown: save workspace, kill children (their sessions live on).
     pub fn shutdown(&mut self) {
-        let _ = self.ws.save();
+        self.save();
         for rt in self.runtimes.values_mut() {
             rt.kill();
         }
@@ -493,19 +522,158 @@ fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
 }
 
-/// If `target` is a collapsed member of any stack, expand it.
-fn expand_in_stacks(node: &mut LayoutNode, target: PaneId) {
-    match node {
-        LayoutNode::Pane(_) => {}
-        LayoutNode::Stack { children, expanded } => {
-            if let Some(pos) = children.iter().position(|&c| c == target) {
-                *expanded = pos;
-            }
+// ---------------------------------------------------------------------------
+// Unit tests — the whole app core runs against fakes, no PTYs involved.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents;
+    use crate::ports::fakes::{FakePane, MemStore};
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    fn mk_app(ws: Workspace) -> (App<FakePane>, MemStore) {
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::channel();
+        let app = App::<FakePane>::new(
+            ws,
+            agents::registry(),
+            Box::new(store.clone()),
+            tx,
+            Size::new(100, 30),
+            None,
+        )
+        .unwrap();
+        (app, store)
+    }
+
+    fn shell_ws() -> Workspace {
+        Workspace::default_in(PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn new_pane_splits_focuses_and_persists() {
+        let (mut app, store) = mk_app(shell_ws());
+        assert_eq!(app.focused, 1);
+        app.apply(Action::NewPane);
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.runtimes.len(), 2);
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert_eq!(saved.tabs[0].panes.len(), 2);
+    }
+
+    #[test]
+    fn close_last_pane_quits() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ClosePane);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn close_pane_returns_focus_to_remaining() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ClosePane);
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.runtimes.len(), 1);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn session_reported_by_socket_is_persisted() {
+        let (mut app, store) = mk_app(shell_ws());
+        app.on_session(1, "sess-42".into());
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert_eq!(saved.tabs[0].panes[&1].session.as_deref(), Some("sess-42"));
+    }
+
+    #[test]
+    fn resume_command_uses_saved_session() {
+        let mut ws = shell_ws();
+        let spec = ws.tabs[0].panes.get_mut(&1).unwrap();
+        spec.adapter = "pi".into();
+        spec.session = Some("abc".into());
+        let (app, _) = mk_app(ws);
+        let rt = app.runtimes.get(&1).unwrap();
+        assert_eq!(rt.cmd.program, "pi");
+        assert_eq!(rt.cmd.args, vec!["--session", "abc"]);
+    }
+
+    #[test]
+    fn respawn_fresh_drops_session() {
+        let mut ws = shell_ws();
+        ws.tabs[0].panes.get_mut(&1).unwrap().session = Some("old".into());
+        let (mut app, store) = mk_app(ws);
+        app.on_pty_exit(1);
+        assert!(app.focused_dead());
+        app.respawn_focused(true);
+        assert!(!app.focused_dead());
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert!(saved.tabs[0].panes[&1].session.is_none());
+    }
+
+    #[test]
+    fn notification_only_for_unfocused_working_to_waiting() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2
+        app.on_status(1, AgentStatus::Working);
+        assert!(app.on_status(1, AgentStatus::Waiting).is_some());
+        // Focused pane never notifies.
+        app.on_status(2, AgentStatus::Working);
+        assert!(app.on_status(2, AgentStatus::NeedsInput).is_none());
+        // Idle → waiting (no working phase) doesn't notify.
+        assert!(app.on_status(1, AgentStatus::Waiting).is_none());
+    }
+
+    #[test]
+    fn toggle_stack_then_click_expands_member() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleStack);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
+        app.on_click(1);
+        assert_eq!(app.focused, 1);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { expanded: 0, .. }));
+    }
+
+    #[test]
+    fn wheel_scroll_reaches_backend_and_typing_resets() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.wheel_scroll(1, 3);
+        app.wheel_scroll(1, 3);
+        assert_eq!(app.runtimes[&1].scrollback, 6);
+        app.wheel_scroll(1, -10); // clamped at 0
+        assert_eq!(app.runtimes[&1].scrollback, 0);
+        app.wheel_scroll(1, 5);
+        app.forward_bytes(b"x"); // typing snaps to live tail
+        assert_eq!(app.runtimes[&1].scrollback, 0);
+    }
+
+    #[test]
+    fn quick_launch_picker_spawns_selected_adapter() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::QuickLaunch);
+        assert!(matches!(app.mode, Mode::Picker { .. }));
+        // pick item 1 ("claude")
+        app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        let id = app.focused;
+        assert_eq!(app.runtimes[&id].cmd.program, "claude");
+    }
+
+    #[test]
+    fn rename_sets_title() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, store) = mk_app(shell_ws());
+        app.apply(Action::RenamePane);
+        for c in "build".chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
         }
-        LayoutNode::Split { children, .. } => {
-            for c in children {
-                expand_in_stacks(c, target);
-            }
-        }
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert_eq!(saved.tabs[0].panes[&1].title.as_deref(), Some("build"));
     }
 }

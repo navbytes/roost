@@ -6,11 +6,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Mode, PICKER_ITEMS};
-use crate::status::AgentStatus;
-use crate::workspace::{compute_rects, PaneRect};
+use crate::core::app::{App, Mode, PICKER_ITEMS};
+use crate::core::status::AgentStatus;
+use crate::core::layout::{compute_rects, PaneRect};
+use crate::ports::PaneBackend;
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     let area = f.area();
     if area.height < 2 {
         return;
@@ -41,7 +42,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-fn draw_mode_overlay(f: &mut Frame, app: &App, body: Rect) {
+fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect) {
     match &app.mode {
         Mode::Normal | Mode::Scroll { .. } => {}
         Mode::Rename { buffer } => {
@@ -79,7 +80,7 @@ fn draw_mode_overlay(f: &mut Frame, app: &App, body: Rect) {
     }
 }
 
-fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     let mut spans: Vec<Span> = vec![Span::styled(
         " roost ",
         Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -105,14 +106,14 @@ fn status_color(s: AgentStatus) -> Color {
     }
 }
 
-fn draw_pane(f: &mut Frame, app: &mut App, pr: PaneRect) {
+fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
     let focused = app.focused == pr.id;
     let (title, status) = {
         let spec = app.ws.active_tab().panes.get(&pr.id);
         let status = app
             .runtimes
             .get(&pr.id)
-            .map(|rt| rt.status.current())
+            .map(|rt| rt.status())
             .unwrap_or(AgentStatus::Exited);
         let name = spec
             .and_then(|s| s.title.clone())
@@ -146,10 +147,10 @@ fn draw_pane(f: &mut Frame, app: &mut App, pr: PaneRect) {
     let inner = block.inner(pr.rect);
     f.render_widget(block, pr.rect);
 
-    if let Some(rt) = app.runtimes.get(&pr.id) {
-        blit_screen(f, rt.parser.screen(), inner);
+    if let Some(screen) = app.runtimes.get(&pr.id).and_then(|rt| rt.screen()) {
+        blit_screen(f, screen, inner);
         if focused && status != AgentStatus::Exited {
-            let (cr, cc) = rt.parser.screen().cursor_position();
+            let (cr, cc) = screen.cursor_position();
             let x = inner.x.saturating_add(cc);
             let y = inner.y.saturating_add(cr);
             if x < inner.x + inner.width && y < inner.y + inner.height {

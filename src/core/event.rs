@@ -1,8 +1,8 @@
 //! Events flowing into the main loop from PTY reader threads (and, in M3,
 //! from the status socket listener).
 
-use crate::status::AgentStatus;
-use crate::workspace::PaneId;
+use crate::core::status::AgentStatus;
+use crate::core::workspace::PaneId;
 
 pub enum AppEvent {
     /// Raw bytes from a pane's PTY.

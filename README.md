@@ -37,6 +37,12 @@ change, atomic writes). Delete it to start clean.
 
 Everything else passes through to the focused pane untouched.
 
+**Mouse**: the wheel scrolls the pane under the cursor — forwarded to the
+inner app when it has mouse reporting enabled (pi/claude TUIs, vim, less),
+otherwise it scrolls roost's own scrollback for that pane; typing snaps back
+to the live tail. Left click focuses a pane (and expands collapsed stack
+members).
+
 In a **dead pane** (process exited or spawn failed): `Enter` relaunches /
 resumes, `f` starts a fresh session (drops the stored session id).
 
@@ -69,15 +75,40 @@ Status arrives two ways:
 New adapters implement the `AgentAdapter` trait in `src/adapters/` (five
 small methods).
 
-## Layout
+## Architecture (ports & adapters)
 
-- `src/workspace.rs` — layout tree (splits/stacks/tabs), persistence, geometry, layout ops
-- `src/pane.rs` — PTY + vt100 runtime per pane (the disposable state)
-- `src/adapters/` — `AgentAdapter` trait; `pi`, `claude`, `shell`
-- `src/sock.rs` — status socket listener (ndjson over unix socket)
-- `src/status.rs` — status model: extension signals + output heuristics
-- `src/app.rs` — actions, modes (rename/picker/scroll), session detection
-- `src/render.rs`, `src/input.rs`, `src/main.rs` — TUI core
+The core never touches a PTY, socket, or the filesystem — it talks to traits
+in `src/ports.rs`, and every core behavior is unit-tested against in-memory
+fakes. Real I/O lives at the edges:
+
+```
+src/
+  core/        the domain — pure, fully unit-tested
+    layout.rs    split/stack/pane tree, ops, geometry
+    workspace.rs tabs + (adapter, cwd, session-id) per pane
+    status.rs    Working/NeedsInput/Waiting/Idle/Exited model
+    app.rs       orchestration: App<B: PaneBackend>, actions, modes
+    event.rs     event vocabulary (PTY output, exit, socket events)
+  ports.rs     trait boundaries: PaneBackend, StateStore, Notifier
+               (+ fakes for tests: FakePane, MemStore, RecordingNotifier)
+  agents/      domain adapters per CLI: pi, claude, shell (AgentAdapter)
+  infra/       production port implementations — all real I/O
+    pty.rs       PaneBackend via portable-pty + vt100
+    store.rs     StateStore via atomic workspace.json writes
+    sock.rs      status socket listener (ndjson over unix socket)
+    notify.rs    Notifier via terminal bell / macOS osascript
+  ui/          presentation
+    render.rs    ratatui drawing (generic over PaneBackend)
+    input.rs     key → Action/bytes translation (pure)
+    mouse.rs     hit-testing + wheel routing decisions (pure)
+  main.rs      composition root: wires infra into core, runs the loop
+vendor/vt100/  vendored vt100 with a scrollback-underflow fix (see below)
+```
+
+`vendor/vt100`: upstream vt100 0.15.2 panics (`rows_len - scrollback_offset`
+underflow) when scrolled back further than one screen height; the vendored
+copy fixes `visible_rows()` with a saturating subtraction, which also makes
+deep-history scrolling render correctly.
 
 ## Roadmap status
 

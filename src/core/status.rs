@@ -76,3 +76,23 @@ impl StatusTracker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_status_wins_and_exit_is_sticky() {
+        let mut t = StatusTracker::new();
+        assert_eq!(t.current(), AgentStatus::Idle);
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::Working);
+        t.set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(t.current(), AgentStatus::NeedsInput);
+        t.set_extension_status(AgentStatus::Exited);
+        t.set_extension_status(AgentStatus::Working);
+        // exited is sticky even if a late event arrives
+        t.on_exit();
+        assert_eq!(t.current(), AgentStatus::Exited);
+    }
+}

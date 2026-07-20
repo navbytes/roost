@@ -13,7 +13,7 @@ portable-pty = "0.8"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-vt100 = "0.15"
+vt100 = { path = "vendor/vt100" }
 
 [profile.release]
 lto = true

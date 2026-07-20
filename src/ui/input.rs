@@ -94,3 +94,65 @@ fn encode_key(key: KeyEvent) -> InputResult {
     };
     InputResult::Forward(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+    fn alt_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::SHIFT)
+    }
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn alt_chords_map_to_actions() {
+        assert!(matches!(translate(alt(KeyCode::Char('q'))), InputResult::Action(Action::Quit)));
+        assert!(matches!(translate(alt(KeyCode::Char('n'))), InputResult::Action(Action::NewPane)));
+        assert!(matches!(translate(alt(KeyCode::Char('s'))), InputResult::Action(Action::ToggleStack)));
+        assert!(matches!(translate(alt(KeyCode::Enter)), InputResult::Action(Action::QuickLaunch)));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('3'))),
+            InputResult::Action(Action::GoToTab(2))
+        ));
+    }
+
+    #[test]
+    fn alt_shift_arrows_resize_not_focus() {
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Right)),
+            InputResult::Action(Action::Resize { horizontal: true, grow: true })
+        ));
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Up)),
+            InputResult::Action(Action::Resize { horizontal: false, grow: false })
+        ));
+        // plain Alt+arrow still moves focus
+        assert!(matches!(translate(alt(KeyCode::Right)), InputResult::Action(Action::FocusNext)));
+    }
+
+    #[test]
+    fn plain_keys_encode_as_terminal_bytes() {
+        match translate(plain(KeyCode::Char('a'))) {
+            InputResult::Forward(b) => assert_eq!(b, b"a"),
+            _ => panic!(),
+        }
+        match translate(plain(KeyCode::Enter)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\r"),
+            _ => panic!(),
+        }
+        match translate(plain(KeyCode::Up)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b[A"),
+            _ => panic!(),
+        }
+        match translate(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            InputResult::Forward(b) => assert_eq!(b, vec![0x03]),
+            _ => panic!(),
+        }
+    }
+}

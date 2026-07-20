@@ -2,44 +2,65 @@
 //!
 //! No daemon: quitting kills the agent processes; the (layout × session-id)
 //! mapping persists, and every pane resumes its exact session on relaunch.
-//! See DESIGN.md for the full picture.
+//!
+//! This file is the composition root: it wires the core (`core::app`) to the
+//! production adapters (`infra::*`) and runs the event loop. Everything
+//! below `run()` is thin glue; behavior lives in the core and is unit-tested
+//! there against fakes.
 
-mod adapters;
-mod app;
-mod event;
-mod input;
-mod pane;
-mod render;
-mod sock;
-mod status;
-mod workspace;
+mod agents;
+mod core;
+mod infra;
+mod ports;
+mod ui;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+};
+use crossterm::execute;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use app::App;
-use event::AppEvent;
-use input::InputResult;
+use crate::core::app::App;
+use crate::core::event::AppEvent;
+use crate::infra::notify::TermNotifier;
+use crate::infra::pty::PtyPane;
+use crate::infra::store::FsStore;
+use crate::ports::{Notifier, PaneBackend, StateStore};
+use crate::ui::input::{self, InputResult};
+use crate::ui::mouse::{self, WheelRoute};
 
 fn main() -> Result<()> {
     let mut terminal = ratatui::init();
+    // Without mouse capture the hosting terminal consumes wheel events and
+    // scrolls its own buffer — content *outside* the TUI. Capture them.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let (tx, rx) = mpsc::channel::<AppEvent>();
-    // Status socket: agent extensions/hooks report exact status + session ids.
-    let sock_path = sock::spawn_listener(tx.clone()).ok();
+
+    // Wire production adapters to the core's ports.
+    let store = FsStore::default();
+    let ws = store.load()?.unwrap_or_else(|| {
+        core::workspace::Workspace::default_in(
+            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+        )
+    });
+    let sock_path = infra::sock::spawn_listener(tx.clone()).ok();
+    let mut notifier = TermNotifier;
     let size = terminal.size()?;
-    let mut app = App::new(adapters::registry(), tx, size, sock_path)?;
+    let mut app: App<PtyPane> =
+        App::new(ws, agents::registry(), Box::new(store), tx, size, sock_path)?;
     app.relayout();
 
     loop {
-        terminal.draw(|f| render::draw(f, &mut app))?;
+        terminal.draw(|f| ui::render::draw(f, &mut app))?;
 
         // Terminal input (with a frame-rate timeout)...
         if crossterm::event::poll(Duration::from_millis(33))? {
@@ -62,6 +83,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         InputResult::Ignore => {}
                     }
                 }
+                Event::Mouse(me) => handle_mouse(&mut app, me),
                 Event::Resize(w, h) => app.on_resize(ratatui::layout::Size::new(w, h)),
                 Event::Paste(s) => app.forward_bytes(s.as_bytes()),
                 _ => {}
@@ -76,7 +98,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 AppEvent::Session(id, s) => app.on_session(id, s),
                 AppEvent::Status(id, s) => {
                     if let Some(msg) = app.on_status(id, s) {
-                        notify(&msg);
+                        notifier.notify(&msg);
                     }
                 }
             }
@@ -94,20 +116,26 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
-/// "A pane needs you": terminal bell always; native notification on macOS.
-fn notify(msg: &str) {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x07");
-    let _ = out.flush();
-    #[cfg(target_os = "macos")]
-    {
-        let script = format!(
-            "display notification \"{}\" with title \"roost\"",
-            msg.replace('\\', "").replace('"', "'")
-        );
-        let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
+/// Route mouse events: wheel scrolls the hovered pane (forwarded to
+/// mouse-aware apps, roost-side scrollback otherwise); left click focuses.
+fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEvent) {
+    let rects = app.rects();
+    let Some(pane) = mouse::hit_test(&rects, me.column, me.row) else { return };
+    match me.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = me.kind == MouseEventKind::ScrollUp;
+            let proto = app
+                .runtimes
+                .get(&pane.id)
+                .map(|rt| rt.mouse_proto())
+                .unwrap_or(ports::MouseProto::None);
+            match mouse::route_wheel(proto, &pane, me.column, me.row, up) {
+                WheelRoute::Forward(bytes) => app.wheel_forward(pane.id, &bytes),
+                WheelRoute::Scroll(delta) => app.wheel_scroll(pane.id, delta),
+                WheelRoute::Ignore => {}
+            }
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => app.on_click(pane.id),
+        _ => {}
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = msg;
 }

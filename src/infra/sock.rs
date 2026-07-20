@@ -14,9 +14,9 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-use crate::event::AppEvent;
-use crate::status::AgentStatus;
-use crate::workspace::PaneId;
+use crate::core::event::AppEvent;
+use crate::core::status::AgentStatus;
+use crate::core::workspace::PaneId;
 
 pub fn socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")

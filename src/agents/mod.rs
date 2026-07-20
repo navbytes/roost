@@ -8,7 +8,7 @@ pub mod claude;
 pub mod pi;
 pub mod shell;
 
-use crate::workspace::PaneSpec;
+use crate::core::workspace::PaneSpec;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
