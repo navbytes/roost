@@ -143,10 +143,34 @@ impl<B: PaneBackend> App<B> {
 
     fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
         let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
-        let mut cmd = adapter.command_for(spec);
+
+        // Validate a stored session id: if the CLI can no longer resolve it
+        // (it handed out the id but never persisted a resumable session, or
+        // the user deleted it), launch fresh instead of resuming into a dead
+        // pane. All adapter queries happen here, before we borrow self mut.
+        let session = match &spec.session {
+            Some(s) if adapter.session_exists(&spec.cwd, s) => Some(s.clone()),
+            _ => None,
+        };
+        let stale = spec.session.is_some() && session.is_none();
+        let mut cmd = match &session {
+            Some(s) => adapter.resume(&spec.cwd, s),
+            None => adapter.launch(&spec.cwd),
+        };
         if let Some(sock) = &self.sock_path {
             cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
         }
+        let wants_detect = session.is_none() && adapter.session_root(&spec.cwd).is_some();
+        // adapter / registry borrow ends here.
+
+        if stale {
+            // Persist the correction so the dead id isn't retried next launch.
+            if let Some(s) = self.find_spec_mut(id) {
+                s.session = None;
+            }
+            self.save();
+        }
+
         let (rows, cols) = inner_dims(rect);
         match B::spawn(id, &cmd, rows, cols, self.tx.clone()) {
             Ok(rt) => {
@@ -154,7 +178,7 @@ impl<B: PaneBackend> App<B> {
                 self.dead.remove(&id);
                 // Owe this pane a session id? Watch for one (socket reports
                 // it exactly; the filesystem scan in tick() is the fallback).
-                if spec.session.is_none() && adapter.session_root(&spec.cwd).is_some() {
+                if wants_detect {
                     self.pending_detect.insert(id, SystemTime::now());
                 }
             }
@@ -655,15 +679,21 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_uses_saved_session() {
+    fn stale_session_falls_back_to_fresh_launch() {
+        // A pi pane whose stored session id has no backing file on disk must
+        // launch fresh instead of resuming into a dead pane, and the dead id
+        // must be cleared from the workspace (regression: two concurrent pi
+        // panes where one session was never persisted).
         let mut ws = shell_ws();
         let spec = ws.tabs[0].panes.get_mut(&1).unwrap();
         spec.adapter = "pi".into();
-        spec.session = Some("abc".into());
-        let (app, _) = mk_app(ws);
+        spec.session = Some("roost-test-nonexistent-uuid-zzzz".into());
+        let (app, store) = mk_app(ws);
         let rt = app.runtimes.get(&1).unwrap();
         assert_eq!(rt.cmd.program, "pi");
-        assert_eq!(rt.cmd.args, vec!["--session", "abc"]);
+        assert!(rt.cmd.args.is_empty(), "expected fresh launch, got {:?}", rt.cmd.args);
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert!(saved.tabs[0].panes[&1].session.is_none());
     }
 
     #[test]

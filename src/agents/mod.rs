@@ -8,7 +8,6 @@ pub mod claude;
 pub mod pi;
 pub mod shell;
 
-use crate::core::workspace::PaneSpec;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,13 +76,19 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
-    /// Pick launch vs resume based on what the pane spec knows.
-    fn command_for(&self, spec: &PaneSpec) -> CommandSpec {
-        match &spec.session {
-            Some(s) => self.resume(&spec.cwd, s),
-            None => self.launch(&spec.cwd),
-        }
+    /// Does a resumable session with this id still exist on disk? Used to
+    /// avoid resuming into a session the CLI can no longer find (e.g. one it
+    /// handed out an id for but never persisted, or the user deleted). The
+    /// default reuses `session_root` + `session_id_from_path`, so pi and
+    /// claude get it for free; adapters without a session root (shell) always
+    /// return true since they have nothing to validate.
+    fn session_exists(&self, cwd: &Path, id: &str) -> bool {
+        let Some(root) = self.session_root(cwd) else { return true };
+        session_files_since(&root, SystemTime::UNIX_EPOCH)
+            .iter()
+            .any(|p| self.session_id_from_path(p).as_deref() == Some(id))
     }
+
 }
 
 /// Files under `root` (recursive) modified after `since`, newest first.
