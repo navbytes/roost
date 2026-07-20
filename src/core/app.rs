@@ -225,8 +225,16 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         self.last_detect = Instant::now();
-        let pending: Vec<(PaneId, SystemTime)> =
+        let mut pending: Vec<(PaneId, SystemTime)> =
             self.pending_detect.iter().map(|(k, v)| (*k, *v)).collect();
+        // Newest spawn first: two panes launched into the same cwd share one
+        // session root, and `detect_session` just grabs the newest unclaimed
+        // file in its window. Processing oldest-first let an earlier pane's
+        // wider window see (and steal) a later pane's not-yet-claimed file,
+        // starving that pane of a session id forever (HashMap iteration order
+        // made this non-deterministic). Claiming newest-spawned-first mirrors
+        // file-creation order, so each pane gets its own file.
+        pending.sort_by(|a, b| b.1.cmp(&a.1));
         for (id, since) in pending {
             let Some((spec, adapter)) = self.find_spec(id).and_then(|s| {
                 self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a))
@@ -884,6 +892,78 @@ mod tests {
         assert_eq!(app.ws.active_tab().name, "roost-repo");
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].name, "roost-repo");
+    }
+
+    /// Test-only adapter whose session root is the pane's own cwd, so a test
+    /// can drop session files directly in a temp dir without touching a real
+    /// `~/.pi/agent/sessions`.
+    struct DetectAdapter;
+    impl crate::agents::AgentAdapter for DetectAdapter {
+        fn id(&self) -> &'static str {
+            "detect"
+        }
+        fn launch(&self, cwd: &std::path::Path) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd)
+        }
+        fn resume(&self, cwd: &std::path::Path, session: &str) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd).arg(session)
+        }
+        fn session_root(&self, cwd: &std::path::Path) -> Option<PathBuf> {
+            Some(cwd.to_path_buf())
+        }
+    }
+
+    #[test]
+    fn tick_lets_each_concurrently_launched_pane_claim_its_own_session_file() {
+        // Regression: two panes launched into the same cwd around the same
+        // time share one session root. `tick()` used to process pending
+        // panes in HashMap (i.e. arbitrary) order; whichever pane got
+        // processed first could steal the *other* pane's newer, not-yet-
+        // claimed session file, leaving that other pane with none at all —
+        // it would then relaunch fresh instead of resuming on the next run.
+        let dir = std::env::temp_dir().join(format!("roost-detect-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = SystemTime::now();
+        let file_a = dir.join("a.jsonl");
+        let file_b = dir.join("b.jsonl");
+        std::fs::write(&file_a, "").unwrap();
+        std::fs::write(&file_b, "").unwrap();
+        std::fs::File::open(&file_a).unwrap().set_modified(base + Duration::from_millis(10)).unwrap();
+        std::fs::File::open(&file_b).unwrap().set_modified(base + Duration::from_millis(20)).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None });
+        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None });
+        let layout = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        let ws = Workspace { version: 1, active_tab: 0, tabs: vec![Tab { name: "main".into(), layout, panes }] };
+
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::channel();
+        let mut app =
+            App::<FakePane>::new(ws, registry, Box::new(store), tx, Size::new(100, 30), None).unwrap();
+
+        // Pane 1 "spawned" before either file existed (widest window); pane 2
+        // "spawned" after file_a but before file_b — the precise ordering
+        // that used to starve whichever pane got processed second.
+        app.pending_detect.clear();
+        app.pending_detect.insert(1, base);
+        app.pending_detect.insert(2, base + Duration::from_millis(15));
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+
+        app.tick();
+
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("a"));
+        assert_eq!(app.find_spec(2).unwrap().session.as_deref(), Some("b"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
