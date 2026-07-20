@@ -46,6 +46,15 @@ members).
 In a **dead pane** (process exited or spawn failed): `Enter` relaunches /
 resumes, `f` starts a fresh session (drops the stored session id).
 
+## Corner badge
+
+Each pane shows a faint label in its **top-right corner** (iTerm2-style),
+sourced from the pane's name — its `Alt+r` title, or the adapter name
+(`pi` / `claude` / `shell`) when unnamed. It's a quick at-a-glance "which
+pane am I looking at" marker; a cell TUI can't do true translucency, so it's
+rendered dim rather than see-through, and the inner app's content still draws
+underneath it on the rest of the screen.
+
 ## Status badges
 
 Pane borders and stack title bars show each agent's state:

@@ -108,7 +108,7 @@ fn status_color(s: AgentStatus) -> Color {
 
 fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
     let focused = app.focused == pr.id;
-    let (title, status) = {
+    let (title, status, name) = {
         let spec = app.ws.active_tab().panes.get(&pr.id);
         let status = app
             .runtimes
@@ -124,7 +124,7 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
         } else {
             ""
         };
-        (format!(" {} {}{} ", status.badge(), name, scroll_tag), status)
+        (format!(" {} {}{} ", status.badge(), name, scroll_tag), status, name)
     };
 
     if pr.collapsed {
@@ -159,6 +159,16 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
         }
     }
 
+    // iTerm2-style corner badge: the pane label, faint, top-right. Drawn
+    // after the content so it stays visible (a cell TUI can't do true
+    // translucency; dim gray reads as a watermark rather than content).
+    if let Some((rect, text)) = corner_badge(inner, &name) {
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+            rect,
+        );
+    }
+
     // Dead pane: overlay the relaunch hint (and spawn error, if any) on the
     // bottom rows. The last screen contents stay visible above.
     if status == AgentStatus::Exited && inner.height > 0 {
@@ -178,6 +188,26 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
         let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
         f.render_widget(Paragraph::new(lines), overlay);
     }
+}
+
+/// Top-right corner badge (iTerm2-style label). Returns the 1-row rect and
+/// the space-padded, right-aligned, clipped text — or None if the pane is too
+/// small to be worth badging. Pure so it can be unit-tested.
+fn corner_badge(inner: Rect, label: &str) -> Option<(Rect, String)> {
+    if label.trim().is_empty() || inner.width < 3 || inner.height == 0 {
+        return None;
+    }
+    // One space of breathing room on the right edge.
+    let max = inner.width.saturating_sub(1) as usize;
+    let padded = format!(" {label} ");
+    let text: String = if padded.chars().count() > max {
+        padded.chars().take(max).collect()
+    } else {
+        padded
+    };
+    let w = text.chars().count() as u16;
+    let x = inner.x + inner.width - w;
+    Some((Rect::new(x, inner.y, w, 1), text))
 }
 
 /// Copy the vt100 grid into the ratatui buffer.
@@ -231,4 +261,38 @@ fn cell_style(cell: &vt100::Cell) -> Style {
         style = style.add_modifier(Modifier::REVERSED);
     }
     style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::corner_badge;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn badge_is_right_aligned_on_top_row() {
+        // inner content area at (1,1) sized 40x20 (borders excluded)
+        let inner = Rect::new(1, 1, 40, 20);
+        let (rect, text) = corner_badge(inner, "claude").unwrap();
+        assert_eq!(text, " claude ");
+        assert_eq!(rect.y, inner.y); // top row of the content
+        assert_eq!(rect.height, 1);
+        // right edge: badge ends one col shy of the inner right edge is fine;
+        // here it butts to the edge because label fits.
+        assert_eq!(rect.x + rect.width, inner.x + inner.width);
+    }
+
+    #[test]
+    fn badge_clips_when_label_too_long_for_pane() {
+        let inner = Rect::new(0, 0, 6, 5);
+        let (rect, text) = corner_badge(inner, "a-very-long-name").unwrap();
+        assert!(text.chars().count() <= 5); // width-1 breathing room
+        assert!(rect.x >= inner.x && rect.x + rect.width <= inner.x + inner.width);
+    }
+
+    #[test]
+    fn no_badge_for_tiny_or_empty() {
+        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x").is_none()); // too narrow
+        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x").is_none()); // no height
+        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ").is_none()); // blank label
+    }
 }
