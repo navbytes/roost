@@ -32,6 +32,18 @@ use crate::ui::input::{self, InputResult};
 use crate::ui::mouse::{self, WheelRoute};
 
 fn main() -> Result<()> {
+    // One roost per state dir: two instances sharing a workspace.json race
+    // and corrupt each other's panes. Hold an exclusive lock for the whole
+    // run (released automatically on exit). Do this before touching the
+    // terminal so a refusal prints cleanly.
+    let _lock = match acquire_instance_lock() {
+        Ok(lock) => lock,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
+
     // Restore the terminal on panic — otherwise a crash (even one deep in a
     // dependency) leaves the user in raw mode / the alternate screen with
     // mouse capture on, i.e. a wrecked terminal. Do this before init.
@@ -45,6 +57,26 @@ fn main() -> Result<()> {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// Acquire an exclusive lock on `<state>/roost.lock`. Returns the held file
+/// (keep it alive for the process lifetime) or a user-facing error message.
+fn acquire_instance_lock() -> std::result::Result<std::fs::File, String> {
+    use fs2::FileExt;
+    let path = FsStore::default_path().with_extension("lock");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let file = std::fs::File::create(&path)
+        .map_err(|e| format!("roost: cannot open lock file {}: {e}", path.display()))?;
+    file.try_lock_exclusive().map_err(|_| {
+        let dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+        format!(
+            "roost is already running for this workspace ({dir}).\n\
+             Close the other instance, or set ROOST_STATE=<dir> to run an isolated one."
+        )
+    })?;
+    Ok(file)
 }
 
 fn install_panic_hook() {

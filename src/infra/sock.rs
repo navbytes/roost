@@ -83,16 +83,35 @@ pub fn spawn_listener(tx: Sender<AppEvent>) -> Result<PathBuf> {
             std::thread::spawn(move || {
                 for line in BufReader::new(stream).lines() {
                     let Ok(line) = line else { break };
-                    if let Some(ev) = parse_line(&line) {
-                        if tx.send(ev).is_err() {
-                            break;
+                    match parse_line(&line) {
+                        Some(ev) => {
+                            if tx.send(ev).is_err() {
+                                break;
+                            }
                         }
+                        // A malformed line usually means a broken extension /
+                        // hook integration — log it (ROOST_DEBUG) so it's
+                        // debuggable instead of silently vanishing.
+                        None => log_dropped(&line),
                     }
                 }
             });
         }
     });
     Ok(path)
+}
+
+/// Append an unparseable socket line to `<state>/roost.log` when ROOST_DEBUG
+/// is set. No-op otherwise (and never touches the TUI's stdout).
+fn log_dropped(line: &str) {
+    if std::env::var_os("ROOST_DEBUG").is_none() {
+        return;
+    }
+    use std::io::Write;
+    let log = socket_path().with_file_name("roost.log");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = writeln!(f, "dropped malformed socket line: {line}");
+    }
 }
 
 #[cfg(test)]

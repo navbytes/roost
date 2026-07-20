@@ -40,7 +40,13 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // (key, what it does) pairs for the current context.
     let hints: Vec<(&str, &str)> = match &app.mode {
-        Mode::Rename { .. } => vec![("type", "name"), ("↵", "save"), ("Esc", "cancel")],
+        Mode::Rename { target, .. } => {
+            let what = match target {
+                RenameTarget::Pane => "pane name",
+                RenameTarget::Tab => "tab name",
+            };
+            vec![("type", what), ("↵", "save"), ("Esc", "cancel")]
+        }
         Mode::Picker { .. } => vec![("↑↓", "choose"), ("↵", "open"), ("Esc", "cancel")],
         Mode::Scroll { .. } => {
             vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]

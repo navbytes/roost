@@ -18,7 +18,14 @@ impl Notifier for TermNotifier {
                 "display notification \"{}\" with title \"roost\"",
                 msg.replace('\\', "").replace('"', "'")
             );
-            let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
+            if let Ok(child) = std::process::Command::new("osascript").arg("-e").arg(script).spawn()
+            {
+                // Reap it so rapid notifications don't accumulate zombies.
+                std::thread::spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                });
+            }
         }
         #[cfg(not(target_os = "macos"))]
         let _ = msg;

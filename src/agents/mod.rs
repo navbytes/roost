@@ -50,6 +50,15 @@ pub trait AgentAdapter: Send + Sync {
         path.file_stem().map(|s| s.to_string_lossy().into_owned())
     }
 
+    /// Does this session file belong to a pane in `cwd`? Adapters that store
+    /// every session in one flat directory can't tell (default: yes). Those
+    /// that organize by working directory override this to scope detection to
+    /// the pane's own project, so two agents in different folders launched at
+    /// once can't cross-detect.
+    fn owns_session_file(&self, _path: &Path, _cwd: &Path) -> bool {
+        true
+    }
+
     /// Learn the session id of a freshly launched pane by finding the session
     /// file written since spawn. The exact channel (extension handshake over
     /// the status socket) takes precedence when available; this is the
@@ -67,6 +76,9 @@ pub trait AgentAdapter: Send + Sync {
     ) -> Option<String> {
         let root = self.session_root(cwd)?;
         for path in session_files_since(&root, since) {
+            if !self.owns_session_file(&path, cwd) {
+                continue;
+            }
             if let Some(id) = self.session_id_from_path(&path) {
                 if !taken.contains(&id) {
                     return Some(id);
@@ -84,9 +96,9 @@ pub trait AgentAdapter: Send + Sync {
     /// return true since they have nothing to validate.
     fn session_exists(&self, cwd: &Path, id: &str) -> bool {
         let Some(root) = self.session_root(cwd) else { return true };
-        session_files_since(&root, SystemTime::UNIX_EPOCH)
-            .iter()
-            .any(|p| self.session_id_from_path(p).as_deref() == Some(id))
+        session_files_since(&root, SystemTime::UNIX_EPOCH).iter().any(|p| {
+            self.owns_session_file(p, cwd) && self.session_id_from_path(p).as_deref() == Some(id)
+        })
     }
 
 }

@@ -17,6 +17,22 @@ cargo install --path .   # or just: cargo run
 roost
 ```
 
+Only one roost runs per workspace at a time — a second instance on the same
+state dir refuses to start (they would race and corrupt `workspace.json`).
+Run an isolated one with `ROOST_STATE=/some/dir roost`.
+
+### macOS: make the Option key send Alt
+
+roost's shortcuts are all on `Alt`. On macOS the **Option** key sends
+accented characters by default, so the shortcuts silently do nothing until
+you tell your terminal to treat Option as Meta/Alt:
+
+- **Terminal.app**: Settings → Profiles → Keyboard → check *Use Option as Meta key*.
+- **iTerm2**: Settings → Profiles → Keys → set the Left/Right Option key to *Esc+*.
+- **Ghostty / WezTerm / kitty**: send Alt by default — nothing to change.
+
+If your first `Alt+n` seems to do nothing, this is almost certainly why.
+
 State lives in `~/.local/state/roost/workspace.json` (auto-saved on every
 change, atomic writes). Delete it to start clean.
 

@@ -45,6 +45,21 @@ impl AgentAdapter for PiAdapter {
         let stem = path.file_stem()?.to_str()?;
         Some(stem.rsplit('_').next().unwrap_or(stem).to_string())
     }
+
+    /// pi stores sessions in a per-cwd subdirectory whose name is the path
+    /// with separators turned to dashes (and some dash-wrapping). Rather than
+    /// hardcode that private encoding, compare the file's parent dir to the
+    /// cwd with all non-alphanumerics stripped — robust to pi's exact dash
+    /// convention while still scoping detection to this pane's project.
+    fn owns_session_file(&self, path: &Path, cwd: &Path) -> bool {
+        let key = |s: &str| -> String {
+            s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+        };
+        match path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+            Some(dir) => key(dir) == key(&cwd.to_string_lossy()),
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -76,5 +91,15 @@ mod tests {
         let cmd = a.resume(Path::new("/tmp"), "abc-123");
         assert_eq!(cmd.program, "pi");
         assert_eq!(cmd.args, vec!["--session", "abc-123"]);
+    }
+
+    #[test]
+    fn owns_session_file_scopes_to_cwd_ignoring_dash_encoding() {
+        let a = PiAdapter;
+        // pi's real dir name for /home/nav/proj-x, dash-wrapped
+        let f = Path::new("/root/.pi/agent/sessions/--home-nav-proj-x--/ts_uuid.jsonl");
+        assert!(a.owns_session_file(f, Path::new("/home/nav/proj-x")));
+        // a different project must not match
+        assert!(!a.owns_session_file(f, Path::new("/home/nav/other")));
     }
 }
