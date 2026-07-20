@@ -190,6 +190,54 @@ pub fn resize_pane(node: &mut LayoutNode, target: PaneId, axis: SplitDir, delta:
     true
 }
 
+/// A spatial focus direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// The pane nearest to `focused` in direction `dir`, by pane rectangles.
+/// Returns None when nothing lies that way (focus then stays put — the
+/// predictable tmux/zellij behavior, and the fix for cyclic focus feeling
+/// "inverted" relative to arrow keys). `rects` are the laid-out pane rects.
+pub fn neighbor(rects: &[PaneRect], focused: PaneId, dir: Dir) -> Option<PaneId> {
+    let cur = rects.iter().find(|p| p.id == focused)?.rect;
+    let cx = cur.x as i32 + cur.width as i32 / 2;
+    let cy = cur.y as i32 + cur.height as i32 / 2;
+    let mut best: Option<(i32, PaneId)> = None;
+    for p in rects {
+        if p.id == focused {
+            continue;
+        }
+        let r = p.rect;
+        let px = r.x as i32 + r.width as i32 / 2;
+        let py = r.y as i32 + r.height as i32 / 2;
+        let in_dir = match dir {
+            Dir::Left => px < cx,
+            Dir::Right => px > cx,
+            Dir::Up => py < cy,
+            Dir::Down => py > cy,
+        };
+        if !in_dir {
+            continue;
+        }
+        // Distance dominated by the primary axis, perpendicular offset as a
+        // tie-breaker so we pick the pane most directly in that direction.
+        let (prim, perp) = match dir {
+            Dir::Left | Dir::Right => ((cx - px).abs(), (cy - py).abs()),
+            Dir::Up | Dir::Down => ((cy - py).abs(), (cx - px).abs()),
+        };
+        let score = prim * 4 + perp;
+        if best.is_none_or(|(s, _)| score < s) {
+            best = Some((score, p.id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// If `target` is a collapsed member of any stack, expand it.
 pub fn expand_in_stacks(node: &mut LayoutNode, target: PaneId) {
     match node {
@@ -374,5 +422,26 @@ mod tests {
         let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
         expand_in_stacks(&mut node, 3);
         assert!(matches!(node, LayoutNode::Stack { expanded: 2, .. }));
+    }
+
+    #[test]
+    fn neighbor_moves_spatially() {
+        // Four-quadrant layout:
+        //   1 | 2
+        //   -----
+        //   3 | 4
+        let rects = vec![
+            PaneRect { id: 1, rect: Rect::new(0, 0, 50, 12), collapsed: false },
+            PaneRect { id: 2, rect: Rect::new(50, 0, 50, 12), collapsed: false },
+            PaneRect { id: 3, rect: Rect::new(0, 12, 50, 12), collapsed: false },
+            PaneRect { id: 4, rect: Rect::new(50, 12, 50, 12), collapsed: false },
+        ];
+        assert_eq!(neighbor(&rects, 1, Dir::Right), Some(2));
+        assert_eq!(neighbor(&rects, 1, Dir::Down), Some(3));
+        assert_eq!(neighbor(&rects, 4, Dir::Left), Some(3));
+        assert_eq!(neighbor(&rects, 4, Dir::Up), Some(2));
+        // Nothing to the left of pane 1 → stay put.
+        assert_eq!(neighbor(&rects, 1, Dir::Left), None);
+        assert_eq!(neighbor(&rects, 2, Dir::Up), None);
     }
 }

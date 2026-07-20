@@ -17,6 +17,9 @@ pub struct Grid {
 
 impl Grid {
     pub fn new(size: Size, scrollback_len: usize) -> Self {
+        // roost hardening: a 0-row/0-col grid makes every `rows - 1` /
+        // `cols - width` below underflow. Never allow a degenerate size.
+        let size = Size { rows: size.rows.max(1), cols: size.cols.max(1) };
         Self {
             size,
             pos: Pos::default(),
@@ -64,6 +67,8 @@ impl Grid {
     }
 
     pub fn set_size(&mut self, size: Size) {
+        // roost hardening: clamp to a 1x1 floor (see Grid::new).
+        let size = Size { rows: size.rows.max(1), cols: size.cols.max(1) };
         if size.cols != self.size.cols {
             for row in &mut self.rows {
                 row.wrap(false);
@@ -669,11 +674,15 @@ impl Grid {
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
-        if self.pos.col > self.size.cols - width {
+        // roost hardening: `cols - width` underflows when a wide (width 2)
+        // char lands in a 1-col grid; `prev_pos.row -= scrolled` underflows
+        // when scrolling a 1-row grid. Saturating keeps a degenerate pane
+        // from panicking the whole multiplexer.
+        if self.pos.col > self.size.cols.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
+            prev_pos.row = prev_pos.row.saturating_sub(scrolled);
             let new_pos = self.pos;
             self.drawing_row_mut(prev_pos.row)
                 // we assume self.pos.row is always valid, and so prev_pos.row

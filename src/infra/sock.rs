@@ -19,6 +19,9 @@ use crate::core::status::AgentStatus;
 use crate::core::workspace::PaneId;
 
 pub fn socket_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ROOST_STATE") {
+        return PathBuf::from(dir).join("roost.sock");
+    }
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

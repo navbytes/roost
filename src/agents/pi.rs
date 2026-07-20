@@ -35,4 +35,46 @@ impl AgentAdapter for PiAdapter {
     fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
         Some(dirs::home_dir()?.join(".pi").join("agent").join("sessions"))
     }
+
+    /// pi names session files `<iso-timestamp>_<uuid>.jsonl`, but
+    /// `pi --session` only matches on the bare UUID (or a prefix of it) — the
+    /// timestamp prefix makes it reject the id outright. Extract the segment
+    /// after the last underscore. Files without an underscore (e.g. the
+    /// pi-fake test fixture) fall back to the whole stem.
+    fn session_id_from_path(&self, path: &Path) -> Option<String> {
+        let stem = path.file_stem()?.to_str()?;
+        Some(stem.rsplit('_').next().unwrap_or(stem).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_bare_uuid_from_pi_filename() {
+        let a = PiAdapter;
+        let p = Path::new(
+            "/h/.pi/agent/sessions/proj/2026-07-20T09-17-57-467Z_019f7ed1-5b5a-72cc-b89a-2c4fd41a0006.jsonl",
+        );
+        assert_eq!(
+            a.session_id_from_path(p).as_deref(),
+            Some("019f7ed1-5b5a-72cc-b89a-2c4fd41a0006")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_stem_without_underscore() {
+        let a = PiAdapter;
+        let p = Path::new("/h/.pi/agent/sessions/proj/fake-uuid-999.jsonl");
+        assert_eq!(a.session_id_from_path(p).as_deref(), Some("fake-uuid-999"));
+    }
+
+    #[test]
+    fn resume_uses_session_flag() {
+        let a = PiAdapter;
+        let cmd = a.resume(Path::new("/tmp"), "abc-123");
+        assert_eq!(cmd.program, "pi");
+        assert_eq!(cmd.args, vec!["--session", "abc-123"]);
+    }
 }

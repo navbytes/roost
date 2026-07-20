@@ -13,7 +13,12 @@ pub struct FsStore {
 }
 
 impl FsStore {
+    /// `$ROOST_STATE/workspace.json` when set (isolated profiles / parallel
+    /// instances), else the XDG state dir.
     pub fn default_path() -> PathBuf {
+        if let Some(dir) = std::env::var_os("ROOST_STATE") {
+            return PathBuf::from(dir).join("workspace.json");
+        }
         dirs::state_dir()
             .or_else(dirs::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("."))

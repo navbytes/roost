@@ -834,7 +834,9 @@ impl Screen {
         // (xterm handles this by introducing the concept of triple width
         // cells, which i really don't want to do).
         let mut wrap = false;
-        if pos.col > size.cols - width {
+        // roost hardening: saturating — `cols - width` underflows for a wide
+        // char in a 1-col grid (grid size is already clamped to >= 1x1).
+        if pos.col > size.cols.saturating_sub(width) {
             let last_cell = self
                 .grid()
                 .drawing_cell(crate::grid::Pos {

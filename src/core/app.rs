@@ -20,6 +20,12 @@ use crate::ui::input::Action;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// A pane must stay usable after a split. These are the smallest *outer*
+/// rects (borders included) we allow a split to produce; below them the new
+/// pane would be a sliver, so the split is refused.
+const MIN_SPLIT_COLS: u16 = 36; // two ~16-col inner panes + borders
+const MIN_SPLIT_ROWS: u16 = 10; // two ~3-row inner panes + borders
+
 /// Adapters offered by the quick-launch picker (Alt+Enter).
 pub const PICKER_ITEMS: [&str; 3] = ["pi", "claude", "shell"];
 
@@ -153,10 +159,23 @@ impl<B: PaneBackend> App<B> {
                 self.pending_detect.remove(&id);
                 continue;
             };
-            if let Some(session) = adapter.detect_session(&spec.cwd, since) {
+            // Session ids already owned by other panes — never re-assign one
+            // (concurrent same-cwd launches otherwise cross-wire onto it).
+            let taken = self.claimed_sessions();
+            if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
                 self.set_session(id, session);
             }
         }
+    }
+
+    /// Session ids currently assigned to any pane.
+    fn claimed_sessions(&self) -> std::collections::HashSet<String> {
+        self.ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.values())
+            .filter_map(|s| s.session.clone())
+            .collect()
     }
 
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
@@ -303,8 +322,7 @@ impl<B: PaneBackend> App<B> {
             Action::Quit => self.quit = true,
             Action::NewPane => self.new_pane_with("shell"),
             Action::ClosePane => self.close_pane(),
-            Action::FocusNext => self.cycle_focus(1),
-            Action::FocusPrev => self.cycle_focus(-1),
+            Action::Focus(dir) => self.focus_dir(dir),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
             Action::ToggleStack => {
@@ -331,15 +349,13 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    fn cycle_focus(&mut self, dir: i64) {
-        let order = self.pane_order();
-        if order.is_empty() {
-            return;
+    /// Move focus spatially to the nearest pane in `dir`; stay put if none.
+    fn focus_dir(&mut self, dir: layout::Dir) {
+        let rects = self.rects();
+        if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
+            self.focused = id;
+            layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         }
-        let cur = order.iter().position(|&p| p == self.focused).unwrap_or(0) as i64;
-        let next = (cur + dir).rem_euclid(order.len() as i64) as usize;
-        self.focused = order[next];
-        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, self.focused);
     }
 
     fn new_pane_with(&mut self, adapter: &str) {
@@ -354,18 +370,29 @@ impl<B: PaneBackend> App<B> {
         let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None };
 
         // Split in the widest direction of the focused pane's rect.
-        let dir = self
-            .rects()
-            .iter()
-            .find(|pr| pr.id == self.focused)
-            .map(|pr| {
-                if pr.rect.width >= pr.rect.height * 3 {
+        let focused_rect = self.rects().iter().find(|pr| pr.id == self.focused).map(|pr| pr.rect);
+        let dir = focused_rect
+            .map(|r| {
+                if r.width >= r.height * 3 {
                     SplitDir::Vertical
                 } else {
                     SplitDir::Horizontal
                 }
             })
             .unwrap_or(SplitDir::Vertical);
+
+        // Refuse a split that would produce unusably tiny panes (also the
+        // trigger for the vt100 underflow crash). Silent no-op — the layout
+        // is left untouched. See MIN_SPLIT_* below.
+        if let Some(r) = focused_rect {
+            let too_small = match dir {
+                SplitDir::Vertical => r.width < MIN_SPLIT_COLS,
+                SplitDir::Horizontal => r.height < MIN_SPLIT_ROWS,
+            };
+            if too_small {
+                return;
+            }
+        }
 
         let focused = self.focused;
         let tab = self.ws.active_tab_mut();
@@ -662,6 +689,31 @@ mod tests {
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
         let id = app.focused;
         assert_eq!(app.runtimes[&id].cmd.program, "claude");
+    }
+
+    #[test]
+    fn splits_refuse_when_panes_get_too_small() {
+        let (mut app, _) = mk_app(shell_ws()); // 100x30 terminal
+        for _ in 0..60 {
+            app.apply(Action::NewPane);
+        }
+        let n = app.ws.tabs[0].panes.len();
+        // Splits must stop well before 60 panes — the guard refuses slivers.
+        assert!(n < 40, "expected splits to be refused, got {n} panes");
+        // Every surviving pane still has a non-degenerate rect.
+        for pr in app.rects() {
+            assert!(pr.rect.width >= 2 && pr.rect.height >= 1);
+        }
+    }
+
+    #[test]
+    fn directional_focus_moves_by_position() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // vertical split → panes 1 (left) | 2 (right), focus 2
+        app.apply(Action::Focus(crate::core::layout::Dir::Left));
+        assert_eq!(app.focused, 1);
+        app.apply(Action::Focus(crate::core::layout::Dir::Right));
+        assert_eq!(app.focused, 2);
     }
 
     #[test]

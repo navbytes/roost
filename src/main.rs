@@ -32,6 +32,11 @@ use crate::ui::input::{self, InputResult};
 use crate::ui::mouse::{self, WheelRoute};
 
 fn main() -> Result<()> {
+    // Restore the terminal on panic — otherwise a crash (even one deep in a
+    // dependency) leaves the user in raw mode / the alternate screen with
+    // mouse capture on, i.e. a wrecked terminal. Do this before init.
+    install_panic_hook();
+
     let mut terminal = ratatui::init();
     // Without mouse capture the hosting terminal consumes wheel events and
     // scrolls its own buffer — content *outside* the TUI. Capture them.
@@ -40,6 +45,15 @@ fn main() -> Result<()> {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        ratatui::restore();
+        original(info);
+    }));
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {

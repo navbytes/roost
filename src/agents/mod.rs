@@ -9,7 +9,7 @@ pub mod pi;
 pub mod shell;
 
 use crate::core::workspace::PaneSpec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -55,10 +55,26 @@ pub trait AgentAdapter: Send + Sync {
     /// file written since spawn. The exact channel (extension handshake over
     /// the status socket) takes precedence when available; this is the
     /// filesystem fallback.
-    fn detect_session(&self, cwd: &Path, since: SystemTime) -> Option<String> {
+    ///
+    /// `taken` holds session ids already claimed by other panes. When several
+    /// agents launch in the same directory at once they share one session
+    /// root, so we walk candidate files newest-first and skip any id another
+    /// pane already owns — otherwise two panes cross-wire onto one session.
+    fn detect_session(
+        &self,
+        cwd: &Path,
+        since: SystemTime,
+        taken: &HashSet<String>,
+    ) -> Option<String> {
         let root = self.session_root(cwd)?;
-        let path = newest_session_file_since(&root, since)?;
-        self.session_id_from_path(&path)
+        for path in session_files_since(&root, since) {
+            if let Some(id) = self.session_id_from_path(&path) {
+                if !taken.contains(&id) {
+                    return Some(id);
+                }
+            }
+        }
+        None
     }
 
     /// Pick launch vs resume based on what the pane spec knows.
@@ -70,10 +86,10 @@ pub trait AgentAdapter: Send + Sync {
     }
 }
 
-/// Newest file under `root` (recursive) modified after `since`. Used to spot
-/// the session file a freshly launched agent just created.
-pub fn newest_session_file_since(root: &Path, since: SystemTime) -> Option<PathBuf> {
-    let mut best: Option<(SystemTime, PathBuf)> = None;
+/// Files under `root` (recursive) modified after `since`, newest first.
+/// Used to spot the session file a freshly launched agent just created.
+pub fn session_files_since(root: &Path, since: SystemTime) -> Vec<PathBuf> {
+    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(rd) = fs::read_dir(&dir) else { continue };
@@ -85,12 +101,13 @@ pub fn newest_session_file_since(root: &Path, since: SystemTime) -> Option<PathB
             }
             let Ok(meta) = entry.metadata() else { continue };
             let Ok(mtime) = meta.modified() else { continue };
-            if mtime > since && best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-                best = Some((mtime, p));
+            if mtime > since {
+                found.push((mtime, p));
             }
         }
     }
-    best.map(|(_, p)| p)
+    found.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    found.into_iter().map(|(_, p)| p).collect()
 }
 
 pub type Registry = HashMap<&'static str, Box<dyn AgentAdapter>>;

@@ -1,6 +1,7 @@
 //! Keybindings (design doc §7): roost owns the Alt layer, everything else is
 //! forwarded raw to the focused pane so agents see a normal terminal.
 
+use crate::core::layout::Dir;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,8 +9,8 @@ pub enum Action {
     Quit,
     NewPane,
     ClosePane,
-    FocusNext,
-    FocusPrev,
+    /// Move focus spatially (arrows / hjkl).
+    Focus(Dir),
     NewTab,
     GoToTab(usize),
     ToggleStack,
@@ -48,12 +49,10 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Enter => Some(Action::QuickLaunch),
             KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
-            KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
-                Some(Action::FocusNext)
-            }
-            KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
-                Some(Action::FocusPrev)
-            }
+            KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
+            KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
             _ => None,
         };
         return match action {
@@ -133,7 +132,14 @@ mod tests {
             InputResult::Action(Action::Resize { horizontal: false, grow: false })
         ));
         // plain Alt+arrow still moves focus
-        assert!(matches!(translate(alt(KeyCode::Right)), InputResult::Action(Action::FocusNext)));
+        assert!(matches!(
+            translate(alt(KeyCode::Right)),
+            InputResult::Action(Action::Focus(Dir::Right))
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('h'))),
+            InputResult::Action(Action::Focus(Dir::Left))
+        ));
     }
 
     #[test]
