@@ -572,6 +572,10 @@ impl<B: PaneBackend> App<B> {
         if let Some(mut rt) = self.runtimes.remove(&id) {
             rt.kill();
         }
+        // Drop any spawn-error record for this pane too; otherwise a pane that
+        // failed to spawn and is then closed leaves a stale `dead` entry that
+        // never gets cleaned (pane ids are not reused for it).
+        self.dead.remove(&id);
         let tab = self.ws.active_tab_mut();
         tab.panes.remove(&id);
         let empty = layout::remove_pane(&mut tab.layout, id);
@@ -1071,6 +1075,17 @@ mod tests {
         app.runtimes.get_mut(&1).unwrap().observation = None;
         app.observe_panes();
         assert_eq!(app.find_spec(1).unwrap().adapter, "pi");
+    }
+
+    #[test]
+    fn closing_a_pane_clears_its_dead_record() {
+        // A spawn-failed pane's error lives in `dead`; closing the pane must
+        // drop it so the map doesn't accumulate stale entries over a session.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 & 2, focus = 2
+        app.dead.insert(2, "spawn failed".into());
+        app.apply(Action::ClosePane); // closes focused pane 2
+        assert!(!app.dead.contains_key(&2));
     }
 
     #[test]

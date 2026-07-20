@@ -123,7 +123,13 @@ impl PaneBackend for PtyPane {
     }
 
     fn kill(&mut self) {
+        // portable-pty's child is a std::process::Child, whose Drop does NOT
+        // reap. kill() only sends SIGKILL; without a wait() the child lingers
+        // as a zombie until roost exits. Reap it here so pane churn (close,
+        // respawn, quit) doesn't accumulate zombies. SIGKILL isn't catchable,
+        // so the wait returns promptly.
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     fn status(&self) -> AgentStatus {
@@ -136,6 +142,12 @@ impl PaneBackend for PtyPane {
 
     fn on_exit(&mut self) {
         self.status.on_exit();
+        // The PTY hit EOF because the child closed it — almost always because
+        // it exited. Reap it now (non-blocking) so a pane left sitting in its
+        // "exited" state doesn't hold a zombie. If the child somehow closed the
+        // PTY without exiting, try_wait returns Ok(None) and we don't block;
+        // kill() will reap it definitively when the pane is finally cleaned up.
+        let _ = self.child.try_wait();
     }
 
     fn screen(&self) -> Option<&vt100::Screen> {
