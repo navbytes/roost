@@ -293,15 +293,16 @@ impl<B: PaneBackend> App<B> {
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.on_exit();
         }
-        if id != self.focused {
-            let name = self
-                .find_spec(id)
-                .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
-                .unwrap_or_else(|| format!("pane {id}"));
-            Some(format!("{name} exited"))
-        } else {
-            None
+        if id == self.focused {
+            return None;
         }
+        // A pane the user just closed (Alt+w) is already gone from the
+        // workspace by the time its process EOFs — that Exit is expected, not
+        // attention-worthy. Only nudge for a still-present, unfocused pane
+        // that exited on its own (its recovery hint is hidden in its borders).
+        let spec = self.find_spec(id)?;
+        let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+        Some(format!("{name} exited"))
     }
 
     /// Session id reported exactly by an agent-side extension.
@@ -972,6 +973,16 @@ mod tests {
         app.apply(Action::NewPane); // focus = 2
         assert!(app.on_pty_exit(1).is_some()); // pane 1 exits, unfocused
         assert!(app.on_pty_exit(2).is_none()); // pane 2 exits, focused
+    }
+
+    #[test]
+    fn closing_a_pane_does_not_notify_on_its_eof() {
+        // Alt+w removes the pane, then its process EOFs and delivers Exit.
+        // That deliberate close must not ring the bell / fire a notification.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 & 2, focus = 2
+        app.apply(Action::ClosePane); // closes pane 2, focus -> 1
+        assert!(app.on_pty_exit(2).is_none()); // its late EOF is silent
     }
 
     #[test]
