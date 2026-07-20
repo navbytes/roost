@@ -91,7 +91,7 @@ fn draw_pane(f: &mut Frame, app: &mut App, pr: PaneRect) {
 
     if let Some(rt) = app.runtimes.get(&pr.id) {
         blit_screen(f, rt.parser.screen(), inner);
-        if focused {
+        if focused && status != AgentStatus::Exited {
             let (cr, cc) = rt.parser.screen().cursor_position();
             let x = inner.x.saturating_add(cc);
             let y = inner.y.saturating_add(cr);
@@ -99,6 +99,26 @@ fn draw_pane(f: &mut Frame, app: &mut App, pr: PaneRect) {
                 f.set_cursor_position(Position::new(x, y));
             }
         }
+    }
+
+    // Dead pane: overlay the relaunch hint (and spawn error, if any) on the
+    // bottom rows. The last screen contents stay visible above.
+    if status == AgentStatus::Exited && inner.height > 0 {
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(err) = app.dead.get(&pr.id) {
+            lines.push(Line::from(Span::styled(
+                format!(" spawn failed: {err} "),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            " ✕ exited — Enter: relaunch/resume · f: fresh session ",
+            Style::default().fg(Color::Black).bg(Color::Red),
+        )));
+        let n = lines.len() as u16;
+        let y = inner.y + inner.height.saturating_sub(n);
+        let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
+        f.render_widget(Paragraph::new(lines), overlay);
     }
 }
 

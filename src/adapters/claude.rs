@@ -6,7 +6,16 @@
 //!   PreToolUse) can run a shell command → point them at roost's socket.
 
 use super::{AgentAdapter, CommandSpec};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Claude Code encodes a project cwd into a directory name by replacing
+/// path separators and dots with dashes: /home/nav/code.x → -home-nav-code-x
+pub fn encode_cwd(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' || c == ' ' || c == '_' { '-' } else { c })
+        .collect()
+}
 
 pub struct ClaudeAdapter;
 
@@ -23,8 +32,15 @@ impl AgentAdapter for ClaudeAdapter {
         CommandSpec::new("claude", cwd).arg("--resume").arg(session)
     }
 
-    fn detect_session(&self, _cwd: &Path) -> Option<String> {
-        // TODO(M5): newest new .jsonl in ~/.claude/projects/<encoded-cwd>/
-        None
+    fn session_root(&self, cwd: &Path) -> Option<PathBuf> {
+        Some(dirs::home_dir()?.join(".claude").join("projects").join(encode_cwd(cwd)))
+    }
+
+    /// Only .jsonl files are sessions (ignore sidecar files).
+    fn session_id_from_path(&self, path: &Path) -> Option<String> {
+        if path.extension()?.to_str()? != "jsonl" {
+            return None;
+        }
+        path.file_stem().map(|s| s.to_string_lossy().into_owned())
     }
 }

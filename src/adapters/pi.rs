@@ -12,7 +12,7 @@
 //! tagged with the ROOST_PANE env var we set at spawn. See design doc §6.1.
 
 use super::{AgentAdapter, CommandSpec};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct PiAdapter;
 
@@ -29,9 +29,10 @@ impl AgentAdapter for PiAdapter {
         CommandSpec::new("pi", cwd).arg("--session").arg(session)
     }
 
-    fn detect_session(&self, _cwd: &Path) -> Option<String> {
-        // TODO(M2): diff ~/.pi/agent/sessions/<cwd-encoded>/ before/after
-        // spawn as a fallback when the roost.ts extension isn't installed.
-        None
+    /// pi organizes sessions under ~/.pi/agent/sessions/ by cwd. We scan the
+    /// whole root: only files newer than our spawn time matter, and a fresh
+    /// pane can only have produced one of those.
+    fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
+        Some(dirs::home_dir()?.join(".pi").join("agent").join("sessions"))
     }
 }

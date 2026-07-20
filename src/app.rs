@@ -4,15 +4,20 @@
 use anyhow::Result;
 use ratatui::layout::{Rect, Size};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::adapters::Registry;
 use crate::event::AppEvent;
 use crate::input::Action;
 use crate::pane::PaneRuntime;
+use crate::status::AgentStatus;
 use crate::workspace::{
     self, compute_rects, LayoutNode, PaneId, PaneRect, PaneSpec, SplitDir, Tab, Workspace,
 };
+
+const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct App {
     pub ws: Workspace,
@@ -20,8 +25,14 @@ pub struct App {
     pub registry: Registry,
     pub focused: PaneId,
     pub quit: bool,
+    /// Spawn errors for panes whose process never started.
+    pub dead: HashMap<PaneId, String>,
     tx: Sender<AppEvent>,
     term_size: Size,
+    /// Freshly launched agent panes we still owe a session id.
+    pending_detect: HashMap<PaneId, SystemTime>,
+    last_detect: Instant,
+    sock_path: Option<PathBuf>,
 }
 
 impl App {
@@ -29,7 +40,12 @@ impl App {
     /// every pane via its adapter — resume when a session id is known,
     /// fresh launch otherwise. A failed spawn degrades to a dead pane, it
     /// never aborts restore.
-    pub fn new(registry: Registry, tx: Sender<AppEvent>, term_size: Size) -> Result<Self> {
+    pub fn new(
+        registry: Registry,
+        tx: Sender<AppEvent>,
+        term_size: Size,
+        sock_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let ws = Workspace::load_or_default()?;
         let mut app = Self {
             focused: 0,
@@ -37,8 +53,12 @@ impl App {
             runtimes: HashMap::new(),
             registry,
             quit: false,
+            dead: HashMap::new(),
             tx,
             term_size,
+            pending_detect: HashMap::new(),
+            last_detect: Instant::now(),
+            sock_path,
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -75,17 +95,119 @@ impl App {
 
     fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
         let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
-        let cmd = adapter.command_for(spec);
+        let mut cmd = adapter.command_for(spec);
+        if let Some(sock) = &self.sock_path {
+            cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
+        }
         let (rows, cols) = inner_dims(rect);
         match PaneRuntime::spawn(id, &cmd, rows, cols, self.tx.clone()) {
             Ok(rt) => {
                 self.runtimes.insert(id, rt);
+                self.dead.remove(&id);
+                // Owe this pane a session id? Watch for one (socket reports
+                // it exactly; the filesystem scan below is the fallback).
+                if spec.session.is_none() && adapter.session_root(&spec.cwd).is_some() {
+                    self.pending_detect.insert(id, SystemTime::now());
+                }
             }
-            Err(_) => {
-                // Dead pane placeholder: rendered as Exited. TODO(M2): show
-                // the spawn error in the pane body + offer fresh launch.
+            Err(e) => {
+                self.dead.insert(id, e.to_string());
             }
         }
+    }
+
+    /// Periodic housekeeping: filesystem-based session detection (design doc
+    /// §6.1 fallback). Called from the main loop; self-throttled.
+    pub fn tick(&mut self) {
+        if self.last_detect.elapsed() < DETECT_INTERVAL || self.pending_detect.is_empty() {
+            return;
+        }
+        self.last_detect = Instant::now();
+        let pending: Vec<(PaneId, SystemTime)> =
+            self.pending_detect.iter().map(|(k, v)| (*k, *v)).collect();
+        for (id, since) in pending {
+            let Some((spec, adapter)) = self.find_spec(id).and_then(|s| {
+                self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a))
+            }) else {
+                self.pending_detect.remove(&id);
+                continue;
+            };
+            if let Some(session) = adapter.detect_session(&spec.cwd, since) {
+                self.set_session(id, session);
+            }
+        }
+    }
+
+    fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
+        self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
+    }
+
+    fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
+        self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
+    }
+
+    fn set_session(&mut self, id: PaneId, session: String) {
+        if let Some(spec) = self.find_spec_mut(id) {
+            spec.session = Some(session);
+            self.pending_detect.remove(&id);
+            let _ = self.ws.save();
+        }
+    }
+
+    /// Session id reported exactly by an agent-side extension.
+    pub fn on_session(&mut self, id: PaneId, session: String) {
+        self.set_session(id, session);
+    }
+
+    /// Exact status from an agent-side extension. Returns a notification
+    /// message when a *non-focused* pane starts needing the user.
+    pub fn on_status(&mut self, id: PaneId, status: AgentStatus) -> Option<String> {
+        let prev = self.runtimes.get(&id).map(|rt| rt.status.current());
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.status.set_extension_status(status);
+        }
+        let became_needy = matches!(status, AgentStatus::NeedsInput | AgentStatus::Waiting)
+            && prev == Some(AgentStatus::Working);
+        if became_needy && id != self.focused {
+            let name = self
+                .find_spec(id)
+                .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
+                .unwrap_or_else(|| format!("pane {id}"));
+            Some(format!("{name} is waiting for you"))
+        } else {
+            None
+        }
+    }
+
+    // -- dead panes --------------------------------------------------------
+
+    /// True when the focused pane has no live process (spawn failed or the
+    /// child exited) — its keys are then handled by roost, not forwarded.
+    pub fn focused_dead(&self) -> bool {
+        match self.runtimes.get(&self.focused) {
+            None => true,
+            Some(rt) => rt.status.current() == AgentStatus::Exited,
+        }
+    }
+
+    /// Relaunch the focused dead pane. `fresh` drops the session id first
+    /// (for when resume fails because the session was deleted).
+    pub fn respawn_focused(&mut self, fresh: bool) {
+        let id = self.focused;
+        if fresh {
+            if let Some(spec) = self.find_spec_mut(id) {
+                spec.session = None;
+            }
+        }
+        if let Some(mut rt) = self.runtimes.remove(&id) {
+            rt.kill();
+        }
+        self.dead.remove(&id);
+        let Some(spec) = self.find_spec(id).cloned() else { return };
+        if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
+            self.spawn_pane(id, &spec, pr.rect);
+        }
+        let _ = self.ws.save();
     }
 
     // -- event handling ----------------------------------------------------

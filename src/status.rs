@@ -55,8 +55,10 @@ impl StatusTracker {
         self.exited = true;
     }
 
-    #[allow(dead_code)] // wired up in M3 by the socket listener
     pub fn set_extension_status(&mut self, s: AgentStatus) {
+        if s == AgentStatus::Exited {
+            self.exited = true;
+        }
         self.extension_status = Some(s);
     }
 

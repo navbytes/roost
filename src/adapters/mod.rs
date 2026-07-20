@@ -10,7 +10,9 @@ pub mod shell;
 
 use crate::workspace::PaneSpec;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
@@ -39,13 +41,24 @@ pub trait AgentAdapter: Send + Sync {
     /// Command to resume the given session id in `cwd`.
     fn resume(&self, cwd: &Path, session: &str) -> CommandSpec;
 
-    /// Try to learn the session id of a freshly launched pane so it can be
-    /// persisted (e.g. by diffing the tool's session directory before/after
-    /// spawn, or via an extension handshake).
-    ///
-    /// TODO(M2): implement session-dir diffing for pi and claude.
-    fn detect_session(&self, _cwd: &Path) -> Option<String> {
+    /// Where this tool stores its session files for `cwd`, if it has any.
+    fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
         None
+    }
+
+    /// Turn a session file path into the id the resume command expects.
+    fn session_id_from_path(&self, path: &Path) -> Option<String> {
+        path.file_stem().map(|s| s.to_string_lossy().into_owned())
+    }
+
+    /// Learn the session id of a freshly launched pane by finding the session
+    /// file written since spawn. The exact channel (extension handshake over
+    /// the status socket) takes precedence when available; this is the
+    /// filesystem fallback.
+    fn detect_session(&self, cwd: &Path, since: SystemTime) -> Option<String> {
+        let root = self.session_root(cwd)?;
+        let path = newest_session_file_since(&root, since)?;
+        self.session_id_from_path(&path)
     }
 
     /// Pick launch vs resume based on what the pane spec knows.
@@ -55,6 +68,29 @@ pub trait AgentAdapter: Send + Sync {
             None => self.launch(&spec.cwd),
         }
     }
+}
+
+/// Newest file under `root` (recursive) modified after `since`. Used to spot
+/// the session file a freshly launched agent just created.
+pub fn newest_session_file_since(root: &Path, since: SystemTime) -> Option<PathBuf> {
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(mtime) = meta.modified() else { continue };
+            if mtime > since && best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, p));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 pub type Registry = HashMap<&'static str, Box<dyn AgentAdapter>>;
