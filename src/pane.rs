@@ -15,6 +15,7 @@ use crate::workspace::PaneId;
 const SCROLLBACK_LINES: usize = 5000;
 
 pub struct PaneRuntime {
+    #[allow(dead_code)] // useful in logs/debugging; identity lives in App maps
     pub id: PaneId,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,

@@ -216,12 +216,12 @@ Resize: on layout change, recompute rects → `pty.resize(rows, cols)` per pane 
 
 Each milestone is independently usable; stop anywhere and still have a tool.
 
-- **M0 — one pane** *(weekend)*: spawn `pi` in a PTY, render via vt100+ratatui full-screen, pass keys through, clean exit. Proves the render/input core.
-- **M1 — splits + tabs**: layout tree, focus movement, resize, tab bar.
-- **M2 — persistence + resume**: workspace.json, atomic debounced saves, restore-on-launch with the pi adapter (`--session`). Session detection via session-dir diffing (works before the extension exists). **← daily-driver threshold for the reboot story**
-- **M3 — status**: heuristic detector + the roost pi extension over the unix socket; border colors, badges, bell on NeedsInput. **← the v1 bar from the interview**
-- **M4 — stacked panes**: stack node, collapsed title bars, stack navigation. Fleet-at-a-glance.
-- **M5 — polish**: claude adapter, quick-launch picker, macOS notifications, config file, generic TOML adapter.
+- **M0 ✓ — one pane** *(weekend)*: spawn `pi` in a PTY, render via vt100+ratatui full-screen, pass keys through, clean exit. Proves the render/input core.
+- **M1 ✓ — splits + tabs**: layout tree, focus movement, resize, tab bar.
+- **M2 ✓ — persistence + resume**: workspace.json, atomic debounced saves, restore-on-launch with the pi adapter (`--session`). Session detection via session-dir diffing (works before the extension exists). **← daily-driver threshold for the reboot story**
+- **M3 ✓ — status**: heuristic detector + the roost pi extension over the unix socket; border colors, badges, bell on NeedsInput. **← the v1 bar from the interview**
+- **M4 ✓ — stacked panes**: stack node, collapsed title bars, stack navigation. Fleet-at-a-glance.
+- **M5 ✓ — polish (partial: claude adapter, picker, notifications; floating panes + config deferred)**: claude adapter, quick-launch picker, macOS notifications, config file, generic TOML adapter.
 
 Risk notes: vt100 fidelity is the main unknown (agents use rich TUIs — pi and Claude Code both redraw aggressively). Mitigation: M0 exists precisely to stress this early; if `vt100` falls short, wezterm's `termwiz` is the upgrade path. Second risk: `NeedsInput` semantics differ per tool ("turn ended" vs "explicit question") — the adapter owns that interpretation, so wrongness stays local.
 
