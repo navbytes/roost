@@ -76,32 +76,39 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     loop {
         terminal.draw(|f| ui::render::draw(f, &mut app))?;
 
-        // Terminal input (with a frame-rate timeout)...
+        // Drain ALL pending terminal events this tick, not just one. During a
+        // resize storm (dragging the window edge) several events queue up
+        // faster than a one-event-per-iteration loop can consume; processing
+        // one at a time leaves roost's geometry lagging the true terminal size
+        // and stale intermediate frames on screen. We coalesce resizes to a
+        // single post-drain reconciliation.
+        let mut resized = false;
         if crossterm::event::poll(Duration::from_millis(33))? {
-            match crossterm::event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if app.handle_mode_key(key) {
-                        continue;
-                    }
-                    match input::translate(key) {
-                        InputResult::Action(a) => app.apply(a),
-                        InputResult::Forward(bytes) if app.focused_dead() => {
-                            // Dead pane: roost handles the keys instead.
-                            match bytes.as_slice() {
-                                b"\r" => app.respawn_focused(false), // retry/resume
-                                b"f" => app.respawn_focused(true),   // fresh session
-                                _ => {}
-                            }
+            loop {
+                match crossterm::event::read()? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        if !app.handle_mode_key(key) {
+                            handle_key(&mut app, key);
                         }
-                        InputResult::Forward(bytes) => app.forward_bytes(&bytes),
-                        InputResult::Ignore => {}
                     }
+                    Event::Mouse(me) => handle_mouse(&mut app, me),
+                    // Coalesce: act on the true size once, after draining.
+                    Event::Resize(..) => resized = true,
+                    Event::Paste(s) => app.forward_bytes(s.as_bytes()),
+                    _ => {}
                 }
-                Event::Mouse(me) => handle_mouse(&mut app, me),
-                Event::Resize(w, h) => app.on_resize(ratatui::layout::Size::new(w, h)),
-                Event::Paste(s) => app.forward_bytes(s.as_bytes()),
-                _ => {}
+                if !crossterm::event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
+        }
+        if resized {
+            // Trust the terminal's current size, not a possibly-stale value
+            // carried on an intermediate coalesced event, then hard-clear so
+            // no leftover cells from an in-between frame survive.
+            let sz = terminal.size()?;
+            app.on_resize(sz);
+            terminal.clear()?;
         }
 
         // ...then drain PTY output and socket events.
@@ -128,6 +135,21 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
     app.shutdown();
     Ok(())
+}
+
+/// Handle a key that a UI mode did not consume: a global action, or bytes
+/// forwarded to the focused pane (dead panes intercept relaunch keys).
+fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent) {
+    match input::translate(key) {
+        InputResult::Action(a) => app.apply(a),
+        InputResult::Forward(bytes) if app.focused_dead() => match bytes.as_slice() {
+            b"\r" => app.respawn_focused(false), // retry/resume
+            b"f" => app.respawn_focused(true),   // fresh session
+            _ => {}
+        },
+        InputResult::Forward(bytes) => app.forward_bytes(&bytes),
+        InputResult::Ignore => {}
+    }
 }
 
 /// Route mouse events: wheel scrolls the hovered pane (forwarded to
