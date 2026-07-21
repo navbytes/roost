@@ -239,8 +239,14 @@ reflexively expose the whole `Action` enum.
   a real session-branching `fork` via a bidirectional pi extension; semantic
   `read(last_turn)`; HTTP transport; multi-instance discovery.
 
-**Interface status: complete via the CLI.** Remaining is a live-terminal smoke
-test and, if ever wanted, the Phase 3 niceties above.
+**Interface status: complete via the CLI.** Security constraints §5 now met:
+per-verb capability + ownership scope (#1–4), owner-scoped reads (#5), 0600
+socket + separate off-env control token (#2), CSPRNG control token that
+hard-fails rather than falling back (#10), and an unconditional audit log at
+`<state>/control.log` — principal + verb + target + outcome, never the message
+text (#9). Still open: a per-principal connection/rate cap (#6, beyond the
+global 64) and a human-consent gate on reads (#5). Remaining overall is a
+live-terminal smoke test and, if ever wanted, the Phase 3 niceties above.
 
 ## 9. The three paradigms, compared
 

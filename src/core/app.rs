@@ -172,6 +172,11 @@ impl<B: PaneBackend> App<B> {
         // otherwise inconsistent — repair layout ↔ panes before spawning.
         let mut ws = ws;
         ws.validate_and_repair();
+        // The fleet control token authorizes driving the whole workspace, so it
+        // must be genuinely unpredictable — refuse to start rather than fall
+        // back to a weak (time-seeded) secret if the CSPRNG is unavailable.
+        let control_token = gen_secret()
+            .ok_or_else(|| anyhow::anyhow!("cannot read /dev/urandom for the control token"))?;
         let mut app = Self {
             focused: 0,
             ws,
@@ -194,7 +199,7 @@ impl<B: PaneBackend> App<B> {
             undo: Vec::new(),
             confirm_close: None,
             tokens: HashMap::new(),
-            control_token: gen_token(),
+            control_token,
             waiters: Vec::new(),
         };
         app.spawn_active_tab();
@@ -582,16 +587,49 @@ impl<B: PaneBackend> App<B> {
     /// replies later) and delegates every other verb to synchronous dispatch.
     pub fn handle_control_msg(&mut self, req: Request, reply: Sender<Reply>) {
         let actor = self.resolve_actor(&req.token);
+        let summary = method_summary(&req.method);
         match (actor, req.method) {
             (None, _) => {
+                self.audit(None, &summary, false, "unauthorized");
                 let _ = reply.send(Reply::err("unauthorized: unknown or missing token"));
             }
             (Some(actor), Method::Wait { panes, until, timeout_ms }) => {
+                self.audit(Some(actor), &summary, true, "parked");
                 self.register_waiter(actor, panes, &until, timeout_ms, reply);
             }
             (Some(actor), method) => {
-                let _ = reply.send(self.dispatch(actor, method));
+                let r = self.dispatch(actor, method);
+                let (ok, detail) = match &r {
+                    Reply::Ok { .. } => (true, String::new()),
+                    Reply::Err { err } => (false, err.clone()),
+                };
+                self.audit(Some(actor), &summary, ok, &detail);
+                let _ = reply.send(r);
             }
+        }
+    }
+
+    /// Append a control action to `<state>/control.log` (unconditional — every
+    /// spawn/send/read/close/etc. that touches the fleet is recorded with who
+    /// did it, what, and the outcome). No-op when there's no socket dir.
+    fn audit(&self, actor: Option<Actor>, summary: &str, ok: bool, detail: &str) {
+        let Some(dir) = self.sock_path.as_ref().and_then(|p| p.parent()) else { return };
+        let principal = match actor {
+            Some(Actor::Fleet) => "fleet".to_string(),
+            Some(Actor::Pane(id)) => format!("pane:{id}"),
+            None => "?".to_string(),
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let outcome = if ok { "ok" } else { "err" };
+        let line = format!("{ts} {principal} {summary} -> {outcome} {detail}\n");
+        use std::io::Write;
+        if let Ok(mut f) =
+            std::fs::OpenOptions::new().create(true).append(true).open(dir.join("control.log"))
+        {
+            let _ = f.write_all(line.as_bytes());
         }
     }
 
@@ -1479,28 +1517,49 @@ impl<B: PaneBackend> App<B> {
 /// hex-encoded. The socket is already owner-only (0600); this token is the
 /// extra guard against a process in one pane spoofing another pane over the
 /// shared socket, so it needs to be unpredictable to a sibling pane.
-fn gen_token() -> String {
+/// A compact, log-safe summary of a control verb + its target. Deliberately
+/// omits `send` text (may contain secrets) — records only its length.
+fn method_summary(m: &Method) -> String {
+    let opt = |p: &Option<PaneId>| p.map(|p| p.to_string()).unwrap_or_else(|| "all".into());
+    match m {
+        Method::List => "list".into(),
+        Method::Status { pane } => format!("status pane={}", opt(pane)),
+        Method::Spawn { adapter, .. } => format!("spawn adapter={adapter}"),
+        Method::Fork { pane } => format!("fork pane={}", opt(pane)),
+        Method::Send { pane, text, submit } => {
+            format!("send pane={pane} len={} submit={submit}", text.len())
+        }
+        Method::Read { pane, .. } => format!("read pane={pane}"),
+        Method::Close { pane, force } => format!("close pane={pane} force={force}"),
+        Method::Wait { panes, until, .. } => format!("wait panes={panes:?} until={until}"),
+    }
+}
+
+/// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is
+/// unreadable — the caller decides whether that's fatal.
+fn gen_secret() -> Option<String> {
     use std::io::Read;
     let mut buf = [0u8; 16];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok()
-    {
-        let mut s = String::with_capacity(32);
-        for b in buf {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
-    } else {
-        // /dev/urandom is present on every platform roost runs on; if it's
-        // somehow unreadable, fall back to a time-seeded value. Weaker, but the
-        // socket's 0600 permissions are still the primary boundary.
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).ok()?;
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        s.push_str(&format!("{b:02x}"));
+    }
+    Some(s)
+}
+
+/// A per-pane status token. Unlike the fleet control token, a weak fallback is
+/// tolerable here: it only authenticates a pane's *own* status/session reports
+/// and sits behind the 0600 socket. The control token, which can drive the
+/// whole fleet, hard-fails instead (see `App::new`).
+fn gen_token() -> String {
+    gen_secret().unwrap_or_else(|| {
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{n:032x}")
-    }
+    })
 }
 
 /// Find an http(s) URL that covers character index `col` in `line`. The URL
@@ -1746,6 +1805,18 @@ mod tests {
             app.handle_control(Request { token: ct, method: Method::Close { pane: 1, force: true } }),
             crate::core::control::Reply::Err { .. }
         ));
+    }
+
+    #[test]
+    fn audit_summary_omits_send_text() {
+        use crate::core::control::Method;
+        let s = super::method_summary(&Method::Send {
+            pane: 5,
+            text: "SUPER_SECRET_VALUE".into(),
+            submit: true,
+        });
+        assert!(!s.contains("SECRET")); // text is never logged
+        assert!(s.contains("pane=5") && s.contains("len=18") && s.contains("submit=true"));
     }
 
     #[test]

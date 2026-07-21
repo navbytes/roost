@@ -165,7 +165,9 @@ may spawn/fork freely and drive only the panes *it* spawned (its subtree) — a
 prompt-injected pane can't reach panes it didn't create. The fleet token in
 `<state>/control.token` (0600, never in a pane's env) grants an external
 orchestrator full reach. Targeting is daemonless: an in-pane client finds its
-instance via `$ROOST_SOCK` automatically.
+instance via `$ROOST_SOCK` automatically. Every control action is recorded in
+`<state>/control.log` (principal, verb, target, outcome — never the message
+text).
 
 ## Architecture (ports & adapters)
 
