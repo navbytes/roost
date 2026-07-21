@@ -202,10 +202,35 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        // Shared label with the mouse hit-tester so clicks land on the right tab.
-        spans.push(Span::styled(crate::ui::mouse::tab_label(i, &tab.name), style));
+        // The shared label (`  N name`) starts with two spaces; overwrite the
+        // first with a per-tab status glyph so the tab bar summarises every
+        // tab — crucially, an un-spawned background tab shows `·` (unknown),
+        // never an idle-looking blank. Same column count as the plain label,
+        // so `tab_at_x` hit-testing is unaffected.
+        let label = crate::ui::mouse::tab_label(i, &tab.name);
+        let rest: String = label.chars().skip(1).collect();
+        let (glyph, glyph_color) = tab_summary_badge(app.tab_summary(i));
+        spans.push(Span::styled(
+            glyph.to_string(),
+            Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(rest, style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Map a tab's aggregate summary to a tab-bar glyph + colour. `Quiet` renders
+/// as a blank (no clutter for tabs with nothing to report); `Unknown` is a
+/// faint dot so a not-yet-spawned background tab reads as "unknown", not idle.
+fn tab_summary_badge(s: crate::core::app::TabSummary) -> (char, Color) {
+    use crate::core::app::TabSummary::*;
+    match s {
+        NeedsInput => ('◆', Color::Magenta),
+        Working => ('●', Color::Green),
+        Unknown => ('·', Color::DarkGray),
+        Waiting => ('○', Color::Yellow),
+        Quiet => (' ', Color::DarkGray),
+    }
 }
 
 fn status_color(s: AgentStatus) -> Color {

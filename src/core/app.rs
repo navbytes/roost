@@ -63,6 +63,19 @@ pub struct Selection {
 /// How long the "copied" flash stays in the hint bar.
 const FLASH_WINDOW: Duration = Duration::from_secs(2);
 
+/// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
+/// is a lazily-loaded tab whose panes haven't been spawned — deliberately
+/// distinct from `Quiet` (spawned, nothing happening) so a background tab
+/// never masquerades as idle. `render` maps each to a glyph + colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabSummary {
+    NeedsInput,
+    Working,
+    Unknown,
+    Waiting,
+    Quiet,
+}
+
 pub struct App<B: PaneBackend> {
     pub ws: Workspace,
     pub runtimes: HashMap<PaneId, B>,
@@ -368,6 +381,41 @@ impl<B: PaneBackend> App<B> {
 
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
         self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
+    }
+
+    /// One-glyph summary of a tab's panes for the tab bar. Background tabs are
+    /// spawned lazily (only when first visited), so their panes have no runtime
+    /// and no known status — we report `Unknown` for those rather than letting
+    /// the tab look idle/quiet, which would be a lie. A pane that's neither
+    /// running nor a recorded spawn-failure is "not spawned yet".
+    pub fn tab_summary(&self, tab_index: usize) -> TabSummary {
+        let Some(tab) = self.ws.tabs.get(tab_index) else { return TabSummary::Quiet };
+        let mut any_unknown = false;
+        let (mut needs, mut working, mut waiting) = (false, false, false);
+        for id in tab.panes.keys() {
+            match self.runtimes.get(id) {
+                Some(rt) => match rt.status() {
+                    AgentStatus::NeedsInput => needs = true,
+                    AgentStatus::Working => working = true,
+                    AgentStatus::Waiting => waiting = true,
+                    _ => {}
+                },
+                // No runtime and not a known spawn-failure ⇒ not spawned yet.
+                None if !self.dead.contains_key(id) => any_unknown = true,
+                None => {}
+            }
+        }
+        if needs {
+            TabSummary::NeedsInput // a real, actionable signal wins outright
+        } else if any_unknown {
+            TabSummary::Unknown // honest: we haven't run these panes
+        } else if working {
+            TabSummary::Working
+        } else if waiting {
+            TabSummary::Waiting
+        } else {
+            TabSummary::Quiet
+        }
     }
 
     /// Is a socket message claiming to be `id` carrying that pane's token?
@@ -960,6 +1008,20 @@ mod tests {
         assert_eq!(app.runtimes.len(), 2);
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes.len(), 2);
+    }
+
+    #[test]
+    fn tab_summary_unknown_for_unspawned_needs_input_wins() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        // Freshly spawned shell, nothing happening → Quiet (not Unknown).
+        assert_eq!(app.tab_summary(0), TabSummary::Quiet);
+        // A pane needing input dominates the summary.
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.tab_summary(0), TabSummary::NeedsInput);
+        // Not spawned (no runtime, no recorded failure) → Unknown, never idle.
+        app.runtimes.remove(&id);
+        assert_eq!(app.tab_summary(0), TabSummary::Unknown);
     }
 
     #[test]
