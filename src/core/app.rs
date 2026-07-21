@@ -488,6 +488,13 @@ impl<B: PaneBackend> App<B> {
             .map(|(m, _)| m.as_str())
     }
 
+    /// The URL under inner cell (row, col) of pane `id`, if any (for
+    /// Alt+click-to-open). Reads that row's text from the pane grid.
+    pub fn url_at(&self, id: PaneId, row: u16, col: u16) -> Option<String> {
+        let line = self.runtimes.get(&id)?.grab_text((row, 0), (row, u16::MAX));
+        find_url_at(&line, col as usize)
+    }
+
     // -- mouse -------------------------------------------------------------
 
     /// Left click: focus the pane under the cursor (expanding stack members).
@@ -813,6 +820,32 @@ impl<B: PaneBackend> App<B> {
     }
 }
 
+/// Find an http(s) URL that covers character index `col` in `line`. The URL
+/// is the surrounding non-whitespace run, with wrapping/trailing punctuation
+/// stripped. Pure, so it's unit-tested.
+pub fn find_url_at(line: &str, col: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+        end += 1;
+    }
+    let token: String = chars[start..=end].iter().collect();
+    // Strip wrapping brackets/quotes and trailing sentence punctuation.
+    let trimmed = token.trim_matches(|c: char| "()[]{}<>\"'`.,;:!?".contains(c));
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
 }
@@ -1009,6 +1042,23 @@ mod tests {
         assert!(!app.in_copy_mode()); // exited on copy
         assert!(app.selection.is_none());
         assert!(app.flash().is_some()); // "copied N chars"
+    }
+
+    #[test]
+    fn find_url_detects_and_trims() {
+        use super::find_url_at;
+        let line = "see https://example.com/path for details";
+        // click anywhere within the URL (cols 4..=28) returns it
+        assert_eq!(find_url_at(line, 4).as_deref(), Some("https://example.com/path"));
+        assert_eq!(find_url_at(line, 20).as_deref(), Some("https://example.com/path"));
+        // click on surrounding words → nothing
+        assert_eq!(find_url_at(line, 0), None); // "see"
+        assert_eq!(find_url_at(line, 30), None); // "for"
+        // trailing punctuation and wrapping parens are stripped
+        assert_eq!(find_url_at("(https://a.co).", 3).as_deref(), Some("https://a.co"));
+        assert_eq!(find_url_at("go to https://a.co!", 10).as_deref(), Some("https://a.co"));
+        // non-http tokens ignored
+        assert_eq!(find_url_at("ftp://x.co here", 2), None);
     }
 
     #[test]

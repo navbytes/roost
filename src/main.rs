@@ -215,6 +215,18 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
     let rects = app.rects();
     let Some(pane) = mouse::hit_test(&rects, me.column, me.row) else { return };
 
+    // Alt+click a URL to open it in the browser (roost owns the Alt layer).
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
+        && me.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+        && !pane.collapsed
+    {
+        let (r, c) = inner_cell(pane.rect, me.column, me.row);
+        if let Some(url) = app.url_at(pane.id, r, c) {
+            infra::open::open_url(&url);
+            return;
+        }
+    }
+
     // A left press focuses the pane under the cursor (expands stack members).
     if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
         app.on_click(pane.id);

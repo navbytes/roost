@@ -70,6 +70,11 @@ members). Over a mouse-aware app, clicks and drags are forwarded too, so you
 can interact with an agent's TUI directly (menus, buttons, selection). Click
 a tab in the tab bar to switch to it.
 
+**Opening links**: `Alt`+click a URL in any pane to open it in your browser
+(`open` on macOS, `xdg-open` on Linux). roost uses `Alt`+click rather than
+plain click so it doesn't fight click-to-focus, and because a terminal can't
+report Cmd-clicks to it.
+
 **Selecting text**: because roost holds mouse capture (to route the wheel and
 clicks), your terminal's own drag-to-select is intercepted. Use **copy mode**
 instead: press `Alt+c`, drag to select within a pane, and it copies to your

@@ -4,6 +4,7 @@
 pub mod clipboard;
 pub mod inspect;
 pub mod notify;
+pub mod open;
 pub mod pty;
 pub mod sock;
 pub mod store;
