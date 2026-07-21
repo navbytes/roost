@@ -10,6 +10,7 @@ use crate::core::app::{picker_items, App, Mode, RenameTarget};
 use crate::core::status::AgentStatus;
 use crate::core::layout::PaneRect;
 use crate::ports::PaneBackend;
+use crate::ui::theme;
 
 pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     let area = f.area();
@@ -265,28 +266,16 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Map a tab's aggregate summary to a tab-bar glyph + colour. `Quiet` renders
-/// as a blank (no clutter for tabs with nothing to report); `Unknown` is a
-/// faint dot so a not-yet-spawned background tab reads as "unknown", not idle.
+/// Map a tab's aggregate summary to a tab-bar glyph + colour (theme::C5).
+/// `Quiet` renders as a blank (no clutter for tabs with nothing to report);
+/// `Unknown` is a faint dot so a not-yet-spawned background tab reads as
+/// "unknown", not idle.
 fn tab_summary_badge(s: crate::core::app::TabSummary) -> (char, Color) {
-    use crate::core::app::TabSummary::*;
-    match s {
-        NeedsInput => ('◆', Color::Magenta),
-        Working => ('●', Color::Green),
-        Unknown => ('·', Color::DarkGray),
-        Waiting => ('○', Color::Yellow),
-        Quiet => (' ', Color::DarkGray),
-    }
+    theme::tab_summary_style(s)
 }
 
 fn status_color(s: AgentStatus) -> Color {
-    match s {
-        AgentStatus::Working => Color::Green,
-        AgentStatus::NeedsInput => Color::Magenta,
-        AgentStatus::Waiting => Color::Yellow,
-        AgentStatus::Idle => Color::DarkGray,
-        AgentStatus::Exited => Color::Red,
-    }
+    theme::status_color(s)
 }
 
 fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
@@ -341,10 +330,12 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
         return;
     }
 
+    // C3: focus is the only signal a border carries now — status lives in
+    // the glyph system (badge/title), not the border color. No BOLD.
     let border_style = if focused {
-        Style::default().fg(status_color(status)).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme::ACCENT)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme::RULE)
     };
     let block = Block::bordered().title(title_line).border_style(border_style);
     let inner = block.inner(pr.rect);

@@ -4,3 +4,4 @@
 pub mod input;
 pub mod mouse;
 pub mod render;
+pub mod theme;
