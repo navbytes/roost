@@ -182,4 +182,69 @@ impl PaneBackend for PtyPane {
     fn observe(&self, known: &[String]) -> Option<Observation> {
         inspect::observe(self.pid?, known)
     }
+
+    fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        extract_selection(self.parser.screen(), start, end)
+    }
+}
+
+/// Pull the text between two inclusive cell coords (row, col) from a vt100
+/// screen, in reading order: from `start` to end-of-line, whole middle lines,
+/// and start-of-line to `end`. Trailing spaces are trimmed per line and lines
+/// joined with '\n'. `start`/`end` are normalized (either order accepted).
+pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -> String {
+    let (rows, cols) = screen.size();
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+    // Normalize so `start` precedes `end` in reading order.
+    let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
+    let mut lines: Vec<String> = Vec::new();
+    for row in start.0..=end.0.min(rows - 1) {
+        let first = if row == start.0 { start.1 } else { 0 };
+        let last = if row == end.0 { end.1 } else { cols - 1 };
+        let mut line = String::new();
+        for col in first..=last.min(cols - 1) {
+            match screen.cell(row, col) {
+                Some(c) if !c.contents().is_empty() => line.push_str(&c.contents()),
+                _ => line.push(' '),
+            }
+        }
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_selection;
+
+    fn screen_with(text: &str, rows: u16, cols: u16) -> vt100::Parser {
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        p.process(text.as_bytes());
+        p
+    }
+
+    #[test]
+    fn extracts_single_line_range() {
+        let p = screen_with("hello world", 3, 20);
+        // "hello world": cols 0..=10; select "world" = cols 6..=10
+        assert_eq!(extract_selection(p.screen(), (0, 6), (0, 10)), "world");
+    }
+
+    #[test]
+    fn extracts_multi_line_and_trims_trailing() {
+        let p = screen_with("abc\r\ndef", 3, 20);
+        // from (0,0) to (1,2) → "abc\ndef"
+        assert_eq!(extract_selection(p.screen(), (0, 0), (1, 2)), "abc\ndef");
+    }
+
+    #[test]
+    fn normalizes_reversed_coords() {
+        let p = screen_with("hello", 2, 10);
+        assert_eq!(extract_selection(p.screen(), (0, 4), (0, 0)), "hello");
+    }
 }

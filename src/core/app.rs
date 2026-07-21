@@ -46,7 +46,22 @@ pub enum Mode {
     Rename { buffer: String, target: RenameTarget },
     Picker { selection: usize },
     Scroll { offset: usize },
+    /// Mouse-drag text selection; copies to the clipboard on release.
+    Copy,
 }
+
+/// An in-progress / completed text selection within one pane. Coordinates are
+/// (row, col) in the pane's inner (border-excluded) cell space, 0-based.
+#[derive(Debug, Clone, Copy)]
+pub struct Selection {
+    pub pane: PaneId,
+    pub anchor: (u16, u16),
+    pub cursor: (u16, u16),
+    pub dragging: bool,
+}
+
+/// How long the "copied" flash stays in the hint bar.
+const FLASH_WINDOW: Duration = Duration::from_secs(2);
 
 pub struct App<B: PaneBackend> {
     pub ws: Workspace,
@@ -72,6 +87,10 @@ pub struct App<B: PaneBackend> {
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
     /// they are (or the window has simply run out).
     alt_seen: bool,
+    /// Active/last text selection (copy mode).
+    pub selection: Option<Selection>,
+    /// Transient status message shown in the hint bar (e.g. "copied").
+    flash: Option<(String, Instant)>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -104,6 +123,8 @@ impl<B: PaneBackend> App<B> {
             sock_path,
             started: Instant::now(),
             alt_seen: false,
+            selection: None,
+            flash: None,
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -422,6 +443,51 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    // -- copy mode / selection --------------------------------------------
+
+    pub fn in_copy_mode(&self) -> bool {
+        matches!(self.mode, Mode::Copy)
+    }
+
+    /// Start a selection in pane `id` at inner cell (row, col).
+    pub fn begin_selection(&mut self, id: PaneId, row: u16, col: u16) {
+        self.selection = Some(Selection { pane: id, anchor: (row, col), cursor: (row, col), dragging: true });
+    }
+
+    /// Extend the active drag to inner cell (row, col).
+    pub fn extend_selection(&mut self, row: u16, col: u16) {
+        if let Some(sel) = &mut self.selection {
+            if sel.dragging {
+                sel.cursor = (row, col);
+            }
+        }
+    }
+
+    /// Finish the drag: extract the selected text, set a "copied" flash, and
+    /// leave copy mode. Returns the text to hand to the clipboard (None when
+    /// the selection is empty).
+    pub fn finish_selection(&mut self) -> Option<String> {
+        let sel = self.selection.as_mut()?;
+        sel.dragging = false;
+        let (pane, anchor, cursor) = (sel.pane, sel.anchor, sel.cursor);
+        let text = self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
+        self.mode = Mode::Normal;
+        self.selection = None;
+        if text.is_empty() {
+            return None;
+        }
+        self.flash = Some((format!("copied {} chars", text.len()), Instant::now()));
+        Some(text)
+    }
+
+    /// Current transient hint-bar message, if still within its window.
+    pub fn flash(&self) -> Option<&str> {
+        self.flash
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < FLASH_WINDOW)
+            .map(|(m, _)| m.as_str())
+    }
+
     // -- mouse -------------------------------------------------------------
 
     /// Left click: focus the pane under the cursor (expanding stack members).
@@ -517,6 +583,10 @@ impl<B: PaneBackend> App<B> {
             }
             Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
             Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
+            Action::CopyMode => {
+                self.mode = Mode::Copy;
+                self.selection = None;
+            }
             Action::ToggleHints => self.hints = !self.hints,
         }
         self.relayout();
@@ -723,6 +793,14 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
+            Mode::Copy => {
+                // Selection is mouse-driven; keys just exit.
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.mode = Mode::Normal;
+                    self.selection = None;
+                }
+                true
+            }
         }
     }
 
@@ -917,6 +995,29 @@ mod tests {
         for pr in app.rects() {
             assert!(pr.rect.width >= 2 && pr.rect.height >= 1);
         }
+    }
+
+    #[test]
+    fn copy_mode_selection_extracts_text_and_flashes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        assert!(app.in_copy_mode());
+        app.runtimes.get_mut(&1).unwrap().grab = "selected text".into();
+        app.begin_selection(1, 0, 0);
+        app.extend_selection(0, 5);
+        assert_eq!(app.finish_selection().as_deref(), Some("selected text"));
+        assert!(!app.in_copy_mode()); // exited on copy
+        assert!(app.selection.is_none());
+        assert!(app.flash().is_some()); // "copied N chars"
+    }
+
+    #[test]
+    fn copy_mode_empty_selection_copies_nothing() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        app.begin_selection(1, 0, 0); // grab defaults to ""
+        assert!(app.finish_selection().is_none());
+        assert!(!app.in_copy_mode());
     }
 
     #[test]

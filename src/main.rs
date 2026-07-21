@@ -195,6 +195,12 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
 fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
 
+    // Copy mode owns the mouse: drag selects text, release copies.
+    if app.in_copy_mode() {
+        handle_copy_mouse(app, me);
+        return;
+    }
+
     // Tab bar (top row): click a tab to switch to it.
     if me.row == 0 {
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -224,4 +230,45 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         MouseAction::Scroll(delta) => app.wheel_scroll(pane.id, delta),
         MouseAction::None => {}
     }
+}
+
+/// Copy-mode mouse: left-drag selects text within the pane it started in;
+/// release extracts the selection and copies it to the system clipboard.
+fn handle_copy_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let rects = app.rects();
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(pane) = mouse::hit_test(&rects, me.column, me.row) {
+                if !pane.collapsed {
+                    let (r, c) = inner_cell(pane.rect, me.column, me.row);
+                    app.begin_selection(pane.id, r, c);
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(sel) = app.selection {
+                if let Some(pane) = rects.iter().find(|p| p.id == sel.pane) {
+                    let (r, c) = inner_cell(pane.rect, me.column, me.row);
+                    app.extend_selection(r, c);
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(text) = app.finish_selection() {
+                infra::clipboard::copy(&text);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Screen (col, row) → 0-based cell inside a pane's border-excluded area,
+/// clamped to the inner bounds.
+fn inner_cell(rect: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
+    let iw = rect.width.saturating_sub(2).max(1);
+    let ih = rect.height.saturating_sub(2).max(1);
+    let c = col.saturating_sub(rect.x + 1).min(iw - 1);
+    let r = row.saturating_sub(rect.y + 1).min(ih - 1);
+    (r, c)
 }

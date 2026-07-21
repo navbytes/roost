@@ -22,6 +22,7 @@ pub enum Action {
     RenameTab,
     QuickLaunch,
     ScrollMode,
+    CopyMode,
     ToggleHints,
 }
 
@@ -55,6 +56,7 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('R') => Some(Action::RenameTab),
             KeyCode::Enter => Some(Action::QuickLaunch),
             KeyCode::Char('/') => Some(Action::ToggleHints),
+            KeyCode::Char('c') => Some(Action::CopyMode),
             KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
             KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),

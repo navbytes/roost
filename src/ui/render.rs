@@ -53,8 +53,19 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         return;
     }
 
+    // A transient action result (e.g. "copied") takes over the bar briefly.
+    if let Some(msg) = app.flash() {
+        f.render_widget(
+            Paragraph::new(format!(" {msg} "))
+                .style(Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
+            area,
+        );
+        return;
+    }
+
     // (key, what it does) pairs for the current context.
     let hints: Vec<(&str, &str)> = match &app.mode {
+        Mode::Copy => vec![("drag", "select text"), ("Esc", "cancel")],
         Mode::Rename { target, .. } => {
             let what = match target {
                 RenameTarget::Pane => "pane name",
@@ -135,7 +146,8 @@ fn dialog_border_style() -> Style {
 
 fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
     match &app.mode {
-        Mode::Normal | Mode::Scroll { .. } => {}
+        // Copy mode has no centered overlay — the selection is drawn in-pane.
+        Mode::Normal | Mode::Scroll { .. } | Mode::Copy => {}
         Mode::Rename { buffer, target } => {
             let rect = centered_near(anchor, body, 44, 3);
             dim_backdrop(f, body, rect);
@@ -279,6 +291,11 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
         }
     }
 
+    // Copy-mode selection: reverse-highlight the selected cells in this pane.
+    if let Some(sel) = app.selection.filter(|s| s.pane == pr.id) {
+        highlight_selection(f, inner, sel.anchor, sel.cursor);
+    }
+
     // iTerm2-style corner badge: the pane label, faint, top-right. Drawn
     // after the content so it stays visible (a cell TUI can't do true
     // translucency; dim gray reads as a watermark rather than content).
@@ -328,6 +345,28 @@ fn corner_badge(inner: Rect, label: &str) -> Option<(Rect, String)> {
     let w = text.chars().count() as u16;
     let x = inner.x + inner.width - w;
     Some((Rect::new(x, inner.y, w, 1), text))
+}
+
+/// Reverse-video the cells between `a` and `b` (inclusive, pane-inner coords)
+/// to show a copy-mode selection. Reading-order/linewise, clipped to `inner`.
+fn highlight_selection(f: &mut Frame, inner: Rect, a: (u16, u16), b: (u16, u16)) {
+    let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
+    let (w, h) = (inner.width, inner.height);
+    let buf = f.buffer_mut();
+    let mut row = start.0;
+    while row <= end.0 && row < h {
+        let first = if row == start.0 { start.1 } else { 0 };
+        let last = if row == end.0 { end.1 } else { w.saturating_sub(1) };
+        let mut col = first;
+        while col <= last && col < w {
+            if let Some(cell) = buf.cell_mut((inner.x + col, inner.y + row)) {
+                let s = cell.style().add_modifier(Modifier::REVERSED);
+                cell.set_style(s);
+            }
+            col += 1;
+        }
+        row += 1;
+    }
 }
 
 /// Copy the vt100 grid into the ratatui buffer.

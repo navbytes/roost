@@ -77,6 +77,13 @@ pub trait PaneBackend: Sized {
     fn observe(&self, _known_agents: &[String]) -> Option<Observation> {
         None
     }
+
+    /// Extract the visible text between two inclusive cell coords (row, col),
+    /// in pane-inner space, for copy mode. Reading order, trailing spaces
+    /// trimmed per line, lines joined with '\n'. Default empty.
+    fn grab_text(&self, _start: (u16, u16), _end: (u16, u16)) -> String {
+        String::new()
+    }
 }
 
 /// Workspace persistence. Implemented by `infra::store::FsStore`.
@@ -107,6 +114,8 @@ pub mod fakes {
         pub proto: MouseProto,
         /// Test-settable observation returned by `observe`.
         pub observation: Option<Observation>,
+        /// Test-settable text returned by `grab_text`.
+        pub grab: String,
     }
 
     impl PaneBackend for FakePane {
@@ -129,6 +138,7 @@ pub mod fakes {
                 exited: false,
                 proto: MouseProto::None,
                 observation: None,
+                grab: String::new(),
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -175,6 +185,9 @@ pub mod fakes {
         }
         fn observe(&self, _known: &[String]) -> Option<Observation> {
             self.observation.clone()
+        }
+        fn grab_text(&self, _start: (u16, u16), _end: (u16, u16)) -> String {
+            self.grab.clone()
         }
     }
 

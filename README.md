@@ -49,6 +49,7 @@ change, atomic writes). Delete it to start clean.
 | `Alt+r` | rename pane |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
+| `Alt+c` | copy mode — drag to select text, copies on release (`Esc` cancels) |
 | `Alt+t`, `Alt+1..9` | new tab / go to tab |
 | `Alt+w` | close pane |
 | `Alt+/` | toggle the shortcut hint bar |
@@ -67,8 +68,15 @@ otherwise it scrolls roost's own scrollback for that pane; typing snaps back
 to the live tail. A left click focuses a pane (and expands collapsed stack
 members). Over a mouse-aware app, clicks and drags are forwarded too, so you
 can interact with an agent's TUI directly (menus, buttons, selection). Click
-a tab in the tab bar to switch to it. (On a plain shell pane, use Shift+drag
-for your terminal's native text selection, since roost holds mouse capture.)
+a tab in the tab bar to switch to it.
+
+**Selecting text**: because roost holds mouse capture (to route the wheel and
+clicks), your terminal's own drag-to-select is intercepted. Use **copy mode**
+instead: press `Alt+c`, drag to select within a pane, and it copies to your
+system clipboard on release (via a native helper — pbcopy / wl-copy / xclip —
+and OSC 52, so it works locally and over SSH). This is pane-scoped, unlike the
+terminal's native whole-window selection. (Your terminal's Shift+drag native
+selection still works too, if you prefer it.)
 
 In a **dead pane** (process exited or spawn failed): `Enter` relaunches /
 resumes, `f` starts a fresh session (drops the stored session id).
