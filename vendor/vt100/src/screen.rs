@@ -172,6 +172,35 @@ impl Screen {
         })
     }
 
+    /// Returns the text contents of the entire buffer: scrollback history
+    /// followed by the current screen (`rows`/`contents` only cover the
+    /// visible window). Trailing spaces are trimmed per line, and wholly
+    /// blank trailing lines are trimmed from the end so a mostly-empty
+    /// screen doesn't return hundreds of blank lines.
+    ///
+    /// This will not include any formatting information, and will be in plain
+    /// text format.
+    #[must_use]
+    pub fn all_contents(&self) -> String {
+        let (_, cols) = self.size();
+        let mut lines: Vec<String> = self
+            .grid()
+            .all_rows()
+            .map(|row| {
+                let mut contents = String::new();
+                row.write_contents(&mut contents, 0, cols, false);
+                while contents.ends_with(' ') {
+                    contents.pop();
+                }
+                contents
+            })
+            .collect();
+        while lines.last().map_or(false, String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     /// Returns the text contents of the terminal logically between two cells.
     /// This will include the remainder of the starting row after `start_col`,
     /// followed by the entire contents of the rows between `start_row` and

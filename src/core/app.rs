@@ -160,6 +160,10 @@ pub struct App<B: PaneBackend> {
     control_token: String,
     /// Parked `wait` requests, polled each event-loop iteration.
     waiters: Vec<Waiter>,
+    /// `initial_input` from a control `spawn`, buffered until the pane's
+    /// first PTY output rather than written the instant it spawns — see
+    /// `on_pty_output` for why.
+    pending_input: HashMap<PaneId, Vec<u8>>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -208,6 +212,7 @@ impl<B: PaneBackend> App<B> {
             tokens: HashMap::new(),
             control_token,
             waiters: Vec::new(),
+            pending_input: HashMap::new(),
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -818,9 +823,11 @@ impl<B: PaneBackend> App<B> {
         if let Some(text) = initial_input {
             let mut bytes = text.into_bytes();
             bytes.push(b'\r');
-            if let Some(rt) = self.runtimes.get_mut(&id) {
-                rt.write_input(&bytes);
-            }
+            // Don't write yet: the agent's stdin reader may not be up this
+            // instant after spawn, silently dropping the bytes. Buffer and
+            // flush on the pane's first output (see on_pty_output) — the
+            // minimal reliable "it's alive and reading" signal.
+            self.pending_input.insert(id, bytes);
         }
         self.relayout();
         self.save();
@@ -888,11 +895,13 @@ impl<B: PaneBackend> App<B> {
         let Some(rt) = self.runtimes.get(&pane) else {
             return Reply::err("pane is not running");
         };
-        // grab_text clamps to the screen, so (0,0)..MAX is the whole grid.
-        let full = rt.grab_text((0, 0), (u16::MAX, u16::MAX));
         let text = match mode {
-            ReadMode::Screen | ReadMode::Full => full,
+            // grab_text clamps to the screen, so (0,0)..MAX is the whole
+            // visible grid — deliberately bounded, unlike Full/Tail below.
+            ReadMode::Screen => rt.grab_text((0, 0), (u16::MAX, u16::MAX)),
+            ReadMode::Full => rt.grab_all_text(),
             ReadMode::Tail(n) => {
+                let full = rt.grab_all_text();
                 let lines: Vec<&str> = full.lines().filter(|l| !l.trim().is_empty()).collect();
                 let start = lines.len().saturating_sub(n);
                 lines[start..].join("\n")
@@ -940,6 +949,10 @@ impl<B: PaneBackend> App<B> {
         // failed to spawn and is then closed leaves a stale `dead` entry that
         // never gets cleaned (pane ids are not reused for it).
         self.dead.remove(&id);
+        // A pane closed before its first output never got to flush its
+        // buffered initial_input (see on_pty_output) — drop it too, rather
+        // than leaking an entry keyed on an id that's gone for good.
+        self.pending_input.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         let empty = layout::remove_pane(&mut tab.layout, id);
@@ -987,6 +1000,14 @@ impl<B: PaneBackend> App<B> {
     pub fn on_pty_output(&mut self, id: PaneId, bytes: &[u8]) {
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.process_output(bytes);
+            // First output ⇒ the agent is alive and reading its stdin: flush
+            // any buffered spawn-time initial_input now (exactly once). A
+            // pane that never emits any output would never get it, but every
+            // agent prints a banner/prompt, so that's acceptable — a
+            // tick-based fallback flush would be the upgrade path if not.
+            if let Some(pending) = self.pending_input.remove(&id) {
+                rt.write_input(&pending);
+            }
         }
     }
 
@@ -1812,6 +1833,37 @@ mod tests {
     }
 
     #[test]
+    fn control_read_full_and_tail_reach_scrollback_not_just_the_screen() {
+        // M1 regression: Full/Tail used to alias Screen (grab_text only ever
+        // sees the visible grid), so an orchestrator's read(tail:20) missed
+        // anything that had already scrolled off. FakePane's `grab` (screen)
+        // and `all_text` (full history) are deliberately different here so a
+        // test can tell them apart.
+        use crate::core::control::{Method, ReadMode, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let id = app.focused;
+        {
+            let rt = app.runtimes.get_mut(&id).unwrap();
+            rt.grab = "visible screen only".into();
+            rt.all_text = "line1\nline2\nline3\nline4\nline5".into();
+        }
+        let ok = |r: Reply| match r {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("expected ok, got err: {err}"),
+        };
+        let mut text = |mode: ReadMode| -> String {
+            let req = Request { token: ct.clone(), method: Method::Read { pane: id, mode } };
+            let v = ok(app.handle_control(req));
+            v["text"].as_str().unwrap().to_string()
+        };
+
+        assert_eq!(text(ReadMode::Full), "line1\nline2\nline3\nline4\nline5");
+        assert_eq!(text(ReadMode::Tail(2)), "line4\nline5");
+        assert_eq!(text(ReadMode::Screen), "visible screen only");
+    }
+
+    #[test]
     fn control_pane_actor_is_scoped_to_its_subtree() {
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
@@ -2475,6 +2527,62 @@ mod tests {
         app.dead.insert(2, "spawn failed".into());
         app.apply(Action::ClosePane); // closes focused pane 2
         assert!(!app.dead.contains_key(&2));
+    }
+
+    #[test]
+    fn spawn_initial_input_is_buffered_until_first_output() {
+        // M6 regression: initial_input used to be written the instant the
+        // pane spawned, before the agent's stdin reader was necessarily up —
+        // silently dropping it. It must sit buffered until the pane's first
+        // output (a reliable "it's alive and reading" signal) and be flushed
+        // exactly once then.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let id = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: Some("hello".into()),
+            },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        // Not written yet — buffered, not lost.
+        assert!(app.runtimes.get(&id).unwrap().input.is_empty());
+        assert!(app.pending_input.contains_key(&id));
+
+        app.on_pty_output(id, b"agent banner\n");
+        assert!(app.runtimes.get(&id).unwrap().input.ends_with(b"hello\r"));
+        assert!(!app.pending_input.contains_key(&id)); // flushed exactly once
+
+        // A second output must not re-send it.
+        let len_before = app.runtimes.get(&id).unwrap().input.len();
+        app.on_pty_output(id, b"more\n");
+        assert_eq!(app.runtimes.get(&id).unwrap().input.len(), len_before);
+    }
+
+    #[test]
+    fn closing_a_pane_before_first_output_drops_its_pending_initial_input() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let id = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: Some("hello".into()),
+            },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert!(app.pending_input.contains_key(&id));
+        app.close_pane_id(id); // closed before any output ever arrived
+        assert!(!app.pending_input.contains_key(&id));
     }
 
     #[test]

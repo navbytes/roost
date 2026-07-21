@@ -271,6 +271,10 @@ impl PaneBackend for PtyPane {
     fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
         extract_selection(self.parser.screen(), start, end)
     }
+
+    fn grab_all_text(&self) -> String {
+        self.parser.screen().all_contents()
+    }
 }
 
 /// Pull the text between two inclusive cell coords (row, col) from a vt100

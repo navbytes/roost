@@ -138,6 +138,13 @@ impl Grid {
         self.rows.iter()
     }
 
+    // roost: full-history read (scrollback + current screen), for the
+    // control interface's `read --full`/`--tail` (visible_rows above only
+    // covers the on-screen window).
+    pub fn all_rows(&self) -> impl Iterator<Item = &crate::row::Row> + '_ {
+        self.scrollback.iter().chain(self.rows.iter())
+    }
+
     pub fn drawing_rows_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut crate::row::Row> {

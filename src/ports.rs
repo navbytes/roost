@@ -95,6 +95,14 @@ pub trait PaneBackend: Sized {
     fn grab_text(&self, _start: (u16, u16), _end: (u16, u16)) -> String {
         String::new()
     }
+
+    /// The pane's full scrollback history plus its current screen, for the
+    /// control interface's `read --full`/`--tail` (which must see output
+    /// that's since scrolled off-screen, not just the visible grid). Default
+    /// degrades to the visible grid, for backends with no history to offer.
+    fn grab_all_text(&self) -> String {
+        self.grab_text((0, 0), (u16::MAX, u16::MAX))
+    }
 }
 
 /// Workspace persistence. Implemented by `infra::store::FsStore`.
@@ -127,6 +135,10 @@ pub mod fakes {
         pub observation: Option<Observation>,
         /// Test-settable text returned by `grab_text`.
         pub grab: String,
+        /// Test-settable text returned by `grab_all_text` (distinct from
+        /// `grab` so a test can tell a full/tail read apart from a screen
+        /// read).
+        pub all_text: String,
     }
 
     impl PaneBackend for FakePane {
@@ -150,6 +162,7 @@ pub mod fakes {
                 proto: MouseProto::None,
                 observation: None,
                 grab: String::new(),
+                all_text: String::new(),
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -199,6 +212,9 @@ pub mod fakes {
         }
         fn grab_text(&self, _start: (u16, u16), _end: (u16, u16)) -> String {
             self.grab.clone()
+        }
+        fn grab_all_text(&self) -> String {
+            self.all_text.clone()
         }
     }
 
