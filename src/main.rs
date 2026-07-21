@@ -111,8 +111,17 @@ fn install_panic_hook() {
     }));
 }
 
+/// Bound on the event channel. A runaway pane (a `yes`, a firehose build log)
+/// produces PTY output faster than the main loop parses and draws it; an
+/// unbounded channel would let that queue grow without limit and OOM the whole
+/// multiplexer. A bounded channel makes the reader thread's `send` block once
+/// the queue is full, so the pane's PTY buffer fills and the child is throttled
+/// at the OS level — real backpressure. Sized generously so normal bursts never
+/// block.
+const EVENT_CHANNEL_BOUND: usize = 1024;
+
 fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<AppEvent>();
+    let (tx, rx) = mpsc::sync_channel::<AppEvent>(EVENT_CHANNEL_BOUND);
 
     // Wire production adapters to the core's ports.
     let store = FsStore::default();

@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 use crate::agents::CommandSpec;
 use crate::core::event::AppEvent;
@@ -45,7 +45,7 @@ pub trait PaneBackend: Sized {
         cmd: &CommandSpec,
         rows: u16,
         cols: u16,
-        tx: Sender<AppEvent>,
+        tx: SyncSender<AppEvent>,
     ) -> Result<Self>;
 
     /// Feed process output into the terminal state machine.
@@ -124,7 +124,7 @@ pub mod fakes {
             cmd: &CommandSpec,
             _rows: u16,
             _cols: u16,
-            _tx: Sender<AppEvent>,
+            _tx: SyncSender<AppEvent>,
         ) -> Result<Self> {
             if cmd.program == "spawn-fail" {
                 anyhow::bail!("spawn-fail requested");

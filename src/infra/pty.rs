@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
 use crate::agents::CommandSpec;
@@ -46,7 +46,7 @@ impl PaneBackend for PtyPane {
         spec: &CommandSpec,
         rows: u16,
         cols: u16,
-        tx: Sender<AppEvent>,
+        tx: SyncSender<AppEvent>,
     ) -> Result<Self> {
         let pty = native_pty_system();
         let pair = pty

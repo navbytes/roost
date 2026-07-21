@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 /// Max bytes accepted for one status line. A well-formed message is well under
 /// this; a client that streams without a newline is dropped instead of being
@@ -74,7 +74,7 @@ fn parse_line(line: &str) -> Option<AppEvent> {
 
 /// Bind the socket and pump parsed events into the main loop. Returns the
 /// bound path (exported to panes as ROOST_SOCK).
-pub fn spawn_listener(tx: Sender<AppEvent>) -> Result<PathBuf> {
+pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
     let path = socket_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;

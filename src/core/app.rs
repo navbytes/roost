@@ -7,7 +7,7 @@ use anyhow::Result;
 use ratatui::layout::{Rect, Size};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::agents::Registry;
@@ -76,7 +76,7 @@ pub struct App<B: PaneBackend> {
     /// are always discoverable. Session-only (not persisted).
     hints: bool,
     store: Box<dyn StateStore>,
-    tx: Sender<AppEvent>,
+    tx: SyncSender<AppEvent>,
     term_size: Size,
     /// Freshly launched agent panes we still owe a session id.
     pending_detect: HashMap<PaneId, SystemTime>,
@@ -102,7 +102,7 @@ impl<B: PaneBackend> App<B> {
         ws: Workspace,
         registry: Registry,
         store: Box<dyn StateStore>,
-        tx: Sender<AppEvent>,
+        tx: SyncSender<AppEvent>,
         term_size: Size,
         sock_path: Option<PathBuf>,
     ) -> Result<Self> {
@@ -878,7 +878,7 @@ mod tests {
 
     fn mk_app(ws: Workspace) -> (App<FakePane>, MemStore) {
         let store = MemStore::default();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(64);
         let app = App::<FakePane>::new(
             ws,
             agents::registry(),
@@ -1208,7 +1208,7 @@ mod tests {
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
         let store = MemStore::default();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(64);
         let mut app =
             App::<FakePane>::new(ws, registry, Box::new(store), tx, Size::new(100, 30), None).unwrap();
 
