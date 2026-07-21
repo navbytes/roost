@@ -77,6 +77,13 @@ const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 /// How many closed panes/tabs the undo stack keeps.
 const UNDO_DEPTH: usize = 20;
 
+/// Cap on concurrently parked `wait` requests. Each parked wait holds a
+/// socket connection slot for up to its whole timeout, and one-shot calls
+/// like status/list share that same pool (`MAX_CONN` in sock.rs) — without a
+/// cap, enough parked waits could starve those of a slot to even report in
+/// on. Left well below that pool size so plenty always stay free.
+const MAX_WAITS: usize = 16;
+
 /// A closed pane or tab, kept on the undo stack so `Alt+u` can reopen it —
 /// crucially with its session id intact, so the agent resumes where it was.
 #[derive(Debug, Clone)]
@@ -547,7 +554,9 @@ impl<B: PaneBackend> App<B> {
                 AgentStatus::Idle => "idle",
                 AgentStatus::Exited => "exited",
             }
-        } else if self.dead.contains_key(&id) {
+        } else if self.dead.contains_key(&id) || self.find_spec(id).is_none() {
+            // Spawn failed, or the pane is closed/never existed — either way
+            // nothing further will happen to it.
             "exited"
         } else {
             "unknown" // a background pane not spawned yet (lazy)
@@ -594,8 +603,14 @@ impl<B: PaneBackend> App<B> {
                 let _ = reply.send(Reply::err("unauthorized: unknown or missing token"));
             }
             (Some(actor), Method::Wait { panes, until, timeout_ms }) => {
-                self.audit(Some(actor), &summary, true, "parked");
-                self.register_waiter(actor, panes, &until, timeout_ms, reply);
+                // Audit the real outcome, not an assumed "parked" — a
+                // rejected wait (bad pane, forbidden, at the concurrency cap)
+                // never parks, and must show up as a denial, not a success
+                // (M3).
+                match self.register_waiter(actor, panes, &until, timeout_ms, reply) {
+                    Ok(outcome) => self.audit(Some(actor), &summary, true, outcome),
+                    Err(reason) => self.audit(Some(actor), &summary, false, &reason),
+                }
             }
             (Some(actor), method) => {
                 let r = self.dispatch(actor, method);
@@ -624,7 +639,8 @@ impl<B: PaneBackend> App<B> {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let outcome = if ok { "ok" } else { "err" };
-        let line = format!("{ts} {principal} {summary} -> {outcome} {detail}\n");
+        let line =
+            format!("{ts} {principal} {} -> {outcome} {}\n", sanitize(summary), sanitize(detail));
         use std::io::Write;
         if let Ok(mut f) =
             std::fs::OpenOptions::new().create(true).append(true).open(dir.join("control.log"))
@@ -633,14 +649,25 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// Does pane `id` currently satisfy `until`? A pane with a runtime
+    /// matches on an exact status comparison. One with none is either lazy
+    /// (present in the workspace, just not spawned yet — still going to run,
+    /// so it never self-resolves a wait) or terminal (its spawn failed, or
+    /// it's gone from the workspace entirely) — which can't reach any
+    /// further status, so it satisfies any `until` right away instead of
+    /// blocking a parked wait to its deadline (M2).
     fn pane_matches(&self, id: PaneId, until: AgentStatus) -> bool {
         match self.runtimes.get(&id) {
             Some(rt) => rt.status() == until,
-            // A pane with no runtime (closed / never spawned) counts as exited.
-            None => until == AgentStatus::Exited,
+            None => self.dead.contains_key(&id) || self.find_spec(id).is_none(),
         }
     }
 
+    /// Validate and register a `wait`. The reply is always sent from here —
+    /// immediately if already satisfied, rejected, or over the parked-wait
+    /// cap, later from `poll_waiters` otherwise — the return value only tells
+    /// the caller what really happened, so it can audit that instead of
+    /// assuming success (M3).
     fn register_waiter(
         &mut self,
         actor: Actor,
@@ -648,36 +675,49 @@ impl<B: PaneBackend> App<B> {
         until: &str,
         timeout_ms: Option<u64>,
         reply: Sender<Reply>,
-    ) {
+    ) -> Result<&'static str, String> {
         if panes.is_empty() {
-            let _ = reply.send(Reply::err("wait needs at least one pane"));
-            return;
+            let msg = "wait needs at least one pane";
+            let _ = reply.send(Reply::err(msg));
+            return Err(msg.into());
         }
         let Some(until) = crate::core::control::parse_status(until) else {
-            let _ = reply
-                .send(Reply::err("unknown status; use working|needs_input|waiting|idle|exited"));
-            return;
+            let msg = "unknown status; use working|needs_input|waiting|idle|exited";
+            let _ = reply.send(Reply::err(msg));
+            return Err(msg.into());
         };
         for &p in &panes {
             if self.find_spec(p).is_none() {
-                let _ = reply.send(Reply::err(format!("no such pane: {p}")));
-                return;
+                let msg = format!("no such pane: {p}");
+                let _ = reply.send(Reply::err(msg.clone()));
+                return Err(msg);
             }
             if !self.may_target(actor, p) {
-                let _ = reply.send(Reply::err("forbidden: pane not in your subtree"));
-                return;
+                let msg = "forbidden: pane not in your subtree";
+                let _ = reply.send(Reply::err(msg));
+                return Err(msg.into());
             }
         }
         // Already satisfied → reply immediately.
         if let Some(id) = panes.iter().copied().find(|&p| self.pane_matches(p, until)) {
             let _ = reply
                 .send(Reply::ok(serde_json::json!({ "pane": id, "status": self.status_str(id) })));
-            return;
+            return Ok("immediate");
+        }
+        // Cap concurrently parked waiters well below the socket's global
+        // connection limit: rejecting here closes the connection right away,
+        // freeing its slot back to the pool instead of holding it for the
+        // full timeout (see MAX_WAITS).
+        if self.waiters.len() >= MAX_WAITS {
+            let msg = "too many concurrent waits";
+            let _ = reply.send(Reply::err(msg));
+            return Err(msg.into());
         }
         // Default 5 min, capped at 24 h, so a parked reply can't live forever.
         let ms = timeout_ms.unwrap_or(300_000).min(24 * 3600 * 1000);
         let deadline = Instant::now() + Duration::from_millis(ms);
         self.waiters.push(Waiter { panes, until, reply, deadline });
+        Ok("parked")
     }
 
     /// Fire any parked `wait` whose condition is met (or which timed out).
@@ -762,7 +802,17 @@ impl<B: PaneBackend> App<B> {
             Actor::Fleet => None,
             Actor::Pane(a) => Some(a),
         };
-        let Some(id) = self.spawn_child(adapter, cwd.map(PathBuf::from), owner) else {
+        // spawn_child (shared with the interactive Alt+n path) splits off
+        // self.focused and moves focus to the new pane — fine for a human
+        // keystroke, but the control API must never steal the human's focus
+        // or jump their active tab out from under them (DESIGN-control
+        // §5.2). Save + restore around the call; the new pane is still
+        // created, spawned, and its id returned either way.
+        let (focused, active_tab) = (self.focused, self.ws.active_tab);
+        let id = self.spawn_child(adapter, cwd.map(PathBuf::from), owner);
+        self.focused = focused;
+        self.ws.active_tab = active_tab;
+        let Some(id) = id else {
             return Reply::err("spawn refused: not enough room to split");
         };
         if let Some(text) = initial_input {
@@ -796,7 +846,13 @@ impl<B: PaneBackend> App<B> {
         // Same adapter + cwd. Session-branching (a true fork of the agent's
         // conversation) lands with the bidirectional pi extension; for now this
         // opens a fresh sibling in the same context.
-        let Some(id) = self.spawn_child(&spec.adapter, Some(spec.cwd), owner) else {
+        // See ctl_spawn: the control path must never steal the human's focus
+        // or active tab.
+        let (focused, active_tab) = (self.focused, self.ws.active_tab);
+        let id = self.spawn_child(&spec.adapter, Some(spec.cwd), owner);
+        self.focused = focused;
+        self.ws.active_tab = active_tab;
+        let Some(id) = id else {
             return Reply::err("fork refused: not enough room to split");
         };
         self.relayout();
@@ -867,8 +923,11 @@ impl<B: PaneBackend> App<B> {
         Reply::ok(serde_json::json!({ "closed": pane }))
     }
 
-    /// Close a specific pane (any tab), capturing it for undo. Unlike
-    /// `close_pane` this is not focus-relative and never quits roost.
+    /// Close a specific pane (any tab) — the single removal path shared by
+    /// the control interface and the interactive close (`close_pane`, which
+    /// wraps this with its confirm/quit handling). Captures it for undo,
+    /// never quits roost, and keeps the human's on-screen tab and focus
+    /// consistent even when the pane it removes isn't either of those.
     fn close_pane_id(&mut self, id: PaneId) -> bool {
         let Some(ti) = self.tab_of(id) else { return false };
         let spec = self.ws.tabs[ti].panes.get(&id).cloned();
@@ -877,22 +936,39 @@ impl<B: PaneBackend> App<B> {
             rt.kill();
         }
         self.tokens.remove(&id);
+        // Drop any spawn-error record for this pane too; otherwise a pane that
+        // failed to spawn and is then closed leaves a stale `dead` entry that
+        // never gets cleaned (pane ids are not reused for it).
         self.dead.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         let empty = layout::remove_pane(&mut tab.layout, id);
         if empty && self.ws.tabs.len() > 1 {
             self.ws.tabs.remove(ti);
-            if self.ws.active_tab >= self.ws.tabs.len() {
+            // A tab removed *before* the active one shifts every later index
+            // down by one; adjust so the human's on-screen tab doesn't
+            // silently change underneath them (regression: the renderer kept
+            // showing the old active-tab index while focus pointed at a pane
+            // that had shifted into a different, off-screen tab). Removing
+            // the active tab itself, or one after it, needs only the usual
+            // out-of-range clamp.
+            if ti < self.ws.active_tab {
+                self.ws.active_tab -= 1;
+            } else if self.ws.active_tab >= self.ws.tabs.len() {
                 self.ws.active_tab = self.ws.tabs.len().saturating_sub(1);
             }
             self.remember_closed(Closed::Tab { index: ti, tab: tab_snapshot });
+            self.spawn_active_tab();
         } else if !empty {
             if let Some(spec) = spec {
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
-        if self.find_spec(self.focused).is_none() {
+        // The active tab's membership may have changed out from under
+        // `focused` (its pane closed, or its tab shifted/removed above) —
+        // keep focus inside whatever tab is now on screen rather than
+        // routing keystrokes to a pane in a tab nobody's looking at.
+        if !self.ws.active_tab().panes.contains_key(&self.focused) {
             self.focused = self.pane_order().first().copied().unwrap_or(0);
         }
         true
@@ -1319,38 +1395,15 @@ impl<B: PaneBackend> App<B> {
         }
         self.confirm_close = None;
 
-        // Capture for undo *before* mutating. If this empties the tab, we
-        // reopen the whole tab; otherwise just the pane (session preserved).
-        let tab_index = self.ws.active_tab;
-        let tab_snapshot = self.ws.active_tab().clone();
-        let closed_spec = self.find_spec(id).cloned();
-
-        if let Some(mut rt) = self.runtimes.remove(&id) {
-            rt.kill();
+        // The actual removal (kill the runtime, capture undo, fix up
+        // tab/focus bookkeeping) is close_pane_id's job — shared with the
+        // control interface. This wrapper only adds the confirm guard above
+        // and the quit flag below: closing the very last pane exits roost
+        // outright, so (unlike every other close) there's nothing to reopen.
+        self.close_pane_id(id);
+        if would_quit {
+            self.quit = true;
         }
-        self.tokens.remove(&id);
-        // Drop any spawn-error record for this pane too; otherwise a pane that
-        // failed to spawn and is then closed leaves a stale `dead` entry that
-        // never gets cleaned (pane ids are not reused for it).
-        self.dead.remove(&id);
-        let tab = self.ws.active_tab_mut();
-        tab.panes.remove(&id);
-        let empty = layout::remove_pane(&mut tab.layout, id);
-        if empty {
-            if self.ws.tabs.len() > 1 {
-                let i = self.ws.active_tab;
-                self.ws.tabs.remove(i);
-                self.ws.active_tab = i.saturating_sub(1);
-                self.remember_closed(Closed::Tab { index: tab_index, tab: tab_snapshot });
-                self.spawn_active_tab();
-            } else {
-                self.quit = true;
-                return;
-            }
-        } else if let Some(spec) = closed_spec {
-            self.remember_closed(Closed::Pane { tab_index, spec });
-        }
-        self.focused = self.pane_order().first().copied().unwrap_or(0);
     }
 
     fn new_tab(&mut self) {
@@ -1533,6 +1586,14 @@ fn method_summary(m: &Method) -> String {
         Method::Close { pane, force } => format!("close pane={pane} force={force}"),
         Method::Wait { panes, until, .. } => format!("wait panes={panes:?} until={until}"),
     }
+}
+
+/// Neutralize a string before it's written to `control.log`: CR/LF (or any
+/// ASCII control char) in an attacker-controlled value — an adapter name, a
+/// `wait` `until`, an error detail — could otherwise forge a fake extra log
+/// line attributed to whoever made the real call. One entry stays one line.
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_control() { ' ' } else { c }).collect()
 }
 
 /// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is
@@ -1808,6 +1869,36 @@ mod tests {
     }
 
     #[test]
+    fn control_spawn_and_fork_preserve_human_focus_and_active_tab() {
+        // The control API must never steal the human's focus or jump their
+        // active tab (DESIGN-control §5.2) — spawn_child (shared with the
+        // interactive Alt+n path) does both internally; ctl_spawn/ctl_fork
+        // must undo it (H1/H2).
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // active_tab=1, focused = the new tab's pane
+        let (focused, active_tab) = (app.focused, app.ws.active_tab);
+        let ct = app.control_token().to_string();
+
+        let spawned = match app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert_eq!(app.focused, focused, "spawn must not move the human's focus");
+        assert_eq!(app.ws.active_tab, active_tab, "spawn must not switch the human's tab");
+
+        match app.handle_control(Request { token: ct, method: Method::Fork { pane: Some(spawned) } }) {
+            Reply::Ok { .. } => {}
+            Reply::Err { err } => panic!("{err}"),
+        }
+        assert_eq!(app.focused, focused, "fork must not move the human's focus");
+        assert_eq!(app.ws.active_tab, active_tab, "fork must not switch the human's tab");
+    }
+
+    #[test]
     fn audit_summary_omits_send_text() {
         use crate::core::control::Method;
         let s = super::method_summary(&Method::Send {
@@ -1817,6 +1908,64 @@ mod tests {
         });
         assert!(!s.contains("SECRET")); // text is never logged
         assert!(s.contains("pane=5") && s.contains("len=18") && s.contains("submit=true"));
+    }
+
+    #[test]
+    fn audit_log_sanitizes_lines_and_reflects_real_outcome() {
+        use crate::core::control::{Method, Reply, Request};
+        let dir = std::env::temp_dir().join(format!("roost-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            Some(dir.join("roost.sock")),
+        )
+        .unwrap();
+        let ct = app.control_token().to_string();
+
+        // A denied wait (unknown pane) must be audited as a denial (M3), not
+        // the unconditional "ok ... parked" it used to log regardless of
+        // outcome.
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct.clone(),
+                method: Method::Wait { panes: vec![999], until: "idle".into(), timeout_ms: None },
+            },
+            rtx,
+        );
+        assert!(matches!(rrx.recv().unwrap(), Reply::Err { .. }));
+
+        // An attacker-controlled field (adapter name) with an embedded
+        // newline must not forge a second, fake log line.
+        let (rtx2, rrx2) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct,
+                method: Method::Spawn {
+                    adapter: "evil\nFORGED fleet spawn -> ok pane=1".into(),
+                    cwd: None,
+                    initial_input: None,
+                },
+            },
+            rtx2,
+        );
+        assert!(matches!(rrx2.recv().unwrap(), Reply::Err { .. })); // unknown adapter
+
+        let log = std::fs::read_to_string(dir.join("control.log")).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "embedded control chars must not add log lines: {log:?}");
+        assert!(lines[0].contains(" err "), "denied wait must audit as err: {}", lines[0]);
+        assert!(!lines[0].contains("parked"), "denied wait must not claim it parked: {}", lines[0]);
+        assert!(lines[1].contains("FORGED"), "content preserved, just de-lined: {}", lines[1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1860,6 +2009,45 @@ mod tests {
             Reply::Ok { ok } => assert_eq!(ok["timed_out"], true),
             Reply::Err { err } => panic!("{err}"),
         }
+    }
+
+    #[test]
+    fn wait_on_a_closed_pane_resolves_instead_of_hanging() {
+        // M2 regression: a wait parked on a pane that's then closed must
+        // resolve right away (reported as "exited") instead of blocking to
+        // the deadline and holding its connection slot the whole time.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 & 2, focus = 2
+        let target = app.focused;
+        let ct = app.control_token().to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct,
+                method: Method::Wait {
+                    panes: vec![target],
+                    until: "needs_input".into(),
+                    timeout_ms: Some(60_000),
+                },
+            },
+            tx,
+        );
+        assert!(rx.try_recv().is_err()); // idle pane, not yet needs_input → parked
+        assert_eq!(app.waiters.len(), 1);
+
+        app.apply(Action::ClosePane); // closes `target` (non-busy → closes immediately)
+        app.poll_waiters();
+
+        match rx.recv().unwrap() {
+            Reply::Ok { ok } => {
+                assert_eq!(ok["pane"], target);
+                assert_eq!(ok["status"], "exited");
+            }
+            Reply::Err { err } => panic!("{err}"),
+        }
+        assert!(app.waiters.is_empty());
     }
 
     #[test]
@@ -1913,16 +2101,42 @@ mod tests {
         // launch fresh instead of resuming into a dead pane, and the dead id
         // must be cleared from the workspace (regression: two concurrent pi
         // panes where one session was never persisted).
+        //
+        // Hermetic: point $HOME at a scratch dir with an *empty* (but
+        // present) .pi/agent/sessions, so `session_state` deterministically
+        // lands on "root present, id absent" → Gone, regardless of what the
+        // real machine's actual ~/.pi looks like. Since a missing root now
+        // legitimately means Unknown (not Gone — see agents::session_state),
+        // a dev machine without ~/.pi at all would otherwise flip this test
+        // into a resume attempt instead of a fresh launch.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!("roost-home-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".pi").join("agent").join("sessions")).unwrap();
+        let real_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
         let mut ws = shell_ws();
         let spec = ws.tabs[0].panes.get_mut(&1).unwrap();
         spec.adapter = "pi".into();
         spec.session = Some("roost-test-nonexistent-uuid-zzzz".into());
         let (app, store) = mk_app(ws);
-        let rt = app.runtimes.get(&1).unwrap();
-        assert_eq!(rt.cmd.program, "pi");
-        assert!(rt.cmd.args.is_empty(), "expected fresh launch, got {:?}", rt.cmd.args);
-        let saved = store.0.lock().unwrap().clone().unwrap();
-        assert!(saved.tabs[0].panes[&1].session.is_none());
+        let program = app.runtimes.get(&1).unwrap().cmd.program.clone();
+        let args = app.runtimes.get(&1).unwrap().cmd.args.clone();
+        let saved_session = store.0.lock().unwrap().clone().unwrap().tabs[0].panes[&1].session.clone();
+
+        // Restore before asserting, so a failure here can't leave $HOME
+        // redirected for the rest of the test binary.
+        match real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(program, "pi");
+        assert!(args.is_empty(), "expected fresh launch, got {args:?}");
+        assert!(saved_session.is_none());
     }
 
     #[test]

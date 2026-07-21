@@ -108,12 +108,14 @@ pub trait AgentAdapter: Send + Sync {
     /// free; adapters without a session root (shell) return Unknown.
     fn session_state(&self, cwd: &Path, id: &str) -> SessionState {
         let Some(root) = self.session_root(cwd) else { return SessionState::Unknown };
-        // A missing sessions dir means the session is truly gone; an
-        // *unreadable* one (permission/transient) means we simply don't know.
-        match std::fs::read_dir(&root) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SessionState::Gone,
-            Err(_) => return SessionState::Unknown,
+        // A missing sessions ROOT usually means the tool changed its on-disk
+        // layout or $HOME resolved differently — not that *this* session is
+        // gone, so don't wipe a possibly-still-valid resume pointer over it.
+        // An unreadable root (permission/transient) is the same "can't tell".
+        // Only an id absent from a root that's actually present and readable
+        // is Gone (below).
+        if std::fs::read_dir(&root).is_err() {
+            return SessionState::Unknown;
         }
         let exists = session_files_since(&root, SystemTime::UNIX_EPOCH).iter().any(|p| {
             self.owns_session_file(p, cwd) && self.session_id_from_path(p).as_deref() == Some(id)
@@ -239,12 +241,17 @@ mod tests {
     }
 
     #[test]
-    fn session_state_gone_when_dir_missing() {
+    fn session_state_unknown_when_root_dir_missing() {
+        // A missing session ROOT (as opposed to an absent id within a present
+        // one) can't tell us the id is stale — the tool may have changed its
+        // on-disk layout, or $HOME may have resolved differently. Treat it as
+        // Unknown so the caller still attempts resume instead of nuking a
+        // possibly-good id.
         let d = std::env::temp_dir().join(format!("roost-ss-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(
             RootAdapter(Some(d)).session_state(Path::new("/x"), "id"),
-            SessionState::Gone
+            SessionState::Unknown
         );
     }
 
