@@ -228,14 +228,19 @@ reflexively expose the whole `Action` enum.
   `<state>/control.token` (0600); the capability check that rejects pane tokens
   from control verbs. *This is the load-bearing refactor* (the focus-relative →
   pane-addressed conversion the earlier code reviews already flagged).
-- **Phase 1 — MVP verbs + the CLI skin.** The irreducible seven over the socket;
-  `roost <verb>` one-shot CLI reading `control.token`; audit log; `wait` registry.
-  Ships the hello-world and the fan-out flagship.
-- **Phase 2 — MCP bridge.** `roost-mcp` stdio bridge exposing tools + resources;
-  auto-written MCP config; in-pane agents get it only via explicit `--grant`.
-- **Phase 3 — advanced (optional).** Consented event subscription; semantic
-  `read(last_turn)` via the extension (token-efficient, not screen-scraping);
-  HTTP transport for external orchestrators; multi-instance discovery.
+- **Phase 1 — MVP verbs + the CLI skin.** ✅ Done. The verbs over the socket
+  (`list`/`status`/`spawn`/`fork`/`send`/`read`/`close`); `roost <verb>` one-shot
+  CLI reading `control.token`; plus `wait` (deferred reply) pulled forward.
+- **Phase 2 — MCP bridge.** ❌ **Descoped.** The CLI is the chosen interface —
+  it's the safest, most auditable skin and LLMs drive it natively via shell, so
+  a second (MCP) surface isn't worth the added attack surface + tokio/rmcp
+  weight. Revisit only if a use-case genuinely needs native tool-calling.
+- **Phase 3 — advanced (optional, not planned).** Consented event subscription;
+  a real session-branching `fork` via a bidirectional pi extension; semantic
+  `read(last_turn)`; HTTP transport; multi-instance discovery.
+
+**Interface status: complete via the CLI.** Remaining is a live-terminal smoke
+test and, if ever wanted, the Phase 3 niceties above.
 
 ## 9. The three paradigms, compared
 
