@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::core::app::{App, Mode, RenameTarget, PICKER_ITEMS};
+use crate::core::app::{picker_items, App, Mode, RenameTarget};
 use crate::core::status::AgentStatus;
 use crate::core::layout::PaneRect;
 use crate::ports::PaneBackend;
@@ -167,7 +167,8 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             f.render_widget(Paragraph::new(format!("{buffer}▏")), inner);
         }
         Mode::Picker { selection } => {
-            let rect = centered_near(anchor, body, 32, PICKER_ITEMS.len() as u16 + 2);
+            let items = picker_items();
+            let rect = centered_near(anchor, body, 32, items.len() as u16 + 2);
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
@@ -176,7 +177,7 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            let lines: Vec<Line> = PICKER_ITEMS
+            let lines: Vec<Line> = items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {

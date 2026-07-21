@@ -30,8 +30,12 @@ const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
 const MIN_SPLIT_COLS: u16 = 36; // two ~16-col inner panes + borders
 const MIN_SPLIT_ROWS: u16 = 10; // two ~3-row inner panes + borders
 
-/// Adapters offered by the quick-launch picker (Alt+Enter).
-pub const PICKER_ITEMS: [&str; 3] = ["pi", "claude", "shell"];
+/// Adapters offered by the quick-launch picker (Alt+Enter), derived from the
+/// single adapter list in `agents` so the picker can never drift out of sync
+/// with the registry.
+pub fn picker_items() -> Vec<&'static str> {
+    crate::agents::picker_ids()
+}
 
 /// What a rename overlay is editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -975,15 +979,16 @@ impl<B: PaneBackend> App<B> {
                 true
             }
             Mode::Picker { selection } => {
+                let items = picker_items();
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        *selection = selection.checked_sub(1).unwrap_or(PICKER_ITEMS.len() - 1)
+                        *selection = selection.checked_sub(1).unwrap_or(items.len() - 1)
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        *selection = (*selection + 1) % PICKER_ITEMS.len()
+                        *selection = (*selection + 1) % items.len()
                     }
                     KeyCode::Enter => {
-                        let adapter = PICKER_ITEMS[*selection];
+                        let adapter = items[(*selection).min(items.len() - 1)];
                         self.mode = Mode::Normal;
                         self.new_pane_with(adapter);
                         self.relayout();

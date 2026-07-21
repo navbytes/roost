@@ -171,16 +171,29 @@ pub fn session_files_since(root: &Path, since: SystemTime) -> Vec<PathBuf> {
 
 pub type Registry = HashMap<&'static str, Box<dyn AgentAdapter>>;
 
-pub fn registry() -> Registry {
-    let mut m: Registry = HashMap::new();
-    for a in [
-        Box::new(shell::ShellAdapter) as Box<dyn AgentAdapter>,
+/// The single source of truth for which adapters exist, in user-facing display
+/// order (agents first, the generic shell last). `registry()` and the launch
+/// picker both derive from this, so adding an adapter is a one-line change here
+/// rather than three places that can silently diverge.
+fn adapter_specs() -> Vec<Box<dyn AgentAdapter>> {
+    vec![
         Box::new(pi::PiAdapter),
         Box::new(claude::ClaudeAdapter),
-    ] {
+        Box::new(shell::ShellAdapter),
+    ]
+}
+
+pub fn registry() -> Registry {
+    let mut m: Registry = HashMap::new();
+    for a in adapter_specs() {
         m.insert(a.id(), a);
     }
     m
+}
+
+/// Adapter ids in picker order, derived from `adapter_specs()`.
+pub fn picker_ids() -> Vec<&'static str> {
+    adapter_specs().iter().map(|a| a.id()).collect()
 }
 
 #[cfg(test)]
