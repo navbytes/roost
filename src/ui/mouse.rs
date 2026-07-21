@@ -20,14 +20,14 @@ use crate::ports::MouseProto;
 
 /// Lines per wheel notch for roost-side scrolling (tmux uses 3).
 pub const WHEEL_LINES: i32 = 3;
-/// The tab bar's fixed left brand mark. The 🪹 nest ("your agents come home to
-/// roost") is a double-width glyph, so tab hit-testing must offset by display
-/// columns via `TABBAR_PREFIX_WIDTH`, not a `.chars().count()` that would
-/// undercount the emoji by one column and skew every click.
-pub const TABBAR_PREFIX: &str = " 🪹 roost ";
+/// The tab bar's fixed left brand mark. The 🪶 feather is a double-width glyph,
+/// so tab hit-testing must offset by display columns via `TABBAR_PREFIX_WIDTH`,
+/// not a `.chars().count()` that would undercount the emoji by one column and
+/// skew every click.
+pub const TABBAR_PREFIX: &str = " 🪶 roost ";
 /// Display width of `TABBAR_PREFIX` in terminal columns: leading space (1) +
-/// nest (2) + space (1) + "roost" (5) + trailing space (1) = 10. Kept in sync
-/// with `TABBAR_PREFIX` by hand; the unit test below guards the click offset.
+/// feather (2) + space (1) + "roost" (5) + trailing space (1) = 10. Kept in
+/// sync with `TABBAR_PREFIX` by hand; the unit test below guards the offset.
 pub const TABBAR_PREFIX_WIDTH: u16 = 10;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -242,8 +242,8 @@ mod tests {
     #[test]
     fn tab_hit_testing_matches_labels() {
         let names = vec!["main".to_string(), "api".to_string()];
-        // prefix " 🪹 roost " is 10 cols → tab 0 "  1 main" starts at 10
-        assert_eq!(tab_at_x(&names, 3), None); // in the prefix (over the nest)
+        // prefix " 🪶 roost " is 10 cols → tab 0 "  1 main" starts at 10
+        assert_eq!(tab_at_x(&names, 3), None); // in the prefix (over the feather)
         assert_eq!(tab_at_x(&names, 10), Some(0));
         assert_eq!(tab_at_x(&names, 15), Some(0)); // within "  1 main" (width 8: cols 10..18)
         assert_eq!(tab_at_x(&names, 18), Some(1)); // "  2 api" starts at 18
@@ -251,8 +251,8 @@ mod tests {
     }
 
     #[test]
-    fn tabbar_prefix_width_accounts_for_the_wide_nest() {
-        // The prefix has exactly one double-width glyph (🪹), so its display
+    fn tabbar_prefix_width_accounts_for_the_wide_feather() {
+        // The prefix has exactly one double-width glyph (🪶), so its display
         // width is the char count plus one. If someone edits TABBAR_PREFIX
         // without updating TABBAR_PREFIX_WIDTH, this fails and click offsets
         // won't silently drift.
