@@ -184,13 +184,30 @@ impl PaneBackend for PtyPane {
         // will see EOF the moment the child dies, doesn't emit a stale
         // Exit/Output for an id that may be reused or respawned.
         self.alive.store(false, Ordering::Relaxed);
-        // portable-pty's child is a std::process::Child, whose Drop does NOT
-        // reap. kill() only sends SIGKILL; without a wait() the child lingers
-        // as a zombie until roost exits. Reap it here so pane churn (close,
-        // respawn, quit) doesn't accumulate zombies. SIGKILL isn't catchable,
-        // so the wait returns promptly.
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // The child is a session/process-group leader (portable-pty setsid's
+        // it), so also SIGKILL the whole group — otherwise pi/claude's own
+        // subprocesses linger as orphans, and a child that's blocked waiting on
+        // one of them can itself fail to exit. Signalling -pgid (== -pid for a
+        // leader) is a no-op if there's no such group.
+        if let Some(pid) = self.pid {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        // Reap WITHOUT blocking the UI thread indefinitely. A bare
+        // `child.wait()` runs on the event-loop thread (close/quit), so if it
+        // ever fails to return promptly — a wedged child, a PTY reaping edge
+        // case — it freezes the *whole* app: no input, no render, no quit.
+        // SIGKILL is normally reaped within a millisecond; poll `try_wait`
+        // briefly (~100ms cap), then move on. A lingering zombie is harmless
+        // (reaped when roost exits) and infinitely preferable to a frozen UI.
+        for _ in 0..100 {
+            match self.child.try_wait() {
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                _ => break, // reaped, or errored (already gone)
+            }
+        }
     }
 
     fn status(&self) -> AgentStatus {
