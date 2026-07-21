@@ -5,9 +5,10 @@
 //!
 //! Targeting is daemonless: `$ROOST_SOCK` (set in every pane, so an in-pane
 //! agent needs no config) else the default per-state-dir socket path.
-//! Credential precedence: `$ROOST_CONTROL_TOKEN`, else `<state>/control.token`
-//! (the fleet token), else `$ROOST_TOKEN` (an in-pane agent's own pane token,
-//! which the ownership model scopes to its subtree).
+//! Credential precedence: `$ROOST_CONTROL_TOKEN`, else `$ROOST_TOKEN` (an
+//! in-pane agent's own pane token — authenticates it as its pane, scoped to
+//! its spawned subtree and audited as that pane), else `<state>/control.token`
+//! (the fleet token, for an external operator with no pane env).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -71,17 +72,19 @@ fn run(args: &[String]) -> i32 {
     }
 }
 
-/// The control credential: explicit env, else the fleet token file, else the
-/// pane's own token (for an in-pane agent).
+/// The control credential: explicit env, else the pane's own token (an
+/// in-pane agent authenticates as its pane — scoped to its spawned subtree
+/// and audited as that pane), else the fleet token file (an external
+/// operator, which has no `$ROOST_TOKEN` in its env).
 fn resolve_token() -> String {
     if let Ok(t) = std::env::var("ROOST_CONTROL_TOKEN") {
         return t;
     }
-    let path = FsStore::default_path().with_file_name("control.token");
-    if let Ok(t) = std::fs::read_to_string(path) {
-        return t.trim().to_string();
+    if let Ok(t) = std::env::var("ROOST_TOKEN") {
+        return t;
     }
-    std::env::var("ROOST_TOKEN").unwrap_or_default()
+    let path = FsStore::default_path().with_file_name("control.token");
+    std::fs::read_to_string(path).map(|t| t.trim().to_string()).unwrap_or_default()
 }
 
 fn build_request(args: &[String], token: String) -> Result<serde_json::Value, String> {

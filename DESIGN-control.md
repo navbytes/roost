@@ -120,16 +120,25 @@ protect.
    needs an explicit grant.** A pane may `spawn`/`fork` new panes and may
    `read`/`send`/`close` the panes *in its own spawned subtree* — but a pane it
    did **not** create (your other sessions, your shell) is off-limits unless the
-   pane was launched with an explicit control grant. This is the boundary that
-   makes self-orchestration ergonomic (an agent manages the workers it spawned,
-   no ceremony) while still containing a prompt-injected pane to its own subtree.
-   Track a `spawned_by: Option<PaneId>` parent pointer per pane; the capability
-   check compares actor→target against subtree membership.
+   pane was launched with an explicit control grant. This is default scoping
+   that makes self-orchestration ergonomic (an agent manages the workers it
+   spawned, no ceremony) and serves as defense-in-depth — it is **not** a
+   proven containment guarantee against a shell-capable pane (see the
+   correction below). Track a `spawned_by: Option<PaneId>` parent pointer per
+   pane; the capability check compares actor→target against subtree membership.
 2. **Separate control credential from the status token.** A CSPRNG control token
    written to `<state>/control.token` at 0600, **never placed in any pane's
    environment.** External orchestrators / the human's CLI read the file (same
    trust boundary as the 0600 socket). The time-seeded `gen_token` fallback is
    *disqualifying* for a control secret — hard-fail instead.
+
+   **Post-audit correction:** this stops *inheritance* and *other users*
+   (0600), not the pane itself — pi and Claude Code both have a shell/exec
+   tool, so a same-uid `cat <state>/control.token` hands any in-pane agent the
+   fleet token. #1's subtree containment therefore does not hold against those
+   agents: treat it as default scoping + defense-in-depth, not a security
+   boundary. The boundary roost does enforce is **cross-UID** — 0600 inside an
+   owner-verified 0700 dir stops other users, not other same-uid processes.
 3. **Capability is per-verb, not per-principal.** A "set my status" credential
    must be structurally incapable of spawn/read/write/kill. Control verbs are
    rejected from *any* principal presenting a pane token, even a valid one.
@@ -164,9 +173,13 @@ bash/exec tool**, so "spawn a shell pane and type into it" grants no capability
 they lack — they can already run commands in their own pane. The genuinely *new*
 risk of pane control is therefore **cross-pane reach into panes the agent didn't
 create** (reading your other session's screen, injecting into an unrelated
-agent). Ownership scoping removes exactly that: an injected worker can still spawn
-and drive *its own* children, but cannot read the pane where you pasted a key or
-hijack a sibling it doesn't own.
+agent). Ownership scoping *narrows* this by default, but does **not** contain a
+shell-capable injected agent: because the fleet token is a same-uid-readable file
+(see the §5.2 correction), such an agent can read it and act as `Fleet` on any
+pane. So cross-pane read/inject is a **residual risk you accept** when you run a
+semi-trusted agent in roost — bounded by cross-uid isolation and recorded in full
+by the audit log, not prevented. Ownership scoping remains the default
+behavior/attribution and defense-in-depth against a *non-shell* principal.
 
 **Fleet-wide grant** (`roost spawn --grant control`) is the opt-in escalation for
 a genuine supervisor that must reach panes it didn't spawn. **Fork-bomb guard**
@@ -239,10 +252,13 @@ reflexively expose the whole `Action` enum.
   a real session-branching `fork` via a bidirectional pi extension; semantic
   `read(last_turn)`; HTTP transport; multi-instance discovery.
 
-**Interface status: complete via the CLI.** Security constraints §5 now met:
-per-verb capability + ownership scope (#1–4), owner-scoped reads (#5), 0600
-socket + separate off-env control token (#2), CSPRNG control token that
-hard-fails rather than falling back (#10), and an unconditional audit log at
+**Interface status: complete via the CLI.** Security constraints §5 mostly met,
+with one downgrade: ownership scope (#1) turned out to be default behavior +
+defense-in-depth, not a proven containment boundary, once a same-uid file read
+is in scope (see the §5.2 correction) — the boundary actually enforced is
+cross-UID. Otherwise met: per-verb capability (#3–4), owner-scoped reads (#5),
+0600 socket + off-env control token (#2), CSPRNG control token that hard-fails
+rather than falling back (#10), and an unconditional audit log at
 `<state>/control.log` — principal + verb + target + outcome, never the message
 text (#9). Still open: a per-principal connection/rate cap (#6, beyond the
 global 64) and a human-consent gate on reads (#5). Remaining overall is a
@@ -267,8 +283,11 @@ that makes control-mode the adversary's lowest-ranked option.
 
 ## 10. Principal risks
 
-- **Privilege escalation via the inherited token** — mitigated by §5.2/5.3
-  (separate, off-env, per-verb control credential). This is the one that matters.
+- **Privilege escalation via the inherited token** — §5.2/5.3 (separate,
+  off-env, per-verb control credential) mitigate the *inherited*-token and
+  cross-UID vectors, but not a same-uid `cat` of the token file by a
+  shell-capable pane; that path is accepted, not fixed (see the §5.2
+  correction). Cross-UID is the boundary that actually holds.
 - **Fork-bomb / recursion** in self-referential orchestration — leaf tokens +
   pane budget + depth counter.
 - **Command flood stalling the render loop** — per-connection token bucket +
@@ -288,10 +307,13 @@ that makes control-mode the adversary's lowest-ranked option.
    are shared; this sets emphasis and how aggressively to gate in-pane control.
 2. **Transport priority?** CLI-first (recommended: simplest, safest, most
    auditable) vs MCP-first (most LLM-native). The core is shared either way.
-3. **In-pane trust?** *Resolved:* ownership-scoped control by default (a pane
-   freely spawns/forks and drives its own subtree; fleet-wide reach needs
-   `--grant control`). Enables the fork + sub-agent workflows with no ceremony
-   while containing an injected pane to its own subtree.
+3. **In-pane trust?** *Resolved (post-audit):* ownership scoping is the default
+   *behavior* — a pane freely spawns/forks and drives its own subtree, audited as
+   that pane — but it is **not** a security boundary: a shell-capable pane can read
+   the fleet token file and reach any pane, so in-pane control is effectively
+   fleet-wide. Treat every in-pane agent as fully control-capable; the enforced
+   boundary is cross-uid, and the audit log is the accountability mechanism. (The
+   `--grant control` escalation is moot under this posture and is unimplemented.)
 4. **Read policy?** Snapshot-on-demand only (recommended) vs allow the passive
    output stream (powerful, but the adversary's top risk).
 5. **Scope?** Single-instance for v1 (recommended) vs multi-instance from the

@@ -134,8 +134,8 @@ Status arrives two ways:
 | `claude` | `claude` | `claude --resume <id>` | newest `*.jsonl` under `~/.claude/projects/<encoded-cwd>/` |
 | `shell` | `$SHELL` | relaunch in saved cwd | — |
 
-New adapters implement the `AgentAdapter` trait in `src/adapters/` (five
-small methods).
+New adapters implement the `AgentAdapter` trait in `src/agents/` (eight
+methods, most with defaults).
 
 ## Controlling roost (CLI / LLM)
 
@@ -160,12 +160,18 @@ This is how an LLM manages a fleet — an agent inside a pane can spawn and driv
 worker panes for its sub-agents, and you watch (and take over) the whole fleet
 live. See [DESIGN-control.md](DESIGN-control.md).
 
-**Authorization is ownership-scoped.** A pane acting via its own `$ROOST_TOKEN`
-may spawn/fork freely and drive only the panes *it* spawned (its subtree) — a
-prompt-injected pane can't reach panes it didn't create. The fleet token in
-`<state>/control.token` (0600, never in a pane's env) grants an external
-orchestrator full reach. Targeting is daemonless: an in-pane client finds its
-instance via `$ROOST_SOCK` automatically. Every control action is recorded in
+**Authorization is scoped by default, not sandboxed.** A pane acting via its own
+`$ROOST_TOKEN` authenticates *as that pane*: its `spawn`/`fork` calls are scoped
+to the subtree it creates, and its actions are audited under that pane's id.
+That's convenience and defense-in-depth, **not a hard security boundary** — pi
+and Claude Code both ship a shell/exec tool, so any in-pane agent can `cat` the
+fleet token at `<state>/control.token` (0600, never placed in a pane's env, but
+readable by anything running as you) and drive the whole fleet with full reach.
+Treat every in-pane agent as capable of full control-plane access. The boundary
+roost does enforce is **cross-UID**: the socket and `control.token` are 0600
+inside an owner-verified 0700 state dir, so no *other* user on the machine can
+drive your roost. Targeting is daemonless: an in-pane client finds its instance
+via `$ROOST_SOCK` automatically. Every control action is recorded in
 `<state>/control.log` (principal, verb, target, outcome — never the message
 text).
 
