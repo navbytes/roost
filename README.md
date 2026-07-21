@@ -98,19 +98,33 @@ selection still works too, if you prefer it.)
 In a **dead pane** (process exited or spawn failed): `Enter` relaunches /
 resumes, `f` starts a fresh session (drops the stored session id).
 
+## Appearance
+
+roost's own chrome is **ink · paper · one red** — three warm grays for
+hierarchy, one accent (`#ff563c`) for focus, badges, and live keys. Program
+output inside panes keeps its own colors and attributes untouched. Colors are
+truecolor RGB: best on a truecolor terminal (iTerm2, Ghostty, kitty, WezTerm)
+with a dark background in the `#15120f` family — roost never repaints your
+terminal's background. On non-truecolor terminals (macOS Terminal.app) the
+palette quantizes; legibility survives, exact hues don't. The full design
+spec lives in [`DESIGN-ui.md`](DESIGN-ui.md).
+
 ## Corner badge
 
-Each pane shows a faint label in its **top-right corner** (iTerm2-style),
-sourced from the pane's name — its `Alt+r` title, or the adapter name
-(`pi` / `claude` / `shell`) when unnamed. It's a quick at-a-glance "which
-pane am I looking at" marker; a cell TUI can't do true translucency, so it's
-rendered dim rather than see-through, and the inner app's content still draws
-underneath it on the rest of the screen.
+Each pane shows a faint label in its **top-right corner** (iTerm2-style):
+`name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
+(`pi` / `claude` / `shell`) when unnamed, and the glyph is the pane's live
+status. It's a quick at-a-glance "which pane is this, doing what" marker; a
+cell TUI can't do true translucency, so it's rendered dim rather than
+see-through, and the inner app's content still draws underneath it on the
+rest of the screen.
 
 ## Status badges
 
-Pane borders and stack title bars show each agent's state:
-`●` working · `◆` needs input · `○` waiting for you · `·` idle · `✕` exited.
+Tab bar, corner badges, and collapsed stack rows show each agent's state:
+`●` working (pulses) · `◆` needs input · `○` waiting for you · `·` idle ·
+`✕` exited. Status lives in the glyph, not the border — the focused pane's
+border is always accent-red, everything else stays quiet.
 When a non-focused pane starts waiting for you, roost rings the terminal
 bell (and posts a native notification on macOS).
 

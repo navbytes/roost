@@ -140,6 +140,9 @@ pub struct App<B: PaneBackend> {
     pending_detect: HashMap<PaneId, SystemTime>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
+    /// `$HOME`, resolved once at startup — `focused_cwd()`'s `~`-abbreviation
+    /// reads this instead of asking the environment on every frame (D4).
+    home: Option<PathBuf>,
     started: Instant,
     /// Set the first time an Alt-modified key event arrives, so the
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
@@ -209,6 +212,7 @@ impl<B: PaneBackend> App<B> {
             pending_detect: HashMap::new(),
             last_detect: Instant::now(),
             sock_path,
+            home: dirs::home_dir(),
             started: Instant::now(),
             alt_seen: false,
             selection: None,
@@ -472,7 +476,7 @@ impl<B: PaneBackend> App<B> {
     /// pane has no spec.
     pub fn focused_cwd(&self) -> Option<String> {
         let cwd = &self.find_spec(self.focused)?.cwd;
-        Some(abbreviate_home(cwd, dirs::home_dir().as_deref()))
+        Some(abbreviate_home(cwd, self.home.as_deref()))
     }
 
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
@@ -2692,6 +2696,18 @@ mod tests {
         assert_eq!(abbreviate_home(&PathBuf::from("/home/nav"), Some(&home)), "~");
         assert_eq!(abbreviate_home(&PathBuf::from("/etc"), Some(&home)), "/etc");
         assert_eq!(abbreviate_home(&PathBuf::from("/home/nav/work"), None), "/home/nav/work");
+    }
+
+    #[test]
+    fn abbreviate_home_ignores_empty_home_and_partial_component_matches() {
+        // An empty $HOME (unset/misconfigured env) must not turn every path
+        // into "~" — falls back to the plain path, same as `home: None`.
+        assert_eq!(abbreviate_home(&PathBuf::from("/foo/bar"), Some(&PathBuf::new())), "/foo/bar");
+        // Path::strip_prefix is component-wise: "/home/navvy" is NOT inside
+        // "/home/nav" even though the *string* "/home/nav" is a byte-prefix
+        // of it — guards against a naive str::starts_with reimplementation.
+        let home = PathBuf::from("/home/nav");
+        assert_eq!(abbreviate_home(&PathBuf::from("/home/navvy/work"), Some(&home)), "/home/navvy/work");
     }
 
     #[test]

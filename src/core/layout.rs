@@ -646,4 +646,40 @@ mod tests {
         assert_eq!(neighbor(&rects, 1, Dir::Left), None);
         assert_eq!(neighbor(&rects, 2, Dir::Up), None);
     }
+
+    #[test]
+    fn stack_header_shown_iff_height_at_least_n_plus_3_for_smallest_stack() {
+        // n=2 is the smallest real stack (1 collapsed row) — a different
+        // arithmetic regime from the n=3 case above; pin the threshold here
+        // too. Threshold = n+3 = 5.
+        let node = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        let mut out = vec![];
+        let mut headers = vec![];
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 4), &mut out, &mut headers);
+        assert!(headers.is_empty(), "height 4 (n+2) < n+3=5 → no header");
+        assert_eq!(out.iter().find(|p| !p.collapsed).unwrap().rect.height, 3);
+
+        out.clear();
+        headers.clear();
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 5), &mut out, &mut headers);
+        assert_eq!(headers.len(), 1, "height 5 (n+3) → header shown");
+        assert_eq!(headers[0].n, 2);
+        assert_eq!(out.iter().find(|p| !p.collapsed).unwrap().rect.height, 3);
+    }
+
+    #[test]
+    fn compute_rects_on_zero_area_yields_nothing() {
+        // Degenerate terminal size (zero width or height): must not panic,
+        // and must not fabricate rects/headers out of no area.
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let mut out = vec![];
+        let mut headers = vec![];
+        compute_rects_and_headers(&node, Rect::new(0, 0, 0, 20), &mut out, &mut headers);
+        assert!(out.is_empty());
+        assert!(headers.is_empty());
+
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 0), &mut out, &mut headers);
+        assert!(out.is_empty());
+        assert!(headers.is_empty());
+    }
 }

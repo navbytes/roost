@@ -280,6 +280,9 @@ focused = Black on status-color bg, unfocused = status-color fg.
   - name fg by state: Working/NeedsInput → `FG`; Waiting/Idle → `MUTED`;
     Exited → `DIM`.
   - right segment fg `DIM`; adapter = `PaneSpec.adapter`.
+  - No-dup rule (mirrors C4): when the pane is untitled and its fallback name
+    already carries the adapter, the right segment is the state word alone
+    (`your turn`, not `shell · your turn`). [Amended 2026-07-22, ux finding #3.]
 - State-word mapping from `AgentStatus`:
   | Status | word |
   |---|---|
@@ -385,6 +388,10 @@ markup, lines ~669–671.) Size and behavior unchanged.
 
 **Target:** C12 frame; key column fg `ACCENT` (no BOLD), description column
 fg `MUTED` — same key/label system as the hint bar. Content unchanged.
+Width fits the widest content line (key column + longest description),
+clamped to screen bounds; anchoring via `centered_near` unchanged — no
+mid-word clipping of its own content. [Amended 2026-07-22, ux finding #1;
+the fixed 52-col width predates the restyle and clipped descriptions.]
 
 ### C16 — Dead-pane overlay
 

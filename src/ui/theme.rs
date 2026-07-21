@@ -7,12 +7,8 @@
 //! **not** defined here: those are program-output-only hues (§2); defining
 //! them would invite casual reuse and dilute the one-red rule.
 //!
-//! Tokens are exported ahead of full consumption: P1 re-points status colors
-//! and pane borders (the first tranche); P2–P4 (tab bar, panes/stack,
-//! bars/modals — see PLAN.md) wire the rest. `dead_code` is allowed at the
-//! module level for exactly that reason — e.g. `BG`/`TAB_STRIP`/`BAR` and
-//! most glyphs have no P1 call site yet, and `BG` per §2 may never gain one.
-#![allow(dead_code)]
+//! Every token here has a chrome call site except `BG`, which carries its
+//! own narrow `#[allow(dead_code)]` — no module-wide allow (see its doc).
 
 use std::time::Duration;
 
@@ -25,6 +21,7 @@ use crate::core::status::AgentStatus;
 
 /// "Paper". Explicit fill only when a surface needs it (§2 background policy)
 /// — roost otherwise leaves the terminal's own background showing through.
+#[allow(dead_code)] // reserved: §2 says BG may never gain a call site (roost never repaints the bg)
 pub const BG: Color = Color::Rgb(21, 18, 15);
 /// Primary ink.
 pub const FG: Color = Color::Rgb(234, 229, 223);
@@ -89,13 +86,6 @@ pub fn status_style(status: AgentStatus) -> (char, Color, bool) {
     }
 }
 
-/// Steady status color (C5's Color column, ignoring pulse phase) — for chrome
-/// surfaces not yet wired to the shared pulse clock (e.g. today's pane
-/// border, which per C3 doesn't vary with status at all).
-pub fn status_color(status: AgentStatus) -> Color {
-    status_style(status).1
-}
-
 /// `TabSummary` → (glyph, color) — C5's tab-bar variant. Same colors as the
 /// `AgentStatus` table; `Unknown` reuses the idle dot, `Quiet` is a blank
 /// space (its color is unused by callers).
@@ -158,18 +148,5 @@ mod tests {
         assert_eq!(tab_summary_style(TabSummary::Waiting), (GLYPH_WAITING, FG));
         assert_eq!(tab_summary_style(TabSummary::Unknown), (GLYPH_IDLE, DIM));
         assert_eq!(tab_summary_style(TabSummary::Quiet), (' ', DIM));
-    }
-
-    #[test]
-    fn status_color_matches_status_style() {
-        for s in [
-            AgentStatus::Working,
-            AgentStatus::NeedsInput,
-            AgentStatus::Waiting,
-            AgentStatus::Idle,
-            AgentStatus::Exited,
-        ] {
-            assert_eq!(status_color(s), status_style(s).1);
-        }
     }
 }

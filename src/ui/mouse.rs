@@ -14,9 +14,11 @@
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use unicode_width::UnicodeWidthStr;
 
 use crate::core::layout::PaneRect;
 use crate::ports::MouseProto;
+use crate::ui::theme;
 
 /// Lines per wheel notch for roost-side scrolling (tmux uses 3).
 pub const WHEEL_LINES: i32 = 3;
@@ -52,11 +54,20 @@ pub fn tab_label(index: usize, name: &str) -> String {
     format!("{} {}", index + 1, name)
 }
 
+/// Terminal display width of `s` — the one measure every hitbox/clip
+/// computation in this module, and `render.rs`'s `clip_spans`/`corner_badge`/
+/// `collapsed_row_spans`, shares (D1). A renamed tab or pane can hold wide
+/// glyphs (CJK, emoji — two terminal columns each); `.chars().count()`
+/// undercounts those and desyncs mouse math from what's actually drawn.
+pub fn display_width(s: &str) -> u16 {
+    s.width() as u16
+}
+
 /// Total columns one tab occupies in the bar (C2): a 1-col marker, a space,
 /// the label body, a space, a 1-col status glyph, a space, and the trailing
 /// separator — six fixed columns plus the label.
 pub fn tab_width(index: usize, name: &str) -> u16 {
-    tab_label(index, name).chars().count() as u16 + 6
+    display_width(&tab_label(index, name)) + 6
 }
 
 /// Sum of `tab_width` over every tab.
@@ -120,7 +131,11 @@ pub fn tab_at_x(names: &[String], bar_width: u16, status_width: u16, x: u16) -> 
 /// them independently. `prefix` is `"{cwd} · "`, or empty when there's no
 /// cwd to show (the segment is omitted, not blanked).
 pub fn status_parts(cwd: Option<&str>, save_ok: bool) -> (String, String) {
-    let save_word = if save_ok { "saved ✓".to_string() } else { "save failed ✕".to_string() };
+    let save_word = if save_ok {
+        format!("saved {}", theme::SAVED)
+    } else {
+        format!("save failed {}", theme::GLYPH_EXITED)
+    };
     let prefix = cwd.map(|c| format!("{c} · ")).unwrap_or_default();
     (prefix, save_word)
 }
@@ -129,7 +144,7 @@ pub fn status_parts(cwd: Option<&str>, save_ok: bool) -> (String, String) {
 /// space — the column span `tab_at_x` treats as off-limits for tab clicks.
 pub fn status_width(cwd: Option<&str>, save_ok: bool) -> u16 {
     let (prefix, save_word) = status_parts(cwd, save_ok);
-    (prefix.chars().count() + save_word.chars().count() + 1) as u16
+    display_width(&prefix) + display_width(&save_word) + 1
 }
 
 /// Route a mouse event over a pane to either the inner app or roost's
@@ -315,6 +330,30 @@ mod tests {
     }
 
     #[test]
+    fn wide_glyph_tab_name_uses_display_width_not_char_count() {
+        // "日本" is 2 chars but 4 display columns (CJK glyphs are
+        // double-width in a terminal): label "1 日本" is 1 + 1 + 2 + 2 = 6
+        // display columns, so tab_width is 6 + 6 = 12 — not the char-count
+        // answer of 10. D1: a renamed tab with wide glyphs must not
+        // misindex clicks past the glyph's real width.
+        let names = vec!["日本".to_string()];
+        assert_eq!(tab_width(0, "日本"), 12);
+        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(0)); // last col of the tab
+        assert_eq!(tab_at_x(&names, 100, 0, 12), None); // just past it
+    }
+
+    #[test]
+    fn tab_at_x_after_a_wide_glyph_tab_uses_its_real_width() {
+        // tab 0's label "1 🦀x" is 1 + 1 + 2 + 1 = 5 display columns (the
+        // crab emoji is double-width, 'x' is single) + 6 fixed cols = 11;
+        // tab 1 must start at col 11, not the char-count answer of 10.
+        let names = vec!["🦀x".to_string(), "b".to_string()];
+        assert_eq!(tab_width(0, "🦀x"), 11);
+        assert_eq!(tab_at_x(&names, 100, 0, 10), Some(0)); // last col of tab 0
+        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(1)); // first col of tab 1
+    }
+
+    #[test]
     fn status_area_click_switches_nothing() {
         let names = vec!["main".to_string(), "api".to_string()];
         // Bar exactly wide enough for both tabs (23 cols) plus a 10-col
@@ -350,11 +389,36 @@ mod tests {
     fn status_parts_formats_cwd_and_save_state() {
         let (prefix, save) = status_parts(Some("~/work"), true);
         assert_eq!(prefix, "~/work · ");
-        assert_eq!(save, "saved ✓");
-        assert_eq!(status_width(Some("~/work"), true), (prefix.chars().count() + save.chars().count() + 1) as u16);
+        assert_eq!(save, format!("saved {}", theme::SAVED));
+        assert_eq!(status_width(Some("~/work"), true), display_width(&prefix) + display_width(&save) + 1);
 
         let (prefix, save) = status_parts(None, false);
         assert_eq!(prefix, "");
-        assert_eq!(save, "save failed ✕");
+        assert_eq!(save, format!("save failed {}", theme::GLYPH_EXITED));
+    }
+
+    #[test]
+    fn single_tab_bar_hit_testing() {
+        // One tab, no separators to get confused by: "1 solo" is 6 chars + 6
+        // fixed cols = 12, occupying the whole visible width.
+        let names = vec!["solo".to_string()];
+        assert_eq!(tab_width(0, "solo"), 12);
+        assert_eq!(tabs_visible_width(&names, 100, 0), 12);
+        assert_eq!(tab_at_x(&names, 100, 0, 0), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, 12), None); // just past the only tab
+    }
+
+    #[test]
+    fn empty_or_zero_width_bar_has_no_clickable_tabs() {
+        // No tabs, and a zero-width bar: nothing is clickable, and the width
+        // math (which never divides) doesn't panic on the degenerate input.
+        let none: Vec<String> = vec![];
+        assert_eq!(total_tabs_width(&none), 0);
+        assert_eq!(tab_at_x(&none, 40, 0, 0), None);
+
+        let one = vec!["solo".to_string()];
+        assert_eq!(tabs_visible_width(&one, 0, 0), 0);
+        assert_eq!(tab_at_x(&one, 0, 0, 0), None);
     }
 }
