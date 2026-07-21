@@ -248,19 +248,19 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        // The shared label (`  N name`) starts with two spaces; overwrite the
-        // first with a per-tab status glyph so the tab bar summarises every
-        // tab — crucially, an un-spawned background tab shows `·` (unknown),
-        // never an idle-looking blank. Same column count as the plain label,
-        // so `tab_at_x` hit-testing is unaffected.
-        let label = crate::ui::mouse::tab_label(i, &tab.name);
-        let rest: String = label.chars().skip(1).collect();
+        // Each tab: two separator spaces, a per-tab status glyph, a space, then
+        // "N name". The glyph summarises every tab — crucially a not-yet-spawned
+        // background tab shows `·` (unknown), never an idle-looking blank. The
+        // four leading columns match `mouse::tab_width`, so click hit-testing
+        // lines up with what's drawn.
         let (glyph, glyph_color) = tab_summary_badge(app.tab_summary(i));
+        spans.push(Span::raw("  "));
         spans.push(Span::styled(
             glyph.to_string(),
             Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(rest, style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(crate::ui::mouse::tab_label(i, &tab.name), style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

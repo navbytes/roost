@@ -53,17 +53,24 @@ pub fn hit_test(rects: &[PaneRect], col: u16, row: u16) -> Option<PaneRect> {
         .copied()
 }
 
-/// The tab bar label for a tab — shared with the renderer so click
-/// hit-testing lines up exactly with what's drawn.
+/// The body of a tab's label: `N name` (no separator, no status glyph). The
+/// renderer draws `"  " + glyph + " "` ahead of this; `tab_width` accounts for
+/// those four columns so click hit-testing lines up with what's drawn.
 pub fn tab_label(index: usize, name: &str) -> String {
-    format!("  {} {}", index + 1, name)
+    format!("{} {}", index + 1, name)
+}
+
+/// Total columns one tab occupies in the bar: two separator spaces + a 1-col
+/// status glyph + a space + the label body.
+pub fn tab_width(index: usize, name: &str) -> u16 {
+    4 + tab_label(index, name).chars().count() as u16
 }
 
 /// Which tab (if any) sits at column `x` on the tab bar row.
 pub fn tab_at_x(names: &[String], x: u16) -> Option<usize> {
     let mut cur = TABBAR_PREFIX_WIDTH;
     for (i, name) in names.iter().enumerate() {
-        let w = tab_label(i, name).chars().count() as u16;
+        let w = tab_width(i, name);
         if x >= cur && x < cur + w {
             return Some(i);
         }
@@ -242,11 +249,13 @@ mod tests {
     #[test]
     fn tab_hit_testing_matches_labels() {
         let names = vec!["main".to_string(), "api".to_string()];
-        // prefix " 🪶 roost " is 10 cols → tab 0 "  1 main" starts at 10
+        // prefix " 🪶 roost " = 10 cols. Each tab is "  {glyph} {N} {name}":
+        // tab 0 "  · 1 main" = 4 + len("1 main")=6 → 10 cols, at cols 10..20;
+        // tab 1 "  · 2 api"  = 4 + len("2 api")=5  → 9 cols,  at cols 20..29.
         assert_eq!(tab_at_x(&names, 3), None); // in the prefix (over the feather)
         assert_eq!(tab_at_x(&names, 10), Some(0));
-        assert_eq!(tab_at_x(&names, 15), Some(0)); // within "  1 main" (width 8: cols 10..18)
-        assert_eq!(tab_at_x(&names, 18), Some(1)); // "  2 api" starts at 18
+        assert_eq!(tab_at_x(&names, 19), Some(0)); // within tab 0 (cols 10..20)
+        assert_eq!(tab_at_x(&names, 20), Some(1)); // tab 1 starts at 20
         assert_eq!(tab_at_x(&names, 200), None); // past the end
     }
 
