@@ -201,8 +201,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             terminal.clear()?;
         }
 
-        // ...then drain PTY output and socket events.
-        while let Ok(ev) = rx.try_recv() {
+        // ...then drain PTY output and socket events — but cap how many per
+        // tick. A firehose pane (an agent dumping megabytes) could otherwise
+        // keep this loop busy indefinitely and starve draw / input / the
+        // wait-registry poll below. The channel is bounded, so events past the
+        // cap simply wait for the next tick: no loss, bounded latency.
+        // ponytail: fixed cap; make it adaptive only if a real workload starves.
+        const MAX_EVENTS_PER_TICK: usize = 512;
+        for _ in 0..MAX_EVENTS_PER_TICK {
+            let Ok(ev) = rx.try_recv() else { break };
             match ev {
                 AppEvent::Command(req, reply) => {
                     app.handle_control_msg(req, reply);
