@@ -45,6 +45,7 @@ change, atomic writes). Delete it to start clean.
 | `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
 | `Alt+Shift+arrow` | resize along that axis |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
+| `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
 | `Alt+r` | rename pane |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |

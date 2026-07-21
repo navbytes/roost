@@ -163,6 +163,31 @@ pub fn toggle_stack(node: &mut LayoutNode, target: PaneId) -> bool {
     }
 }
 
+/// Flip the orientation (vertical ⇄ horizontal) of the innermost split that
+/// directly contains `target` — turning a side-by-side pair into a stacked
+/// one and vice versa. Ratios are preserved. No-op if the focused pane isn't
+/// a direct child of a split (e.g. it's in a stack).
+pub fn flip_split(node: &mut LayoutNode, target: PaneId) -> bool {
+    let LayoutNode::Split { dir, children, .. } = node else {
+        return false;
+    };
+    // Deeper split first, so nested layouts flip the split closest to focus.
+    for c in children.iter_mut() {
+        if flip_split(c, target) {
+            return true;
+        }
+    }
+    let direct = children.iter().any(|c| matches!(c, LayoutNode::Pane(id) if *id == target));
+    if !direct {
+        return false;
+    }
+    *dir = match dir {
+        SplitDir::Vertical => SplitDir::Horizontal,
+        SplitDir::Horizontal => SplitDir::Vertical,
+    };
+    true
+}
+
 /// Alt+Shift+arrows: grow/shrink the subtree containing `target` along the
 /// given axis by `delta` (fraction of the parent split). Innermost matching
 /// split wins. Ratios are clamped to [0.1, 0.9].
@@ -373,6 +398,46 @@ mod tests {
         let mut order = vec![];
         pane_order(&root, &mut order);
         assert_eq!(order, vec![1, 2]);
+    }
+
+    #[test]
+    fn flip_split_toggles_orientation_innermost_first() {
+        // Split[ 1, Split_h[2,3] ]: flipping on 1 flips the outer (vertical),
+        // flipping on 3 flips the inner (horizontal), leaving the other alone.
+        let inner = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(2), LayoutNode::Pane(3)],
+        };
+        let mut root = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), inner],
+        };
+        assert!(flip_split(&mut root, 1));
+        match &root {
+            LayoutNode::Split { dir, children, .. } => {
+                assert_eq!(*dir, SplitDir::Horizontal); // outer flipped
+                // inner untouched
+                assert!(matches!(&children[1], LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+            }
+            _ => panic!(),
+        }
+        // flipping on a nested pane flips only the inner split
+        assert!(flip_split(&mut root, 3));
+        if let LayoutNode::Split { children, .. } = &root {
+            assert!(matches!(&children[1], LayoutNode::Split { dir: SplitDir::Vertical, .. }));
+        }
+        // ratios preserved (2 children still 0.5/0.5)
+        if let LayoutNode::Split { ratios, .. } = &root {
+            assert_eq!(ratios.len(), 2);
+        }
+    }
+
+    #[test]
+    fn flip_split_noop_in_a_stack() {
+        let mut node = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        assert!(!flip_split(&mut node, 1));
     }
 
     #[test]

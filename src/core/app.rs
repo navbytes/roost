@@ -494,6 +494,10 @@ impl<B: PaneBackend> App<B> {
                 let focused = self.focused;
                 layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
             }
+            Action::FlipSplit => {
+                let focused = self.focused;
+                layout::flip_split(&mut self.ws.active_tab_mut().layout, focused);
+            }
             Action::Resize { horizontal, grow } => {
                 let delta = if grow { 0.04 } else { -0.04 };
                 let axis = if horizontal { SplitDir::Vertical } else { SplitDir::Horizontal };
@@ -913,6 +917,22 @@ mod tests {
         for pr in app.rects() {
             assert!(pr.rect.width >= 2 && pr.rect.height >= 1);
         }
+    }
+
+    #[test]
+    fn flip_split_changes_focused_pane_orientation() {
+        use crate::core::layout::SplitDir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // vertical split (side by side)
+        assert!(matches!(
+            app.ws.tabs[0].layout,
+            LayoutNode::Split { dir: SplitDir::Vertical, .. }
+        ));
+        app.apply(Action::FlipSplit);
+        assert!(matches!(
+            app.ws.tabs[0].layout,
+            LayoutNode::Split { dir: SplitDir::Horizontal, .. }
+        ));
     }
 
     #[test]

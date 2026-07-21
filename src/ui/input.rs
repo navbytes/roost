@@ -14,6 +14,8 @@ pub enum Action {
     NewTab,
     GoToTab(usize),
     ToggleStack,
+    /// Flip the focused pane's split between vertical and horizontal.
+    FlipSplit,
     /// Grow (+) or shrink (−) the focused pane along an axis.
     Resize { horizontal: bool, grow: bool },
     RenamePane,
@@ -47,6 +49,7 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('w') => Some(Action::ClosePane),
             KeyCode::Char('t') => Some(Action::NewTab),
             KeyCode::Char('s') => Some(Action::ToggleStack),
+            KeyCode::Char('o') => Some(Action::FlipSplit), // orientation
             // Alt+r renames the pane; Alt+Shift+r (or Alt+R) renames the tab.
             KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::RenamePane }),
             KeyCode::Char('R') => Some(Action::RenameTab),
