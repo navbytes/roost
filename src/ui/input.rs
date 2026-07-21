@@ -84,14 +84,20 @@ fn encode_key(key: KeyEvent) -> InputResult {
             vec![b]
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
-        // Shift+Enter / Ctrl+Enter: a bare terminal can't express these as
-        // distinct bytes (both collapse to CR), so agent TUIs like Claude Code
-        // and pi read the kitty CSI-u encoding to mean "insert a newline"
-        // rather than "submit". This only fires when the enhanced keyboard
-        // protocol is negotiated (see main.rs); without it the modifier never
-        // reaches us and plain Enter (submit) is unaffected.
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => b"\x1b[13;2u".to_vec(),
-        KeyCode::Enter if ctrl => b"\x1b[13;5u".to_vec(),
+        // Shift+Enter / Ctrl+Enter → ESC+CR ("meta-enter"), which agent TUIs
+        // accept as "insert a newline" rather than "submit": pi's editor matches
+        // the literal `\x1b\r`, and it's exactly macOS Option+Enter, which Claude
+        // Code treats as newline too. We deliberately do NOT send the kitty CSI-u
+        // encoding: that requires the *inner* app to have enabled the kitty
+        // keyboard protocol, which it only does if its terminal answered the
+        // `CSI ? u` probe as kitty-capable — and roost, as a multiplexer, does
+        // not. ESC+CR needs no negotiation with the pane. This still depends on
+        // the *outer* terminal delivering Shift/Ctrl+Enter as a distinct key
+        // (see the enhancement negotiation in main.rs); without that, the
+        // modifier never reaches us and plain Enter (submit) is unaffected.
+        KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL) => {
+            b"\x1b\r".to_vec()
+        }
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
@@ -198,15 +204,15 @@ mod tests {
     }
 
     #[test]
-    fn shift_and_ctrl_enter_insert_newline_via_csi_u() {
-        // Shift+Enter → CSI-u for keycode 13, modifier 2 (shift): newline.
+    fn shift_and_ctrl_enter_insert_newline_via_esc_cr() {
+        // Shift+Enter → ESC+CR, which agent TUIs read as "insert newline".
         match translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)) {
-            InputResult::Forward(b) => assert_eq!(b, b"\x1b[13;2u"),
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b\r"),
             _ => panic!(),
         }
-        // Ctrl+Enter → CSI-u for keycode 13, modifier 5 (ctrl).
+        // Ctrl+Enter → same ESC+CR newline.
         match translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)) {
-            InputResult::Forward(b) => assert_eq!(b, b"\x1b[13;5u"),
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b\r"),
             _ => panic!(),
         }
         // Plain Enter still submits (bare CR), unchanged.
