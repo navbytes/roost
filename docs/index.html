@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>roost — session-native terminal multiplexer</title>
+<meta name="description" content="roost is a session-native terminal multiplexer for AI agent CLIs — pi, Claude Code, your shell. Quit, reboot, run roost — every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="roost — session-native terminal multiplexer">
+<meta property="og:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for AI agent CLIs, with no daemon.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%23ec3013'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  /* ── modernist design-system tokens (verbatim subset) ─────────────── */
+  :root {
+    --color-bg: #f3f2f2;
+    --color-surface: #eae9e9;
+    --color-text: #201e1d;
+    --color-accent: #ec3013;
+    --color-accent-2: #e15b47;
+    --color-divider: color-mix(in srgb, #201e1d 40%, transparent);
+
+    --color-neutral-100: #f8f4f4;
+    --color-neutral-800: #444141;
+
+    --color-accent-100: #fff2ef;
+    --color-accent-600: #dd2b0f;
+    --color-accent-700: #ae1800;
+    --color-accent-800: #7c1405;
+
+    --font-heading: "Archivo", system-ui, sans-serif;
+    --font-heading-weight: 800;
+    --font-body: "Archivo", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+
+    --radius-md: 0px;
+
+    --shadow-lg: 0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent);
+
+    --edge: clamp(20px, 5vw, 72px);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; font: 400 15px/1.55 var(--font-body);
+    background: var(--color-bg); color: var(--color-text); text-wrap: pretty;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+    line-height: 1.12; letter-spacing: -0.015em; margin: 0 0 var(--space-2);
+  }
+  p { margin: 0 0 var(--space-3); }
+  a { color: var(--color-accent); text-underline-offset: 3px; }
+  a:hover { color: var(--color-accent-700); }
+  :focus { outline: none; }
+  :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+  ::selection { background: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    cursor: pointer; text-decoration: none;
+    font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+    font-size: 14px; line-height: 1.2; color: var(--color-text);
+    background: transparent; border: 1px solid transparent;
+    padding: var(--space-2) calc(var(--space-3) * 1.2);
+    border-radius: var(--radius-md);
+  }
+  .btn-primary { background: var(--color-accent); color: var(--color-bg); }
+  .btn-primary:hover { background: var(--color-accent-600); color: var(--color-bg); }
+  .btn-primary:active { background: var(--color-accent-700); }
+  .btn-secondary { border-color: var(--color-divider); }
+  .btn-secondary:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); color: var(--color-text); }
+  .btn-secondary:active { background: color-mix(in srgb, var(--color-text) 14%, transparent); }
+
+  .tag {
+    display: inline-flex; align-items: center; font-size: 11px;
+    letter-spacing: 0.02em; padding: 3px 10px;
+    border-radius: calc(var(--radius-md) * 0.75);
+  }
+  .tag-accent { background: var(--color-accent-100); color: var(--color-accent-800); }
+  .tag-neutral { background: var(--color-neutral-100); color: var(--color-neutral-800); }
+  .tag-outline { border: 1px solid var(--color-accent); color: var(--color-accent); }
+
+  .nav {
+    display: flex; align-items: center; gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 2px solid var(--color-divider);
+  }
+  .nav-brand {
+    font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+    font-size: 18px; margin-right: auto;
+  }
+  .nav a { color: inherit; text-decoration: none; font-size: 14px; }
+  .nav a:hover { color: var(--color-accent); }
+  .nav a.btn-primary:hover { color: var(--color-bg); }
+
+  /* ── page ─────────────────────────────────────────────────────────── */
+  @keyframes roost-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+  @keyframes roost-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  .kicker {
+    display: block; font-family: var(--font-mono); font-size: 13px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--color-accent-700); margin-bottom: 14px;
+  }
+
+  .demo-grid { display: grid; grid-template-columns: minmax(0,240px) minmax(0,1fr); min-height: 340px; }
+  .demo-side { border-right: 1px solid rgba(255,255,255,0.12); display: flex; flex-direction: column; font-family: var(--font-mono); font-size: 12.5px; }
+
+  .stats { display: grid; grid-template-columns: repeat(4,1fr); gap: 32px 24px; }
+  .stat-num {
+    font-family: var(--font-heading); font-weight: 800;
+    font-size: clamp(34px,3.6vw,52px); color: var(--color-accent);
+    margin: 0; letter-spacing: -0.02em;
+  }
+  .stat-label {
+    font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase;
+    color: color-mix(in srgb, var(--color-text) 66%, transparent); margin: 12px 0 0;
+  }
+
+  .frow {
+    display: grid; grid-template-columns: minmax(56px,120px) minmax(0,360px) minmax(0,1fr);
+    gap: 24px clamp(24px,4vw,64px); align-items: baseline;
+    padding: 32px 0; border-top: 2px solid var(--color-divider);
+  }
+  .frow:last-child { border-bottom: 2px solid var(--color-divider); }
+  .frow-num { font-family: var(--font-heading); font-weight: 800; font-size: 15px; margin: 0; font-feature-settings: 'tnum' 1; }
+  .frow h3 { font-family: var(--font-heading); font-weight: 800; font-size: clamp(22px,2vw,26px); letter-spacing: -0.01em; margin: 0; }
+  .frow-body { font-size: 16px; line-height: 1.65; margin: 0; color: color-mix(in srgb, var(--color-text) 78%, transparent); max-width: 56ch; }
+
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: 2px solid var(--color-text); }
+  .compare-left { padding: 28px; border-right: 2px solid var(--color-text); }
+  .how-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: clamp(24px,4vw,56px); margin-top: 44px; align-items: start; }
+
+  .keys-grid {
+    display: grid; grid-template-columns: repeat(auto-fill,minmax(260px,1fr)); gap: 0;
+    border-top: 2px solid var(--color-text); border-left: 2px solid var(--color-text);
+  }
+  .keycell {
+    display: flex; align-items: center; gap: 14px; padding: 16px 18px;
+    border-right: 2px solid var(--color-text); border-bottom: 2px solid var(--color-text);
+  }
+  .keycell kbd {
+    font-family: var(--font-mono); font-size: 12.5px; font-weight: 500;
+    background: var(--color-surface); border: 1px solid var(--color-divider);
+    padding: 5px 9px; white-space: nowrap;
+  }
+  .keycell span { font-size: 14.5px; }
+
+  @media (max-width: 760px) {
+    .nav a:not(.btn) { display: none; }
+    .demo-grid { grid-template-columns: 1fr; }
+    .demo-side { border-right: 0; border-bottom: 1px solid rgba(255,255,255,0.12); }
+    .stats { grid-template-columns: repeat(2,1fr); }
+    .frow { grid-template-columns: 1fr; gap: 10px; }
+    .compare { grid-template-columns: 1fr; }
+    .compare-left { border-right: 0; border-bottom: 2px solid var(--color-text); }
+    .how-grid { grid-template-columns: 1fr; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { animation: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<nav class="nav" style="position:sticky;top:0;z-index:20;background:var(--color-bg);padding-inline:max(var(--space-4),calc((100% - 1200px) / 2 + var(--edge)))">
+  <span class="nav-brand" style="display:flex;align-items:center;gap:10px">
+    <span style="display:inline-block;width:13px;height:13px;background:var(--color-accent)"></span>roost
+  </span>
+  <a href="#features">Features</a>
+  <a href="#how">How it works</a>
+  <a href="#keys">Keys</a>
+  <a href="#agents">Agents</a>
+  <a href="#install">Install</a>
+  <a class="btn btn-primary" href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="text-decoration:none">GitHub ↗</a>
+</nav>
+
+<div style="max-width:1200px;margin:0 auto;padding:0 var(--edge)">
+
+  <section style="padding:clamp(48px,7vw,104px) 0 clamp(40px,5vw,72px)">
+    <span class="kicker" style="margin-bottom:28px">Session-native terminal multiplexer</span>
+    <h1 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(42px,6.6vw,88px);line-height:1.02;letter-spacing:-0.03em;margin:0;margin-left:-0.04em">
+      <span style="display:block">Processes are disposable.</span>
+      <span style="display:block;color:var(--color-accent)">Sessions are precious.</span>
+    </h1>
+    <p style="font-size:clamp(17px,1.5vw,20px);line-height:1.6;max-width:60ch;margin:32px 0 0;color:color-mix(in srgb, var(--color-text) 82%, transparent)">
+      roost is a terminal multiplexer built for AI agent CLIs — pi, Claude Code, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — and every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon. No detach. No lost context.
+    </p>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
+      <div style="display:flex;align-items:stretch;border:2px solid var(--color-text);font-family:var(--font-mono)">
+        <span style="display:flex;align-items:center;gap:10px;padding:12px 16px;font-size:15px;white-space:nowrap">
+          <span style="color:var(--color-accent)">$</span>cargo install --path .
+        </span>
+        <button type="button" id="copy" style="border:0;border-left:2px solid var(--color-text);background:var(--color-text);color:var(--color-bg);font-family:var(--font-mono);font-weight:500;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;padding:0 16px;cursor:pointer;min-width:88px">Copy</button>
+      </div>
+      <a class="btn btn-secondary" href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="text-decoration:none;padding:12px 20px;font-size:15px">Star on GitHub ↗</a>
+    </div>
+  </section>
+
+  <section aria-label="roost terminal demo" style="padding-bottom:clamp(40px,5vw,72px)">
+    <div style="border:2px solid var(--color-text);background:#181615;box-shadow:var(--shadow-lg)">
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:#221f1e;border-bottom:1px solid rgba(255,255,255,0.09)">
+        <span style="display:flex;gap:7px">
+          <span style="width:11px;height:11px;background:#5a5654;display:inline-block"></span>
+          <span style="width:11px;height:11px;background:#5a5654;display:inline-block"></span>
+          <span style="width:11px;height:11px;background:#5a5654;display:inline-block"></span>
+        </span>
+        <span style="font-family:var(--font-mono);font-size:12.5px;color:#8f8a88;letter-spacing:0.02em">roost — ~/code</span>
+        <span style="margin-left:auto;font-family:var(--font-mono);font-size:11px;color:#6d6866;letter-spacing:0.04em">workspace saved ✓</span>
+      </div>
+      <div style="display:flex;font-family:var(--font-mono);font-size:12.5px;background:#1e1b1a;border-bottom:1px solid rgba(255,255,255,0.09)">
+        <span style="padding:8px 16px;color:#f3f2f2;background:#181615;border-right:1px solid rgba(255,255,255,0.09);border-top:2px solid var(--color-accent)">1 pi-mono</span>
+        <span style="padding:8px 16px;color:#8f8a88;border-right:1px solid rgba(255,255,255,0.09)">2 api</span>
+        <span style="padding:8px 16px;color:#8f8a88;border-right:1px solid rgba(255,255,255,0.09)">3 infra ◆</span>
+      </div>
+      <div class="demo-grid">
+        <div class="demo-side">
+          <span style="padding:9px 14px;color:#8f8a88;font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;border-bottom:1px solid rgba(255,255,255,0.09)">stack · 4 panes</span>
+          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#f3f2f2;background:#242120;border-left:3px solid var(--color-accent);border-bottom:1px solid rgba(255,255,255,0.06)">
+            <span class="js-spinner" style="color:var(--color-accent);animation:roost-pulse 1.1s ease-in-out infinite">⠋</span> run tests <span style="margin-left:auto;color:#6d6866;font-size:10.5px">pi</span>
+          </span>
+          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#cfcbc9;border-bottom:1px solid rgba(255,255,255,0.06)">
+            <span style="color:var(--color-accent)">◆</span> refactor tui <span style="margin-left:auto;color:#6d6866;font-size:10.5px">pi</span>
+          </span>
+          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#cfcbc9;border-bottom:1px solid rgba(255,255,255,0.06)">
+            <span style="color:#9b9797">○</span> write docs <span style="margin-left:auto;color:#6d6866;font-size:10.5px">claude</span>
+          </span>
+          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#8f8a88">
+            <span style="color:#605d5d">·</span> shell <span style="margin-left:auto;color:#6d6866;font-size:10.5px">zsh</span>
+          </span>
+        </div>
+        <div style="position:relative;padding:16px 18px;font-family:var(--font-mono);font-size:13px;line-height:1.7;color:#d7d3d3;overflow:hidden">
+          <span style="position:absolute;top:10px;right:14px;font-size:11px;color:#6d6866;letter-spacing:0.04em">pi · run tests ●</span>
+          <div style="color:#8f8a88">~/code/pi-mono</div>
+          <div><span style="color:var(--color-accent)">❯</span> <span id="typed"></span><span style="display:inline-block;width:8px;height:15px;background:#d7d3d3;vertical-align:-2px;animation:roost-blink 1.05s step-end infinite"></span></div>
+          <div style="margin-top:12px;color:#8f8a88">spawned pane <span style="color:#cfcbc9">#5</span> · pi · resuming session 01998e5f…</div>
+          <div style="color:#8f8a88">running <span style="color:#cfcbc9">cargo test</span> …</div>
+          <div style="margin-top:4px;color:#7fae7f">   Compiling roost v0.1.0</div>
+          <div style="color:#7fae7f">    Finished test profile</div>
+          <div style="color:#cfcbc9">running 48 tests <span class="js-spinner" style="color:var(--color-accent);animation:roost-pulse 1.1s ease-in-out infinite">⠋</span></div>
+        </div>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:18px;padding:9px 14px;background:#221f1e;border-top:1px solid rgba(255,255,255,0.09);font-family:var(--font-mono);font-size:11.5px;color:#8f8a88">
+        <span><span style="color:var(--color-accent)">Alt+n</span> new</span>
+        <span><span style="color:var(--color-accent)">Alt+Enter</span> launch</span>
+        <span><span style="color:var(--color-accent)">Alt+s</span> stack</span>
+        <span><span style="color:var(--color-accent)">Alt+↑↓</span> focus</span>
+        <span><span style="color:var(--color-accent)">Alt+w</span> close</span>
+        <span style="margin-left:auto"><span style="color:var(--color-accent)">Alt+q</span> quit — sessions live</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:20px 28px;margin-top:20px;font-family:var(--font-mono);font-size:12px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
+      <span><span style="color:var(--color-accent)">●</span> working</span>
+      <span><span style="color:var(--color-accent)">◆</span> needs input</span>
+      <span>○ waiting for you</span>
+      <span>· idle</span>
+      <span>✕ exited</span>
+    </div>
+  </section>
+
+  <hr style="height:2px;border:0;margin:0;background:var(--color-divider)">
+
+  <section style="padding:clamp(40px,5vw,72px) 0" aria-label="roost by the numbers">
+    <div class="stats">
+      <div><p class="stat-num">0</p><p class="stat-label">Daemons to run</p></div>
+      <div><p class="stat-num">1</p><p class="stat-label">Foreground process, like an editor</p></div>
+      <div><p class="stat-num">100%</p><p class="stat-label">Workspace restored on relaunch</p></div>
+      <div><p class="stat-num">8→1</p><p class="stat-label">Agents in the space of one, stacked</p></div>
+    </div>
+  </section>
+
+  <hr style="height:2px;border:0;margin:0;background:var(--color-divider)">
+
+  <section id="features" style="padding:clamp(40px,5vw,72px) 0 clamp(24px,3vw,40px)">
+    <span class="kicker">What roost does</span>
+    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 8px;max-width:22ch">The muxer contract, inverted.</h2>
+  </section>
+
+  <div>
+    <div class="frow">
+      <p class="frow-num">01</p>
+      <h3>Full workspace resurrection</h3>
+      <p class="frow-body">Quit, reboot, reopen the terminal, run <code style="font-family:var(--font-mono);font-size:0.9em">roost</code>. It rebuilds every tab, split, and stacked pane, then resumes each agent into the exact session it was in — right working directory and all.</p>
+    </div>
+    <div class="frow">
+      <p class="frow-num">02</p>
+      <h3>Session-native by design</h3>
+      <p class="frow-body">Agent CLIs already persist their own conversation state and resume by id. So roost persists only the layout tree plus each pane's <code style="font-family:var(--font-mono);font-size:0.9em">(adapter, cwd, session-id)</code> — and relaunches processes on demand. No daemon required.</p>
+    </div>
+    <div class="frow">
+      <p class="frow-num">03</p>
+      <h3>Fleet at a glance</h3>
+      <p class="frow-body">Stacked panes collapse to one-line title bars, each carrying a live status badge — working, needs input, waiting, idle, exited. Eight agents fit in the space of one, and roost rings the bell when one needs you.</p>
+    </div>
+    <div class="frow">
+      <p class="frow-num">04</p>
+      <h3>Drive a fleet from the CLI</h3>
+      <p class="frow-body"><code style="font-family:var(--font-mono);font-size:0.9em">spawn</code>, <code style="font-family:var(--font-mono);font-size:0.9em">send</code>, <code style="font-family:var(--font-mono);font-size:0.9em">wait</code>, <code style="font-family:var(--font-mono);font-size:0.9em">fork</code>, <code style="font-family:var(--font-mono);font-size:0.9em">close</code> — the same binary in client mode. An agent inside a pane can spawn and orchestrate its own workers while you watch the whole fleet live. Authorization is ownership-scoped.</p>
+    </div>
+    <div class="frow">
+      <p class="frow-num">05</p>
+      <h3>Nothing heavy left over</h3>
+      <p class="frow-body">No client/server protocol, no detach, no scrollback serialization, no process migration. roost is a single foreground process — the hardest parts of a multiplexer simply don't exist here.</p>
+    </div>
+  </div>
+
+  <section id="how" style="padding:clamp(48px,6vw,88px) 0 clamp(40px,5vw,72px)">
+    <span class="kicker">How it works</span>
+    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 40px;max-width:24ch">Keep the map, not the machine.</h2>
+    <div class="compare">
+      <div class="compare-left">
+        <span style="font-family:var(--font-mono);font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb, var(--color-text) 60%, transparent)">tmux / zellij</span>
+        <p style="font-family:var(--font-heading);font-weight:800;font-size:clamp(19px,1.7vw,23px);line-height:1.25;letter-spacing:-0.01em;margin:14px 0 0">The layout is cheap, the processes are precious — keep them alive at all cost.</p>
+      </div>
+      <div style="padding:28px;background:var(--color-accent);color:var(--color-bg)">
+        <span style="font-family:var(--font-mono);font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb, var(--color-bg) 82%, transparent)">roost</span>
+        <p style="font-family:var(--font-heading);font-weight:800;font-size:clamp(19px,1.7vw,23px);line-height:1.25;letter-spacing:-0.01em;margin:14px 0 0">The processes are cheap, the layout × session-id mapping is precious — persist that, relaunch the rest.</p>
+      </div>
+    </div>
+    <div class="how-grid">
+      <div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:20px;margin:0 0 16px">The precious state</h3>
+        <p style="font-size:15.5px;line-height:1.65;margin:0 0 20px;color:color-mix(in srgb, var(--color-text) 78%, transparent)">A single file — <code style="font-family:var(--font-mono);font-size:0.9em">workspace.json</code> — is the whole product, morally. Atomic writes on every change; delete it to start clean.</p>
+        <pre style="font-family:var(--font-mono);font-size:12.5px;line-height:1.7;background:#181615;color:#d7d3d3;padding:18px;margin:0;overflow-x:auto;border:2px solid var(--color-text)"><span style="color:#8f8a88">{</span>
+  <span style="color:#e6a15c">"active_tab"</span>: 0,
+  <span style="color:#e6a15c">"tabs"</span>: [{
+    <span style="color:#e6a15c">"name"</span>: <span style="color:#7fae7f">"pi-mono"</span>,
+    <span style="color:#e6a15c">"panes"</span>: {
+      <span style="color:#e6a15c">"p1"</span>: { <span style="color:#e6a15c">"adapter"</span>: <span style="color:#7fae7f">"pi"</span>,
+             <span style="color:#e6a15c">"session"</span>: <span style="color:#7fae7f">"01998e5f…"</span> }
+    }
+  }]
+<span style="color:#8f8a88">}</span></pre>
+      </div>
+      <div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:20px;margin:0 0 16px">Ports &amp; adapters</h3>
+        <p style="font-size:15.5px;line-height:1.65;margin:0 0 20px;color:color-mix(in srgb, var(--color-text) 78%, transparent)">The core is pure and fully unit-tested — it never touches a PTY, socket, or the filesystem. Real I/O lives at the edges, behind trait boundaries.</p>
+        <div style="border:2px solid var(--color-text);font-family:var(--font-mono);font-size:13px">
+          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>core/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">pure domain</span></div>
+          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>ports.rs</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">trait boundaries</span></div>
+          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>agents/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">pi · claude · shell</span></div>
+          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>infra/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">real I/O at the edges</span></div>
+          <div style="padding:12px 16px;display:flex;justify-content:space-between"><span>ui/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">ratatui rendering</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="keys" style="padding:clamp(40px,5vw,72px) 0;border-top:2px solid var(--color-divider)">
+    <span class="kicker">Keys</span>
+    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 8px;max-width:20ch">One flat modifier layer.</h2>
+    <p style="font-size:16px;line-height:1.65;margin:0 0 36px;max-width:52ch;color:color-mix(in srgb, var(--color-text) 78%, transparent)">Everything's on <code style="font-family:var(--font-mono);font-size:0.9em">Alt</code>, so it never fights the agents' own <code style="font-family:var(--font-mono);font-size:0.9em">Ctrl</code> bindings. Everything else passes straight through to the focused pane.</p>
+    <div class="keys-grid">
+      <div class="keycell"><kbd>Alt+n</kbd><span>new pane</span></div>
+      <div class="keycell"><kbd>Alt+Enter</kbd><span>launch picker</span></div>
+      <div class="keycell"><kbd>Alt+hjkl</kbd><span>move focus</span></div>
+      <div class="keycell"><kbd>Alt+s</kbd><span>stack ⇄ explode</span></div>
+      <div class="keycell"><kbd>Alt+o</kbd><span>flip orientation</span></div>
+      <div class="keycell"><kbd>Alt+c</kbd><span>copy mode</span></div>
+      <div class="keycell"><kbd>Alt+t</kbd><span>new tab</span></div>
+      <div class="keycell"><kbd>Alt+u</kbd><span>undo — reopen pane</span></div>
+      <div class="keycell"><kbd>Alt+w</kbd><span>close pane</span></div>
+      <div class="keycell"><kbd>Alt+?</kbd><span>full keymap</span></div>
+      <div class="keycell"><kbd>Alt+PgUp</kbd><span>scroll mode</span></div>
+      <div class="keycell"><kbd>Alt+q</kbd><span>quit — sessions live</span></div>
+    </div>
+  </section>
+
+  <section id="agents" style="padding:clamp(40px,5vw,72px) 0;border-top:2px solid var(--color-divider)">
+    <span class="kicker">Supported agents</span>
+    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 40px;max-width:24ch">An adapter per CLI. Five small methods.</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:0;border-top:2px solid var(--color-text);border-left:2px solid var(--color-text)">
+      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><span class="tag tag-accent">Flagship</span></div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">pi</h3>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">A shipped extension reports session ids and exact status over roost's unix socket — no spinner-parsing. Installed on first run, with consent.</p>
+        <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">pi</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">pi --session &lt;id&gt;</span></div>
+      </div>
+      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><span class="tag tag-neutral">Hooks</span></div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">Claude Code</h3>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Hook snippets point Notification / Stop / PreToolUse at the same socket. Session detection falls back to diffing the project's <code style="font-family:var(--font-mono);font-size:0.9em">.jsonl</code> dir.</p>
+        <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">claude</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">claude --resume &lt;id&gt;</span></div>
+      </div>
+      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><span class="tag tag-outline">Generic</span></div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">shell</h3>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Any <code style="font-family:var(--font-mono);font-size:0.9em">$SHELL</code>, relaunched in its saved cwd. Status comes from PTY-output heuristics — bytes flowing means working, the bell means needs-you.</p>
+        <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">$SHELL</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">relaunch in cwd</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" style="padding:clamp(48px,6vw,88px) 0 clamp(40px,5vw,72px);border-top:2px solid var(--color-divider)">
+    <span class="kicker">Get started</span>
+    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 32px;max-width:18ch">Two lines and a reboot you'll never fear.</h2>
+    <div style="border:2px solid var(--color-text);background:#181615;font-family:var(--font-mono);font-size:14.5px;line-height:2;color:#d7d3d3;padding:22px 24px;overflow-x:auto">
+      <div><span style="color:#8f8a88"># build &amp; install</span></div>
+      <div><span style="color:var(--color-accent)">$</span> cargo install --path .</div>
+      <div><span style="color:var(--color-accent)">$</span> roost</div>
+      <div style="margin-top:14px"><span style="color:#8f8a88"># or an isolated workspace</span></div>
+      <div><span style="color:var(--color-accent)">$</span> ROOST_STATE=/some/dir roost</div>
+    </div>
+    <p style="font-size:14px;line-height:1.65;margin:18px 0 0;max-width:64ch;color:color-mix(in srgb, var(--color-text) 66%, transparent)"><strong style="color:var(--color-text)">macOS note:</strong> roost's shortcuts live on <code style="font-family:var(--font-mono);font-size:0.9em">Alt</code>. Tell your terminal to treat <strong style="color:var(--color-text)">Option</strong> as Meta — Terminal.app and iTerm2 need a one-time setting; Ghostty, WezTerm, and kitty already do.</p>
+  </section>
+
+</div>
+
+<section style="background:var(--color-accent);color:var(--color-bg)">
+  <div style="max-width:1200px;margin:0 auto;padding:clamp(56px,7vw,96px) var(--edge)">
+    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(38px,5.5vw,72px);line-height:1.02;letter-spacing:-0.03em;margin:0;margin-left:-0.04em">
+      <span style="display:block">Bring your agents home.</span>
+    </h2>
+    <p style="font-size:clamp(16px,1.4vw,19px);line-height:1.55;max-width:46ch;margin:24px 0 0;color:color-mix(in srgb, var(--color-bg) 88%, transparent)">Free and open source. Your agents come home to roost after every reboot.</p>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
+      <div style="display:flex;align-items:center;gap:12px;padding:13px 18px;font-family:var(--font-mono);font-size:15px;background:color-mix(in srgb, var(--color-bg) 12%, transparent);border:2px solid var(--color-bg)">
+        <span>cargo install --path .</span>
+      </div>
+      <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" class="btn" style="text-decoration:none;color:var(--color-bg);border:2px solid var(--color-bg);padding:12px 22px;font-size:15px">View on GitHub ↗</a>
+    </div>
+  </div>
+</section>
+
+<footer style="border-top:2px solid var(--color-divider)">
+  <div style="max-width:1200px;margin:0 auto;padding:36px var(--edge);display:flex;flex-wrap:wrap;gap:24px;align-items:center;justify-content:space-between">
+    <span style="display:flex;align-items:center;gap:10px;font-family:var(--font-heading);font-weight:800;font-size:16px"><span style="display:inline-block;width:11px;height:11px;background:var(--color-accent)"></span>roost</span>
+    <div style="display:flex;flex-wrap:wrap;gap:24px;font-family:var(--font-mono);font-size:13px">
+      <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">GitHub</a>
+      <a href="https://github.com/navbytes/roost/blob/main/DESIGN.md" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">DESIGN.md</a>
+      <a href="#features" style="color:inherit;text-decoration:none">Features</a>
+      <a href="#install" style="color:inherit;text-decoration:none">Install</a>
+    </div>
+    <span style="font-family:var(--font-mono);font-size:12px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">Rust · portable-pty · vt100 · ratatui</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var cmd = 'roost spawn pi --input "run the tests, report pass/fail"';
+  var typed = document.getElementById('typed');
+
+  if (reduced) {
+    typed.textContent = cmd;
+  } else {
+    var frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+    var spinners = document.querySelectorAll('.js-spinner');
+    var fi = 0;
+    setInterval(function () {
+      fi = (fi + 1) % frames.length;
+      spinners.forEach(function (s) { s.textContent = frames[fi]; });
+    }, 100);
+
+    var i = 0, dir = 1, hold = 0;
+    setInterval(function () {
+      if (dir === 1) {
+        i++;
+        if (i >= cmd.length) { hold++; if (hold > 32) { dir = -1; hold = 0; } }
+      } else {
+        i -= 2;
+        if (i <= 0) { i = 0; dir = 1; }
+      }
+      typed.textContent = cmd.slice(0, i);
+    }, 55);
+  }
+
+  var btn = document.getElementById('copy');
+  var ct;
+  btn.addEventListener('click', function () {
+    try { navigator.clipboard.writeText('cargo install --path .').catch(function () {}); } catch (e) {}
+    btn.textContent = 'Copied ✓';
+    clearTimeout(ct);
+    ct = setTimeout(function () { btn.textContent = 'Copy'; }, 1400);
+  });
+})();
+</script>
+</body>
+</html>
