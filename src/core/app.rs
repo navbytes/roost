@@ -418,6 +418,13 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// Whether the focused pane negotiated the kitty keyboard protocol, so the
+    /// input layer knows whether to send modified Enter as CSI-u or the legacy
+    /// fallback.
+    pub fn focused_kitty(&self) -> bool {
+        self.runtimes.get(&self.focused).map(|rt| rt.kitty_disambiguate()).unwrap_or(false)
+    }
+
     /// Is a socket message claiming to be `id` carrying that pane's token?
     /// Guards session/status updates against cross-pane spoofing over the
     /// shared socket. Fails closed: unknown pane or missing token → rejected.

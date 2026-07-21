@@ -74,8 +74,26 @@ pub fn translate(key: KeyEvent) -> InputResult {
     encode_key(key)
 }
 
+/// Upgrade modified-Enter bytes to the kitty CSI-u encoding when the target
+/// pane negotiated the protocol (`kitty` = its disambiguate flag). Panes that
+/// never opted in keep the ESC+CR fallback from `encode_key`. Called from the
+/// forward path, where the focused pane's state is known.
+pub fn kitty_upgrade(key: KeyEvent, bytes: Vec<u8>, kitty: bool) -> Vec<u8> {
+    if !kitty || key.code != KeyCode::Enter || key.modifiers.contains(KeyModifiers::ALT) {
+        return bytes;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        b"\x1b[13;2u".to_vec() // Shift+Enter, kitty CSI-u (mods 2 = shift)
+    } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+        b"\x1b[13;5u".to_vec() // Ctrl+Enter, kitty CSI-u (mods 5 = ctrl)
+    } else {
+        bytes
+    }
+}
+
 /// Encode a key event as the bytes a terminal would send. Covers the common
-/// set; kitty-protocol fidelity is a later concern.
+/// set; a pane that negotiated kitty gets modified Enter upgraded to CSI-u by
+/// `kitty_upgrade` on the way out.
 fn encode_key(key: KeyEvent) -> InputResult {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let bytes: Vec<u8> = match key.code {
@@ -84,17 +102,16 @@ fn encode_key(key: KeyEvent) -> InputResult {
             vec![b]
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
-        // Shift+Enter / Ctrl+Enter → ESC+CR ("meta-enter"), which agent TUIs
-        // accept as "insert a newline" rather than "submit": pi's editor matches
-        // the literal `\x1b\r`, and it's exactly macOS Option+Enter, which Claude
-        // Code treats as newline too. We deliberately do NOT send the kitty CSI-u
-        // encoding: that requires the *inner* app to have enabled the kitty
-        // keyboard protocol, which it only does if its terminal answered the
-        // `CSI ? u` probe as kitty-capable — and roost, as a multiplexer, does
-        // not. ESC+CR needs no negotiation with the pane. This still depends on
-        // the *outer* terminal delivering Shift/Ctrl+Enter as a distinct key
-        // (see the enhancement negotiation in main.rs); without that, the
-        // modifier never reaches us and plain Enter (submit) is unaffected.
+        // Shift+Enter / Ctrl+Enter → ESC+CR ("meta-enter") as the *fallback*
+        // for panes that never negotiated the kitty keyboard protocol: pi's
+        // editor matches the literal `\x1b\r`, and it's macOS Option+Enter,
+        // which Claude Code accepts too. A pane that DID negotiate kitty gets
+        // the precise CSI-u form instead — that upgrade happens in
+        // `kitty_upgrade` (called from main with the focused pane's state),
+        // since key encoding here has no per-pane context. Either way this only
+        // fires when the *outer* terminal delivers Shift/Ctrl+Enter as a
+        // distinct key (the enhancement negotiation in main.rs); without that,
+        // plain Enter (submit) is unaffected.
         KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL) => {
             b"\x1b\r".to_vec()
         }
@@ -225,5 +242,19 @@ mod tests {
             translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             InputResult::Action(Action::QuickLaunch)
         ));
+    }
+
+    #[test]
+    fn kitty_upgrade_uses_csi_u_only_for_negotiated_panes() {
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        // Non-kitty pane: keep the ESC+CR fallback bytes untouched.
+        assert_eq!(kitty_upgrade(shift_enter, b"\x1b\r".to_vec(), false), b"\x1b\r");
+        // Kitty pane: upgrade to the precise CSI-u encodings.
+        assert_eq!(kitty_upgrade(shift_enter, b"\x1b\r".to_vec(), true), b"\x1b[13;2u");
+        assert_eq!(kitty_upgrade(ctrl_enter, b"\x1b\r".to_vec(), true), b"\x1b[13;5u");
+        // A plain letter is never touched, kitty or not.
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(kitty_upgrade(a, b"a".to_vec(), true), b"a");
     }
 }

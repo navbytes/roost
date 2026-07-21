@@ -67,6 +67,13 @@ pub trait PaneBackend: Sized {
     fn set_extension_status(&mut self, s: AgentStatus);
     fn on_exit(&mut self);
 
+    /// Has the pane negotiated the kitty "disambiguate" keyboard flag? When
+    /// true, roost forwards modified Enter (and friends) in the CSI-u encoding
+    /// the app asked for; otherwise it uses a legacy fallback. Default false.
+    fn kitty_disambiguate(&self) -> bool {
+        false
+    }
+
     /// Terminal grid for rendering. `None` for fakes (renderer must cope).
     fn screen(&self) -> Option<&vt100::Screen>;
     fn set_scrollback(&mut self, lines: usize);

@@ -232,7 +232,13 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
             b"f" => app.respawn_focused(true),   // fresh session
             _ => {}
         },
-        InputResult::Forward(bytes) => app.forward_bytes(&bytes),
+        InputResult::Forward(bytes) => {
+            // If the focused pane negotiated the kitty keyboard protocol, upgrade
+            // modified Enter from the ESC+CR fallback to the CSI-u form it asked
+            // for (Shift+Enter → CSI 13;2u, Ctrl+Enter → CSI 13;5u).
+            let bytes = input::kitty_upgrade(key, bytes, app.focused_kitty());
+            app.forward_bytes(&bytes);
+        }
         InputResult::Ignore => {}
     }
 }

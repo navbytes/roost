@@ -15,6 +15,7 @@ use crate::core::event::AppEvent;
 use crate::core::status::{AgentStatus, StatusTracker};
 use crate::core::workspace::PaneId;
 use crate::infra::inspect;
+use crate::infra::kitty::KittyKeyboard;
 use crate::ports::{MouseProto, Observation, PaneBackend};
 
 const SCROLLBACK_LINES: usize = 5000;
@@ -29,6 +30,9 @@ pub struct PtyPane {
     scroll: usize,
     /// The pane's child pid, for OS observation (live cwd / running agent).
     pid: Option<u32>,
+    /// Tracks the kitty keyboard flags this pane negotiated, so roost can
+    /// forward modified keys (Shift/Ctrl+Enter) in the encoding it asked for.
+    kitty: KittyKeyboard,
     /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
     /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
     /// id. Without this, a pane id that is reused (close→new) or respawned
@@ -113,11 +117,18 @@ impl PaneBackend for PtyPane {
             status: StatusTracker::new(),
             scroll: 0,
             pid,
+            kitty: KittyKeyboard::new(),
             alive,
         })
     }
 
     fn process_output(&mut self, bytes: &[u8]) {
+        // Answer the pane's kitty-keyboard queries and track the flags it
+        // pushes, so modified keys reach it in the encoding it negotiated.
+        let reply = self.kitty.feed(bytes);
+        if !reply.is_empty() {
+            self.write_input_raw(&reply);
+        }
         // vt100 counts *parsed* bells, so a 0x07 consumed as an OSC string
         // terminator (ESC ] … BEL) doesn't count — only a real bell does.
         let bells_before = self.parser.screen().audible_bell_count();
@@ -126,6 +137,10 @@ impl PaneBackend for PtyPane {
             self.status.on_bell();
         }
         self.status.on_output();
+    }
+
+    fn kitty_disambiguate(&self) -> bool {
+        self.kitty.disambiguate()
     }
 
     fn write_input(&mut self, bytes: &[u8]) {

@@ -3,6 +3,7 @@
 
 pub mod clipboard;
 pub mod inspect;
+pub mod kitty;
 pub mod notify;
 pub mod open;
 pub mod pty;
