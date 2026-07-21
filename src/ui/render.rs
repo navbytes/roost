@@ -1,5 +1,8 @@
 //! Rendering: tab bar + pane borders + vt100 grid blit (design doc §8).
 
+use std::collections::HashSet;
+use std::time::Duration;
+
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -8,7 +11,7 @@ use ratatui::Frame;
 
 use crate::core::app::{picker_items, App, Mode, RenameTarget, TabSummary};
 use crate::core::status::AgentStatus;
-use crate::core::layout::PaneRect;
+use crate::core::layout::{self, PaneRect};
 use crate::ports::PaneBackend;
 use crate::ui::mouse;
 use crate::ui::theme;
@@ -25,9 +28,21 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 
     draw_tab_bar(f, app, tab_bar);
 
+    // C6: header row above each stack tall enough to spare one — a separate
+    // walk over the same tree `app.rects()` reads, since the header isn't a
+    // `PaneRect` (it belongs to no pane; §5).
+    for header in layout::stack_headers(&app.ws.active_tab().layout, body) {
+        draw_stack_header(f, header);
+    }
+    // C7: which pane (if any) is the currently-expanded member of a stack —
+    // computed once per frame, independent of whether that stack's header
+    // row is shown.
+    let mut stack_expanded = HashSet::new();
+    layout::stack_expanded_ids(&app.ws.active_tab().layout, &mut stack_expanded);
+
     let rects = app.rects();
     for pr in &rects {
-        draw_pane(f, app, *pr);
+        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id));
     }
 
     if app.hints_shown() {
@@ -347,24 +362,79 @@ fn tab_summary_badge(s: crate::core::app::TabSummary) -> (char, Color) {
     theme::tab_summary_style(s)
 }
 
-fn status_color(s: AgentStatus) -> Color {
-    theme::status_color(s)
+/// C8's state-word table: the collapsed row's right-segment word for each
+/// status. `Exited` is contracted bare — no exit code (SPEC-GAP-1: no
+/// exit-code plumbing exists; `status.rs` tracks only a bool).
+fn state_word(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Working => "working",
+        AgentStatus::NeedsInput => "needs you",
+        AgentStatus::Waiting => "your turn",
+        AgentStatus::Idle => "idle",
+        AgentStatus::Exited => "exited",
+    }
 }
 
-fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
+/// C8's collapsed-row name color, by status.
+fn collapsed_name_color(status: AgentStatus) -> Color {
+    match status {
+        AgentStatus::Working | AgentStatus::NeedsInput => theme::FG,
+        AgentStatus::Waiting | AgentStatus::Idle => theme::MUTED,
+        AgentStatus::Exited => theme::DIM,
+    }
+}
+
+/// C4's no-dup rule: an untitled pane's display `name` is the adapter/cwd
+/// fallback built in `draw_pane`, which already embeds the adapter — so
+/// appending `· {adapter}` again would duplicate it ("pi · repo · pi"). Only
+/// a custom title needs the adapter spelled out separately.
+fn badge_text(name: &str, adapter: &str, has_title: bool) -> String {
+    if has_title {
+        format!("{name} · {adapter}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Render `parts` in order, stopping once `budget` columns are spent — the
+/// part that doesn't fully fit is cut off mid-string rather than dropped
+/// whole, so a badge/row degrades by trimming its tail instead of losing a
+/// whole segment early. Shared by `corner_badge` (C4) and the collapsed-row
+/// left side (C8) so both clip identically.
+fn clip_spans(parts: &[(String, Style)], budget: u16) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(parts.len());
+    let mut left = budget as usize;
+    for (text, style) in parts {
+        if left == 0 {
+            break;
+        }
+        let count = text.chars().count();
+        if count <= left {
+            spans.push(Span::styled(text.clone(), *style));
+            left -= count;
+        } else {
+            spans.push(Span::styled(text.chars().take(left).collect::<String>(), *style));
+            left = 0;
+        }
+    }
+    spans
+}
+
+fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect, stack_expanded: bool) {
     let focused = app.focused == pr.id;
-    let (title, title_line, status, name) = {
+    let (status, name, has_title, adapter) = {
         let spec = app.ws.active_tab().panes.get(&pr.id);
         let status = app
             .runtimes
             .get(&pr.id)
             .map(|rt| rt.status())
             .unwrap_or(AgentStatus::Exited);
+        let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
+        let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
         // Untitled panes on the same adapter are otherwise indistinguishable
         // (same badge, same idle glyph) — tag them with the cwd's last path
         // component so a bank of fresh shells can be told apart at a glance.
         let name = spec.and_then(|s| s.title.clone()).unwrap_or_else(|| {
-            let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
             let cwd_tag = spec
                 .and_then(|s| s.cwd.file_name())
                 .and_then(|f| f.to_str())
@@ -372,47 +442,35 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
                 .unwrap_or_default();
             format!("{adapter}{cwd_tag}")
         });
-        let scroll_tag = if focused && matches!(app.mode, Mode::Scroll { .. }) {
-            " [scroll]"
-        } else {
-            ""
-        };
-        let title = format!(" {} {}{} ", status.badge(), name, scroll_tag);
-        // Color the status glyph itself (not just the focused border) so
-        // idle vs. waiting vs. needs-input reads at a glance on every pane,
-        // not only the one currently focused.
-        let title_line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                status.badge(),
-                Style::default().fg(status_color(status)).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" {name}{scroll_tag} ")),
-        ]);
-        (title, title_line, status, name)
+        (status, name, has_title, adapter)
     };
 
     if pr.collapsed {
-        // Collapsed stack member: a single-row title bar (the fleet view).
-        let style = if focused {
-            Style::default().fg(Color::Black).bg(status_color(status))
-        } else {
-            Style::default().fg(status_color(status))
-        };
-        f.render_widget(Paragraph::new(title).style(style), pr.rect);
+        // C8: collapsed stack member — a single-row fleet-view bar.
+        draw_collapsed_row(f, pr.rect, focused, status, &name, &adapter, app.elapsed());
         return;
     }
 
     // C3: focus is the only signal a border carries now — status lives in
-    // the glyph system (badge/title), not the border color. No BOLD.
+    // the glyph system (corner badge / collapsed row), not the border color,
+    // and the border no longer carries a title (identity moved to the
+    // corner badge, C4). No BOLD.
     let border_style = if focused {
         Style::default().fg(theme::ACCENT)
     } else {
         Style::default().fg(theme::RULE)
     };
-    let block = Block::bordered().title(title_line).border_style(border_style);
+    let block = Block::bordered().border_style(border_style);
     let inner = block.inner(pr.rect);
     f.render_widget(block, pr.rect);
+
+    // C7: an unfocused expanded stack member gets its left border column
+    // overpainted with the accent-dim edge marker. Suppressed when focused —
+    // the full accent border is already the stronger signal, and stacking
+    // ACCENT_DIM inside an ACCENT frame would smear the one-red discipline.
+    if stack_expanded && !focused {
+        paint_stack_edge(f, pr.rect);
+    }
 
     if let Some(screen) = app.runtimes.get(&pr.id).and_then(|rt| rt.screen()) {
         blit_screen(f, screen, inner);
@@ -431,34 +489,31 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
         highlight_selection(f, inner, sel.anchor, sel.cursor);
     }
 
-    // iTerm2-style corner badge: the pane label, faint, top-right. Drawn
-    // after the content so it stays visible (a cell TUI can't do true
-    // translucency; dim gray reads as a watermark rather than content).
-    // Suppressed on the focused pane: you know which pane you're in, the
-    // border title already names it, and the badge would occlude the inner
-    // app's own top-right cells (a header/counter) right where you're working.
-    if !focused {
-        if let Some((rect, text)) = corner_badge(inner, &name) {
-            f.render_widget(
-                Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
-                rect,
-            );
-        }
+    // C4: corner badge — the pane label, top-right. Drawn after the content
+    // so it stays visible (a cell TUI can't do true translucency; MUTED text
+    // reads as a watermark rather than content). Drawn on every pane,
+    // focused included: occlusion of the inner app's own top-right cells is
+    // accepted by design now that identity lives here, not a border title.
+    let (glyph, glyph_base, pulses) = theme::status_style(status);
+    let glyph_color = if pulses { theme::pulse_phase(app.elapsed()) } else { glyph_base };
+    let text = badge_text(&name, &adapter, has_title);
+    if let Some((rect, spans)) = corner_badge(inner, &text, glyph, glyph_color) {
+        f.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
 
-    // Dead pane: overlay the relaunch hint (and spawn error, if any) on the
-    // bottom rows. The last screen contents stay visible above.
+    // C16: dead pane — overlay the relaunch hint (and spawn error, if any)
+    // on the bottom rows. The last screen contents stay visible above.
     if status == AgentStatus::Exited && inner.height > 0 {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(err) = app.dead.get(&pr.id) {
             lines.push(Line::from(Span::styled(
                 format!(" spawn failed: {err} "),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::ACCENT),
             )));
         }
         lines.push(Line::from(Span::styled(
             " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close ",
-            Style::default().fg(Color::Black).bg(Color::Red),
+            Style::default().fg(theme::FG).bg(theme::ACCENT_DIM),
         )));
         let n = lines.len() as u16;
         let y = inner.y + inner.height.saturating_sub(n);
@@ -467,24 +522,122 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
     }
 }
 
-/// Top-right corner badge (iTerm2-style label). Returns the 1-row rect and
-/// the space-padded, right-aligned, clipped text — or None if the pane is too
-/// small to be worth badging. Pure so it can be unit-tested.
-fn corner_badge(inner: Rect, label: &str) -> Option<(Rect, String)> {
-    if label.trim().is_empty() || inner.width < 3 || inner.height == 0 {
+/// C7: overpaint an expanded stack member's left border column with the
+/// accent-dim half-block edge — the cell translation of the mockup's 2px
+/// `--tui-red-dim` left edge (a half-block reads "thicker than a 1px line").
+fn paint_stack_edge(f: &mut Frame, rect: Rect) {
+    let buf = f.buffer_mut();
+    for y in rect.y..rect.y + rect.height {
+        if let Some(cell) = buf.cell_mut((rect.x, y)) {
+            cell.set_symbol(&theme::MARKER_EXPANDED_EDGE.to_string());
+            cell.set_style(Style::default().fg(theme::ACCENT_DIM));
+        }
+    }
+}
+
+/// C8: one collapsed stack row's spans for the given width — marker, status
+/// glyph, and name on the left; the right-aligned dim "adapter · word"
+/// segment when there's room. The right segment drops first when narrow; if
+/// even the left side overflows, the name (last in `left`) is what visibly
+/// clips. Pure so the width-shedding order is unit-testable.
+fn collapsed_row_spans(
+    width: u16,
+    focused: bool,
+    status: AgentStatus,
+    name: &str,
+    adapter: &str,
+    glyph_color: Color,
+) -> Vec<Span<'static>> {
+    let (glyph, ..) = theme::status_style(status);
+    let marker = if focused {
+        (theme::MARKER_ACTIVE.to_string(), Style::default().fg(theme::ACCENT))
+    } else {
+        (" ".to_string(), Style::default())
+    };
+    let left: Vec<(String, Style)> = vec![
+        marker,
+        (glyph.to_string(), Style::default().fg(glyph_color)),
+        (format!(" {name}"), Style::default().fg(collapsed_name_color(status))),
+    ];
+    let left_w: u16 = left.iter().map(|(t, _)| t.chars().count() as u16).sum();
+    let right = format!("{adapter} · {} ", state_word(status));
+    let right_w = right.chars().count() as u16;
+
+    if width >= left_w + right_w {
+        let pad = width - left_w - right_w;
+        let mut spans: Vec<Span> = left.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
+        spans.push(Span::raw(" ".repeat(pad as usize)));
+        spans.push(Span::styled(right, Style::default().fg(theme::DIM)));
+        spans
+    } else {
+        clip_spans(&left, width)
+    }
+}
+
+/// C8: render one collapsed stack member's row. Focused rows additionally
+/// paint `RULE` across the full row width; unfocused rows have no bg
+/// (background policy, §2).
+fn draw_collapsed_row(
+    f: &mut Frame,
+    rect: Rect,
+    focused: bool,
+    status: AgentStatus,
+    name: &str,
+    adapter: &str,
+    elapsed: Duration,
+) {
+    let (_, base, pulses) = theme::status_style(status);
+    let glyph_color = if pulses { theme::pulse_phase(elapsed) } else { base };
+    let spans = collapsed_row_spans(rect.width, focused, status, name, adapter, glyph_color);
+    let style = if focused { Style::default().bg(theme::RULE) } else { Style::default() };
+    f.render_widget(Paragraph::new(Line::from(spans)).style(style), rect);
+}
+
+/// C6's header text for the given row width: uppercase " STACK · N PANES"
+/// left, "ALT+↑↓ " right-aligned, filled with spaces between. Pure so the
+/// content and right-alignment are unit-testable without a `Frame`.
+fn stack_header_text(width: u16, n: usize) -> String {
+    let left = format!(" STACK · {n} PANES");
+    let right = "ALT+↑↓ ";
+    let pad = width
+        .saturating_sub(left.chars().count() as u16)
+        .saturating_sub(right.chars().count() as u16);
+    format!("{left}{}{right}", " ".repeat(pad as usize))
+}
+
+/// C6: a stack's header row. Every cell (text and fill alike) carries
+/// `Modifier::UNDERLINED` — the cell translation of the mockup's 1px bottom
+/// rule — via the paragraph-level style, the same edge-to-edge-fill trick
+/// `draw_tab_bar` uses. No bg (background policy, §2).
+fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
+    f.render_widget(
+        Paragraph::new(stack_header_text(header.rect.width, header.n))
+            .style(Style::default().fg(theme::DIM).add_modifier(Modifier::UNDERLINED)),
+        header.rect,
+    );
+}
+
+/// Top-right corner badge (C4): pane name (+ adapter, when titled) and the
+/// status glyph, right-aligned with one column of breathing room. Two-tone:
+/// the text is MUTED, the glyph carries its own C5 status color. Returns the
+/// 1-row rect and the clipped spans — or `None` if the pane is too small to
+/// be worth badging. Pure so it can be unit-tested.
+fn corner_badge(inner: Rect, text: &str, glyph: char, glyph_color: Color) -> Option<(Rect, Vec<Span<'static>>)> {
+    if text.trim().is_empty() || inner.width < 3 || inner.height == 0 {
         return None;
     }
-    // One space of breathing room on the right edge.
-    let max = inner.width.saturating_sub(1) as usize;
-    let padded = format!(" {label} ");
-    let text: String = if padded.chars().count() > max {
-        padded.chars().take(max).collect()
-    } else {
-        padded
-    };
-    let w = text.chars().count() as u16;
+    let max = inner.width.saturating_sub(1);
+    // One space of breathing room on the right edge (the trailing space in
+    // the glyph part).
+    let parts = [
+        (format!(" {text} "), Style::default().fg(theme::MUTED)),
+        (format!("{glyph} "), Style::default().fg(glyph_color)),
+    ];
+    let total: u16 = parts.iter().map(|(t, _)| t.chars().count() as u16).sum();
+    let w = total.min(max);
+    let spans = clip_spans(&parts, w);
     let x = inner.x + inner.width - w;
-    Some((Rect::new(x, inner.y, w, 1), text))
+    Some((Rect::new(x, inner.y, w, 1), spans))
 }
 
 /// Reverse-video the cells between `a` and `b` (inclusive, pane-inner coords)
@@ -564,7 +717,12 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{centered_near, corner_badge};
+    use super::{
+        badge_text, centered_near, collapsed_name_color, collapsed_row_spans, corner_badge,
+        stack_header_text, state_word,
+    };
+    use crate::core::status::AgentStatus;
+    use crate::ui::theme;
     use ratatui::layout::Rect;
 
     #[test]
@@ -591,30 +749,107 @@ mod tests {
     }
 
     #[test]
-    fn badge_is_right_aligned_on_top_row() {
-        // inner content area at (1,1) sized 40x20 (borders excluded)
-        let inner = Rect::new(1, 1, 40, 20);
-        let (rect, text) = corner_badge(inner, "claude").unwrap();
-        assert_eq!(text, " claude ");
-        assert_eq!(rect.y, inner.y); // top row of the content
-        assert_eq!(rect.height, 1);
-        // right edge: badge ends one col shy of the inner right edge is fine;
-        // here it butts to the edge because label fits.
-        assert_eq!(rect.x + rect.width, inner.x + inner.width);
+    fn badge_no_dup_rule_pins_c4() {
+        // Untitled fallback name already embeds the adapter — don't repeat it.
+        assert_eq!(badge_text("pi · myrepo", "pi", false), "pi · myrepo");
+        // A custom title doesn't embed the adapter — spell it out.
+        assert_eq!(badge_text("worker1", "claude", true), "worker1 · claude");
     }
 
     #[test]
-    fn badge_clips_when_label_too_long_for_pane() {
+    fn badge_is_two_toned_and_right_aligned_on_top_row() {
+        // inner content area at (1,1) sized 40x20 (borders excluded)
+        let inner = Rect::new(1, 1, 40, 20);
+        let (rect, spans) = corner_badge(inner, "claude", theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+        assert_eq!(rect.y, inner.y); // top row of the content
+        assert_eq!(rect.height, 1);
+        // right edge: badge ends one col shy of the inner right edge is fine;
+        // here it butts to the edge because the text fits.
+        assert_eq!(rect.x + rect.width, inner.x + inner.width);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), " claude ");
+        assert_eq!(spans[0].style.fg, Some(theme::MUTED));
+        assert_eq!(spans[1].content.as_ref(), format!("{} ", theme::GLYPH_WORKING));
+        assert_eq!(spans[1].style.fg, Some(theme::ACCENT));
+    }
+
+    #[test]
+    fn badge_clips_and_drops_the_glyph_first_when_pane_too_small() {
         let inner = Rect::new(0, 0, 6, 5);
-        let (rect, text) = corner_badge(inner, "a-very-long-name").unwrap();
-        assert!(text.chars().count() <= 5); // width-1 breathing room
+        let (rect, spans) =
+            corner_badge(inner, "a-very-long-name", theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+        let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert!(total <= 5); // width-1 breathing room
         assert!(rect.x >= inner.x && rect.x + rect.width <= inner.x + inner.width);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains(theme::GLYPH_WORKING)); // too narrow even for the text alone
     }
 
     #[test]
     fn no_badge_for_tiny_or_empty() {
-        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x").is_none()); // too narrow
-        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x").is_none()); // no height
-        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ").is_none()); // blank label
+        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", theme::GLYPH_WORKING, theme::ACCENT).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", theme::GLYPH_WORKING, theme::ACCENT).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", theme::GLYPH_WORKING, theme::ACCENT).is_none());
+    }
+
+    #[test]
+    fn state_word_matches_c8_table() {
+        assert_eq!(state_word(AgentStatus::Working), "working");
+        assert_eq!(state_word(AgentStatus::NeedsInput), "needs you");
+        assert_eq!(state_word(AgentStatus::Waiting), "your turn");
+        assert_eq!(state_word(AgentStatus::Idle), "idle");
+        assert_eq!(state_word(AgentStatus::Exited), "exited");
+    }
+
+    #[test]
+    fn collapsed_name_color_by_state() {
+        assert_eq!(collapsed_name_color(AgentStatus::Working), theme::FG);
+        assert_eq!(collapsed_name_color(AgentStatus::NeedsInput), theme::FG);
+        assert_eq!(collapsed_name_color(AgentStatus::Waiting), theme::MUTED);
+        assert_eq!(collapsed_name_color(AgentStatus::Idle), theme::MUTED);
+        assert_eq!(collapsed_name_color(AgentStatus::Exited), theme::DIM);
+    }
+
+    #[test]
+    fn collapsed_row_shows_right_segment_when_it_fits() {
+        let spans = collapsed_row_spans(40, false, AgentStatus::Working, "pi", "pi", theme::ACCENT);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.ends_with("pi · working "));
+    }
+
+    #[test]
+    fn collapsed_row_drops_right_segment_before_clipping_name() {
+        let name = "a-fairly-long-pane-name";
+        // Exactly enough room for "marker + glyph + ' ' + name", nothing more.
+        let left_w = 3 + name.chars().count() as u16;
+        let spans = collapsed_row_spans(left_w, false, AgentStatus::Idle, name, "shell", theme::DIM);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" · {name}"));
+        assert!(!text.contains("shell"));
+    }
+
+    #[test]
+    fn collapsed_row_clips_name_when_even_the_left_side_overflows() {
+        let spans =
+            collapsed_row_spans(4, false, AgentStatus::Waiting, "a-very-long-pane-name", "shell", theme::FG);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.chars().count(), 4);
+        assert!(!text.contains("shell"));
+    }
+
+    #[test]
+    fn collapsed_row_focused_marker_is_accent() {
+        let spans = collapsed_row_spans(40, true, AgentStatus::Working, "pi", "pi", theme::ACCENT);
+        assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
+        assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
+    }
+
+    #[test]
+    fn stack_header_text_is_uppercase_and_right_aligned() {
+        let text = stack_header_text(30, 3);
+        assert_eq!(text.chars().count(), 30);
+        assert!(text.starts_with(" STACK · 3 PANES"));
+        assert!(text.ends_with("ALT+↑↓ "));
+        assert_eq!(text, text.to_uppercase());
     }
 }

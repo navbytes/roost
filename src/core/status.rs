@@ -30,18 +30,6 @@ pub enum AgentStatus {
     Exited,
 }
 
-impl AgentStatus {
-    pub fn badge(self) -> &'static str {
-        match self {
-            AgentStatus::Working => "●",
-            AgentStatus::NeedsInput => "◆",
-            AgentStatus::Waiting => "○",
-            AgentStatus::Idle => "·",
-            AgentStatus::Exited => "✕",
-        }
-    }
-}
-
 pub struct StatusTracker {
     last_output: Option<Instant>,
     exited: bool,

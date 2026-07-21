@@ -1,6 +1,8 @@
 //! Pure layout domain: the tree (splits / stacks / panes), its operations,
 //! and geometry. No I/O, no process state — fully unit-testable.
 
+use std::collections::HashSet;
+
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 
@@ -292,22 +294,61 @@ pub struct PaneRect {
     pub collapsed: bool,
 }
 
+/// A stack's header row (C6) — shown above its members, in the space it
+/// borrows from them, when `stack_header_shown` says there's room. Not a
+/// `PaneRect`: it belongs to no pane (clicks/wheel events over it hit
+/// nothing — see `compute_rects_and_headers`, which never emits a pane rect
+/// covering this row).
+#[derive(Debug, Clone, Copy)]
+pub struct StackHeader {
+    pub rect: Rect,
+    /// Member count, for the "STACK · N PANES" label.
+    pub n: usize,
+}
+
+/// C6: a stack spares a header row only when every member still clears its
+/// floor afterward — 1 row each for the `n-1` collapsed members, and at
+/// least 3 for the expanded one, plus the header's own row. Below that,
+/// geometry is exactly as if there were no header at all.
+fn stack_header_shown(area_height: u16, n: usize) -> bool {
+    area_height >= n as u16 + 3
+}
+
 /// Walk the layout tree and assign every pane a rectangle within `area`.
 pub fn compute_rects(node: &LayoutNode, area: Rect, out: &mut Vec<PaneRect>) {
+    compute_rects_and_headers(node, area, out, &mut Vec::new());
+}
+
+/// The one real geometry walk: pane rects (as `compute_rects`) plus every
+/// stack's header row (C6), so the two can never disagree about where a
+/// header lands or how much it shrinks its stack's expanded member.
+pub fn compute_rects_and_headers(
+    node: &LayoutNode,
+    area: Rect,
+    out: &mut Vec<PaneRect>,
+    headers: &mut Vec<StackHeader>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     match node {
         LayoutNode::Pane(id) => out.push(PaneRect { id: *id, rect: area, collapsed: false }),
         LayoutNode::Stack { children, expanded } => {
-            let n = children.len() as u16;
+            let n = children.len();
             if n == 0 {
                 return;
             }
+            let n16 = n as u16;
+            let show_header = stack_header_shown(area.height, n);
             let mut y = area.y;
+            if show_header {
+                headers.push(StackHeader { rect: Rect::new(area.x, area.y, area.width, 1), n });
+                y = y.saturating_add(1);
+            }
+            let avail = area.height.saturating_sub(if show_header { 1 } else { 0 });
             for (i, id) in children.iter().enumerate() {
                 let h = if i == *expanded {
-                    area.height.saturating_sub(n.saturating_sub(1))
+                    avail.saturating_sub(n16.saturating_sub(1))
                 } else {
                     1
                 };
@@ -339,7 +380,36 @@ pub fn compute_rects(node: &LayoutNode, area: Rect, out: &mut Vec<PaneRect>) {
                     SplitDir::Horizontal => Rect::new(area.x, area.y + offset, area.width, size),
                 };
                 offset = offset.saturating_add(size);
-                compute_rects(child, rect, out);
+                compute_rects_and_headers(child, rect, out, headers);
+            }
+        }
+    }
+}
+
+/// Just the stack header rows (C6), for the renderer — which already gets
+/// pane rects from `App::rects`/`compute_rects` and only needs the header
+/// geometry alongside them. Same underlying walk, so it can't drift from
+/// `compute_rects`.
+pub fn stack_headers(node: &LayoutNode, area: Rect) -> Vec<StackHeader> {
+    let mut headers = Vec::new();
+    compute_rects_and_headers(node, area, &mut Vec::new(), &mut headers);
+    headers
+}
+
+/// PaneIds that are the currently-expanded member of a `Stack` node (C7) —
+/// distinct from an ordinary split-pane leaf, which is never a member of
+/// this set. Independent of whether that stack's header row (C6) is shown.
+pub fn stack_expanded_ids(node: &LayoutNode, out: &mut HashSet<PaneId>) {
+    match node {
+        LayoutNode::Pane(_) => {}
+        LayoutNode::Stack { children, expanded } => {
+            if let Some(&id) = children.get(*expanded) {
+                out.insert(id);
+            }
+        }
+        LayoutNode::Split { children, .. } => {
+            for c in children {
+                stack_expanded_ids(c, out);
             }
         }
     }
@@ -472,14 +542,81 @@ mod tests {
 
     #[test]
     fn stack_rects_collapse_to_title_bars() {
+        // height 20 for 3 members clears the C6 header threshold (>= 3+3=6),
+        // so this scenario carries a header row too — see the dedicated
+        // header tests below for the threshold boundary itself.
         let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
         let mut out = vec![];
-        compute_rects(&node, Rect::new(0, 0, 80, 20), &mut out);
+        let mut headers = vec![];
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 20), &mut out, &mut headers);
+        assert_eq!(headers.len(), 1);
         assert_eq!(out.iter().filter(|p| p.collapsed).count(), 2);
         let expanded = out.iter().find(|p| !p.collapsed).unwrap();
-        assert_eq!(expanded.rect.height, 18);
-        let total: u16 = out.iter().map(|p| p.rect.height).sum();
+        assert_eq!(expanded.rect.height, 17); // 20 − 1 header − 2 collapsed
+        let total: u16 = out.iter().map(|p| p.rect.height).sum::<u16>() + headers[0].rect.height;
         assert_eq!(total, 20);
+    }
+
+    #[test]
+    fn stack_header_shown_iff_height_at_least_n_plus_3() {
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 }; // n=3, threshold=6
+        let mut out = vec![];
+        let mut headers = vec![];
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 5), &mut out, &mut headers);
+        assert!(headers.is_empty(), "height 5 < n+3=6 → no header");
+        // Below threshold, geometry is exactly today's (no-header) formula:
+        // height − (n−1) = 5 − 2 = 3.
+        assert_eq!(out.iter().find(|p| !p.collapsed).unwrap().rect.height, 3);
+
+        out.clear();
+        headers.clear();
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 6), &mut out, &mut headers);
+        assert_eq!(headers.len(), 1, "height 6 == n+3 → header shown");
+        assert_eq!(headers[0].rect, Rect::new(0, 0, 80, 1));
+        assert_eq!(headers[0].n, 3);
+    }
+
+    #[test]
+    fn stack_header_shrinks_expanded_height_by_exactly_one() {
+        let n = 3u16;
+        let area = Rect::new(0, 0, 80, 20); // comfortably above the n+3 threshold
+        let pre_c6_height = area.height - (n - 1); // the no-header formula: 18
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        let mut out = vec![];
+        let mut headers = vec![];
+        compute_rects_and_headers(&node, area, &mut out, &mut headers);
+        assert_eq!(headers.len(), 1);
+        let expanded = out.iter().find(|p| !p.collapsed).unwrap();
+        assert_eq!(expanded.rect.height, pre_c6_height - 1);
+    }
+
+    #[test]
+    fn stack_header_row_belongs_to_no_pane() {
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        let area = Rect::new(0, 0, 80, 20);
+        let mut out = vec![];
+        let mut headers = vec![];
+        compute_rects_and_headers(&node, area, &mut out, &mut headers);
+        let header_row = headers[0].rect.y;
+        for pr in &out {
+            let covers_header_row = pr.rect.y <= header_row && header_row < pr.rect.y + pr.rect.height;
+            assert!(!covers_header_row, "pane {} covers the header row", pr.id);
+        }
+    }
+
+    #[test]
+    fn stack_expanded_ids_flags_only_the_expanded_member() {
+        let root = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![
+                LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 },
+                LayoutNode::Pane(9),
+            ],
+        };
+        let mut ids = HashSet::new();
+        stack_expanded_ids(&root, &mut ids);
+        assert_eq!(ids, HashSet::from([2u64]));
     }
 
     #[test]
