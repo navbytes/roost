@@ -1,10 +1,12 @@
 //! Status socket (design doc §6.1): agent-side extensions/hooks report exact
 //! status and session ids as newline-delimited JSON over a unix socket.
 //!
-//! Message shape (pane comes from the ROOST_PANE env var roost sets):
-//!   { "pane": "3", "event": "session", "session": "<uuid>" }
-//!   { "pane": "3", "event": "status",  "status": "working" | "waiting"
-//!                                              | "needs_input" | "exited" }
+//! Message shape (pane comes from the ROOST_PANE env var roost sets; token
+//! from ROOST_TOKEN — roost drops any message whose token doesn't match the
+//! one it issued to that pane, so panes can't spoof each other):
+//!   { "pane": "3", "token": "<hex>", "event": "session", "session": "<uuid>" }
+//!   { "pane": "3", "token": "<hex>", "event": "status",  "status": "working"
+//!                                    | "waiting" | "needs_input" | "exited" }
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -44,6 +46,8 @@ struct Msg {
     pane: serde_json::Value, // tolerate string or number
     event: String,
     #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
     session: Option<String>,
     #[serde(default)]
     status: Option<String>,
@@ -56,8 +60,10 @@ fn parse_line(line: &str) -> Option<AppEvent> {
         serde_json::Value::Number(n) => n.as_u64()?,
         _ => return None,
     };
+    // Missing token → empty string, which App rejects (fails closed).
+    let token = msg.token.unwrap_or_default();
     match msg.event.as_str() {
-        "session" => Some(AppEvent::Session(pane, msg.session?)),
+        "session" => Some(AppEvent::Session(pane, token, msg.session?)),
         "status" => {
             let status = match msg.status?.as_str() {
                 "working" => AgentStatus::Working,
@@ -66,7 +72,7 @@ fn parse_line(line: &str) -> Option<AppEvent> {
                 "exited" => AgentStatus::Exited,
                 _ => return None,
             };
-            Some(AppEvent::Status(pane, status))
+            Some(AppEvent::Status(pane, token, status))
         }
         _ => None,
     }
@@ -148,13 +154,24 @@ mod tests {
 
     #[test]
     fn parses_string_and_numeric_pane_ids() {
-        let ev = parse_line(r#"{"pane":"7","event":"status","status":"working"}"#);
-        assert!(matches!(ev, Some(AppEvent::Status(7, AgentStatus::Working))));
-        let ev = parse_line(r#"{"pane":7,"event":"session","session":"abc-123"}"#);
+        let ev = parse_line(r#"{"pane":"7","event":"status","token":"tok","status":"working"}"#);
+        assert!(matches!(ev, Some(AppEvent::Status(7, ref t, AgentStatus::Working)) if t == "tok"));
+        let ev = parse_line(r#"{"pane":7,"event":"session","token":"tok","session":"abc-123"}"#);
         match ev {
-            Some(AppEvent::Session(7, s)) => assert_eq!(s, "abc-123"),
+            Some(AppEvent::Session(7, t, s)) => {
+                assert_eq!(t, "tok");
+                assert_eq!(s, "abc-123");
+            }
             _ => panic!("expected session event"),
         }
+    }
+
+    #[test]
+    fn missing_token_parses_as_empty_and_is_rejected_downstream() {
+        // A message without a token still parses (empty token), but App's
+        // socket_authorized fails closed on an empty token.
+        let ev = parse_line(r#"{"pane":"7","event":"status","status":"working"}"#);
+        assert!(matches!(ev, Some(AppEvent::Status(7, ref t, _)) if t.is_empty()));
     }
 
     #[test]

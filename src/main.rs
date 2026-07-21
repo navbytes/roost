@@ -188,10 +188,19 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         notifier.notify(&msg);
                     }
                 }
-                AppEvent::Session(id, s) => app.on_session(id, s),
-                AppEvent::Status(id, s) => {
-                    if let Some(msg) = app.on_status(id, s) {
-                        notifier.notify(&msg);
+                // Socket-sourced events must present the pane's token; a
+                // mismatch means another pane (or process) is trying to spoof
+                // this one — drop it silently.
+                AppEvent::Session(id, token, s) => {
+                    if app.socket_authorized(id, &token) {
+                        app.on_session(id, s);
+                    }
+                }
+                AppEvent::Status(id, token, s) => {
+                    if app.socket_authorized(id, &token) {
+                        if let Some(msg) = app.on_status(id, s) {
+                            notifier.notify(&msg);
+                        }
                     }
                 }
             }

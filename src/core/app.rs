@@ -91,6 +91,11 @@ pub struct App<B: PaneBackend> {
     pub selection: Option<Selection>,
     /// Transient status message shown in the hint bar (e.g. "copied").
     flash: Option<(String, Instant)>,
+    /// Per-spawn secret handed to each pane's child via `ROOST_TOKEN`. A
+    /// socket message is only honored if its token matches the one issued to
+    /// the pane it claims to be — so a process in one pane can't spoof another
+    /// pane's status/session (they share the socket path via `ROOST_SOCK`).
+    tokens: HashMap<PaneId, String>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -125,6 +130,7 @@ impl<B: PaneBackend> App<B> {
             alt_seen: false,
             selection: None,
             flash: None,
+            tokens: HashMap::new(),
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -217,6 +223,11 @@ impl<B: PaneBackend> App<B> {
         };
         if let Some(sock) = &self.sock_path {
             cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
+            // Fresh per-spawn token: the pane authenticates its socket messages
+            // with it, and no other pane knows it. Reissued on every (re)spawn.
+            let token = gen_token();
+            cmd.env.push(("ROOST_TOKEN".into(), token.clone()));
+            self.tokens.insert(id, token);
         }
         let wants_detect = session.is_none() && adapter.session_root(&spec.cwd).is_some();
         // adapter / registry borrow ends here.
@@ -357,6 +368,13 @@ impl<B: PaneBackend> App<B> {
 
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
         self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
+    }
+
+    /// Is a socket message claiming to be `id` carrying that pane's token?
+    /// Guards session/status updates against cross-pane spoofing over the
+    /// shared socket. Fails closed: unknown pane or missing token → rejected.
+    pub fn socket_authorized(&self, id: PaneId, token: &str) -> bool {
+        !token.is_empty() && self.tokens.get(&id).map(|t| t == token).unwrap_or(false)
     }
 
     fn set_session(&mut self, id: PaneId, session: String) {
@@ -838,6 +856,34 @@ impl<B: PaneBackend> App<B> {
     }
 }
 
+/// A fresh, unguessable per-pane socket token. 16 bytes from /dev/urandom,
+/// hex-encoded. The socket is already owner-only (0600); this token is the
+/// extra guard against a process in one pane spoofing another pane over the
+/// shared socket, so it needs to be unpredictable to a sibling pane.
+fn gen_token() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok()
+    {
+        let mut s = String::with_capacity(32);
+        for b in buf {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    } else {
+        // /dev/urandom is present on every platform roost runs on; if it's
+        // somehow unreadable, fall back to a time-seeded value. Weaker, but the
+        // socket's 0600 permissions are still the primary boundary.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{n:032x}")
+    }
+}
+
 /// Find an http(s) URL that covers character index `col` in `line`. The URL
 /// is the surrounding non-whitespace run, with wrapping/trailing punctuation
 /// stripped. Pure, so it's unit-tested.
@@ -914,6 +960,22 @@ mod tests {
         assert_eq!(app.runtimes.len(), 2);
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes.len(), 2);
+    }
+
+    #[test]
+    fn socket_auth_requires_matching_pane_token() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.tokens.insert(1, "secret-1".into());
+        app.tokens.insert(2, "secret-2".into());
+        // Correct pane+token pair is authorized.
+        assert!(app.socket_authorized(1, "secret-1"));
+        // Pane 2's process presenting pane 1's id with its own token is
+        // rejected — the cross-pane spoof the token exists to stop.
+        assert!(!app.socket_authorized(1, "secret-2"));
+        // Wrong / empty / unknown-pane tokens all fail closed.
+        assert!(!app.socket_authorized(1, "wrong"));
+        assert!(!app.socket_authorized(1, ""));
+        assert!(!app.socket_authorized(99, "secret-1"));
     }
 
     #[test]

@@ -6,9 +6,11 @@
  * no socket), this extension no-ops at zero cost.
  *
  * Events reported over the unix socket ($XDG_RUNTIME_DIR/roost.sock or
- * ~/.local/state/roost/roost.sock), one JSON object per line:
- *   { pane, event: "session"  , session: "<uuid>" }
- *   { pane, event: "status"   , status: "working" | "waiting" | "needs_input" | "exited" }
+ * ~/.local/state/roost/roost.sock), one JSON object per line. Every message
+ * carries the pane's ROOST_TOKEN; roost rejects any whose token doesn't match
+ * the pane it claims to be, so one pane can't spoof another's status/session:
+ *   { pane, token, event: "session"  , session: "<uuid>" }
+ *   { pane, token, event: "status"   , status: "working" | "waiting" | "needs_input" | "exited" }
  */
 import * as net from "node:net";
 import * as os from "node:os";
@@ -18,6 +20,9 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 export default function (pi: ExtensionAPI) {
   const pane = process.env.ROOST_PANE;
   if (!pane) return; // not running inside roost
+  // Per-pane secret roost issued to this child; every message must carry it or
+  // roost drops it (prevents one pane spoofing another over the shared socket).
+  const token = process.env.ROOST_TOKEN ?? "";
 
   const sockPath =
     process.env.ROOST_SOCK ??
@@ -35,7 +40,7 @@ export default function (pi: ExtensionAPI) {
   const send = (msg: Record<string, unknown>) => {
     if (!sock) return;
     try {
-      sock.write(JSON.stringify({ pane, ...msg }) + "\n");
+      sock.write(JSON.stringify({ pane, token, ...msg }) + "\n");
     } catch {
       sock = null;
     }

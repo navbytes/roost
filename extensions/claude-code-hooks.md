@@ -13,7 +13,7 @@ Claude Code's hooks at roost's status socket. Add this to
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$ROOST_PANE\" ] && printf '{\"pane\":\"%s\",\"event\":\"status\",\"status\":\"working\"}\\n' \"$ROOST_PANE\" | nc -U -q0 \"$ROOST_SOCK\" 2>/dev/null; true"
+            "command": "[ -n \"$ROOST_PANE\" ] && printf '{\"pane\":\"%s\",\"token\":\"%s\",\"event\":\"status\",\"status\":\"working\"}\\n' \"$ROOST_PANE\" \"$ROOST_TOKEN\" | nc -U -q0 \"$ROOST_SOCK\" 2>/dev/null; true"
           }
         ]
       }
@@ -23,7 +23,7 @@ Claude Code's hooks at roost's status socket. Add this to
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$ROOST_PANE\" ] && printf '{\"pane\":\"%s\",\"event\":\"status\",\"status\":\"waiting\"}\\n' \"$ROOST_PANE\" | nc -U -q0 \"$ROOST_SOCK\" 2>/dev/null; true"
+            "command": "[ -n \"$ROOST_PANE\" ] && printf '{\"pane\":\"%s\",\"token\":\"%s\",\"event\":\"status\",\"status\":\"waiting\"}\\n' \"$ROOST_PANE\" \"$ROOST_TOKEN\" | nc -U -q0 \"$ROOST_SOCK\" 2>/dev/null; true"
           }
         ]
       }
@@ -33,7 +33,7 @@ Claude Code's hooks at roost's status socket. Add this to
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$ROOST_PANE\" ] && printf '{\"pane\":\"%s\",\"event\":\"status\",\"status\":\"needs_input\"}\\n' \"$ROOST_PANE\" | nc -U -q0 \"$ROOST_SOCK\" 2>/dev/null; true"
+            "command": "[ -n \"$ROOST_PANE\" ] && printf '{\"pane\":\"%s\",\"token\":\"%s\",\"event\":\"status\",\"status\":\"needs_input\"}\\n' \"$ROOST_PANE\" \"$ROOST_TOKEN\" | nc -U -q0 \"$ROOST_SOCK\" 2>/dev/null; true"
           }
         ]
       }

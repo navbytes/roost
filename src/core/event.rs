@@ -10,7 +10,10 @@ pub enum AppEvent {
     /// The pane's child process exited (EOF on the PTY).
     Exit(PaneId),
     /// Exact status pushed by an agent-side extension/hook (status socket).
-    Status(PaneId, AgentStatus),
-    /// Session id reported by an agent-side extension (status socket).
-    Session(PaneId, String),
+    /// The middle field is the pane's `ROOST_TOKEN`, verified before the status
+    /// is applied so one pane can't spoof another's.
+    Status(PaneId, String, AgentStatus),
+    /// Session id reported by an agent-side extension (status socket). Middle
+    /// field is the pane's `ROOST_TOKEN` (verified before use).
+    Session(PaneId, String, String),
 }
