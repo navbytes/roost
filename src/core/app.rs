@@ -11,6 +11,7 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::agents::Registry;
+use crate::core::control::{Actor, Method, ReadMode, Reply, Request};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::status::AgentStatus;
@@ -137,6 +138,10 @@ pub struct App<B: PaneBackend> {
     /// the pane it claims to be — so a process in one pane can't spoof another
     /// pane's status/session (they share the socket path via `ROOST_SOCK`).
     tokens: HashMap<PaneId, String>,
+    /// The fleet control-interface token. Written to `<state>/control.token`
+    /// (0600) and NEVER placed in any pane's environment, so only a deliberately
+    /// authorized external client can drive panes it doesn't own.
+    control_token: String,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -178,6 +183,7 @@ impl<B: PaneBackend> App<B> {
             undo: Vec::new(),
             confirm_close: None,
             tokens: HashMap::new(),
+            control_token: gen_token(),
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -464,6 +470,283 @@ impl<B: PaneBackend> App<B> {
     /// shared socket. Fails closed: unknown pane or missing token → rejected.
     pub fn socket_authorized(&self, id: PaneId, token: &str) -> bool {
         !token.is_empty() && self.tokens.get(&id).map(|t| t == token).unwrap_or(false)
+    }
+
+    // -- control interface -------------------------------------------------
+
+    /// The fleet control token (written to `<state>/control.token` by startup).
+    pub fn control_token(&self) -> &str {
+        &self.control_token
+    }
+
+    /// Resolve a token to the caller it represents: the fleet control token, or
+    /// a pane acting via its own `ROOST_TOKEN`. Fails closed on empty/unknown.
+    fn resolve_actor(&self, token: &str) -> Option<Actor> {
+        if token.is_empty() {
+            return None;
+        }
+        if token == self.control_token {
+            return Some(Actor::Fleet);
+        }
+        self.tokens.iter().find(|(_, t)| t.as_str() == token).map(|(id, _)| Actor::Pane(*id))
+    }
+
+    /// Is `node` `ancestor`, or somewhere in `ancestor`'s spawned subtree?
+    fn in_subtree(&self, ancestor: PaneId, node: PaneId) -> bool {
+        let mut cur = Some(node);
+        let mut hops = 0;
+        while let Some(id) = cur {
+            if id == ancestor {
+                return true;
+            }
+            cur = self.find_spec(id).and_then(|s| s.spawned_by);
+            hops += 1;
+            if hops > 4096 {
+                break; // cycle guard
+            }
+        }
+        false
+    }
+
+    /// May `actor` act on `target`? Fleet may act on any pane; a pane may act
+    /// only within its own spawned subtree (itself included).
+    fn may_target(&self, actor: Actor, target: PaneId) -> bool {
+        match actor {
+            Actor::Fleet => true,
+            Actor::Pane(a) => self.in_subtree(a, target),
+        }
+    }
+
+    fn tab_of(&self, id: PaneId) -> Option<usize> {
+        self.ws.tabs.iter().position(|t| t.panes.contains_key(&id))
+    }
+
+    fn status_str(&self, id: PaneId) -> &'static str {
+        if let Some(rt) = self.runtimes.get(&id) {
+            match rt.status() {
+                AgentStatus::Working => "working",
+                AgentStatus::NeedsInput => "needs_input",
+                AgentStatus::Waiting => "waiting",
+                AgentStatus::Idle => "idle",
+                AgentStatus::Exited => "exited",
+            }
+        } else if self.dead.contains_key(&id) {
+            "exited"
+        } else {
+            "unknown" // a background pane not spawned yet (lazy)
+        }
+    }
+
+    /// Execute a control request: authorize the caller, then dispatch. Returns
+    /// a `Reply` the transport serializes back to the client.
+    pub fn handle_control(&mut self, req: Request) -> Reply {
+        let Some(actor) = self.resolve_actor(&req.token) else {
+            return Reply::err("unauthorized: unknown or missing token");
+        };
+        match req.method {
+            Method::List => self.ctl_list(actor),
+            Method::Status { pane } => self.ctl_status(actor, pane),
+            Method::Spawn { adapter, cwd, initial_input } => {
+                self.ctl_spawn(actor, &adapter, cwd, initial_input)
+            }
+            Method::Fork { pane } => self.ctl_fork(actor, pane),
+            Method::Send { pane, text, submit } => self.ctl_send(actor, pane, &text, submit),
+            Method::Read { pane, mode } => self.ctl_read(actor, pane, mode),
+            Method::Close { pane, force } => self.ctl_close(actor, pane, force),
+        }
+    }
+
+    fn pane_json(&self, id: PaneId, tab: usize) -> serde_json::Value {
+        let spec = self.find_spec(id);
+        serde_json::json!({
+            "pane": id,
+            "tab": tab,
+            "adapter": spec.map(|s| s.adapter.clone()),
+            "cwd": spec.map(|s| s.cwd.to_string_lossy().into_owned()),
+            "title": spec.and_then(|s| s.title.clone()),
+            "session": spec.and_then(|s| s.session.clone()),
+            "spawned_by": spec.and_then(|s| s.spawned_by),
+            "status": self.status_str(id),
+            "focused": id == self.focused,
+        })
+    }
+
+    fn ctl_list(&self, actor: Actor) -> Reply {
+        let visible: Vec<(PaneId, usize)> = self
+            .ws
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, tab)| tab.panes.keys().map(move |id| (*id, ti)))
+            .filter(|(id, _)| self.may_target(actor, *id))
+            .collect();
+        let arr: Vec<_> = visible.into_iter().map(|(id, ti)| self.pane_json(id, ti)).collect();
+        Reply::ok(serde_json::json!(arr))
+    }
+
+    fn ctl_status(&self, actor: Actor, pane: Option<PaneId>) -> Reply {
+        match pane {
+            Some(p) => {
+                if self.find_spec(p).is_none() {
+                    return Reply::err("no such pane");
+                }
+                if !self.may_target(actor, p) {
+                    return Reply::err("forbidden: pane not in your subtree");
+                }
+                Reply::ok(serde_json::json!({ "pane": p, "status": self.status_str(p) }))
+            }
+            None => self.ctl_list(actor),
+        }
+    }
+
+    fn ctl_spawn(
+        &mut self,
+        actor: Actor,
+        adapter: &str,
+        cwd: Option<String>,
+        initial_input: Option<String>,
+    ) -> Reply {
+        if self.registry.get(adapter).is_none() {
+            return Reply::err(format!("unknown adapter: {adapter}"));
+        }
+        let owner = match actor {
+            Actor::Fleet => None,
+            Actor::Pane(a) => Some(a),
+        };
+        let Some(id) = self.spawn_child(adapter, cwd.map(PathBuf::from), owner) else {
+            return Reply::err("spawn refused: not enough room to split");
+        };
+        if let Some(text) = initial_input {
+            let mut bytes = text.into_bytes();
+            bytes.push(b'\r');
+            if let Some(rt) = self.runtimes.get_mut(&id) {
+                rt.write_input(&bytes);
+            }
+        }
+        self.relayout();
+        self.save();
+        Reply::ok(serde_json::json!({ "pane": id }))
+    }
+
+    fn ctl_fork(&mut self, actor: Actor, pane: Option<PaneId>) -> Reply {
+        let target = match (pane, actor) {
+            (Some(p), _) => p,
+            (None, Actor::Pane(a)) => a,
+            (None, Actor::Fleet) => return Reply::err("fork requires a pane id for a fleet caller"),
+        };
+        if !self.may_target(actor, target) {
+            return Reply::err("forbidden: pane not in your subtree");
+        }
+        let Some(spec) = self.find_spec(target).cloned() else {
+            return Reply::err("no such pane");
+        };
+        let owner = match actor {
+            Actor::Fleet => None,
+            Actor::Pane(a) => Some(a),
+        };
+        // Same adapter + cwd. Session-branching (a true fork of the agent's
+        // conversation) lands with the bidirectional pi extension; for now this
+        // opens a fresh sibling in the same context.
+        let Some(id) = self.spawn_child(&spec.adapter, Some(spec.cwd), owner) else {
+            return Reply::err("fork refused: not enough room to split");
+        };
+        self.relayout();
+        self.save();
+        Reply::ok(serde_json::json!({ "pane": id }))
+    }
+
+    fn ctl_send(&mut self, actor: Actor, pane: PaneId, text: &str, submit: bool) -> Reply {
+        if self.find_spec(pane).is_none() {
+            return Reply::err("no such pane");
+        }
+        if !self.may_target(actor, pane) {
+            return Reply::err("forbidden: pane not in your subtree");
+        }
+        let Some(rt) = self.runtimes.get_mut(&pane) else {
+            return Reply::err("pane is not running");
+        };
+        let mut bytes = text.as_bytes().to_vec();
+        if submit {
+            bytes.push(b'\r');
+        }
+        rt.write_input(&bytes);
+        Reply::ok(serde_json::json!({ "sent": bytes.len() }))
+    }
+
+    fn ctl_read(&self, actor: Actor, pane: PaneId, mode: ReadMode) -> Reply {
+        if self.find_spec(pane).is_none() {
+            return Reply::err("no such pane");
+        }
+        if !self.may_target(actor, pane) {
+            return Reply::err("forbidden: pane not in your subtree");
+        }
+        let Some(rt) = self.runtimes.get(&pane) else {
+            return Reply::err("pane is not running");
+        };
+        // grab_text clamps to the screen, so (0,0)..MAX is the whole grid.
+        let full = rt.grab_text((0, 0), (u16::MAX, u16::MAX));
+        let text = match mode {
+            ReadMode::Screen | ReadMode::Full => full,
+            ReadMode::Tail(n) => {
+                let lines: Vec<&str> = full.lines().filter(|l| !l.trim().is_empty()).collect();
+                let start = lines.len().saturating_sub(n);
+                lines[start..].join("\n")
+            }
+        };
+        Reply::ok(serde_json::json!({ "pane": pane, "text": text }))
+    }
+
+    fn ctl_close(&mut self, actor: Actor, pane: PaneId, force: bool) -> Reply {
+        if self.find_spec(pane).is_none() {
+            return Reply::err("no such pane");
+        }
+        if !self.may_target(actor, pane) {
+            return Reply::err("forbidden: pane not in your subtree");
+        }
+        // The API must never quit roost by closing its last pane.
+        if self.ws.tabs.len() == 1 && self.ws.active_tab().panes.len() == 1 {
+            return Reply::err("cannot close the last pane via the control interface");
+        }
+        let working =
+            self.runtimes.get(&pane).map(|rt| rt.status() == AgentStatus::Working).unwrap_or(false);
+        if working && !force {
+            return Reply::err("pane is working; pass force to close it");
+        }
+        self.close_pane_id(pane);
+        self.relayout();
+        self.save();
+        Reply::ok(serde_json::json!({ "closed": pane }))
+    }
+
+    /// Close a specific pane (any tab), capturing it for undo. Unlike
+    /// `close_pane` this is not focus-relative and never quits roost.
+    fn close_pane_id(&mut self, id: PaneId) -> bool {
+        let Some(ti) = self.tab_of(id) else { return false };
+        let spec = self.ws.tabs[ti].panes.get(&id).cloned();
+        let tab_snapshot = self.ws.tabs[ti].clone();
+        if let Some(mut rt) = self.runtimes.remove(&id) {
+            rt.kill();
+        }
+        self.tokens.remove(&id);
+        self.dead.remove(&id);
+        let tab = &mut self.ws.tabs[ti];
+        tab.panes.remove(&id);
+        let empty = layout::remove_pane(&mut tab.layout, id);
+        if empty && self.ws.tabs.len() > 1 {
+            self.ws.tabs.remove(ti);
+            if self.ws.active_tab >= self.ws.tabs.len() {
+                self.ws.active_tab = self.ws.tabs.len().saturating_sub(1);
+            }
+            self.remember_closed(Closed::Tab { index: ti, tab: tab_snapshot });
+        } else if !empty {
+            if let Some(spec) = spec {
+                self.remember_closed(Closed::Pane { tab_index: ti, spec });
+            }
+        }
+        if self.find_spec(self.focused).is_none() {
+            self.focused = self.pane_order().first().copied().unwrap_or(0);
+        }
+        true
     }
 
     fn set_session(&mut self, id: PaneId, session: String) {
@@ -801,15 +1084,29 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn new_pane_with(&mut self, adapter: &str) {
+        self.spawn_child(adapter, None, None);
+    }
+
+    /// Split the focused pane and spawn a new one running `adapter`. `cwd`
+    /// overrides the inherited working directory; `spawned_by` records the
+    /// owner for the control-interface capability model. Returns the new pane
+    /// id, or None if the split was refused (pane too small).
+    fn spawn_child(
+        &mut self,
+        adapter: &str,
+        cwd: Option<PathBuf>,
+        spawned_by: Option<PaneId>,
+    ) -> Option<PaneId> {
         let id = self.ws.next_pane_id();
-        let cwd = self
-            .ws
-            .active_tab()
-            .panes
-            .get(&self.focused)
-            .map(|s| s.cwd.clone())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None };
+        let cwd = cwd.unwrap_or_else(|| {
+            self.ws
+                .active_tab()
+                .panes
+                .get(&self.focused)
+                .map(|s| s.cwd.clone())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        });
+        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by };
 
         // Split in the widest direction of the focused pane's rect.
         let focused_rect = self.rects().iter().find(|pr| pr.id == self.focused).map(|pr| pr.rect);
@@ -832,7 +1129,7 @@ impl<B: PaneBackend> App<B> {
                 SplitDir::Horizontal => r.height < MIN_SPLIT_ROWS,
             };
             if too_small {
-                return;
+                return None;
             }
         }
 
@@ -846,6 +1143,7 @@ impl<B: PaneBackend> App<B> {
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
+        Some(id)
     }
 
     fn close_pane(&mut self) {
@@ -910,7 +1208,7 @@ impl<B: PaneBackend> App<B> {
         let id = self.ws.next_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
-        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None });
+        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None });
         self.ws.tabs.push(Tab {
             name: format!("tab{}", self.ws.tabs.len() + 1),
             layout: LayoutNode::Pane(id),
@@ -1245,6 +1543,101 @@ mod tests {
     }
 
     #[test]
+    fn control_fleet_can_spawn_send_read_list_and_close() {
+        use crate::core::control::{Method, ReadMode, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let ok = |r: Reply| match r {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("expected ok, got err: {err}"),
+        };
+        // spawn
+        let v = ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }));
+        let p = v["pane"].as_u64().unwrap();
+        assert_eq!(app.runtimes.len(), 2);
+        // send
+        ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Send { pane: p, text: "hello".into(), submit: true },
+        }));
+        assert!(app.runtimes.get(&p).unwrap().input.ends_with(b"hello\r"));
+        // list shows both panes for the fleet actor
+        let list = ok(app.handle_control(Request { token: ct.clone(), method: Method::List }));
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        // read (FakePane grab is empty but the call succeeds)
+        ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Read { pane: p, mode: ReadMode::Screen },
+        }));
+        // close the spawned pane
+        ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Close { pane: p, force: false },
+        }));
+        assert_eq!(app.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn control_pane_actor_is_scoped_to_its_subtree() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        // Pane 1 acts via its own token.
+        app.tokens.insert(1, "tok1".into());
+        // Pane 1 spawns a child → child.spawned_by == 1.
+        let child = match app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert_eq!(app.find_spec(child).unwrap().spawned_by, Some(1));
+        // Pane 1 may drive its own child.
+        assert!(matches!(
+            app.handle_control(Request {
+                token: "tok1".into(),
+                method: Method::Send { pane: child, text: "x".into(), submit: false },
+            }),
+            Reply::Ok { .. }
+        ));
+        // A pane spawned by the *fleet* is not in pane 1's subtree.
+        let other = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert!(matches!(
+            app.handle_control(Request {
+                token: "tok1".into(),
+                method: Method::Send { pane: other, text: "x".into(), submit: false },
+            }),
+            Reply::Err { .. } // forbidden — not in subtree
+        ));
+        // An unknown token is unauthorized outright.
+        assert!(matches!(
+            app.handle_control(Request { token: "nope".into(), method: Method::List }),
+            Reply::Err { .. }
+        ));
+    }
+
+    #[test]
+    fn control_cannot_close_the_last_pane() {
+        use crate::core::control::{Method, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        assert!(matches!(
+            app.handle_control(Request { token: ct, method: Method::Close { pane: 1, force: true } }),
+            crate::core::control::Reply::Err { .. }
+        ));
+    }
+
+    #[test]
     fn socket_auth_requires_matching_pane_token() {
         let (mut app, _) = mk_app(shell_ws());
         app.tokens.insert(1, "secret-1".into());
@@ -1554,8 +1947,8 @@ mod tests {
         std::fs::File::open(&file_b).unwrap().set_modified(base + Duration::from_millis(20)).unwrap();
 
         let mut panes = HashMap::new();
-        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None });
-        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None });
+        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
+        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
         let layout = LayoutNode::Split {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],

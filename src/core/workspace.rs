@@ -18,6 +18,11 @@ pub struct PaneSpec {
     pub session: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// The pane that spawned this one via the control interface, if any. Roots
+    /// the ownership-scoped capability model: a controlling pane may drive the
+    /// panes in its own spawned subtree, but not panes it didn't create.
+    #[serde(default)]
+    pub spawned_by: Option<PaneId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +45,7 @@ impl Workspace {
         let mut panes = HashMap::new();
         panes.insert(
             1,
-            PaneSpec { adapter: "shell".into(), cwd, session: None, title: None },
+            PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None },
         );
         Workspace {
             version: 1,
@@ -85,6 +90,7 @@ impl Workspace {
                     cwd: std::env::current_dir().unwrap_or_else(|_| "/".into()),
                     session: None,
                     title: None,
+                    spawned_by: None,
                 });
             }
         }
@@ -112,7 +118,7 @@ mod tests {
         // Orphan spec: a pane id with no place in the layout tree.
         ws.tabs[0].panes.insert(
             5,
-            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None },
+            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
         );
         // Orphan layout leaf: the layout references pane 1, but drop its spec.
         ws.tabs[0].panes.remove(&1);
