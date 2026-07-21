@@ -26,6 +26,19 @@ change · **[descoped]** decided against unless a use-case demands it.
   sends Shift+Enter and Option+Enter identically, so there it hits the Alt+Enter
   picker. See README.)
 
+## Chrome restyle — shipped
+
+- **[done] Ink · paper · one red.** roost's chrome (tabs, borders, badges,
+  stack, hint bar, modals) restyled to the `docs/tui-design.html` mockup.
+  Spec of record: `DESIGN-ui.md` (contracts C1–C18 + amendments). Verified:
+  161 unit tests, design-supervisor audit 18/18 ALIGNED, code review, ux
+  review, and a live iTerm2 session hosting pi (pulse phases confirmed on
+  screen). Alignment stays auditable via the `design-supervisor` agent
+  (`.claude/agents/design-supervisor.md`) — invoke after any `src/ui/**`
+  change. Known follow-up candidates: spawn-failure error doesn't say *why*
+  (e.g. ENOENT vs PATH); vt100 golden-frame harness deferred until the first
+  chrome regression (DESIGN-ui.md §6).
+
 ## Control interface — remaining
 
 The interface is complete via the CLI (`list/status/spawn/fork/send/read/close/
