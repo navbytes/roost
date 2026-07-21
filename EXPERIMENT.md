@@ -54,12 +54,6 @@ Fix (event loop): drain all pending events per tick coalescing resizes to
 one, reconcile against `terminal.size()` (the true size), and `clear()` on
 resize. Verified: height-, width-, and multi-step storms all render cleanly.
 
-## Deferred (tracked, not yet done)
+## Deferred
 
-- Click a tab in the tab bar to switch tabs (README already lists tab-bar
-  click as deferred).
-- Closing a tab's last pane deletes the tab — currently deliberate (mirrors
-  "close last pane quits"); may become a configurable choice.
-- Dead-pane `Enter` re-runs the same resume command even when it just failed
-  — now rare (pi ids are correct), but could distinguish permanent vs
-  transient failure.
+Outstanding work is tracked in [ROADMAP.md](ROADMAP.md).
