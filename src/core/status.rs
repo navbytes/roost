@@ -48,15 +48,31 @@ pub struct StatusTracker {
     /// Exact status pushed by an extension/hook, plus when it arrived.
     extension_status: Option<AgentStatus>,
     ext_at: Option<Instant>,
+    /// Last time the pane rang the terminal bell (0x07). The decades-old
+    /// "program wants your attention" signal (tmux's monitor-bell), used as a
+    /// heuristic NeedsInput when no extension/hook is installed.
+    bell_at: Option<Instant>,
 }
 
 impl StatusTracker {
     pub fn new() -> Self {
-        Self { last_output: None, exited: false, extension_status: None, ext_at: None }
+        Self {
+            last_output: None,
+            exited: false,
+            extension_status: None,
+            ext_at: None,
+            bell_at: None,
+        }
     }
 
     pub fn on_output(&mut self) {
         self.last_output = Some(Instant::now());
+    }
+
+    /// The pane emitted a bell (0x07). Recorded as a heuristic attention
+    /// signal; only consulted when no exact extension status is present.
+    pub fn on_bell(&mut self) {
+        self.bell_at = Some(Instant::now());
     }
 
     pub fn on_exit(&mut self) {
@@ -115,11 +131,23 @@ impl StatusTracker {
                     other
                 }
             }
-            None => match self.last_output {
-                Some(_) if self.recent_output() => AgentStatus::Working,
-                Some(_) => AgentStatus::Waiting,
-                None => AgentStatus::Idle,
-            },
+            // No extension/hook: pure heuristics. A recent bell (0x07) is the
+            // classic "pane wants you" signal (tmux monitor-bell) — surface it
+            // as NeedsInput once the pane is quiet, decaying on the same window
+            // as the extension path so a stray bell can't pin ◆ forever. Active
+            // output still means Working; longer silence means Waiting.
+            None => {
+                let recent_bell = self.bell_at.is_some_and(|t| t.elapsed() < STUCK_WORKING);
+                if self.recent_output() {
+                    AgentStatus::Working
+                } else if recent_bell {
+                    AgentStatus::NeedsInput
+                } else if self.last_output.is_some() {
+                    AgentStatus::Waiting
+                } else {
+                    AgentStatus::Idle
+                }
+            }
         }
     }
 }
@@ -168,6 +196,27 @@ mod tests {
         // ...but recent output means the agent is still interacting → keep ◆.
         t.on_output();
         assert_eq!(t.current(), AgentStatus::NeedsInput);
+    }
+
+    #[test]
+    fn bell_is_heuristic_needs_input_only_without_an_extension() {
+        let mut t = StatusTracker::new();
+        assert_eq!(t.current(), AgentStatus::Idle);
+        // A bell while the pane is quiet → heuristic "needs you" (tmux's ! flag).
+        t.on_bell();
+        assert_eq!(t.current(), AgentStatus::NeedsInput);
+        // Active output supersedes it — the pane is clearly working.
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::Working);
+        // Once an extension reports exact status, the heuristic bell is ignored.
+        t.set_extension_status(AgentStatus::Working);
+        assert_eq!(t.current(), AgentStatus::Working);
+        // A long-stale bell decays away: old output (not recent) + expired bell
+        // → Waiting, not a stuck ◆.
+        let mut t2 = StatusTracker::new();
+        t2.last_output = Some(Instant::now() - Duration::from_secs(10));
+        t2.bell_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
+        assert_eq!(t2.current(), AgentStatus::Waiting);
     }
 
     #[test]

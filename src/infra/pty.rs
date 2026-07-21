@@ -118,7 +118,13 @@ impl PaneBackend for PtyPane {
     }
 
     fn process_output(&mut self, bytes: &[u8]) {
+        // vt100 counts *parsed* bells, so a 0x07 consumed as an OSC string
+        // terminator (ESC ] … BEL) doesn't count — only a real bell does.
+        let bells_before = self.parser.screen().audible_bell_count();
         self.parser.process(bytes);
+        if self.parser.screen().audible_bell_count() != bells_before {
+            self.status.on_bell();
+        }
         self.status.on_output();
     }
 
