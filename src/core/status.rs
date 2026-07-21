@@ -91,6 +91,19 @@ impl StatusTracker {
         self.last_output.is_some_and(|t| t.elapsed() < ACTIVE_WINDOW)
     }
 
+    /// A bell that arrived *after* the extension's last status report, and
+    /// recently enough to still matter. This is the signal the extension can't
+    /// give us: pi exposes no event for its built-in permission/approval prompt,
+    /// but pi rings the bell for it — so a bell landing after a resting
+    /// "waiting" means a fresh prompt the hook didn't (couldn't) report.
+    fn bell_after_ext(&self) -> bool {
+        match (self.bell_at, self.ext_at) {
+            (Some(b), Some(e)) => b >= e && b.elapsed() < STUCK_WORKING,
+            (Some(b), None) => b.elapsed() < STUCK_WORKING,
+            _ => false,
+        }
+    }
+
     /// Resolve the pane's status, reconciling exact extension signals with
     /// output activity so neither source can leave the badge permanently
     /// wrong (a dead hook stuck on "working", or a stale "waiting" while the
@@ -123,10 +136,15 @@ impl StatusTracker {
                 }
             }
             // For a resting state (waiting/idle), fresh output means a new
-            // turn started even if no "working" event arrived.
+            // turn started even if no "working" event arrived; and a bell that
+            // landed after this resting report means the agent is now blocked on
+            // a prompt the extension can't see (pi's permission gate) — promote
+            // it to NeedsInput so it still pulls the user.
             Some(other) => {
                 if self.recent_output() {
                     AgentStatus::Working
+                } else if self.bell_after_ext() {
+                    AgentStatus::NeedsInput
                 } else {
                     other
                 }
@@ -216,6 +234,25 @@ mod tests {
         let mut t2 = StatusTracker::new();
         t2.last_output = Some(Instant::now() - Duration::from_secs(10));
         t2.bell_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
+        assert_eq!(t2.current(), AgentStatus::Waiting);
+    }
+
+    #[test]
+    fn bell_after_a_waiting_report_promotes_to_needs_input() {
+        // The extension (pi hook) says the turn ended → Waiting.
+        let mut t = StatusTracker::new();
+        t.set_extension_status(AgentStatus::Waiting);
+        assert_eq!(t.current(), AgentStatus::Waiting);
+        // pi then rings the bell for a built-in permission prompt it can't
+        // report as an event → promote the resting pane to NeedsInput.
+        t.on_bell();
+        assert_eq!(t.current(), AgentStatus::NeedsInput);
+
+        // A bell that predates the extension's report belonged to the finished
+        // turn and must NOT promote it.
+        let mut t2 = StatusTracker::new();
+        t2.on_bell();
+        t2.set_extension_status(AgentStatus::Waiting);
         assert_eq!(t2.current(), AgentStatus::Waiting);
     }
 

@@ -138,6 +138,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         App::new(ws, agents::registry(), Box::new(store), tx, size, sock_path)?;
     app.relayout();
 
+    // Keep the pi status extension in sync with this build so it can't silently
+    // go stale (a stale one's socket messages are now dropped for lacking the
+    // per-pane token). No-op when pi isn't installed or ROOST_NO_EXT_INSTALL set.
+    if let Some(msg) = infra::extension::ensure_pi_extension() {
+        app.set_flash(msg);
+    }
+
     let loop_result: Result<()> = (|| {
     loop {
         terminal.draw(|f| ui::render::draw(f, &mut app))?;

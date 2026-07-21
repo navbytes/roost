@@ -596,6 +596,11 @@ impl<B: PaneBackend> App<B> {
         Some(text)
     }
 
+    /// Set a transient hint-bar message (e.g. a startup notice).
+    pub fn set_flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), Instant::now()));
+    }
+
     /// Current transient hint-bar message, if still within its window.
     pub fn flash(&self) -> Option<&str> {
         self.flash

@@ -56,9 +56,6 @@ resize. Verified: height-, width-, and multi-step storms all render cleanly.
 
 ## Deferred (tracked, not yet done)
 
-- Offer to auto-install `roost.ts` into `~/.pi/agent/extensions/` on first
-  run (DESIGN §6.1) — today the exact-status/session path requires a manual
-  copy; the fs fallback works but is ~2 s slower.
 - Click a tab in the tab bar to switch tabs (README already lists tab-bar
   click as deferred).
 - Closing a tab's last pane deletes the tab — currently deliberate (mirrors

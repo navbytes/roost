@@ -112,13 +112,19 @@ bell (and posts a native notification on macOS).
 Status arrives two ways:
 
 1. **Exact** — agent-side integrations report over roost's unix socket
-   (`$ROOST_SOCK`, pane identified by `$ROOST_PANE`):
-   - pi: install [`extensions/roost.ts`](extensions/roost.ts) into
-     `~/.pi/agent/extensions/` — uses pi's `agent_start`/`agent_end`/
-     `session_start` events; also reports session ids instantly.
+   (`$ROOST_SOCK`, pane identified by `$ROOST_PANE`, authenticated with a
+   per-pane `$ROOST_TOKEN`):
+   - pi: [`extensions/roost.ts`](extensions/roost.ts) — roost installs/updates
+     it into `~/.pi/agent/extensions/` automatically at startup when pi is
+     present (set `ROOST_NO_EXT_INSTALL` to manage it yourself). Uses pi's
+     `agent_start`/`agent_end`/`session_start`/ask-tool events, and reports
+     session ids instantly.
    - Claude Code: hook snippets in
      [`extensions/claude-code-hooks.md`](extensions/claude-code-hooks.md).
-2. **Heuristic fallback** — recent PTY output ⇒ working; silence ⇒ waiting.
+2. **Heuristic fallback** — recent PTY output ⇒ working; silence ⇒ waiting; a
+   terminal bell (`0x07`) ⇒ needs-you (tmux-style). The bell also supplements
+   the pi extension for pi's built-in permission prompts, which pi exposes no
+   event for.
 
 ## Session resume
 

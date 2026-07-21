@@ -1,9 +1,10 @@
 /**
  * roost.ts — pi extension reporting exact agent status to roost.
  *
- * Install: copy to ~/.pi/agent/extensions/roost.ts (roost offers to do this
- * on first run). If pi is not running inside roost (no ROOST_PANE env var or
- * no socket), this extension no-ops at zero cost.
+ * Install: roost installs/updates this automatically at startup when pi is
+ * present (into ~/.pi/agent/extensions/roost.ts); set ROOST_NO_EXT_INSTALL to
+ * manage it yourself. If pi is not running inside roost (no ROOST_PANE env var
+ * or no socket), this extension no-ops at zero cost.
  *
  * Events reported over the unix socket ($XDG_RUNTIME_DIR/roost.sock or
  * ~/.local/state/roost/roost.sock), one JSON object per line. Every message
