@@ -249,10 +249,13 @@ mod tests {
         assert_eq!(t.current(), AgentStatus::NeedsInput);
 
         // A bell that predates the extension's report belonged to the finished
-        // turn and must NOT promote it.
+        // turn and must NOT promote it. Pin the bell strictly before `ext_at`
+        // explicitly: two back-to-back `Instant::now()` calls can read equal at
+        // the clock's resolution, and `bell_after_ext` uses `b >= e`, so relying
+        // on call order alone made this assertion flaky (~50% on a fast clock).
         let mut t2 = StatusTracker::new();
-        t2.on_bell();
         t2.set_extension_status(AgentStatus::Waiting);
+        t2.bell_at = Some(t2.ext_at.unwrap() - Duration::from_millis(1));
         assert_eq!(t2.current(), AgentStatus::Waiting);
     }
 
