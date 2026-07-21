@@ -57,6 +57,10 @@ pub trait PaneBackend: Sized {
     /// events must not yank the view to the live tail).
     fn write_input_raw(&mut self, bytes: &[u8]);
     fn resize(&mut self, rows: u16, cols: u16);
+    /// Ask the child to exit cleanly (SIGHUP, as if its terminal closed) so it
+    /// can flush a final turn. Best-effort; `kill()` is the guaranteed stop.
+    /// Default no-op for backends without a real process.
+    fn hangup(&mut self) {}
     fn kill(&mut self);
 
     fn status(&self) -> AgentStatus;

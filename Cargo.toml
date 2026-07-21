@@ -10,6 +10,7 @@ anyhow = "1"
 crossterm = "0.28"
 dirs = "5"
 fs2 = "0.4"
+libc = "0.2"
 portable-pty = "0.8"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }

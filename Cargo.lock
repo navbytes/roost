@@ -509,6 +509,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "fs2",
+ "libc",
  "portable-pty",
  "ratatui",
  "serde",

@@ -144,6 +144,20 @@ impl PaneBackend for PtyPane {
         self.parser.set_size(rows, cols);
     }
 
+    fn hangup(&mut self) {
+        // SIGHUP the child so it exits the way a closed terminal would —
+        // giving pi/claude a chance to flush their final turn to the session
+        // file — before shutdown escalates to the guaranteed SIGKILL. Mark the
+        // spawn dead first so a resulting EOF doesn't emit a stale event.
+        self.alive.store(false, Ordering::Relaxed);
+        if let Some(pid) = self.pid {
+            // Safety: kill(2) with a pid we own and a plain signal number.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGHUP);
+            }
+        }
+    }
+
     fn kill(&mut self) {
         // Mark this spawn dead *before* killing so the reader thread, which
         // will see EOF the moment the child dies, doesn't emit a stale

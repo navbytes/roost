@@ -822,6 +822,16 @@ impl<B: PaneBackend> App<B> {
     /// Clean shutdown: save workspace, kill children (their sessions live on).
     pub fn shutdown(&mut self) {
         self.save();
+        // Graceful stop: SIGHUP everything (agents flush their final turn like
+        // a closed terminal would allow), a short grace window, then the
+        // guaranteed SIGKILL + reap for anything that ignored the hangup.
+        if self.runtimes.is_empty() {
+            return;
+        }
+        for rt in self.runtimes.values_mut() {
+            rt.hangup();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
         for rt in self.runtimes.values_mut() {
             rt.kill();
         }
