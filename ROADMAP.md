@@ -26,6 +26,15 @@ change · **[descoped]** decided against unless a use-case demands it.
   sends Shift+Enter and Option+Enter identically, so there it hits the Alt+Enter
   picker. See README.)
 
+## Chrome restyle — planned
+
+- **[choice] Ink · paper · one red.** Approved redesign of roost's own chrome
+  (tabs, borders, badges, stack, hint bar, modals) to the `docs/tui-design.html`
+  mockup. Spec of record: `DESIGN-ui.md` (contracts C1–C18, token table,
+  truecolor stance). Staged plan sized ~3 builder-days; implementation not
+  started. Alignment is auditable any time via the `design-supervisor` agent
+  (`.claude/agents/design-supervisor.md`).
+
 ## Control interface — remaining
 
 The interface is complete via the CLI (`list/status/spawn/fork/send/read/close/
