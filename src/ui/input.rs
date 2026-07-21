@@ -84,6 +84,14 @@ fn encode_key(key: KeyEvent) -> InputResult {
             vec![b]
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
+        // Shift+Enter / Ctrl+Enter: a bare terminal can't express these as
+        // distinct bytes (both collapse to CR), so agent TUIs like Claude Code
+        // and pi read the kitty CSI-u encoding to mean "insert a newline"
+        // rather than "submit". This only fires when the enhanced keyboard
+        // protocol is negotiated (see main.rs); without it the modifier never
+        // reaches us and plain Enter (submit) is unaffected.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => b"\x1b[13;2u".to_vec(),
+        KeyCode::Enter if ctrl => b"\x1b[13;5u".to_vec(),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
@@ -187,5 +195,29 @@ mod tests {
             InputResult::Forward(b) => assert_eq!(b, vec![0x03]),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn shift_and_ctrl_enter_insert_newline_via_csi_u() {
+        // Shift+Enter → CSI-u for keycode 13, modifier 2 (shift): newline.
+        match translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b[13;2u"),
+            _ => panic!(),
+        }
+        // Ctrl+Enter → CSI-u for keycode 13, modifier 5 (ctrl).
+        match translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b[13;5u"),
+            _ => panic!(),
+        }
+        // Plain Enter still submits (bare CR), unchanged.
+        match translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\r"),
+            _ => panic!(),
+        }
+        // Alt+Enter remains the quick-launch chord, not a newline.
+        assert!(matches!(
+            translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            InputResult::Action(Action::QuickLaunch)
+        ));
     }
 }

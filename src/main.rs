@@ -15,7 +15,10 @@ mod ports;
 mod ui;
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -51,7 +54,22 @@ fn main() -> Result<()> {
     // Without mouse capture the hosting terminal consumes wheel events and
     // scrolls its own buffer — content *outside* the TUI. Capture them.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // Negotiate the enhanced (kitty) keyboard protocol so Shift+Enter and
+    // Ctrl+Enter arrive as distinct key events — a bare terminal collapses
+    // both to a plain CR, making "newline vs submit" impossible to tell apart.
+    // Only push the flag if the terminal actually supports it, and remember
+    // that so we can pop it on the way out (and in the panic hook).
+    let kbd_enhanced = matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
+    if kbd_enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let result = run(&mut terminal);
+    if kbd_enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -80,7 +98,14 @@ fn acquire_instance_lock() -> std::result::Result<std::fs::File, String> {
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        // Pop keyboard enhancement unconditionally: if none was pushed the
+        // terminal ignores it, and leaving it set would wedge the user's shell
+        // into the kitty protocol after a crash.
+        let _ = execute!(
+            std::io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture
+        );
         ratatui::restore();
         original(info);
     }));

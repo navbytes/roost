@@ -60,7 +60,12 @@ showing the keys you can press right now — and it changes with context, so
 rename / picker / scroll / dead-pane modes each show their own keys. `Alt+/`
 hides it to reclaim the row.
 
-Everything else passes through to the focused pane untouched.
+Everything else passes through to the focused pane untouched. **Shift+Enter**
+and **Ctrl+Enter** are sent to the pane as an "insert newline" (rather than
+"submit"), so you can compose multi-line prompts in agent TUIs that support it.
+This needs the enhanced keyboard protocol, which roost negotiates on start when
+the host terminal supports it (Ghostty, kitty, WezTerm, recent iTerm2); on a
+terminal without it, both still submit, exactly as before.
 
 **Mouse**: the wheel scrolls the pane under the cursor — forwarded to the
 inner app when it has mouse reporting enabled (pi/claude TUIs, vim, less),
