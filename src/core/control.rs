@@ -112,3 +112,52 @@ impl Reply {
         Reply::Err { err: msg.into() }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_deserializes_from_the_cli_json_shape() {
+        // spawn with optional flags
+        let r: Request =
+            serde_json::from_str(r#"{"token":"t","method":"spawn","adapter":"pi","cwd":"/x"}"#)
+                .unwrap();
+        assert_eq!(r.token, "t");
+        match r.method {
+            Method::Spawn { adapter, cwd, initial_input } => {
+                assert_eq!(adapter, "pi");
+                assert_eq!(cwd.as_deref(), Some("/x"));
+                assert!(initial_input.is_none());
+            }
+            _ => panic!("expected spawn"),
+        }
+        // read with a tail mode (tuple variant → {"tail": N})
+        let r: Request =
+            serde_json::from_str(r#"{"token":"t","method":"read","pane":3,"mode":{"tail":20}}"#)
+                .unwrap();
+        match r.method {
+            Method::Read { pane, mode } => {
+                assert_eq!(pane, 3);
+                assert_eq!(mode, ReadMode::Tail(20));
+            }
+            _ => panic!("expected read"),
+        }
+        // bare list; and default read mode = screen
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"token":"t","method":"list"}"#).unwrap().method,
+            Method::List
+        ));
+        let r: Request =
+            serde_json::from_str(r#"{"token":"t","method":"read","pane":1}"#).unwrap();
+        assert!(matches!(r.method, Method::Read { mode: ReadMode::Screen, .. }));
+    }
+
+    #[test]
+    fn reply_serializes_untagged() {
+        let s = serde_json::to_string(&Reply::ok(serde_json::json!({ "pane": 5 }))).unwrap();
+        assert_eq!(s, r#"{"ok":{"pane":5}}"#);
+        let s = serde_json::to_string(&Reply::err("nope")).unwrap();
+        assert_eq!(s, r#"{"err":"nope"}"#);
+    }
+}

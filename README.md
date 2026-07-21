@@ -137,6 +137,32 @@ Status arrives two ways:
 New adapters implement the `AgentAdapter` trait in `src/adapters/` (five
 small methods).
 
+## Controlling roost (CLI / LLM)
+
+A running roost can be driven programmatically over its control socket — the
+same binary in client mode:
+
+```sh
+roost list                                   # panes: id, adapter, cwd, status, …
+roost spawn pi --cwd ~/api --input "run the tests, report pass/fail"
+roost read 5 --tail 20                        # a pane's recent output
+roost send 5 hello world --enter              # type into a pane (+ Enter)
+roost status 5                                # working | waiting | needs_input | …
+roost fork 5                                  # a sibling in the same context
+roost close 5 [--force]
+```
+
+This is how an LLM manages a fleet — an agent inside a pane can spawn and drive
+worker panes for its sub-agents, and you watch (and take over) the whole fleet
+live. See [DESIGN-control.md](DESIGN-control.md).
+
+**Authorization is ownership-scoped.** A pane acting via its own `$ROOST_TOKEN`
+may spawn/fork freely and drive only the panes *it* spawned (its subtree) — a
+prompt-injected pane can't reach panes it didn't create. The fleet token in
+`<state>/control.token` (0600, never in a pane's env) grants an external
+orchestrator full reach. Targeting is daemonless: an in-pane client finds its
+instance via `$ROOST_SOCK` automatically.
+
 ## Architecture (ports & adapters)
 
 The core never touches a PTY, socket, or the filesystem — it talks to traits

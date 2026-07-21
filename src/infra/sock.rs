@@ -11,13 +11,15 @@
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+
+use crate::core::control::Request;
 
 /// Max bytes accepted for one status line. A well-formed message is well under
 /// this; a client that streams without a newline is dropped instead of being
@@ -72,6 +74,17 @@ struct Msg {
     session: Option<String>,
     #[serde(default)]
     status: Option<String>,
+}
+
+/// A control request is any message carrying a `method` field (status/session
+/// reports don't). Returns None for non-control lines so they fall through to
+/// the one-way `parse_line` path.
+fn parse_control(line: &str) -> Option<Request> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("method").is_none() {
+        return None;
+    }
+    serde_json::from_value(v).ok()
 }
 
 fn parse_line(line: &str) -> Option<AppEvent> {
@@ -152,6 +165,24 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
                     }
                     let Ok(line) = std::str::from_utf8(&buf) else { continue };
                     let line = line.trim_end();
+                    // Control request (has a `method`): execute on the main loop
+                    // and write the reply back down this connection.
+                    if let Some(req) = parse_control(line) {
+                        let (rtx, rrx) = std::sync::mpsc::channel();
+                        if tx.send(AppEvent::Command(req, rtx)).is_err() {
+                            break; // main gone
+                        }
+                        let Ok(reply) = rrx.recv() else { break };
+                        let mut json = match serde_json::to_string(&reply) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        json.push('\n');
+                        if reader.get_mut().write_all(json.as_bytes()).is_err() {
+                            break; // client hung up
+                        }
+                        continue;
+                    }
                     match parse_line(line) {
                         Some(ev) => {
                             if tx.send(ev).is_err() {

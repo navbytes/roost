@@ -9,6 +9,7 @@
 //! there against fakes.
 
 mod agents;
+mod cli;
 mod core;
 mod infra;
 mod ports;
@@ -33,6 +34,12 @@ use crate::ui::input::{self, InputResult};
 use crate::ui::mouse::{self, MouseAction};
 
 fn main() -> Result<()> {
+    // Client mode: `roost <verb> ...` talks to a running instance and exits,
+    // before any terminal/lock setup. No args → launch the multiplexer.
+    if let Some(code) = cli::maybe_run() {
+        std::process::exit(code);
+    }
+
     // One roost per state dir: two instances sharing a workspace.json race
     // and corrupt each other's panes. Hold an exclusive lock for the whole
     // run (released automatically on exit). Do this before touching the
@@ -145,6 +152,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         app.set_flash(msg);
     }
 
+    // Write the fleet control token where an external `roost <verb>` client can
+    // read it (0600, owner-only, next to the socket). Never placed in a pane's
+    // env — that's the boundary between "a pane reports itself" and "a client
+    // drives the fleet". Cleaned up on exit.
+    let control_token_path = FsStore::default_path().with_file_name("control.token");
+    write_control_token(&control_token_path, app.control_token());
+
     let loop_result: Result<()> = (|| {
     loop {
         terminal.draw(|f| ui::render::draw(f, &mut app))?;
@@ -190,6 +204,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         // ...then drain PTY output and socket events.
         while let Ok(ev) = rx.try_recv() {
             match ev {
+                AppEvent::Command(req, reply) => {
+                    let _ = reply.send(app.handle_control(req));
+                }
                 AppEvent::Output(id, bytes) => app.on_pty_output(id, &bytes),
                 AppEvent::Exit(id) => {
                     if let Some(msg) = app.on_pty_exit(id) {
@@ -230,7 +247,23 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     if let Some(p) = &sock_cleanup {
         infra::sock::cleanup(p);
     }
+    let _ = std::fs::remove_file(&control_token_path);
     loop_result
+}
+
+/// Write the control token 0600, owner-only.
+fn write_control_token(path: &std::path::Path, token: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+    {
+        let _ = f.write_all(token.as_bytes());
+    }
 }
 
 /// Handle a key that a UI mode did not consume: a global action, or bytes
