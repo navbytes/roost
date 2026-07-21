@@ -24,6 +24,8 @@ pub enum Action {
     ScrollMode,
     CopyMode,
     ToggleHints,
+    /// Reopen the most recently closed pane or tab (fat-finger undo).
+    Undo,
 }
 
 pub enum InputResult {
@@ -57,6 +59,7 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Enter => Some(Action::QuickLaunch),
             KeyCode::Char('/') => Some(Action::ToggleHints),
             KeyCode::Char('c') => Some(Action::CopyMode),
+            KeyCode::Char('u') => Some(Action::Undo),
             KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
             KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),

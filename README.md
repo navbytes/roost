@@ -51,7 +51,8 @@ change, atomic writes). Delete it to start clean.
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
 | `Alt+c` | copy mode — drag to select text, copies on release (`Esc` cancels) |
 | `Alt+t`, `Alt+1..9` | new tab / go to tab |
-| `Alt+w` | close pane |
+| `Alt+w` | close pane (press twice to confirm when the agent is busy or it's the last pane) |
+| `Alt+u` | undo — reopen the last closed pane/tab, resuming its session |
 | `Alt+/` | toggle the shortcut hint bar |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 

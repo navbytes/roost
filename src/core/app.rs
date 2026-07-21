@@ -63,6 +63,23 @@ pub struct Selection {
 /// How long the "copied" flash stays in the hint bar.
 const FLASH_WINDOW: Duration = Duration::from_secs(2);
 
+/// How long an armed destructive-close confirmation stays live: press the same
+/// key again within this window to actually close/quit.
+const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
+/// How many closed panes/tabs the undo stack keeps.
+const UNDO_DEPTH: usize = 20;
+
+/// A closed pane or tab, kept on the undo stack so `Alt+u` can reopen it —
+/// crucially with its session id intact, so the agent resumes where it was.
+#[derive(Debug, Clone)]
+enum Closed {
+    /// A single pane closed out of a tab that still exists.
+    Pane { tab_index: usize, spec: PaneSpec },
+    /// A whole tab (its last pane was closed), captured before removal.
+    Tab { index: usize, tab: Tab },
+}
+
 /// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
 /// is a lazily-loaded tab whose panes haven't been spawned — deliberately
 /// distinct from `Quiet` (spawned, nothing happening) so a background tab
@@ -104,6 +121,11 @@ pub struct App<B: PaneBackend> {
     pub selection: Option<Selection>,
     /// Transient status message shown in the hint bar (e.g. "copied").
     flash: Option<(String, Instant)>,
+    /// Recently closed panes/tabs, for `Alt+u` undo (most-recent last).
+    undo: Vec<Closed>,
+    /// When a destructive close (busy pane / last pane) has been armed and is
+    /// awaiting a confirming second keypress.
+    confirm_close: Option<Instant>,
     /// Per-spawn secret handed to each pane's child via `ROOST_TOKEN`. A
     /// socket message is only honored if its token matches the one issued to
     /// the pane it claims to be — so a process in one pane can't spoof another
@@ -143,6 +165,8 @@ impl<B: PaneBackend> App<B> {
             alt_seen: false,
             selection: None,
             flash: None,
+            undo: Vec::new(),
+            confirm_close: None,
             tokens: HashMap::new(),
         };
         app.spawn_active_tab();
@@ -676,9 +700,78 @@ impl<B: PaneBackend> App<B> {
                 self.selection = None;
             }
             Action::ToggleHints => self.hints = !self.hints,
+            Action::Undo => self.undo_close(),
+        }
+        // Any action other than a repeated close disarms a pending close
+        // confirmation, so a stale "press again" can't leak onto a later key.
+        if !matches!(action, Action::ClosePane) {
+            self.confirm_close = None;
         }
         self.relayout();
         self.save();
+    }
+
+    /// Push a closed pane/tab onto the bounded undo stack.
+    fn remember_closed(&mut self, closed: Closed) {
+        self.undo.push(closed);
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Reopen the most recently closed pane or tab, resuming its session.
+    fn undo_close(&mut self) {
+        let Some(closed) = self.undo.pop() else {
+            self.flash = Some(("nothing to reopen".into(), Instant::now()));
+            return;
+        };
+        match closed {
+            Closed::Tab { index, tab } => {
+                let i = index.min(self.ws.tabs.len());
+                self.ws.tabs.insert(i, tab);
+                self.ws.active_tab = i;
+                self.spawn_active_tab();
+                self.focused = self.pane_order().first().copied().unwrap_or(0);
+                self.flash = Some(("reopened tab".into(), Instant::now()));
+            }
+            Closed::Pane { tab_index, spec } => {
+                // Restore into its original tab if it still exists, else the
+                // active one; split the focused pane and reuse the saved spec
+                // (session id preserved ⇒ the agent resumes).
+                self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
+                self.focused = self.pane_order().first().copied().unwrap_or(0);
+                self.restore_pane(spec);
+                self.flash = Some(("reopened pane".into(), Instant::now()));
+            }
+        }
+    }
+
+    /// Insert `spec` as a new pane split off the focused pane, spawning it.
+    /// Shared by undo (reuses a saved spec, session and all).
+    fn restore_pane(&mut self, spec: PaneSpec) {
+        let id = self.ws.next_pane_id();
+        let focused = self.focused;
+        let dir = self
+            .rects()
+            .iter()
+            .find(|pr| pr.id == focused)
+            .map(|pr| {
+                if pr.rect.width >= pr.rect.height * 3 {
+                    SplitDir::Vertical
+                } else {
+                    SplitDir::Horizontal
+                }
+            })
+            .unwrap_or(SplitDir::Vertical);
+        let tab = self.ws.active_tab_mut();
+        tab.panes.insert(id, spec.clone());
+        if !layout::split_pane(&mut tab.layout, focused, id, dir) {
+            tab.layout = LayoutNode::Pane(id);
+        }
+        self.focused = id;
+        if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
+            self.spawn_pane(id, &spec, pr.rect);
+        }
     }
 
     /// Move focus spatially to the nearest pane in `dir`; stay put if none.
@@ -740,9 +833,38 @@ impl<B: PaneBackend> App<B> {
 
     fn close_pane(&mut self) {
         let id = self.focused;
+
+        // Destructive-close guard. Closing a *busy* agent loses its in-flight
+        // turn, and closing the last pane quits roost outright (which undo
+        // can't recover). In those cases, arm a confirmation and require a
+        // second Alt+w within the window; a non-busy pane closes immediately
+        // (undo covers an accidental one).
+        let is_working =
+            self.runtimes.get(&id).map(|rt| rt.status() == AgentStatus::Working).unwrap_or(false);
+        let would_quit = self.ws.tabs.len() == 1 && self.ws.active_tab().panes.len() == 1;
+        let armed = self.confirm_close.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
+        if (is_working || would_quit) && !armed {
+            self.confirm_close = Some(Instant::now());
+            let msg = if would_quit {
+                "last pane — Alt+w again to quit roost"
+            } else {
+                "agent busy — Alt+w again to close"
+            };
+            self.flash = Some((msg.into(), Instant::now()));
+            return;
+        }
+        self.confirm_close = None;
+
+        // Capture for undo *before* mutating. If this empties the tab, we
+        // reopen the whole tab; otherwise just the pane (session preserved).
+        let tab_index = self.ws.active_tab;
+        let tab_snapshot = self.ws.active_tab().clone();
+        let closed_spec = self.find_spec(id).cloned();
+
         if let Some(mut rt) = self.runtimes.remove(&id) {
             rt.kill();
         }
+        self.tokens.remove(&id);
         // Drop any spawn-error record for this pane too; otherwise a pane that
         // failed to spawn and is then closed leaves a stale `dead` entry that
         // never gets cleaned (pane ids are not reused for it).
@@ -755,11 +877,14 @@ impl<B: PaneBackend> App<B> {
                 let i = self.ws.active_tab;
                 self.ws.tabs.remove(i);
                 self.ws.active_tab = i.saturating_sub(1);
+                self.remember_closed(Closed::Tab { index: tab_index, tab: tab_snapshot });
                 self.spawn_active_tab();
             } else {
                 self.quit = true;
                 return;
             }
+        } else if let Some(spec) = closed_spec {
+            self.remember_closed(Closed::Pane { tab_index, spec });
         }
         self.focused = self.pane_order().first().copied().unwrap_or(0);
     }
@@ -1032,6 +1157,47 @@ mod tests {
     }
 
     #[test]
+    fn undo_reopens_a_closed_pane_with_its_session() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // 2 panes; focus on the new one
+        let id = app.focused;
+        app.set_session(id, "sess-xyz".into());
+        assert_eq!(app.runtimes.len(), 2);
+        // A non-busy pane closes immediately (undo covers accidents).
+        app.apply(Action::ClosePane);
+        assert_eq!(app.runtimes.len(), 1);
+        // Undo reopens it, and the restored pane keeps its resume id.
+        app.apply(Action::Undo);
+        assert_eq!(app.runtimes.len(), 2);
+        let restored = app.focused;
+        assert_eq!(app.find_spec(restored).unwrap().session.as_deref(), Some("sess-xyz"));
+    }
+
+    #[test]
+    fn closing_a_busy_pane_needs_a_confirming_second_press() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // FakePane: output ⇒ Working
+        assert_eq!(app.runtimes.len(), 2);
+        app.apply(Action::ClosePane); // armed, not closed
+        assert_eq!(app.runtimes.len(), 2);
+        app.apply(Action::ClosePane); // confirmed ⇒ closed
+        assert_eq!(app.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn undo_reopens_a_closed_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        assert_eq!(app.ws.tabs.len(), 2);
+        app.apply(Action::ClosePane); // last pane of tab 2 ⇒ tab removed
+        assert_eq!(app.ws.tabs.len(), 1);
+        app.apply(Action::Undo);
+        assert_eq!(app.ws.tabs.len(), 2);
+    }
+
+    #[test]
     fn socket_auth_requires_matching_pane_token() {
         let (mut app, _) = mk_app(shell_ws());
         app.tokens.insert(1, "secret-1".into());
@@ -1048,8 +1214,12 @@ mod tests {
     }
 
     #[test]
-    fn close_last_pane_quits() {
+    fn close_last_pane_confirms_then_quits() {
         let (mut app, _) = mk_app(shell_ws());
+        // First press arms the "this quits roost" confirmation — does not quit.
+        app.apply(Action::ClosePane);
+        assert!(!app.quit);
+        // Second press within the window confirms and quits.
         app.apply(Action::ClosePane);
         assert!(app.quit);
     }

@@ -78,7 +78,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
             vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
         }
         Mode::Normal if app.focused_dead() => {
-            vec![("↵", "relaunch"), ("f", "fresh"), ("Alt+q", "quit")]
+            vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
         }
         Mode::Normal => vec![
             ("Alt+n", "split"),
@@ -88,6 +88,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
             ("Alt+r", "rename"),
             ("Alt+←↓↑→", "focus"),
             ("Alt+w", "close"),
+            ("Alt+u", "undo"),
             ("Alt+/", "hide"),
             ("Alt+q", "quit"),
         ],
@@ -342,7 +343,7 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
             )));
         }
         lines.push(Line::from(Span::styled(
-            " ✕ exited — Enter: relaunch/resume · f: fresh session ",
+            " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close ",
             Style::default().fg(Color::Black).bg(Color::Red),
         )));
         let n = lines.len() as u16;
