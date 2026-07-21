@@ -309,11 +309,16 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
-    // Tab bar (top row): click a tab to switch to it.
+    // Tab bar (top row): click a tab to switch to it. Clicks past the last
+    // visible tab — the `…` overflow marker, the gap, or the right-aligned
+    // status area — hit no tab; `mouse::tab_at_x` clamps to what's actually
+    // drawn (C2).
     if me.row == 0 {
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
             let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
-            if let Some(i) = mouse::tab_at_x(&names, me.column) {
+            let bar_width = app.body_area().width;
+            let status_w = mouse::status_width(app.focused_cwd().as_deref(), app.last_save_ok());
+            if let Some(i) = mouse::tab_at_x(&names, bar_width, status_w, me.column) {
                 app.apply(input::Action::GoToTab(i));
             }
         }

@@ -6,10 +6,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::core::app::{picker_items, App, Mode, RenameTarget};
+use crate::core::app::{picker_items, App, Mode, RenameTarget, TabSummary};
 use crate::core::status::AgentStatus;
 use crate::core::layout::PaneRect;
 use crate::ports::PaneBackend;
+use crate::ui::mouse;
 use crate::ui::theme;
 
 pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
@@ -238,32 +239,104 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
     }
 }
 
+/// Active tab's label cell fuses with the body background — whatever the
+/// terminal's own bg is — rather than the tab strip's bg (§2 background
+/// policy / C2). It's a sentinel, not one of theme.rs's named hues, and
+/// theme.rs is outside this package's file scope, so it's declared locally
+/// rather than added there.
+const ACTIVE_TAB_BG: Color = Color::Reset;
+
+/// C2: numbered tabs (marker + label + status glyph + separator) filling
+/// the row edge-to-edge on `TAB_STRIP`, plus a right-aligned
+/// "{cwd} · {save}" status area. Column bookkeeping here is the renderer
+/// half of the mouse-hitbox lockstep rule (DESIGN-ui.md §4/§5) —
+/// `mouse::tab_width`/`tab_at_x` mirror this exactly and change together.
 fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
-    let mut spans: Vec<Span> = vec![Span::styled(
-        crate::ui::mouse::TABBAR_PREFIX,
-        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
-    )];
+    let cwd = app.focused_cwd();
+    let saved = app.last_save_ok();
+    let status_w = mouse::status_width(cwd.as_deref(), saved);
+    let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
+    let show_status = mouse::effective_status_width(&names, area.width, status_w) > 0;
+    let tabs_end = mouse::tabs_visible_width(&names, area.width, status_w);
+    let total_tabs_w = mouse::total_tabs_width(&names);
+
+    // Left to right, one 7-part span group per tab (marker/label/glyph/
+    // separator), stopping exactly where `tabs_visible_width` says to.
+    let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 3);
+    let mut used = 0u16;
     for (i, tab) in app.ws.tabs.iter().enumerate() {
-        let style = if i == app.ws.active_tab {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        // Each tab: two separator spaces, a per-tab status glyph, a space, then
-        // "N name". The glyph summarises every tab — crucially a not-yet-spawned
-        // background tab shows `·` (unknown), never an idle-looking blank. The
-        // four leading columns match `mouse::tab_width`, so click hit-testing
-        // lines up with what's drawn.
-        let (glyph, glyph_color) = tab_summary_badge(app.tab_summary(i));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            glyph.to_string(),
-            Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(crate::ui::mouse::tab_label(i, &tab.name), style));
+        if used >= tabs_end {
+            break;
+        }
+        let active = i == app.ws.active_tab;
+        let summary = app.tab_summary(i);
+        let (glyph, base_color) = tab_summary_badge(summary);
+        let glyph_color =
+            if summary == TabSummary::Working { theme::pulse_phase(app.elapsed()) } else { base_color };
+        push_tab_spans(&mut spans, i, &tab.name, active, glyph, glyph_color);
+        used += mouse::tab_width(i, &tab.name);
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // A single `…` marks the clip point when at least one tab didn't fit and
+    // there's a spare column to show it in (overflow, C2).
+    let budget = if show_status { area.width.saturating_sub(status_w) } else { area.width };
+    if used < total_tabs_w && used < budget {
+        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), Style::default().fg(theme::MUTED)));
+        used += 1;
+    }
+
+    if show_status {
+        let (prefix, save_word) = mouse::status_parts(cwd.as_deref(), saved);
+        let pad = area.width.saturating_sub(used).saturating_sub(status_w);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad as usize)));
+        }
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, Style::default().fg(theme::DIM)));
+        }
+        let save_color = if saved { theme::DIM } else { theme::ACCENT };
+        spans.push(Span::styled(format!("{save_word} "), Style::default().fg(save_color)));
+    }
+
+    // Base fill first (edge-to-edge TAB_STRIP, including any empty middle):
+    // Paragraph's own `.style()` fills the whole `area`, so cells no span
+    // touches (the gap before the status area, or the entire row past the
+    // last tab when there's no overflow) still get the strip background.
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::TAB_STRIP)),
+        area,
+    );
+}
+
+/// One tab's 7-part span sequence (C2): marker, label, status glyph, and the
+/// trailing separator — column count matches `mouse::tab_width` exactly.
+fn push_tab_spans(
+    spans: &mut Vec<Span<'static>>,
+    index: usize,
+    name: &str,
+    active: bool,
+    glyph: char,
+    glyph_color: Color,
+) {
+    if active {
+        spans.push(Span::styled(theme::MARKER_ACTIVE.to_string(), Style::default().fg(theme::ACCENT)));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::raw(" "));
+
+    let label_style = if active {
+        Style::default().fg(theme::FG).bg(ACTIVE_TAB_BG)
+    } else {
+        Style::default().fg(theme::MUTED)
+    };
+    spans.push(Span::styled(mouse::tab_label(index, name), label_style));
+    spans.push(Span::raw(" "));
+
+    spans.push(Span::styled(glyph.to_string(), Style::default().fg(glyph_color)));
+    spans.push(Span::raw(" "));
+
+    spans.push(Span::styled(theme::TAB_SEPARATOR.to_string(), Style::default().fg(theme::RULE)));
 }
 
 /// Map a tab's aggregate summary to a tab-bar glyph + colour (theme::C5).

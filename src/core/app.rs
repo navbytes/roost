@@ -6,7 +6,7 @@
 use anyhow::Result;
 use ratatui::layout::{Rect, Size};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -129,6 +129,11 @@ pub struct App<B: PaneBackend> {
     /// are always discoverable. Session-only (not persisted).
     hints: bool,
     store: Box<dyn StateStore>,
+    /// Whether the most recent workspace save succeeded — the tab bar's
+    /// right status area (C2) shows "saved ✓" while this is true and
+    /// "save failed ✕" once a save errors. Starts `true`: on load we just
+    /// read `ws` from disk, so "saved" is accurate until proven otherwise.
+    last_save_ok: bool,
     tx: SyncSender<AppEvent>,
     term_size: Size,
     /// Freshly launched agent panes we still owe a session id.
@@ -198,6 +203,7 @@ impl<B: PaneBackend> App<B> {
             mode: Mode::Normal,
             hints: true,
             store,
+            last_save_ok: true,
             tx,
             term_size,
             pending_detect: HashMap::new(),
@@ -219,8 +225,8 @@ impl<B: PaneBackend> App<B> {
         Ok(app)
     }
 
-    fn save(&self) {
-        let _ = self.store.save(&self.ws);
+    fn save(&mut self) {
+        self.last_save_ok = self.store.save(&self.ws).is_ok();
     }
 
     /// The pane area: below the tab bar (row 0), above the hint bar (last
@@ -254,6 +260,19 @@ impl<B: PaneBackend> App<B> {
             self.started.elapsed(),
             std::env::var("TERM_PROGRAM").ok().as_deref(),
         )
+    }
+
+    /// Time since app start — the shared clock chrome uses for the
+    /// Working-glyph pulse (`theme::pulse_phase`, C5), so every pulsing
+    /// glyph on screen flips in unison.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Whether the last workspace save succeeded — the tab bar's right
+    /// status area (C2).
+    pub fn last_save_ok(&self) -> bool {
+        self.last_save_ok
     }
 
     /// Pane rectangles of the active tab (border-inclusive).
@@ -446,6 +465,14 @@ impl<B: PaneBackend> App<B> {
 
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
         self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
+    }
+
+    /// The focused pane's working directory, `$HOME` abbreviated to `~`,
+    /// for the tab bar's right status area (C2). `None` when the focused
+    /// pane has no spec.
+    pub fn focused_cwd(&self) -> Option<String> {
+        let cwd = &self.find_spec(self.focused)?.cwd;
+        Some(abbreviate_home(cwd, dirs::home_dir().as_deref()))
     }
 
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
@@ -1680,6 +1707,20 @@ fn wants_alt_hint(alt_seen: bool, elapsed: Duration, term_program: Option<&str>)
     !alt_seen && elapsed < ALT_HINT_WINDOW && term_program == Some("Apple_Terminal")
 }
 
+/// Pure decision behind `App::focused_cwd`: abbreviate a `$HOME`-rooted path
+/// to `~`, split out so it's testable without depending on the real
+/// environment's home directory.
+fn abbreviate_home(cwd: &Path, home: Option<&Path>) -> String {
+    match home {
+        Some(home) if !home.as_os_str().is_empty() => match cwd.strip_prefix(home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => cwd.display().to_string(),
+        },
+        _ => cwd.display().to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — the whole app core runs against fakes, no PTYs involved.
 // ---------------------------------------------------------------------------
@@ -2615,5 +2656,51 @@ mod tests {
         }
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.ws.active_tab().name, "main"); // unchanged
+    }
+
+    #[test]
+    fn abbreviate_home_replaces_the_home_prefix_with_a_tilde() {
+        let home = PathBuf::from("/home/nav");
+        assert_eq!(abbreviate_home(&PathBuf::from("/home/nav/work"), Some(&home)), "~/work");
+        assert_eq!(abbreviate_home(&PathBuf::from("/home/nav"), Some(&home)), "~");
+        assert_eq!(abbreviate_home(&PathBuf::from("/etc"), Some(&home)), "/etc");
+        assert_eq!(abbreviate_home(&PathBuf::from("/home/nav/work"), None), "/home/nav/work");
+    }
+
+    #[test]
+    fn focused_cwd_reports_the_focused_panes_directory_or_none() {
+        let (mut app, _) = mk_app(shell_ws()); // default_in(/tmp): pane 1's cwd is /tmp
+        assert!(app.focused_cwd().is_some());
+        app.focused = 999; // no such pane
+        assert!(app.focused_cwd().is_none());
+    }
+
+    /// A `StateStore` whose `save` always fails — exercises the "save
+    /// failed" path (C2's honest save indicator) without touching disk.
+    struct FailingStore;
+    impl StateStore for FailingStore {
+        fn load(&self) -> Result<Option<Workspace>> {
+            Ok(None)
+        }
+        fn save(&self, _ws: &Workspace) -> Result<()> {
+            Err(anyhow::anyhow!("disk full"))
+        }
+    }
+
+    #[test]
+    fn failed_save_flips_the_tab_bar_indicator() {
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(FailingStore),
+            tx,
+            Size::new(100, 30),
+            None,
+        )
+        .unwrap();
+        assert!(app.last_save_ok()); // startup counts as saved (we just loaded)
+        app.apply(Action::NewPane); // triggers a save() that fails
+        assert!(!app.last_save_ok());
     }
 }
