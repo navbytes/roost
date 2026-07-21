@@ -128,6 +128,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         App::new(ws, agents::registry(), Box::new(store), tx, size, sock_path)?;
     app.relayout();
 
+    let loop_result: Result<()> = (|| {
     loop {
         terminal.draw(|f| ui::render::draw(f, &mut app))?;
 
@@ -194,9 +195,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             break;
         }
     }
-
-    app.shutdown();
     Ok(())
+    })();
+
+    // Always run shutdown — even if the loop bailed with an error via `?` — so
+    // agents are killed/reaped and the workspace saved, never left orphaned.
+    app.shutdown();
+    loop_result
 }
 
 /// Handle a key that a UI mode did not consume: a global action, or bytes

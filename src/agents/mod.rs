@@ -127,6 +127,24 @@ pub trait AgentAdapter: Send + Sync {
 
 }
 
+/// Is `id` a plausible session id we're willing to hand to `pi --session` /
+/// `claude --resume`? No shell is ever involved (ids are passed as separate
+/// argv tokens), so this is defense-in-depth, not the only guard: it rejects a
+/// tampered `workspace.json` or a poisoned status-socket message trying to
+/// steer resume at an attacker-chosen path, a flag (leading `-`), or something
+/// that isn't an id at all. Real ids from pi/claude are UUID/hex-with-dashes;
+/// we allow that plus `_`/`.` and cap the length, and reject empties, control
+/// chars, path separators, `..`, and leading dashes.
+pub fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && !id.starts_with('-')
+        && !id.contains("..")
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Files under `root` (recursive) modified after `since`, newest first.
 /// Used to spot the session file a freshly launched agent just created.
 pub fn session_files_since(root: &Path, since: SystemTime) -> Vec<PathBuf> {
@@ -168,6 +186,21 @@ pub fn registry() -> Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_id_validation_accepts_ids_rejects_paths_and_flags() {
+        // Real-shaped ids pass.
+        assert!(valid_session_id("3f9a1c2e-7b4d-4a11-9c2e-0f1a2b3c4d5e"));
+        assert!(valid_session_id("abc_123.session"));
+        // Hostile / malformed values are rejected.
+        assert!(!valid_session_id("")); // empty
+        assert!(!valid_session_id("../../etc/passwd")); // traversal
+        assert!(!valid_session_id("/home/attacker/evil")); // path
+        assert!(!valid_session_id("-oProxyCommand=evil")); // leading-dash flag
+        assert!(!valid_session_id("has space")); // whitespace
+        assert!(!valid_session_id("nul\0byte")); // control char
+        assert!(!valid_session_id(&"x".repeat(257))); // too long
+    }
 
     /// Adapter whose session root is a caller-supplied path, so session_state
     /// branches can be exercised deterministically against a temp dir.

@@ -9,10 +9,16 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+
+/// Max bytes accepted for one status line. A well-formed message is well under
+/// this; a client that streams without a newline is dropped instead of being
+/// allowed to grow an unbounded buffer (local DoS).
+const MAX_LINE: u64 = 64 * 1024;
 
 use crate::core::event::AppEvent;
 use crate::core::status::AgentStatus;
@@ -72,18 +78,40 @@ pub fn spawn_listener(tx: Sender<AppEvent>) -> Result<PathBuf> {
     let path = socket_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
+        // The socket is the control plane (it can set session ids / status);
+        // keep its directory private to the owner.
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     }
     let _ = fs::remove_file(&path); // stale socket from a previous run
     let listener = UnixListener::bind(&path)?;
+    // Restrict the socket to the owner so another local user can't connect and
+    // poison session ids / spoof status.
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let tx = tx.clone();
             std::thread::spawn(move || {
-                for line in BufReader::new(stream).lines() {
-                    let Ok(line) = line else { break };
-                    match parse_line(&line) {
+                let mut reader = BufReader::new(stream);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    // Cap the bytes read per line so a newline-less flood can't
+                    // grow the buffer without bound.
+                    let n = match reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut buf) {
+                        Ok(0) => break,       // EOF
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    // Hit the cap without terminating — oversized line; drop the
+                    // connection rather than trying to resync.
+                    if buf.last() != Some(&b'\n') && n as u64 == MAX_LINE {
+                        break;
+                    }
+                    let Ok(line) = std::str::from_utf8(&buf) else { continue };
+                    let line = line.trim_end();
+                    match parse_line(line) {
                         Some(ev) => {
                             if tx.send(ev).is_err() {
                                 break;
@@ -92,7 +120,7 @@ pub fn spawn_listener(tx: Sender<AppEvent>) -> Result<PathBuf> {
                         // A malformed line usually means a broken extension /
                         // hook integration — log it (ROOST_DEBUG) so it's
                         // debuggable instead of silently vanishing.
-                        None => log_dropped(&line),
+                        None => log_dropped(line),
                     }
                 }
             });

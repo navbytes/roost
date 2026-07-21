@@ -84,8 +84,18 @@ impl StatusTracker {
             return AgentStatus::Exited;
         }
         match self.extension_status {
-            // Explicit "needs you" is always honored.
-            Some(AgentStatus::NeedsInput) => AgentStatus::NeedsInput,
+            // Explicit "needs you" is honored, but self-heals: if the clearing
+            // event never arrives (an elicitation the agent cancelled or that
+            // errored out), a long silence decays it to Waiting so ◆ doesn't
+            // pull the user to a pane forever. Mirrors the Working decay below.
+            Some(AgentStatus::NeedsInput) => {
+                let stuck = self.ext_at.is_some_and(|t| t.elapsed() > STUCK_WORKING);
+                if stuck && !self.recent_output() {
+                    AgentStatus::Waiting
+                } else {
+                    AgentStatus::NeedsInput
+                }
+            }
             // Trust "working" while output flows; if it goes quiet for a long
             // time the reporting hook probably died — self-heal to Waiting.
             Some(AgentStatus::Working) => {
@@ -144,6 +154,20 @@ mod tests {
         // fresh output resurrects Working
         t.on_output();
         assert_eq!(t.current(), AgentStatus::Working);
+    }
+
+    #[test]
+    fn stale_needs_input_decays_after_silence() {
+        let mut t = StatusTracker::new();
+        t.set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(t.current(), AgentStatus::NeedsInput);
+        // A dead/cancelled elicitation: the clear never comes. After a long
+        // silence, ◆ self-heals to Waiting instead of pulling the user forever.
+        t.ext_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
+        assert_eq!(t.current(), AgentStatus::Waiting);
+        // ...but recent output means the agent is still interacting → keep ◆.
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::NeedsInput);
     }
 
     #[test]

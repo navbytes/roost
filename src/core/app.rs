@@ -202,6 +202,10 @@ impl<B: PaneBackend> App<B> {
         // here, before we borrow self mut.
         let (session, stale) = match &spec.session {
             None => (None, false),
+            // A malformed/hostile id (tampered workspace.json, poisoned socket)
+            // never reaches the resume command — treat it as gone and launch
+            // fresh, clearing it from disk.
+            Some(s) if !crate::agents::valid_session_id(s) => (None, true),
             Some(s) => match adapter.session_state(&spec.cwd, s) {
                 crate::agents::SessionState::Gone => (None, true),
                 _ => (Some(s.clone()), false), // Exists or Unknown → try resume
@@ -314,9 +318,13 @@ impl<B: PaneBackend> App<B> {
             if spec.adapter != want {
                 let demoting = want == "shell";
                 spec.adapter = want;
-                if demoting {
-                    spec.session = None;
-                } else {
+                // Keep spec.session even when demoting to shell. A single missed
+                // observation (a transient argv miss, a subprocess reparent, the
+                // agent's startup window) must not destroy the resume pointer —
+                // that's the H1-class data-loss path on a different route. The
+                // shell adapter simply ignores a stored session; if the pane is
+                // re-promoted to the agent, the id is still there to resume.
+                if !demoting {
                     promoted.push(id);
                 }
                 dirty = true;

@@ -6,7 +6,9 @@
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use crate::agents::CommandSpec;
 use crate::core::event::AppEvent;
@@ -27,6 +29,13 @@ pub struct PtyPane {
     scroll: usize,
     /// The pane's child pid, for OS observation (live cwd / running agent).
     pid: Option<u32>,
+    /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
+    /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
+    /// id. Without this, a pane id that is reused (close→new) or respawned
+    /// (relaunch) could receive a stale `Exit` from the *old* child's reader
+    /// and be flipped straight back to "dead", or get old bytes rendered into
+    /// the new pane.
+    alive: Arc<AtomicBool>,
 }
 
 impl PaneBackend for PtyPane {
@@ -67,15 +76,27 @@ impl PaneBackend for PtyPane {
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
 
+        let alive = Arc::new(AtomicBool::new(true));
+        let reader_alive = alive.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        let _ = tx.send(AppEvent::Exit(id));
+                        // Suppress the Exit if this pane was deliberately killed
+                        // (respawn/close): the id may already belong to a new
+                        // child, and reporting Exit would wrongly mark it dead.
+                        if reader_alive.load(Ordering::Relaxed) {
+                            let _ = tx.send(AppEvent::Exit(id));
+                        }
                         break;
                     }
                     Ok(n) => {
+                        // Same guard for output: don't feed a killed pane's
+                        // trailing bytes into whatever now holds this id.
+                        if !reader_alive.load(Ordering::Relaxed) {
+                            break;
+                        }
                         if tx.send(AppEvent::Output(id, buf[..n].to_vec())).is_err() {
                             break;
                         }
@@ -92,6 +113,7 @@ impl PaneBackend for PtyPane {
             status: StatusTracker::new(),
             scroll: 0,
             pid,
+            alive,
         })
     }
 
@@ -123,6 +145,10 @@ impl PaneBackend for PtyPane {
     }
 
     fn kill(&mut self) {
+        // Mark this spawn dead *before* killing so the reader thread, which
+        // will see EOF the moment the child dies, doesn't emit a stale
+        // Exit/Output for an id that may be reused or respawned.
+        self.alive.store(false, Ordering::Relaxed);
         // portable-pty's child is a std::process::Child, whose Drop does NOT
         // reap. kill() only sends SIGKILL; without a wait() the child lingers
         // as a zombie until roost exits. Reap it here so pane churn (close,
