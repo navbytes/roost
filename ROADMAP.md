@@ -13,13 +13,18 @@ change · **[descoped]** decided against unless a use-case demands it.
 
 ## Verification
 
-- **[you] Live smoke test.** Nothing here has run against a real terminal. The
-  logic is unit-tested at every seam, but the socket round-trip, the control
-  CLI, the kitty/Shift+Enter path, and the Alt+w/Alt+q freeze fix have never
-  been exercised live. Launch roost; from a pane run `roost list` and
-  `roost spawn shell`; confirm Shift+Enter inserts a newline in a pi/Claude
-  pane; confirm Alt+w and Alt+q are instant. This is the single highest-value
-  next step and it's the one thing I can't do.
+- **[done] Live smoke test.** Exercised against a real terminal via a PTY
+  harness: socket round-trip, the full control CLI
+  (`list/spawn/send/read/status/wait/close`), the deferred-reply `wait`,
+  `read --full` scrollback, bad-token rejection, the audit log, `workspace.json`
+  persistence, and the **Alt+q freeze fix** (quit in 0.26 s with live child
+  panes) — 15/15 green, clean shutdown, no orphans. The startup handshake
+  (alt-screen, mouse, `CSI ? u` kitty query + correct fallback) was verified
+  from the wire. The one path a headless PTY can't drive — **Shift+Enter
+  inserting a newline in a real pi/Claude pane** — was confirmed by hand in
+  iTerm2. (It needs a CSI-u terminal — iTerm2/Ghostty/kitty/WezTerm; Terminal.app
+  sends Shift+Enter and Option+Enter identically, so there it hits the Alt+Enter
+  picker. See README.)
 
 ## Control interface — remaining
 

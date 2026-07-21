@@ -65,9 +65,14 @@ hides it to reclaim the row.
 Everything else passes through to the focused pane untouched. **Shift+Enter**
 and **Ctrl+Enter** are sent to the pane as an "insert newline" (rather than
 "submit"), so you can compose multi-line prompts in agent TUIs that support it.
-This needs the enhanced keyboard protocol, which roost negotiates on start when
-the host terminal supports it (Ghostty, kitty, WezTerm, recent iTerm2); on a
-terminal without it, both still submit, exactly as before.
+This needs a terminal that reports modified keys via the CSI-u ("kitty")
+keyboard protocol — **iTerm2, Ghostty, kitty, WezTerm** — which roost negotiates
+on start.
+
+⚠️ **Not macOS Terminal.app.** It sends Shift+Enter *and* Option+Enter as the
+same bytes (`ESC CR`), which roost can only read as Alt+Enter — so on
+Terminal.app, Shift+Enter opens the quick-launch picker instead of inserting a
+newline. Use one of the CSI-u terminals above to compose multi-line prompts.
 
 **Mouse**: the wheel scrolls the pane under the cursor — forwarded to the
 inner app when it has mouse reporting enabled (pi/claude TUIs, vim, less),
