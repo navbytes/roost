@@ -48,6 +48,8 @@ pub enum Mode {
     Scroll { offset: usize },
     /// Mouse-drag text selection; copies to the clipboard on release.
     Copy,
+    /// Full-keymap overlay (Alt+?); any key dismisses it.
+    Help,
 }
 
 /// An in-progress / completed text selection within one pane. Coordinates are
@@ -581,7 +583,8 @@ impl<B: PaneBackend> App<B> {
         if text.is_empty() {
             return None;
         }
-        self.flash = Some((format!("copied {} chars", text.len()), Instant::now()));
+        self.flash =
+            Some((format!("copied {} chars", text.chars().count()), Instant::now()));
         Some(text)
     }
 
@@ -701,6 +704,7 @@ impl<B: PaneBackend> App<B> {
             }
             Action::ToggleHints => self.hints = !self.hints,
             Action::Undo => self.undo_close(),
+            Action::Help => self.mode = Mode::Help,
         }
         // Any action other than a repeated close disarms a pending close
         // confirmation, so a stale "press again" can't leak onto a later key.
@@ -918,11 +922,18 @@ impl<B: PaneBackend> App<B> {
     pub fn handle_mode_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::KeyCode;
         // Alt-chords always reach the global bindings (Alt+q must quit from
-        // anywhere). Overlay modes cancel; scroll mode survives.
+        // anywhere), so any mode yields to them. If we were scrolling, snap the
+        // pane back to its live tail first — otherwise moving focus (Alt+arrow)
+        // would leave the pane you were reading frozen mid-history while scroll
+        // keys silently drive a different pane.
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
-            if !matches!(self.mode, Mode::Scroll { .. }) {
-                self.mode = Mode::Normal;
+            if matches!(self.mode, Mode::Scroll { .. }) {
+                let focused = self.focused;
+                if let Some(rt) = self.runtimes.get_mut(&focused) {
+                    rt.set_scrollback(0);
+                }
             }
+            self.mode = Mode::Normal;
             return false;
         }
         match &mut self.mode {
@@ -1012,6 +1023,11 @@ impl<B: PaneBackend> App<B> {
                     self.mode = Mode::Normal;
                     self.selection = None;
                 }
+                true
+            }
+            Mode::Help => {
+                // Any key dismisses the keymap overlay.
+                self.mode = Mode::Normal;
                 true
             }
         }
@@ -1184,6 +1200,23 @@ mod tests {
         assert_eq!(app.runtimes.len(), 2);
         app.apply(Action::ClosePane); // confirmed ⇒ closed
         assert_eq!(app.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn scrolling_then_a_global_chord_snaps_the_pane_back_to_live() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)); // scroll back 1
+        assert!(matches!(app.mode, Mode::Scroll { .. }));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 1);
+        // A global Alt chord (e.g. focus move) exits scroll mode AND resets the
+        // pane's scrollback, so it isn't left frozen mid-history.
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT));
+        assert!(!consumed); // Alt passes through to the global binding
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 0);
     }
 
     #[test]

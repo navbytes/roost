@@ -53,6 +53,7 @@ change, atomic writes). Delete it to start clean.
 | `Alt+t`, `Alt+1..9` | new tab / go to tab |
 | `Alt+w` | close pane (press twice to confirm when the agent is busy or it's the last pane) |
 | `Alt+u` | undo — reopen the last closed pane/tab, resuming its session |
+| `Alt+?` | show the full keymap (any key closes it) |
 | `Alt+/` | toggle the shortcut hint bar |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 

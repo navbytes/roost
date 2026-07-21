@@ -26,6 +26,8 @@ pub enum Action {
     ToggleHints,
     /// Reopen the most recently closed pane or tab (fat-finger undo).
     Undo,
+    /// Toggle the full-keymap help overlay.
+    Help,
 }
 
 pub enum InputResult {
@@ -60,6 +62,7 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('/') => Some(Action::ToggleHints),
             KeyCode::Char('c') => Some(Action::CopyMode),
             KeyCode::Char('u') => Some(Action::Undo),
+            KeyCode::Char('?') => Some(Action::Help),
             KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
             KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),

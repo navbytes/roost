@@ -66,6 +66,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // (key, what it does) pairs for the current context.
     let hints: Vec<(&str, &str)> = match &app.mode {
         Mode::Copy => vec![("drag", "select text"), ("Esc", "cancel")],
+        Mode::Help => vec![("Alt+?", "all keys"), ("any key", "close")],
         Mode::Rename { target, .. } => {
             let what = match target {
                 RenameTarget::Pane => "pane name",
@@ -185,6 +186,49 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                         Style::default()
                     };
                     Line::from(Span::styled(format!("  {item:<28}"), style))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        Mode::Help => {
+            // Full keymap — every binding, including the modal ones the compact
+            // hint bar can't fit (scroll, copy, resize, flip, go-to-tab).
+            let keys: &[(&str, &str)] = &[
+                ("Alt+n", "new shell pane (auto split)"),
+                ("Alt+Enter", "quick-launch picker (pi / claude / shell)"),
+                ("Alt+←↓↑→ / hjkl", "move focus"),
+                ("Alt+Shift+←↓↑→", "resize along that axis"),
+                ("Alt+s", "toggle split ⇄ stack"),
+                ("Alt+o", "flip split orientation"),
+                ("Alt+r / Alt+Shift+r", "rename pane / tab"),
+                ("Alt+t / Alt+1..9", "new tab / go to tab"),
+                ("Alt+w", "close pane (confirm if busy / last)"),
+                ("Alt+u", "undo — reopen last closed pane/tab"),
+                ("Alt+c", "copy mode (drag to select)"),
+                ("Alt+PgUp", "scroll mode"),
+                ("Alt+/", "toggle hint bar"),
+                ("Alt+q", "quit (workspace saved; sessions live)"),
+            ];
+            let h = keys.len() as u16 + 2;
+            let rect = centered_near(anchor, body, 52, h.min(body.height));
+            dim_backdrop(f, body, rect);
+            f.render_widget(Clear, rect);
+            let block = Block::bordered()
+                .title(" keys — any key to close ")
+                .border_type(BorderType::Double)
+                .border_style(dialog_border_style());
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let lines: Vec<Line> = keys
+                .iter()
+                .map(|(k, d)| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {k:<18}"),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("{d}"), Style::default().fg(Color::Gray)),
+                    ])
                 })
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
@@ -325,11 +369,16 @@ fn draw_pane<B: PaneBackend>(f: &mut Frame, app: &mut App<B>, pr: PaneRect) {
     // iTerm2-style corner badge: the pane label, faint, top-right. Drawn
     // after the content so it stays visible (a cell TUI can't do true
     // translucency; dim gray reads as a watermark rather than content).
-    if let Some((rect, text)) = corner_badge(inner, &name) {
-        f.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
-            rect,
-        );
+    // Suppressed on the focused pane: you know which pane you're in, the
+    // border title already names it, and the badge would occlude the inner
+    // app's own top-right cells (a header/counter) right where you're working.
+    if !focused {
+        if let Some((rect, text)) = corner_badge(inner, &name) {
+            f.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+                rect,
+            );
+        }
     }
 
     // Dead pane: overlay the relaunch hint (and spawn error, if any) on the
