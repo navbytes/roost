@@ -514,6 +514,15 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// Count of panes across **every** tab whose runtime status is
+    /// `NeedsInput` — the hint bar's aggregate "◆ N needs you" (C9). Scans
+    /// `runtimes` directly rather than `tab_summary` (which reports one tab
+    /// at a time and collapses multiple needs-input panes to a single flag),
+    /// so a pane in a background tab still counts.
+    pub fn needs_input_count(&self) -> usize {
+        self.runtimes.values().filter(|rt| rt.status() == AgentStatus::NeedsInput).count()
+    }
+
     /// Whether the focused pane negotiated the kitty keyboard protocol, so the
     /// input layer knows whether to send modified Enter as CSI-u or the legacy
     /// fallback.
@@ -1775,6 +1784,24 @@ mod tests {
         // Not spawned (no runtime, no recorded failure) → Unknown, never idle.
         app.runtimes.remove(&id);
         assert_eq!(app.tab_summary(0), TabSummary::Unknown);
+    }
+
+    #[test]
+    fn needs_input_count_is_0_1_many_and_spans_every_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        let tab0_pane = app.pane_order()[0];
+        assert_eq!(app.needs_input_count(), 0); // 0: omitted from the hint bar
+
+        app.apply(Action::NewTab); // tab 1 now active; tab 0's pane stays spawned
+        let tab1_pane = app.focused;
+        app.runtimes.get_mut(&tab0_pane).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.needs_input_count(), 1); // 1
+
+        app.runtimes.get_mut(&tab1_pane).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.needs_input_count(), 2); // many, and counted while tab 1 is active
+
+        app.go_to_tab(0); // switching the active tab must not change the count
+        assert_eq!(app.needs_input_count(), 2);
     }
 
     #[test]

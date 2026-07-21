@@ -43,6 +43,13 @@ pub const TAB_STRIP: Color = Color::Rgb(27, 23, 19);
 /// Hint bar row background.
 pub const BAR: Color = Color::Rgb(33, 29, 25);
 
+/// Active tab's label cell background: `Color::Reset`, not one of the nine
+/// `Rgb` tokens above — a deliberate sentinel (§2 background policy) so the
+/// active tab visually fuses with whatever the terminal's own background
+/// is, rather than painting `TAB_STRIP` under it or assuming roost owns the
+/// terminal bg.
+pub const ACTIVE_TAB_BG: Color = Color::Reset;
+
 // ---- Chrome glyphs (§2 glyph inventory; all single-width) ----
 
 // Status glyphs (C5 table).

@@ -56,32 +56,12 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     draw_mode_overlay(f, app, body, anchor);
 }
 
-/// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
-/// actually press right now.
-fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
-    if app.show_alt_hint() {
-        f.render_widget(
-            Paragraph::new(
-                " Alt keys aren't reaching roost? Enable \"Use Option as Meta Key\" in Terminal > Settings > Profiles > Keyboard ",
-            )
-            .style(Style::default().fg(Color::Black).bg(Color::Yellow)),
-            area,
-        );
-        return;
-    }
-
-    // A transient action result (e.g. "copied") takes over the bar briefly.
-    if let Some(msg) = app.flash() {
-        f.render_widget(
-            Paragraph::new(format!(" {msg} "))
-                .style(Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
-            area,
-        );
-        return;
-    }
-
-    // (key, what it does) pairs for the current context.
-    let hints: Vec<(&str, &str)> = match &app.mode {
+/// C9: Normal-mode hint pairs — exactly these seven; bindings the old
+/// ten-pair list dropped (tab/undo/hide/quit) stay discoverable via
+/// `Alt+?`. Every other mode's pairs are unchanged in content (restyled
+/// only). Pure — no `Frame` — so the exact Normal-mode list pins down.
+fn hint_pairs(mode: &Mode, focused_dead: bool) -> Vec<(&'static str, &'static str)> {
+    match mode {
         Mode::Copy => vec![("drag", "select text"), ("Esc", "cancel")],
         Mode::Help => vec![("Alt+?", "all keys"), ("any key", "close")],
         Mode::Rename { target, .. } => {
@@ -95,33 +75,98 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         Mode::Scroll { .. } => {
             vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
         }
-        Mode::Normal if app.focused_dead() => {
+        Mode::Normal if focused_dead => {
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
         }
         Mode::Normal => vec![
-            ("Alt+n", "split"),
+            ("Alt+n", "new"),
             ("Alt+↵", "launch"),
             ("Alt+s", "stack"),
-            ("Alt+t", "tab"),
-            ("Alt+r", "rename"),
             ("Alt+←↓↑→", "focus"),
+            ("Alt+r", "rename"),
             ("Alt+w", "close"),
-            ("Alt+u", "undo"),
-            ("Alt+/", "hide"),
-            ("Alt+q", "quit"),
+            ("Alt+?", "keys"),
         ],
-    };
-
-    let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 3);
-    for (key, label) in hints {
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(format!(" {label}   "), Style::default().fg(Color::Gray)));
     }
-    // Paragraph truncates (no wrap) so a narrow terminal just clips the tail.
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// C9's right-segment uppercase mode word, one per `Mode` variant.
+fn mode_word(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Normal => "NORMAL",
+        Mode::Rename { .. } => "RENAME",
+        Mode::Picker { .. } => "PICKER",
+        Mode::Scroll { .. } => "SCROLL",
+        Mode::Copy => "COPY",
+        Mode::Help => "HELP",
+    }
+}
+
+/// C9's right-aligned segment: the aggregate "◆ N needs you" — omitted at
+/// `n == 0` rather than shown as a hollow "0 needs you" — then the
+/// uppercase mode word, then one trailing space. Pure so the
+/// omission-at-zero rule is unit-testable without a `Frame`.
+fn hint_bar_right_spans(n: usize, word: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if n > 0 {
+        spans.push(Span::styled(format!("◆ {n} needs you"), Style::default().fg(theme::ACCENT)));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(word.to_string(), Style::default().fg(theme::DIM)));
+    spans.push(Span::raw(" "));
+    spans
+}
+
+/// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
+/// actually press right now. Precedence (C9): alt-warning, then flash, then
+/// the hint pairs — each takes over the whole bar from the next.
+fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
+    if app.show_alt_hint() {
+        f.render_widget(
+            Paragraph::new(
+                " Alt keys aren't reaching roost? Enable \"Use Option as Meta Key\" in Terminal > Settings > Profiles > Keyboard ",
+            )
+            .style(Style::default().fg(theme::FG).bg(theme::ACCENT_DIM)),
+            area,
+        );
+        return;
+    }
+
+    // A transient action result (e.g. "copied") takes over the bar briefly.
+    if let Some(msg) = app.flash() {
+        f.render_widget(
+            Paragraph::new(format!(" {msg} ")).style(Style::default().fg(theme::FG).bg(theme::RULE)),
+            area,
+        );
+        return;
+    }
+
+    // (key, what it does) pairs for the current context: key ACCENT, label
+    // MUTED, no chip bg.
+    let hints = hint_pairs(&app.mode, app.focused_dead());
+    let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 2 + 4);
+    let mut used = 0u16;
+    for (key, label) in hints {
+        let key_span = format!(" {key} ");
+        let label_span = format!("{label}  ");
+        used += (key_span.chars().count() + label_span.chars().count()) as u16;
+        spans.push(Span::styled(key_span, Style::default().fg(theme::ACCENT)));
+        spans.push(Span::styled(label_span, Style::default().fg(theme::MUTED)));
+    }
+
+    // Right-aligned aggregate + mode word, drawn only when it still fits
+    // after the hints (hints win on narrow widths).
+    let right = hint_bar_right_spans(app.needs_input_count(), mode_word(&app.mode));
+    let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
+    if used.saturating_add(right_w) <= area.width {
+        let pad = area.width.saturating_sub(used).saturating_sub(right_w);
+        spans.push(Span::raw(" ".repeat(pad as usize)));
+        spans.extend(right);
+    }
+
+    // Paragraph truncates (no wrap) so a narrow terminal just clips the
+    // tail; the bg fills the row edge-to-edge regardless of span coverage.
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BAR)), area);
 }
 
 /// Floating rect of the given size, centered on `anchor` (the focused pane)
@@ -157,10 +202,18 @@ fn dim_backdrop(f: &mut Frame, body: Rect, dialog: Rect) {
     }
 }
 
-/// Border style for floating dialogs: a fixed color + double border, so it
-/// never blends with a pane's own (status-colored, single-line) border.
+/// Border style for floating dialogs (C12): the one look all three modals
+/// share — a modal is the focused interaction surface, so it takes the
+/// focus color; the dimmed backdrop (below) keeps it from being confused
+/// with the focused pane's own accent border. No BOLD (§2 bold policy).
 fn dialog_border_style() -> Style {
-    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    Style::default().fg(theme::ACCENT)
+}
+
+/// C12's title style: regular weight, primary ink — shared by all three
+/// modals so there's exactly one place that sets it.
+fn dialog_title(text: &'static str) -> Line<'static> {
+    Line::from(text).style(Style::default().fg(theme::FG))
 }
 
 fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
@@ -176,12 +229,16 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                 RenameTarget::Tab => " rename tab ",
             };
             let block = Block::bordered()
-                .title(heading)
-                .border_type(BorderType::Double)
+                .title(dialog_title(heading))
+                .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            f.render_widget(Paragraph::new(format!("{buffer}▏")), inner);
+            f.render_widget(
+                Paragraph::new(format!("{buffer}{}", theme::RENAME_CURSOR))
+                    .style(Style::default().fg(theme::FG)),
+                inner,
+            );
         }
         Mode::Picker { selection } => {
             let items = picker_items();
@@ -189,21 +246,25 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
-                .title(" new pane — pick agent ")
-                .border_type(BorderType::Double)
+                .title(dialog_title(" new pane — pick agent "))
+                .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
+            // C14: selected row is a `❯`-prefix + FG item text, no bg
+            // highlight; unselected rows are plain MUTED text.
             let lines: Vec<Line> = items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
-                    let style = if i == *selection {
-                        Style::default().fg(Color::Black).bg(Color::Yellow)
+                    if i == *selection {
+                        Line::from(vec![
+                            Span::styled(theme::PICKER_SELECTED.to_string(), Style::default().fg(theme::ACCENT)),
+                            Span::styled(format!(" {item}"), Style::default().fg(theme::FG)),
+                        ])
                     } else {
-                        Style::default()
-                    };
-                    Line::from(Span::styled(format!("  {item:<28}"), style))
+                        Line::from(Span::styled(format!("  {item}"), Style::default().fg(theme::MUTED)))
+                    }
                 })
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
@@ -232,8 +293,8 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
-                .title(" keys — any key to close ")
-                .border_type(BorderType::Double)
+                .title(dialog_title(" keys — any key to close "))
+                .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
@@ -241,11 +302,8 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                 .iter()
                 .map(|(k, d)| {
                     Line::from(vec![
-                        Span::styled(
-                            format!(" {k:<18}"),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("{d}"), Style::default().fg(Color::Gray)),
+                        Span::styled(format!(" {k:<18}"), Style::default().fg(theme::ACCENT)),
+                        Span::styled(format!("{d}"), Style::default().fg(theme::MUTED)),
                     ])
                 })
                 .collect();
@@ -253,13 +311,6 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
         }
     }
 }
-
-/// Active tab's label cell fuses with the body background — whatever the
-/// terminal's own bg is — rather than the tab strip's bg (§2 background
-/// policy / C2). It's a sentinel, not one of theme.rs's named hues, and
-/// theme.rs is outside this package's file scope, so it's declared locally
-/// rather than added there.
-const ACTIVE_TAB_BG: Color = Color::Reset;
 
 /// C2: numbered tabs (marker + label + status glyph + separator) filling
 /// the row edge-to-edge on `TAB_STRIP`, plus a right-aligned
@@ -341,7 +392,7 @@ fn push_tab_spans(
     spans.push(Span::raw(" "));
 
     let label_style = if active {
-        Style::default().fg(theme::FG).bg(ACTIVE_TAB_BG)
+        Style::default().fg(theme::FG).bg(theme::ACTIVE_TAB_BG)
     } else {
         Style::default().fg(theme::MUTED)
     };
@@ -719,11 +770,13 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 mod tests {
     use super::{
         badge_text, centered_near, collapsed_name_color, collapsed_row_spans, corner_badge,
-        stack_header_text, state_word,
+        dialog_border_style, hint_bar_right_spans, hint_pairs, stack_header_text, state_word,
     };
+    use crate::core::app::Mode;
     use crate::core::status::AgentStatus;
     use crate::ui::theme;
     use ratatui::layout::Rect;
+    use ratatui::style::Style;
 
     #[test]
     fn dialog_centers_on_focused_pane_not_whole_screen() {
@@ -851,5 +904,44 @@ mod tests {
         assert!(text.starts_with(" STACK · 3 PANES"));
         assert!(text.ends_with("ALT+↑↓ "));
         assert_eq!(text, text.to_uppercase());
+    }
+
+    #[test]
+    fn hint_pairs_normal_mode_is_exactly_the_seven_c9_pairs() {
+        assert_eq!(
+            hint_pairs(&Mode::Normal, false),
+            vec![
+                ("Alt+n", "new"),
+                ("Alt+↵", "launch"),
+                ("Alt+s", "stack"),
+                ("Alt+←↓↑→", "focus"),
+                ("Alt+r", "rename"),
+                ("Alt+w", "close"),
+                ("Alt+?", "keys"),
+            ],
+        );
+    }
+
+    #[test]
+    fn hint_bar_right_omits_needs_segment_at_zero() {
+        let spans = hint_bar_right_spans(0, "NORMAL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "NORMAL ");
+        assert!(!text.contains('◆'));
+    }
+
+    #[test]
+    fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
+        let spans = hint_bar_right_spans(3, "NORMAL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "◆ 3 needs you  NORMAL ");
+        assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
+    }
+
+    #[test]
+    fn dialog_border_style_is_accent_with_no_modifiers() {
+        // Pins C12: the old bright-fg/double-border/bold dialog look is
+        // gone — one plain accent style for all three modals.
+        assert_eq!(dialog_border_style(), Style::default().fg(theme::ACCENT));
     }
 }
