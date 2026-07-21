@@ -205,7 +205,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 AppEvent::Command(req, reply) => {
-                    let _ = reply.send(app.handle_control(req));
+                    app.handle_control_msg(req, reply);
                 }
                 AppEvent::Output(id, bytes) => app.on_pty_output(id, &bytes),
                 AppEvent::Exit(id) => {
@@ -233,6 +233,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
         // Periodic housekeeping (filesystem session detection).
         app.tick();
+        // Fire any parked `wait` control requests whose panes hit their target
+        // status (or timed out) this iteration.
+        app.poll_waiters();
 
         if app.quit {
             break;

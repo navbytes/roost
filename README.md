@@ -148,9 +148,13 @@ roost spawn pi --cwd ~/api --input "run the tests, report pass/fail"
 roost read 5 --tail 20                        # a pane's recent output
 roost send 5 hello world --enter              # type into a pane (+ Enter)
 roost status 5                                # working | waiting | needs_input | …
+roost wait 5 --until waiting --timeout 300    # block until the agent finishes
 roost fork 5                                  # a sibling in the same context
 roost close 5 [--force]
 ```
+
+`wait` is what turns "spawn then poll" into "spawn → await → read": block until a
+pane hits a status (or a timeout), so an orchestrator doesn't sleep-and-grep.
 
 This is how an LLM manages a fleet — an agent inside a pane can spawn and drive
 worker panes for its sub-agents, and you watch (and take over) the whole fleet

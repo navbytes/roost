@@ -7,7 +7,7 @@ use anyhow::Result;
 use ratatui::layout::{Rect, Size};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::agents::Registry;
@@ -87,6 +87,15 @@ enum Closed {
     Tab { index: usize, tab: Tab },
 }
 
+/// A parked `wait` control request: reply when any of `panes` reaches `until`,
+/// or when `deadline` passes. Holds the client's reply channel until then.
+struct Waiter {
+    panes: Vec<PaneId>,
+    until: AgentStatus,
+    reply: Sender<Reply>,
+    deadline: Instant,
+}
+
 /// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
 /// is a lazily-loaded tab whose panes haven't been spawned — deliberately
 /// distinct from `Quiet` (spawned, nothing happening) so a background tab
@@ -142,6 +151,8 @@ pub struct App<B: PaneBackend> {
     /// (0600) and NEVER placed in any pane's environment, so only a deliberately
     /// authorized external client can drive panes it doesn't own.
     control_token: String,
+    /// Parked `wait` requests, polled each event-loop iteration.
+    waiters: Vec<Waiter>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -184,6 +195,7 @@ impl<B: PaneBackend> App<B> {
             confirm_close: None,
             tokens: HashMap::new(),
             control_token: gen_token(),
+            waiters: Vec::new(),
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -537,13 +549,20 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// Execute a control request: authorize the caller, then dispatch. Returns
-    /// a `Reply` the transport serializes back to the client.
+    /// Execute a control request synchronously: authorize, then dispatch.
+    /// (`wait` is asynchronous and goes through `handle_control_msg`.) The
+    /// socket path uses `handle_control_msg`; this is the direct/in-process
+    /// entry, exercised by the unit tests.
+    #[allow(dead_code)]
     pub fn handle_control(&mut self, req: Request) -> Reply {
-        let Some(actor) = self.resolve_actor(&req.token) else {
-            return Reply::err("unauthorized: unknown or missing token");
-        };
-        match req.method {
+        match self.resolve_actor(&req.token) {
+            Some(actor) => self.dispatch(actor, req.method),
+            None => Reply::err("unauthorized: unknown or missing token"),
+        }
+    }
+
+    fn dispatch(&mut self, actor: Actor, method: Method) -> Reply {
+        match method {
             Method::List => self.ctl_list(actor),
             Method::Status { pane } => self.ctl_status(actor, pane),
             Method::Spawn { adapter, cwd, initial_input } => {
@@ -553,6 +572,98 @@ impl<B: PaneBackend> App<B> {
             Method::Send { pane, text, submit } => self.ctl_send(actor, pane, &text, submit),
             Method::Read { pane, mode } => self.ctl_read(actor, pane, mode),
             Method::Close { pane, force } => self.ctl_close(actor, pane, force),
+            // `wait` is handled asynchronously; only reached if a caller sends
+            // it down the synchronous path.
+            Method::Wait { .. } => Reply::err("wait is asynchronous; issue it over the socket"),
+        }
+    }
+
+    /// Socket entry point. Handles the asynchronous `wait` (parks a waiter and
+    /// replies later) and delegates every other verb to synchronous dispatch.
+    pub fn handle_control_msg(&mut self, req: Request, reply: Sender<Reply>) {
+        let actor = self.resolve_actor(&req.token);
+        match (actor, req.method) {
+            (None, _) => {
+                let _ = reply.send(Reply::err("unauthorized: unknown or missing token"));
+            }
+            (Some(actor), Method::Wait { panes, until, timeout_ms }) => {
+                self.register_waiter(actor, panes, &until, timeout_ms, reply);
+            }
+            (Some(actor), method) => {
+                let _ = reply.send(self.dispatch(actor, method));
+            }
+        }
+    }
+
+    fn pane_matches(&self, id: PaneId, until: AgentStatus) -> bool {
+        match self.runtimes.get(&id) {
+            Some(rt) => rt.status() == until,
+            // A pane with no runtime (closed / never spawned) counts as exited.
+            None => until == AgentStatus::Exited,
+        }
+    }
+
+    fn register_waiter(
+        &mut self,
+        actor: Actor,
+        panes: Vec<PaneId>,
+        until: &str,
+        timeout_ms: Option<u64>,
+        reply: Sender<Reply>,
+    ) {
+        if panes.is_empty() {
+            let _ = reply.send(Reply::err("wait needs at least one pane"));
+            return;
+        }
+        let Some(until) = crate::core::control::parse_status(until) else {
+            let _ = reply
+                .send(Reply::err("unknown status; use working|needs_input|waiting|idle|exited"));
+            return;
+        };
+        for &p in &panes {
+            if self.find_spec(p).is_none() {
+                let _ = reply.send(Reply::err(format!("no such pane: {p}")));
+                return;
+            }
+            if !self.may_target(actor, p) {
+                let _ = reply.send(Reply::err("forbidden: pane not in your subtree"));
+                return;
+            }
+        }
+        // Already satisfied → reply immediately.
+        if let Some(id) = panes.iter().copied().find(|&p| self.pane_matches(p, until)) {
+            let _ = reply
+                .send(Reply::ok(serde_json::json!({ "pane": id, "status": self.status_str(id) })));
+            return;
+        }
+        // Default 5 min, capped at 24 h, so a parked reply can't live forever.
+        let ms = timeout_ms.unwrap_or(300_000).min(24 * 3600 * 1000);
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        self.waiters.push(Waiter { panes, until, reply, deadline });
+    }
+
+    /// Fire any parked `wait` whose condition is met (or which timed out).
+    /// Called every event-loop iteration; cheap when there are no waiters.
+    pub fn poll_waiters(&mut self) {
+        if self.waiters.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.waiters.len() {
+            let w = &self.waiters[i];
+            let hit = w.panes.iter().copied().find(|&p| self.pane_matches(p, w.until));
+            let timed_out = now >= w.deadline;
+            if let Some(id) = hit {
+                let status = self.status_str(id);
+                let w = self.waiters.remove(i);
+                let _ = w.reply.send(Reply::ok(serde_json::json!({ "pane": id, "status": status })));
+            } else if timed_out {
+                let w = self.waiters.remove(i);
+                let _ = w.reply.send(Reply::ok(serde_json::json!({ "timed_out": true })));
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -1635,6 +1746,49 @@ mod tests {
             app.handle_control(Request { token: ct, method: Method::Close { pane: 1, force: true } }),
             crate::core::control::Reply::Err { .. }
         ));
+    }
+
+    #[test]
+    fn control_wait_immediate_parks_and_fires() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let p = 1; // the initial shell pane (FakePane starts Idle)
+        let wait = |until: &str, ms: u64| Request {
+            token: ct.clone(),
+            method: Method::Wait { panes: vec![p], until: until.into(), timeout_ms: Some(ms) },
+        };
+
+        // Already at the target status → reply comes back immediately.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(wait("idle", 1000), tx);
+        match rx.recv().unwrap() {
+            Reply::Ok { ok } => assert_eq!(ok["status"], "idle"),
+            Reply::Err { err } => panic!("{err}"),
+        }
+        assert!(app.waiters.is_empty());
+
+        // Not yet at target → parks (no reply), then fires when it transitions.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(wait("working", 60_000), tx);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.waiters.len(), 1);
+        app.on_pty_output(p, b"x"); // FakePane: output ⇒ Working
+        app.poll_waiters();
+        match rx.recv().unwrap() {
+            Reply::Ok { ok } => assert_eq!(ok["status"], "working"),
+            Reply::Err { err } => panic!("{err}"),
+        }
+        assert!(app.waiters.is_empty());
+
+        // A 0ms timeout on an unreachable status → times out on the next poll.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(wait("exited", 0), tx);
+        app.poll_waiters();
+        match rx.recv().unwrap() {
+            Reply::Ok { ok } => assert_eq!(ok["timed_out"], true),
+            Reply::Err { err } => panic!("{err}"),
+        }
     }
 
     #[test]

@@ -77,6 +77,29 @@ pub enum Method {
         #[serde(default)]
         force: bool,
     },
+    /// Block until any of `panes` reaches status `until` (e.g. "waiting" =
+    /// finished its turn), or `timeout_ms` elapses. A deferred reply: the reply
+    /// is sent later by the event loop, not synchronously. This is what turns
+    /// "spawn then poll" into "spawn then await".
+    Wait {
+        panes: Vec<PaneId>,
+        until: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+}
+
+/// Parse a status name (as sent by a `wait` client) into an `AgentStatus`.
+pub fn parse_status(s: &str) -> Option<crate::core::status::AgentStatus> {
+    use crate::core::status::AgentStatus::*;
+    Some(match s {
+        "working" => Working,
+        "needs_input" => NeedsInput,
+        "waiting" => Waiting,
+        "idle" => Idle,
+        "exited" => Exited,
+        _ => return None,
+    })
 }
 
 /// A control request as received from a transport: the caller's token + a verb.

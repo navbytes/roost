@@ -15,7 +15,7 @@ use std::os::unix::net::UnixStream;
 use crate::infra::sock::socket_path;
 use crate::infra::store::FsStore;
 
-const VERBS: &[&str] = &["list", "status", "spawn", "fork", "send", "read", "close"];
+const VERBS: &[&str] = &["list", "status", "spawn", "fork", "send", "read", "close", "wait"];
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
 /// code. Otherwise return None so `main` launches the TUI.
@@ -41,6 +41,7 @@ roost — control a running instance:
   roost send PANE TEXT... [--enter]
   roost read PANE [--tail N | --full]
   roost close PANE [--force]
+  roost wait PANE... [--until STATUS] [--timeout SEC]
 (run `roost` with no args to launch the multiplexer)";
 
 fn run(args: &[String]) -> i32 {
@@ -140,6 +141,20 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             m.insert("pane".into(), parse_pane(pane)?.into());
             m.insert("force".into(), has_flag(rest, "--force").into());
         }
+        "wait" => {
+            let pos = positional(rest);
+            if pos.is_empty() {
+                return Err("wait needs at least one PANE".into());
+            }
+            let panes: Result<Vec<serde_json::Value>, String> =
+                pos.iter().map(|p| parse_pane(p).map(Into::into)).collect();
+            m.insert("panes".into(), serde_json::Value::Array(panes?));
+            m.insert("until".into(), flag_value(rest, "--until").unwrap_or_else(|| "waiting".into()).into());
+            if let Some(secs) = flag_value(rest, "--timeout") {
+                let secs: u64 = secs.parse().map_err(|_| "--timeout needs a number (seconds)")?;
+                m.insert("timeout_ms".into(), (secs * 1000).into());
+            }
+        }
         _ => return Err(format!("unknown verb: {verb}")),
     }
     Ok(serde_json::Value::Object(m))
@@ -157,7 +172,7 @@ fn positional(args: &[String]) -> Vec<String> {
         let a = &args[i];
         if a.starts_with("--") {
             // --cwd/--input/--tail take a value; skip it.
-            if matches!(a.as_str(), "--cwd" | "--input" | "--tail") {
+            if matches!(a.as_str(), "--cwd" | "--input" | "--tail" | "--until" | "--timeout") {
                 i += 2;
             } else {
                 i += 1;
