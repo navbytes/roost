@@ -225,7 +225,14 @@ impl PaneBackend for PtyPane {
         // "exited" state doesn't hold a zombie. If the child somehow closed the
         // PTY without exiting, try_wait returns Ok(None) and we don't block;
         // kill() will reap it definitively when the pane is finally cleaned up.
-        let _ = self.child.try_wait();
+        // ponytail: once try_wait confirms the reap, `pid` is a dead
+        // reference the OS is free to recycle for an unrelated process —
+        // clear it so hangup()/kill(), which both already gate their raw
+        // libc::kill on `self.pid.is_some()` (and run again unconditionally
+        // on every runtime during App::shutdown), can't signal it.
+        if let Ok(Some(_)) = self.child.try_wait() {
+            self.pid = None;
+        }
     }
 
     fn screen(&self) -> Option<&vt100::Screen> {
