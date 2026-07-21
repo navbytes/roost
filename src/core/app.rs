@@ -148,6 +148,10 @@ impl<B: PaneBackend> App<B> {
         term_size: Size,
         sock_path: Option<PathBuf>,
     ) -> Result<Self> {
+        // A loaded workspace.json may be hand-edited, partially migrated, or
+        // otherwise inconsistent — repair layout ↔ panes before spawning.
+        let mut ws = ws;
+        ws.validate_and_repair();
         let mut app = Self {
             focused: 0,
             ws,

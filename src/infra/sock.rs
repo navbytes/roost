@@ -8,19 +8,40 @@
 //!   { "pane": "3", "token": "<hex>", "event": "status",  "status": "working"
 //!                                    | "waiting" | "needs_input" | "exited" }
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
+use std::sync::Arc;
 
 /// Max bytes accepted for one status line. A well-formed message is well under
 /// this; a client that streams without a newline is dropped instead of being
 /// allowed to grow an unbounded buffer (local DoS).
 const MAX_LINE: u64 = 64 * 1024;
+
+/// Cap concurrent client connections so a buggy/looping extension that
+/// reconnects rapidly can't spawn unbounded threads/FDs.
+const MAX_CONN: usize = 64;
+
+/// Is `dir` owned by us with no group/other access? Refusing otherwise stops
+/// an attacker who pre-created the runtime dir from hosting our control socket
+/// (tmux does the same for its socket dir).
+fn dir_is_private_and_ours(dir: &Path) -> bool {
+    match fs::metadata(dir) {
+        Ok(m) => m.uid() == unsafe { libc::geteuid() } && (m.mode() & 0o077) == 0,
+        Err(_) => false,
+    }
+}
+
+/// Remove the socket file on clean exit so a stale socket isn't left behind.
+pub fn cleanup(path: &Path) {
+    let _ = fs::remove_file(path);
+}
 
 use crate::core::event::AppEvent;
 use crate::core::status::AgentStatus;
@@ -85,8 +106,13 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
         // The socket is the control plane (it can set session ids / status);
-        // keep its directory private to the owner.
+        // keep its directory private to the owner...
         let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        // ...and refuse to run if it isn't actually ours and private (an
+        // attacker may have pre-created it to intercept the socket).
+        if !dir_is_private_and_ours(dir) {
+            bail!("roost: socket directory {} has unsafe ownership/permissions", dir.display());
+        }
     }
     let _ = fs::remove_file(&path); // stale socket from a previous run
     let listener = UnixListener::bind(&path)?;
@@ -94,9 +120,18 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
     // poison session ids / spoof status.
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
 
+    let conns = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            // Shed load past the connection cap rather than spawning threads
+            // without bound.
+            if conns.load(Ordering::Relaxed) >= MAX_CONN {
+                drop(stream);
+                continue;
+            }
+            conns.fetch_add(1, Ordering::Relaxed);
+            let conns = conns.clone();
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream);
@@ -129,6 +164,7 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
                         None => log_dropped(line),
                     }
                 }
+                conns.fetch_sub(1, Ordering::Relaxed);
             });
         }
     });

@@ -131,6 +131,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         )
     });
     let sock_path = infra::sock::spawn_listener(tx.clone()).ok();
+    let sock_cleanup = sock_path.clone();
     let mut notifier = TermNotifier;
     let size = terminal.size()?;
     let mut app: App<PtyPane> =
@@ -219,6 +220,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // Always run shutdown — even if the loop bailed with an error via `?` — so
     // agents are killed/reaped and the workspace saved, never left orphaned.
     app.shutdown();
+    if let Some(p) = &sock_cleanup {
+        infra::sock::cleanup(p);
+    }
     loop_result
 }
 
