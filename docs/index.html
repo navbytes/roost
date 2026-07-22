@@ -45,6 +45,21 @@
     --shadow-lg: 0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent);
 
     --edge: clamp(20px, 5vw, 72px);
+
+    /* roost's own TUI chrome — ink · paper · one red (DESIGN-ui.md token
+       table). Distinct from --color-accent above, which is this site's
+       brand red, not the terminal's. */
+    --tui-bg: #15120f;
+    --tui-fg: #eae5df;
+    --tui-mut: #8f8983;
+    --tui-dim: #57524b;
+    --tui-rule: #332f2a;
+    --tui-accent: #ff563c;
+    --tui-accent-dim: #a83a28;
+    --tui-strip: #1b1713;
+    --tui-bar: #211d19;
+    --tui-ok: #7fae7f;
+    --tui-info: #8fb2c9;
   }
 
   *, *::before, *::after { box-sizing: border-box; }
@@ -103,7 +118,6 @@
   .nav a.btn-primary:hover { color: var(--color-bg); }
 
   /* ── page ─────────────────────────────────────────────────────────── */
-  @keyframes roost-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
   @keyframes roost-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
   .kicker {
@@ -112,8 +126,8 @@
     color: var(--color-accent-700); margin-bottom: 14px;
   }
 
-  .demo-grid { display: grid; grid-template-columns: minmax(0,240px) minmax(0,1fr); min-height: 340px; }
-  .demo-side { border-right: 1px solid rgba(255,255,255,0.12); display: flex; flex-direction: column; font-family: var(--font-mono); font-size: 12.5px; }
+  .demo-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,300px); min-height: 340px; }
+  .demo-side { border: 1px solid var(--tui-rule); display: flex; flex-direction: column; font-family: var(--font-mono); font-size: 12.5px; }
 
   .stats { display: grid; grid-template-columns: repeat(4,1fr); gap: 32px 24px; }
   .stat-num {
@@ -158,7 +172,6 @@
   @media (max-width: 760px) {
     .nav a:not(.btn) { display: none; }
     .demo-grid { grid-template-columns: 1fr; }
-    .demo-side { border-right: 0; border-bottom: 1px solid rgba(255,255,255,0.12); }
     .stats { grid-template-columns: repeat(2,1fr); }
     .frow { grid-template-columns: 1fr; gap: 10px; }
     .compare { grid-template-columns: 1fr; }
@@ -209,64 +222,99 @@
   </section>
 
   <section aria-label="roost terminal demo" style="padding-bottom:clamp(40px,5vw,72px)">
-    <div style="border:2px solid var(--color-text);background:#181615;box-shadow:var(--shadow-lg)">
-      <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:#221f1e;border-bottom:1px solid rgba(255,255,255,0.09)">
+    <div style="border:2px solid var(--color-text);background:var(--tui-bg);box-shadow:var(--shadow-lg);font-family:var(--font-mono);color:var(--tui-fg)">
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--tui-bar);border-bottom:1px solid rgba(255,255,255,0.07)">
         <span style="display:flex;gap:7px">
-          <span style="width:11px;height:11px;background:#5a5654;display:inline-block"></span>
-          <span style="width:11px;height:11px;background:#5a5654;display:inline-block"></span>
-          <span style="width:11px;height:11px;background:#5a5654;display:inline-block"></span>
+          <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
+          <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
+          <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
         </span>
-        <span style="font-family:var(--font-mono);font-size:12.5px;color:#8f8a88;letter-spacing:0.02em">roost — ~/code</span>
-        <span style="margin-left:auto;font-family:var(--font-mono);font-size:11px;color:#6d6866;letter-spacing:0.04em">workspace saved ✓</span>
+        <span style="font-size:12.5px;color:var(--tui-mut);letter-spacing:0.02em">roost — ~/code</span>
       </div>
-      <div style="display:flex;font-family:var(--font-mono);font-size:12.5px;background:#1e1b1a;border-bottom:1px solid rgba(255,255,255,0.09)">
-        <span style="padding:8px 16px;color:#f3f2f2;background:#181615;border-right:1px solid rgba(255,255,255,0.09);border-top:2px solid var(--color-accent)">1 pi-mono</span>
-        <span style="padding:8px 16px;color:#8f8a88;border-right:1px solid rgba(255,255,255,0.09)">2 api</span>
-        <span style="padding:8px 16px;color:#8f8a88;border-right:1px solid rgba(255,255,255,0.09)">3 infra ◆</span>
+
+      <!-- tab bar: ▎ marker + "N name" + status glyph + │ separator, per tab -->
+      <div style="display:flex;align-items:stretch;background:var(--tui-strip);font-size:12.5px">
+        <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-fg);background:var(--tui-bg)"><span style="color:var(--tui-accent)">▎</span>1 main<span style="color:var(--tui-accent)">◆</span></span>
+        <span style="color:var(--tui-rule);align-self:center">│</span>
+        <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-mut)"><span style="color:transparent">▎</span>2 api</span>
+        <span style="color:var(--tui-rule);align-self:center">│</span>
+        <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-mut)"><span style="color:transparent">▎</span>3 infra<span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span></span>
+        <span style="color:var(--tui-rule);align-self:center">│</span>
+        <span style="margin-left:auto;display:flex;align-items:center;padding:9px 16px;color:var(--tui-dim);font-size:11.5px;letter-spacing:0.02em">~/code · saved ✓</span>
       </div>
+
+      <!-- split: focused pane (left) + a stack (right) -->
       <div class="demo-grid">
-        <div class="demo-side">
-          <span style="padding:9px 14px;color:#8f8a88;font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;border-bottom:1px solid rgba(255,255,255,0.09)">stack · 4 panes</span>
-          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#f3f2f2;background:#242120;border-left:3px solid var(--color-accent);border-bottom:1px solid rgba(255,255,255,0.06)">
-            <span class="js-spinner" style="color:var(--color-accent);animation:roost-pulse 1.1s ease-in-out infinite">⠋</span> run tests <span style="margin-left:auto;color:#6d6866;font-size:10.5px">pi</span>
-          </span>
-          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#cfcbc9;border-bottom:1px solid rgba(255,255,255,0.06)">
-            <span style="color:var(--color-accent)">◆</span> refactor tui <span style="margin-left:auto;color:#6d6866;font-size:10.5px">pi</span>
-          </span>
-          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#cfcbc9;border-bottom:1px solid rgba(255,255,255,0.06)">
-            <span style="color:#9b9797">○</span> write docs <span style="margin-left:auto;color:#6d6866;font-size:10.5px">claude</span>
-          </span>
-          <span style="display:flex;align-items:center;gap:10px;padding:11px 14px;color:#8f8a88">
-            <span style="color:#605d5d">·</span> shell <span style="margin-left:auto;color:#6d6866;font-size:10.5px">zsh</span>
-          </span>
+        <div style="position:relative;border:1px solid var(--tui-accent);padding:14px 16px;font-size:13px;line-height:1.65;overflow:hidden">
+          <span style="position:absolute;top:6px;right:11px;font-size:11px;color:var(--tui-mut);letter-spacing:0.02em">refactor tui · pi <span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span></span>
+          <div style="color:var(--tui-mut)">~/code/pi-mono</div>
+          <div style="margin-top:3px"><span style="color:var(--tui-accent)">❯</span> split the pane renderer into one draw fn per node</div>
+          <div style="margin-top:10px;color:var(--tui-mut)"><span style="color:var(--tui-accent)">⏺</span> read <span style="color:var(--tui-fg)">src/ui/render.rs</span> <span style="color:var(--tui-dim)">· 342 lines</span></div>
+          <div style="color:var(--tui-mut)"><span style="color:var(--tui-accent)">⏺</span> edit <span style="color:var(--tui-fg)">src/ui/render.rs</span></div>
+          <div style="margin-top:8px;border:1px solid var(--tui-rule);padding:8px 10px;font-size:12.5px">
+            <div style="color:var(--tui-dim);font-size:11px">src/ui/render.rs · draw_pane()</div>
+            <div style="margin-top:5px;color:var(--tui-accent-dim)">-   fn draw_pane(f, pane) {</div>
+            <div style="color:var(--tui-ok)">+   fn draw_pane(f, pane, focus: bool) {</div>
+            <div style="color:var(--tui-ok)">+       let edge = if focus { ACCENT } else { RULE };</div>
+            <div style="color:var(--tui-mut)">        blit_grid(f, pane.grid, rect);</div>
+          </div>
+          <div style="margin-top:10px;color:var(--tui-fg)">composing edit — 3 hunks, tests next</div>
         </div>
-        <div style="position:relative;padding:16px 18px;font-family:var(--font-mono);font-size:13px;line-height:1.7;color:#d7d3d3;overflow:hidden">
-          <span style="position:absolute;top:10px;right:14px;font-size:11px;color:#6d6866;letter-spacing:0.04em">pi · run tests ●</span>
-          <div style="color:#8f8a88">~/code/pi-mono</div>
-          <div><span style="color:var(--color-accent)">❯</span> <span id="typed"></span><span style="display:inline-block;width:8px;height:15px;background:#d7d3d3;vertical-align:-2px;animation:roost-blink 1.05s step-end infinite"></span></div>
-          <div style="margin-top:12px;color:#8f8a88">spawned pane <span style="color:#cfcbc9">#5</span> · pi · resuming session 01998e5f…</div>
-          <div style="color:#8f8a88">running <span style="color:#cfcbc9">cargo test</span> …</div>
-          <div style="margin-top:4px;color:#7fae7f">   Compiling roost v0.1.0</div>
-          <div style="color:#7fae7f">    Finished test profile</div>
-          <div style="color:#cfcbc9">running 48 tests <span class="js-spinner" style="color:var(--color-accent);animation:roost-pulse 1.1s ease-in-out infinite">⠋</span></div>
+
+        <div class="demo-side">
+          <span style="padding:7px 12px;color:var(--tui-dim);font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;border-bottom:1px solid var(--tui-rule);display:flex;justify-content:space-between">
+            <span>stack · 5 panes</span><span>Alt+↑↓</span>
+          </span>
+
+          <!-- expanded member: unfocused stack member gets a RULE frame + accent-dim left edge -->
+          <span style="position:relative;flex:1;min-height:0;border-left:2px solid var(--tui-accent-dim);padding:11px 13px;overflow:hidden">
+            <span style="position:absolute;top:5px;right:10px;font-size:10.5px;color:var(--tui-mut)">write tests · claude <span style="color:var(--tui-accent)">◆</span></span>
+            <span style="display:block;color:var(--tui-mut)">~/code/pi-mono/tests</span>
+            <span style="display:block;margin-top:6px;color:var(--tui-fg)">Claude wants to edit <span style="color:var(--tui-info)">status_test.rs</span></span>
+            <span style="display:block;margin-top:8px;border:1px solid var(--tui-accent-dim);padding:8px 10px">
+              <span style="display:block;color:var(--tui-fg)">Allow this edit?</span>
+              <span style="display:block;margin-top:6px;color:var(--tui-fg)"><span style="color:var(--tui-accent)">❯</span> 1. Yes</span>
+              <span style="display:block;color:var(--tui-mut)">&nbsp;&nbsp;2. Yes, and don't ask again</span>
+            </span>
+          </span>
+
+          <!-- collapsed rows: glyph + name + fill + "adapter · state-word" -->
+          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+            <span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span><span style="color:var(--tui-fg)">api-worker</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">pi · working</span>
+          </span>
+          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+            <span style="color:var(--tui-fg)">○</span><span style="color:var(--tui-mut)">write docs</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">claude · your turn</span>
+          </span>
+          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+            <span style="color:var(--tui-dim)">·</span><span style="color:var(--tui-mut)">scratch</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">shell · idle</span>
+          </span>
+          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+            <span style="color:var(--tui-accent-dim)">✕</span><span style="color:var(--tui-dim)">old build</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">pi · exited</span>
+          </span>
         </div>
       </div>
-      <div style="display:flex;flex-wrap:wrap;gap:18px;padding:9px 14px;background:#221f1e;border-top:1px solid rgba(255,255,255,0.09);font-family:var(--font-mono);font-size:11.5px;color:#8f8a88">
-        <span><span style="color:var(--color-accent)">Alt+n</span> new</span>
-        <span><span style="color:var(--color-accent)">Alt+Enter</span> launch</span>
-        <span><span style="color:var(--color-accent)">Alt+s</span> stack</span>
-        <span><span style="color:var(--color-accent)">Alt+↑↓</span> focus</span>
-        <span><span style="color:var(--color-accent)">Alt+w</span> close</span>
-        <span style="margin-left:auto"><span style="color:var(--color-accent)">Alt+q</span> quit — sessions live</span>
+
+      <!-- hint bar: bg BAR, accent keys, right-aligned needs-you count + mode word -->
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:18px;padding:9px 14px;background:var(--tui-bar);font-size:11.5px;color:var(--tui-mut)">
+        <span><span style="color:var(--tui-accent)">Alt+n</span> new</span>
+        <span><span style="color:var(--tui-accent)">Alt+↵</span> launch</span>
+        <span><span style="color:var(--tui-accent)">Alt+s</span> stack</span>
+        <span><span style="color:var(--tui-accent)">Alt+←↓↑→</span> focus</span>
+        <span><span style="color:var(--tui-accent)">Alt+r</span> rename</span>
+        <span><span style="color:var(--tui-accent)">Alt+w</span> close</span>
+        <span><span style="color:var(--tui-accent)">Alt+?</span> keys</span>
+        <span style="margin-left:auto;display:flex;align-items:center;gap:16px"><span style="color:var(--tui-accent)">◆ 1 needs you</span><span style="color:var(--tui-dim);letter-spacing:0.06em">NORMAL</span></span>
       </div>
     </div>
+
     <div style="display:flex;flex-wrap:wrap;gap:20px 28px;margin-top:20px;font-family:var(--font-mono);font-size:12px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
-      <span><span style="color:var(--color-accent)">●</span> working</span>
-      <span><span style="color:var(--color-accent)">◆</span> needs input</span>
+      <span><span style="color:var(--tui-accent)">●</span> working</span>
+      <span><span style="color:var(--tui-accent)">◆</span> needs input</span>
       <span>○ waiting for you</span>
       <span>· idle</span>
       <span>✕ exited</span>
     </div>
+    <p style="margin:14px 0 0;font-family:var(--font-mono);font-size:12.5px;color:color-mix(in srgb, var(--color-text) 60%, transparent)">This is roost's real chrome, token for token — <a href="./tui-design.html">explore the full design reference ↗</a> or read the <a href="https://github.com/navbytes/roost/blob/main/DESIGN-ui.md" target="_blank" rel="noopener">token spec (DESIGN-ui.md) ↗</a>.</p>
   </section>
 
   <hr style="height:2px;border:0;margin:0;background:var(--color-divider)">
@@ -274,9 +322,9 @@
   <section style="padding:clamp(40px,5vw,72px) 0" aria-label="roost by the numbers">
     <div class="stats">
       <div><p class="stat-num">0</p><p class="stat-label">Daemons to run</p></div>
-      <div><p class="stat-num">1</p><p class="stat-label">Foreground process, like an editor</p></div>
-      <div><p class="stat-num">100%</p><p class="stat-label">Workspace restored on relaunch</p></div>
-      <div><p class="stat-num">8→1</p><p class="stat-label">Agents in the space of one, stacked</p></div>
+      <div><p class="stat-num">3</p><p class="stat-label">Adapters — pi, Claude Code, shell</p></div>
+      <div><p class="stat-num">8</p><p class="stat-label">Control-CLI verbs</p></div>
+      <div><p class="stat-num">161</p><p class="stat-label">Unit tests</p></div>
     </div>
   </section>
 
@@ -301,17 +349,17 @@
     <div class="frow">
       <p class="frow-num">03</p>
       <h3>Fleet at a glance</h3>
-      <p class="frow-body">Stacked panes collapse to one-line title bars, each carrying a live status badge — working, needs input, waiting, idle, exited. Eight agents fit in the space of one, and roost rings the bell when one needs you.</p>
+      <p class="frow-body">Stacked panes collapse to one-line title bars, each carrying a live status badge — working, needs input, waiting, idle, exited. Any number of agents fit in the space of one, and roost rings the bell when a background pane needs you.</p>
     </div>
     <div class="frow">
       <p class="frow-num">04</p>
       <h3>Drive a fleet from the CLI</h3>
-      <p class="frow-body"><code style="font-family:var(--font-mono);font-size:0.9em">spawn</code>, <code style="font-family:var(--font-mono);font-size:0.9em">send</code>, <code style="font-family:var(--font-mono);font-size:0.9em">wait</code>, <code style="font-family:var(--font-mono);font-size:0.9em">fork</code>, <code style="font-family:var(--font-mono);font-size:0.9em">close</code> — the same binary in client mode. An agent inside a pane can spawn and orchestrate its own workers while you watch the whole fleet live. Authorization is ownership-scoped.</p>
+      <p class="frow-body"><code style="font-family:var(--font-mono);font-size:0.9em">list</code>, <code style="font-family:var(--font-mono);font-size:0.9em">status</code>, <code style="font-family:var(--font-mono);font-size:0.9em">spawn</code>, <code style="font-family:var(--font-mono);font-size:0.9em">fork</code>, <code style="font-family:var(--font-mono);font-size:0.9em">send</code>, <code style="font-family:var(--font-mono);font-size:0.9em">read</code>, <code style="font-family:var(--font-mono);font-size:0.9em">close</code>, <code style="font-family:var(--font-mono);font-size:0.9em">wait</code> — eight verbs, the same binary in client mode. An agent inside a pane can spawn and orchestrate its own workers while you watch the whole fleet live. Authorization is scoped by default, not sandboxed — any in-pane agent with shell access can still reach the fleet token.</p>
     </div>
     <div class="frow">
       <p class="frow-num">05</p>
       <h3>Nothing heavy left over</h3>
-      <p class="frow-body">No client/server protocol, no detach, no scrollback serialization, no process migration. roost is a single foreground process — the hardest parts of a multiplexer simply don't exist here.</p>
+      <p class="frow-body">No client/server protocol, no detach, no scrollback serialization, no process migration. roost is a single foreground process — the hardest parts of a multiplexer simply don't exist here. The release binary is about 1.2 MB.</p>
     </div>
   </div>
 
@@ -338,6 +386,7 @@
     <span style="color:#e6a15c">"name"</span>: <span style="color:#7fae7f">"pi-mono"</span>,
     <span style="color:#e6a15c">"panes"</span>: {
       <span style="color:#e6a15c">"p1"</span>: { <span style="color:#e6a15c">"adapter"</span>: <span style="color:#7fae7f">"pi"</span>,
+             <span style="color:#e6a15c">"cwd"</span>: <span style="color:#7fae7f">"~/code/pi-mono"</span>,
              <span style="color:#e6a15c">"session"</span>: <span style="color:#7fae7f">"01998e5f…"</span> }
     }
   }]
@@ -363,28 +412,33 @@
     <p style="font-size:16px;line-height:1.65;margin:0 0 36px;max-width:52ch;color:color-mix(in srgb, var(--color-text) 78%, transparent)">Everything's on <code style="font-family:var(--font-mono);font-size:0.9em">Alt</code>, so it never fights the agents' own <code style="font-family:var(--font-mono);font-size:0.9em">Ctrl</code> bindings. Everything else passes straight through to the focused pane.</p>
     <div class="keys-grid">
       <div class="keycell"><kbd>Alt+n</kbd><span>new pane</span></div>
-      <div class="keycell"><kbd>Alt+Enter</kbd><span>launch picker</span></div>
-      <div class="keycell"><kbd>Alt+hjkl</kbd><span>move focus</span></div>
+      <div class="keycell"><kbd>Alt+Enter</kbd><span>quick-launch picker</span></div>
+      <div class="keycell"><kbd>Alt+←↓↑→ / hjkl</kbd><span>move focus</span></div>
+      <div class="keycell"><kbd>Alt+Shift+arrow</kbd><span>resize pane</span></div>
       <div class="keycell"><kbd>Alt+s</kbd><span>stack ⇄ explode</span></div>
       <div class="keycell"><kbd>Alt+o</kbd><span>flip orientation</span></div>
-      <div class="keycell"><kbd>Alt+c</kbd><span>copy mode</span></div>
+      <div class="keycell"><kbd>Alt+r</kbd><span>rename pane</span></div>
+      <div class="keycell"><kbd>Alt+Shift+r</kbd><span>rename tab</span></div>
       <div class="keycell"><kbd>Alt+t</kbd><span>new tab</span></div>
-      <div class="keycell"><kbd>Alt+u</kbd><span>undo — reopen pane</span></div>
+      <div class="keycell"><kbd>Alt+1..9</kbd><span>go to tab</span></div>
       <div class="keycell"><kbd>Alt+w</kbd><span>close pane</span></div>
-      <div class="keycell"><kbd>Alt+?</kbd><span>full keymap</span></div>
+      <div class="keycell"><kbd>Alt+u</kbd><span>undo — reopen last closed</span></div>
+      <div class="keycell"><kbd>Alt+c</kbd><span>copy mode</span></div>
       <div class="keycell"><kbd>Alt+PgUp</kbd><span>scroll mode</span></div>
+      <div class="keycell"><kbd>Alt+/</kbd><span>toggle hint bar</span></div>
+      <div class="keycell"><kbd>Alt+?</kbd><span>full keymap</span></div>
       <div class="keycell"><kbd>Alt+q</kbd><span>quit — sessions live</span></div>
     </div>
   </section>
 
   <section id="agents" style="padding:clamp(40px,5vw,72px) 0;border-top:2px solid var(--color-divider)">
     <span class="kicker">Supported agents</span>
-    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 40px;max-width:24ch">An adapter per CLI. Five small methods.</h2>
+    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 40px;max-width:24ch">An adapter per CLI. Eight small methods.</h2>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:0;border-top:2px solid var(--color-text);border-left:2px solid var(--color-text)">
       <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><span class="tag tag-accent">Flagship</span></div>
         <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">pi</h3>
-        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">A shipped extension reports session ids and exact status over roost's unix socket — no spinner-parsing. Installed on first run, with consent.</p>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">A shipped extension reports session ids and exact status over roost's unix socket — no spinner-parsing. roost installs and updates it automatically at startup (opt out with <code style="font-family:var(--font-mono);font-size:0.9em">ROOST_NO_EXT_INSTALL</code>).</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">pi</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">pi --session &lt;id&gt;</span></div>
       </div>
       <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
@@ -438,6 +492,8 @@
     <div style="display:flex;flex-wrap:wrap;gap:24px;font-family:var(--font-mono);font-size:13px">
       <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">GitHub</a>
       <a href="https://github.com/navbytes/roost/blob/main/DESIGN.md" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">DESIGN.md</a>
+      <a href="https://github.com/navbytes/roost/blob/main/DESIGN-ui.md" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">DESIGN-ui.md</a>
+      <a href="./tui-design.html" style="color:inherit;text-decoration:none">Design reference</a>
       <a href="#features" style="color:inherit;text-decoration:none">Features</a>
       <a href="#install" style="color:inherit;text-decoration:none">Install</a>
     </div>
@@ -447,34 +503,6 @@
 
 <script>
 (function () {
-  var reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
-  var cmd = 'roost spawn pi --input "run the tests, report pass/fail"';
-  var typed = document.getElementById('typed');
-
-  if (reduced) {
-    typed.textContent = cmd;
-  } else {
-    var frames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-    var spinners = document.querySelectorAll('.js-spinner');
-    var fi = 0;
-    setInterval(function () {
-      fi = (fi + 1) % frames.length;
-      spinners.forEach(function (s) { s.textContent = frames[fi]; });
-    }, 100);
-
-    var i = 0, dir = 1, hold = 0;
-    setInterval(function () {
-      if (dir === 1) {
-        i++;
-        if (i >= cmd.length) { hold++; if (hold > 32) { dir = -1; hold = 0; } }
-      } else {
-        i -= 2;
-        if (i <= 0) { i = 0; dir = 1; }
-      }
-      typed.textContent = cmd.slice(0, i);
-    }, 55);
-  }
-
   var btn = document.getElementById('copy');
   var ct;
   btn.addEventListener('click', function () {

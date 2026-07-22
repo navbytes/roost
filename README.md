@@ -1,40 +1,63 @@
+<div align="center">
+
 # roost
 
-A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, …).
+**Processes are disposable. Sessions are precious.**
 
-The inversion that makes it simple: **processes are disposable, sessions are
-precious.** Agent CLIs persist their own conversation state and resume by id,
-so roost never needs a daemon. It persists the layout tree plus each pane's
-`(adapter, cwd, session-id)` and, on relaunch — even after a macOS reboot —
-rebuilds every tab/split/stack and resumes each agent into its exact session.
+A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, shell) — no daemon, ever.
 
-See [DESIGN.md](DESIGN.md) for the full design rationale.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.1.0-informational.svg)](Cargo.toml)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
-## Install & run
+<img src="docs/roost-hero.png" alt="Screenshot of roost running in iTerm2: a single focused shell pane in ~/workspace, showing the ink-and-paper chrome — accent-red focused border, tab bar with save status, a top-right corner badge, and the bottom hint bar." width="800">
+
+</div>
+
+## Why roost
+
+- **Workspace resurrection.** Quit roost, reboot the Mac, run `roost` again — every tab, split, and stacked pane comes back, each agent resumed into its exact session.
+- **Session-native, not process-native.** Agent CLIs persist their own conversation state and resume by id, so roost never needs a daemon — it just remembers the layout tree plus each pane's `(adapter, cwd, session-id)`.
+- **Fleet at a glance.** The tab bar, corner badges, and collapsed stack rows show every agent's state — working, needs input, waiting, idle, exited — and roost rings the bell the moment one needs you.
+- **A control CLI for orchestrators.** `roost spawn / send / read / status / wait / close` — an LLM (or you) can drive a fleet of agent panes and watch the whole thing live.
+- **~1.2 MB, no daemon.** One binary, zero config, nothing to keep alive in the background.
+
+Full design rationale: [DESIGN.md](DESIGN.md).
+
+## Quick start
+
+Needs a Rust toolchain — grab one at [rustup.rs](https://rustup.rs) if you don't have one.
 
 ```sh
-cargo install --path .   # or just: cargo run
-roost
+git clone https://github.com/navbytes/roost
+cd roost
+cargo build --release
+./target/release/roost
 ```
 
+Or install it onto your `$PATH` with `cargo install --path .` (then just run `roost`), or skip the build step with `cargo run`.
+
 Only one roost runs per workspace at a time — a second instance on the same
-state dir refuses to start (they would race and corrupt `workspace.json`).
-Run an isolated one with `ROOST_STATE=/some/dir roost`.
+state dir refuses to start (they'd race and corrupt `workspace.json`). Run an
+isolated one with `ROOST_STATE=/some/dir roost`.
 
-### macOS: make the Option key send Alt
+State lives in `~/.local/state/roost/workspace.json` (auto-saved on every
+change, atomic writes). Delete it to start clean.
 
-roost's shortcuts are all on `Alt`. On macOS the **Option** key sends
-accented characters by default, so the shortcuts silently do nothing until
-you tell your terminal to treat Option as Meta/Alt:
+### macOS: make Option send Alt
+
+roost's shortcuts all live on `Alt`. On macOS, **Option** sends accented
+characters by default, so shortcuts silently do nothing until you tell your
+terminal to treat Option as Meta/Alt:
 
 - **Terminal.app**: Settings → Profiles → Keyboard → check *Use Option as Meta key*.
 - **iTerm2**: Settings → Profiles → Keys → set the Left/Right Option key to *Esc+*.
 - **Ghostty / WezTerm / kitty**: send Alt by default — nothing to change.
 
-If your first `Alt+n` seems to do nothing, this is almost certainly why.
-
-State lives in `~/.local/state/roost/workspace.json` (auto-saved on every
-change, atomic writes). Delete it to start clean.
+If your first `Alt+n` seems to do nothing, this is almost certainly why. Once
+it's set, `Alt+Enter` opens the quick-launch picker (pi / claude / shell) and
+you're in.
 
 ## Keys
 
@@ -57,22 +80,29 @@ change, atomic writes). Delete it to start clean.
 | `Alt+/` | toggle the shortcut hint bar |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 
-A **shortcut hint bar** runs along the bottom (on by default), zellij-style,
-showing the keys you can press right now — and it changes with context, so
-rename / picker / scroll / dead-pane modes each show their own keys. `Alt+/`
-hides it to reclaim the row.
+A shortcut hint bar runs along the bottom by default (zellij-style), showing
+the keys you can press right now — it changes with context, so rename /
+picker / scroll / dead-pane modes each show their own keys. `Alt+/` hides it
+to reclaim the row.
 
-Everything else passes through to the focused pane untouched. **Shift+Enter**
-and **Ctrl+Enter** are sent to the pane as an "insert newline" (rather than
-"submit"), so you can compose multi-line prompts in agent TUIs that support it.
-This needs a terminal that reports modified keys via the CSI-u ("kitty")
-keyboard protocol — **iTerm2, Ghostty, kitty, WezTerm** — which roost negotiates
-on start.
+Everything else passes straight through to the focused pane. **Shift+Enter**
+and **Ctrl+Enter** are sent as "insert newline" rather than "submit", so you
+can compose multi-line prompts in agent TUIs that support it — this needs a
+terminal that reports modified keys via the CSI-u ("kitty") keyboard
+protocol (**iTerm2, Ghostty, kitty, WezTerm**), which roost negotiates on
+start.
 
-⚠️ **Not macOS Terminal.app.** It sends Shift+Enter *and* Option+Enter as the
-same bytes (`ESC CR`), which roost can only read as Alt+Enter — so on
-Terminal.app, Shift+Enter opens the quick-launch picker instead of inserting a
-newline. Use one of the CSI-u terminals above to compose multi-line prompts.
+> ⚠️ **Not macOS Terminal.app.** It sends Shift+Enter and Option+Enter as the
+> same bytes (`ESC CR`), which roost can only read as Alt+Enter — so on
+> Terminal.app, Shift+Enter opens the quick-launch picker instead of
+> inserting a newline. Use one of the CSI-u terminals above to compose
+> multi-line prompts.
+
+In a **dead pane** (process exited or spawn failed): `Enter` relaunches or
+resumes, `f` starts fresh (drops the stored session id).
+
+<details>
+<summary><strong>Mouse, links & copy mode</strong></summary>
 
 **Mouse**: the wheel scrolls the pane under the cursor — forwarded to the
 inner app when it has mouse reporting enabled (pi/claude TUIs, vim, less),
@@ -83,7 +113,7 @@ can interact with an agent's TUI directly (menus, buttons, selection). Click
 a tab in the tab bar to switch to it.
 
 **Opening links**: `Alt`+click a URL in any pane to open it in your browser
-(`open` on macOS, `xdg-open` on Linux). roost uses `Alt`+click rather than
+(`open` on macOS, `xdg-open` on Linux). roost uses `Alt`+click rather than a
 plain click so it doesn't fight click-to-focus, and because a terminal can't
 report Cmd-clicks to it.
 
@@ -95,38 +125,24 @@ and OSC 52, so it works locally and over SSH). This is pane-scoped, unlike the
 terminal's native whole-window selection. (Your terminal's Shift+drag native
 selection still works too, if you prefer it.)
 
-In a **dead pane** (process exited or spawn failed): `Enter` relaunches /
-resumes, `f` starts a fresh session (drops the stored session id).
+</details>
 
-## Appearance
+## Status glyphs
 
-roost's own chrome is **ink · paper · one red** — three warm grays for
-hierarchy, one accent (`#ff563c`) for focus, badges, and live keys. Program
-output inside panes keeps its own colors and attributes untouched. Colors are
-truecolor RGB: best on a truecolor terminal (iTerm2, Ghostty, kitty, WezTerm)
-with a dark background in the `#15120f` family — roost never repaints your
-terminal's background. On non-truecolor terminals (macOS Terminal.app) the
-palette quantizes; legibility survives, exact hues don't. The full design
-spec lives in [`DESIGN-ui.md`](DESIGN-ui.md).
+Tab bar, corner badges, and collapsed stack rows all show the same states:
 
-## Corner badge
+| Glyph | Meaning |
+|---|---|
+| `●` | working — pulses |
+| `◆` | needs input |
+| `○` | waiting for you |
+| `·` | idle |
+| `✕` | exited |
 
-Each pane shows a faint label in its **top-right corner** (iTerm2-style):
-`name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
-(`pi` / `claude` / `shell`) when unnamed, and the glyph is the pane's live
-status. It's a quick at-a-glance "which pane is this, doing what" marker; a
-cell TUI can't do true translucency, so it's rendered dim rather than
-see-through, and the inner app's content still draws underneath it on the
-rest of the screen.
-
-## Status badges
-
-Tab bar, corner badges, and collapsed stack rows show each agent's state:
-`●` working (pulses) · `◆` needs input · `○` waiting for you · `·` idle ·
-`✕` exited. Status lives in the glyph, not the border — the focused pane's
-border is always accent-red, everything else stays quiet.
-When a non-focused pane starts waiting for you, roost rings the terminal
-bell (and posts a native notification on macOS).
+Status lives in the glyph, not the border — the focused pane's border is
+always accent-red, everything else stays quiet. When a non-focused pane
+starts waiting for you, roost rings the terminal bell (and posts a native
+notification on macOS).
 
 Status arrives two ways:
 
@@ -144,6 +160,25 @@ Status arrives two ways:
    terminal bell (`0x07`) ⇒ needs-you (tmux-style). The bell also supplements
    the pi extension for pi's built-in permission prompts, which pi exposes no
    event for.
+
+Each pane also carries a faint **corner badge**, top-right (iTerm2-style):
+`name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
+(`pi` / `claude` / `shell`) when unnamed, and the glyph is the pane's live
+status. A cell TUI can't do true translucency, so it's rendered dim rather
+than see-through; the inner app's content still draws underneath it.
+
+## Appearance
+
+> Chrome is ink · paper · one red; program output keeps its own colors.
+
+roost's own chrome — tabs, borders, badges, hint bar — uses three warm grays
+for hierarchy and one accent (`#ff563c`) for focus, badges, and live keys.
+Program output inside panes keeps its own colors and attributes untouched.
+Colors are truecolor RGB: best on a truecolor terminal (iTerm2, Ghostty,
+kitty, WezTerm) with a dark background in the `#15120f` family — roost never
+repaints your terminal's background. On non-truecolor terminals (macOS
+Terminal.app) the palette quantizes; legibility survives, exact hues don't.
+Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 
 ## Session resume
 
@@ -172,6 +207,8 @@ roost fork 5                                  # a sibling in the same context
 roost close 5 [--force]
 ```
 
+(`roost --help` prints this same reference.)
+
 `wait` is what turns "spawn then poll" into "spawn → await → read": block until a
 pane hits a status (or a timeout), so an orchestrator doesn't sleep-and-grep.
 
@@ -194,7 +231,8 @@ via `$ROOST_SOCK` automatically. Every control action is recorded in
 `<state>/control.log` (principal, verb, target, outcome — never the message
 text).
 
-## Architecture (ports & adapters)
+<details>
+<summary><strong>Architecture</strong> (ports & adapters)</summary>
 
 The core never touches a PTY, socket, or the filesystem — it talks to traits
 in `src/ports.rs`, and every core behavior is unit-tested against in-memory
@@ -229,9 +267,21 @@ underflow) when scrolled back further than one screen height; the vendored
 copy fixes `visible_rows()` with a saturating subtraction, which also makes
 deep-history scrolling render correctly.
 
+</details>
+
 ## Roadmap status
 
 M0 render core ✓ · M1 splits/tabs ✓ · M2 persistence + session detection ✓ ·
 M3 status socket + badges ✓ · M4 stacks + resize ✓ · M5 picker, rename,
 scroll, notifications ✓. Deferred: floating panes, mouse support, opencode
-adapter, config file (roost is deliberately zero-config for now).
+adapter, config file (roost is deliberately zero-config for now). Full
+detail: [ROADMAP.md](ROADMAP.md).
+
+---
+
+<p align="center">
+<a href="DESIGN-ui.md">DESIGN-ui.md</a> (design spec) ·
+<a href="https://navbytes.github.io/roost/tui-design.html">tui-design.html</a> (design reference) ·
+<a href="ROADMAP.md">ROADMAP.md</a> ·
+<a href="LICENSE">LICENSE</a>
+</p>
