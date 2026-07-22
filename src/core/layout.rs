@@ -447,7 +447,6 @@ fn grid_row(panes: &[PaneId]) -> LayoutNode {
 /// row's `Split` directly (no pointless outer wrapper); `n = 1` collapses
 /// all the way to a bare `Pane`. Worked shapes: n=2 side-by-side, n=3
 /// two-over-one, n=4 2×2, n=5 three-over-two, n=7 three/three/one.
-#[allow(dead_code)] // F1: pure builder, exercised by the tests here; wired onto Alt+g by F3 (C25)
 pub fn grid_layout(panes: &[PaneId]) -> LayoutNode {
     match panes {
         [] => LayoutNode::Stack { children: Vec::new(), expanded: 0 },
@@ -475,7 +474,6 @@ pub fn grid_layout(panes: &[PaneId]) -> LayoutNode {
 /// is `focused` followed by `rest`. Two panes total (`rest.len() == 1`) is
 /// a plain 0.6/0.4 split, never a one-member `Stack`; zero panes in `rest`
 /// (`n = 1`) collapses to a bare `Pane(focused)`.
-#[allow(dead_code)] // F1: pure builder, exercised by the tests here; wired onto Alt+g by F3 (C25)
 pub fn main_stack_layout(focused: PaneId, rest: &[PaneId]) -> LayoutNode {
     match rest {
         [] => LayoutNode::Pane(focused),
@@ -500,7 +498,6 @@ pub fn main_stack_layout(focused: PaneId, rest: &[PaneId]) -> LayoutNode {
 /// moves to the front) joins one `Stack`, expanded on `focused`'s position.
 /// A single pane collapses to a bare `Pane` — the same "no one-member
 /// stack" rule the main+stack `n = 2` case states explicitly.
-#[allow(dead_code)] // F1: pure builder, exercised by the tests here; wired onto Alt+g by F3 (C25)
 pub fn all_stack_layout(panes: &[PaneId], focused: PaneId) -> LayoutNode {
     match panes {
         [] => LayoutNode::Stack { children: Vec::new(), expanded: 0 },
@@ -512,17 +509,17 @@ pub fn all_stack_layout(panes: &[PaneId], focused: PaneId) -> LayoutNode {
     }
 }
 
-/// Mirrors `MIN_SPLIT_COLS`/`MIN_SPLIT_ROWS` in `app.rs` — the same split
-/// floors, applied here to the C25 fit predicate. `layout.rs` has no
-/// dependency on `app.rs` to import them from; kept in sync by hand.
-const MIN_SPLIT_COLS: u16 = 36;
-const MIN_SPLIT_ROWS: u16 = 10;
+/// The smallest *outer* pane rect (borders included) a split is allowed to
+/// produce — below it the new pane would be a sliver. Single source for both
+/// the interactive split guard (`app.rs::spawn_child`) and the C25 fit
+/// predicate below, so the two rules can't drift apart.
+pub const MIN_SPLIT_COLS: u16 = 36;
+pub const MIN_SPLIT_ROWS: u16 = 10;
 
 /// C25 fit predicate: true iff every non-collapsed rect the arrangement
 /// would produce in `area` is at least `MIN_SPLIT_COLS` × `MIN_SPLIT_ROWS` —
 /// reuses `compute_rects`, so it can't drift from the real geometry walk.
 /// Collapsed stack rows (1-row title bars) are exempt by design.
-#[allow(dead_code)] // F1: pure predicate, exercised by the tests here; wired onto Alt+g by F3 (C25)
 pub fn arrangement_fits(node: &LayoutNode, area: Rect) -> bool {
     let mut rects = Vec::new();
     compute_rects(node, area, &mut rects);

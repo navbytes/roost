@@ -325,7 +325,9 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
-    let rects = app.rects();
+    // C21/§5: zoom-aware — while zoomed, the display list is just the
+    // zoomed pane, so body clicks/wheel can only ever hit it.
+    let rects = app.display_rects();
     let Some(pane) = mouse::hit_test(&rects, me.column, me.row) else { return };
 
     // Alt+click a URL to open it in the browser (roost owns the Alt layer).
@@ -361,7 +363,7 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
 /// release extracts the selection and copies it to the system clipboard.
 fn handle_copy_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
-    let rects = app.rects();
+    let rects = app.display_rects(); // C21/§5: zoom-aware, same as handle_mouse
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(pane) = mouse::hit_test(&rects, me.column, me.row) {

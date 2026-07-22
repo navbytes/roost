@@ -25,12 +25,6 @@ const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 /// launch before we assume the user isn't going to press one / already saw it.
 const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
 
-/// A pane must stay usable after a split. These are the smallest *outer*
-/// rects (borders included) we allow a split to produce; below them the new
-/// pane would be a sliver, so the split is refused.
-const MIN_SPLIT_COLS: u16 = 36; // two ~16-col inner panes + borders
-const MIN_SPLIT_ROWS: u16 = 10; // two ~3-row inner panes + borders
-
 /// Adapters offered by the quick-launch picker (Alt+Enter), derived from the
 /// single adapter list in `agents` so the picker can never drift out of sync
 /// with the registry.
@@ -128,6 +122,14 @@ pub struct App<B: PaneBackend> {
     /// Zellij-style shortcut hint bar at the bottom; on by default so keys
     /// are always discoverable. Session-only (not persisted).
     hints: bool,
+    /// C21: a pure view transform. While true, the render / PTY-resize /
+    /// mouse paths see only the focused pane at the full body area (see
+    /// `display_rects`); the layout tree itself is never touched.
+    /// Session-only, never persisted.
+    zoomed: bool,
+    /// C25: index of the arrangement Alt+g tries first on the next press
+    /// (grid=0 / main+stack=1 / all-stack=2). Session-only.
+    layout_cycle: usize,
     store: Box<dyn StateStore>,
     /// Whether the most recent workspace save succeeded — the tab bar's
     /// right status area (C2) shows "saved ✓" while this is true and
@@ -205,6 +207,8 @@ impl<B: PaneBackend> App<B> {
             dead: HashMap::new(),
             mode: Mode::Normal,
             hints: true,
+            zoomed: false,
+            layout_cycle: 0,
             store,
             last_save_ok: true,
             tx,
@@ -247,6 +251,12 @@ impl<B: PaneBackend> App<B> {
         self.hints && self.term_size.height >= 3
     }
 
+    /// C21: is the focused pane currently zoomed (full-body view)? Drives
+    /// the hint bar's `ZOOM` pseudo-state word (amended C9).
+    pub fn zoomed(&self) -> bool {
+        self.zoomed
+    }
+
     /// Record that an Alt-modified key actually arrived, so the startup hint
     /// (below) knows it doesn't need to warn.
     pub fn note_alt_seen(&mut self) {
@@ -284,6 +294,19 @@ impl<B: PaneBackend> App<B> {
         let mut v = Vec::new();
         layout::compute_rects(&self.ws.active_tab().layout, self.body_area(), &mut v);
         v
+    }
+
+    /// C21/§5: the one display list the renderer, PTY-resize, and mouse-hit
+    /// paths all consume — the zoomed singleton `[focused @ body]` while
+    /// zoomed, else the real tree's `rects()`. Focus math (`layout::neighbor`,
+    /// `focus_dir`) deliberately keeps reading `rects()` instead — that's
+    /// what makes zoom follow focus rather than freeze it.
+    pub fn display_rects(&self) -> Vec<PaneRect> {
+        if self.zoomed {
+            vec![PaneRect { id: self.focused, rect: self.body_area(), collapsed: false }]
+        } else {
+            self.rects()
+        }
     }
 
     pub fn pane_order(&self) -> Vec<PaneId> {
@@ -1021,6 +1044,12 @@ impl<B: PaneBackend> App<B> {
     /// consistent even when the pane it removes isn't either of those.
     fn close_pane_id(&mut self, id: PaneId) -> bool {
         let Some(ti) = self.tab_of(id) else { return false };
+        // C21: closing the pane you're zoomed on ends the zoomed view —
+        // there's nothing left to show full-screen. A control-plane close of
+        // some *other* pane leaves an unrelated zoom alone.
+        if self.zoomed && id == self.focused {
+            self.exit_zoom();
+        }
         let spec = self.ws.tabs[ti].panes.get(&id).cloned();
         let tab_snapshot = self.ws.tabs[ti].clone();
         if let Some(mut rt) = self.runtimes.remove(&id) {
@@ -1156,9 +1185,12 @@ impl<B: PaneBackend> App<B> {
         self.relayout();
     }
 
-    /// Recompute rects and push new sizes to every pane backend.
+    /// Recompute rects and push new sizes to every pane backend. C21: driven
+    /// by `display_rects`, so while zoomed only the zoomed pane's PTY is
+    /// resized (to the full body) — every other pane keeps its last size
+    /// until unzoom relayouts them (no reflow churn while reading).
     pub fn relayout(&mut self) {
-        for pr in self.rects() {
+        for pr in self.display_rects() {
             if pr.collapsed {
                 continue;
             }
@@ -1279,7 +1311,10 @@ impl<B: PaneBackend> App<B> {
         }
         self.dead.remove(&id);
         let Some(spec) = self.find_spec(id).cloned() else { return };
-        if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
+        // display_rects, not rects: this bypasses apply()'s trailing
+        // relayout(), so a zoomed dead pane must be spawned at the size it's
+        // actually shown at (full body) — not its stale tiled rect.
+        if let Some(pr) = self.display_rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
         self.save();
@@ -1288,6 +1323,20 @@ impl<B: PaneBackend> App<B> {
     // -- actions -----------------------------------------------------------
 
     pub fn apply(&mut self, action: Action) {
+        // C21: a structural layout action must not change the tab invisibly
+        // behind a full-screen zoomed pane — leave zoom first, then apply
+        // (exhaustive trigger list; tab changes exit zoom too, handled inside
+        // `new_tab`/`go_to_tab` since only a *real* switch should count).
+        if matches!(
+            action,
+            Action::NewPane
+                | Action::ToggleStack
+                | Action::FlipSplit
+                | Action::Resize { .. }
+                | Action::CycleLayout
+        ) {
+            self.exit_zoom();
+        }
         match action {
             Action::Quit => self.quit = true,
             Action::NewPane => self.new_pane_with("shell"),
@@ -1329,6 +1378,9 @@ impl<B: PaneBackend> App<B> {
             Action::ToggleHints => self.hints = !self.hints,
             Action::Undo => self.undo_close(),
             Action::Help => self.mode = Mode::Help,
+            Action::JumpAttention => self.jump_attention(),
+            Action::ToggleZoom => self.toggle_zoom(),
+            Action::CycleLayout => self.cycle_layout(),
         }
         // Any action other than a repeated close disarms a pending close
         // confirmation, so a stale "press again" can't leak onto a later key.
@@ -1450,11 +1502,11 @@ impl<B: PaneBackend> App<B> {
 
         // Refuse a split that would produce unusably tiny panes (also the
         // trigger for the vt100 underflow crash). Silent no-op — the layout
-        // is left untouched. See MIN_SPLIT_* below.
+        // is left untouched. See layout::MIN_SPLIT_* (also the C25 fit floor).
         if let Some(r) = focused_rect {
             let too_small = match dir {
-                SplitDir::Vertical => r.width < MIN_SPLIT_COLS,
-                SplitDir::Horizontal => r.height < MIN_SPLIT_ROWS,
+                SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
+                SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
             };
             if too_small {
                 return None;
@@ -1510,6 +1562,7 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn new_tab(&mut self) {
+        self.exit_zoom(); // C21: any tab change exits zoom
         let id = self.ws.next_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
@@ -1526,10 +1579,106 @@ impl<B: PaneBackend> App<B> {
 
     fn go_to_tab(&mut self, i: usize) {
         if i < self.ws.tabs.len() {
+            self.exit_zoom(); // C21: any (real) tab change exits zoom
             self.ws.active_tab = i;
             self.spawn_active_tab();
             self.focused = self.pane_order().first().copied().unwrap_or(self.focused);
         }
+    }
+
+    /// C21: leave zoom (a pure view flag). Called by every documented exit
+    /// trigger before applying whatever caused it, so the layout never
+    /// changes invisibly behind a full-screen zoomed pane.
+    fn exit_zoom(&mut self) {
+        self.zoomed = false;
+    }
+
+    /// Alt+z: toggle the zoomed view. A collapsed stack member is expanded
+    /// first, so zooming always lands on something visible.
+    fn toggle_zoom(&mut self) {
+        if self.zoomed {
+            self.zoomed = false;
+            return;
+        }
+        let focused = self.focused;
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, focused);
+        self.zoomed = true;
+    }
+
+    /// C19: every pane whose runtime status is `NeedsInput` — the exact
+    /// predicate `needs_input_count` uses, so the ring's size can never
+    /// disagree with the hint bar's advertised N. Ordered by (tab index
+    /// ascending, position within that tab's `pane_order()`).
+    fn attention_ring(&self) -> Vec<PaneId> {
+        let mut ring = Vec::new();
+        for tab in &self.ws.tabs {
+            let mut order = Vec::new();
+            layout::pane_order(&tab.layout, &mut order);
+            ring.extend(order.into_iter().filter(|id| {
+                self.runtimes.get(id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false)
+            }));
+        }
+        ring
+    }
+
+    /// Alt+a: cycle-focus to the next ring member after the focused pane,
+    /// wrapping past the end back to the first; a focused pane that isn't in
+    /// the ring jumps straight to the first member.
+    fn jump_attention(&mut self) {
+        let ring = self.attention_ring();
+        if ring.is_empty() {
+            self.flash = Some(("nothing needs you".into(), Instant::now()));
+            return;
+        }
+        let next = match ring.iter().position(|&id| id == self.focused) {
+            Some(k) => ring[(k + 1) % ring.len()],
+            None => ring[0],
+        };
+        if next == self.focused {
+            // The only ring member is the pane we're already on.
+            self.flash = Some(("nothing else needs you".into(), Instant::now()));
+            return;
+        }
+        self.focus_attention_target(next);
+    }
+
+    /// Land focus on `target`, switching tabs first (go_to_tab semantics,
+    /// lazy spawn included) when it lives outside the active one — which
+    /// also exits zoom, per C21's tab-switch rule. A same-tab jump keeps
+    /// zoom (zoom follows focus). Either way, expand the target out of any
+    /// collapsed stack, same as any other focus move.
+    fn focus_attention_target(&mut self, target: PaneId) {
+        if let Some(ti) = self.tab_of(target) {
+            if ti != self.ws.active_tab {
+                self.go_to_tab(ti);
+            }
+        }
+        self.focused = target;
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
+    }
+
+    /// Alt+g: step the active tab through the three canned arrangements,
+    /// skipping ones that don't fit the current body area. No-ops (without
+    /// advancing the cycle counter) when there's nothing to arrange or
+    /// nothing fits.
+    fn cycle_layout(&mut self) {
+        let order = self.pane_order();
+        if order.len() < 2 {
+            self.flash = Some(("one pane — nothing to arrange".into(), Instant::now()));
+            return;
+        }
+        let focused = self.focused;
+        let area = self.body_area();
+        for step in 0..3 {
+            let idx = (self.layout_cycle + step) % 3;
+            let node = arrangement_for(idx, &order, focused);
+            if layout::arrangement_fits(&node, area) {
+                self.ws.active_tab_mut().layout = node;
+                self.layout_cycle = (idx + 1) % 3;
+                return;
+            }
+        }
+        self.flash = Some(("no room to rearrange".into(), Instant::now()));
     }
 
     // -- modes -------------------------------------------------------------
@@ -1598,6 +1747,7 @@ impl<B: PaneBackend> App<B> {
                     KeyCode::Enter => {
                         let adapter = items[(*selection).min(items.len() - 1)];
                         self.mode = Mode::Normal;
+                        self.exit_zoom(); // C21: "picker launch" is a structural action
                         self.new_pane_with(adapter);
                         self.relayout();
                         self.save();
@@ -1757,6 +1907,20 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
+}
+
+/// C25: the arrangement at cycle index `idx` (0=grid, 1=main+stack,
+/// 2=all-stack) for pane order `order` with `focused` kept in place — the
+/// pure per-index dispatch `cycle_layout` walks while searching for a fit.
+fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode {
+    match idx {
+        0 => layout::grid_layout(order),
+        1 => {
+            let rest: Vec<PaneId> = order.iter().copied().filter(|&id| id != focused).collect();
+            layout::main_stack_layout(focused, &rest)
+        }
+        _ => layout::all_stack_layout(order, focused),
+    }
 }
 
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
@@ -2929,5 +3093,350 @@ mod tests {
         assert!(app.last_save_ok()); // startup counts as saved (we just loaded)
         app.apply(Action::NewPane); // triggers a save() that fails
         assert!(!app.last_save_ok());
+    }
+
+    // -- C19 jump-to-attention ----------------------------------------------
+
+    #[test]
+    fn jump_attention_empty_ring_flashes_and_does_not_move_focus() {
+        let (mut app, _) = mk_app(shell_ws());
+        let focused = app.focused;
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, focused);
+        assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
+    #[test]
+    fn jump_attention_only_member_is_focused_flashes_and_stays() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, id);
+        assert_eq!(app.flash(), Some("nothing else needs you"));
+    }
+
+    #[test]
+    fn jump_attention_jumps_to_the_lone_needy_pane_when_not_already_focused() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 1);
+    }
+
+    #[test]
+    fn jump_attention_visits_the_ring_in_tab_then_pane_order_and_wraps() {
+        let (mut app, _) = mk_app(shell_ws()); // tab0: pane 1
+        app.apply(Action::NewPane); // tab0: panes 1,2 — focus=2
+        app.apply(Action::NewTab); // tab1: pane 3 — focus=3, active_tab=1
+        for id in [1u64, 2, 3] {
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        }
+        // Ring order: tab0's pane_order() ([1,2]) then tab1's ([3]) — and its
+        // size can never disagree with the hint bar's advertised count.
+        assert_eq!(app.attention_ring(), vec![1, 2, 3]);
+        assert_eq!(app.attention_ring().len(), app.needs_input_count());
+
+        app.go_to_tab(0);
+        app.focused = 1; // start of the ring
+
+        app.apply(Action::JumpAttention); // same-tab hop
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.ws.active_tab, 0);
+
+        app.apply(Action::JumpAttention); // crosses into tab1
+        assert_eq!(app.focused, 3);
+        assert_eq!(app.ws.active_tab, 1);
+
+        app.apply(Action::JumpAttention); // wraps back to the first member
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.ws.active_tab, 0);
+    }
+
+    // -- C21 zoom -------------------------------------------------------------
+
+    #[test]
+    fn zoom_display_list_is_focused_pane_at_body_area_only_when_zoomed() {
+        // This is exactly what `relayout()` (PTY resize) and the renderer
+        // consume — see `display_rects`.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        assert_eq!(app.display_rects().len(), app.rects().len()); // not zoomed: mirrors the real tree
+
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        let dr = app.display_rects();
+        assert_eq!(dr.len(), 1);
+        assert_eq!(dr[0].id, app.focused);
+        assert_eq!(dr[0].rect, app.body_area());
+        assert!(!dr[0].collapsed);
+
+        app.apply(Action::ToggleZoom);
+        assert!(!app.zoomed());
+        assert_eq!(app.display_rects().len(), app.rects().len());
+    }
+
+    #[test]
+    fn zoom_follows_focus_when_focus_moves_within_the_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2 side by side, focus=2
+        app.apply(Action::ToggleZoom);
+        assert_eq!(app.display_rects()[0].id, 2);
+        app.apply(Action::Focus(crate::core::layout::Dir::Left));
+        assert_eq!(app.focused, 1);
+        assert!(app.zoomed(), "focus moves keep zoom");
+        assert_eq!(app.display_rects()[0].id, 1);
+    }
+
+    #[test]
+    fn zoom_expands_a_collapsed_stack_member_first() {
+        let mut panes = HashMap::new();
+        for id in [1u64, 2, 3] {
+            panes.insert(
+                id,
+                PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+            );
+        }
+        let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let ws = Workspace { version: 1, active_tab: 0, tabs: vec![Tab { name: "main".into(), layout, panes }] };
+        let (mut app, _) = mk_app(ws);
+        app.focused = 3; // a collapsed member — expanded is currently 0 (pane 1)
+
+        app.apply(Action::ToggleZoom);
+
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Stack { expanded, children } => assert_eq!(children[*expanded], 3),
+            other => panic!("expected a stack, got {other:?}"),
+        }
+        assert!(app.zoomed());
+        assert_eq!(app.display_rects()[0].id, 3);
+    }
+
+    #[test]
+    fn zoom_exits_on_every_structural_or_new_tab_action() {
+        let triggers = [
+            Action::NewPane,
+            Action::ToggleStack,
+            Action::FlipSplit,
+            Action::Resize { horizontal: true, grow: true },
+            Action::CycleLayout,
+            Action::NewTab,
+        ];
+        for action in triggers {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::NewPane); // >=2 panes, so none of these are themselves no-ops
+            app.apply(Action::ToggleZoom);
+            assert!(app.zoomed(), "setup failed before {action:?}");
+            app.apply(action);
+            assert!(!app.zoomed(), "{action:?} must exit zoom (C21)");
+        }
+    }
+
+    #[test]
+    fn zoom_exits_on_tab_switch() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // 2 tabs, active=1
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::GoToTab(0));
+        assert!(!app.zoomed());
+    }
+
+    #[test]
+    fn zoom_exits_on_picker_launch_but_not_on_opening_the_picker() {
+        // "picker launch" (C21) is the Enter-to-spawn step inside Mode::Picker
+        // — a separate code path from `apply()`'s structural actions. Merely
+        // opening the picker overlay (QuickLaunch) must not exit zoom on its
+        // own; only the actual spawn is structural.
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::QuickLaunch);
+        assert!(app.zoomed(), "opening the picker overlay must not exit zoom on its own");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!app.zoomed(), "picker launch must exit zoom (C21)");
+    }
+
+    #[test]
+    fn zoom_exits_when_the_zoomed_pane_itself_closes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        assert!(app.zoomed());
+        app.apply(Action::ClosePane); // Alt+w always closes the focused (zoomed) pane
+        assert!(!app.zoomed());
+    }
+
+    #[test]
+    fn zoom_survives_a_control_close_of_a_different_pane() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Close { pane: 1, force: false },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert!(app.zoomed(), "closing an unrelated pane must not touch an unrelated zoom");
+    }
+
+    #[test]
+    fn zoom_exits_on_a_cross_tab_jump() {
+        let (mut app, _) = mk_app(shell_ws()); // tab0: pane 1, focus=1
+        app.apply(Action::NewTab); // tab1: pane 2, focus=2, active_tab=1
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleZoom); // zoom on pane 2 (tab1)
+        assert!(app.zoomed());
+        app.apply(Action::JumpAttention); // only ring member is pane 1, in a different tab
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.ws.active_tab, 0);
+        assert!(!app.zoomed(), "cross-tab jump must exit zoom (C19/C21 interplay)");
+    }
+
+    #[test]
+    fn zoom_survives_a_same_tab_jump() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab0: panes 1,2 — focus=2
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        app.apply(Action::JumpAttention); // same-tab jump to pane 1
+        assert_eq!(app.focused, 1);
+        assert!(app.zoomed(), "same-tab jump keeps zoom (zoom follows focus)");
+        assert_eq!(app.display_rects()[0].id, 1);
+    }
+
+    // -- C25 canned layout cycle ----------------------------------------------
+
+    #[test]
+    fn cycle_layout_advances_grid_then_main_stack_then_all_stack_then_wraps() {
+        let (mut app, _) = mk_app(shell_ws()); // 100x30 — comfortable for all 3 shapes
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes total
+
+        app.apply(Action::CycleLayout);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+
+        app.apply(Action::CycleLayout);
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.6, 0.4]),
+            other => panic!("expected a main+stack split, got {other:?}"),
+        }
+
+        app.apply(Action::CycleLayout);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
+
+        app.apply(Action::CycleLayout); // wraps back to grid
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+    }
+
+    #[test]
+    fn cycle_layout_skips_an_unfit_arrangement_and_applies_the_next() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(80, 22)); // body ~80x20: main+stack's 0.4 column (32) < the 36 floor
+        app.apply(Action::NewPane); // 2 panes
+
+        app.apply(Action::CycleLayout); // 1st: grid (0.5/0.5) fits
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]),
+            other => panic!("expected grid (0.5/0.5 split), got {other:?}"),
+        }
+
+        app.apply(Action::CycleLayout); // 2nd: main+stack unfit here → skipped → all-stack applied
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
+    }
+
+    #[test]
+    fn cycle_layout_noop_when_fewer_than_two_panes() {
+        let (mut app, _) = mk_app(shell_ws()); // 1 pane
+        app.apply(Action::CycleLayout);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Pane(_)));
+        assert_eq!(app.flash(), Some("one pane — nothing to arrange"));
+    }
+
+    #[test]
+    fn cycle_layout_noop_when_nothing_fits() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes, organically nested splits
+        app.on_resize(Size::new(30, 10)); // body far below the 36x10 floor for any arrangement
+        let before = format!("{:?}", app.ws.tabs[0].layout);
+        app.apply(Action::CycleLayout);
+        assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
+        assert_eq!(app.flash(), Some("no room to rearrange"));
+    }
+
+    #[test]
+    fn cycle_layout_preserves_focus() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        let focused = app.focused;
+        for _ in 0..3 {
+            app.apply(Action::CycleLayout);
+            assert_eq!(app.focused, focused);
+        }
+    }
+
+    #[test]
+    fn cycle_layout_persists_like_any_layout_edit() {
+        let (mut app, store) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout);
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        match &saved.tabs[0].layout {
+            LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]), // grid, n=2
+            other => panic!("expected the cycled layout to be saved, got {other:?}"),
+        }
+    }
+
+    // -- C26 tab-undo pinning ---------------------------------------------------
+
+    #[test]
+    fn c26_multi_pane_tab_undo_restores_all_panes_with_sessions_and_tab_name() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let tab_index = app.ws.active_tab;
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // the new tab now has 3 panes
+
+        let ids = app.pane_order();
+        assert_eq!(ids.len(), 3);
+        for (i, &id) in ids.iter().enumerate() {
+            app.set_session(id, format!("sess-{i}"));
+        }
+        app.ws.tabs[tab_index].name = "fleet".into();
+
+        // Close pane-by-pane: the third close empties (and removes) the tab.
+        app.apply(Action::ClosePane);
+        app.apply(Action::ClosePane);
+        assert_eq!(app.ws.tabs.len(), 2, "sanity: tab not gone yet");
+        app.apply(Action::ClosePane);
+        assert_eq!(app.ws.tabs.len(), 1, "tab emptied and removed");
+
+        // 3x Alt+u restores it: the tab (by name), all three panes, sessions
+        // intact (C26's honest scope: re-split off the focused pane, not at
+        // their original geometry — only identity and sessions are pinned).
+        app.apply(Action::Undo);
+        app.apply(Action::Undo);
+        app.apply(Action::Undo);
+
+        assert_eq!(app.ws.tabs.len(), 2);
+        let restored = app.ws.tabs.iter().find(|t| t.name == "fleet").expect("tab reopened by name");
+        assert_eq!(restored.panes.len(), 3);
+        let sessions: std::collections::HashSet<Option<String>> =
+            restored.panes.values().map(|s| s.session.clone()).collect();
+        assert_eq!(
+            sessions,
+            std::collections::HashSet::from([
+                Some("sess-0".to_string()),
+                Some("sess-1".to_string()),
+                Some("sess-2".to_string()),
+            ])
+        );
     }
 }

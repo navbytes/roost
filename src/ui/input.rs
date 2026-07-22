@@ -28,6 +28,14 @@ pub enum Action {
     Undo,
     /// Toggle the full-keymap help overlay.
     Help,
+    /// Focus the next pane that needs input, worst-first, wrapping across
+    /// tabs (C19).
+    JumpAttention,
+    /// Toggle a full-screen, focus-following view of the focused pane — a
+    /// pure view transform, no layout change (C21).
+    ToggleZoom,
+    /// Snap the active tab to the next canned arrangement that fits (C25).
+    CycleLayout,
 }
 
 pub enum InputResult {
@@ -63,6 +71,9 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('c') => Some(Action::CopyMode),
             KeyCode::Char('u') => Some(Action::Undo),
             KeyCode::Char('?') => Some(Action::Help),
+            KeyCode::Char('a') => Some(Action::JumpAttention),
+            KeyCode::Char('z') => Some(Action::ToggleZoom),
+            KeyCode::Char('g') => Some(Action::CycleLayout),
             KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
             KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
@@ -165,6 +176,22 @@ mod tests {
         assert!(matches!(
             translate(alt(KeyCode::Char('3'))),
             InputResult::Action(Action::GoToTab(2))
+        ));
+    }
+
+    #[test]
+    fn alt_a_z_g_map_to_jump_zoom_and_cycle_layout() {
+        assert!(matches!(
+            translate(alt(KeyCode::Char('a'))),
+            InputResult::Action(Action::JumpAttention)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('z'))),
+            InputResult::Action(Action::ToggleZoom)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('g'))),
+            InputResult::Action(Action::CycleLayout)
         ));
     }
 

@@ -35,9 +35,12 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 
     // C6: header row above each stack tall enough to spare one — a separate
     // walk over the same tree `app.rects()` reads, since the header isn't a
-    // `PaneRect` (it belongs to no pane; §5).
-    for header in layout::stack_headers(&app.ws.active_tab().layout, body) {
-        draw_stack_header(f, header);
+    // `PaneRect` (it belongs to no pane; §5). C21: stack headers are
+    // real-tree chrome, suppressed entirely while zoomed.
+    if !app.zoomed() {
+        for header in layout::stack_headers(&app.ws.active_tab().layout, body) {
+            draw_stack_header(f, header);
+        }
     }
     // C7: which pane (if any) is the currently-expanded member of a stack —
     // computed once per frame, independent of whether that stack's header
@@ -45,7 +48,10 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     let mut stack_expanded = HashSet::new();
     layout::stack_expanded_ids(&app.ws.active_tab().layout, &mut stack_expanded);
 
-    let rects = app.rects();
+    // C21/§5: the zoom-aware display list — every render/PTY-resize/mouse-hit
+    // path shares this one accessor so none of them can disagree with what's
+    // actually on screen.
+    let rects = app.display_rects();
     for pr in &rects {
         draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), pulse);
     }
@@ -95,9 +101,12 @@ fn hint_pairs(mode: &Mode, focused_dead: bool) -> Vec<(&'static str, &'static st
     }
 }
 
-/// C9's right-segment uppercase mode word, one per `Mode` variant.
-fn mode_word(mode: &Mode) -> &'static str {
+/// C9's right-segment uppercase mode word. A real non-Normal mode always
+/// wins; in Normal, the `ZOOM` pseudo-state (C21) shows while zoomed (`RAW`,
+/// F5, will slot in ahead of it later — "RAW beats ZOOM beats NORMAL").
+fn mode_word(mode: &Mode, zoomed: bool) -> &'static str {
     match mode {
+        Mode::Normal if zoomed => "ZOOM",
         Mode::Normal => "NORMAL",
         Mode::Rename { .. } => "RENAME",
         Mode::Picker { .. } => "PICKER",
@@ -107,14 +116,17 @@ fn mode_word(mode: &Mode) -> &'static str {
     }
 }
 
-/// C9's right-aligned segment: the aggregate "◆ N needs you" — omitted at
-/// `n == 0` rather than shown as a hollow "0 needs you" — then the
-/// uppercase mode word, then one trailing space. Pure so the
+/// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" —
+/// omitted at `n == 0` rather than shown as a hollow "0 needs you" — then
+/// the uppercase mode word, then one trailing space. Pure so the
 /// omission-at-zero rule is unit-testable without a `Frame`.
 fn hint_bar_right_spans(n: usize, word: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if n > 0 {
-        spans.push(Span::styled(format!("◆ {n} needs you"), Style::default().fg(theme::ACCENT)));
+        spans.push(Span::styled(
+            format!("◆ {n} needs you · Alt+a"),
+            Style::default().fg(theme::ACCENT),
+        ));
         spans.push(Span::raw("  "));
     }
     spans.push(Span::styled(word.to_string(), Style::default().fg(theme::DIM)));
@@ -161,7 +173,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
 
     // Right-aligned aggregate + mode word, drawn only when it still fits
     // after the hints (hints win on narrow widths).
-    let right = hint_bar_right_spans(app.needs_input_count(), mode_word(&app.mode));
+    let right = hint_bar_right_spans(app.needs_input_count(), mode_word(&app.mode, app.zoomed()));
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
     if used.saturating_add(right_w) <= area.width {
         let pad = area.width.saturating_sub(used).saturating_sub(right_w);
@@ -1035,7 +1047,7 @@ mod tests {
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
         let spans = hint_bar_right_spans(3, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "◆ 3 needs you  NORMAL ");
+        assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
     }
 
@@ -1074,15 +1086,25 @@ mod tests {
 
     #[test]
     fn mode_word_matches_c9_table() {
-        assert_eq!(mode_word(&Mode::Normal), "NORMAL");
+        assert_eq!(mode_word(&Mode::Normal, false), "NORMAL");
         assert_eq!(
-            mode_word(&Mode::Rename { buffer: String::new(), target: RenameTarget::Pane }),
+            mode_word(&Mode::Rename { buffer: String::new(), target: RenameTarget::Pane }, false),
             "RENAME"
         );
-        assert_eq!(mode_word(&Mode::Picker { selection: 0 }), "PICKER");
-        assert_eq!(mode_word(&Mode::Scroll { offset: 0 }), "SCROLL");
-        assert_eq!(mode_word(&Mode::Copy), "COPY");
-        assert_eq!(mode_word(&Mode::Help), "HELP");
+        assert_eq!(mode_word(&Mode::Picker { selection: 0 }, false), "PICKER");
+        assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, false), "SCROLL");
+        assert_eq!(mode_word(&Mode::Copy, false), "COPY");
+        assert_eq!(mode_word(&Mode::Help, false), "HELP");
+    }
+
+    #[test]
+    fn mode_word_shows_zoom_pseudo_state_only_in_the_normal_slot() {
+        // C21/amended C9: ZOOM shows only when the mode is Normal — every
+        // other mode's own word wins regardless of the zoomed flag.
+        assert_eq!(mode_word(&Mode::Normal, true), "ZOOM");
+        assert_eq!(mode_word(&Mode::Normal, false), "NORMAL");
+        assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, true), "SCROLL");
+        assert_eq!(mode_word(&Mode::Help, true), "HELP");
     }
 
     #[test]
