@@ -563,8 +563,9 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
     );
 }
 
-/// One tab's 7-part span sequence (C2): marker, label, status glyph, and the
-/// trailing separator — column count matches `mouse::tab_width` exactly.
+/// One tab's 8-part span sequence (C2): marker, label, status glyph, the
+/// separator, and a trailing gutter space — column count matches
+/// `mouse::tab_width` (`display_width(label) + 7`) exactly.
 fn push_tab_spans(
     spans: &mut Vec<Span<'static>>,
     index: usize,
@@ -592,6 +593,10 @@ fn push_tab_spans(
     spans.push(Span::raw(" "));
 
     spans.push(Span::styled(theme::TAB_SEPARATOR.to_string(), Style::default().fg(theme::RULE)));
+    // C2 (amended 2026-07-23): trailing gutter — one space after the separator
+    // gives every divider symmetric 1-cell padding, so adjacent tabs read
+    // `│ ▎` not `│▎`. Counts as this tab's own column (mouse::tab_width +7).
+    spans.push(Span::raw(" "));
 }
 
 /// Map a tab's aggregate summary to a tab-bar glyph + colour (theme::C5).
@@ -1481,7 +1486,7 @@ mod tests {
         // with the body bg), glyph in its own color, separator RULE.
         let mut spans = Vec::new();
         push_tab_spans(&mut spans, 0, "main", true, theme::GLYPH_WORKING, theme::ACCENT);
-        assert_eq!(spans.len(), 7);
+        assert_eq!(spans.len(), 8); // 7 parts + trailing gutter (C2, amended 2026-07-23)
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
         assert_eq!(spans[2].content.as_ref(), "1 main");
@@ -1491,6 +1496,7 @@ mod tests {
         assert_eq!(spans[4].style.fg, Some(theme::ACCENT));
         assert_eq!(spans[6].content.as_ref(), theme::TAB_SEPARATOR.to_string());
         assert_eq!(spans[6].style.fg, Some(theme::RULE));
+        assert_eq!(spans[7].content.as_ref(), " "); // trailing gutter
     }
 
     #[test]
@@ -1500,7 +1506,7 @@ mod tests {
         // not a per-span bg).
         let mut spans = Vec::new();
         push_tab_spans(&mut spans, 1, "api", false, theme::GLYPH_IDLE, theme::DIM);
-        assert_eq!(spans.len(), 7);
+        assert_eq!(spans.len(), 8); // 7 parts + trailing gutter (C2, amended 2026-07-23)
         assert_eq!(spans[0].content.as_ref(), " ");
         assert_eq!(spans[0].style.fg, None);
         assert_eq!(spans[2].content.as_ref(), "2 api");
