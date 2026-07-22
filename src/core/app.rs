@@ -629,6 +629,7 @@ impl<B: PaneBackend> App<B> {
             }
             Method::Fork { pane } => self.ctl_fork(actor, pane),
             Method::Send { pane, text, submit } => self.ctl_send(actor, pane, &text, submit),
+            Method::Broadcast { text, submit } => self.ctl_broadcast(actor, &text, submit),
             Method::Read { pane, mode } => self.ctl_read(actor, pane, mode),
             Method::Close { pane, force } => self.ctl_close(actor, pane, force),
             // `wait` is handled asynchronously; only reached if a caller sends
@@ -923,6 +924,47 @@ impl<B: PaneBackend> App<B> {
         }
         rt.write_input(&bytes);
         Reply::ok(serde_json::json!({ "sent": bytes.len() }))
+    }
+
+    /// Deliver `text` (+ CR when `submit`) to every **running** pane `actor`
+    /// may target. Fleet reaches every spawned pane by iterating `runtimes`
+    /// directly (not `ws.tabs`), so a future float pane needs no change
+    /// here; a pane actor reaches only its own spawned subtree, itself
+    /// included — the exact same `may_target`/`in_subtree` rule as every
+    /// other verb. "Running" excludes a pane whose process already exited
+    /// but hasn't been closed (its runtime lingers with `AgentStatus::Exited`
+    /// — see `on_pty_exit`): writing to it would silently go nowhere, so
+    /// counting it as "sent" would be a dishonest reply/audit. There's no
+    /// per-target id to validate (unlike send/read/close), so this never
+    /// errors — zero matching panes is `ok` with count 0.
+    fn ctl_broadcast(&mut self, actor: Actor, text: &str, submit: bool) -> Reply {
+        let mut bytes = text.as_bytes().to_vec();
+        if submit {
+            bytes.push(b'\r');
+        }
+        let mut sent: Vec<PaneId> = Vec::new();
+        for (&id, rt) in self.runtimes.iter() {
+            if rt.status() != AgentStatus::Exited && self.may_target(actor, id) {
+                sent.push(id);
+            }
+        }
+        sent.sort_unstable();
+        for &id in &sent {
+            if let Some(rt) = self.runtimes.get_mut(&id) {
+                rt.write_input(&bytes);
+            }
+        }
+        let count = sent.len();
+        // Self-audit with the real count. The generic per-call audit in
+        // handle_control_msg always logs an empty detail on `Ok` (it only
+        // sees the Reply after dispatch and discards its payload — `Reply::Ok
+        // { .. }`), so it can't produce the `count=` this contract's line
+        // needs; that generic call still also fires afterward when this
+        // arrives over the socket; harmless double log line — the wrapper's
+        // is out of ctl_broadcast's edit scope to suppress here.
+        let summary = method_summary(&Method::Broadcast { text: text.to_string(), submit });
+        self.audit(Some(actor), &summary, true, &format!("count={count}"));
+        Reply::ok(serde_json::json!({ "sent": sent, "count": count }))
     }
 
     fn ctl_read(&self, actor: Actor, pane: PaneId, mode: ReadMode) -> Reply {
@@ -1643,6 +1685,9 @@ fn method_summary(m: &Method) -> String {
         Method::Send { pane, text, submit } => {
             format!("send pane={pane} len={} submit={submit}", text.len())
         }
+        Method::Broadcast { text, submit } => {
+            format!("broadcast len={} submit={submit}", text.len())
+        }
         Method::Read { pane, .. } => format!("read pane={pane}"),
         Method::Close { pane, force } => format!("close pane={pane} force={force}"),
         Method::Wait { panes, until, .. } => format!("wait panes={panes:?} until={until}"),
@@ -1982,6 +2027,105 @@ mod tests {
     }
 
     #[test]
+    fn control_broadcast_reaches_every_running_pane_for_fleet_actor() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let p1 = app.focused;
+        app.apply(Action::NewPane);
+        let p2 = app.focused;
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi there".into(), submit: true },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let mut sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        sent.sort();
+        assert_eq!(sent, vec![p1, p2]);
+        assert_eq!(ok["count"], 2);
+        assert!(app.runtimes.get(&p1).unwrap().input.ends_with(b"hi there\r"));
+        assert!(app.runtimes.get(&p2).unwrap().input.ends_with(b"hi there\r"));
+    }
+
+    #[test]
+    fn control_broadcast_stays_inside_pane_actors_subtree() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        app.tokens.insert(1, "tok1".into());
+        // Pane 1 spawns a child → the child is in its subtree.
+        let child = match app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        // The fleet spawns a sibling, outside pane 1's subtree.
+        let other = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+
+        let ok = match app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Broadcast { text: "x".into(), submit: false },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let mut sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        sent.sort();
+        // Itself (1) + its spawned subtree (child) — not the fleet's sibling.
+        assert_eq!(sent, vec![1, child]);
+        assert_eq!(ok["count"], 2);
+        assert!(app.runtimes.get(&1).unwrap().input.ends_with(b"x"));
+        assert!(app.runtimes.get(&child).unwrap().input.ends_with(b"x"));
+        assert!(app.runtimes.get(&other).unwrap().input.is_empty());
+    }
+
+    #[test]
+    fn control_broadcast_skips_non_running_panes() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let running = app.focused;
+        app.apply(Action::NewPane);
+        let exited = app.focused;
+        app.apply(Action::NewPane);
+        let never_spawned = app.focused;
+        // Process exited but the pane hasn't been closed — its runtime
+        // lingers with AgentStatus::Exited (see on_pty_exit); still present
+        // in `runtimes`, so a naive "present ⇒ running" check would wrongly
+        // include it.
+        app.runtimes.get_mut(&exited).unwrap().set_extension_status(AgentStatus::Exited);
+        // Lazy, never-spawned pane: spec present, no runtime at all — same
+        // idiom as tab_summary_unknown_for_unspawned_needs_input_wins.
+        app.runtimes.remove(&never_spawned);
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi".into(), submit: false },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert_eq!(sent, vec![running]);
+        assert_eq!(ok["count"], 1);
+        assert!(app.runtimes.get(&exited).unwrap().input.is_empty());
+    }
+
+    #[test]
     fn control_cannot_close_the_last_pane() {
         use crate::core::control::{Method, Request};
         let (mut app, _) = mk_app(shell_ws());
@@ -2088,6 +2232,46 @@ mod tests {
         assert!(lines[0].contains(" err "), "denied wait must audit as err: {}", lines[0]);
         assert!(!lines[0].contains("parked"), "denied wait must not claim it parked: {}", lines[0]);
         assert!(lines[1].contains("FORGED"), "content preserved, just de-lined: {}", lines[1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_audit_line_has_the_contracted_shape_and_omits_the_text() {
+        use crate::core::control::{Method, Reply, Request};
+        let dir = std::env::temp_dir().join(format!("roost-broadcast-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            Some(dir.join("roost.sock")),
+        )
+        .unwrap();
+        let ct = app.control_token().to_string();
+
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct,
+                method: Method::Broadcast { text: "secret payload".into(), submit: true },
+            },
+            rtx,
+        );
+        assert!(matches!(rrx.recv().unwrap(), Reply::Ok { .. }));
+
+        let log = std::fs::read_to_string(dir.join("control.log")).unwrap();
+        // ctl_broadcast's own self-audit line (PLAN §F2's contracted shape,
+        // carrying the real fan-out count) must be present. len=14 is
+        // "secret payload".len(); count=1 is the lone auto-spawned pane.
+        let line = log.lines().find(|l| l.contains("count=")).expect("no count-bearing audit line");
+        assert!(line.contains("fleet broadcast len=14 submit=true -> ok count=1"), "{line}");
+        assert!(!log.contains("secret payload"), "broadcast text must never be logged: {log:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
