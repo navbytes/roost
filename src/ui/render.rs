@@ -563,8 +563,9 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
     );
 }
 
-/// One tab's 7-part span sequence (C2): marker, label, status glyph, and the
-/// trailing separator — column count matches `mouse::tab_width` exactly.
+/// One tab's 8-part span sequence (C2): marker, label, status glyph, the
+/// separator, and a trailing gutter space — column count matches
+/// `mouse::tab_width` (`display_width(label) + 7`) exactly.
 fn push_tab_spans(
     spans: &mut Vec<Span<'static>>,
     index: usize,
