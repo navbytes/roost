@@ -352,9 +352,18 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   pushes real hints off the bar. All six new chords (§8) are discoverable via
   `Alt+?` (C15); the jump chord additionally teaches itself at the moment of
   need via the amended right segment (previous bullet — `· Alt+a` costs zero
-  columns when N = 0 and, when N > 0, the whole right segment yields exactly
-  as before: hints always win, the segment drops whole, the bar never
-  overflows).
+  columns when N = 0).
+- **Yield order (re-amended 2026-07-22, live-QA finding):** the right segment
+  WINS over the static pairs — trailing pairs drop (whole pairs, from the
+  right) until the segment fits; the mode word is the last thing on the bar
+  to ever disappear. Rationale: the mode word is a modal-safety affordance
+  (RAW/COPY/ZOOM must be visible to be escapable) and `◆ N needs you` is the
+  fleet's primary signal; both outrank a static cheat-row whose full content
+  lives under `Alt+?`. Live QA at 120 cols showed the previous
+  hints-win order blanked the mode word whenever N > 0. Predicate: at any
+  width, `mode word visible` unless width < word length; pairs render
+  left-to-right in list order, each dropped whole when it no longer fits
+  alongside the right segment.
 - **Mode-word list** (`mode_word`, `render.rs:99–108`) becomes:
   `NORMAL / RENAME / PICKER / SCROLL / COPY / HELP / FEED` — plus two
   **pseudo-state words** shown only in the Normal slot:
@@ -712,9 +721,14 @@ can never see them.
     kitty upgrade included;
   - **Alt-modified printable keys: the meta-ESC convention** — `0x1b` + the
     unmodified key's encoding (this is what readline/agent CLIs bind);
-    Alt+Enter → `0x1b 0x0d`. Other Alt+special keys forward as their
-    unmodified encoding (documented approximation; upgrade path if an agent
-    ever needs it: xterm `CSI 1;3` modifier encodings).
+    Alt+Enter → `0x1b 0x0d`. Alt+special keys forward as **meta-ESC
+    uniformly**: `0x1b` + the key's unmodified sequence (Alt+Right →
+    `0x1b 0x1b 0x5b 0x43`) — this is xterm's `altSendsEscape` behavior, and
+    unlike a bare passthrough it preserves the Alt distinction for the inner
+    app. [Amended 2026-07-22, supervisor D1: the earlier "bare unmodified
+    encoding" wording lost information and matched no real terminal; the
+    upgrade path (xterm `CSI 1;3` modifier encodings) stands if an agent
+    ever needs it.]
   - **Nothing else is intercepted.** Not Alt+q, not Alt+arrows, not
     Alt+1..9 — that is the feature. The hint bar shows the way out.
 - **Interplay with modes:** raw routing applies only in Normal mode.
@@ -1082,7 +1096,13 @@ only the C9-curated subsets.
 | 17 | `Alt+PgUp` | scroll mode | — |
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
-| 20 | `Alt+q` | quit (workspace saved; sessions live) | — |
+| 20 | `Alt+?` | full keymap overlay (this table) | C15 |
+| 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
+
+[Amended 2026-07-22, supervisor SPEC-GAP: row 20 `Alt+?` was bound in
+translate() and advertised by C9's hint bar but missing from this canonical
+table. The C15 help overlay's ≤20-content-row cap counts key ROWS, some of
+which pair two chords — the overlay stays within cap.]
 
 Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
 raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes

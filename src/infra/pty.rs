@@ -336,4 +336,17 @@ mod tests {
         let p = screen_with("hello", 2, 10);
         assert_eq!(extract_selection(p.screen(), (0, 4), (0, 0)), "hello");
     }
+
+    #[test]
+    fn zero_dollar_multiline_selection_trims_each_lines_trailing_whitespace() {
+        // C24's `0`/`$` keyboard motions drive a realistic `0 v j $ y` flow:
+        // row 0 has real trailing spaces printed by the shell (not just
+        // unwritten cell padding beyond the row's own content), row 1 is
+        // shorter than the screen width. Each line must trim independently
+        // and join with '\n' — a per-line trim, not one global trim.
+        let p = screen_with("hi   \r\nbye", 3, 10);
+        // (0,0) = `0` on row 0; (1,9) = `$` (last column) on row 1 — exactly
+        // what pressing 0 then j then $ drives.
+        assert_eq!(extract_selection(p.screen(), (0, 0), (1, 9)), "hi\nbye");
+    }
 }

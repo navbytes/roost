@@ -169,6 +169,12 @@ impl Harness {
         self.child.process_id().expect("roost has a pid")
     }
 
+    /// The instance's `ROOST_STATE` dir (control socket, workspace.json,
+    /// control.log) — lets a scenario assert on the audit log.
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+
     /// Send Alt+q and wait for roost to exit on its own. Returns the elapsed
     /// time on a clean exit; force-kills the process and returns `None` if
     /// it's still alive after `timeout` (the historical quit-freeze

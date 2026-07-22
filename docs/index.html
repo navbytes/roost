@@ -324,7 +324,7 @@
       <div><p class="stat-num">0</p><p class="stat-label">Daemons to run</p></div>
       <div><p class="stat-num">3</p><p class="stat-label">Adapters — pi, Claude Code, shell</p></div>
       <div><p class="stat-num">8</p><p class="stat-label">Control-CLI verbs</p></div>
-      <div><p class="stat-num">161</p><p class="stat-label">Unit tests</p></div>
+      <div><p class="stat-num">306</p><p class="stat-label">Unit tests</p></div>
     </div>
   </section>
 
@@ -354,7 +354,7 @@
     <div class="frow">
       <p class="frow-num">04</p>
       <h3>Drive a fleet from the CLI</h3>
-      <p class="frow-body"><code style="font-family:var(--font-mono);font-size:0.9em">list</code>, <code style="font-family:var(--font-mono);font-size:0.9em">status</code>, <code style="font-family:var(--font-mono);font-size:0.9em">spawn</code>, <code style="font-family:var(--font-mono);font-size:0.9em">fork</code>, <code style="font-family:var(--font-mono);font-size:0.9em">send</code>, <code style="font-family:var(--font-mono);font-size:0.9em">read</code>, <code style="font-family:var(--font-mono);font-size:0.9em">close</code>, <code style="font-family:var(--font-mono);font-size:0.9em">wait</code> — eight verbs, the same binary in client mode. An agent inside a pane can spawn and orchestrate its own workers while you watch the whole fleet live. Authorization is scoped by default, not sandboxed — any in-pane agent with shell access can still reach the fleet token.</p>
+      <p class="frow-body"><code style="font-family:var(--font-mono);font-size:0.9em">list</code>, <code style="font-family:var(--font-mono);font-size:0.9em">status</code>, <code style="font-family:var(--font-mono);font-size:0.9em">spawn</code>, <code style="font-family:var(--font-mono);font-size:0.9em">fork</code>, <code style="font-family:var(--font-mono);font-size:0.9em">send</code>, <code style="font-family:var(--font-mono);font-size:0.9em">read</code>, <code style="font-family:var(--font-mono);font-size:0.9em">close</code>, <code style="font-family:var(--font-mono);font-size:0.9em">wait</code> — eight verbs, the same binary in client mode, including a <code style="font-family:var(--font-mono);font-size:0.9em">send --all</code> broadcast to reach every pane at once. An agent inside a pane can spawn and orchestrate its own workers while you watch the whole fleet live. Authorization is scoped by default, not sandboxed — any in-pane agent with shell access can still reach the fleet token.</p>
     </div>
     <div class="frow">
       <p class="frow-num">05</p>
@@ -417,6 +417,11 @@
       <div class="keycell"><kbd>Alt+Shift+arrow</kbd><span>resize pane</span></div>
       <div class="keycell"><kbd>Alt+s</kbd><span>stack ⇄ explode</span></div>
       <div class="keycell"><kbd>Alt+o</kbd><span>flip orientation</span></div>
+      <div class="keycell"><kbd>Alt+g</kbd><span>cycle layouts</span></div>
+      <div class="keycell"><kbd>Alt+z</kbd><span>zoom pane</span></div>
+      <div class="keycell"><kbd>Alt+f</kbd><span>float scratch pane</span></div>
+      <div class="keycell"><kbd>Alt+a</kbd><span>jump to needs-input</span></div>
+      <div class="keycell"><kbd>Alt+e</kbd><span>activity feed</span></div>
       <div class="keycell"><kbd>Alt+r</kbd><span>rename pane</span></div>
       <div class="keycell"><kbd>Alt+Shift+r</kbd><span>rename tab</span></div>
       <div class="keycell"><kbd>Alt+t</kbd><span>new tab</span></div>
@@ -425,6 +430,7 @@
       <div class="keycell"><kbd>Alt+u</kbd><span>undo — reopen last closed</span></div>
       <div class="keycell"><kbd>Alt+c</kbd><span>copy mode</span></div>
       <div class="keycell"><kbd>Alt+PgUp</kbd><span>scroll mode</span></div>
+      <div class="keycell"><kbd>Alt+Shift+p</kbd><span>raw pass-through</span></div>
       <div class="keycell"><kbd>Alt+/</kbd><span>toggle hint bar</span></div>
       <div class="keycell"><kbd>Alt+?</kbd><span>full keymap</span></div>
       <div class="keycell"><kbd>Alt+q</kbd><span>quit — sessions live</span></div>

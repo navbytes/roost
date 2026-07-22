@@ -3040,6 +3040,62 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_then_independent_status_transitions_dont_cross_contaminate_the_feed() {
+        // One ctl line from a broadcast to N panes, then N independent
+        // status transitions on a later tick — each must get its own
+        // correctly-named line (no merging, no borrowed identity), and an
+        // unchanged pane must stay silent.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let a = app.focused;
+        app.apply(Action::NewPane);
+        let b = app.focused;
+        app.apply(Action::NewPane);
+        let c = app.focused;
+        app.find_spec_mut(a).unwrap().title = Some("alpha".into());
+        app.find_spec_mut(b).unwrap().title = Some("bravo".into());
+        app.find_spec_mut(c).unwrap().title = Some("charlie".into());
+
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "go".into(), submit: false },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
+
+        // A status-transition line (`"{name}: {old} → {new}"`) vs. the ctl
+        // audit line, which *also* contains '→' in its own "... → ok/err"
+        // outcome — `contains('→')` alone can't tell them apart.
+        let is_transition = |e: &&FeedEntry| e.text.contains('→') && !e.text.starts_with("ctl ");
+
+        // Baseline tick: first observation of each pane is silently seeded
+        // (spawn owns the birth line), so this must add no transition line.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.feed().iter().filter(is_transition).count(), 0, "{:?}", app.feed());
+
+        app.runtimes.get_mut(&a).unwrap().set_extension_status(AgentStatus::Working);
+        app.runtimes.get_mut(&c).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        // b stays Idle — must not produce a line.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
+        assert_eq!(transitions.len(), 2, "{:?}", app.feed());
+        let alpha = transitions.iter().find(|e| e.text.starts_with("alpha:")).expect("alpha's own line");
+        assert_eq!(alpha.text, "alpha: idle → working");
+        assert!(!alpha.needs_input);
+        let charlie = transitions.iter().find(|e| e.text.starts_with("charlie:")).expect("charlie's own line");
+        assert_eq!(charlie.text, "charlie: idle → needs you");
+        assert!(charlie.needs_input);
+        assert!(!transitions.iter().any(|e| e.text.starts_with("bravo:")), "unchanged pane must stay silent");
+
+        // The broadcast's one ctl line must still be exactly one — untouched by the tick.
+        assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
+    }
+
+    #[test]
     fn control_wait_immediate_parks_and_fires() {
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
@@ -3751,6 +3807,36 @@ mod tests {
         app.apply(Action::JumpAttention); // wraps back to the first member
         assert_eq!(app.focused, 1);
         assert_eq!(app.ws.active_tab, 0);
+    }
+
+    #[test]
+    fn attention_ring_flattens_multiple_needy_panes_across_multiple_tabs_in_order() {
+        // The wrap test above only ever put one needy pane in the second
+        // tab. This pins the full (tab index ascending, then position in
+        // that tab's pane_order()) predicate when *every* tab contributes
+        // more than one ring member, with a quiet pane interleaved in each
+        // tab to prove it's skipped without disturbing its neighbors' order.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // tab0: 3 panes
+        let tab0_order = app.pane_order();
+        assert_eq!(tab0_order.len(), 3);
+
+        app.apply(Action::NewTab);
+        app.apply(Action::NewPane); // tab1: 2 panes
+        let tab1_order = app.pane_order();
+        assert_eq!(tab1_order.len(), 2);
+
+        // tab0: needy at positions 0 and 2, quiet at position 1.
+        app.runtimes.get_mut(&tab0_order[0]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&tab0_order[2]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        // tab1: both needy.
+        app.runtimes.get_mut(&tab1_order[0]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&tab1_order[1]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+
+        let expected = vec![tab0_order[0], tab0_order[2], tab1_order[0], tab1_order[1]];
+        assert_eq!(app.attention_ring(), expected);
+        assert_eq!(app.needs_input_count(), expected.len());
     }
 
     // -- C21 zoom -------------------------------------------------------------
@@ -4703,6 +4789,28 @@ mod tests {
         assert!(app.is_raw(id));
         app.apply(Action::ClosePane);
         assert!(!app.is_raw(id));
+    }
+
+    #[test]
+    fn control_send_still_delivers_bytes_to_a_raw_pane() {
+        // C23's routing predicate only gates the *keyboard* path
+        // (main.rs's handle_key) — the control socket writes straight to
+        // the runtime via ctl_send and must keep working while the focused
+        // pane is flagged raw; raw is not consulted anywhere on that path.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::ToggleRaw);
+        assert!(app.is_raw(id));
+
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Send { pane: id, text: "hello".into(), submit: true },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert!(app.runtimes.get(&id).unwrap().input.ends_with(b"hello\r"));
+        assert!(app.is_raw(id), "control send must not disturb the raw flag");
     }
 
     // -- C24 keyboard copy mode -------------------------------------------------

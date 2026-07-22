@@ -160,6 +160,21 @@ fn hint_bar_right_spans(n: usize, word: &str) -> Vec<Span<'static>> {
 /// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
 /// actually press right now. Precedence (C9): alt-warning, then flash, then
 /// the hint pairs — each takes over the whole bar from the next.
+/// How many leading hint pairs fit alongside the right segment (C9 yield
+/// order: pairs drop whole, from the right, before the segment ever yields).
+fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u16) -> usize {
+    let budget = width.saturating_sub(right_w);
+    let mut used = 0u16;
+    for (i, (key, label)) in hints.iter().enumerate() {
+        let w = (key.chars().count() + label.chars().count() + 3) as u16; // " k " + "l  "
+        if used + w > budget {
+            return i;
+        }
+        used += w;
+    }
+    hints.len()
+}
+
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     if app.show_alt_hint() {
         f.render_widget(
@@ -182,24 +197,26 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     }
 
     // (key, what it does) pairs for the current context: key ACCENT, label
-    // MUTED, no chip bg.
+    // MUTED, no chip bg. The right segment (aggregate + mode word) WINS over
+    // the pairs (C9 yield order): the mode word is a modal-safety affordance
+    // and "◆ N needs you" the fleet's primary signal — trailing pairs drop
+    // whole until the segment fits.
     let focused_raw = app.is_raw(app.focused);
     let hints = hint_pairs(&app.mode, app.focused_dead(), focused_raw);
-    let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 2 + 4);
+    let right =
+        hint_bar_right_spans(app.needs_input_count(), mode_word(&app.mode, app.zoomed(), focused_raw));
+    let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
+
+    let shown = fit_hint_pairs(&hints, right_w, area.width);
+    let mut spans: Vec<Span> = Vec::with_capacity(shown * 2 + 4);
     let mut used = 0u16;
-    for (key, label) in hints {
+    for (key, label) in &hints[..shown] {
         let key_span = format!(" {key} ");
         let label_span = format!("{label}  ");
         used += (key_span.chars().count() + label_span.chars().count()) as u16;
         spans.push(Span::styled(key_span, Style::default().fg(theme::ACCENT)));
         spans.push(Span::styled(label_span, Style::default().fg(theme::MUTED)));
     }
-
-    // Right-aligned aggregate + mode word, drawn only when it still fits
-    // after the hints (hints win on narrow widths).
-    let right =
-        hint_bar_right_spans(app.needs_input_count(), mode_word(&app.mode, app.zoomed(), focused_raw));
-    let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
     if used.saturating_add(right_w) <= area.width {
         let pad = area.width.saturating_sub(used).saturating_sub(right_w);
         spans.push(Span::raw(" ".repeat(pad as usize)));
@@ -382,7 +399,7 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                 .map(|(k, d)| {
                     Line::from(vec![
                         Span::styled(help_key_prefix(k), Style::default().fg(theme::ACCENT)),
-                        Span::styled(format!("{d}"), Style::default().fg(theme::MUTED)),
+                        Span::styled(d.to_string(), Style::default().fg(theme::MUTED)),
                     ])
                 })
                 .collect();
@@ -1040,6 +1057,7 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use crate::App;
     use super::{
         badge_text, cell_in_selection, centered_near, collapsed_name_color, collapsed_row_spans,
         corner_badge, dialog_border_style, feed_entry_spans, feed_window, help_dialog_width,
@@ -1377,6 +1395,28 @@ mod tests {
     }
 
     #[test]
+    fn fit_hint_pairs_right_segment_wins_over_trailing_pairs() {
+        // C9 yield order (re-amended 2026-07-22): pairs drop whole from the
+        // right before the aggregate/mode-word segment ever yields.
+        let pairs = hint_pairs(&Mode::Normal, false, false);
+        let pair_w = |p: &(&str, &str)| (p.0.chars().count() + p.1.chars().count() + 3) as u16;
+        let all_w: u16 = pairs.iter().map(&pair_w).sum();
+
+        // Roomy bar, no right segment: everything fits.
+        assert_eq!(super::fit_hint_pairs(&pairs, 0, all_w + 10), pairs.len());
+        // 120-col bar with a live "◆ 2 needs you · Alt+a" + "NORMAL" segment:
+        // some pairs must yield, and what remains must leave the segment room.
+        let right_w = 30;
+        let shown = super::fit_hint_pairs(&pairs, right_w, 120);
+        assert!(shown < pairs.len(), "trailing pairs must drop at 120 cols");
+        let used: u16 = pairs[..shown].iter().map(&pair_w).sum();
+        assert!(used + right_w <= 120, "shown pairs + segment must fit");
+        // Degenerate: a bar narrower than the segment shows zero pairs (the
+        // draw fn then right-aligns whatever of the segment still fits).
+        assert_eq!(super::fit_hint_pairs(&pairs, 118, 120), 0);
+    }
+
+    #[test]
     fn hint_pairs_dead_focused_normal_offers_relaunch_not_new_pane() {
         let dead = hint_pairs(&Mode::Normal, true, false);
         assert_eq!(
@@ -1631,5 +1671,59 @@ mod tests {
         // Must not panic even when the cursor sits outside the pane's inner
         // bounds (a stale cursor after a resize, before the next clamp).
         term.draw(|f| super::paint_copy_cursor(f, inner, (99, 99), None)).unwrap();
+    }
+
+    // -- full draw() smoke tests at degenerate sizes (fleet features pass) --
+
+    fn mk_app(size: ratatui::layout::Size) -> App<crate::ports::fakes::FakePane> {
+        use crate::agents;
+        use crate::core::workspace::Workspace;
+        use crate::ports::fakes::MemStore;
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let ws = Workspace::default_in(PathBuf::from("/tmp"));
+        App::<crate::ports::fakes::FakePane>::new(ws, agents::registry(), Box::new(store), tx, size, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn draw_does_not_panic_at_the_80x24_floor_with_float_and_feed_open() {
+        // C22's stacking order draws the float under the feed modal; at the
+        // spec's own 80x24 floor both are live at once whenever the float
+        // was already shown before Alt+e (toggling feed doesn't hide it) —
+        // a combination no existing test drove through the real draw()
+        // pipeline end to end.
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(80, 24));
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::ToggleFeed);
+        assert!(matches!(app.mode, Mode::Feed { .. }));
+        assert!(app.display_rects().len() >= 2, "float should still be in the display list");
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn draw_does_not_panic_at_36x10_single_pane() {
+        // 36x10 (app.rs's MIN_SPLIT_COLS/ROWS) is the smallest size roost's
+        // own split gate considers usable; a lone unsplit pane should still
+        // draw cleanly at that floor.
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(36, 10));
+        let backend = TestBackend::new(36, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
     }
 }
