@@ -4,10 +4,17 @@ Canonical design reference: `docs/tui-design.html` (tokens at `:root` ~line 584,
 terminal markup ~614–696, token legend ~698). This document translates that
 mockup into testable contracts for a ratatui 0.29 cell-grid TUI. The
 `design-supervisor` agent audits implementation against the numbered contracts
-below (C1–C18) and issues a per-contract verdict: **ALIGNED** or **DEVIATED**
+below (C1–C26) and issues a per-contract verdict: **ALIGNED** or **DEVIATED**
 (with file:line evidence). Line anchors below were verified against the working
 tree on 2026-07-21 and may drift a line or two; the code element named is the
 anchor, not the number.
+
+**Amendment 2026-07-22 (fleet features):** contracts C19–C26, the C9/C15
+amendments, the §6 firehose gate, and the §8 key table were added for the
+fleet-features engagement (BRIEF: `.claude/company/fleet-features/BRIEF.md`).
+Their line anchors were verified against the working tree on 2026-07-22.
+C1–C18 are unchanged and must **still** audit ALIGNED after the fleet build —
+in particular the C1 grep gates and the C18 zero-diff rule.
 
 ---
 
@@ -33,7 +40,7 @@ keeps its own palette. Red is never decoration: it means either *focus* or
 | `DIM` | `#57524b` | `Color::Rgb(87, 82, 75)` | tertiary ink: idle glyph ·, tab-bar right status, stack header, collapsed-row right text, exited row names, hint-bar mode word |
 | `RULE` | `#332f2a` | `Color::Rgb(51, 47, 42)` | structure: unfocused pane borders, tab separators `│`, focused collapsed-row bg, flash bg |
 | `ACCENT` | `#ff563c` | `Color::Rgb(255, 86, 60)` | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, ● working (pulse phase A), modal borders, "◆ N needs you", "save failed" |
-| `ACCENT_DIM` | `#a83a28` | `Color::Rgb(168, 58, 40)` | ✕ exited glyph, expanded-stack edge `▌`, ● working pulse phase B, dead-pane action bar bg, alt-warning bg |
+| `ACCENT_DIM` | `#a83a28` | `Color::Rgb(168, 58, 40)` | ✕ exited glyph, expanded-stack edge `▌`, ● working pulse phase B, dead-pane action bar bg, alt-warning bg, `raw` badge token (C23) |
 | `TAB_STRIP` | `#1b1713` | `Color::Rgb(27, 23, 19)` | tab bar row bg (inactive cells + fill + right status area) |
 | `BAR` | `#211d19` | `Color::Rgb(33, 29, 25)` | hint bar row bg |
 | `ok` | `#7fae7f` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
@@ -81,8 +88,9 @@ Chrome uses **no `Modifier::BOLD` anywhere** (the mockup's TUI region is
 regular weight throughout; color carries hierarchy). Current BOLD uses (brand
 block, active tab, glyphs, dialog borders, help keys, hint keys, flash,
 focused border) are all removed. Modifiers still permitted: `DIM` (modal
-backdrop mechanism, C12), `REVERSED` (copy selection, C17), `UNDERLINED`
-(stack header rule, C6). Program output keeps whatever attributes it sent.
+backdrop mechanism, C12), `REVERSED` (copy selection C17 + copy cursor C24),
+`UNDERLINED` (stack header rule C6 + copy cursor-in-selection C24). Program
+output keeps whatever attributes it sent.
 
 ### Glyph inventory (chrome)
 
@@ -92,6 +100,12 @@ U+2502 (tab separator) · `▏` U+258F (rename cursor, existing) · `❯` U+276F
 (picker selection) · `✓` U+2713 (saved) · `…` U+2026 (tab overflow). All are
 single-width. The double-width `🪶` is removed with the brand block (C2),
 eliminating the wide-glyph offset hazard in mouse math.
+
+**[Amended 2026-07-22, fleet features]: the fleet features add NO new
+glyphs.** The feed (C20) reuses `◆` with its C5 meaning; zoom/raw are word
+indications (`ZOOM`/`RAW`, C9) plus a plain-text `raw` badge token (C23); the
+float (C22) is chrome-identical to a pane; the copy cursor (C24) is
+modifier-based. Any new glyph appearing under `src/ui/` is a DEVIATED.
 
 ---
 
@@ -196,6 +210,8 @@ with tests `:530–555`.
 - Geometry: top row of the pane's inner area, right-aligned, one column of
   right breathing room — `corner_badge()` clipping behavior and its tests
   stay (helper may evolve to return spans for the two-tone styling).
+- [Amended 2026-07-22, fleet features] A raw pane's badge additionally carries
+  the `raw` token per C23.
 
 ### C5 — Status glyph system + pulse
 
@@ -299,6 +315,8 @@ focused = Black on status-color bg, unfocused = status-color fg.
   unfocused rows have no bg.
 - When the row is too narrow, the right segment drops first (name clips last).
 - Click-to-expand behavior unchanged.
+- [Amended 2026-07-22, fleet features] A raw pane's right segment carries the
+  `raw · ` prefix per C23.
 
 ### C9 — Hint bar
 
@@ -319,14 +337,38 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
 - Other modes keep their current pair lists (`:68–83`), restyled identically
   (dead-focused Normal list `:81–83` included).
 - Right-aligned segment, drawn only when it fits after the hint spans
-  (hints win on narrow widths): `"◆ {N} needs you"` fg `ACCENT` — N = count
-  of panes whose runtime status is `NeedsInput` across **all** spawned panes
-  (every entry in `app.runtimes`, not just the active tab); segment omitted
-  when N = 0 — then two spaces, then the mode word fg `DIM`, uppercase:
-  `NORMAL` / `RENAME` / `PICKER` / `SCROLL` / `COPY` / `HELP`, then one
-  trailing space.
+  (hints win on narrow widths): `"◆ {N} needs you · Alt+a"` fg `ACCENT` —
+  N = count of panes whose runtime status is `NeedsInput` across **all**
+  spawned panes (every entry in `app.runtimes`, not just the active tab);
+  segment omitted when N = 0 — then two spaces, then the mode word fg `DIM`,
+  uppercase (word list below), then one trailing space.
 - Precedence unchanged: alt-warning (C11) takes the bar over flash (C10),
   which takes it over hints (`:45–64`).
+
+**[Amended 2026-07-22, fleet features]:**
+- **The Normal-mode seven-pair list gains NOTHING.** Justification: rendered
+  per the `" {key} {label}  "` formula, the seven pairs measure exactly
+  **100 columns** (12+15+14+17+15+14+13); at the 100-col floor any eighth pair
+  pushes real hints off the bar. All six new chords (§8) are discoverable via
+  `Alt+?` (C15); the jump chord additionally teaches itself at the moment of
+  need via the amended right segment (previous bullet — `· Alt+a` costs zero
+  columns when N = 0 and, when N > 0, the whole right segment yields exactly
+  as before: hints always win, the segment drops whole, the bar never
+  overflows).
+- **Mode-word list** (`mode_word`, `render.rs:99–108`) becomes:
+  `NORMAL / RENAME / PICKER / SCROLL / COPY / HELP / FEED` — plus two
+  **pseudo-state words** shown only in the Normal slot:
+  `RAW` when the focused pane is raw (C23), `ZOOM` when zoomed (C21).
+  Precedence: a real non-Normal mode word always wins; else `RAW` beats
+  `ZOOM` beats `NORMAL` (input safety trumps view state).
+- **New / amended pair lists** (all obey the same styling formula):
+  - Feed mode (C20): `↑↓ scroll` · `Esc close`.
+  - Focused-raw Normal (C23): exactly **one** pair — `Alt+Shift+p exit raw`.
+    Every other hint would be a lie: nothing else is intercepted.
+  - Copy mode (C24, replaces the two-pair list at `:70`):
+    `hjkl move` · `v mark` · `y/↵ yank` · `drag select` · `Esc exit`
+    (63 columns — fits beside the right segment at 100 cols).
+  - Zoomed Normal keeps the standard seven pairs (they all still work).
 
 ### C10 — Flash message
 
@@ -364,6 +406,9 @@ modals; derived from its rules):**
   mechanism unchanged (`:126–141`).
 - Anchoring: `centered_near(anchor, body, w, h)` unchanged, including its
   tests (`:507–527`).
+- [Amended 2026-07-22, fleet features] The feed overlay (C20) is a fourth
+  C12 modal. Modals are the **topmost** chrome layer — above the float pane
+  (C22) and the zoomed view (C21); stacking order is contracted in C22.
 
 ### C13 — Rename dialog
 
@@ -393,6 +438,15 @@ clamped to screen bounds; anchoring via `centered_near` unchanged — no
 mid-word clipping of its own content. [Amended 2026-07-22, ux finding #1;
 the fixed 52-col width predates the restyle and clipped descriptions.]
 
+**[Amended 2026-07-22, fleet features]:** "content unchanged" is superseded —
+the help overlay's row list is now pinned to the **§8 key table** and grows by
+exactly six rows (Alt+a, Alt+e, Alt+z, Alt+f, Alt+Shift+p, Alt+g — wording per
+§8). **Hard cap: ≤ 20 content rows.** Arithmetic: at the 80×24 floor the body
+is 22 rows; 20 content + 2 border = 22 — the overlay fits exactly with zero
+slack. The current list is 14 rows (`render.rs:301–316`) + 6 = 20. Any future
+chord must merge into an existing row (the `Alt+t / Alt+1..9` idiom), never
+add a 21st.
+
 ### C16 — Dead-pane overlay
 
 **Current:** `render.rs:387–403` — error line Red fg; action bar Black on Red.
@@ -411,7 +465,8 @@ the fixed 52-col width predates the restyle and clipped descriptions.]
 
 **Target:** unchanged, and **must stay modifier-based**: selection sits on top
 of arbitrary program colors, so it may not assume any palette token. Contract
-exists to stop a well-meaning restyle from "theming" it.
+exists to stop a well-meaning restyle from "theming" it. (The keyboard copy
+cursor, C24, extends this rule — modifiers only.)
 
 ### C18 — vt100 blit guard
 
@@ -419,7 +474,399 @@ exists to stop a well-meaning restyle from "theming" it.
 
 **Target:** **zero diffs** in these functions for this engagement. Program
 output keeps its own colors, attributes, and default-bg passthrough. Any
-change here is an automatic DEVIATED.
+change here is an automatic DEVIATED. [Re-affirmed 2026-07-22 for the fleet
+build: the feed, float, zoom, raw, and copy-cursor features all draw *around*
+the blit, never inside it.]
+
+---
+
+### C19 — Jump-to-attention (Alt+a) — [Added 2026-07-22, fleet features]
+
+**Current:** no binding — unmatched Alt chords are swallowed
+(`input.rs:72–77`); the hint bar's `◆ N needs you` segment
+(`render.rs:114–123`) is informational only; reaching a needy pane in another
+tab takes Alt+{digit} then Alt+arrows.
+
+**Target:**
+- New `Action::JumpAttention`, bound to **Alt+a** in `translate()`
+  (`input.rs:39–81`). Mnemonic: *attention*. (Collision note: zsh's emacs
+  keymap binds ESC-a to accept-and-hold — already swallowed by roost today;
+  raw mode, C23, is the remedy for panes that want it.)
+- **Attention ring** R: every pane whose runtime status is `NeedsInput` —
+  the *same* predicate as `needs_input_count` (`app.rs:526–528`), so the ring
+  size always equals the hint bar's N (the affordance never lies). Ordered by
+  `(tab index ascending, position in that tab's pane_order())`; the float
+  pane (C22), if needy, is last. Nothing else is in the ring — not Exited,
+  not Working: worst-first across roost's statuses means ◆ is the only
+  actionable severity, and the ring must match the advertised count.
+- Press semantics (deterministic, unit-tested):
+  - R empty → flash `nothing needs you` (flash mechanism `app.rs:1169–1179`);
+    no other state changes.
+  - Else focus the first member of R whose ring position is strictly after
+    the focused pane's position, **wrapping** past the end to R[0] (the ring
+    wraps by contract); if the focused pane is the only member, flash
+    `nothing else needs you` and stay.
+  - Repeated presses visit every member in order and wrap.
+- Jump mechanics reuse existing paths: a cross-tab jump switches the active
+  tab with `go_to_tab` semantics (`app.rs:1485–1491`, lazy spawn included);
+  any jump expands the target in its stack (`expand_in_stacks`, as focus
+  moves do at `app.rs:1364–1370`); a jump to the float shows it (C22).
+- Zoom interplay (C21): a same-tab jump keeps zoom (zoom follows focus); a
+  cross-tab jump exits zoom (tab-switch rule).
+- Hint-bar affordance: the amended C9 right segment
+  (`◆ {N} needs you · Alt+a`) is this feature's discoverability surface; no
+  Normal-mode pair is added (C9 amendment, justification there).
+- Unit tests: ring order across two tabs; wrap; focused-not-in-ring; empty
+  ring flash; count == ring size.
+
+### C20 — Activity feed (Alt+e) — [Added 2026-07-22, fleet features]
+
+**Current:** no surface. The data exists but scattered: control actions are
+audit-logged (`app.rs:675–695` → `<state>/control.log`), status arrives via
+extension events (`app.rs:1081`) or is polled from `StatusTracker`
+(`status.rs:99–158`), exits via `on_pty_exit` (`app.rs:1058`).
+
+**Target:**
+- **Surface: a C12 modal overlay, not a persistent pane.** Rationale: at the
+  80×24 floor there is no spare row for a persistent strip (the C6 height
+  rules show how expensive reserved rows are), a pane would churn PTY resizes
+  on every toggle, and the ~33 ms draw tick already makes an open overlay
+  *stream live* — entries appended while it is open appear on the next frame.
+  Trade-off accepted: keys are captured while it is open (it is a monitoring
+  glance, not a workspace).
+- New `Mode::Feed { offset: usize }` (`Mode` enum, `app.rs:49–58`), entered
+  by **Alt+e** (`Action::ToggleFeed`) from Normal. Mnemonic: *events*. Mode
+  word `FEED` (C9). Keys while open: `Esc`/`q`/`Alt+e` close; `Up`/`k`,
+  `Down`/`j` scroll one entry; `PgUp`/`PgDn` scroll half the overlay height;
+  `offset` counts entries back from the newest, clamped to the buffer;
+  offset 0 follows the live tail. All other keys are consumed
+  (`handle_mode_key` pattern, `app.rs:1496`).
+- **Ring buffer:** `VecDeque<FeedEntry>` on `App`, capacity **200**, oldest
+  evicted first. Session-only — never persisted. An entry is
+  `(SystemTime, kind, text)`; text is preformatted at push time.
+- **Event taxonomy — exactly five kinds, hooked at these seams:**
+
+  | kind | hook (single source each — no double reporting) | line text |
+  |---|---|---|
+  | `status` | the 2 s housekeeping tick (`app.rs:367–401`): App keeps a last-known-status map for spawned panes and diffs it *before* the `pending_detect` early-return. One source for all transitions — extension-pushed and heuristic alike — at ≤ 2 s granularity (documented; a sub-2 s flicker may be missed, accepted). Transitions **to Exited are suppressed** here (the `exit` hook owns that). First observation of a pane logs nothing (`spawn` owns birth). | `{name}: {old} → {new}` using the C8 state words |
+  | `spawn` | `spawn_pane` success (`app.rs:349–358`) — covers Alt+n, picker, control spawn/fork, undo restore, respawn | `spawned {name} ({adapter})` |
+  | `close` | `close_pane_id` (`app.rs:980–1028`) and `undo_close` (`app.rs:1309–1333`) | `closed {name}` / `closed tab {name}` / `reopened {name}` / `reopened tab {name}` |
+  | `exit` | `on_pty_exit` (`app.rs:1058–1072`), including the focused pane (unlike the notifier) | `{name} exited` |
+  | `ctl` | `audit()` (`app.rs:675–695`, becomes `&mut self`; feed push happens even when there is no socket dir) — the same sanitized `method_summary` as `control.log`, so broadcast and every other control verb land here with zero extra code | `ctl {principal}: {summary} → {ok\|err}` |
+
+  Session-detection events are deliberately excluded (noise, not action).
+- **Geometry:** centered on `body_area()`;
+  `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`; C12 frame
+  (Plain `ACCENT` border, title `" activity "`, `Clear` interior, DIM
+  backdrop). At the 80×24 floor: 72×16, fits.
+- **Entry rows**, newest at the bottom, one row per entry (no wrap; the
+  paragraph clips long lines at the overlay width):
+  `" HH:MM:SS  {text}"` — timestamp (local wall clock) fg `DIM`, text fg
+  `MUTED`. Exception: a `status` line whose new state is NeedsInput renders
+  its text fg `FG` prefixed with `◆ ` fg `ACCENT` — the one red in the feed,
+  same meaning as everywhere (C5).
+- **Empty state:** a single centered line `no activity yet` fg `DIM`.
+- Unit tests: ring cap eviction at 200; taxonomy hooks fire (status diff on
+  tick, ctl entry on an audited control call, exit-suppression rule); the
+  NeedsInput-line styling rule; offset clamping.
+
+### C21 — Pane zoom (Alt+z) — [Added 2026-07-22, fleet features]
+
+**Current:** no zoom. Rendering walks every `PaneRect` of the active tab
+(`render.rs:48–51` via `app.rects()`, `app.rs:283–287`); PTY sizing and mouse
+hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
+
+**Target:**
+- New `Action::ToggleZoom`, bound to **Alt+z** (`translate()`). Mnemonic:
+  *zoom* — tmux's `prefix+z` heritage. App-level `zoomed: bool`,
+  session-only, never persisted.
+- **Semantics: zoom is a pure view transform.** The layout tree is untouched.
+  While zoomed, the renderer, PTY-resize, and mouse paths consume a display
+  list containing exactly one entry: the focused pane at the full
+  `body_area()` (a `display_rects()` accessor beside `rects()`); the focus
+  math (`layout::neighbor`, `app.rs:1364–1370`) keeps using the real tree.
+  Consequences, all contracted:
+  - The zoomed pane draws with its normal chrome — `ACCENT` focused border
+    (C3) and corner badge (C4). Stack headers (C6) are not drawn while
+    zoomed. Tab bar and hint bar are unaffected (outside the body).
+  - Focus moves still work: Alt+arrows/hjkl (and same-tab Alt+a) move focus
+    through the real layout and the zoomed view then shows the newly focused
+    pane — **zoom follows focus** (zellij-style; deliberate deviation from
+    tmux's unzoom-on-switch: zoom stays a stable one-pane-at-a-time reading
+    mode instead of silently ending).
+  - The zoomed pane's PTY is resized to the full body inner dims; hidden
+    panes keep their last size until unzoom relayouts them (no reflow churn
+    while reading).
+  - Mouse: body clicks/wheel can only hit the zoomed pane (it is the whole
+    display list); tab-bar clicks behave normally (and exit zoom, below).
+- If the focused pane is a collapsed stack member when Alt+z fires, it is
+  expanded first (`expand_in_stacks`), then zoomed.
+- **Exits zoom** (exhaustive list): Alt+z again · any tab change (Alt+t,
+  Alt+1..9, tab-bar click, cross-tab Alt+a) · any structural layout action —
+  Alt+n, picker launch, Alt+s, Alt+o, Alt+Shift+arrows, Alt+g — which exit
+  zoom *first, then apply*, so the layout never changes invisibly · the
+  zoomed pane closing (Alt+w or control close). **Keeps zoom:** focus moves,
+  same-tab Alt+a, entering/leaving scroll·copy·rename·help·feed modes, the
+  float toggle (the float draws above the zoomed view, C22), control-plane
+  activity in other panes.
+- Alt+z while the float (C22) is focused: no-op + flash `can't zoom the
+  float`.
+- **Chrome indication:** the C9 mode-word slot shows `ZOOM` whenever zoomed
+  and the mode is Normal (precedence per C9 amendment: real mode words and
+  `RAW` win over `ZOOM`). No border/badge change — the full-body accent
+  border is itself the signal. Normal hint pairs unchanged.
+- Unit tests: display list is `[focused @ body]` iff zoomed; each exit
+  trigger clears the flag; focus-move-under-zoom retargets the display list;
+  PTY resize targets.
+
+### C22 — Floating scratch pane (Alt+f) — [Added 2026-07-22, fleet features]
+
+**Current:** no floating anything. All panes live in a tab's layout tree;
+`hit_test` scans tiled rects in order (`mouse.rs:37–47`); pane ids are
+allocated by scanning the tabs (`workspace.rs:57–65`).
+
+**Target:**
+- New `Action::ToggleFloat`, bound to **Alt+f**. Mnemonic: *float* — zellij's
+  own Alt+f. (Collision note, flagged per brief: Alt+f is readline
+  forward-word; roost already swallows it today (`input.rs:72–77`), and raw
+  mode (C23) is the remedy for panes that need it back.)
+- **One float slot, app-wide** (not per tab): `Option<Float>` holding
+  `{ id, spec, shown, prev_focus }`. The scratch's roadmap cousin (a floating
+  *picker*) is explicitly out of scope.
+- **Lifecycle:** first toggle spawns a `shell` adapter pane in the focused
+  pane's cwd (else the process cwd), spec title preset `"scratch"`, shown and
+  focused. Later toggles hide/show; the process stays alive while hidden.
+  **Session-only by design:** never written to `workspace.json`; at quit it
+  dies like every pane and is not restored — a scratch pane is ephemeral
+  (documented honest scope). Closing it (Alt+w while focused) kills it and
+  clears the slot **without** an undo entry (scratch is not precious); flash
+  `scratch closed`. If its shell exits, the C16 dead-pane overlay renders
+  inside the float rect and Enter/f relaunch as normal.
+- **Id safety (hard predicate):** pane-id allocation must account for the
+  float — `workspace.rs::next_pane_id` scans only the tabs, so without a
+  guard the next split would reuse the float's id. Allocation goes through an
+  App-level wrapper: `max(ws.next_pane_id(), float.id + 1)`.
+- **Geometry:** centered on `body_area()`;
+  `w = clamp(3·body.width/5, 36, body.width − 4)`,
+  `h = clamp(3·body.height/5, 8, body.height − 2)`. If `body.width < 40` or
+  `body.height < 10`, the toggle refuses with flash `no room for float`.
+  Worked example (audit fixture): 80×24 terminal → body 80×22 → float 48×13,
+  centered. Recomputed on resize.
+- **Stacking order (topmost last), contracted:** tiled panes → zoomed view
+  (C21) → **float** → C12 modal overlays (rename/picker/help/feed). The
+  float never dims the workspace — it is a pane, not a modal.
+- **Border/badge:** rendered exactly as a pane: `ACCENT` focused border
+  whenever shown (it is focused whenever shown — next bullet), corner badge
+  through the normal titled path → `scratch · shell {glyph}`. No new glyphs,
+  no special border.
+- **Focus & input rules (the whole contract in four lines):**
+  1. Shown ⇒ focused. All keys route to it normally; scroll, copy, and
+     rename modes target it like any pane.
+  2. Any action that moves focus off it **hides** it (process alive):
+     Alt+arrows/hjkl, Alt+a, any tab change, a mouse click outside its rect
+     (that click then lands normally on what it hit). Focus returns to
+     `prev_focus`.
+  3. Structural pane actions — Alt+n, picker launch, Alt+s, Alt+o,
+     Alt+Shift+arrows, Alt+g, Alt+z — first hide the float and restore
+     `prev_focus`, *then* apply. (The float is outside the layout tree;
+     without this, `spawn_child`'s empty-tab fallback at `app.rs:1425–1427`
+     would wipe the tab's layout when asked to split a pane the tree doesn't
+     contain.)
+  4. Alt+w closes it for real (above); Alt+f hides it.
+- **Mouse:** when shown, the float's rect is **first** in the hit-test list
+  (`hit_test` takes the first match — the caller orders the slice; topmost
+  wins). Wheel, clicks, drags, and copy-mode selection inside it behave as
+  for any pane.
+- **Control plane (documented, deliberate):** the float is absent from
+  `roost list` (`ctl_list` walks `ws.tabs`); `send`/`read` by id work
+  (`find_spec` learns the float so badges/rename/respawn work); control
+  `close` of the float is refused with `cannot close the scratch pane`.
+- Unit tests: spawn-once/hide/show lifecycle; id-allocation guard; geometry
+  formula incl. refusal floor; focus rules 1–3; hit-test ordering.
+
+### C23 — Per-pane raw mode (Alt+Shift+p) — [Added 2026-07-22, fleet features]
+
+**Current:** roost owns the whole Alt layer: matched chords become actions,
+**unmatched Alt chords are swallowed**, never forwarded (`input.rs:72–77`) —
+an agent CLI with its own Alt bindings (readline word ops, custom editors)
+can never see them.
+
+**Target:**
+- New `Action::ToggleRaw`, bound to **Alt+Shift+p** — also accepted as
+  Alt+`'P'` (uppercase-delivery tolerance, same as the rename-tab chord,
+  `input.rs:59–60`). Toggles the **focused** pane's membership in an
+  App-level `raw: HashSet<PaneId>`; per-pane, session-only, never persisted.
+- **Exit-chord rationale (safety-critical, recorded):** while raw this is the
+  only chord roost intercepts, so it must be (a) nearly impossible to hit by
+  accident — a three-key shifted chord is; (b) collision-free — no default
+  readline/zsh/agent-CLI binding uses shifted meta letters; (c) memorable —
+  it is the *same* chord that enters raw ("the key that got you in gets you
+  out"), P = **P**ass-through, and the hint bar displays it the entire time
+  the pane is raw (below), so nobody can get trapped. Lowercase Alt+p stays
+  unbound in Normal and passes through in raw.
+- **Routing predicate (the core of the contract):** when
+  `mode == Normal && raw.contains(focused) && !focused_dead()`, every key
+  event except Alt+Shift+p bypasses `translate()` and is forwarded as bytes
+  (`main.rs` key path, `:281–298`):
+  - non-Alt keys: exactly today's `encode_key` bytes (`input.rs:103–142`),
+    kitty upgrade included;
+  - **Alt-modified printable keys: the meta-ESC convention** — `0x1b` + the
+    unmodified key's encoding (this is what readline/agent CLIs bind);
+    Alt+Enter → `0x1b 0x0d`. Other Alt+special keys forward as their
+    unmodified encoding (documented approximation; upgrade path if an agent
+    ever needs it: xterm `CSI 1;3` modifier encodings).
+  - **Nothing else is intercepted.** Not Alt+q, not Alt+arrows, not
+    Alt+1..9 — that is the feature. The hint bar shows the way out.
+- **Interplay with modes:** raw routing applies only in Normal mode.
+  Non-Normal modes are unreachable from a raw-focused pane by keyboard (their
+  entry chords pass through) — by design. **Mouse is unaffected** (raw is a
+  key-path property): click another pane to move focus away; the flag stays
+  on its pane and routing resumes when it is refocused. Paste events forward
+  unchanged. A **dead** raw pane falls back to dead-pane key handling
+  (`main.rs:284–287` — Enter/f/Alt+w work; forwarding keys to a corpse would
+  trap the user).
+- **Indication (must be visible on the pane even when unfocused):**
+  - Corner badge (C4): the badge text gains a `raw` token —
+    titled: `"{name} · {adapter} · raw {glyph}"`, untitled:
+    `"{name} · raw {glyph}"` — the `raw` token fg `ACCENT_DIM` (the
+    "roost stepped back" color family, C11/C16).
+  - Collapsed stack row (C8): right segment gains the prefix →
+    `"raw · {word}"`.
+  - Hint bar while a raw pane is focused and mode is Normal: mode word
+    `RAW`, pair list exactly `Alt+Shift+p exit raw` (C9 amendment). `RAW`
+    beats `ZOOM` in the word slot.
+- Orthogonal to zoom/float/stacks: the flag follows the pane wherever it
+  renders; the float can be marked raw too.
+- Unit tests: routing predicate (raw focused: `Alt+q` forwards as
+  `0x1b 'q'`, `Alt+b` as `0x1b 'b'`, Alt+Shift+p toggles off; cooked pane
+  unchanged); dead-pane override; badge/row tokens; only-intercepted-chord
+  property (table-driven over the whole current action list).
+
+### C24 — Keyboard copy mode — [Added 2026-07-22, fleet features]
+
+**Current:** `Mode::Copy` is mouse-only — drag selects, release copies; keys
+just exit (`app.rs:1595–1602`); selection painted `REVERSED` per C17
+(`render.rs:763–781`); extraction via `grab_text` (visible grid, inclusive
+reading order).
+
+**Target:**
+- `Mode::Copy` gains a cursor: `Mode::Copy { cursor: (u16, u16) }` in the
+  focused pane's inner cell space. Initial position: `(inner_height − 1, 0)`
+  — bottom-left; deterministic, and adjacent to the prompt in practice.
+- **Key set (the brief's minimum, nothing more):**
+  - `h j k l` and arrows — move one cell, clamped to the inner grid;
+  - `0` — column 0; `$` — last column (`inner_width − 1`);
+  - `v` — set the anchor at the cursor / clear an existing anchor (toggle);
+    with an anchor set, movement extends the selection (`Selection.cursor`);
+  - `y` or `Enter` — with a selection: yank via the existing
+    `finish_selection` path (`app.rs:1153–1166` — clipboard, `copied N
+    chars` flash, exit to Normal); without: flash `nothing selected`, stay;
+  - `Esc` / `q` — exit, clearing any selection.
+  - Alt chords still break out to global bindings (existing rule,
+    `app.rs:1503–1511`).
+- **Cursor visualization (modifier-only, extends C17 — no palette tokens):**
+  the cursor cell always carries `Modifier::REVERSED`; when it lies inside an
+  active selection it additionally carries `UNDERLINED`, so it stays
+  distinguishable within the reversed region. Painted after the selection
+  pass. Any color-token styling of the cursor is a DEVIATED.
+- **Selection semantics — identical to the mouse path** (one selection
+  model, two input methods): inclusive anchor→cursor, reading order, same
+  `Selection` struct, same `highlight_selection`, same `grab_text`. Honest
+  limit, shared with the mouse path and documented: the **visible grid
+  only** — no scrollback paging inside copy mode (deliberately left out;
+  Scroll mode remains a separate concern).
+- **Mouse drag still works in copy mode** and simply replaces the keyboard
+  selection (both write `app.selection`); a drag also moves the cursor to
+  the drag point, so the two methods interleave without surprises.
+- Hint pairs per C9 amendment: `hjkl move · v mark · y/↵ yank · drag select
+  · Esc exit`.
+- Unit tests: motion clamping; `0`/`$`; anchor toggle and extension;
+  yank-with/without-selection; Esc clears; drag-replaces-keyboard-selection.
+
+### C25 — Canned layout cycle (Alt+g) — [Added 2026-07-22, fleet features]
+
+**Current:** layout shape is built up manually (splits Alt+n/Alt+o, stacks
+Alt+s, ratios Alt+Shift+arrows); no way to snap the tab to a known-good
+arrangement. Tree ops live in `layout.rs` (`toggle_stack :129–166`,
+`split_pane :54–78`); `MIN_SPLIT_COLS/ROWS = 36/10` gate splits
+(`app.rs:31–32`).
+
+**Target:**
+- New `Action::CycleLayout`, bound to **Alt+g**. Mnemonic: *arranGe / grid*.
+  (Rejected alternatives, recorded: `Alt+Space` — tmux's next-layout key, but
+  OS-captured as the window/system menu on GNOME and Windows Terminal;
+  `Alt+[`/`Alt+]` — zellij's, but ESC-`[` *is* the CSI introducer byte pair,
+  an encoding hazard.)
+- **Zero-config, hardcoded, exactly three arrangements**, applied to the
+  active tab's pane set. Let `P` = `pane_order()` of the current tree at
+  press time, `f` = the focused pane, `n = |P|`. Only `tab.layout` is
+  replaced — specs, sessions, titles, runtimes untouched.
+  1. **even-grid:** `c = ceil(sqrt(n))`, `r = ceil(n/c)`;
+     `Split{Horizontal}` of `r` rows (even ratios), each row a
+     `Split{Vertical}` of the next ≤ c panes of P (even ratios); a single
+     row/column collapses to one Split; `n = 1` → `Pane`. Worked shapes
+     (audit fixtures): n=2 → side-by-side; n=3 → 2 over 1; n=4 → 2×2;
+     n=5 → 3 over 2; n=7 → 3/3/1.
+  2. **main+stack:** `Split{Vertical, ratios [0.6, 0.4]}` — left `Pane(f)`,
+     right `Stack(P minus f, expanded 0)`. `n = 2` → a plain 0.6/0.4
+     vertical split (no one-member stacks); `n = 1` → `Pane`.
+  3. **all-stack:** `Stack(P, expanded = position of f in P)`.
+- **Preservation rules (each a predicate):** focus stays on `f` in all
+  three · pane order is preserved — `pane_order()` of the produced tree
+  equals `P`, except main+stack where `f` moves to the front (deterministic,
+  pinned by test) · prior stack membership is **not** preserved (the
+  arrangement dictates structure — that is the feature) · prior ratios are
+  lost (canned means canned) · not undoable via Alt+u (undo is for closes;
+  documented) · the result is persisted like any layout edit; PTYs resize
+  via the normal relayout.
+- **Cycle & fit:** one App-level cycle counter (session-only) advancing
+  grid → main+stack → all-stack → grid. An arrangement **fits** iff every
+  non-collapsed rect it would produce in the current body area is
+  ≥ `MIN_SPLIT_COLS × MIN_SPLIT_ROWS` (36×10 — the existing split floors;
+  collapsed 1-row stack bars are exempt by design). Alt+g applies the next
+  **fitting** arrangement, skipping unfit ones; the counter lands on what was
+  applied.
+- **Cycling is disabled** (press is a no-op, counter does not advance) when:
+  `n < 2` → flash `one pane — nothing to arrange`; or no arrangement fits →
+  flash `no room to rearrange`.
+- Interplay: exits zoom first (C21 structural rule); hides the float first
+  if focused (C22 rule 3); the float itself is untouched (not in the tree).
+- Builders and the fit predicate are pure `layout.rs` functions with unit
+  tests: the worked shapes above, order preservation, fit refusal, n=1/n=2
+  degenerate forms.
+
+### C26 — Tab undo: scope statement — [Added 2026-07-22, fleet features]
+
+**Current = already implemented.** Verified in the working tree: the undo
+stack has a whole-tab variant (`Closed::Tab`, `app.rs:89–95`), captured with
+the tab's full state when closing its last pane empties it
+(`close_pane_id`, `app.rs:999–1014` — snapshot cloned *before* removal, so
+the last pane's spec and session ride along), restored at its original index
+with name + layout + specs + sessions by `undo_close` (`app.rs:1315–1322`),
+respawned via `spawn_active_tab`; pinned by the existing test
+`undo_reopens_a_closed_tab` (`app.rs:1859–1867`). The brief's "extend to
+whole tabs" is therefore a **scope statement + pinning**, not a build.
+
+**The honest scope (contracted wording for README/help):**
+- What restores on Alt+u after a tab disappears: the tab, by name, at its
+  original position, with the layout and pane specs it had at the moment it
+  emptied — **session ids included, so agents resume**.
+- Honest limits (deliberate, documented):
+  - A multi-pane tab is dismantled close-by-close, so its earlier panes come
+    back as individual pane-undos — sessions intact, but re-split off the
+    focused pane (`restore_pane`, `app.rs:1337–1361`) rather than at their
+    original geometry/ratios. Only the state at last-pane close restores
+    atomically. (There is no close-whole-tab gesture to snapshot sooner —
+    tabs only die by their last pane closing.)
+  - The stack holds 20 entries (`UNDO_DEPTH`, `app.rs:78`) and is
+    session-only — quitting roost clears it.
+  - Closing the last pane of the *last* tab quits roost; nothing to undo
+    (existing confirm guard covers it, `app.rs:1445–1456`).
+  - The float pane (C22) never enters the undo stack.
+- **Build work is exactly:** one added unit test (a 3-pane tab closed
+  pane-by-pane, then 3×Alt+u restores all three panes with their sessions
+  and the tab name) + the README wording above. Zero behavior change; any
+  behavior diff in this area is a DEVIATED.
 
 ---
 
@@ -465,6 +912,14 @@ Every px-only construct in the mockup, and its cell-level fate:
   aggregation (`app.rs:448–476`), and decay windows are not touched; this is a
   re-skin of their presentation plus one honest addition (save-result
   tracking, C2).
+- **[Added 2026-07-22, fleet features] One display list, ordered.** The
+  renderer, PTY sizing, and mouse hit-testing consume the same
+  `display_rects()` sequence: float first when shown (topmost wins in
+  `hit_test`), else the zoom singleton when zoomed, else `rects()`. Focus
+  math alone keeps reading the real tree (`rects()`), which is what makes
+  zoom-follows-focus work. Raw mode (C23) alters the **key path only** —
+  mouse routing, mouse capture, paste, and the vt100 blit are untouched by
+  it.
 
 ---
 
@@ -474,7 +929,7 @@ Every px-only construct in the mockup, and its cell-level fate:
 
 The `design-supervisor` agent runs after any change under `src/ui/**`,
 `src/core/layout.rs`, or `src/core/app.rs` (UI-adjacent helpers), and issues
-one verdict per contract C1–C18: **ALIGNED** or **DEVIATED** (+ file:line and
+one verdict per contract C1–C26: **ALIGNED** or **DEVIATED** (+ file:line and
 the violated bullet). Mechanics per contract class:
 
 - **Greppable predicates** (C1 theme gate, C18 zero-diff, no-BOLD rule,
@@ -482,12 +937,13 @@ the violated bullet). Mechanics per contract class:
   `Color::` outside the blit section, `Modifier::BOLD` anywhere in `ui/`,
   any of `7fae7f|d8a657|8fb2c9` under `src/ui/`.
 - **Structural predicates** (C2 cell layout + width formula, C6 geometry
-  threshold, C5 phase boundaries): verify against the unit tests this plan
-  requires (mouse offsets, layout stack rects, pulse phase) — tests are the
-  executable form of the contract.
-- **Visual predicates** (colors in place, marker glyphs, right-alignment):
-  verify by reading the span-construction code; ambiguity → run roost and
-  eyeball, or wait for the harness below.
+  threshold, C5 phase boundaries; fleet additions: C19 ring order, C20 ring
+  cap/taxonomy, C21 display list, C22 geometry/id guard, C23 routing
+  predicate, C24 motion/anchor, C25 builders/fit): verify against the unit
+  tests this plan requires — tests are the executable form of the contract.
+- **Visual predicates** (colors in place, marker glyphs, right-alignment,
+  feed styling, raw badge token): verify by reading the span-construction
+  code; ambiguity → run roost and eyeball, or use the harness below.
 
 ### vt100 golden-frame harness — assessment
 
@@ -522,6 +978,48 @@ is meant to verify. It is recorded as its own decision item in the plan
 (PLAN.md P6) with a revisit trigger: first post-restyle chrome regression, or
 the next engagement that touches `src/ui/render.rs`.
 
+### Firehose input-latency gate — the harness's first concrete test
+**[Added 2026-07-22, fleet features — item 10]**
+
+The trigger above has fired in spirit: the fleet engagement touches
+`src/ui/render.rs` heavily, and item 10 needs a real PTY anyway. The firehose
+test therefore **instantiates the harness foundation** — the spawn/settle
+helper is ~80 % of what the golden frames would need, so the marginal cost of
+folding the foundation in is near zero. **Golden-frame color scenarios remain
+deferred** on the same trigger as before; this is a smoke-level perf gate,
+not a benchmark suite.
+
+- **Files:** `tests/harness/mod.rs` (shared helper: open a portable-pty at
+  120×40 · exec `CARGO_BIN_EXE_roost` with `ROOST_STATE=<tempdir>` and a
+  fixture `workspace.json` · feed PTY bytes to a `vt100::Parser` ·
+  `settle()` = poll-parse until two consecutive parses agree) and
+  `tests/firehose.rs`. roost is a **binary** crate, so integration tests
+  cannot import its modules — the harness drives the built binary and needs
+  its own parser deps: `Cargo.toml` gains
+  `[dev-dependencies] portable-pty = "0.8"` and
+  `vt100 = { path = "vendor/vt100" }` (same versions as the main deps; no
+  new third-party code).
+- **Scenario:** fixture workspace of two `shell` panes side by side. Pane A
+  runs a flat-out spew loop (`sh -c 'while :; do printf "%0.sX" $(seq 200);
+  echo; done'` — deterministic filler, ~200-char lines). Pane B is a quiet
+  interactive shell holding focus. During ≥ 5 s of sustained spew, write 20
+  single printable characters to the outer PTY at 100 ms intervals; after
+  each, poll the parsed outer screen for the character echoed in pane B's
+  region.
+- **Pass thresholds (each an assertion):**
+  1. **Input latency:** every echo visible within **250 ms** of the write
+     (≈ 7–8 of the ~33 ms draw ticks — an order-of-magnitude guard that
+     survives CI jitter, chosen against the loop's own budget:
+     33 ms poll + 512-events/tick cap, `main.rs:173/:210`).
+  2. **No draw starvation:** pane A's on-screen region differs between
+     consecutive 500 ms samples for the whole run (the firehose visibly
+     keeps flowing — bounded, not frozen).
+  3. **Clean exit under load:** send Alt+q (`0x1b q` — meta-ESC) mid-spew;
+     the roost process exits within **2 s** and no child of it survives
+     (the historical quit-freeze regression, ROADMAP "Alt+q freeze fix").
+- Skipped on runners without a functional PTY (compile-time cfg or runtime
+  skip with a printed reason) — same stance as the golden-frame assessment.
+
 ---
 
 ## 7. Spec gaps & deliberate exclusions
@@ -541,5 +1039,60 @@ the next engagement that touches `src/ui/render.rs`.
   Documented stance, no code (see §2).
 - **Deliberately left out:** config/theme file (zero-config stands, tokens are
   consts) · named-ANSI fallback palette · tab-overflow scrolling (ROADMAP item;
-  C2 clips honestly) · any restyle of program output · golden-frame harness in
-  this build (see §6) · letterspacing/gap/padding emulation (§4).
+  C2 clips honestly) · any restyle of program output · golden-frame *color
+  scenarios* in this build (§6 — the harness foundation itself now ships with
+  the firehose gate) · letterspacing/gap/padding emulation (§4).
+- **[Added 2026-07-22, fleet features — deliberately left out:]**
+  float persistence across restarts (scratch is ephemeral, C22) · feed
+  persistence / feed filtering / feed search (200-entry ring is the whole
+  product, C20) · sub-2 s status-transition granularity in the feed (single
+  tick-diff source beats double-reporting, C20) · per-tab zoom flags (one
+  app-level bool, C21) · copy-mode scrollback paging (visible grid only,
+  same as the mouse path, C24) · layout-cycle undo (C25) · a close-whole-tab
+  gesture (C26 — tabs die by last-pane close only) · a TUI broadcast key
+  (fat-finger safety — CLI only, per brief; grammar lives in PLAN F2) ·
+  configurable keys for any of the above (zero-config stands).
+
+---
+
+## 8. Key table — [Added 2026-07-22, fleet features]
+
+The one canonical list. The help overlay (C15) renders exactly these rows in
+this order (merged rows stay merged; ≤ 20 rows, hard cap). The hint bar shows
+only the C9-curated subsets.
+
+| # | Chord | Action | Contract |
+|---|---|---|---|
+| 1 | `Alt+n` | new shell pane (auto split) | — |
+| 2 | `Alt+Enter` | quick-launch picker (pi / claude / shell) | C14 |
+| 3 | `Alt+←↓↑→ / hjkl` | move focus | — |
+| 4 | `Alt+Shift+←↓↑→` | resize along that axis | — |
+| 5 | `Alt+s` | toggle split ⇄ stack | C6–C8 |
+| 6 | `Alt+o` | flip split orientation | — |
+| 7 | `Alt+g` | **cycle layout: grid / main+stack / all-stack** | C25 |
+| 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
+| 9 | `Alt+f` | **floating scratch shell (toggle)** | C22 |
+| 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
+| 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
+| 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
+| 13 | `Alt+t / Alt+1..9` | new tab / go to tab | C2 |
+| 14 | `Alt+w` | close pane (confirm if busy / last) | — |
+| 15 | `Alt+u` | undo — reopen last closed pane/tab | C26 |
+| 16 | `Alt+c` | copy mode (hjkl+v+y, or drag) | C17/C24 |
+| 17 | `Alt+PgUp` | scroll mode | — |
+| 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
+| 19 | `Alt+/` | toggle hint bar | C9 |
+| 20 | `Alt+q` | quit (workspace saved; sessions live) | — |
+
+Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
+raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes
+capture their own keys (C9 lists them).
+
+Control-plane only, no key by design: `roost send --all TEXT [--enter]`
+(broadcast — PLAN F2; surfaces in chrome only as a C20 `ctl` feed line).
+
+Free Alt keys remaining after this engagement: `b d i m p v x y 0 PgDn`.
+Collision flags (all already swallowed by roost today, `input.rs:72–77`;
+raw mode C23 is the remedy): `Alt+f` readline forward-word · `Alt+a` zsh
+accept-and-hold · `Alt+b/d` left deliberately free (readline word ops — the
+most-missed bindings; do not assign them to chrome without strong cause).
