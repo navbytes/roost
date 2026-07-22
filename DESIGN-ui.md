@@ -142,8 +142,8 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
 - Brand block removed entirely. `TABBAR_PREFIX` / `TABBAR_PREFIX_WIDTH` and
   the prefix-width test (`mouse.rs:262–269`) are deleted. Tabs start at x=0.
 - Row 0 is filled edge-to-edge with bg `TAB_STRIP` (including empty middle).
-- Each tab i renders as 7 parts, in order:
-  `marker(1) + " " + label + " " + glyph(1) + " " + "│"(1)` where
+- Each tab i renders as 8 parts, in order:
+  `marker(1) + " " + label + " " + glyph(1) + " " + "│"(1) + " "(1)` where
   `label = tab_label(i, name) = "{i+1} {name}"` (function unchanged).
   - marker: `▎` fg `ACCENT` for the active tab; `" "` for inactive.
   - label + number: fg `FG` for active, fg `MUTED` for inactive; active cell
@@ -151,12 +151,22 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
   - glyph (aggregate `TabSummary`, semantics unchanged from `app.rs:448–476`):
     NeedsInput `◆` `ACCENT` · Working `●` `ACCENT` + pulse (C5) · Unknown `·`
     `DIM` · Waiting `○` `FG` · Quiet = single space.
-  - separator `│` fg `RULE`, drawn after every tab (including the last).
-- `mouse::tab_width(i, name)` returns `label.chars().count() + 6` and the
-  renderer emits exactly that many columns per tab; `tab_at_x` starts at 0.
+  - separator `│` fg `RULE`, drawn after every tab (including the last), with
+    a trailing gutter space on `TAB_STRIP` after it.
+  - **[Amended 2026-07-23, herdr-inspired tab breathing room]** The trailing
+    gutter is the 8th part: it gives every separator symmetric 1-cell padding
+    (one space before `│` from the glyph slot, one after), so adjacent tabs no
+    longer touch (`│▎` → `│ ▎`) and the strip reads closer to the mockup's
+    roomy `padding:9px 18px` tabs. A cell TUI expresses "horizontal padding"
+    as space cells; one symmetric gutter cell is the tasteful analog — more
+    would waste columns and cut tab capacity. Vertical padding is NOT added:
+    the bar stays one row (see the height note in §4).
+- `mouse::tab_width(i, name)` returns `display_width(label) + 7` and the
+  renderer emits exactly that many columns per tab; the trailing gutter counts
+  as that tab's own columns; `tab_at_x` starts at 0.
   Worked example (audit fixture): tabs `["main", "api"]` → tab 0 occupies
-  cols 0..12, tab 1 cols 12..23; `tab_at_x(_, 11) == Some(0)`,
-  `tab_at_x(_, 12) == Some(1)`, `tab_at_x(_, 23) == None`.
+  cols 0..13, tab 1 cols 13..25; `tab_at_x(_, 12) == Some(0)`,
+  `tab_at_x(_, 13) == Some(1)`, `tab_at_x(_, 25) == None`.
 - Right-aligned status area, fg `DIM` on `TAB_STRIP`, content
   `"{cwd} · {save}"` + one trailing space:
   - `cwd` = focused pane's `PaneSpec.cwd` with a `$HOME` prefix abbreviated to
@@ -894,6 +904,8 @@ Every px-only construct in the mockup, and its cell-level fate:
 | 2px `--tui-red-dim` left edge on expanded stack member (`:662`) | left border column overpainted `▌` U+258C fg `ACCENT_DIM` (C7); half-block ≈ "thicker than 1px". |
 | 1px borders throughout | `BorderType::Plain` single-line glyphs (C3, C12). |
 | 6px pane gap + 12–14px pane padding (`:636, :639`) | **dropped** — border cells already separate panes; spending whole cell columns on gaps wastes terminal real estate. |
+| ~9px vertical padding on every bar (tab/hint/stack-header/collapsed-row) → each renders ~2 text-lines tall in the browser | **height dropped — every bar stays exactly 1 row.** A terminal row is indivisible and scarce; reproducing the padding means adding blank rows, burning ~3 of ~44 rows for pure air. No serious TUI (tmux/zellij/lazygit) uses multi-row bars. The mockup's tall bars are a CSS-padding rendering artifact, not a directive. Only *horizontal* padding translates (space cells, C2 gutter); vertical does not. |
+| ~18px horizontal tab padding (`:628`) | ~1 gutter cell per separator (C2, amended 2026-07-23) — the translatable half of the mockup's tab padding. |
 | letterspacing (0.02–0.11em) | **dropped** — no letterspacing in a cell grid; spacing out characters by hand is a gimmick that breaks widths. |
 | tab strip `border-bottom` / hint bar `border-top` (1px rules) | **dropped** — no spare rows; the `TAB_STRIP`/`BAR` bg steps carry the separation. |
 | stack header `border-bottom` (`:659`) | `Modifier::UNDERLINED` across the header row (C6) — the one place a rule translates to an attribute instead of a row. |

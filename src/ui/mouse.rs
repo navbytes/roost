@@ -64,10 +64,11 @@ pub fn display_width(s: &str) -> u16 {
 }
 
 /// Total columns one tab occupies in the bar (C2): a 1-col marker, a space,
-/// the label body, a space, a 1-col status glyph, a space, and the trailing
-/// separator — six fixed columns plus the label.
+/// the label body, a space, a 1-col status glyph, a space, the separator, and
+/// a trailing gutter space (amended 2026-07-23) — seven fixed columns plus the
+/// label. The gutter gives every divider symmetric 1-cell padding (`│ ▎`).
 pub fn tab_width(index: usize, name: &str) -> u16 {
-    display_width(&tab_label(index, name)) + 6
+    display_width(&tab_label(index, name)) + 7
 }
 
 /// Sum of `tab_width` over every tab.
@@ -316,16 +317,16 @@ mod tests {
 
     #[test]
     fn tab_hit_testing_matches_the_c2_worked_example() {
-        // C2 worked example: ["main", "api"] → tab 0 spans cols 0..12
-        // ("1 main" is 6 chars + 6 fixed cols), tab 1 spans cols 12..23
-        // ("2 api" is 5 chars + 6). Generous bar width, no status area, so
-        // this pins the base hit-math with nothing else in play.
+        // C2 worked example (amended 2026-07-23, +7 gutter): ["main", "api"]
+        // → tab 0 spans cols 0..13 ("1 main" is 6 chars + 7 fixed cols), tab 1
+        // spans cols 13..25 ("2 api" is 5 chars + 7). Generous bar width, no
+        // status area, so this pins the base hit-math with nothing else in play.
         let names = vec!["main".to_string(), "api".to_string()];
         assert_eq!(tab_at_x(&names, 100, 0, 0), Some(0)); // start of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(0)); // last col of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(1)); // first col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 22), Some(1)); // last col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 23), None); // past the end
+        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(0)); // last col of tab 0 (its gutter)
+        assert_eq!(tab_at_x(&names, 100, 0, 13), Some(1)); // first col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, 24), Some(1)); // last col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, 25), None); // past the end
         assert_eq!(tab_at_x(&names, 100, 0, 200), None);
     }
 
@@ -333,56 +334,57 @@ mod tests {
     fn wide_glyph_tab_name_uses_display_width_not_char_count() {
         // "日本" is 2 chars but 4 display columns (CJK glyphs are
         // double-width in a terminal): label "1 日本" is 1 + 1 + 2 + 2 = 6
-        // display columns, so tab_width is 6 + 6 = 12 — not the char-count
-        // answer of 10. D1: a renamed tab with wide glyphs must not
+        // display columns, so tab_width is 6 + 7 = 13 — not the char-count
+        // answer of 11. D1: a renamed tab with wide glyphs must not
         // misindex clicks past the glyph's real width.
         let names = vec!["日本".to_string()];
-        assert_eq!(tab_width(0, "日本"), 12);
-        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(0)); // last col of the tab
-        assert_eq!(tab_at_x(&names, 100, 0, 12), None); // just past it
+        assert_eq!(tab_width(0, "日本"), 13);
+        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(0)); // last col of the tab
+        assert_eq!(tab_at_x(&names, 100, 0, 13), None); // just past it
     }
 
     #[test]
     fn tab_at_x_after_a_wide_glyph_tab_uses_its_real_width() {
         // tab 0's label "1 🦀x" is 1 + 1 + 2 + 1 = 5 display columns (the
-        // crab emoji is double-width, 'x' is single) + 6 fixed cols = 11;
-        // tab 1 must start at col 11, not the char-count answer of 10.
+        // crab emoji is double-width, 'x' is single) + 7 fixed cols = 12;
+        // tab 1 must start at col 12, not the char-count answer of 11.
         let names = vec!["🦀x".to_string(), "b".to_string()];
-        assert_eq!(tab_width(0, "🦀x"), 11);
-        assert_eq!(tab_at_x(&names, 100, 0, 10), Some(0)); // last col of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(1)); // first col of tab 1
+        assert_eq!(tab_width(0, "🦀x"), 12);
+        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(0)); // last col of tab 0
+        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(1)); // first col of tab 1
     }
 
     #[test]
     fn status_area_click_switches_nothing() {
+        // +7 gutter (2026-07-23): two tabs are 25 cols (13 + 12); a 10-col
+        // status area then occupies cols 25..35.
         let names = vec!["main".to_string(), "api".to_string()];
-        // Bar exactly wide enough for both tabs (23 cols) plus a 10-col
-        // status area: the status area occupies cols 23..33.
-        assert_eq!(tab_at_x(&names, 33, 10, 22), Some(1)); // last tab col
-        assert_eq!(tab_at_x(&names, 33, 10, 23), None); // status area starts here
-        assert_eq!(tab_at_x(&names, 33, 10, 32), None); // status area, last col
+        assert_eq!(tab_at_x(&names, 35, 10, 24), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, 35, 10, 25), None); // status area starts here
+        assert_eq!(tab_at_x(&names, 35, 10, 34), None); // status area, last col
     }
 
     #[test]
     fn status_area_is_dropped_before_tabs_clip() {
-        // Tabs alone (23 cols) fit a 25-col bar, but not alongside a 10-col
-        // status area (23+10=33 > 25) — C2 says the status area drops first,
-        // so tab 1 (cols 12..23) stays fully clickable and nothing clips.
+        // Tabs alone (25 cols) fit a 25-col bar, but not alongside a 10-col
+        // status area (25+10=35 > 25) — C2 says the status area drops first,
+        // so tab 1 (cols 13..25) stays fully clickable and nothing clips.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 25, 10, 22), Some(1));
-        assert_eq!(tab_at_x(&names, 25, 10, 23), None); // past both tabs, no status shown
+        assert_eq!(tab_at_x(&names, 25, 10, 24), Some(1));
+        assert_eq!(tab_at_x(&names, 25, 10, 25), None); // past both tabs, no status shown
     }
 
     #[test]
     fn overflow_clips_and_the_clip_point_switches_nothing() {
-        // Ten single-letter tabs: labels "1 a".."10 j", each 9 cols except
-        // the last (10). A 40-col bar with no status area fits exactly four
-        // tabs (36 cols) before the fifth would overflow.
+        // Ten single-letter tabs: labels "1 a".."10 j", each 10 cols except
+        // the last (11), after the +7 gutter. A 45-col bar with no status area
+        // fits exactly four tabs (40 cols) before the fifth would overflow,
+        // leaving spare columns for the `…` clip marker at col 40.
         let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
-        assert_eq!(tabs_visible_width(&names, 40, 0), 36);
-        assert_eq!(tab_at_x(&names, 40, 0, 35), Some(3)); // last col of tab 3 (0-based)
-        assert_eq!(tab_at_x(&names, 40, 0, 36), None); // the `…` clip marker
-        assert_eq!(tab_at_x(&names, 40, 0, 39), None); // past the bar too
+        assert_eq!(tabs_visible_width(&names, 45, 0), 40);
+        assert_eq!(tab_at_x(&names, 45, 0, 39), Some(3)); // last col of tab 3 (0-based)
+        assert_eq!(tab_at_x(&names, 45, 0, 40), None); // the `…` clip marker
+        assert_eq!(tab_at_x(&names, 45, 0, 44), None); // past the visible tabs too
     }
 
     #[test]
@@ -399,14 +401,14 @@ mod tests {
 
     #[test]
     fn single_tab_bar_hit_testing() {
-        // One tab, no separators to get confused by: "1 solo" is 6 chars + 6
-        // fixed cols = 12, occupying the whole visible width.
+        // One tab, no separators to get confused by: "1 solo" is 6 chars + 7
+        // fixed cols = 13, occupying the whole visible width.
         let names = vec!["solo".to_string()];
-        assert_eq!(tab_width(0, "solo"), 12);
-        assert_eq!(tabs_visible_width(&names, 100, 0), 12);
+        assert_eq!(tab_width(0, "solo"), 13);
+        assert_eq!(tabs_visible_width(&names, 100, 0), 13);
         assert_eq!(tab_at_x(&names, 100, 0, 0), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 12), None); // just past the only tab
+        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, 13), None); // just past the only tab
     }
 
     #[test]
