@@ -160,13 +160,22 @@ fn hint_bar_right_spans(n: usize, word: &str) -> Vec<Span<'static>> {
 /// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
 /// actually press right now. Precedence (C9): alt-warning, then flash, then
 /// the hint pairs — each takes over the whole bar from the next.
+/// Rendered column width of one hint pair. THE single source both the fit
+/// calculation and the actual draw use, so they can never drift (a +3/+4
+/// mismatch once dropped the whole right segment at widths 111–116).
+/// Matches the span strings in `draw_hint_bar`: `" {key} "` (key + 2) plus
+/// `"{label}  "` (label + 2).
+fn hint_pair_cols(key: &str, label: &str) -> u16 {
+    (key.chars().count() + label.chars().count() + 4) as u16
+}
+
 /// How many leading hint pairs fit alongside the right segment (C9 yield
 /// order: pairs drop whole, from the right, before the segment ever yields).
 fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u16) -> usize {
     let budget = width.saturating_sub(right_w);
     let mut used = 0u16;
     for (i, (key, label)) in hints.iter().enumerate() {
-        let w = (key.chars().count() + label.chars().count() + 3) as u16; // " k " + "l  "
+        let w = hint_pair_cols(key, label);
         if used + w > budget {
             return i;
         }
@@ -211,11 +220,9 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     let mut spans: Vec<Span> = Vec::with_capacity(shown * 2 + 4);
     let mut used = 0u16;
     for (key, label) in &hints[..shown] {
-        let key_span = format!(" {key} ");
-        let label_span = format!("{label}  ");
-        used += (key_span.chars().count() + label_span.chars().count()) as u16;
-        spans.push(Span::styled(key_span, Style::default().fg(theme::ACCENT)));
-        spans.push(Span::styled(label_span, Style::default().fg(theme::MUTED)));
+        used += hint_pair_cols(key, label); // same source as fit_hint_pairs
+        spans.push(Span::styled(format!(" {key} "), Style::default().fg(theme::ACCENT)));
+        spans.push(Span::styled(format!("{label}  "), Style::default().fg(theme::MUTED)));
     }
     if used.saturating_add(right_w) <= area.width {
         let pad = area.width.saturating_sub(used).saturating_sub(right_w);
@@ -1397,20 +1404,32 @@ mod tests {
     #[test]
     fn fit_hint_pairs_right_segment_wins_over_trailing_pairs() {
         // C9 yield order (re-amended 2026-07-22): pairs drop whole from the
-        // right before the aggregate/mode-word segment ever yields.
+        // right before the aggregate/mode-word segment ever yields. Measure
+        // via the SAME `hint_pair_cols` the draw path uses — a +3/+4 drift
+        // here once let the whole segment drop at widths 111-116 (D2).
         let pairs = hint_pairs(&Mode::Normal, false, false);
-        let pair_w = |p: &(&str, &str)| (p.0.chars().count() + p.1.chars().count() + 3) as u16;
-        let all_w: u16 = pairs.iter().map(&pair_w).sum();
+        let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
+        let all_w: u16 = pairs.iter().map(&pw).sum();
 
         // Roomy bar, no right segment: everything fits.
         assert_eq!(super::fit_hint_pairs(&pairs, 0, all_w + 10), pairs.len());
-        // 120-col bar with a live "◆ 2 needs you · Alt+a" + "NORMAL" segment:
-        // some pairs must yield, and what remains must leave the segment room.
-        let right_w = 30;
-        let shown = super::fit_hint_pairs(&pairs, right_w, 120);
-        assert!(shown < pairs.len(), "trailing pairs must drop at 120 cols");
-        let used: u16 = pairs[..shown].iter().map(&pair_w).sum();
-        assert!(used + right_w <= 120, "shown pairs + segment must fit");
+        // Invariant across every width/segment combo: the shown pairs plus
+        // the right segment must ALWAYS fit — the segment is never clipped by
+        // an over-optimistic fit. Sweep the band D2 lived in and beyond.
+        for width in 80..=140u16 {
+            for right_w in [0u16, 22, 30] {
+                let shown = super::fit_hint_pairs(&pairs, right_w, width);
+                let used: u16 = pairs[..shown].iter().map(&pw).sum();
+                assert!(
+                    used + right_w <= width || shown == 0,
+                    "width={width} right_w={right_w}: shown={shown} used={used} overflows"
+                );
+                // And it's not needlessly stingy: one more pair really wouldn't fit.
+                if shown < pairs.len() {
+                    assert!(used + pw(&pairs[shown]) + right_w > width, "width={width}: too stingy");
+                }
+            }
+        }
         // Degenerate: a bar narrower than the segment shows zero pairs (the
         // draw fn then right-aligns whatever of the segment still fits).
         assert_eq!(super::fit_hint_pairs(&pairs, 118, 120), 0);

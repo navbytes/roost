@@ -112,6 +112,12 @@ enum Closed {
 /// A parked `wait` control request: reply when any of `panes` reaches `until`,
 /// or when `deadline` passes. Holds the client's reply channel until then.
 struct Waiter {
+    /// Who registered this wait — re-checked against `may_target` when a
+    /// candidate pane fires (see `poll_waiters`). Pane ids are recycled
+    /// once free (`Workspace::next_pane_id` is a max+1, not a monotonic
+    /// counter): the id this waiter was authorized for at registration can
+    /// belong to a different, unrelated pane by the time it fires.
+    actor: Actor,
     panes: Vec<PaneId>,
     until: AgentStatus,
     reply: Sender<Reply>,
@@ -1014,7 +1020,7 @@ impl<B: PaneBackend> App<B> {
         // Default 5 min, capped at 24 h, so a parked reply can't live forever.
         let ms = timeout_ms.unwrap_or(300_000).min(24 * 3600 * 1000);
         let deadline = Instant::now() + Duration::from_millis(ms);
-        self.waiters.push(Waiter { panes, until, reply, deadline });
+        self.waiters.push(Waiter { actor, panes, until, reply, deadline });
         Ok("parked")
     }
 
@@ -1028,7 +1034,20 @@ impl<B: PaneBackend> App<B> {
         let mut i = 0;
         while i < self.waiters.len() {
             let w = &self.waiters[i];
-            let hit = w.panes.iter().copied().find(|&p| self.pane_matches(p, w.until));
+            // LOW-3: re-verify authorization at fire time, not just at
+            // registration. If `p` now resolves to a *live* spec (it may
+            // have been closed and recycled to an unrelated pane since
+            // this waiter registered) that the waiter isn't authorized for,
+            // never disclose its status — treat it as not-yet-matched. A
+            // fully gone id (no live spec at all) still resolves normally
+            // below: "it's gone" discloses nothing pane-specific, so it
+            // needs no re-check.
+            let hit = w.panes.iter().copied().find(|&p| {
+                if self.find_spec(p).is_some() && !self.may_target(w.actor, p) {
+                    return false;
+                }
+                self.pane_matches(p, w.until)
+            });
             let timed_out = now >= w.deadline;
             if let Some(id) = hit {
                 let status = self.status_str(id);
@@ -1174,36 +1193,50 @@ impl<B: PaneBackend> App<B> {
         if submit {
             bytes.push(b'\r');
         }
-        rt.write_input(&bytes);
+        // LOW-2: a pane can look running (status snapshot) yet have a dead
+        // write pipe (e.g. it just exited) — don't report bytes as sent
+        // unless the write actually succeeded.
+        if !rt.write_input(&bytes) {
+            return Reply::err("pane did not accept input");
+        }
         Reply::ok(serde_json::json!({ "sent": bytes.len() }))
     }
 
     /// Deliver `text` (+ CR when `submit`) to every **running** pane `actor`
     /// may target. Fleet reaches every spawned pane by iterating `runtimes`
-    /// directly (not `ws.tabs`), so a future float pane needs no change
-    /// here; a pane actor reaches only its own spawned subtree, itself
-    /// included — the exact same `may_target`/`in_subtree` rule as every
-    /// other verb. "Running" excludes a pane whose process already exited
-    /// but hasn't been closed (its runtime lingers with `AgentStatus::Exited`
-    /// — see `on_pty_exit`): writing to it would silently go nowhere, so
-    /// counting it as "sent" would be a dishonest reply/audit. There's no
-    /// per-target id to validate (unlike send/read/close), so this never
-    /// errors — zero matching panes is `ok` with count 0.
+    /// directly (not `ws.tabs`) — except the float (C22): it's the human's
+    /// private interactive scratch shell, never a fleet member, so it is
+    /// always excluded from the fan-out regardless of actor; a pane actor
+    /// reaches only its own spawned subtree, itself included — the exact
+    /// same `may_target`/`in_subtree` rule as every other verb. "Running"
+    /// excludes a pane whose process already exited but hasn't been closed
+    /// (its runtime lingers with `AgentStatus::Exited` — see `on_pty_exit`):
+    /// writing to it would silently go nowhere, so counting it as "sent"
+    /// would be a dishonest reply/audit — same reasoning covers a pane that
+    /// *looked* running in that snapshot but whose write pipe is actually
+    /// dead (it exited a moment later): `sent`/`count` only include panes
+    /// whose write call actually succeeded. There's no per-target id to
+    /// validate (unlike send/read/close), so this never errors — zero
+    /// matching panes is `ok` with count 0.
     fn ctl_broadcast(&mut self, actor: Actor, text: &str, submit: bool) -> Reply {
         let mut bytes = text.as_bytes().to_vec();
         if submit {
             bytes.push(b'\r');
         }
-        let mut sent: Vec<PaneId> = Vec::new();
+        let mut targets: Vec<PaneId> = Vec::new();
         for (&id, rt) in self.runtimes.iter() {
-            if rt.status() != AgentStatus::Exited && self.may_target(actor, id) {
-                sent.push(id);
+            if rt.status() != AgentStatus::Exited && !self.is_float(id) && self.may_target(actor, id)
+            {
+                targets.push(id);
             }
         }
-        sent.sort_unstable();
-        for &id in &sent {
+        targets.sort_unstable();
+        let mut sent: Vec<PaneId> = Vec::new();
+        for &id in &targets {
             if let Some(rt) = self.runtimes.get_mut(&id) {
-                rt.write_input(&bytes);
+                if rt.write_input(&bytes) {
+                    sent.push(id);
+                }
             }
         }
         let count = sent.len();
@@ -2864,6 +2897,50 @@ mod tests {
     }
 
     #[test]
+    fn control_broadcast_counts_only_successful_writes() {
+        // LOW-2: a pane can look running (status snapshot says not Exited)
+        // yet have a dead write pipe (it died a moment later) — `sent`/
+        // `count` must reflect delivery, not just "looked targetable".
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let alive = app.focused;
+        app.apply(Action::NewPane);
+        let dying = app.focused;
+        app.runtimes.get_mut(&dying).unwrap().fail_write = true;
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi".into(), submit: false },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert_eq!(sent, vec![alive], "the dying pane's failed write must not count as sent");
+        assert_eq!(ok["count"], 1);
+    }
+
+    #[test]
+    fn control_send_errors_when_the_write_fails() {
+        // LOW-2 (send side): same honesty rule as broadcast — a pane whose
+        // write pipe is dead must not be reported as having received input.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let p = app.focused;
+        app.runtimes.get_mut(&p).unwrap().fail_write = true;
+
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Send { pane: p, text: "hi".into(), submit: false },
+        });
+        assert!(matches!(reply, Reply::Err { .. }), "a failed write must not be reported as sent");
+        assert!(app.runtimes.get(&p).unwrap().input.is_empty());
+    }
+
+    #[test]
     fn control_cannot_close_the_last_pane() {
         use crate::core::control::{Method, Request};
         let (mut app, _) = mk_app(shell_ws());
@@ -3175,6 +3252,68 @@ mod tests {
             Reply::Err { err } => panic!("{err}"),
         }
         assert!(app.waiters.is_empty());
+    }
+
+    #[test]
+    fn wait_does_not_leak_a_recycled_pane_ids_status_cross_subtree() {
+        // LOW-3: `Workspace::next_pane_id` is max(current ids)+1, not a
+        // monotonic counter — closing the highest-numbered pane frees its
+        // id for reuse. A waiter registered on that id must not be handed
+        // the *new*, unrelated pane's status just because the numeric id
+        // matches.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.tokens.insert(1, "tok1".into());
+        let ct = app.control_token().to_string();
+
+        // Pane 1 spawns its own child (pane 2, in its subtree) and waits on it.
+        let child = match app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert_eq!(child, 2, "test assumes pane 2 is the highest id so far");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: "tok1".into(),
+                method: Method::Wait {
+                    panes: vec![child],
+                    until: "needs_input".into(),
+                    timeout_ms: Some(60_000),
+                },
+            },
+            tx,
+        );
+        assert!(rx.try_recv().is_err()); // idle child, not yet needs_input → parked
+        assert_eq!(app.waiters.len(), 1);
+
+        // Pane 2 closes (it's the highest id) and the fleet spawns an
+        // unrelated pane that recycles id 2 — same number, different owner.
+        app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Close { pane: 2, force: true },
+        });
+        let recycled = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert_eq!(recycled, 2, "test assumes the id is actually recycled");
+
+        // The new (fleet-owned, unrelated) pane 2 hits the exact status the
+        // stale waiter is armed for.
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.poll_waiters();
+
+        // Must NOT fire: pane 1 is not authorized for the fleet's new pane 2.
+        assert!(rx.try_recv().is_err(), "must not leak the recycled pane's status cross-subtree");
+        assert_eq!(app.waiters.len(), 1, "the waiter stays parked, not silently dropped");
     }
 
     #[test]
@@ -4727,6 +4866,36 @@ mod tests {
         let Reply::Ok { ok } = reply else { panic!("expected ok") };
         let ids: Vec<u64> = ok.as_array().unwrap().iter().map(|v| v["pane"].as_u64().unwrap()).collect();
         assert!(!ids.contains(&float_id));
+    }
+
+    #[test]
+    fn float_never_receives_a_fleet_broadcast() {
+        // LOW-1: the float is the human's private interactive scratch shell
+        // (Alt+f), never a fleet member — `send --all` must not type/submit
+        // into it, and it must not inflate the reported count.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let p1 = app.focused;
+        app.apply(Action::ToggleFloat); // spawns + shows the float
+        let float_id = app.focused; // C22: toggling on focuses the float
+        assert_ne!(float_id, p1);
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi".into(), submit: true },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert_eq!(sent, vec![p1], "the float must never be a broadcast target");
+        assert_eq!(ok["count"], 1);
+        assert!(
+            app.runtimes.get(&float_id).unwrap().input.is_empty(),
+            "the human's private scratch shell must never receive broadcast input"
+        );
     }
 
     #[test]

@@ -143,18 +143,22 @@ impl PaneBackend for PtyPane {
         self.kitty.disambiguate()
     }
 
-    fn write_input(&mut self, bytes: &[u8]) {
+    fn write_input(&mut self, bytes: &[u8]) -> bool {
         // Typing means "I'm back" — snap to the live tail.
         if self.scroll != 0 {
             self.scroll = 0;
             self.parser.set_scrollback(0);
         }
-        self.write_input_raw(bytes);
+        self.write_input_raw(bytes)
     }
 
-    fn write_input_raw(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
+    /// Returns whether the write actually reached the child — a dead/broken
+    /// pipe must not be reported as delivered by a caller that counts
+    /// successful sends (`ctl_send`/`ctl_broadcast`).
+    fn write_input_raw(&mut self, bytes: &[u8]) -> bool {
+        let ok = self.writer.write_all(bytes).is_ok();
         let _ = self.writer.flush();
+        ok
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
