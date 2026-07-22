@@ -1,6 +1,6 @@
 //! Rendering: tab bar + pane borders + vt100 grid blit (design doc §8).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-use crate::core::app::{picker_items, App, Mode, RenameTarget, TabSummary};
+use crate::core::app::{feed_overlay_size, picker_items, App, FeedEntry, Mode, RenameTarget, TabSummary};
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, PaneRect};
 use crate::ports::PaneBackend;
@@ -86,6 +86,7 @@ fn hint_pairs(mode: &Mode, focused_dead: bool) -> Vec<(&'static str, &'static st
         Mode::Scroll { .. } => {
             vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
         }
+        Mode::Feed { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
         Mode::Normal if focused_dead => {
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
         }
@@ -113,6 +114,7 @@ fn mode_word(mode: &Mode, zoomed: bool) -> &'static str {
         Mode::Scroll { .. } => "SCROLL",
         Mode::Copy => "COPY",
         Mode::Help => "HELP",
+        Mode::Feed { .. } => "FEED",
     }
 }
 
@@ -348,7 +350,94 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
         }
+        Mode::Feed { offset } => {
+            let (w, h) = feed_overlay_size(body);
+            let rect = centered_near(anchor, body, w, h);
+            dim_backdrop(f, body, rect);
+            f.render_widget(Clear, rect);
+            let block = Block::bordered()
+                .title(dialog_title(" activity "))
+                .border_type(BorderType::Plain)
+                .border_style(dialog_border_style());
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            draw_feed_entries(f, app.feed(), *offset, inner);
+        }
     }
+}
+
+/// C20: the feed's visible entry rows inside the modal's inner area — newest
+/// at the bottom, scrolled back by `offset` entries from the tail; a single
+/// centered line when the ring is empty.
+fn draw_feed_entries(f: &mut Frame, feed: &VecDeque<FeedEntry>, offset: usize, inner: Rect) {
+    if inner.height == 0 {
+        return;
+    }
+    if feed.is_empty() {
+        let text = "no activity yet";
+        let pad = inner.width.saturating_sub(text.chars().count() as u16) / 2;
+        let y = inner.y + inner.height / 2;
+        f.render_widget(
+            Paragraph::new(format!("{}{text}", " ".repeat(pad as usize)))
+                .style(Style::default().fg(theme::DIM)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        return;
+    }
+    let range = feed_window(feed.len(), offset, inner.height as usize);
+    let lines: Vec<Line> = feed
+        .iter()
+        .skip(range.start)
+        .take(range.len())
+        .map(|e| Line::from(feed_entry_spans(&local_hh_mm_ss(e.at), &e.text, e.needs_input)))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// C20: which of the feed's `len` entries (0 = oldest .. `len` = newest+1)
+/// fall inside a `rows`-tall window, given a scroll `offset` counting
+/// entries back from the newest (0 = the live tail). Pure so the clamping is
+/// unit-tested without a `Frame` or a real ring buffer.
+fn feed_window(len: usize, offset: usize, rows: usize) -> std::ops::Range<usize> {
+    if len == 0 || rows == 0 {
+        return 0..0;
+    }
+    let offset = offset.min(len - 1);
+    let last = len - 1 - offset;
+    let first = last.saturating_sub(rows - 1);
+    first..last + 1
+}
+
+/// C20's per-row rule: `" HH:MM:SS  {text}"`, timestamp DIM, text MUTED —
+/// except a status line landing on NeedsInput, which gets the `◆ ` ACCENT
+/// prefix and FG text (the one red in the feed, same meaning as everywhere,
+/// C5). Pure so the exception is unit-tested without a `Frame`.
+fn feed_entry_spans(hhmmss: &str, text: &str, needs_input: bool) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(format!(" {hhmmss}  "), Style::default().fg(theme::DIM))];
+    if needs_input {
+        spans.push(Span::styled(
+            format!("{} ", theme::GLYPH_NEEDS_INPUT),
+            Style::default().fg(theme::ACCENT),
+        ));
+        spans.push(Span::styled(text.to_string(), Style::default().fg(theme::FG)));
+    } else {
+        spans.push(Span::styled(text.to_string(), Style::default().fg(theme::MUTED)));
+    }
+    spans
+}
+
+/// Local wall-clock `HH:MM:SS` for a feed entry's timestamp (C20). Uses libc
+/// (already a dependency, see `Cargo.toml`) for the local-timezone
+/// breakdown — the stdlib has no calendar conversion at all, and pulling in
+/// a chrono/time crate would be a lot of dependency for three integers.
+fn local_hh_mm_ss(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 /// C2: numbered tabs (marker + label + status glyph + separator) filling
@@ -452,9 +541,11 @@ fn tab_summary_badge(s: crate::core::app::TabSummary) -> (char, Color) {
 }
 
 /// C8's state-word table: the collapsed row's right-segment word for each
-/// status. `Exited` is contracted bare — no exit code (SPEC-GAP-1: no
-/// exit-code plumbing exists; `status.rs` tracks only a bool).
-fn state_word(status: AgentStatus) -> &'static str {
+/// status — also reused by the C20 feed's status-transition lines
+/// (`app.rs`'s `diff_statuses`), so there's exactly one word table. `Exited`
+/// is contracted bare — no exit code (SPEC-GAP-1: no exit-code plumbing
+/// exists; `status.rs` tracks only a bool).
+pub fn state_word(status: AgentStatus) -> &'static str {
     match status {
         AgentStatus::Working => "working",
         AgentStatus::NeedsInput => "needs you",
@@ -849,8 +940,9 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 mod tests {
     use super::{
         badge_text, centered_near, collapsed_name_color, collapsed_row_spans, corner_badge,
-        dialog_border_style, help_dialog_width, hint_bar_right_spans, hint_pairs, mode_word,
-        push_tab_spans, stack_header_text, state_word,
+        dialog_border_style, feed_entry_spans, feed_window, help_dialog_width,
+        hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans, stack_header_text,
+        state_word,
     };
     use crate::core::app::{Mode, RenameTarget};
     use crate::core::status::AgentStatus;
@@ -1124,6 +1216,17 @@ mod tests {
     }
 
     #[test]
+    fn hint_pairs_feed_mode_is_scroll_and_close() {
+        assert_eq!(hint_pairs(&Mode::Feed { offset: 0 }, false), vec![("↑↓", "scroll"), ("Esc", "close")]);
+    }
+
+    #[test]
+    fn mode_word_feed_wins_regardless_of_zoom() {
+        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, false), "FEED");
+        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, true), "FEED");
+    }
+
+    #[test]
     fn hint_pairs_rename_word_differs_pane_vs_tab() {
         let pane = hint_pairs(&Mode::Rename { buffer: String::new(), target: RenameTarget::Pane }, false);
         let tab = hint_pairs(&Mode::Rename { buffer: String::new(), target: RenameTarget::Tab }, false);
@@ -1182,5 +1285,63 @@ mod tests {
         let text = stack_header_text(4, 3);
         assert!(text.contains("STACK · 3 PANES"));
         assert!(text.ends_with("ALT+↑↓ "));
+    }
+
+    // -- C20 activity feed ---------------------------------------------------
+
+    #[test]
+    fn feed_window_shows_the_newest_rows_when_offset_is_zero() {
+        assert_eq!(feed_window(5, 0, 3), 2..5);
+    }
+
+    #[test]
+    fn feed_window_scrolls_back_by_offset() {
+        assert_eq!(feed_window(5, 2, 3), 0..3);
+    }
+
+    #[test]
+    fn feed_window_clamps_offset_past_the_oldest_entry() {
+        assert_eq!(feed_window(5, 999, 3), 0..1);
+    }
+
+    #[test]
+    fn feed_window_shrinks_to_whatever_the_ring_actually_has() {
+        assert_eq!(feed_window(2, 0, 10), 0..2);
+    }
+
+    #[test]
+    fn feed_window_empty_ring_or_zero_rows_is_empty() {
+        assert_eq!(feed_window(0, 0, 3), 0..0);
+        assert_eq!(feed_window(5, 0, 0), 0..0);
+    }
+
+    #[test]
+    fn feed_entry_spans_default_styling_is_dim_timestamp_muted_text() {
+        let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, " 12:34:56  spawned shell (shell)");
+        assert_eq!(spans[0].style.fg, Some(theme::DIM));
+        assert_eq!(spans[1].style.fg, Some(theme::MUTED));
+    }
+
+    #[test]
+    fn feed_entry_spans_needs_input_line_gets_the_accent_diamond_and_fg_text() {
+        let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text,
+            format!(" 12:34:56  {} pi: waiting → needs you", theme::GLYPH_NEEDS_INPUT)
+        );
+        assert_eq!(spans[0].style.fg, Some(theme::DIM));
+        assert_eq!(spans[1].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[2].style.fg, Some(theme::FG));
+    }
+
+    #[test]
+    fn local_hh_mm_ss_formats_as_a_zero_padded_clock() {
+        let s = super::local_hh_mm_ss(std::time::SystemTime::now());
+        assert_eq!(s.len(), 8);
+        assert_eq!(s.as_bytes()[2], b':');
+        assert_eq!(s.as_bytes()[5], b':');
     }
 }

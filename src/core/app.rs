@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use ratatui::layout::{Rect, Size};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
@@ -18,6 +18,7 @@ use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
 use crate::ports::{Observation, PaneBackend, StateStore};
 use crate::ui::input::Action;
+use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -49,6 +50,9 @@ pub enum Mode {
     Copy,
     /// Full-keymap overlay (Alt+?); any key dismisses it.
     Help,
+    /// C20 activity-feed overlay; `offset` counts entries back from the
+    /// newest (0 = live tail).
+    Feed { offset: usize },
 }
 
 /// An in-progress / completed text selection within one pane. Coordinates are
@@ -59,6 +63,18 @@ pub struct Selection {
     pub anchor: (u16, u16),
     pub cursor: (u16, u16),
     pub dragging: bool,
+}
+
+/// One C20 activity-feed entry, preformatted at push time — the ring stores
+/// only the rendered line (no raw event data: no filtering/search, by
+/// design). `needs_input` is the one styling exception: true only for a
+/// status-transition line landing on `NeedsInput` (the `◆ ` ACCENT prefix,
+/// FG text — same meaning as everywhere else, C5).
+#[derive(Debug, Clone)]
+pub struct FeedEntry {
+    pub at: SystemTime,
+    pub text: String,
+    pub needs_input: bool,
 }
 
 /// How long the "copied" flash stays in the hint bar.
@@ -77,6 +93,9 @@ const UNDO_DEPTH: usize = 20;
 /// cap, enough parked waits could starve those of a slot to even report in
 /// on. Left well below that pool size so plenty always stay free.
 const MAX_WAITS: usize = 16;
+
+/// C20: activity-feed ring buffer capacity — oldest evicted first.
+const FEED_CAP: usize = 200;
 
 /// A closed pane or tab, kept on the undo stack so `Alt+u` can reopen it —
 /// crucially with its session id intact, so the agent resumes where it was.
@@ -174,6 +193,14 @@ pub struct App<B: PaneBackend> {
     /// first PTY output rather than written the instant it spawns — see
     /// `on_pty_output` for why.
     pending_input: HashMap<PaneId, Vec<u8>>,
+    /// C20: last-known status per spawned pane, diffed each tick to produce
+    /// a feed transition line (`diff_statuses`). Pruned to just the
+    /// currently-running panes on the same cadence.
+    last_status: HashMap<PaneId, AgentStatus>,
+    /// C20: activity-feed ring buffer (status/spawn/close/exit/ctl),
+    /// capacity `FEED_CAP`, oldest evicted first. Session-only — never
+    /// persisted.
+    feed: VecDeque<FeedEntry>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -227,6 +254,8 @@ impl<B: PaneBackend> App<B> {
             control_token,
             waiters: Vec::new(),
             pending_input: HashMap::new(),
+            last_status: HashMap::new(),
+            feed: VecDeque::new(),
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -255,6 +284,22 @@ impl<B: PaneBackend> App<B> {
     /// the hint bar's `ZOOM` pseudo-state word (amended C9).
     pub fn zoomed(&self) -> bool {
         self.zoomed
+    }
+
+    /// C20: the activity-feed ring, oldest first — read by the renderer
+    /// while `Mode::Feed` is open.
+    pub fn feed(&self) -> &VecDeque<FeedEntry> {
+        &self.feed
+    }
+
+    /// C20: append one preformatted line to the activity feed, evicting the
+    /// oldest entry once the ring is at capacity. The single entry point
+    /// every hook (spawn/close/exit/status-diff/ctl) pushes through.
+    fn push_feed(&mut self, text: String, needs_input: bool) {
+        self.feed.push_back(FeedEntry { at: SystemTime::now(), text, needs_input });
+        if self.feed.len() > FEED_CAP {
+            self.feed.pop_front();
+        }
     }
 
     /// Record that an Alt-modified key actually arrived, so the startup hint
@@ -378,6 +423,10 @@ impl<B: PaneBackend> App<B> {
                 if wants_detect {
                     self.pending_detect.insert(id, SystemTime::now());
                 }
+                // C20: spawn owns the pane's "birth" line — diff_statuses
+                // deliberately stays silent on a pane's first observation.
+                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+                self.push_feed(format!("spawned {name} ({})", spec.adapter), false);
             }
             Err(e) => {
                 self.dead.insert(id, e.to_string());
@@ -394,6 +443,11 @@ impl<B: PaneBackend> App<B> {
         self.last_detect = Instant::now();
         // Persist what each pane is actually running (live cwd, typed agent).
         self.observe_panes();
+        // C20: one status-transition feed line per pane per tick, diffed
+        // against each pane's last-known status. Placed before the
+        // `pending_detect` early-return below so it always runs, whether or
+        // not any pane is mid-session-detection.
+        self.diff_statuses();
         if self.pending_detect.is_empty() {
             return;
         }
@@ -421,6 +475,36 @@ impl<B: PaneBackend> App<B> {
                 self.set_session(id, session);
             }
         }
+    }
+
+    /// C20: diff every spawned pane's current status against its last-known
+    /// one, pushing `{name}: {old} → {new}` for each real transition. First
+    /// observation of a pane is silently baselined (`spawn_pane` owns
+    /// birth); a transition landing on `Exited` is suppressed (`on_pty_exit`
+    /// owns that line) — one source per transition, no double-reporting.
+    fn diff_statuses(&mut self) {
+        let current: Vec<(PaneId, AgentStatus)> =
+            self.runtimes.iter().map(|(id, rt)| (*id, rt.status())).collect();
+        for (id, status) in current {
+            let prev = self.last_status.insert(id, status);
+            match prev {
+                None => {} // first observation: spawn owns birth, no line
+                Some(old) if old == status || status == AgentStatus::Exited => {}
+                Some(old) => {
+                    let name = self
+                        .find_spec(id)
+                        .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
+                        .unwrap_or_else(|| format!("pane {id}"));
+                    let text =
+                        format!("{name}: {} → {}", state_word(old), state_word(status));
+                    self.push_feed(text, status == AgentStatus::NeedsInput);
+                }
+            }
+        }
+        // Drop entries for panes that no longer have a runtime (closed) —
+        // ids are never reused, so without this the map would grow by one
+        // stale entry per pane ever spawned over a long session.
+        self.last_status.retain(|id, _| self.runtimes.contains_key(id));
     }
 
     /// Persist what each pane is *actually* running — its live working
@@ -681,6 +765,15 @@ impl<B: PaneBackend> App<B> {
                     Err(reason) => self.audit(Some(actor), &summary, false, &reason),
                 }
             }
+            // Broadcast self-audits inside ctl_broadcast with the real
+            // fan-out count — the generic post-dispatch audit below only
+            // ever sees an opaque `Reply::Ok`, so it can't produce that
+            // detail. Handled here, mirroring the Wait special-case above,
+            // so a broadcast is never audited (or fed) twice.
+            (Some(actor), Method::Broadcast { text, submit }) => {
+                let r = self.ctl_broadcast(actor, &text, submit);
+                let _ = reply.send(r);
+            }
             (Some(actor), method) => {
                 let r = self.dispatch(actor, method);
                 let (ok, detail) = match &r {
@@ -693,21 +786,25 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// Append a control action to `<state>/control.log` (unconditional — every
-    /// spawn/send/read/close/etc. that touches the fleet is recorded with who
-    /// did it, what, and the outcome). No-op when there's no socket dir.
-    fn audit(&self, actor: Option<Actor>, summary: &str, ok: bool, detail: &str) {
-        let Some(dir) = self.sock_path.as_ref().and_then(|p| p.parent()) else { return };
+    /// Append a control action to `<state>/control.log` (unconditional —
+    /// every spawn/send/read/close/etc. that touches the fleet is recorded
+    /// with who did it, what, and the outcome) AND to the C20 activity feed
+    /// (the feed push happens even when there's no socket dir — session-only
+    /// state doesn't need one).
+    fn audit(&mut self, actor: Option<Actor>, summary: &str, ok: bool, detail: &str) {
         let principal = match actor {
             Some(Actor::Fleet) => "fleet".to_string(),
             Some(Actor::Pane(id)) => format!("pane:{id}"),
             None => "?".to_string(),
         };
+        let outcome = if ok { "ok" } else { "err" };
+        self.push_feed(format!("ctl {principal}: {} → {outcome}", sanitize(summary)), false);
+
+        let Some(dir) = self.sock_path.as_ref().and_then(|p| p.parent()) else { return };
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let outcome = if ok { "ok" } else { "err" };
         let line =
             format!("{ts} {principal} {} -> {outcome} {}\n", sanitize(summary), sanitize(detail));
         use std::io::Write;
@@ -978,13 +1075,13 @@ impl<B: PaneBackend> App<B> {
             }
         }
         let count = sent.len();
-        // Self-audit with the real count. The generic per-call audit in
-        // handle_control_msg always logs an empty detail on `Ok` (it only
-        // sees the Reply after dispatch and discards its payload — `Reply::Ok
-        // { .. }`), so it can't produce the `count=` this contract's line
-        // needs; that generic call still also fires afterward when this
-        // arrives over the socket; harmless double log line — the wrapper's
-        // is out of ctl_broadcast's edit scope to suppress here.
+        // Self-audit with the real count — the generic post-dispatch audit
+        // in handle_control_msg only ever sees an opaque `Reply::Ok` (it
+        // can't produce this contract's `count=` detail), so
+        // handle_control_msg special-cases Broadcast to call this directly
+        // instead of going through dispatch + that generic audit. This is
+        // the only audit call for a broadcast: one `ctl` line per call, in
+        // both control.log and the C20 feed.
         let summary = method_summary(&Method::Broadcast { text: text.to_string(), submit });
         self.audit(Some(actor), &summary, true, &format!("count={count}"));
         Reply::ok(serde_json::json!({ "sent": sent, "count": count }))
@@ -1081,10 +1178,15 @@ impl<B: PaneBackend> App<B> {
             } else if self.ws.active_tab >= self.ws.tabs.len() {
                 self.ws.active_tab = self.ws.tabs.len().saturating_sub(1);
             }
+            // C20: one line per close_pane_id call — a tab removal doesn't
+            // also get a pane-level "closed" line for the pane that emptied it.
+            self.push_feed(format!("closed tab {}", tab_snapshot.name), false);
             self.remember_closed(Closed::Tab { index: ti, tab: tab_snapshot });
             self.spawn_active_tab();
         } else if !empty {
             if let Some(spec) = spec {
+                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+                self.push_feed(format!("closed {name}"), false);
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
@@ -1130,15 +1232,19 @@ impl<B: PaneBackend> App<B> {
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.on_exit();
         }
+        // A pane the user just closed (Alt+w) is already gone from the
+        // workspace by the time its process EOFs — that Exit is expected, so
+        // there's no name to report: nothing to log (the close hook already
+        // did) or notify about.
+        let spec = self.find_spec(id)?;
+        let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+        // C20: the feed logs every exit, focused pane included — unlike the
+        // notification below, which only nudges for an *unfocused* pane (a
+        // focused one's recovery hint is already on screen).
+        self.push_feed(format!("{name} exited"), false);
         if id == self.focused {
             return None;
         }
-        // A pane the user just closed (Alt+w) is already gone from the
-        // workspace by the time its process EOFs — that Exit is expected, not
-        // attention-worthy. Only nudge for a still-present, unfocused pane
-        // that exited on its own (its recovery hint is hidden in its borders).
-        let spec = self.find_spec(id)?;
-        let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
         Some(format!("{name} exited"))
     }
 
@@ -1381,6 +1487,7 @@ impl<B: PaneBackend> App<B> {
             Action::JumpAttention => self.jump_attention(),
             Action::ToggleZoom => self.toggle_zoom(),
             Action::CycleLayout => self.cycle_layout(),
+            Action::ToggleFeed => self.toggle_feed(),
         }
         // Any action other than a repeated close disarms a pending close
         // confirmation, so a stale "press again" can't leak onto a later key.
@@ -1407,20 +1514,24 @@ impl<B: PaneBackend> App<B> {
         };
         match closed {
             Closed::Tab { index, tab } => {
+                let name = tab.name.clone();
                 let i = index.min(self.ws.tabs.len());
                 self.ws.tabs.insert(i, tab);
                 self.ws.active_tab = i;
                 self.spawn_active_tab();
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
+                self.push_feed(format!("reopened tab {name}"), false);
                 self.flash = Some(("reopened tab".into(), Instant::now()));
             }
             Closed::Pane { tab_index, spec } => {
                 // Restore into its original tab if it still exists, else the
                 // active one; split the focused pane and reuse the saved spec
                 // (session id preserved ⇒ the agent resumes).
+                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.restore_pane(spec);
+                self.push_feed(format!("reopened {name}"), false);
                 self.flash = Some(("reopened pane".into(), Instant::now()));
             }
         }
@@ -1681,6 +1792,17 @@ impl<B: PaneBackend> App<B> {
         self.flash = Some(("no room to rearrange".into(), Instant::now()));
     }
 
+    /// Alt+e: open the C20 activity feed at the live tail, or close it if
+    /// already open. In practice the close direction is intercepted earlier,
+    /// in `handle_mode_key` (its doc comment explains why); this still
+    /// toggles honestly either way.
+    fn toggle_feed(&mut self) {
+        self.mode = match self.mode {
+            Mode::Feed { .. } => Mode::Normal,
+            _ => Mode::Feed { offset: 0 },
+        };
+    }
+
     // -- modes -------------------------------------------------------------
 
     /// Keys while in a non-Normal mode. Returns true when consumed.
@@ -1692,6 +1814,15 @@ impl<B: PaneBackend> App<B> {
         // would leave the pane you were reading frozen mid-history while scroll
         // keys silently drive a different pane.
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            // C20: Alt+e both opens and closes the feed. Handled here, before
+            // the generic reset below clears `self.mode` out from under it —
+            // otherwise `Action::ToggleFeed`, reached via the fallthrough
+            // path, could never tell the feed had just been open and would
+            // always re-open it instead of closing.
+            if matches!(self.mode, Mode::Feed { .. }) && key.code == KeyCode::Char('e') {
+                self.mode = Mode::Normal;
+                return true;
+            }
             if matches!(self.mode, Mode::Scroll { .. }) {
                 let focused = self.focused;
                 if let Some(rt) = self.runtimes.get_mut(&focused) {
@@ -1701,6 +1832,11 @@ impl<B: PaneBackend> App<B> {
             self.mode = Mode::Normal;
             return false;
         }
+        // C20: half the feed overlay's own height, for PgUp/PgDn — computed
+        // here (needs a whole `&self` via `body_area()`) rather than inside
+        // the match below, where `Mode::Feed`'s arm already holds
+        // `self.mode` mutably borrowed.
+        let feed_page = (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize;
         match &mut self.mode {
             Mode::Normal => false,
             Mode::Rename { buffer, target } => {
@@ -1795,6 +1931,18 @@ impl<B: PaneBackend> App<B> {
             Mode::Help => {
                 // Any key dismisses the keymap overlay.
                 self.mode = Mode::Normal;
+                true
+            }
+            Mode::Feed { offset } => {
+                let cap = self.feed.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => *offset = (*offset + 1).min(cap),
+                    KeyCode::Down | KeyCode::Char('j') => *offset = offset.saturating_sub(1),
+                    KeyCode::PageUp => *offset = (*offset + feed_page).min(cap),
+                    KeyCode::PageDown => *offset = offset.saturating_sub(feed_page),
+                    KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                    _ => {}
+                }
                 true
             }
         }
@@ -1907,6 +2055,17 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
+}
+
+/// C20: the feed overlay's `(width, height)` at the given body area —
+/// `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`. Shared by
+/// the renderer (geometry) and `handle_mode_key` (PgUp/PgDn page size) so
+/// both agree on what's actually on screen. Pure so the 72×16 formula is
+/// unit-tested without a `Frame`.
+pub fn feed_overlay_size(body: Rect) -> (u16, u16) {
+    let w = body.width.saturating_sub(4).min(72);
+    let h = body.height.saturating_sub(4).min(16);
+    (w, h)
 }
 
 /// C25: the arrangement at cycle index `idx` (0=grid, 1=main+stack,
@@ -2430,14 +2589,39 @@ mod tests {
         assert!(matches!(rrx.recv().unwrap(), Reply::Ok { .. }));
 
         let log = std::fs::read_to_string(dir.join("control.log")).unwrap();
-        // ctl_broadcast's own self-audit line (PLAN §F2's contracted shape,
-        // carrying the real fan-out count) must be present. len=14 is
-        // "secret payload".len(); count=1 is the lone auto-spawned pane.
-        let line = log.lines().find(|l| l.contains("count=")).expect("no count-bearing audit line");
-        assert!(line.contains("fleet broadcast len=14 submit=true -> ok count=1"), "{line}");
+        let lines: Vec<&str> = log.lines().collect();
+        // F4 carry-forward fix: ctl_broadcast's own self-audit line (the
+        // contracted shape, carrying the real fan-out count) must be the
+        // ONLY line — handle_control_msg's generic post-dispatch audit used
+        // to also fire for Broadcast, writing a second, count-less line for
+        // every fleet-wide send (and, once C20 landed, a second near-
+        // identical feed row too).
+        assert_eq!(lines.len(), 1, "exactly one ctl line per broadcast: {log:?}");
+        // len=14 is "secret payload".len(); count=1 is the lone auto-spawned pane.
+        assert!(lines[0].contains("fleet broadcast len=14 submit=true -> ok count=1"), "{}", lines[0]);
         assert!(!log.contains("secret payload"), "broadcast text must never be logged: {log:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_pushes_exactly_one_ctl_feed_line() {
+        // Same carry-forward fix, pinned on the C20 feed side: the socket
+        // path used to call `audit()` twice for a broadcast, which — once
+        // `audit()` started feeding C20 — would have shown up as two
+        // near-identical `ctl` rows in the activity overlay.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request { token: ct, method: Method::Broadcast { text: "hi".into(), submit: false } },
+            rtx,
+        );
+        assert!(matches!(rrx.recv().unwrap(), Reply::Ok { .. }));
+        let ctl_lines: Vec<&FeedEntry> = app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        assert_eq!(ctl_lines.len(), 1, "exactly one ctl feed line per broadcast: {:?}", app.feed());
+        assert!(ctl_lines[0].text.contains("fleet: broadcast len=2 submit=false → ok"), "{}", ctl_lines[0].text);
     }
 
     #[test]
@@ -3438,5 +3622,239 @@ mod tests {
                 Some("sess-2".to_string()),
             ])
         );
+    }
+
+    // -- C20 activity feed ---------------------------------------------------
+
+    #[test]
+    fn feed_ring_evicts_the_oldest_entry_past_200() {
+        let (mut app, _) = mk_app(shell_ws());
+        for i in 0..(FEED_CAP + 5) {
+            app.push_feed(format!("entry {i}"), false);
+        }
+        assert_eq!(app.feed().len(), FEED_CAP);
+        assert_eq!(app.feed().front().unwrap().text, "entry 5"); // oldest 5 evicted
+        assert_eq!(app.feed().back().unwrap().text, format!("entry {}", FEED_CAP + 4));
+    }
+
+    #[test]
+    fn tick_status_diff_feeds_one_line_per_transition_and_suppresses_exited() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+
+        // First tick after spawn: baseline only — spawn owns the birth line,
+        // so no transition line yet even though this is the pane's first
+        // observation by diff_statuses.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert!(app.feed().iter().all(|e| !e.text.contains('→')));
+
+        // A real transition: one line, using the C8 state words.
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        let transitions: Vec<_> = app.feed().iter().filter(|e| e.text.contains('→')).collect();
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].text.contains("idle → working"), "{}", transitions[0].text);
+
+        // A repeat tick with no status change adds no further line.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.feed().iter().filter(|e| e.text.contains('→')).count(), 1);
+
+        // A transition *to* Exited is suppressed — the exit hook owns it.
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Exited);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.feed().iter().filter(|e| e.text.contains('→')).count(),
+            1,
+            "transition to Exited must not add a feed line: {:?}",
+            app.feed()
+        );
+    }
+
+    #[test]
+    fn tick_status_diff_flags_a_needs_input_transition_for_the_feed_styling_rule() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick(); // baseline
+
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let line = app.feed().iter().find(|e| e.text.contains('→')).expect("no transition line");
+        assert!(line.needs_input);
+    }
+
+    #[test]
+    fn spawn_pushes_a_feed_line_naming_the_adapter() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let last = app.feed().back().expect("spawn should push a feed line");
+        assert!(last.text.starts_with("spawned "), "{}", last.text);
+        assert!(last.text.contains("(shell)"), "{}", last.text);
+        assert!(!last.needs_input);
+    }
+
+    #[test]
+    fn close_pane_pushes_closed_name_when_the_tab_survives() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ClosePane);
+        let last = app.feed().back().unwrap();
+        assert!(last.text.starts_with("closed "), "{}", last.text);
+        assert!(!last.text.starts_with("closed tab"), "{}", last.text);
+    }
+
+    #[test]
+    fn close_last_pane_of_a_tab_pushes_closed_tab_name_not_pane_name() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let ti = app.ws.active_tab;
+        app.ws.tabs[ti].name = "scratch".into();
+        app.apply(Action::ClosePane); // last pane of this tab → the tab is removed
+        let last = app.feed().back().unwrap();
+        assert_eq!(last.text, "closed tab scratch");
+    }
+
+    #[test]
+    fn undo_pushes_reopened_lines_for_pane_and_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ClosePane);
+        app.apply(Action::Undo);
+        let last = app.feed().back().unwrap();
+        assert!(last.text.starts_with("reopened "), "{}", last.text);
+        assert!(!last.text.starts_with("reopened tab"), "{}", last.text);
+
+        app.apply(Action::NewTab);
+        let ti = app.ws.active_tab;
+        app.ws.tabs[ti].name = "scratch".into();
+        app.apply(Action::ClosePane); // removes the tab
+        app.apply(Action::Undo);
+        let last = app.feed().back().unwrap();
+        assert_eq!(last.text, "reopened tab scratch");
+    }
+
+    #[test]
+    fn on_pty_exit_pushes_a_feed_line_even_for_the_focused_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused; // the sole pane starts focused
+        app.on_pty_exit(id);
+        let last = app.feed().back().unwrap();
+        assert!(last.text.ends_with("exited"), "{}", last.text);
+    }
+
+    #[test]
+    fn on_pty_exit_of_an_already_closed_pane_pushes_nothing() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 & 2, focus = 2
+        app.apply(Action::ClosePane); // deliberately closes pane 2
+        let before = app.feed().len();
+        app.on_pty_exit(2); // its late EOF
+        assert_eq!(app.feed().len(), before, "an already-closed pane's EOF logs nothing new");
+    }
+
+    #[test]
+    fn audited_control_call_pushes_exactly_one_ctl_feed_line_even_without_a_socket_dir() {
+        use crate::core::control::{Method, Request};
+        let (mut app, _) = mk_app(shell_ws()); // mk_app passes sock_path = None
+        let ct = app.control_token().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct,
+                method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            },
+            tx,
+        );
+        let _ = rx.recv().unwrap();
+        let ctl_lines: Vec<&FeedEntry> = app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        assert_eq!(ctl_lines.len(), 1, "exactly one ctl feed line per audited call: {:?}", app.feed());
+        assert!(
+            ctl_lines[0].text.contains("fleet: spawn adapter=shell → ok"),
+            "{}",
+            ctl_lines[0].text
+        );
+    }
+
+    #[test]
+    fn toggle_feed_opens_from_normal_and_alt_e_closes_it_again() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFeed);
+        assert!(matches!(app.mode, Mode::Feed { offset: 0 }));
+
+        // The same chord, while the feed is open, closes it (handled
+        // specially in handle_mode_key — see its doc comment).
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT));
+        assert!(consumed);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn feed_esc_and_q_close_it() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        for closer in [KeyCode::Esc, KeyCode::Char('q')] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::ToggleFeed);
+            app.handle_mode_key(KeyEvent::from(closer));
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+    }
+
+    #[test]
+    fn other_alt_chords_close_the_feed_and_still_apply_globally() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // 2 panes, so Focus(Left) actually moves
+        app.apply(Action::ToggleFeed);
+        assert!(matches!(app.mode, Mode::Feed { .. }));
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert!(!consumed, "falls through to the global Focus binding");
+        assert!(matches!(app.mode, Mode::Normal), "any other Alt chord exits feed mode too");
+    }
+
+    #[test]
+    fn feed_scroll_offset_clamps_at_both_ends() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        for i in 0..3 {
+            app.push_feed(format!("entry {i}"), false);
+        }
+        app.apply(Action::ToggleFeed);
+        assert!(matches!(app.mode, Mode::Feed { offset: 0 }));
+
+        // Down (toward the live tail) at offset 0 stays clamped at 0.
+        app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Feed { offset: 0 }));
+
+        // Up scrolls back one entry at a time, clamped at len-1 (3 entries
+        // pushed by this test, plus the spawn line from mk_app's setup —
+        // whatever the real count is, it must never exceed len-1).
+        let cap = app.feed().len() - 1;
+        for _ in 0..(cap + 5) {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Up));
+        }
+        assert!(matches!(app.mode, Mode::Feed { offset } if offset == cap));
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Feed { offset } if offset == cap - 1));
+    }
+
+    #[test]
+    fn feed_overlay_size_is_72x16_at_the_80x24_floor() {
+        // C20: "At the 80×24 floor: 72×16, fits."
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(80, 24));
+        assert_eq!(feed_overlay_size(app.body_area()), (72, 16));
+    }
+
+    #[test]
+    fn feed_overlay_size_clamps_on_a_tiny_body() {
+        assert_eq!(feed_overlay_size(Rect::new(0, 1, 20, 6)), (16, 2));
     }
 }
