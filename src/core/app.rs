@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use ratatui::layout::{Rect, Size};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
@@ -18,18 +18,13 @@ use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
 use crate::ports::{Observation, PaneBackend, StateStore};
 use crate::ui::input::Action;
+use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long the "Alt keys aren't reaching roost" hint stays up on a fresh
 /// launch before we assume the user isn't going to press one / already saw it.
 const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
-
-/// A pane must stay usable after a split. These are the smallest *outer*
-/// rects (borders included) we allow a split to produce; below them the new
-/// pane would be a sliver, so the split is refused.
-const MIN_SPLIT_COLS: u16 = 36; // two ~16-col inner panes + borders
-const MIN_SPLIT_ROWS: u16 = 10; // two ~3-row inner panes + borders
 
 /// Adapters offered by the quick-launch picker (Alt+Enter), derived from the
 /// single adapter list in `agents` so the picker can never drift out of sync
@@ -51,10 +46,15 @@ pub enum Mode {
     Rename { buffer: String, target: RenameTarget },
     Picker { selection: usize },
     Scroll { offset: usize },
-    /// Mouse-drag text selection; copies to the clipboard on release.
-    Copy,
+    /// Text selection — mouse drag, or the C24 keyboard cursor. `cursor` is
+    /// (row, col) in the focused pane's inner cell space; both input
+    /// methods write the same `App::selection`.
+    Copy { cursor: (u16, u16) },
     /// Full-keymap overlay (Alt+?); any key dismisses it.
     Help,
+    /// C20 activity-feed overlay; `offset` counts entries back from the
+    /// newest (0 = live tail).
+    Feed { offset: usize },
 }
 
 /// An in-progress / completed text selection within one pane. Coordinates are
@@ -65,6 +65,18 @@ pub struct Selection {
     pub anchor: (u16, u16),
     pub cursor: (u16, u16),
     pub dragging: bool,
+}
+
+/// One C20 activity-feed entry, preformatted at push time — the ring stores
+/// only the rendered line (no raw event data: no filtering/search, by
+/// design). `needs_input` is the one styling exception: true only for a
+/// status-transition line landing on `NeedsInput` (the `◆ ` ACCENT prefix,
+/// FG text — same meaning as everywhere else, C5).
+#[derive(Debug, Clone)]
+pub struct FeedEntry {
+    pub at: SystemTime,
+    pub text: String,
+    pub needs_input: bool,
 }
 
 /// How long the "copied" flash stays in the hint bar.
@@ -84,6 +96,9 @@ const UNDO_DEPTH: usize = 20;
 /// on. Left well below that pool size so plenty always stay free.
 const MAX_WAITS: usize = 16;
 
+/// C20: activity-feed ring buffer capacity — oldest evicted first.
+const FEED_CAP: usize = 200;
+
 /// A closed pane or tab, kept on the undo stack so `Alt+u` can reopen it —
 /// crucially with its session id intact, so the agent resumes where it was.
 #[derive(Debug, Clone)]
@@ -97,11 +112,36 @@ enum Closed {
 /// A parked `wait` control request: reply when any of `panes` reaches `until`,
 /// or when `deadline` passes. Holds the client's reply channel until then.
 struct Waiter {
+    /// Who registered this wait — re-checked against `may_target` when a
+    /// candidate pane fires (see `poll_waiters`). Pane ids are recycled
+    /// once free (`Workspace::next_pane_id` is a max+1, not a monotonic
+    /// counter): the id this waiter was authorized for at registration can
+    /// belong to a different, unrelated pane by the time it fires.
+    actor: Actor,
     panes: Vec<PaneId>,
     until: AgentStatus,
     reply: Sender<Reply>,
     deadline: Instant,
 }
+
+/// C22: the app-wide floating scratch pane. Lives outside every tab's
+/// layout tree — its runtime sits in the same `App::runtimes` map as any
+/// other pane, but `spec` here (not `Tab::panes`) is its source of truth,
+/// and it is never written to `workspace.json` (session-only by design).
+#[derive(Debug)]
+struct Float {
+    id: PaneId,
+    spec: PaneSpec,
+    shown: bool,
+    /// Whatever was focused right before the float last became shown —
+    /// where focus returns when it hides (C22 rules 2/3).
+    prev_focus: PaneId,
+}
+
+/// C22: below this body size the geometry formula (`App::float_rect`) has
+/// no room to place a sane rect — the toggle refuses instead.
+const MIN_FLOAT_BODY_COLS: u16 = 40;
+const MIN_FLOAT_BODY_ROWS: u16 = 10;
 
 /// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
 /// is a lazily-loaded tab whose panes haven't been spawned — deliberately
@@ -128,6 +168,14 @@ pub struct App<B: PaneBackend> {
     /// Zellij-style shortcut hint bar at the bottom; on by default so keys
     /// are always discoverable. Session-only (not persisted).
     hints: bool,
+    /// C21: a pure view transform. While true, the render / PTY-resize /
+    /// mouse paths see only the focused pane at the full body area (see
+    /// `display_rects`); the layout tree itself is never touched.
+    /// Session-only, never persisted.
+    zoomed: bool,
+    /// C25: index of the arrangement Alt+g tries first on the next press
+    /// (grid=0 / main+stack=1 / all-stack=2). Session-only.
+    layout_cycle: usize,
     store: Box<dyn StateStore>,
     /// Whether the most recent workspace save succeeded — the tab bar's
     /// right status area (C2) shows "saved ✓" while this is true and
@@ -172,6 +220,27 @@ pub struct App<B: PaneBackend> {
     /// first PTY output rather than written the instant it spawns — see
     /// `on_pty_output` for why.
     pending_input: HashMap<PaneId, Vec<u8>>,
+    /// C20: last-known status per spawned pane, diffed each tick to produce
+    /// a feed transition line (`diff_statuses`). Pruned to just the
+    /// currently-running panes on the same cadence.
+    last_status: HashMap<PaneId, AgentStatus>,
+    /// C20: activity-feed ring buffer (status/spawn/close/exit/ctl),
+    /// capacity `FEED_CAP`, oldest evicted first. Session-only — never
+    /// persisted.
+    feed: VecDeque<FeedEntry>,
+    /// C22: the one app-wide floating scratch pane slot, spawned on first
+    /// Alt+f. `None` until then.
+    float: Option<Float>,
+    /// C23: panes currently in raw (hard pass-through) mode, by id.
+    /// Per-pane, session-only — never persisted.
+    raw: HashSet<PaneId>,
+    /// C24: text most recently yanked via the keyboard copy-mode `y`/`Enter`
+    /// chord, waiting for the composition root to hand it to the OS
+    /// clipboard — core has no I/O of its own (module doc). The mouse path
+    /// copies directly from `finish_selection`'s return value in `main.rs`
+    /// instead, since it already runs there; this field exists only because
+    /// `handle_mode_key` has no such caller-side return channel.
+    pending_yank: Option<String>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -205,6 +274,8 @@ impl<B: PaneBackend> App<B> {
             dead: HashMap::new(),
             mode: Mode::Normal,
             hints: true,
+            zoomed: false,
+            layout_cycle: 0,
             store,
             last_save_ok: true,
             tx,
@@ -223,6 +294,11 @@ impl<B: PaneBackend> App<B> {
             control_token,
             waiters: Vec::new(),
             pending_input: HashMap::new(),
+            last_status: HashMap::new(),
+            feed: VecDeque::new(),
+            float: None,
+            raw: HashSet::new(),
+            pending_yank: None,
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -245,6 +321,28 @@ impl<B: PaneBackend> App<B> {
     /// tall enough to spare the row (tab + hint + at least one body row).
     pub fn hints_shown(&self) -> bool {
         self.hints && self.term_size.height >= 3
+    }
+
+    /// C21: is the focused pane currently zoomed (full-body view)? Drives
+    /// the hint bar's `ZOOM` pseudo-state word (amended C9).
+    pub fn zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// C20: the activity-feed ring, oldest first — read by the renderer
+    /// while `Mode::Feed` is open.
+    pub fn feed(&self) -> &VecDeque<FeedEntry> {
+        &self.feed
+    }
+
+    /// C20: append one preformatted line to the activity feed, evicting the
+    /// oldest entry once the ring is at capacity. The single entry point
+    /// every hook (spawn/close/exit/status-diff/ctl) pushes through.
+    fn push_feed(&mut self, text: String, needs_input: bool) {
+        self.feed.push_back(FeedEntry { at: SystemTime::now(), text, needs_input });
+        if self.feed.len() > FEED_CAP {
+            self.feed.pop_front();
+        }
     }
 
     /// Record that an Alt-modified key actually arrived, so the startup hint
@@ -284,6 +382,100 @@ impl<B: PaneBackend> App<B> {
         let mut v = Vec::new();
         layout::compute_rects(&self.ws.active_tab().layout, self.body_area(), &mut v);
         v
+    }
+
+    /// C21/C22/§5: the one display list the renderer, PTY-resize, and
+    /// mouse-hit paths all consume — float first when shown (topmost wins
+    /// in `hit_test`; the renderer instead paints it *last*, see
+    /// `render::draw`), then the zoomed singleton `[zoom target @ body]`
+    /// while zoomed, else the real tree's `rects()`. Focus math
+    /// (`layout::neighbor`, `focus_dir`) deliberately keeps reading
+    /// `rects()` instead — that's what makes zoom follow focus rather than
+    /// freeze it.
+    pub fn display_rects(&self) -> Vec<PaneRect> {
+        let body = self.body_area();
+        let mut v = Vec::new();
+        if let Some(f) = &self.float {
+            if f.shown {
+                v.push(PaneRect { id: f.id, rect: Self::float_rect(body), collapsed: false });
+            }
+        }
+        if self.zoomed {
+            // C21 "keeps zoom" + C22 rule 1: while the float is shown, focus
+            // belongs to it, not the zoomed pane — the real zoom target is
+            // whatever was focused right before the float appeared.
+            let target = match &self.float {
+                Some(f) if f.shown => f.prev_focus,
+                _ => self.focused,
+            };
+            v.push(PaneRect { id: target, rect: body, collapsed: false });
+        } else {
+            v.extend(self.rects());
+        }
+        v
+    }
+
+    /// C22: the float's rect for a given body area — centered,
+    /// `w = clamp(3·body.width/5, 36, body.width−4)`,
+    /// `h = clamp(3·body.height/5, 8, body.height−2)`. Written without
+    /// `.clamp()` (whose panic-on-`min>max` would fire below the refusal
+    /// floor) so a body that shrank *after* the float was shown still
+    /// produces a rect, never a panic; callers gate showing/spawning a new
+    /// float on `float_fits` first.
+    fn float_rect(body: Rect) -> Rect {
+        let w = (3 * body.width / 5).max(36).min(body.width.saturating_sub(4));
+        let h = (3 * body.height / 5).max(8).min(body.height.saturating_sub(2));
+        let x = body.x + body.width.saturating_sub(w) / 2;
+        let y = body.y + body.height.saturating_sub(h) / 2;
+        Rect::new(x, y, w, h)
+    }
+
+    /// C22: is `body` big enough for `float_rect` to place a sane rect?
+    fn float_fits(body: Rect) -> bool {
+        body.width >= MIN_FLOAT_BODY_COLS && body.height >= MIN_FLOAT_BODY_ROWS
+    }
+
+    /// C22: pane-id allocation must account for the float, which lives
+    /// outside `ws.tabs` — `ws.next_pane_id()` alone would eventually let a
+    /// split reuse its id. The one allocator every spawn path goes through.
+    fn alloc_pane_id(&self) -> PaneId {
+        let base = self.ws.next_pane_id();
+        match &self.float {
+            Some(f) => base.max(f.id + 1),
+            None => base,
+        }
+    }
+
+    /// Is `id` the float's pane?
+    fn is_float(&self, id: PaneId) -> bool {
+        self.float.as_ref().is_some_and(|f| f.id == id)
+    }
+
+    /// Is the float currently the focused pane? Equivalent to "is it
+    /// shown" (rule 1: shown ⇒ focused) — checking focus directly is
+    /// simpler and doesn't also require reading `shown`.
+    fn float_focused(&self) -> bool {
+        self.is_float(self.focused)
+    }
+
+    /// C23: does `id` currently have raw pass-through enabled? Read by the
+    /// renderer for the badge/row token and hint-bar word (C4/C8/C9).
+    pub fn is_raw(&self, id: PaneId) -> bool {
+        self.raw.contains(&id)
+    }
+
+    /// C23's routing predicate, verbatim: raw key-forwarding applies only
+    /// when the mode is Normal, the focused pane is flagged raw, and it's
+    /// alive. Checked by `main.rs`'s key path before it ever calls
+    /// `translate()`.
+    pub fn raw_routing_active(&self) -> bool {
+        matches!(self.mode, Mode::Normal) && self.raw.contains(&self.focused) && !self.focused_dead()
+    }
+
+    /// C24: take (clearing) the pending keyboard-copy yank, if any — see
+    /// `pending_yank`. Polled once per tick from the composition root.
+    pub fn take_pending_yank(&mut self) -> Option<String> {
+        self.pending_yank.take()
     }
 
     pub fn pane_order(&self) -> Vec<PaneId> {
@@ -355,6 +547,10 @@ impl<B: PaneBackend> App<B> {
                 if wants_detect {
                     self.pending_detect.insert(id, SystemTime::now());
                 }
+                // C20: spawn owns the pane's "birth" line — diff_statuses
+                // deliberately stays silent on a pane's first observation.
+                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+                self.push_feed(format!("spawned {name} ({})", spec.adapter), false);
             }
             Err(e) => {
                 self.dead.insert(id, e.to_string());
@@ -371,6 +567,11 @@ impl<B: PaneBackend> App<B> {
         self.last_detect = Instant::now();
         // Persist what each pane is actually running (live cwd, typed agent).
         self.observe_panes();
+        // C20: one status-transition feed line per pane per tick, diffed
+        // against each pane's last-known status. Placed before the
+        // `pending_detect` early-return below so it always runs, whether or
+        // not any pane is mid-session-detection.
+        self.diff_statuses();
         if self.pending_detect.is_empty() {
             return;
         }
@@ -398,6 +599,36 @@ impl<B: PaneBackend> App<B> {
                 self.set_session(id, session);
             }
         }
+    }
+
+    /// C20: diff every spawned pane's current status against its last-known
+    /// one, pushing `{name}: {old} → {new}` for each real transition. First
+    /// observation of a pane is silently baselined (`spawn_pane` owns
+    /// birth); a transition landing on `Exited` is suppressed (`on_pty_exit`
+    /// owns that line) — one source per transition, no double-reporting.
+    fn diff_statuses(&mut self) {
+        let current: Vec<(PaneId, AgentStatus)> =
+            self.runtimes.iter().map(|(id, rt)| (*id, rt.status())).collect();
+        for (id, status) in current {
+            let prev = self.last_status.insert(id, status);
+            match prev {
+                None => {} // first observation: spawn owns birth, no line
+                Some(old) if old == status || status == AgentStatus::Exited => {}
+                Some(old) => {
+                    let name = self
+                        .find_spec(id)
+                        .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
+                        .unwrap_or_else(|| format!("pane {id}"));
+                    let text =
+                        format!("{name}: {} → {}", state_word(old), state_word(status));
+                    self.push_feed(text, status == AgentStatus::NeedsInput);
+                }
+            }
+        }
+        // Drop entries for panes that no longer have a runtime (closed) —
+        // ids are never reused, so without this the map would grow by one
+        // stale entry per pane ever spawned over a long session.
+        self.last_status.retain(|id, _| self.runtimes.contains_key(id));
     }
 
     /// Persist what each pane is *actually* running — its live working
@@ -467,7 +698,15 @@ impl<B: PaneBackend> App<B> {
             .collect()
     }
 
+    /// C22: learns the float — `send`/`read`/badges/rename/respawn by id
+    /// all route through this, so they work on the scratch pane exactly
+    /// like any other, with zero extra code at those call sites.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
+        if let Some(f) = &self.float {
+            if f.id == id {
+                return Some(&f.spec);
+            }
+        }
         self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
     }
 
@@ -479,7 +718,13 @@ impl<B: PaneBackend> App<B> {
         Some(abbreviate_home(cwd, self.home.as_deref()))
     }
 
+    /// C22: mirrors `find_spec` — the float's spec is mutable too (rename).
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
+        if let Some(f) = &mut self.float {
+            if f.id == id {
+                return Some(&mut f.spec);
+            }
+        }
         self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
     }
 
@@ -629,6 +874,7 @@ impl<B: PaneBackend> App<B> {
             }
             Method::Fork { pane } => self.ctl_fork(actor, pane),
             Method::Send { pane, text, submit } => self.ctl_send(actor, pane, &text, submit),
+            Method::Broadcast { text, submit } => self.ctl_broadcast(actor, &text, submit),
             Method::Read { pane, mode } => self.ctl_read(actor, pane, mode),
             Method::Close { pane, force } => self.ctl_close(actor, pane, force),
             // `wait` is handled asynchronously; only reached if a caller sends
@@ -657,6 +903,15 @@ impl<B: PaneBackend> App<B> {
                     Err(reason) => self.audit(Some(actor), &summary, false, &reason),
                 }
             }
+            // Broadcast self-audits inside ctl_broadcast with the real
+            // fan-out count — the generic post-dispatch audit below only
+            // ever sees an opaque `Reply::Ok`, so it can't produce that
+            // detail. Handled here, mirroring the Wait special-case above,
+            // so a broadcast is never audited (or fed) twice.
+            (Some(actor), Method::Broadcast { text, submit }) => {
+                let r = self.ctl_broadcast(actor, &text, submit);
+                let _ = reply.send(r);
+            }
             (Some(actor), method) => {
                 let r = self.dispatch(actor, method);
                 let (ok, detail) = match &r {
@@ -669,21 +924,25 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// Append a control action to `<state>/control.log` (unconditional — every
-    /// spawn/send/read/close/etc. that touches the fleet is recorded with who
-    /// did it, what, and the outcome). No-op when there's no socket dir.
-    fn audit(&self, actor: Option<Actor>, summary: &str, ok: bool, detail: &str) {
-        let Some(dir) = self.sock_path.as_ref().and_then(|p| p.parent()) else { return };
+    /// Append a control action to `<state>/control.log` (unconditional —
+    /// every spawn/send/read/close/etc. that touches the fleet is recorded
+    /// with who did it, what, and the outcome) AND to the C20 activity feed
+    /// (the feed push happens even when there's no socket dir — session-only
+    /// state doesn't need one).
+    fn audit(&mut self, actor: Option<Actor>, summary: &str, ok: bool, detail: &str) {
         let principal = match actor {
             Some(Actor::Fleet) => "fleet".to_string(),
             Some(Actor::Pane(id)) => format!("pane:{id}"),
             None => "?".to_string(),
         };
+        let outcome = if ok { "ok" } else { "err" };
+        self.push_feed(format!("ctl {principal}: {} → {outcome}", sanitize(summary)), false);
+
+        let Some(dir) = self.sock_path.as_ref().and_then(|p| p.parent()) else { return };
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let outcome = if ok { "ok" } else { "err" };
         let line =
             format!("{ts} {principal} {} -> {outcome} {}\n", sanitize(summary), sanitize(detail));
         use std::io::Write;
@@ -761,7 +1020,7 @@ impl<B: PaneBackend> App<B> {
         // Default 5 min, capped at 24 h, so a parked reply can't live forever.
         let ms = timeout_ms.unwrap_or(300_000).min(24 * 3600 * 1000);
         let deadline = Instant::now() + Duration::from_millis(ms);
-        self.waiters.push(Waiter { panes, until, reply, deadline });
+        self.waiters.push(Waiter { actor, panes, until, reply, deadline });
         Ok("parked")
     }
 
@@ -775,7 +1034,20 @@ impl<B: PaneBackend> App<B> {
         let mut i = 0;
         while i < self.waiters.len() {
             let w = &self.waiters[i];
-            let hit = w.panes.iter().copied().find(|&p| self.pane_matches(p, w.until));
+            // LOW-3: re-verify authorization at fire time, not just at
+            // registration. If `p` now resolves to a *live* spec (it may
+            // have been closed and recycled to an unrelated pane since
+            // this waiter registered) that the waiter isn't authorized for,
+            // never disclose its status — treat it as not-yet-matched. A
+            // fully gone id (no live spec at all) still resolves normally
+            // below: "it's gone" discloses nothing pane-specific, so it
+            // needs no re-check.
+            let hit = w.panes.iter().copied().find(|&p| {
+                if self.find_spec(p).is_some() && !self.may_target(w.actor, p) {
+                    return false;
+                }
+                self.pane_matches(p, w.until)
+            });
             let timed_out = now >= w.deadline;
             if let Some(id) = hit {
                 let status = self.status_str(id);
@@ -921,8 +1193,63 @@ impl<B: PaneBackend> App<B> {
         if submit {
             bytes.push(b'\r');
         }
-        rt.write_input(&bytes);
+        // LOW-2: a pane can look running (status snapshot) yet have a dead
+        // write pipe (e.g. it just exited) — don't report bytes as sent
+        // unless the write actually succeeded.
+        if !rt.write_input(&bytes) {
+            return Reply::err("pane did not accept input");
+        }
         Reply::ok(serde_json::json!({ "sent": bytes.len() }))
+    }
+
+    /// Deliver `text` (+ CR when `submit`) to every **running** pane `actor`
+    /// may target. Fleet reaches every spawned pane by iterating `runtimes`
+    /// directly (not `ws.tabs`) — except the float (C22): it's the human's
+    /// private interactive scratch shell, never a fleet member, so it is
+    /// always excluded from the fan-out regardless of actor; a pane actor
+    /// reaches only its own spawned subtree, itself included — the exact
+    /// same `may_target`/`in_subtree` rule as every other verb. "Running"
+    /// excludes a pane whose process already exited but hasn't been closed
+    /// (its runtime lingers with `AgentStatus::Exited` — see `on_pty_exit`):
+    /// writing to it would silently go nowhere, so counting it as "sent"
+    /// would be a dishonest reply/audit — same reasoning covers a pane that
+    /// *looked* running in that snapshot but whose write pipe is actually
+    /// dead (it exited a moment later): `sent`/`count` only include panes
+    /// whose write call actually succeeded. There's no per-target id to
+    /// validate (unlike send/read/close), so this never errors — zero
+    /// matching panes is `ok` with count 0.
+    fn ctl_broadcast(&mut self, actor: Actor, text: &str, submit: bool) -> Reply {
+        let mut bytes = text.as_bytes().to_vec();
+        if submit {
+            bytes.push(b'\r');
+        }
+        let mut targets: Vec<PaneId> = Vec::new();
+        for (&id, rt) in self.runtimes.iter() {
+            if rt.status() != AgentStatus::Exited && !self.is_float(id) && self.may_target(actor, id)
+            {
+                targets.push(id);
+            }
+        }
+        targets.sort_unstable();
+        let mut sent: Vec<PaneId> = Vec::new();
+        for &id in &targets {
+            if let Some(rt) = self.runtimes.get_mut(&id) {
+                if rt.write_input(&bytes) {
+                    sent.push(id);
+                }
+            }
+        }
+        let count = sent.len();
+        // Self-audit with the real count — the generic post-dispatch audit
+        // in handle_control_msg only ever sees an opaque `Reply::Ok` (it
+        // can't produce this contract's `count=` detail), so
+        // handle_control_msg special-cases Broadcast to call this directly
+        // instead of going through dispatch + that generic audit. This is
+        // the only audit call for a broadcast: one `ctl` line per call, in
+        // both control.log and the C20 feed.
+        let summary = method_summary(&Method::Broadcast { text: text.to_string(), submit });
+        self.audit(Some(actor), &summary, true, &format!("count={count}"));
+        Reply::ok(serde_json::json!({ "sent": sent, "count": count }))
     }
 
     fn ctl_read(&self, actor: Actor, pane: PaneId, mode: ReadMode) -> Reply {
@@ -954,6 +1281,12 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
+        // C22: the scratch pane never closes via the control plane —
+        // checked for every caller (including Fleet), before authz, since
+        // the refusal is unconditional either way.
+        if self.is_float(pane) {
+            return Reply::err("cannot close the scratch pane");
+        }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
         }
@@ -979,6 +1312,12 @@ impl<B: PaneBackend> App<B> {
     /// consistent even when the pane it removes isn't either of those.
     fn close_pane_id(&mut self, id: PaneId) -> bool {
         let Some(ti) = self.tab_of(id) else { return false };
+        // C21: closing the pane you're zoomed on ends the zoomed view —
+        // there's nothing left to show full-screen. A control-plane close of
+        // some *other* pane leaves an unrelated zoom alone.
+        if self.zoomed && id == self.focused {
+            self.exit_zoom();
+        }
         let spec = self.ws.tabs[ti].panes.get(&id).cloned();
         let tab_snapshot = self.ws.tabs[ti].clone();
         if let Some(mut rt) = self.runtimes.remove(&id) {
@@ -993,6 +1332,10 @@ impl<B: PaneBackend> App<B> {
         // buffered initial_input (see on_pty_output) — drop it too, rather
         // than leaking an entry keyed on an id that's gone for good.
         self.pending_input.remove(&id);
+        // C23: pane ids are never reused, so a stale raw-membership entry is
+        // harmless — but cheap to clean up alongside every other per-pane
+        // side table above.
+        self.raw.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         let empty = layout::remove_pane(&mut tab.layout, id);
@@ -1010,10 +1353,15 @@ impl<B: PaneBackend> App<B> {
             } else if self.ws.active_tab >= self.ws.tabs.len() {
                 self.ws.active_tab = self.ws.tabs.len().saturating_sub(1);
             }
+            // C20: one line per close_pane_id call — a tab removal doesn't
+            // also get a pane-level "closed" line for the pane that emptied it.
+            self.push_feed(format!("closed tab {}", tab_snapshot.name), false);
             self.remember_closed(Closed::Tab { index: ti, tab: tab_snapshot });
             self.spawn_active_tab();
         } else if !empty {
             if let Some(spec) = spec {
+                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+                self.push_feed(format!("closed {name}"), false);
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
@@ -1059,15 +1407,19 @@ impl<B: PaneBackend> App<B> {
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.on_exit();
         }
+        // A pane the user just closed (Alt+w) is already gone from the
+        // workspace by the time its process EOFs — that Exit is expected, so
+        // there's no name to report: nothing to log (the close hook already
+        // did) or notify about.
+        let spec = self.find_spec(id)?;
+        let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+        // C20: the feed logs every exit, focused pane included — unlike the
+        // notification below, which only nudges for an *unfocused* pane (a
+        // focused one's recovery hint is already on screen).
+        self.push_feed(format!("{name} exited"), false);
         if id == self.focused {
             return None;
         }
-        // A pane the user just closed (Alt+w) is already gone from the
-        // workspace by the time its process EOFs — that Exit is expected, not
-        // attention-worthy. Only nudge for a still-present, unfocused pane
-        // that exited on its own (its recovery hint is hidden in its borders).
-        let spec = self.find_spec(id)?;
-        let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
         Some(format!("{name} exited"))
     }
 
@@ -1114,9 +1466,12 @@ impl<B: PaneBackend> App<B> {
         self.relayout();
     }
 
-    /// Recompute rects and push new sizes to every pane backend.
+    /// Recompute rects and push new sizes to every pane backend. C21: driven
+    /// by `display_rects`, so while zoomed only the zoomed pane's PTY is
+    /// resized (to the full body) — every other pane keeps its last size
+    /// until unzoom relayouts them (no reflow churn while reading).
     pub fn relayout(&mut self) {
-        for pr in self.rects() {
+        for pr in self.display_rects() {
             if pr.collapsed {
                 continue;
             }
@@ -1127,23 +1482,47 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// The focused pane's inner (border-excluded) cell dimensions as
+    /// `(rows, cols)`, from the current display list — so a zoomed or
+    /// floated pane's *actual* on-screen size is used, matching the
+    /// (row, col) convention `Mode::Copy`'s cursor and `Selection` share.
+    /// `(1, 1)` if the focused pane isn't currently displayed (shouldn't
+    /// happen, but keeps the C24 cursor math panic-free either way).
+    fn focused_inner_dims(&self) -> (u16, u16) {
+        self.display_rects()
+            .iter()
+            .find(|pr| pr.id == self.focused)
+            .map(|pr| inner_dims(pr.rect))
+            .unwrap_or((1, 1))
+    }
+
     // -- copy mode / selection --------------------------------------------
 
     pub fn in_copy_mode(&self) -> bool {
-        matches!(self.mode, Mode::Copy)
+        matches!(self.mode, Mode::Copy { .. })
     }
 
-    /// Start a selection in pane `id` at inner cell (row, col).
+    /// Start a selection in pane `id` at inner cell (row, col). C24: also
+    /// moves the keyboard cursor there, so a fresh mouse drag and the
+    /// keyboard cursor never disagree about where the selection is.
     pub fn begin_selection(&mut self, id: PaneId, row: u16, col: u16) {
         self.selection = Some(Selection { pane: id, anchor: (row, col), cursor: (row, col), dragging: true });
+        if let Mode::Copy { cursor } = &mut self.mode {
+            *cursor = (row, col);
+        }
     }
 
-    /// Extend the active drag to inner cell (row, col).
+    /// Extend the active drag to inner cell (row, col). C24: a drag "also
+    /// moves the cursor to the drag point" — the two input methods write
+    /// the same state either way.
     pub fn extend_selection(&mut self, row: u16, col: u16) {
         if let Some(sel) = &mut self.selection {
             if sel.dragging {
                 sel.cursor = (row, col);
             }
+        }
+        if let Mode::Copy { cursor } = &mut self.mode {
+            *cursor = (row, col);
         }
     }
 
@@ -1188,7 +1567,14 @@ impl<B: PaneBackend> App<B> {
     // -- mouse -------------------------------------------------------------
 
     /// Left click: focus the pane under the cursor (expanding stack members).
+    /// C22 rule 2: a click outside the float's rect hides it first — the
+    /// click itself still lands normally on whatever it hit (below).
+    /// Clicking the float's own rect (id == the already-focused float) is
+    /// not "outside" and leaves it shown.
     pub fn on_click(&mut self, id: PaneId) {
+        if self.float_focused() && id != self.focused {
+            self.hide_float();
+        }
         self.focused = id;
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         self.relayout();
@@ -1237,7 +1623,10 @@ impl<B: PaneBackend> App<B> {
         }
         self.dead.remove(&id);
         let Some(spec) = self.find_spec(id).cloned() else { return };
-        if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
+        // display_rects, not rects: this bypasses apply()'s trailing
+        // relayout(), so a zoomed dead pane must be spawned at the size it's
+        // actually shown at (full body) — not its stale tiled rect.
+        if let Some(pr) = self.display_rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
         self.save();
@@ -1246,6 +1635,29 @@ impl<B: PaneBackend> App<B> {
     // -- actions -----------------------------------------------------------
 
     pub fn apply(&mut self, action: Action) {
+        // C21/C22: a structural layout action must not change the tab
+        // invisibly behind a full-screen zoomed pane, nor target the float
+        // (which lives outside the layout tree — leaving it focused here is
+        // `spawn_child`'s empty-tab-fallback layout-wipe hazard waiting to
+        // happen). Leave zoom, then hide the float (restoring `prev_focus`),
+        // then apply below — exhaustive trigger list; tab changes exit zoom
+        // and hide the float too, handled inside `new_tab`/`go_to_tab` since
+        // only a *real* switch should count; Focus/JumpAttention hide the
+        // float from inside their own functions (rule 2); Alt+z is
+        // deliberately excluded from the float rule — it gets its own
+        // "can't zoom the float" no-op below instead of retargeting to
+        // `prev_focus`.
+        if matches!(
+            action,
+            Action::NewPane
+                | Action::ToggleStack
+                | Action::FlipSplit
+                | Action::Resize { .. }
+                | Action::CycleLayout
+        ) {
+            self.exit_zoom();
+            self.hide_float();
+        }
         match action {
             Action::Quit => self.quit = true,
             Action::NewPane => self.new_pane_with("shell"),
@@ -1281,12 +1693,31 @@ impl<B: PaneBackend> App<B> {
             Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
             Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
             Action::CopyMode => {
-                self.mode = Mode::Copy;
+                // C24: cursor starts bottom-left of the focused pane's inner
+                // grid (C22 rule 1: targets the float like any pane when
+                // it's the one focused).
+                let (h, _w) = self.focused_inner_dims();
+                self.mode = Mode::Copy { cursor: (h.saturating_sub(1), 0) };
                 self.selection = None;
             }
             Action::ToggleHints => self.hints = !self.hints,
             Action::Undo => self.undo_close(),
             Action::Help => self.mode = Mode::Help,
+            Action::JumpAttention => self.jump_attention(),
+            Action::ToggleZoom => {
+                // C21: zooming the float makes no sense (it's already a
+                // floating full-focus surface) — refuse rather than hide it
+                // and zoom whatever's behind it.
+                if self.float_focused() {
+                    self.flash = Some(("can't zoom the float".into(), Instant::now()));
+                } else {
+                    self.toggle_zoom();
+                }
+            }
+            Action::CycleLayout => self.cycle_layout(),
+            Action::ToggleFeed => self.toggle_feed(),
+            Action::ToggleFloat => self.toggle_float(),
+            Action::ToggleRaw => self.toggle_raw(),
         }
         // Any action other than a repeated close disarms a pending close
         // confirmation, so a stale "press again" can't leak onto a later key.
@@ -1313,20 +1744,24 @@ impl<B: PaneBackend> App<B> {
         };
         match closed {
             Closed::Tab { index, tab } => {
+                let name = tab.name.clone();
                 let i = index.min(self.ws.tabs.len());
                 self.ws.tabs.insert(i, tab);
                 self.ws.active_tab = i;
                 self.spawn_active_tab();
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
+                self.push_feed(format!("reopened tab {name}"), false);
                 self.flash = Some(("reopened tab".into(), Instant::now()));
             }
             Closed::Pane { tab_index, spec } => {
                 // Restore into its original tab if it still exists, else the
                 // active one; split the focused pane and reuse the saved spec
                 // (session id preserved ⇒ the agent resumes).
+                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.restore_pane(spec);
+                self.push_feed(format!("reopened {name}"), false);
                 self.flash = Some(("reopened pane".into(), Instant::now()));
             }
         }
@@ -1335,7 +1770,7 @@ impl<B: PaneBackend> App<B> {
     /// Insert `spec` as a new pane split off the focused pane, spawning it.
     /// Shared by undo (reuses a saved spec, session and all).
     fn restore_pane(&mut self, spec: PaneSpec) {
-        let id = self.ws.next_pane_id();
+        let id = self.alloc_pane_id();
         let focused = self.focused;
         let dir = self
             .rects()
@@ -1362,6 +1797,13 @@ impl<B: PaneBackend> App<B> {
 
     /// Move focus spatially to the nearest pane in `dir`; stay put if none.
     fn focus_dir(&mut self, dir: layout::Dir) {
+        // C22 rule 2: the float has no spatial position in the tiled tree,
+        // so leaving it via a directional key always just returns focus to
+        // `prev_focus` — `dir` doesn't apply to it.
+        if self.float_focused() {
+            self.hide_float();
+            return;
+        }
         let rects = self.rects();
         if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
             self.focused = id;
@@ -1383,20 +1825,35 @@ impl<B: PaneBackend> App<B> {
         cwd: Option<PathBuf>,
         spawned_by: Option<PaneId>,
     ) -> Option<PaneId> {
-        let id = self.ws.next_pane_id();
+        let id = self.alloc_pane_id();
+        // C22: split off a pane actually in the active tab's tree.
+        // `self.focused` can be the float, which lives outside it — the
+        // interactive callers (Alt+n, picker launch) already hide the float
+        // before reaching here (apply()'s C22 rule-3 pre-step), but the
+        // control-plane spawn/fork paths have no such pre-step (they
+        // save/restore `focused` only to protect the human's on-screen
+        // view, not to pick a safe split target). Splitting "off" an id the
+        // tree doesn't contain is exactly what trips `split_pane`'s
+        // empty-tab fallback below and wipes the whole tab's layout — this
+        // fallback closes that hole for every caller at once.
+        let split_target = if self.ws.active_tab().panes.contains_key(&self.focused) {
+            self.focused
+        } else {
+            self.pane_order().first().copied()?
+        };
         let cwd = cwd.unwrap_or_else(|| {
             self.ws
                 .active_tab()
                 .panes
-                .get(&self.focused)
+                .get(&split_target)
                 .map(|s| s.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         });
         let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by };
 
-        // Split in the widest direction of the focused pane's rect.
-        let focused_rect = self.rects().iter().find(|pr| pr.id == self.focused).map(|pr| pr.rect);
-        let dir = focused_rect
+        // Split in the widest direction of the split target's rect.
+        let target_rect = self.rects().iter().find(|pr| pr.id == split_target).map(|pr| pr.rect);
+        let dir = target_rect
             .map(|r| {
                 if r.width >= r.height * 3 {
                     SplitDir::Vertical
@@ -1408,22 +1865,21 @@ impl<B: PaneBackend> App<B> {
 
         // Refuse a split that would produce unusably tiny panes (also the
         // trigger for the vt100 underflow crash). Silent no-op — the layout
-        // is left untouched. See MIN_SPLIT_* below.
-        if let Some(r) = focused_rect {
+        // is left untouched. See layout::MIN_SPLIT_* (also the C25 fit floor).
+        if let Some(r) = target_rect {
             let too_small = match dir {
-                SplitDir::Vertical => r.width < MIN_SPLIT_COLS,
-                SplitDir::Horizontal => r.height < MIN_SPLIT_ROWS,
+                SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
+                SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
             };
             if too_small {
                 return None;
             }
         }
 
-        let focused = self.focused;
         let tab = self.ws.active_tab_mut();
         tab.panes.insert(id, spec.clone());
-        if !layout::split_pane(&mut tab.layout, focused, id, dir) {
-            tab.layout = LayoutNode::Pane(id); // empty tab fallback
+        if !layout::split_pane(&mut tab.layout, split_target, id, dir) {
+            tab.layout = LayoutNode::Pane(id); // empty tab fallback (now only for a genuinely-empty tab)
         }
         self.focused = id;
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
@@ -1433,6 +1889,13 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn close_pane(&mut self) {
+        // C22 rule 4: Alt+w on the float kills it for real, no confirm
+        // guard (scratch is not precious — the whole point of the confirm
+        // guard below is protecting work the float explicitly isn't).
+        if self.float_focused() {
+            self.close_float();
+            return;
+        }
         let id = self.focused;
 
         // Destructive-close guard. Closing a *busy* agent loses its in-flight
@@ -1468,7 +1931,9 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn new_tab(&mut self) {
-        let id = self.ws.next_pane_id();
+        self.exit_zoom(); // C21: any tab change exits zoom
+        self.hide_float(); // C22 rule 2: "any tab change" hides the float too
+        let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
         panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None });
@@ -1484,9 +1949,246 @@ impl<B: PaneBackend> App<B> {
 
     fn go_to_tab(&mut self, i: usize) {
         if i < self.ws.tabs.len() {
+            self.exit_zoom(); // C21: any (real) tab change exits zoom
+            self.hide_float(); // C22 rule 2: any tab change hides the float
             self.ws.active_tab = i;
             self.spawn_active_tab();
             self.focused = self.pane_order().first().copied().unwrap_or(self.focused);
+        }
+    }
+
+    /// C21: leave zoom (a pure view flag). Called by every documented exit
+    /// trigger before applying whatever caused it, so the layout never
+    /// changes invisibly behind a full-screen zoomed pane.
+    fn exit_zoom(&mut self) {
+        self.zoomed = false;
+    }
+
+    /// Alt+z: toggle the zoomed view. A collapsed stack member is expanded
+    /// first, so zooming always lands on something visible.
+    fn toggle_zoom(&mut self) {
+        if self.zoomed {
+            self.zoomed = false;
+            return;
+        }
+        let focused = self.focused;
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, focused);
+        self.zoomed = true;
+    }
+
+    /// C19: every pane whose runtime status is `NeedsInput` — the exact
+    /// predicate `needs_input_count` uses, so the ring's size can never
+    /// disagree with the hint bar's advertised N. Ordered by (tab index
+    /// ascending, position within that tab's `pane_order()`); the float
+    /// (C22), if needy, is last — `needs_input_count` counts `runtimes`
+    /// directly (float included), so it must be too.
+    fn attention_ring(&self) -> Vec<PaneId> {
+        let mut ring = Vec::new();
+        for tab in &self.ws.tabs {
+            let mut order = Vec::new();
+            layout::pane_order(&tab.layout, &mut order);
+            ring.extend(order.into_iter().filter(|id| {
+                self.runtimes.get(id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false)
+            }));
+        }
+        if let Some(f) = &self.float {
+            if self.runtimes.get(&f.id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false) {
+                ring.push(f.id);
+            }
+        }
+        ring
+    }
+
+    /// Alt+a: cycle-focus to the next ring member after the focused pane,
+    /// wrapping past the end back to the first; a focused pane that isn't in
+    /// the ring jumps straight to the first member.
+    fn jump_attention(&mut self) {
+        // C22 rule 2: leaving the float via Alt+a always just returns focus
+        // to `prev_focus` — it does not additionally ring-jump in the same
+        // press (no explicit target was requested, unlike a tab switch).
+        if self.float_focused() {
+            self.hide_float();
+            return;
+        }
+        let ring = self.attention_ring();
+        if ring.is_empty() {
+            self.flash = Some(("nothing needs you".into(), Instant::now()));
+            return;
+        }
+        let next = match ring.iter().position(|&id| id == self.focused) {
+            Some(k) => ring[(k + 1) % ring.len()],
+            None => ring[0],
+        };
+        if next == self.focused {
+            // The only ring member is the pane we're already on.
+            self.flash = Some(("nothing else needs you".into(), Instant::now()));
+            return;
+        }
+        self.focus_attention_target(next);
+    }
+
+    /// Land focus on `target`, switching tabs first (go_to_tab semantics,
+    /// lazy spawn included) when it lives outside the active one — which
+    /// also exits zoom, per C21's tab-switch rule. A same-tab jump keeps
+    /// zoom (zoom follows focus). Either way, expand the target out of any
+    /// collapsed stack, same as any other focus move. C22: a jump landing on
+    /// the float shows it (recording where focus came from as `prev_focus`).
+    fn focus_attention_target(&mut self, target: PaneId) {
+        if let Some(ti) = self.tab_of(target) {
+            if ti != self.ws.active_tab {
+                self.go_to_tab(ti);
+            }
+        }
+        if self.is_float(target) {
+            let from = self.focused;
+            if let Some(f) = &mut self.float {
+                f.shown = true;
+                f.prev_focus = from;
+            }
+        }
+        self.focused = target;
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
+    }
+
+    /// Alt+g: step the active tab through the three canned arrangements,
+    /// skipping ones that don't fit the current body area. No-ops (without
+    /// advancing the cycle counter) when there's nothing to arrange or
+    /// nothing fits.
+    fn cycle_layout(&mut self) {
+        let order = self.pane_order();
+        if order.len() < 2 {
+            self.flash = Some(("one pane — nothing to arrange".into(), Instant::now()));
+            return;
+        }
+        let focused = self.focused;
+        let area = self.body_area();
+        for step in 0..3 {
+            let idx = (self.layout_cycle + step) % 3;
+            let node = arrangement_for(idx, &order, focused);
+            if layout::arrangement_fits(&node, area) {
+                self.ws.active_tab_mut().layout = node;
+                self.layout_cycle = (idx + 1) % 3;
+                return;
+            }
+        }
+        self.flash = Some(("no room to rearrange".into(), Instant::now()));
+    }
+
+    /// Alt+e: open the C20 activity feed at the live tail, or close it if
+    /// already open. In practice the close direction is intercepted earlier,
+    /// in `handle_mode_key` (its doc comment explains why); this still
+    /// toggles honestly either way.
+    fn toggle_feed(&mut self) {
+        self.mode = match self.mode {
+            Mode::Feed { .. } => Mode::Normal,
+            _ => Mode::Feed { offset: 0 },
+        };
+    }
+
+    // -- float (C22) ---------------------------------------------------------
+
+    /// Alt+f: first press spawns the float (a shell in the focused pane's
+    /// cwd, preset title "scratch") and shows+focuses it; later presses
+    /// hide/show it (the process stays alive while hidden). Refuses (flash,
+    /// no state change) when the body is too small for the geometry
+    /// formula to place a sane rect — checked here so both the first spawn
+    /// and a later re-show are covered (the terminal may have shrunk while
+    /// the float was hidden).
+    fn toggle_float(&mut self) {
+        if self.float_focused() {
+            self.hide_float();
+            return;
+        }
+        let body = self.body_area();
+        if !Self::float_fits(body) {
+            self.flash = Some(("no room for float".into(), Instant::now()));
+            return;
+        }
+        match &mut self.float {
+            Some(f) => {
+                f.shown = true;
+                f.prev_focus = self.focused;
+                self.focused = f.id;
+            }
+            None => self.spawn_float(),
+        }
+    }
+
+    fn spawn_float(&mut self) {
+        let id = self.alloc_pane_id();
+        let cwd = self
+            .find_spec(self.focused)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let prev_focus = self.focused;
+        let spec = PaneSpec {
+            adapter: "shell".into(),
+            cwd,
+            session: None,
+            title: Some("scratch".into()),
+            spawned_by: None,
+        };
+        self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
+        self.focused = id;
+        // display_rects, not rects: the float isn't in the tiled tree, so
+        // only the zoom-aware/float-aware display list knows its rect.
+        if let Some(pr) = self.display_rects().iter().find(|pr| pr.id == id).copied() {
+            self.spawn_pane(id, &spec, pr.rect);
+        }
+    }
+
+    /// C22 rules 2/3: hide the float (if shown) and restore focus to
+    /// whatever was focused before it appeared — the single mechanism
+    /// behind Alt+f's toggle-off, every focus-moving/structural action that
+    /// must not leave it focused, and a mouse click landing outside its
+    /// rect. A no-op when the float isn't currently shown.
+    fn hide_float(&mut self) {
+        let Some(f) = &mut self.float else { return };
+        if !f.shown {
+            return;
+        }
+        f.shown = false;
+        let back = f.prev_focus;
+        self.focused = if self.ws.active_tab().panes.contains_key(&back) {
+            back
+        } else {
+            // prev_focus may have been closed via the control plane while
+            // the float was up — fall back to whatever's on screen now,
+            // same recovery `close_pane_id` uses.
+            self.pane_order().first().copied().unwrap_or(0)
+        };
+    }
+
+    /// C22 rule 4: Alt+w on the float kills it for real and clears the slot
+    /// — unlike hiding, no undo entry (scratch is not precious).
+    fn close_float(&mut self) {
+        let Some(f) = self.float.take() else { return };
+        if let Some(mut rt) = self.runtimes.remove(&f.id) {
+            rt.kill();
+        }
+        self.tokens.remove(&f.id);
+        self.dead.remove(&f.id);
+        self.pending_input.remove(&f.id);
+        self.raw.remove(&f.id);
+        self.focused = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
+            f.prev_focus
+        } else {
+            self.pane_order().first().copied().unwrap_or(0)
+        };
+        self.flash = Some(("scratch closed".into(), Instant::now()));
+    }
+
+    // -- raw pass-through (C23) -----------------------------------------------
+
+    /// Alt+Shift+p: toggle the focused pane's raw membership — the same
+    /// chord both enters and exits it ("the key that got you in gets you
+    /// out"), and it is reachable via ordinary `translate()` dispatch
+    /// (`apply`) regardless of whether the pane is currently raw, since
+    /// entering raw must work from a cooked pane in the first place.
+    fn toggle_raw(&mut self) {
+        let focused = self.focused;
+        if !self.raw.remove(&focused) {
+            self.raw.insert(focused);
         }
     }
 
@@ -1501,6 +2203,15 @@ impl<B: PaneBackend> App<B> {
         // would leave the pane you were reading frozen mid-history while scroll
         // keys silently drive a different pane.
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            // C20: Alt+e both opens and closes the feed. Handled here, before
+            // the generic reset below clears `self.mode` out from under it —
+            // otherwise `Action::ToggleFeed`, reached via the fallthrough
+            // path, could never tell the feed had just been open and would
+            // always re-open it instead of closing.
+            if matches!(self.mode, Mode::Feed { .. }) && key.code == KeyCode::Char('e') {
+                self.mode = Mode::Normal;
+                return true;
+            }
             if matches!(self.mode, Mode::Scroll { .. }) {
                 let focused = self.focused;
                 if let Some(rt) = self.runtimes.get_mut(&focused) {
@@ -1510,6 +2221,14 @@ impl<B: PaneBackend> App<B> {
             self.mode = Mode::Normal;
             return false;
         }
+        // C20: half the feed overlay's own height, for PgUp/PgDn — computed
+        // here (needs a whole `&self` via `body_area()`) rather than inside
+        // the match below, where `Mode::Feed`'s arm already holds
+        // `self.mode` mutably borrowed.
+        let feed_page = (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize;
+        // C24: the focused pane's current inner grid, for clamping the copy
+        // cursor — same borrow-ordering reason as `feed_page` above.
+        let (copy_h, copy_w) = self.focused_inner_dims();
         match &mut self.mode {
             Mode::Normal => false,
             Mode::Rename { buffer, target } => {
@@ -1556,6 +2275,8 @@ impl<B: PaneBackend> App<B> {
                     KeyCode::Enter => {
                         let adapter = items[(*selection).min(items.len() - 1)];
                         self.mode = Mode::Normal;
+                        self.exit_zoom(); // C21: "picker launch" is a structural action
+                        self.hide_float(); // C22 rule 3: ditto
                         self.new_pane_with(adapter);
                         self.relayout();
                         self.save();
@@ -1592,17 +2313,84 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
-            Mode::Copy => {
-                // Selection is mouse-driven; keys just exit.
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.mode = Mode::Normal;
-                    self.selection = None;
+            // C24: keyboard copy cursor + selection, alongside the existing
+            // mouse-drag path (both write `self.selection`; a drag also
+            // moves the cursor, see `begin_selection`/`extend_selection`).
+            Mode::Copy { cursor } => {
+                match key.code {
+                    KeyCode::Char('h') | KeyCode::Left => cursor.1 = cursor.1.saturating_sub(1),
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        cursor.1 = (cursor.1 + 1).min(copy_w.saturating_sub(1))
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => cursor.0 = cursor.0.saturating_sub(1),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        cursor.0 = (cursor.0 + 1).min(copy_h.saturating_sub(1))
+                    }
+                    KeyCode::Char('0') => cursor.1 = 0,
+                    KeyCode::Char('$') => cursor.1 = copy_w.saturating_sub(1),
+                    _ => {}
+                }
+                // A motion above extends an active selection to the new
+                // cursor (v's "movement extends the selection" rule) — kept
+                // out of the motion arms themselves so it applies uniformly
+                // without repeating it six times.
+                if matches!(
+                    key.code,
+                    KeyCode::Char('h' | 'l' | 'k' | 'j' | '0' | '$')
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Up
+                        | KeyCode::Down
+                ) {
+                    if let Some(sel) = &mut self.selection {
+                        sel.cursor = *cursor;
+                    }
+                    return true;
+                }
+                match key.code {
+                    KeyCode::Char('v') => {
+                        let focused = self.focused;
+                        let anchor = *cursor;
+                        if self.selection.is_some() {
+                            self.selection = None; // toggle off: clear the anchor
+                        } else {
+                            self.selection =
+                                Some(Selection { pane: focused, anchor, cursor: anchor, dragging: false });
+                        }
+                    }
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        if self.selection.is_some() {
+                            // finish_selection needs the whole &mut self —
+                            // `cursor`'s last use was above, so its borrow
+                            // of `self.mode` has already ended.
+                            self.pending_yank = self.finish_selection();
+                        } else {
+                            self.flash = Some(("nothing selected".into(), Instant::now()));
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.mode = Mode::Normal;
+                        self.selection = None;
+                    }
+                    _ => {}
                 }
                 true
             }
             Mode::Help => {
                 // Any key dismisses the keymap overlay.
                 self.mode = Mode::Normal;
+                true
+            }
+            Mode::Feed { offset } => {
+                let cap = self.feed.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => *offset = (*offset + 1).min(cap),
+                    KeyCode::Down | KeyCode::Char('j') => *offset = offset.saturating_sub(1),
+                    KeyCode::PageUp => *offset = (*offset + feed_page).min(cap),
+                    KeyCode::PageDown => *offset = offset.saturating_sub(feed_page),
+                    KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                    _ => {}
+                }
                 true
             }
         }
@@ -1642,6 +2430,9 @@ fn method_summary(m: &Method) -> String {
         Method::Fork { pane } => format!("fork pane={}", opt(pane)),
         Method::Send { pane, text, submit } => {
             format!("send pane={pane} len={} submit={submit}", text.len())
+        }
+        Method::Broadcast { text, submit } => {
+            format!("broadcast len={} submit={submit}", text.len())
         }
         Method::Read { pane, .. } => format!("read pane={pane}"),
         Method::Close { pane, force } => format!("close pane={pane} force={force}"),
@@ -1712,6 +2503,31 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
+}
+
+/// C20: the feed overlay's `(width, height)` at the given body area —
+/// `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`. Shared by
+/// the renderer (geometry) and `handle_mode_key` (PgUp/PgDn page size) so
+/// both agree on what's actually on screen. Pure so the 72×16 formula is
+/// unit-tested without a `Frame`.
+pub fn feed_overlay_size(body: Rect) -> (u16, u16) {
+    let w = body.width.saturating_sub(4).min(72);
+    let h = body.height.saturating_sub(4).min(16);
+    (w, h)
+}
+
+/// C25: the arrangement at cycle index `idx` (0=grid, 1=main+stack,
+/// 2=all-stack) for pane order `order` with `focused` kept in place — the
+/// pure per-index dispatch `cycle_layout` walks while searching for a fit.
+fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode {
+    match idx {
+        0 => layout::grid_layout(order),
+        1 => {
+            let rest: Vec<PaneId> = order.iter().copied().filter(|&id| id != focused).collect();
+            layout::main_stack_layout(focused, &rest)
+        }
+        _ => layout::all_stack_layout(order, focused),
+    }
 }
 
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
@@ -1982,6 +2798,149 @@ mod tests {
     }
 
     #[test]
+    fn control_broadcast_reaches_every_running_pane_for_fleet_actor() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let p1 = app.focused;
+        app.apply(Action::NewPane);
+        let p2 = app.focused;
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi there".into(), submit: true },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let mut sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        sent.sort();
+        assert_eq!(sent, vec![p1, p2]);
+        assert_eq!(ok["count"], 2);
+        assert!(app.runtimes.get(&p1).unwrap().input.ends_with(b"hi there\r"));
+        assert!(app.runtimes.get(&p2).unwrap().input.ends_with(b"hi there\r"));
+    }
+
+    #[test]
+    fn control_broadcast_stays_inside_pane_actors_subtree() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        app.tokens.insert(1, "tok1".into());
+        // Pane 1 spawns a child → the child is in its subtree.
+        let child = match app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        // The fleet spawns a sibling, outside pane 1's subtree.
+        let other = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+
+        let ok = match app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Broadcast { text: "x".into(), submit: false },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let mut sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        sent.sort();
+        // Itself (1) + its spawned subtree (child) — not the fleet's sibling.
+        assert_eq!(sent, vec![1, child]);
+        assert_eq!(ok["count"], 2);
+        assert!(app.runtimes.get(&1).unwrap().input.ends_with(b"x"));
+        assert!(app.runtimes.get(&child).unwrap().input.ends_with(b"x"));
+        assert!(app.runtimes.get(&other).unwrap().input.is_empty());
+    }
+
+    #[test]
+    fn control_broadcast_skips_non_running_panes() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let running = app.focused;
+        app.apply(Action::NewPane);
+        let exited = app.focused;
+        app.apply(Action::NewPane);
+        let never_spawned = app.focused;
+        // Process exited but the pane hasn't been closed — its runtime
+        // lingers with AgentStatus::Exited (see on_pty_exit); still present
+        // in `runtimes`, so a naive "present ⇒ running" check would wrongly
+        // include it.
+        app.runtimes.get_mut(&exited).unwrap().set_extension_status(AgentStatus::Exited);
+        // Lazy, never-spawned pane: spec present, no runtime at all — same
+        // idiom as tab_summary_unknown_for_unspawned_needs_input_wins.
+        app.runtimes.remove(&never_spawned);
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi".into(), submit: false },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert_eq!(sent, vec![running]);
+        assert_eq!(ok["count"], 1);
+        assert!(app.runtimes.get(&exited).unwrap().input.is_empty());
+    }
+
+    #[test]
+    fn control_broadcast_counts_only_successful_writes() {
+        // LOW-2: a pane can look running (status snapshot says not Exited)
+        // yet have a dead write pipe (it died a moment later) — `sent`/
+        // `count` must reflect delivery, not just "looked targetable".
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let alive = app.focused;
+        app.apply(Action::NewPane);
+        let dying = app.focused;
+        app.runtimes.get_mut(&dying).unwrap().fail_write = true;
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi".into(), submit: false },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert_eq!(sent, vec![alive], "the dying pane's failed write must not count as sent");
+        assert_eq!(ok["count"], 1);
+    }
+
+    #[test]
+    fn control_send_errors_when_the_write_fails() {
+        // LOW-2 (send side): same honesty rule as broadcast — a pane whose
+        // write pipe is dead must not be reported as having received input.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let p = app.focused;
+        app.runtimes.get_mut(&p).unwrap().fail_write = true;
+
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Send { pane: p, text: "hi".into(), submit: false },
+        });
+        assert!(matches!(reply, Reply::Err { .. }), "a failed write must not be reported as sent");
+        assert!(app.runtimes.get(&p).unwrap().input.is_empty());
+    }
+
+    #[test]
     fn control_cannot_close_the_last_pane() {
         use crate::core::control::{Method, Request};
         let (mut app, _) = mk_app(shell_ws());
@@ -2093,6 +3052,127 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_audit_line_has_the_contracted_shape_and_omits_the_text() {
+        use crate::core::control::{Method, Reply, Request};
+        let dir = std::env::temp_dir().join(format!("roost-broadcast-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            Some(dir.join("roost.sock")),
+        )
+        .unwrap();
+        let ct = app.control_token().to_string();
+
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct,
+                method: Method::Broadcast { text: "secret payload".into(), submit: true },
+            },
+            rtx,
+        );
+        assert!(matches!(rrx.recv().unwrap(), Reply::Ok { .. }));
+
+        let log = std::fs::read_to_string(dir.join("control.log")).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        // F4 carry-forward fix: ctl_broadcast's own self-audit line (the
+        // contracted shape, carrying the real fan-out count) must be the
+        // ONLY line — handle_control_msg's generic post-dispatch audit used
+        // to also fire for Broadcast, writing a second, count-less line for
+        // every fleet-wide send (and, once C20 landed, a second near-
+        // identical feed row too).
+        assert_eq!(lines.len(), 1, "exactly one ctl line per broadcast: {log:?}");
+        // len=14 is "secret payload".len(); count=1 is the lone auto-spawned pane.
+        assert!(lines[0].contains("fleet broadcast len=14 submit=true -> ok count=1"), "{}", lines[0]);
+        assert!(!log.contains("secret payload"), "broadcast text must never be logged: {log:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_pushes_exactly_one_ctl_feed_line() {
+        // Same carry-forward fix, pinned on the C20 feed side: the socket
+        // path used to call `audit()` twice for a broadcast, which — once
+        // `audit()` started feeding C20 — would have shown up as two
+        // near-identical `ctl` rows in the activity overlay.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request { token: ct, method: Method::Broadcast { text: "hi".into(), submit: false } },
+            rtx,
+        );
+        assert!(matches!(rrx.recv().unwrap(), Reply::Ok { .. }));
+        let ctl_lines: Vec<&FeedEntry> = app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        assert_eq!(ctl_lines.len(), 1, "exactly one ctl feed line per broadcast: {:?}", app.feed());
+        assert!(ctl_lines[0].text.contains("fleet: broadcast len=2 submit=false → ok"), "{}", ctl_lines[0].text);
+    }
+
+    #[test]
+    fn broadcast_then_independent_status_transitions_dont_cross_contaminate_the_feed() {
+        // One ctl line from a broadcast to N panes, then N independent
+        // status transitions on a later tick — each must get its own
+        // correctly-named line (no merging, no borrowed identity), and an
+        // unchanged pane must stay silent.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let a = app.focused;
+        app.apply(Action::NewPane);
+        let b = app.focused;
+        app.apply(Action::NewPane);
+        let c = app.focused;
+        app.find_spec_mut(a).unwrap().title = Some("alpha".into());
+        app.find_spec_mut(b).unwrap().title = Some("bravo".into());
+        app.find_spec_mut(c).unwrap().title = Some("charlie".into());
+
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "go".into(), submit: false },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
+
+        // A status-transition line (`"{name}: {old} → {new}"`) vs. the ctl
+        // audit line, which *also* contains '→' in its own "... → ok/err"
+        // outcome — `contains('→')` alone can't tell them apart.
+        let is_transition = |e: &&FeedEntry| e.text.contains('→') && !e.text.starts_with("ctl ");
+
+        // Baseline tick: first observation of each pane is silently seeded
+        // (spawn owns the birth line), so this must add no transition line.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.feed().iter().filter(is_transition).count(), 0, "{:?}", app.feed());
+
+        app.runtimes.get_mut(&a).unwrap().set_extension_status(AgentStatus::Working);
+        app.runtimes.get_mut(&c).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        // b stays Idle — must not produce a line.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
+        assert_eq!(transitions.len(), 2, "{:?}", app.feed());
+        let alpha = transitions.iter().find(|e| e.text.starts_with("alpha:")).expect("alpha's own line");
+        assert_eq!(alpha.text, "alpha: idle → working");
+        assert!(!alpha.needs_input);
+        let charlie = transitions.iter().find(|e| e.text.starts_with("charlie:")).expect("charlie's own line");
+        assert_eq!(charlie.text, "charlie: idle → needs you");
+        assert!(charlie.needs_input);
+        assert!(!transitions.iter().any(|e| e.text.starts_with("bravo:")), "unchanged pane must stay silent");
+
+        // The broadcast's one ctl line must still be exactly one — untouched by the tick.
+        assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
+    }
+
+    #[test]
     fn control_wait_immediate_parks_and_fires() {
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
@@ -2172,6 +3252,68 @@ mod tests {
             Reply::Err { err } => panic!("{err}"),
         }
         assert!(app.waiters.is_empty());
+    }
+
+    #[test]
+    fn wait_does_not_leak_a_recycled_pane_ids_status_cross_subtree() {
+        // LOW-3: `Workspace::next_pane_id` is max(current ids)+1, not a
+        // monotonic counter — closing the highest-numbered pane frees its
+        // id for reuse. A waiter registered on that id must not be handed
+        // the *new*, unrelated pane's status just because the numeric id
+        // matches.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.tokens.insert(1, "tok1".into());
+        let ct = app.control_token().to_string();
+
+        // Pane 1 spawns its own child (pane 2, in its subtree) and waits on it.
+        let child = match app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert_eq!(child, 2, "test assumes pane 2 is the highest id so far");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: "tok1".into(),
+                method: Method::Wait {
+                    panes: vec![child],
+                    until: "needs_input".into(),
+                    timeout_ms: Some(60_000),
+                },
+            },
+            tx,
+        );
+        assert!(rx.try_recv().is_err()); // idle child, not yet needs_input → parked
+        assert_eq!(app.waiters.len(), 1);
+
+        // Pane 2 closes (it's the highest id) and the fleet spawns an
+        // unrelated pane that recycles id 2 — same number, different owner.
+        app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Close { pane: 2, force: true },
+        });
+        let recycled = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        assert_eq!(recycled, 2, "test assumes the id is actually recycled");
+
+        // The new (fleet-owned, unrelated) pane 2 hits the exact status the
+        // stale waiter is armed for.
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.poll_waiters();
+
+        // Must NOT fire: pane 1 is not authorized for the fleet's new pane 2.
+        assert!(rx.try_recv().is_err(), "must not leak the recycled pane's status cross-subtree");
+        assert_eq!(app.waiters.len(), 1, "the waiter stays parked, not silently dropped");
     }
 
     #[test]
@@ -2745,5 +3887,1242 @@ mod tests {
         assert!(app.last_save_ok()); // startup counts as saved (we just loaded)
         app.apply(Action::NewPane); // triggers a save() that fails
         assert!(!app.last_save_ok());
+    }
+
+    // -- C19 jump-to-attention ----------------------------------------------
+
+    #[test]
+    fn jump_attention_empty_ring_flashes_and_does_not_move_focus() {
+        let (mut app, _) = mk_app(shell_ws());
+        let focused = app.focused;
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, focused);
+        assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
+    #[test]
+    fn jump_attention_only_member_is_focused_flashes_and_stays() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, id);
+        assert_eq!(app.flash(), Some("nothing else needs you"));
+    }
+
+    #[test]
+    fn jump_attention_jumps_to_the_lone_needy_pane_when_not_already_focused() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 1);
+    }
+
+    #[test]
+    fn jump_attention_visits_the_ring_in_tab_then_pane_order_and_wraps() {
+        let (mut app, _) = mk_app(shell_ws()); // tab0: pane 1
+        app.apply(Action::NewPane); // tab0: panes 1,2 — focus=2
+        app.apply(Action::NewTab); // tab1: pane 3 — focus=3, active_tab=1
+        for id in [1u64, 2, 3] {
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        }
+        // Ring order: tab0's pane_order() ([1,2]) then tab1's ([3]) — and its
+        // size can never disagree with the hint bar's advertised count.
+        assert_eq!(app.attention_ring(), vec![1, 2, 3]);
+        assert_eq!(app.attention_ring().len(), app.needs_input_count());
+
+        app.go_to_tab(0);
+        app.focused = 1; // start of the ring
+
+        app.apply(Action::JumpAttention); // same-tab hop
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.ws.active_tab, 0);
+
+        app.apply(Action::JumpAttention); // crosses into tab1
+        assert_eq!(app.focused, 3);
+        assert_eq!(app.ws.active_tab, 1);
+
+        app.apply(Action::JumpAttention); // wraps back to the first member
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.ws.active_tab, 0);
+    }
+
+    #[test]
+    fn attention_ring_flattens_multiple_needy_panes_across_multiple_tabs_in_order() {
+        // The wrap test above only ever put one needy pane in the second
+        // tab. This pins the full (tab index ascending, then position in
+        // that tab's pane_order()) predicate when *every* tab contributes
+        // more than one ring member, with a quiet pane interleaved in each
+        // tab to prove it's skipped without disturbing its neighbors' order.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // tab0: 3 panes
+        let tab0_order = app.pane_order();
+        assert_eq!(tab0_order.len(), 3);
+
+        app.apply(Action::NewTab);
+        app.apply(Action::NewPane); // tab1: 2 panes
+        let tab1_order = app.pane_order();
+        assert_eq!(tab1_order.len(), 2);
+
+        // tab0: needy at positions 0 and 2, quiet at position 1.
+        app.runtimes.get_mut(&tab0_order[0]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&tab0_order[2]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        // tab1: both needy.
+        app.runtimes.get_mut(&tab1_order[0]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&tab1_order[1]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+
+        let expected = vec![tab0_order[0], tab0_order[2], tab1_order[0], tab1_order[1]];
+        assert_eq!(app.attention_ring(), expected);
+        assert_eq!(app.needs_input_count(), expected.len());
+    }
+
+    // -- C21 zoom -------------------------------------------------------------
+
+    #[test]
+    fn zoom_display_list_is_focused_pane_at_body_area_only_when_zoomed() {
+        // This is exactly what `relayout()` (PTY resize) and the renderer
+        // consume — see `display_rects`.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        assert_eq!(app.display_rects().len(), app.rects().len()); // not zoomed: mirrors the real tree
+
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        let dr = app.display_rects();
+        assert_eq!(dr.len(), 1);
+        assert_eq!(dr[0].id, app.focused);
+        assert_eq!(dr[0].rect, app.body_area());
+        assert!(!dr[0].collapsed);
+
+        app.apply(Action::ToggleZoom);
+        assert!(!app.zoomed());
+        assert_eq!(app.display_rects().len(), app.rects().len());
+    }
+
+    #[test]
+    fn zoom_follows_focus_when_focus_moves_within_the_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2 side by side, focus=2
+        app.apply(Action::ToggleZoom);
+        assert_eq!(app.display_rects()[0].id, 2);
+        app.apply(Action::Focus(crate::core::layout::Dir::Left));
+        assert_eq!(app.focused, 1);
+        assert!(app.zoomed(), "focus moves keep zoom");
+        assert_eq!(app.display_rects()[0].id, 1);
+    }
+
+    #[test]
+    fn zoom_expands_a_collapsed_stack_member_first() {
+        let mut panes = HashMap::new();
+        for id in [1u64, 2, 3] {
+            panes.insert(
+                id,
+                PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+            );
+        }
+        let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let ws = Workspace { version: 1, active_tab: 0, tabs: vec![Tab { name: "main".into(), layout, panes }] };
+        let (mut app, _) = mk_app(ws);
+        app.focused = 3; // a collapsed member — expanded is currently 0 (pane 1)
+
+        app.apply(Action::ToggleZoom);
+
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Stack { expanded, children } => assert_eq!(children[*expanded], 3),
+            other => panic!("expected a stack, got {other:?}"),
+        }
+        assert!(app.zoomed());
+        assert_eq!(app.display_rects()[0].id, 3);
+    }
+
+    #[test]
+    fn zoom_exits_on_every_structural_or_new_tab_action() {
+        let triggers = [
+            Action::NewPane,
+            Action::ToggleStack,
+            Action::FlipSplit,
+            Action::Resize { horizontal: true, grow: true },
+            Action::CycleLayout,
+            Action::NewTab,
+        ];
+        for action in triggers {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::NewPane); // >=2 panes, so none of these are themselves no-ops
+            app.apply(Action::ToggleZoom);
+            assert!(app.zoomed(), "setup failed before {action:?}");
+            app.apply(action);
+            assert!(!app.zoomed(), "{action:?} must exit zoom (C21)");
+        }
+    }
+
+    #[test]
+    fn zoom_exits_on_tab_switch() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // 2 tabs, active=1
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::GoToTab(0));
+        assert!(!app.zoomed());
+    }
+
+    #[test]
+    fn zoom_exits_on_picker_launch_but_not_on_opening_the_picker() {
+        // "picker launch" (C21) is the Enter-to-spawn step inside Mode::Picker
+        // — a separate code path from `apply()`'s structural actions. Merely
+        // opening the picker overlay (QuickLaunch) must not exit zoom on its
+        // own; only the actual spawn is structural.
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::QuickLaunch);
+        assert!(app.zoomed(), "opening the picker overlay must not exit zoom on its own");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!app.zoomed(), "picker launch must exit zoom (C21)");
+    }
+
+    #[test]
+    fn zoom_exits_when_the_zoomed_pane_itself_closes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        assert!(app.zoomed());
+        app.apply(Action::ClosePane); // Alt+w always closes the focused (zoomed) pane
+        assert!(!app.zoomed());
+    }
+
+    #[test]
+    fn zoom_survives_a_control_close_of_a_different_pane() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Close { pane: 1, force: false },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert!(app.zoomed(), "closing an unrelated pane must not touch an unrelated zoom");
+    }
+
+    #[test]
+    fn zoom_exits_on_a_cross_tab_jump() {
+        let (mut app, _) = mk_app(shell_ws()); // tab0: pane 1, focus=1
+        app.apply(Action::NewTab); // tab1: pane 2, focus=2, active_tab=1
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleZoom); // zoom on pane 2 (tab1)
+        assert!(app.zoomed());
+        app.apply(Action::JumpAttention); // only ring member is pane 1, in a different tab
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.ws.active_tab, 0);
+        assert!(!app.zoomed(), "cross-tab jump must exit zoom (C19/C21 interplay)");
+    }
+
+    #[test]
+    fn zoom_survives_a_same_tab_jump() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab0: panes 1,2 — focus=2
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        app.apply(Action::JumpAttention); // same-tab jump to pane 1
+        assert_eq!(app.focused, 1);
+        assert!(app.zoomed(), "same-tab jump keeps zoom (zoom follows focus)");
+        assert_eq!(app.display_rects()[0].id, 1);
+    }
+
+    // -- C25 canned layout cycle ----------------------------------------------
+
+    #[test]
+    fn cycle_layout_advances_grid_then_main_stack_then_all_stack_then_wraps() {
+        let (mut app, _) = mk_app(shell_ws()); // 100x30 — comfortable for all 3 shapes
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes total
+
+        app.apply(Action::CycleLayout);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+
+        app.apply(Action::CycleLayout);
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.6, 0.4]),
+            other => panic!("expected a main+stack split, got {other:?}"),
+        }
+
+        app.apply(Action::CycleLayout);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
+
+        app.apply(Action::CycleLayout); // wraps back to grid
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+    }
+
+    #[test]
+    fn cycle_layout_skips_an_unfit_arrangement_and_applies_the_next() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(80, 22)); // body ~80x20: main+stack's 0.4 column (32) < the 36 floor
+        app.apply(Action::NewPane); // 2 panes
+
+        app.apply(Action::CycleLayout); // 1st: grid (0.5/0.5) fits
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]),
+            other => panic!("expected grid (0.5/0.5 split), got {other:?}"),
+        }
+
+        app.apply(Action::CycleLayout); // 2nd: main+stack unfit here → skipped → all-stack applied
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
+    }
+
+    #[test]
+    fn cycle_layout_noop_when_fewer_than_two_panes() {
+        let (mut app, _) = mk_app(shell_ws()); // 1 pane
+        app.apply(Action::CycleLayout);
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Pane(_)));
+        assert_eq!(app.flash(), Some("one pane — nothing to arrange"));
+    }
+
+    #[test]
+    fn cycle_layout_noop_when_nothing_fits() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes, organically nested splits
+        app.on_resize(Size::new(30, 10)); // body far below the 36x10 floor for any arrangement
+        let before = format!("{:?}", app.ws.tabs[0].layout);
+        app.apply(Action::CycleLayout);
+        assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
+        assert_eq!(app.flash(), Some("no room to rearrange"));
+    }
+
+    #[test]
+    fn cycle_layout_preserves_focus() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        let focused = app.focused;
+        for _ in 0..3 {
+            app.apply(Action::CycleLayout);
+            assert_eq!(app.focused, focused);
+        }
+    }
+
+    #[test]
+    fn cycle_layout_persists_like_any_layout_edit() {
+        let (mut app, store) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout);
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        match &saved.tabs[0].layout {
+            LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]), // grid, n=2
+            other => panic!("expected the cycled layout to be saved, got {other:?}"),
+        }
+    }
+
+    // -- C26 tab-undo pinning ---------------------------------------------------
+
+    #[test]
+    fn c26_multi_pane_tab_undo_restores_all_panes_with_sessions_and_tab_name() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let tab_index = app.ws.active_tab;
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // the new tab now has 3 panes
+
+        let ids = app.pane_order();
+        assert_eq!(ids.len(), 3);
+        for (i, &id) in ids.iter().enumerate() {
+            app.set_session(id, format!("sess-{i}"));
+        }
+        app.ws.tabs[tab_index].name = "fleet".into();
+
+        // Close pane-by-pane: the third close empties (and removes) the tab.
+        app.apply(Action::ClosePane);
+        app.apply(Action::ClosePane);
+        assert_eq!(app.ws.tabs.len(), 2, "sanity: tab not gone yet");
+        app.apply(Action::ClosePane);
+        assert_eq!(app.ws.tabs.len(), 1, "tab emptied and removed");
+
+        // 3x Alt+u restores it: the tab (by name), all three panes, sessions
+        // intact (C26's honest scope: re-split off the focused pane, not at
+        // their original geometry — only identity and sessions are pinned).
+        app.apply(Action::Undo);
+        app.apply(Action::Undo);
+        app.apply(Action::Undo);
+
+        assert_eq!(app.ws.tabs.len(), 2);
+        let restored = app.ws.tabs.iter().find(|t| t.name == "fleet").expect("tab reopened by name");
+        assert_eq!(restored.panes.len(), 3);
+        let sessions: std::collections::HashSet<Option<String>> =
+            restored.panes.values().map(|s| s.session.clone()).collect();
+        assert_eq!(
+            sessions,
+            std::collections::HashSet::from([
+                Some("sess-0".to_string()),
+                Some("sess-1".to_string()),
+                Some("sess-2".to_string()),
+            ])
+        );
+    }
+
+    // -- C20 activity feed ---------------------------------------------------
+
+    #[test]
+    fn feed_ring_evicts_the_oldest_entry_past_200() {
+        let (mut app, _) = mk_app(shell_ws());
+        for i in 0..(FEED_CAP + 5) {
+            app.push_feed(format!("entry {i}"), false);
+        }
+        assert_eq!(app.feed().len(), FEED_CAP);
+        assert_eq!(app.feed().front().unwrap().text, "entry 5"); // oldest 5 evicted
+        assert_eq!(app.feed().back().unwrap().text, format!("entry {}", FEED_CAP + 4));
+    }
+
+    #[test]
+    fn tick_status_diff_feeds_one_line_per_transition_and_suppresses_exited() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+
+        // First tick after spawn: baseline only — spawn owns the birth line,
+        // so no transition line yet even though this is the pane's first
+        // observation by diff_statuses.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert!(app.feed().iter().all(|e| !e.text.contains('→')));
+
+        // A real transition: one line, using the C8 state words.
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        let transitions: Vec<_> = app.feed().iter().filter(|e| e.text.contains('→')).collect();
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].text.contains("idle → working"), "{}", transitions[0].text);
+
+        // A repeat tick with no status change adds no further line.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.feed().iter().filter(|e| e.text.contains('→')).count(), 1);
+
+        // A transition *to* Exited is suppressed — the exit hook owns it.
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Exited);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.feed().iter().filter(|e| e.text.contains('→')).count(),
+            1,
+            "transition to Exited must not add a feed line: {:?}",
+            app.feed()
+        );
+    }
+
+    #[test]
+    fn tick_status_diff_flags_a_needs_input_transition_for_the_feed_styling_rule() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick(); // baseline
+
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let line = app.feed().iter().find(|e| e.text.contains('→')).expect("no transition line");
+        assert!(line.needs_input);
+    }
+
+    #[test]
+    fn spawn_pushes_a_feed_line_naming_the_adapter() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let last = app.feed().back().expect("spawn should push a feed line");
+        assert!(last.text.starts_with("spawned "), "{}", last.text);
+        assert!(last.text.contains("(shell)"), "{}", last.text);
+        assert!(!last.needs_input);
+    }
+
+    #[test]
+    fn close_pane_pushes_closed_name_when_the_tab_survives() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ClosePane);
+        let last = app.feed().back().unwrap();
+        assert!(last.text.starts_with("closed "), "{}", last.text);
+        assert!(!last.text.starts_with("closed tab"), "{}", last.text);
+    }
+
+    #[test]
+    fn close_last_pane_of_a_tab_pushes_closed_tab_name_not_pane_name() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let ti = app.ws.active_tab;
+        app.ws.tabs[ti].name = "scratch".into();
+        app.apply(Action::ClosePane); // last pane of this tab → the tab is removed
+        let last = app.feed().back().unwrap();
+        assert_eq!(last.text, "closed tab scratch");
+    }
+
+    #[test]
+    fn undo_pushes_reopened_lines_for_pane_and_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ClosePane);
+        app.apply(Action::Undo);
+        let last = app.feed().back().unwrap();
+        assert!(last.text.starts_with("reopened "), "{}", last.text);
+        assert!(!last.text.starts_with("reopened tab"), "{}", last.text);
+
+        app.apply(Action::NewTab);
+        let ti = app.ws.active_tab;
+        app.ws.tabs[ti].name = "scratch".into();
+        app.apply(Action::ClosePane); // removes the tab
+        app.apply(Action::Undo);
+        let last = app.feed().back().unwrap();
+        assert_eq!(last.text, "reopened tab scratch");
+    }
+
+    #[test]
+    fn on_pty_exit_pushes_a_feed_line_even_for_the_focused_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused; // the sole pane starts focused
+        app.on_pty_exit(id);
+        let last = app.feed().back().unwrap();
+        assert!(last.text.ends_with("exited"), "{}", last.text);
+    }
+
+    #[test]
+    fn on_pty_exit_of_an_already_closed_pane_pushes_nothing() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 & 2, focus = 2
+        app.apply(Action::ClosePane); // deliberately closes pane 2
+        let before = app.feed().len();
+        app.on_pty_exit(2); // its late EOF
+        assert_eq!(app.feed().len(), before, "an already-closed pane's EOF logs nothing new");
+    }
+
+    #[test]
+    fn audited_control_call_pushes_exactly_one_ctl_feed_line_even_without_a_socket_dir() {
+        use crate::core::control::{Method, Request};
+        let (mut app, _) = mk_app(shell_ws()); // mk_app passes sock_path = None
+        let ct = app.control_token().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct,
+                method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            },
+            tx,
+        );
+        let _ = rx.recv().unwrap();
+        let ctl_lines: Vec<&FeedEntry> = app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        assert_eq!(ctl_lines.len(), 1, "exactly one ctl feed line per audited call: {:?}", app.feed());
+        assert!(
+            ctl_lines[0].text.contains("fleet: spawn adapter=shell → ok"),
+            "{}",
+            ctl_lines[0].text
+        );
+    }
+
+    #[test]
+    fn toggle_feed_opens_from_normal_and_alt_e_closes_it_again() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFeed);
+        assert!(matches!(app.mode, Mode::Feed { offset: 0 }));
+
+        // The same chord, while the feed is open, closes it (handled
+        // specially in handle_mode_key — see its doc comment).
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT));
+        assert!(consumed);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn feed_esc_and_q_close_it() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        for closer in [KeyCode::Esc, KeyCode::Char('q')] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::ToggleFeed);
+            app.handle_mode_key(KeyEvent::from(closer));
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+    }
+
+    #[test]
+    fn other_alt_chords_close_the_feed_and_still_apply_globally() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // 2 panes, so Focus(Left) actually moves
+        app.apply(Action::ToggleFeed);
+        assert!(matches!(app.mode, Mode::Feed { .. }));
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert!(!consumed, "falls through to the global Focus binding");
+        assert!(matches!(app.mode, Mode::Normal), "any other Alt chord exits feed mode too");
+    }
+
+    #[test]
+    fn feed_scroll_offset_clamps_at_both_ends() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        for i in 0..3 {
+            app.push_feed(format!("entry {i}"), false);
+        }
+        app.apply(Action::ToggleFeed);
+        assert!(matches!(app.mode, Mode::Feed { offset: 0 }));
+
+        // Down (toward the live tail) at offset 0 stays clamped at 0.
+        app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Feed { offset: 0 }));
+
+        // Up scrolls back one entry at a time, clamped at len-1 (3 entries
+        // pushed by this test, plus the spawn line from mk_app's setup —
+        // whatever the real count is, it must never exceed len-1).
+        let cap = app.feed().len() - 1;
+        for _ in 0..(cap + 5) {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Up));
+        }
+        assert!(matches!(app.mode, Mode::Feed { offset } if offset == cap));
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Feed { offset } if offset == cap - 1));
+    }
+
+    #[test]
+    fn feed_overlay_size_is_72x16_at_the_80x24_floor() {
+        // C20: "At the 80×24 floor: 72×16, fits."
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(80, 24));
+        assert_eq!(feed_overlay_size(app.body_area()), (72, 16));
+    }
+
+    #[test]
+    fn feed_overlay_size_clamps_on_a_tiny_body() {
+        assert_eq!(feed_overlay_size(Rect::new(0, 1, 20, 6)), (16, 2));
+    }
+
+    // -- C22 floating scratch pane --------------------------------------------
+
+    #[test]
+    fn float_first_toggle_spawns_shows_and_focuses_a_shell_titled_scratch() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert_ne!(float_id, real_pane);
+        assert!(app.float.as_ref().unwrap().shown);
+        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+        let spec = app.find_spec(float_id).expect("float spec");
+        assert_eq!(spec.adapter, "shell");
+        assert_eq!(spec.title.as_deref(), Some("scratch"));
+        assert!(app.runtimes.contains_key(&float_id), "must actually spawn");
+        // Free correctness via the shared spawn_pane hook (no float-specific
+        // feed code needed).
+        assert!(app.feed().back().unwrap().text.starts_with("spawned scratch (shell)"));
+    }
+
+    #[test]
+    fn float_second_toggle_hides_it_without_killing_the_process() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat); // spawn + show
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide
+        assert_eq!(app.focused, real_pane);
+        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.runtimes.contains_key(&float_id), "process stays alive while hidden");
+    }
+
+    #[test]
+    fn float_third_toggle_reshows_the_same_pane_not_a_fresh_spawn() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide
+        app.apply(Action::ToggleFloat); // show again
+        assert_eq!(app.focused, float_id);
+        assert!(app.float.as_ref().unwrap().shown);
+        assert_eq!(app.runtimes.len(), 2, "no second float spawned (real pane + float only)");
+    }
+
+    #[test]
+    fn float_geometry_matches_the_c22_worked_example() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(80, 24)); // body -> 80x22 -> float 48x13, per C22
+        app.apply(Action::ToggleFloat);
+        let rect = app.display_rects()[0].rect;
+        assert_eq!((rect.width, rect.height), (48, 13));
+    }
+
+    #[test]
+    fn float_toggle_refuses_when_the_body_is_too_small() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(39, 20)); // body width 39 < the 40-col floor
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.is_none(), "must not spawn below the refusal floor");
+        assert_eq!(app.flash(), Some("no room for float"));
+    }
+
+    #[test]
+    fn alloc_pane_id_accounts_for_the_float() {
+        let (mut app, _) = mk_app(shell_ws()); // pane 1
+        app.apply(Action::ToggleFloat); // float takes id 2
+        let float_id = app.focused;
+        assert_eq!(float_id, 2);
+        app.apply(Action::ToggleFloat); // hide it, focus back to pane 1
+        app.apply(Action::NewPane);
+        assert_eq!(
+            app.focused, 3,
+            "ws.next_pane_id() alone would say 2 here — the float's own id, a collision"
+        );
+    }
+
+    #[test]
+    fn float_rule1_shown_routes_normally_rename_works_like_any_pane() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::RenamePane);
+        assert!(matches!(app.mode, Mode::Rename { target: RenameTarget::Pane, .. }));
+        // The buffer starts prefilled with the current title ("scratch",
+        // like any titled pane) — clear it before typing the replacement.
+        for _ in 0.."scratch".len() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        for c in "notes".chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.find_spec(float_id).unwrap().title.as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn float_rule2_focus_dir_hides_it_and_returns_to_prev_focus() {
+        let (mut app, _) = mk_app(shell_ws()); // single real pane
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::Focus(crate::core::layout::Dir::Right));
+        assert_eq!(app.focused, real_pane);
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_jump_attention_hides_it_and_returns_to_prev_focus_without_also_jumping() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        let real_pane = app.focused;
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleFloat); // float focused, prev_focus = 2
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, real_pane, "Alt+a from the float returns to prev_focus, not a ring jump");
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_tab_change_hides_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.as_ref().unwrap().shown);
+        app.apply(Action::GoToTab(0));
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_mouse_click_outside_hides_it_and_lands_on_what_it_hit() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert_ne!(float_id, 1);
+        app.on_click(1);
+        assert_eq!(app.focused, 1);
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_mouse_click_on_the_float_itself_is_not_outside() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.on_click(float_id);
+        assert_eq!(app.focused, float_id);
+        assert!(app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule3_structural_action_hides_float_first_and_does_not_wipe_the_tab_layout() {
+        // The regression under test: without hiding the float first,
+        // spawn_child would try to split off the float's id (not in the
+        // tree), trip split_pane's empty-tab fallback, and replace the
+        // whole tab's layout with just the new pane — losing panes 1 and 2.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab0: panes 1,2
+        let real_panes_before = app.ws.tabs[0].panes.len();
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert_ne!(float_id, 1);
+        assert_ne!(float_id, 2);
+
+        app.apply(Action::NewPane); // Alt+n while the float is focused
+
+        assert_eq!(app.ws.tabs[0].panes.len(), real_panes_before + 1);
+        let order = app.pane_order();
+        assert!(order.contains(&1) && order.contains(&2), "original panes must stay reachable: {order:?}");
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_hides_before_cycle_layout_too() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.as_ref().unwrap().shown);
+        app.apply(Action::CycleLayout);
+        assert!(!app.float.as_ref().unwrap().shown);
+        assert_eq!(app.pane_order().len(), 2, "the real 2-pane tab is untouched");
+    }
+
+    #[test]
+    fn float_hides_before_picker_launch_but_not_when_merely_opening_it() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1,2
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.as_ref().unwrap().shown);
+        app.apply(Action::QuickLaunch);
+        assert!(app.float.as_ref().unwrap().shown, "opening the picker alone must not hide the float");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter)); // launches the first item
+        assert!(!app.float.as_ref().unwrap().shown, "picker launch (C22 rule 3) hides it");
+        let order = app.pane_order();
+        assert!(order.contains(&1) && order.contains(&2), "original panes survive: {order:?}");
+    }
+
+    #[test]
+    fn control_spawn_while_float_focused_does_not_wipe_the_tab_layout() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab0: panes 1,2
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        let order = app.pane_order();
+        assert!(order.contains(&1) && order.contains(&2), "control spawn must not wipe the tab layout: {order:?}");
+        assert_eq!(app.focused, float_id, "the human's focus/float must be undisturbed by a control spawn");
+    }
+
+    #[test]
+    fn float_rule3_alt_z_refuses_instead_of_hiding_and_zooming_behind_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleZoom);
+        assert!(!app.zoomed(), "must not zoom");
+        assert!(app.float.as_ref().unwrap().shown, "must not hide the float either");
+        assert_eq!(app.focused, float_id);
+        assert_eq!(app.flash(), Some("can't zoom the float"));
+    }
+
+    #[test]
+    fn float_rule4_alt_w_kills_it_for_real_with_no_undo_entry() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let undo_depth_before = app.undo.len();
+        app.apply(Action::ClosePane);
+        assert!(app.float.is_none());
+        assert!(!app.runtimes.contains_key(&float_id));
+        assert_eq!(app.focused, real_pane);
+        assert_eq!(app.undo.len(), undo_depth_before, "scratch is not precious — no undo entry");
+        assert_eq!(app.flash(), Some("scratch closed"));
+        app.apply(Action::Undo); // must not somehow resurrect it
+        assert!(app.float.is_none());
+    }
+
+    #[test]
+    fn float_close_confirm_is_skipped_even_while_busy() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::Working);
+        app.apply(Action::ClosePane); // must close immediately, no confirm arm
+        assert!(app.float.is_none());
+        assert!(!app.runtimes.contains_key(&float_id));
+    }
+
+    #[test]
+    fn float_is_first_in_the_display_list_when_shown() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let rects = app.display_rects();
+        assert_eq!(rects[0].id, float_id, "float must be first — topmost priority for hit_test");
+        assert_eq!(rects.len(), 3, "float + both real panes");
+    }
+
+    #[test]
+    fn display_rects_omits_the_float_when_hidden() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::ToggleFloat); // hide
+        let rects = app.display_rects();
+        let float_id = app.float.as_ref().unwrap().id;
+        assert!(rects.iter().all(|pr| pr.id != float_id));
+    }
+
+    #[test]
+    fn float_shown_above_a_still_active_zoom_keeps_the_zoomed_pane_in_the_display_list() {
+        // C21 "keeps zoom" + C22 rule 1: showing the float on top of an
+        // already-zoomed pane doesn't disturb the zoom underneath.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        assert!(app.zoomed());
+        app.apply(Action::ToggleFloat); // float shows on top
+        let float_id = app.focused;
+        assert!(app.zoomed(), "zoom must still be active underneath");
+        let rects = app.display_rects();
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].id, float_id);
+        assert_eq!(rects[1].id, 2, "the zoom target stays pane 2, not the float");
+        assert_eq!(rects[1].rect, app.body_area());
+    }
+
+    #[test]
+    fn attention_ring_includes_the_float_last_when_needy() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1,2, focus 2
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide it, focus back to pane 2
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.attention_ring(), vec![1, float_id]);
+        assert_eq!(app.attention_ring().len(), app.needs_input_count());
+    }
+
+    #[test]
+    fn jump_to_a_needy_float_shows_it_and_records_where_focus_came_from() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide, focus back to real_pane
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, float_id);
+        assert!(app.float.as_ref().unwrap().shown);
+        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+    }
+
+    #[test]
+    fn control_close_of_the_float_is_refused() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let reply =
+            app.handle_control(Request { token: ct, method: Method::Close { pane: float_id, force: true } });
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot close the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(app.float.as_ref().unwrap().shown, "the float must survive the refused close");
+    }
+
+    #[test]
+    fn find_spec_learns_the_float_send_and_read_work_by_id() {
+        use crate::core::control::{Method, ReadMode, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert!(app.find_spec(float_id).is_some());
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Send { pane: float_id, text: "hi".into(), submit: false },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.runtimes.get(&float_id).unwrap().input, b"hi");
+        let reply =
+            app.handle_control(Request { token: ct, method: Method::Read { pane: float_id, mode: ReadMode::Screen } });
+        assert!(matches!(reply, Reply::Ok { .. }));
+    }
+
+    #[test]
+    fn float_never_appears_in_ctl_list() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request { token: ct, method: Method::List });
+        let Reply::Ok { ok } = reply else { panic!("expected ok") };
+        let ids: Vec<u64> = ok.as_array().unwrap().iter().map(|v| v["pane"].as_u64().unwrap()).collect();
+        assert!(!ids.contains(&float_id));
+    }
+
+    #[test]
+    fn float_never_receives_a_fleet_broadcast() {
+        // LOW-1: the float is the human's private interactive scratch shell
+        // (Alt+f), never a fleet member — `send --all` must not type/submit
+        // into it, and it must not inflate the reported count.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let p1 = app.focused;
+        app.apply(Action::ToggleFloat); // spawns + shows the float
+        let float_id = app.focused; // C22: toggling on focuses the float
+        assert_ne!(float_id, p1);
+
+        let ok = match app.handle_control(Request {
+            token: ct,
+            method: Method::Broadcast { text: "hi".into(), submit: true },
+        }) {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let sent: Vec<u64> =
+            ok["sent"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert_eq!(sent, vec![p1], "the float must never be a broadcast target");
+        assert_eq!(ok["count"], 1);
+        assert!(
+            app.runtimes.get(&float_id).unwrap().input.is_empty(),
+            "the human's private scratch shell must never receive broadcast input"
+        );
+    }
+
+    #[test]
+    fn float_is_never_persisted_to_the_saved_workspace() {
+        let (mut app, store) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert!(saved.tabs.iter().all(|t| !t.panes.contains_key(&float_id)));
+    }
+
+    #[test]
+    fn dead_float_relaunches_via_respawn_focused() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.runtimes.get_mut(&float_id).unwrap().kill();
+        assert!(app.focused_dead());
+        app.respawn_focused(false);
+        assert!(!app.focused_dead());
+        assert_eq!(app.focused, float_id);
+    }
+
+    // -- C23 raw pass-through --------------------------------------------------
+
+    #[test]
+    fn toggle_raw_action_flips_membership_on_the_focused_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        assert!(!app.is_raw(id));
+        app.apply(Action::ToggleRaw);
+        assert!(app.is_raw(id));
+        app.apply(Action::ToggleRaw);
+        assert!(!app.is_raw(id));
+    }
+
+    #[test]
+    fn raw_routing_active_requires_normal_mode_raw_and_alive() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        assert!(!app.raw_routing_active(), "not raw yet");
+        app.apply(Action::ToggleRaw);
+        assert!(app.raw_routing_active());
+
+        app.mode = Mode::Help;
+        assert!(!app.raw_routing_active(), "only applies in Normal mode");
+        app.mode = Mode::Normal;
+        assert!(app.raw_routing_active());
+
+        app.runtimes.get_mut(&id).unwrap().kill();
+        assert!(!app.raw_routing_active(), "a dead pane never raw-routes");
+    }
+
+    #[test]
+    fn close_pane_id_cleans_up_stale_raw_membership() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.apply(Action::ToggleRaw);
+        assert!(app.is_raw(id));
+        app.apply(Action::ClosePane);
+        assert!(!app.is_raw(id));
+    }
+
+    #[test]
+    fn control_send_still_delivers_bytes_to_a_raw_pane() {
+        // C23's routing predicate only gates the *keyboard* path
+        // (main.rs's handle_key) — the control socket writes straight to
+        // the runtime via ctl_send and must keep working while the focused
+        // pane is flagged raw; raw is not consulted anywhere on that path.
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::ToggleRaw);
+        assert!(app.is_raw(id));
+
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Send { pane: id, text: "hello".into(), submit: true },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert!(app.runtimes.get(&id).unwrap().input.ends_with(b"hello\r"));
+        assert!(app.is_raw(id), "control send must not disturb the raw flag");
+    }
+
+    // -- C24 keyboard copy mode -------------------------------------------------
+
+    /// Extract the C24 cursor from `Mode::Copy`, panicking with a clear
+    /// message otherwise — every test in this section drives copy mode via
+    /// `Action::CopyMode` first, so this should always match.
+    fn copy_cursor(app: &App<FakePane>) -> (u16, u16) {
+        match &app.mode {
+            Mode::Copy { cursor } => *cursor,
+            _ => panic!("expected Mode::Copy"),
+        }
+    }
+
+    #[test]
+    fn copy_mode_cursor_starts_bottom_left_of_the_focused_pane() {
+        // 100x30 term, single pane fills the body (100x28) -> inner 98x26.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        assert_eq!(copy_cursor(&app), (25, 0));
+    }
+
+    #[test]
+    fn copy_cursor_motions_clamp_to_the_inner_grid() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode); // cursor (25, 0), grid 26 rows x 98 cols
+        for _ in 0..30 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char('k'))); // up, clamps at row 0
+        }
+        assert_eq!(copy_cursor(&app), (0, 0));
+        for _ in 0..120 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char('l'))); // right, clamps at col 97
+        }
+        assert_eq!(copy_cursor(&app), (0, 97));
+        for _ in 0..40 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Down)); // clamps at row 25
+        }
+        assert_eq!(copy_cursor(&app), (25, 97));
+        for _ in 0..120 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Left)); // clamps at col 0
+        }
+        assert_eq!(copy_cursor(&app), (25, 0));
+    }
+
+    #[test]
+    fn copy_cursor_0_and_dollar_jump_to_column_bounds() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('$')));
+        assert_eq!(copy_cursor(&app).1, 97);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('0')));
+        assert_eq!(copy_cursor(&app).1, 0);
+    }
+
+    #[test]
+    fn copy_v_toggles_anchor_and_movement_extends_the_selection() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode); // cursor (25, 0)
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v'))); // anchor at (25, 0)
+        let sel = app.selection.expect("v sets an anchor");
+        assert_eq!(sel.anchor, (25, 0));
+        assert_eq!(sel.cursor, (25, 0));
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('k')));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('k')));
+        let sel = app.selection.expect("still selecting");
+        assert_eq!(sel.anchor, (25, 0), "anchor stays put");
+        assert_eq!(sel.cursor, (23, 0), "movement extends to the new cursor");
+        assert_eq!(copy_cursor(&app), (23, 0));
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v'))); // toggle off
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn copy_y_yanks_with_a_selection_and_stashes_it_for_the_clipboard() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.runtimes.get_mut(&1).unwrap().grab = "yanked text".into();
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v')));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.selection.is_none());
+        assert_eq!(app.take_pending_yank().as_deref(), Some("yanked text"));
+        assert!(app.flash().unwrap().starts_with("copied"));
+    }
+
+    #[test]
+    fn copy_enter_also_yanks_same_as_y() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.runtimes.get_mut(&1).unwrap().grab = "abc".into();
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v')));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.take_pending_yank().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn copy_y_without_a_selection_flashes_and_stays_in_copy_mode() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(matches!(app.mode, Mode::Copy { .. }), "must stay in copy mode");
+        assert_eq!(app.flash(), Some("nothing selected"));
+        assert!(app.take_pending_yank().is_none());
+    }
+
+    #[test]
+    fn copy_esc_and_q_clear_the_selection_and_exit() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        for closer in [KeyCode::Esc, KeyCode::Char('q')] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::CopyMode);
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char('v')));
+            assert!(app.selection.is_some());
+            app.handle_mode_key(KeyEvent::from(closer));
+            assert!(matches!(app.mode, Mode::Normal));
+            assert!(app.selection.is_none());
+        }
+    }
+
+    #[test]
+    fn copy_mouse_drag_replaces_the_keyboard_selection_and_moves_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v'))); // keyboard anchor at (25, 0)
+        assert_eq!(app.selection.unwrap().anchor, (25, 0));
+
+        // A fresh mouse drag starts an entirely new selection, overwriting
+        // the keyboard one, and also moves the Mode::Copy cursor (C24: "a
+        // drag also moves the cursor to the drag point").
+        app.begin_selection(1, 3, 4);
+        app.extend_selection(5, 6);
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor, (3, 4));
+        assert_eq!(sel.cursor, (5, 6));
+        assert_eq!(copy_cursor(&app), (5, 6));
     }
 }

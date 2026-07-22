@@ -40,6 +40,7 @@ roost — control a running instance:
   roost spawn ADAPTER [--cwd DIR] [--input TEXT]
   roost fork [PANE]
   roost send PANE TEXT... [--enter]
+  roost send --all TEXT... [--enter]
   roost read PANE [--tail N | --full]
   roost close PANE [--force]
   roost wait PANE... [--until STATUS] [--timeout SEC]
@@ -118,11 +119,25 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "send" => {
             let pos = positional(rest);
-            let pane = pos.first().ok_or("send needs a PANE")?;
-            m.insert("pane".into(), parse_pane(pane)?.into());
-            let text = pos[1..].join(" ");
-            m.insert("text".into(), text.into());
-            m.insert("submit".into(), has_flag(rest, "--enter").into());
+            if has_flag(rest, "--all") {
+                // --all replaces the PANE positional; a leading token that
+                // still parses as one looks like a leftover `send PANE
+                // TEXT...` (old muscle memory) rather than deliberate
+                // broadcast text — reject instead of guessing, since this
+                // fans out to every running pane the actor may target.
+                if pos.first().is_some_and(|p| parse_pane(p).is_ok()) {
+                    return Err("send --all takes TEXT only, no PANE (got both)".into());
+                }
+                m.insert("method".into(), "broadcast".into());
+                m.insert("text".into(), pos.join(" ").into());
+                m.insert("submit".into(), has_flag(rest, "--enter").into());
+            } else {
+                let pane = pos.first().ok_or("send needs a PANE")?;
+                m.insert("pane".into(), parse_pane(pane)?.into());
+                let text = pos[1..].join(" ");
+                m.insert("text".into(), text.into());
+                m.insert("submit".into(), has_flag(rest, "--enter").into());
+            }
         }
         "read" => {
             let pos = positional(rest);
@@ -254,5 +269,21 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn cli_send_all_broadcasts_and_rejects_a_leftover_pane_id() {
+        match parse(&["send", "--all", "hi", "there", "--enter"]).method {
+            Method::Broadcast { text, submit } => {
+                assert_eq!(text, "hi there");
+                assert!(submit);
+            }
+            _ => panic!("expected a broadcast"),
+        }
+        // --all replaces the PANE positional; a leading token that still
+        // parses as a pane id looks like `send PANE TEXT` with --all left
+        // in by mistake — usage error, not a guess.
+        let owned: Vec<String> = ["send", "--all", "3", "x"].iter().map(|s| s.to_string()).collect();
+        assert!(build_request(&owned, "T".into()).is_err());
     }
 }

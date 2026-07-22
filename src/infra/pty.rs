@@ -143,18 +143,22 @@ impl PaneBackend for PtyPane {
         self.kitty.disambiguate()
     }
 
-    fn write_input(&mut self, bytes: &[u8]) {
+    fn write_input(&mut self, bytes: &[u8]) -> bool {
         // Typing means "I'm back" — snap to the live tail.
         if self.scroll != 0 {
             self.scroll = 0;
             self.parser.set_scrollback(0);
         }
-        self.write_input_raw(bytes);
+        self.write_input_raw(bytes)
     }
 
-    fn write_input_raw(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
+    /// Returns whether the write actually reached the child — a dead/broken
+    /// pipe must not be reported as delivered by a caller that counts
+    /// successful sends (`ctl_send`/`ctl_broadcast`).
+    fn write_input_raw(&mut self, bytes: &[u8]) -> bool {
+        let ok = self.writer.write_all(bytes).is_ok();
         let _ = self.writer.flush();
+        ok
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -335,5 +339,18 @@ mod tests {
     fn normalizes_reversed_coords() {
         let p = screen_with("hello", 2, 10);
         assert_eq!(extract_selection(p.screen(), (0, 4), (0, 0)), "hello");
+    }
+
+    #[test]
+    fn zero_dollar_multiline_selection_trims_each_lines_trailing_whitespace() {
+        // C24's `0`/`$` keyboard motions drive a realistic `0 v j $ y` flow:
+        // row 0 has real trailing spaces printed by the shell (not just
+        // unwritten cell padding beyond the row's own content), row 1 is
+        // shorter than the screen width. Each line must trim independently
+        // and join with '\n' — a per-line trim, not one global trim.
+        let p = screen_with("hi   \r\nbye", 3, 10);
+        // (0,0) = `0` on row 0; (1,9) = `$` (last column) on row 1 — exactly
+        // what pressing 0 then j then $ drives.
+        assert_eq!(extract_selection(p.screen(), (0, 0), (1, 9)), "hi\nbye");
     }
 }

@@ -1,7 +1,7 @@
 # roost roadmap
 
 Everything known to be outstanding, as of the current `main`. The core product
-is complete and green (110 unit tests); nothing here is a known-broken defect —
+is complete and green (306 unit tests); nothing here is a known-broken defect —
 it's deferred scope, deliberate choices, and one thing only a human can do.
 
 Legend: **[you]** needs a real terminal / human judgment · **[gap]** promised
@@ -36,8 +36,36 @@ change · **[descoped]** decided against unless a use-case demands it.
   screen). Alignment stays auditable via the `design-supervisor` agent
   (`.claude/agents/design-supervisor.md`) — invoke after any `src/ui/**`
   change. Known follow-up candidates: spawn-failure error doesn't say *why*
-  (e.g. ENOENT vs PATH); vt100 golden-frame harness deferred until the first
-  chrome regression (DESIGN-ui.md §6).
+  (e.g. ENOENT vs PATH); the vt100 golden-frame harness itself is superseded
+  below — its foundation shipped with the fleet-features firehose gate,
+  though golden-frame *color* scenarios remain deferred on the same trigger.
+
+## Fleet features — shipped
+
+- **[done] Navigate & arrange a bigger fleet.** Eight new surfaces landed on
+  top of the restyled chrome: jump-to-attention (`Alt+a`, C19), an activity
+  feed (`Alt+e`, C20), pane zoom (`Alt+z`, C21), a floating scratch pane
+  (`Alt+f`, C22), per-pane raw pass-through (`Alt+Shift+p`, C23), keyboard
+  copy mode (C24), canned layout cycling (`Alt+g`, C25), and broadcast send
+  (`roost send --all` — CLI-only by design, no TUI key). Tab-undo (`Alt+u`)
+  was already whole-tab capable; C26 is a scope statement + pinning test,
+  not new behavior. Spec of record: `DESIGN-ui.md` (contracts C19–C26 +
+  amended C9/C15/§8 key table). Verified: 306 unit tests
+  (`cargo test --bin roost`), all green. Known follow-up candidate: a
+  floating *quick-launch picker* (distinct from the scratch float that
+  shipped) is still an open idea — out of scope this round, per the brief.
+
+- **[done] Firehose input-latency gate + PTY harness foundation
+  (DESIGN-ui.md §6).** The vt100 golden-frame harness assessed and deferred
+  during the chrome restyle now has its foundation built:
+  `tests/harness/mod.rs` spawns the real binary in a 120×40 portable-pty and
+  parses its output with `vt100`; `tests/firehose.rs` uses it to assert
+  input stays responsive under sustained output (every echo visible within
+  250 ms, the firehose region still visibly moving every 500 ms sample, a
+  clean `Alt+q` exit within 2 s with no orphaned children). **Golden-frame
+  *color* scenarios are still deferred** — same trigger as before (first
+  chrome regression, or the next engagement leaning on `src/ui/render.rs`);
+  this gate is a perf smoke test, not a visual regression suite.
 
 ## Control interface — remaining
 

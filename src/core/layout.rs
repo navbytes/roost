@@ -415,6 +415,119 @@ pub fn stack_expanded_ids(node: &LayoutNode, out: &mut HashSet<PaneId>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canned layouts (C25)
+// ---------------------------------------------------------------------------
+//
+// Pure builders — no App/UI wiring here. Each takes `pane_order()` of the
+// tab's current tree (`P` in the contract) and produces a brand-new tree;
+// callers own applying it and advancing the cycle counter.
+
+fn even_ratios(n: usize) -> Vec<f32> {
+    vec![1.0 / n as f32; n]
+}
+
+/// One row of an even-grid: a bare `Pane` if it holds a single pane (this
+/// file never builds a one-child `Split` — see `remove_pane`'s collapse
+/// step), otherwise a `Split{Vertical}` of the row's panes side by side.
+fn grid_row(panes: &[PaneId]) -> LayoutNode {
+    match panes {
+        [id] => LayoutNode::Pane(*id),
+        _ => LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: even_ratios(panes.len()),
+            children: panes.iter().map(|&id| LayoutNode::Pane(id)).collect(),
+        },
+    }
+}
+
+/// C25 even-grid (Alt+g, arrangement 1/3): `c = ceil(sqrt(n))` columns,
+/// `r = ceil(n / c)` rows, `panes` assigned row-major — so `pane_order()` of
+/// the result is `panes` verbatim. A grid of one row collapses to that
+/// row's `Split` directly (no pointless outer wrapper); `n = 1` collapses
+/// all the way to a bare `Pane`. Worked shapes: n=2 side-by-side, n=3
+/// two-over-one, n=4 2×2, n=5 three-over-two, n=7 three/three/one.
+pub fn grid_layout(panes: &[PaneId]) -> LayoutNode {
+    match panes {
+        [] => LayoutNode::Stack { children: Vec::new(), expanded: 0 },
+        [id] => LayoutNode::Pane(*id),
+        _ => {
+            let n = panes.len();
+            let cols = (1..=n).find(|c| c * c >= n).unwrap_or(1);
+            let mut rows: Vec<LayoutNode> = panes.chunks(cols).map(grid_row).collect();
+            if rows.len() == 1 {
+                rows.remove(0)
+            } else {
+                LayoutNode::Split {
+                    dir: SplitDir::Horizontal,
+                    ratios: even_ratios(rows.len()),
+                    children: rows,
+                }
+            }
+        }
+    }
+}
+
+/// C25 main+stack (arrangement 2/3): `focused` fills the left 0.6 column;
+/// `rest` — `pane_order()` of the prior tree with `focused` already
+/// excluded — fills the right 0.4 column, so `pane_order()` of the result
+/// is `focused` followed by `rest`. Two panes total (`rest.len() == 1`) is
+/// a plain 0.6/0.4 split, never a one-member `Stack`; zero panes in `rest`
+/// (`n = 1`) collapses to a bare `Pane(focused)`.
+pub fn main_stack_layout(focused: PaneId, rest: &[PaneId]) -> LayoutNode {
+    match rest {
+        [] => LayoutNode::Pane(focused),
+        [id] => LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.6, 0.4],
+            children: vec![LayoutNode::Pane(focused), LayoutNode::Pane(*id)],
+        },
+        _ => LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.6, 0.4],
+            children: vec![
+                LayoutNode::Pane(focused),
+                LayoutNode::Stack { children: rest.to_vec(), expanded: 0 },
+            ],
+        },
+    }
+}
+
+/// C25 all-stack (arrangement 3/3): every pane in `panes` (`pane_order()`
+/// of the prior tree, order preserved verbatim — unlike main+stack, nothing
+/// moves to the front) joins one `Stack`, expanded on `focused`'s position.
+/// A single pane collapses to a bare `Pane` — the same "no one-member
+/// stack" rule the main+stack `n = 2` case states explicitly.
+pub fn all_stack_layout(panes: &[PaneId], focused: PaneId) -> LayoutNode {
+    match panes {
+        [] => LayoutNode::Stack { children: Vec::new(), expanded: 0 },
+        [id] => LayoutNode::Pane(*id),
+        _ => {
+            let expanded = panes.iter().position(|&id| id == focused).unwrap_or(0);
+            LayoutNode::Stack { children: panes.to_vec(), expanded }
+        }
+    }
+}
+
+/// The smallest *outer* pane rect (borders included) a split is allowed to
+/// produce — below it the new pane would be a sliver. Single source for both
+/// the interactive split guard (`app.rs::spawn_child`) and the C25 fit
+/// predicate below, so the two rules can't drift apart.
+pub const MIN_SPLIT_COLS: u16 = 36;
+pub const MIN_SPLIT_ROWS: u16 = 10;
+
+/// C25 fit predicate: true iff every non-collapsed rect the arrangement
+/// would produce in `area` is at least `MIN_SPLIT_COLS` × `MIN_SPLIT_ROWS` —
+/// reuses `compute_rects`, so it can't drift from the real geometry walk.
+/// Collapsed stack rows (1-row title bars) are exempt by design.
+pub fn arrangement_fits(node: &LayoutNode, area: Rect) -> bool {
+    let mut rects = Vec::new();
+    compute_rects(node, area, &mut rects);
+    rects
+        .iter()
+        .all(|pr| pr.collapsed || (pr.rect.width >= MIN_SPLIT_COLS && pr.rect.height >= MIN_SPLIT_ROWS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +794,191 @@ mod tests {
         compute_rects_and_headers(&node, Rect::new(0, 0, 80, 0), &mut out, &mut headers);
         assert!(out.is_empty());
         assert!(headers.is_empty());
+    }
+
+    // -- C25 canned layouts --------------------------------------------------
+
+    /// Pane count one level down: a bare `Pane` counts as 1, a `Split`/`Stack`
+    /// counts its direct children — i.e. a grid row's width.
+    fn row_pane_count(node: &LayoutNode) -> usize {
+        match node {
+            LayoutNode::Pane(_) => 1,
+            LayoutNode::Split { children, .. } => children.len(),
+            LayoutNode::Stack { children, .. } => children.len(),
+        }
+    }
+
+    #[test]
+    fn grid_layout_n1_is_bare_pane() {
+        assert!(matches!(grid_layout(&[1]), LayoutNode::Pane(1)));
+    }
+
+    #[test]
+    fn grid_layout_n2_is_side_by_side() {
+        let node = grid_layout(&[1, 2]);
+        match &node {
+            LayoutNode::Split { dir: SplitDir::Vertical, ratios, children } => {
+                assert_eq!(ratios, &vec![0.5, 0.5]);
+                assert_eq!(children.len(), 2);
+            }
+            other => panic!("expected side-by-side split, got {other:?}"),
+        }
+        let mut order = vec![];
+        pane_order(&node, &mut order);
+        assert_eq!(order, vec![1, 2]);
+    }
+
+    #[test]
+    fn grid_layout_n3_is_two_over_one() {
+        let node = grid_layout(&[1, 2, 3]);
+        let LayoutNode::Split { dir: SplitDir::Horizontal, children: rows, .. } = &node else {
+            panic!("expected an outer horizontal split, got {node:?}");
+        };
+        assert_eq!(rows.iter().map(row_pane_count).collect::<Vec<_>>(), vec![2, 1]);
+        assert!(matches!(&rows[0], LayoutNode::Split { dir: SplitDir::Vertical, .. }));
+        assert!(matches!(&rows[1], LayoutNode::Pane(3)));
+    }
+
+    #[test]
+    fn grid_layout_n4_is_two_by_two() {
+        let node = grid_layout(&[1, 2, 3, 4]);
+        let LayoutNode::Split { dir: SplitDir::Horizontal, children: rows, .. } = &node else {
+            panic!("expected an outer horizontal split, got {node:?}");
+        };
+        assert_eq!(rows.iter().map(row_pane_count).collect::<Vec<_>>(), vec![2, 2]);
+        for row in rows {
+            assert!(matches!(row, LayoutNode::Split { dir: SplitDir::Vertical, .. }));
+        }
+    }
+
+    #[test]
+    fn grid_layout_n5_is_three_over_two() {
+        let node = grid_layout(&[1, 2, 3, 4, 5]);
+        let LayoutNode::Split { dir: SplitDir::Horizontal, children: rows, .. } = &node else {
+            panic!("expected an outer horizontal split, got {node:?}");
+        };
+        assert_eq!(rows.iter().map(row_pane_count).collect::<Vec<_>>(), vec![3, 2]);
+    }
+
+    #[test]
+    fn grid_layout_n7_is_three_three_one() {
+        let node = grid_layout(&[1, 2, 3, 4, 5, 6, 7]);
+        let LayoutNode::Split { dir: SplitDir::Horizontal, children: rows, .. } = &node else {
+            panic!("expected an outer horizontal split, got {node:?}");
+        };
+        assert_eq!(rows.iter().map(row_pane_count).collect::<Vec<_>>(), vec![3, 3, 1]);
+        assert!(matches!(&rows[2], LayoutNode::Pane(7)));
+    }
+
+    #[test]
+    fn grid_layout_preserves_pane_order() {
+        for n in [1usize, 2, 3, 4, 5, 7] {
+            let panes: Vec<PaneId> = (1..=n as PaneId).collect();
+            let mut order = vec![];
+            pane_order(&grid_layout(&panes), &mut order);
+            assert_eq!(order, panes, "n={n}");
+        }
+    }
+
+    #[test]
+    fn main_stack_layout_n1_is_bare_pane() {
+        assert!(matches!(main_stack_layout(1, &[]), LayoutNode::Pane(1)));
+    }
+
+    #[test]
+    fn main_stack_layout_n2_is_plain_split_no_stack() {
+        match main_stack_layout(1, &[2]) {
+            LayoutNode::Split { dir: SplitDir::Vertical, ratios, children } => {
+                assert_eq!(ratios, vec![0.6, 0.4]);
+                assert!(matches!(&children[0], LayoutNode::Pane(1)));
+                assert!(matches!(&children[1], LayoutNode::Pane(2)), "must not be a one-member stack");
+            }
+            other => panic!("expected a plain 0.6/0.4 split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_stack_layout_stacks_the_rest_from_three_panes_up() {
+        match main_stack_layout(1, &[2, 3, 4]) {
+            LayoutNode::Split { dir: SplitDir::Vertical, ratios, children } => {
+                assert_eq!(ratios, vec![0.6, 0.4]);
+                assert!(matches!(&children[0], LayoutNode::Pane(1)));
+                match &children[1] {
+                    LayoutNode::Stack { children, expanded } => {
+                        assert_eq!(children, &vec![2, 3, 4]);
+                        assert_eq!(*expanded, 0);
+                    }
+                    other => panic!("expected a stack, got {other:?}"),
+                }
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_stack_layout_puts_focused_first_in_pane_order() {
+        for rest_len in [0usize, 1, 2, 3, 4, 6] {
+            let rest: Vec<PaneId> = (2..2 + rest_len as PaneId).collect();
+            let mut order = vec![];
+            pane_order(&main_stack_layout(1, &rest), &mut order);
+            let mut expected = vec![1];
+            expected.extend(&rest);
+            assert_eq!(order, expected, "rest_len={rest_len}");
+        }
+    }
+
+    #[test]
+    fn all_stack_layout_n1_is_bare_pane() {
+        assert!(matches!(all_stack_layout(&[1], 1), LayoutNode::Pane(1)));
+    }
+
+    #[test]
+    fn all_stack_layout_expands_the_focused_member() {
+        match all_stack_layout(&[10, 20, 30], 20) {
+            LayoutNode::Stack { children, expanded } => {
+                assert_eq!(children, vec![10, 20, 30]);
+                assert_eq!(expanded, 1);
+            }
+            other => panic!("expected a stack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_stack_layout_preserves_pane_order() {
+        for n in [1usize, 2, 3, 4, 5, 7] {
+            let panes: Vec<PaneId> = (1..=n as PaneId).collect();
+            let mut order = vec![];
+            pane_order(&all_stack_layout(&panes, 1), &mut order);
+            assert_eq!(order, panes, "n={n}");
+        }
+    }
+
+    #[test]
+    fn arrangement_fits_true_at_exact_boundary_36x10() {
+        let node = grid_layout(&[1]); // bare Pane — rect == area, no rounding to reason about
+        assert!(arrangement_fits(&node, Rect::new(0, 0, 36, 10)));
+    }
+
+    #[test]
+    fn arrangement_fits_false_just_under_the_boundary() {
+        let node = grid_layout(&[1]);
+        assert!(!arrangement_fits(&node, Rect::new(0, 0, 35, 10)));
+        assert!(!arrangement_fits(&node, Rect::new(0, 0, 36, 9)));
+    }
+
+    #[test]
+    fn arrangement_fits_false_when_a_grid_column_is_too_narrow() {
+        // 2x2 grid in 40 cols: each column gets 20 < 36.
+        let node = grid_layout(&[1, 2, 3, 4]);
+        assert!(!arrangement_fits(&node, Rect::new(0, 0, 40, 20)));
+    }
+
+    #[test]
+    fn arrangement_fits_exempts_collapsed_stack_rows() {
+        // all-stack of 5: collapsed members are 1 row tall (under the
+        // 10-row floor) but exempt; only the expanded member (15 rows
+        // here) has to clear the floor.
+        let node = all_stack_layout(&[1, 2, 3, 4, 5], 1);
+        assert!(arrangement_fits(&node, Rect::new(0, 0, 40, 20)));
     }
 }

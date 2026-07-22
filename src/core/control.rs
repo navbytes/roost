@@ -64,6 +64,17 @@ pub enum Method {
         #[serde(default)]
         submit: bool,
     },
+    /// Send text (+ CR when `submit`) to every *running* pane the actor may
+    /// target — Fleet: every spawned pane; a pane actor: its own spawned
+    /// subtree, itself included. A distinct wire method from `Send` (not a
+    /// `Send` with an omitted `pane`) so authz and audit stay explicit about
+    /// a fan-out. CLI/API only — no TUI key (fat-finger safety: this is the
+    /// one verb that can touch the whole fleet at once).
+    Broadcast {
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
     /// Read a pane's contents.
     Read {
         pane: PaneId,

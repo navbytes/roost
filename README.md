@@ -69,21 +69,28 @@ you're in.
 | `Alt+Shift+arrow` | resize along that axis |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
+| `Alt+g` | cycle layout: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
+| `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |
+| `Alt+f` | toggle the floating scratch shell (readline forward-word collision — already swallowed; raw mode below gets it back) |
+| `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
+| `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
 | `Alt+r` | rename pane |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
-| `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
-| `Alt+c` | copy mode — drag to select text, copies on release (`Esc` cancels) |
 | `Alt+t`, `Alt+1..9` | new tab / go to tab |
 | `Alt+w` | close pane (press twice to confirm when the agent is busy or it's the last pane) |
-| `Alt+u` | undo — reopen the last closed pane/tab, resuming its session |
-| `Alt+?` | show the full keymap (any key closes it) |
+| `Alt+u` | undo — reopen the last closed pane or tab, sessions resumed (exact scope below) |
+| `Alt+c` | copy mode — `hjkl`/arrows + `v` mark + `y`/`Enter` yank, or drag with the mouse (`Esc`/`q` exits) |
+| `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
+| `Alt+Shift+p` | raw pass-through for the focused pane — same chord exits it |
 | `Alt+/` | toggle the shortcut hint bar |
+| `Alt+?` | show the full keymap (any key closes it) |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 
 A shortcut hint bar runs along the bottom by default (zellij-style), showing
 the keys you can press right now — it changes with context, so rename /
-picker / scroll / dead-pane modes each show their own keys. `Alt+/` hides it
-to reclaim the row.
+picker / scroll / copy / feed / dead-pane modes each show their own keys, and
+a raw-focused pane collapses it to one pair (`Alt+Shift+p exit raw`).
+`Alt+/` hides it to reclaim the row.
 
 Everything else passes straight through to the focused pane. **Shift+Enter**
 and **Ctrl+Enter** are sent as "insert newline" rather than "submit", so you
@@ -126,6 +133,62 @@ terminal's native whole-window selection. (Your terminal's Shift+drag native
 selection still works too, if you prefer it.)
 
 </details>
+
+## Fleet features
+
+Eight keyboard-first additions for running more agents at once, plus one
+CLI-only escape hatch — all Alt-only, same layer as everything above.
+
+- **Jump to attention (`Alt+a`).** Jumps to the next pane whose status is
+  ◆ needs-input, across tabs, wrapping back to the first; press again for
+  the next one. Nothing needs you? A flash says so and nothing else
+  changes — the hint bar's `◆ N needs you · Alt+a` segment always matches
+  the count it will actually cycle through.
+- **Activity feed (`Alt+e`).** A modal overlay, not a persistent pane —
+  there's no spare row at an 80×24 terminal — streaming the most recent 200
+  events: status changes, spawns, closes/reopens, exits, and control-plane
+  calls (so `roost send --all` and every other control verb show up here
+  too). Session-only, never written to disk. `↑/↓` scroll, `Esc`/`q`/`Alt+e`
+  close.
+- **Pane zoom (`Alt+z`).** A pure view transform: the focused pane fills the
+  screen, but the split/stack tree underneath is untouched. Zoom follows
+  focus inside the tab; switching tabs, closing the zoomed pane, or any
+  layout edit (new pane, split, stack, `Alt+g`) exits it first, so the
+  layout never changes invisibly underneath you.
+- **Floating scratch pane (`Alt+f`).** One app-wide floating shell, toggled
+  in and out of view — the process keeps running while it's hidden. Moving
+  focus away hides it automatically; `Alt+w` while it's focused kills it for
+  real. Honest scope: it's session-only, never written to `workspace.json`,
+  and gone at quit like any other unsaved state — there's no persistent
+  fourth pane type here, just an ephemeral one.
+- **Raw pass-through (`Alt+Shift+p`).** Marks the focused pane raw: every
+  key except the toggle itself — including every other `Alt` chord —
+  forwards straight through as bytes, so an agent CLI with its own Alt
+  bindings (readline word-ops, custom editors) sees a normal terminal. The
+  hint bar shows `Alt+Shift+p exit raw` the whole time you're in it, so you
+  can't get stuck; the same chord that gets you in gets you out.
+- **Keyboard copy mode.** `Alt+c` now also takes `hjkl`/arrows to move a
+  cursor, `0`/`$` for line start/end, `v` to mark an anchor, and `y`/`Enter`
+  to yank — the mouse-drag path from before still works, and the two
+  interleave freely (a drag moves the keyboard cursor too); `Esc`/`q` exits
+  and clears the selection. Honest scope: visible grid only, same as the
+  mouse path — no scrollback paging inside copy mode.
+- **Canned layouts (`Alt+g`).** Cycles the active tab through three built-in
+  arrangements — even grid, main pane + stack, all-stack — skipping any
+  that wouldn't fit the terminal, and always keeping focus and pane order
+  stable. It's a snap-to-arrangement, not undoable via `Alt+u`.
+- **Tab undo, the honest scope.** `Alt+u` already reopened panes; it now
+  reopens whole tabs the same way — name, layout, and pane specs restored,
+  session ids included, so agents resume where they left off. The one limit
+  worth knowing: a multi-pane tab is dismantled close-by-close, so undoing
+  one that had several panes replays them as individual pane-undos —
+  sessions intact, but re-split off the focused pane rather than at their
+  original geometry. The undo stack holds the last 20 closes and is
+  session-only (cleared on quit).
+- **Broadcast.** `roost send --all TEXT [--enter]` types into every running
+  pane at once — CLI/control-plane only, deliberately no TUI key so a
+  fat-fingered `Alt` chord can't blast the whole fleet. See
+  [Controlling roost](#controlling-roost-cli--llm) below.
 
 ## Status glyphs
 
@@ -201,6 +264,7 @@ roost list                                   # panes: id, adapter, cwd, status, 
 roost spawn pi --cwd ~/api --input "run the tests, report pass/fail"
 roost read 5 --tail 20                        # a pane's recent output
 roost send 5 hello world --enter              # type into a pane (+ Enter)
+roost send --all "standup: reply with status" --enter  # broadcast to every reachable pane
 roost status 5                                # working | waiting | needs_input | …
 roost wait 5 --until waiting --timeout 300    # block until the agent finishes
 roost fork 5                                  # a sibling in the same context
@@ -211,6 +275,14 @@ roost close 5 [--force]
 
 `wait` is what turns "spawn then poll" into "spawn → await → read": block until a
 pane hits a status (or a timeout), so an orchestrator doesn't sleep-and-grep.
+
+`send --all` is `send`'s broadcast form, not a separate verb — it fans out to
+every **running** pane the caller may target: every spawned pane (float
+included) for the fleet token, or just its own spawned subtree for a pane
+acting via its own `$ROOST_TOKEN`. Non-running panes are skipped, not errors;
+the reply reports which pane ids it reached. Audited like every control
+action, by shape only — `broadcast len=<n> submit=<bool> -> ok count=<n>` —
+the message text itself is never written to `control.log`.
 
 This is how an LLM manages a fleet — an agent inside a pane can spawn and drive
 worker panes for its sub-agents, and you watch (and take over) the whole fleet
@@ -273,7 +345,8 @@ deep-history scrolling render correctly.
 
 M0 render core ✓ · M1 splits/tabs ✓ · M2 persistence + session detection ✓ ·
 M3 status socket + badges ✓ · M4 stacks + resize ✓ · M5 picker, rename,
-scroll, notifications ✓. Deferred: floating panes, mouse support, opencode
+scroll, notifications ✓ · fleet features (jump, feed, zoom, float, raw mode,
+keyboard copy, layouts, broadcast) ✓. Deferred: mouse support, opencode
 adapter, config file (roost is deliberately zero-config for now). Full
 detail: [ROADMAP.md](ROADMAP.md).
 

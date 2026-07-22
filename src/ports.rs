@@ -51,11 +51,15 @@ pub trait PaneBackend: Sized {
     /// Feed process output into the terminal state machine.
     fn process_output(&mut self, bytes: &[u8]);
     /// User keystrokes → process stdin. Implementations should snap
-    /// scrollback to the live tail (typing means "I'm back").
-    fn write_input(&mut self, bytes: &[u8]);
+    /// scrollback to the live tail (typing means "I'm back"). Returns
+    /// whether the bytes actually reached the process — a caller that
+    /// reports a delivery count (`ctl_send`/`ctl_broadcast`) must not
+    /// count a failed write as sent.
+    fn write_input(&mut self, bytes: &[u8]) -> bool;
     /// Bytes → process stdin without touching scrollback (forwarded mouse
-    /// events must not yank the view to the live tail).
-    fn write_input_raw(&mut self, bytes: &[u8]);
+    /// events must not yank the view to the live tail). Same success
+    /// semantics as `write_input`.
+    fn write_input_raw(&mut self, bytes: &[u8]) -> bool;
     fn resize(&mut self, rows: u16, cols: u16);
     /// Ask the child to exit cleanly (SIGHUP, as if its terminal closed) so it
     /// can flush a final turn. Best-effort; `kill()` is the guaranteed stop.
@@ -139,6 +143,10 @@ pub mod fakes {
         /// `grab` so a test can tell a full/tail read apart from a screen
         /// read).
         pub all_text: String,
+        /// Test knob: when true, `write_input`/`write_input_raw` report
+        /// failure and drop the bytes — simulates a pane whose pipe died
+        /// right after a status snapshot said it was still running.
+        pub fail_write: bool,
     }
 
     impl PaneBackend for FakePane {
@@ -163,17 +171,26 @@ pub mod fakes {
                 observation: None,
                 grab: String::new(),
                 all_text: String::new(),
+                fail_write: false,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
             self.status = AgentStatus::Working;
         }
-        fn write_input(&mut self, bytes: &[u8]) {
+        fn write_input(&mut self, bytes: &[u8]) -> bool {
+            if self.fail_write {
+                return false;
+            }
             self.scrollback = 0;
             self.input.extend_from_slice(bytes);
+            true
         }
-        fn write_input_raw(&mut self, bytes: &[u8]) {
+        fn write_input_raw(&mut self, bytes: &[u8]) -> bool {
+            if self.fail_write {
+                return false;
+            }
             self.input.extend_from_slice(bytes);
+            true
         }
         fn resize(&mut self, _rows: u16, _cols: u16) {}
         fn kill(&mut self) {

@@ -30,7 +30,7 @@ use crate::infra::notify::TermNotifier;
 use crate::infra::pty::PtyPane;
 use crate::infra::store::FsStore;
 use crate::ports::{Notifier, PaneBackend, StateStore};
-use crate::ui::input::{self, InputResult};
+use crate::ui::input::{self, Action, InputResult};
 use crate::ui::mouse::{self, MouseAction};
 
 fn main() -> Result<()> {
@@ -180,6 +180,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         if !app.handle_mode_key(key) {
                             handle_key(&mut app, key);
                         }
+                        // C24: a keyboard-copy `y`/Enter stashes its yanked
+                        // text on the app (core has no clipboard I/O of its
+                        // own); hand it to the OS clipboard here, same as
+                        // the mouse path does inline in `handle_copy_mouse`.
+                        if let Some(text) = app.take_pending_yank() {
+                            infra::clipboard::copy(&text);
+                        }
                     }
                     Event::Mouse(me) => handle_mouse(&mut app, me),
                     // Coalesce: act on the true size once, after draining.
@@ -279,6 +286,24 @@ fn write_control_token(path: &std::path::Path, token: &str) {
 /// Handle a key that a UI mode did not consume: a global action, or bytes
 /// forwarded to the focused pane (dead panes intercept relaunch keys).
 fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent) {
+    // C23: raw pass-through. `App::raw_routing_active` is the routing
+    // predicate verbatim (Normal mode, focused pane raw, alive). Every key
+    // except the toggle bypasses `translate()`'s Action/swallow semantics
+    // and forwards straight to the pane as bytes instead — "the key that
+    // got you in gets you out" is the one exception, so it's still detected
+    // via `translate()` (the single source of the Alt+Shift+p / Alt+'P'
+    // tolerance rule) rather than a second, drift-prone copy of it here.
+    if app.raw_routing_active() {
+        if let InputResult::Action(Action::ToggleRaw) = input::translate(key) {
+            app.apply(Action::ToggleRaw);
+        } else {
+            let bytes = input::kitty_upgrade(key, input::encode_raw(key), app.focused_kitty());
+            if !bytes.is_empty() {
+                app.forward_bytes(&bytes);
+            }
+        }
+        return;
+    }
     match input::translate(key) {
         InputResult::Action(a) => app.apply(a),
         InputResult::Forward(bytes) if app.focused_dead() => match bytes.as_slice() {
@@ -325,7 +350,9 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
-    let rects = app.rects();
+    // C21/§5: zoom-aware — while zoomed, the display list is just the
+    // zoomed pane, so body clicks/wheel can only ever hit it.
+    let rects = app.display_rects();
     let Some(pane) = mouse::hit_test(&rects, me.column, me.row) else { return };
 
     // Alt+click a URL to open it in the browser (roost owns the Alt layer).
@@ -361,7 +388,7 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
 /// release extracts the selection and copies it to the system clipboard.
 fn handle_copy_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
-    let rects = app.rects();
+    let rects = app.display_rects(); // C21/§5: zoom-aware, same as handle_mouse
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(pane) = mouse::hit_test(&rects, me.column, me.row) {
@@ -396,4 +423,164 @@ fn inner_cell(rect: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
     let c = col.saturating_sub(rect.x + 1).min(iw - 1);
     let r = row.saturating_sub(rect.y + 1).min(ih - 1);
     (r, c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::workspace::Workspace;
+    use crate::ports::fakes::{FakePane, MemStore};
+    use crate::ui::input::Action;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Size;
+    use std::path::PathBuf;
+
+    fn mk_app() -> App<FakePane> {
+        let store = MemStore::default();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+        let ws = Workspace::default_in(PathBuf::from("/tmp"));
+        App::<FakePane>::new(ws, agents::registry(), Box::new(store), tx, Size::new(100, 30), None).unwrap()
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+    fn alt_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::SHIFT)
+    }
+
+    /// C23 table-driven proof: with the focused pane raw, every currently
+    /// bound Alt chord (the toggle itself excluded) forwards as meta-ESC
+    /// bytes instead of applying its normal action — `input::encode_raw` is
+    /// the oracle (its own correctness is pinned exhaustively in
+    /// `ui::input`'s tests); this test is the *routing* proof, that
+    /// `handle_key` actually reaches it while raw instead of `translate()`'s
+    /// Action/swallow path.
+    #[test]
+    fn raw_pane_forwards_every_current_action_chord_as_bytes() {
+        let chords = [
+            alt(KeyCode::Char('q')),
+            alt(KeyCode::Char('n')),
+            alt(KeyCode::Char('w')),
+            alt(KeyCode::Char('t')),
+            alt(KeyCode::Char('s')),
+            alt(KeyCode::Char('o')),
+            alt(KeyCode::Char('r')),
+            alt_shift(KeyCode::Char('r')),
+            alt(KeyCode::Char('R')),
+            alt(KeyCode::Enter),
+            alt(KeyCode::Char('/')),
+            alt(KeyCode::Char('c')),
+            alt(KeyCode::Char('u')),
+            alt(KeyCode::Char('?')),
+            alt(KeyCode::Char('a')),
+            alt(KeyCode::Char('z')),
+            alt(KeyCode::Char('g')),
+            alt(KeyCode::Char('e')),
+            alt(KeyCode::Char('f')),
+            alt(KeyCode::PageUp),
+            alt(KeyCode::Char('5')),
+            alt(KeyCode::Right),
+            alt(KeyCode::Left),
+            alt(KeyCode::Up),
+            alt(KeyCode::Down),
+            alt(KeyCode::Char('h')),
+            alt(KeyCode::Char('j')),
+            alt(KeyCode::Char('k')),
+            alt(KeyCode::Char('l')),
+            alt_shift(KeyCode::Right),
+            alt_shift(KeyCode::Left),
+            alt_shift(KeyCode::Up),
+            alt_shift(KeyCode::Down),
+        ];
+        for key in chords {
+            let mut app = mk_app();
+            let focused = app.focused;
+            app.apply(Action::ToggleRaw);
+            assert!(app.raw_routing_active(), "setup: pane should be raw + Normal + alive");
+
+            let expected = input::encode_raw(key);
+            handle_key(&mut app, key);
+
+            assert_eq!(
+                app.runtimes.get(&focused).unwrap().input,
+                expected,
+                "key {key:?} must forward as meta-ESC bytes while raw, not apply its action"
+            );
+            // The action itself must never have fired (Quit is the sharpest
+            // canary: if raw routing leaked to translate()'s Action arm,
+            // Alt+q would set this instead of forwarding bytes).
+            assert!(!app.quit);
+        }
+    }
+
+    #[test]
+    fn only_the_toggle_chord_exits_raw_mode_and_is_never_itself_forwarded() {
+        let mut app = mk_app();
+        let focused = app.focused;
+        app.apply(Action::ToggleRaw);
+        assert!(app.raw_routing_active());
+
+        handle_key(&mut app, alt_shift(KeyCode::Char('p')));
+        assert!(!app.raw_routing_active(), "Alt+Shift+p must exit raw");
+        assert!(app.runtimes.get(&focused).unwrap().input.is_empty(), "the toggle chord itself must not forward");
+
+        // Re-enter, then confirm the uppercase-delivery tolerance also exits.
+        app.apply(Action::ToggleRaw);
+        handle_key(&mut app, alt(KeyCode::Char('P')));
+        assert!(!app.raw_routing_active(), "Alt+'P' tolerance must also exit raw");
+    }
+
+    #[test]
+    fn dead_raw_pane_falls_back_to_dead_pane_keys_instead_of_forwarding() {
+        let mut app = mk_app();
+        let focused = app.focused;
+        app.apply(Action::ToggleRaw);
+        app.runtimes.get_mut(&focused).unwrap().kill(); // simulate the process exiting
+        assert!(app.focused_dead());
+        assert!(!app.raw_routing_active(), "a dead pane must not intercept via raw routing");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.focused_dead(), "Enter must relaunch the dead raw pane, not forward \\r to it");
+    }
+
+    #[test]
+    fn cooked_panes_are_completely_unaffected_by_raw_routing() {
+        let mut app = mk_app();
+        assert!(!app.raw_routing_active());
+        handle_key(&mut app, alt(KeyCode::Char('q')));
+        assert!(app.quit, "Alt+q must still quit a cooked pane");
+    }
+
+    /// C22: float-first hit-test ordering (a click inside its centered rect
+    /// hits it, even though real panes are also present) and click-outside-
+    /// hides (a click elsewhere hides it and focuses what it hit) — both
+    /// driven through the real `handle_mouse` entry point.
+    #[test]
+    fn click_outside_the_float_hides_it_click_inside_keeps_it() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // panes 1|2 side by side, focus 2
+        app.apply(Action::ToggleFloat); // float spawns, shows, focuses
+        let float_id = app.focused;
+        assert_ne!(float_id, 1);
+        assert_ne!(float_id, 2);
+        let float_rect = app.display_rects()[0].rect; // float first (topmost)
+
+        let click = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Inside the float's own rect: hit_test picks it first, stays shown.
+        handle_mouse(&mut app, click(float_rect.x + 1, float_rect.y + 1));
+        assert_eq!(app.focused, float_id);
+
+        // Outside it (pane 1's corner, definitely clear of the centered
+        // float): hides the float, focuses what it actually hit.
+        handle_mouse(&mut app, click(0, 1));
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.display_rects().len(), app.rects().len(), "float no longer in the display list");
+    }
 }
