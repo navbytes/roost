@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use ratatui::layout::{Rect, Size};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
@@ -46,8 +46,10 @@ pub enum Mode {
     Rename { buffer: String, target: RenameTarget },
     Picker { selection: usize },
     Scroll { offset: usize },
-    /// Mouse-drag text selection; copies to the clipboard on release.
-    Copy,
+    /// Text selection — mouse drag, or the C24 keyboard cursor. `cursor` is
+    /// (row, col) in the focused pane's inner cell space; both input
+    /// methods write the same `App::selection`.
+    Copy { cursor: (u16, u16) },
     /// Full-keymap overlay (Alt+?); any key dismisses it.
     Help,
     /// C20 activity-feed overlay; `offset` counts entries back from the
@@ -115,6 +117,25 @@ struct Waiter {
     reply: Sender<Reply>,
     deadline: Instant,
 }
+
+/// C22: the app-wide floating scratch pane. Lives outside every tab's
+/// layout tree — its runtime sits in the same `App::runtimes` map as any
+/// other pane, but `spec` here (not `Tab::panes`) is its source of truth,
+/// and it is never written to `workspace.json` (session-only by design).
+#[derive(Debug)]
+struct Float {
+    id: PaneId,
+    spec: PaneSpec,
+    shown: bool,
+    /// Whatever was focused right before the float last became shown —
+    /// where focus returns when it hides (C22 rules 2/3).
+    prev_focus: PaneId,
+}
+
+/// C22: below this body size the geometry formula (`App::float_rect`) has
+/// no room to place a sane rect — the toggle refuses instead.
+const MIN_FLOAT_BODY_COLS: u16 = 40;
+const MIN_FLOAT_BODY_ROWS: u16 = 10;
 
 /// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
 /// is a lazily-loaded tab whose panes haven't been spawned — deliberately
@@ -201,6 +222,19 @@ pub struct App<B: PaneBackend> {
     /// capacity `FEED_CAP`, oldest evicted first. Session-only — never
     /// persisted.
     feed: VecDeque<FeedEntry>,
+    /// C22: the one app-wide floating scratch pane slot, spawned on first
+    /// Alt+f. `None` until then.
+    float: Option<Float>,
+    /// C23: panes currently in raw (hard pass-through) mode, by id.
+    /// Per-pane, session-only — never persisted.
+    raw: HashSet<PaneId>,
+    /// C24: text most recently yanked via the keyboard copy-mode `y`/`Enter`
+    /// chord, waiting for the composition root to hand it to the OS
+    /// clipboard — core has no I/O of its own (module doc). The mouse path
+    /// copies directly from `finish_selection`'s return value in `main.rs`
+    /// instead, since it already runs there; this field exists only because
+    /// `handle_mode_key` has no such caller-side return channel.
+    pending_yank: Option<String>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -256,6 +290,9 @@ impl<B: PaneBackend> App<B> {
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
             feed: VecDeque::new(),
+            float: None,
+            raw: HashSet::new(),
+            pending_yank: None,
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -341,17 +378,98 @@ impl<B: PaneBackend> App<B> {
         v
     }
 
-    /// C21/§5: the one display list the renderer, PTY-resize, and mouse-hit
-    /// paths all consume — the zoomed singleton `[focused @ body]` while
-    /// zoomed, else the real tree's `rects()`. Focus math (`layout::neighbor`,
-    /// `focus_dir`) deliberately keeps reading `rects()` instead — that's
-    /// what makes zoom follow focus rather than freeze it.
+    /// C21/C22/§5: the one display list the renderer, PTY-resize, and
+    /// mouse-hit paths all consume — float first when shown (topmost wins
+    /// in `hit_test`; the renderer instead paints it *last*, see
+    /// `render::draw`), then the zoomed singleton `[zoom target @ body]`
+    /// while zoomed, else the real tree's `rects()`. Focus math
+    /// (`layout::neighbor`, `focus_dir`) deliberately keeps reading
+    /// `rects()` instead — that's what makes zoom follow focus rather than
+    /// freeze it.
     pub fn display_rects(&self) -> Vec<PaneRect> {
-        if self.zoomed {
-            vec![PaneRect { id: self.focused, rect: self.body_area(), collapsed: false }]
-        } else {
-            self.rects()
+        let body = self.body_area();
+        let mut v = Vec::new();
+        if let Some(f) = &self.float {
+            if f.shown {
+                v.push(PaneRect { id: f.id, rect: Self::float_rect(body), collapsed: false });
+            }
         }
+        if self.zoomed {
+            // C21 "keeps zoom" + C22 rule 1: while the float is shown, focus
+            // belongs to it, not the zoomed pane — the real zoom target is
+            // whatever was focused right before the float appeared.
+            let target = match &self.float {
+                Some(f) if f.shown => f.prev_focus,
+                _ => self.focused,
+            };
+            v.push(PaneRect { id: target, rect: body, collapsed: false });
+        } else {
+            v.extend(self.rects());
+        }
+        v
+    }
+
+    /// C22: the float's rect for a given body area — centered,
+    /// `w = clamp(3·body.width/5, 36, body.width−4)`,
+    /// `h = clamp(3·body.height/5, 8, body.height−2)`. Written without
+    /// `.clamp()` (whose panic-on-`min>max` would fire below the refusal
+    /// floor) so a body that shrank *after* the float was shown still
+    /// produces a rect, never a panic; callers gate showing/spawning a new
+    /// float on `float_fits` first.
+    fn float_rect(body: Rect) -> Rect {
+        let w = (3 * body.width / 5).max(36).min(body.width.saturating_sub(4));
+        let h = (3 * body.height / 5).max(8).min(body.height.saturating_sub(2));
+        let x = body.x + body.width.saturating_sub(w) / 2;
+        let y = body.y + body.height.saturating_sub(h) / 2;
+        Rect::new(x, y, w, h)
+    }
+
+    /// C22: is `body` big enough for `float_rect` to place a sane rect?
+    fn float_fits(body: Rect) -> bool {
+        body.width >= MIN_FLOAT_BODY_COLS && body.height >= MIN_FLOAT_BODY_ROWS
+    }
+
+    /// C22: pane-id allocation must account for the float, which lives
+    /// outside `ws.tabs` — `ws.next_pane_id()` alone would eventually let a
+    /// split reuse its id. The one allocator every spawn path goes through.
+    fn alloc_pane_id(&self) -> PaneId {
+        let base = self.ws.next_pane_id();
+        match &self.float {
+            Some(f) => base.max(f.id + 1),
+            None => base,
+        }
+    }
+
+    /// Is `id` the float's pane?
+    fn is_float(&self, id: PaneId) -> bool {
+        self.float.as_ref().is_some_and(|f| f.id == id)
+    }
+
+    /// Is the float currently the focused pane? Equivalent to "is it
+    /// shown" (rule 1: shown ⇒ focused) — checking focus directly is
+    /// simpler and doesn't also require reading `shown`.
+    fn float_focused(&self) -> bool {
+        self.is_float(self.focused)
+    }
+
+    /// C23: does `id` currently have raw pass-through enabled? Read by the
+    /// renderer for the badge/row token and hint-bar word (C4/C8/C9).
+    pub fn is_raw(&self, id: PaneId) -> bool {
+        self.raw.contains(&id)
+    }
+
+    /// C23's routing predicate, verbatim: raw key-forwarding applies only
+    /// when the mode is Normal, the focused pane is flagged raw, and it's
+    /// alive. Checked by `main.rs`'s key path before it ever calls
+    /// `translate()`.
+    pub fn raw_routing_active(&self) -> bool {
+        matches!(self.mode, Mode::Normal) && self.raw.contains(&self.focused) && !self.focused_dead()
+    }
+
+    /// C24: take (clearing) the pending keyboard-copy yank, if any — see
+    /// `pending_yank`. Polled once per tick from the composition root.
+    pub fn take_pending_yank(&mut self) -> Option<String> {
+        self.pending_yank.take()
     }
 
     pub fn pane_order(&self) -> Vec<PaneId> {
@@ -574,7 +692,15 @@ impl<B: PaneBackend> App<B> {
             .collect()
     }
 
+    /// C22: learns the float — `send`/`read`/badges/rename/respawn by id
+    /// all route through this, so they work on the scratch pane exactly
+    /// like any other, with zero extra code at those call sites.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
+        if let Some(f) = &self.float {
+            if f.id == id {
+                return Some(&f.spec);
+            }
+        }
         self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
     }
 
@@ -586,7 +712,13 @@ impl<B: PaneBackend> App<B> {
         Some(abbreviate_home(cwd, self.home.as_deref()))
     }
 
+    /// C22: mirrors `find_spec` — the float's spec is mutable too (rename).
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
+        if let Some(f) = &mut self.float {
+            if f.id == id {
+                return Some(&mut f.spec);
+            }
+        }
         self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
     }
 
@@ -1116,6 +1248,12 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
+        // C22: the scratch pane never closes via the control plane —
+        // checked for every caller (including Fleet), before authz, since
+        // the refusal is unconditional either way.
+        if self.is_float(pane) {
+            return Reply::err("cannot close the scratch pane");
+        }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
         }
@@ -1161,6 +1299,10 @@ impl<B: PaneBackend> App<B> {
         // buffered initial_input (see on_pty_output) — drop it too, rather
         // than leaking an entry keyed on an id that's gone for good.
         self.pending_input.remove(&id);
+        // C23: pane ids are never reused, so a stale raw-membership entry is
+        // harmless — but cheap to clean up alongside every other per-pane
+        // side table above.
+        self.raw.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         let empty = layout::remove_pane(&mut tab.layout, id);
@@ -1307,23 +1449,47 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// The focused pane's inner (border-excluded) cell dimensions as
+    /// `(rows, cols)`, from the current display list — so a zoomed or
+    /// floated pane's *actual* on-screen size is used, matching the
+    /// (row, col) convention `Mode::Copy`'s cursor and `Selection` share.
+    /// `(1, 1)` if the focused pane isn't currently displayed (shouldn't
+    /// happen, but keeps the C24 cursor math panic-free either way).
+    fn focused_inner_dims(&self) -> (u16, u16) {
+        self.display_rects()
+            .iter()
+            .find(|pr| pr.id == self.focused)
+            .map(|pr| inner_dims(pr.rect))
+            .unwrap_or((1, 1))
+    }
+
     // -- copy mode / selection --------------------------------------------
 
     pub fn in_copy_mode(&self) -> bool {
-        matches!(self.mode, Mode::Copy)
+        matches!(self.mode, Mode::Copy { .. })
     }
 
-    /// Start a selection in pane `id` at inner cell (row, col).
+    /// Start a selection in pane `id` at inner cell (row, col). C24: also
+    /// moves the keyboard cursor there, so a fresh mouse drag and the
+    /// keyboard cursor never disagree about where the selection is.
     pub fn begin_selection(&mut self, id: PaneId, row: u16, col: u16) {
         self.selection = Some(Selection { pane: id, anchor: (row, col), cursor: (row, col), dragging: true });
+        if let Mode::Copy { cursor } = &mut self.mode {
+            *cursor = (row, col);
+        }
     }
 
-    /// Extend the active drag to inner cell (row, col).
+    /// Extend the active drag to inner cell (row, col). C24: a drag "also
+    /// moves the cursor to the drag point" — the two input methods write
+    /// the same state either way.
     pub fn extend_selection(&mut self, row: u16, col: u16) {
         if let Some(sel) = &mut self.selection {
             if sel.dragging {
                 sel.cursor = (row, col);
             }
+        }
+        if let Mode::Copy { cursor } = &mut self.mode {
+            *cursor = (row, col);
         }
     }
 
@@ -1368,7 +1534,14 @@ impl<B: PaneBackend> App<B> {
     // -- mouse -------------------------------------------------------------
 
     /// Left click: focus the pane under the cursor (expanding stack members).
+    /// C22 rule 2: a click outside the float's rect hides it first — the
+    /// click itself still lands normally on whatever it hit (below).
+    /// Clicking the float's own rect (id == the already-focused float) is
+    /// not "outside" and leaves it shown.
     pub fn on_click(&mut self, id: PaneId) {
+        if self.float_focused() && id != self.focused {
+            self.hide_float();
+        }
         self.focused = id;
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         self.relayout();
@@ -1429,10 +1602,18 @@ impl<B: PaneBackend> App<B> {
     // -- actions -----------------------------------------------------------
 
     pub fn apply(&mut self, action: Action) {
-        // C21: a structural layout action must not change the tab invisibly
-        // behind a full-screen zoomed pane — leave zoom first, then apply
-        // (exhaustive trigger list; tab changes exit zoom too, handled inside
-        // `new_tab`/`go_to_tab` since only a *real* switch should count).
+        // C21/C22: a structural layout action must not change the tab
+        // invisibly behind a full-screen zoomed pane, nor target the float
+        // (which lives outside the layout tree — leaving it focused here is
+        // `spawn_child`'s empty-tab-fallback layout-wipe hazard waiting to
+        // happen). Leave zoom, then hide the float (restoring `prev_focus`),
+        // then apply below — exhaustive trigger list; tab changes exit zoom
+        // and hide the float too, handled inside `new_tab`/`go_to_tab` since
+        // only a *real* switch should count; Focus/JumpAttention hide the
+        // float from inside their own functions (rule 2); Alt+z is
+        // deliberately excluded from the float rule — it gets its own
+        // "can't zoom the float" no-op below instead of retargeting to
+        // `prev_focus`.
         if matches!(
             action,
             Action::NewPane
@@ -1442,6 +1623,7 @@ impl<B: PaneBackend> App<B> {
                 | Action::CycleLayout
         ) {
             self.exit_zoom();
+            self.hide_float();
         }
         match action {
             Action::Quit => self.quit = true,
@@ -1478,16 +1660,31 @@ impl<B: PaneBackend> App<B> {
             Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
             Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
             Action::CopyMode => {
-                self.mode = Mode::Copy;
+                // C24: cursor starts bottom-left of the focused pane's inner
+                // grid (C22 rule 1: targets the float like any pane when
+                // it's the one focused).
+                let (h, _w) = self.focused_inner_dims();
+                self.mode = Mode::Copy { cursor: (h.saturating_sub(1), 0) };
                 self.selection = None;
             }
             Action::ToggleHints => self.hints = !self.hints,
             Action::Undo => self.undo_close(),
             Action::Help => self.mode = Mode::Help,
             Action::JumpAttention => self.jump_attention(),
-            Action::ToggleZoom => self.toggle_zoom(),
+            Action::ToggleZoom => {
+                // C21: zooming the float makes no sense (it's already a
+                // floating full-focus surface) — refuse rather than hide it
+                // and zoom whatever's behind it.
+                if self.float_focused() {
+                    self.flash = Some(("can't zoom the float".into(), Instant::now()));
+                } else {
+                    self.toggle_zoom();
+                }
+            }
             Action::CycleLayout => self.cycle_layout(),
             Action::ToggleFeed => self.toggle_feed(),
+            Action::ToggleFloat => self.toggle_float(),
+            Action::ToggleRaw => self.toggle_raw(),
         }
         // Any action other than a repeated close disarms a pending close
         // confirmation, so a stale "press again" can't leak onto a later key.
@@ -1540,7 +1737,7 @@ impl<B: PaneBackend> App<B> {
     /// Insert `spec` as a new pane split off the focused pane, spawning it.
     /// Shared by undo (reuses a saved spec, session and all).
     fn restore_pane(&mut self, spec: PaneSpec) {
-        let id = self.ws.next_pane_id();
+        let id = self.alloc_pane_id();
         let focused = self.focused;
         let dir = self
             .rects()
@@ -1567,6 +1764,13 @@ impl<B: PaneBackend> App<B> {
 
     /// Move focus spatially to the nearest pane in `dir`; stay put if none.
     fn focus_dir(&mut self, dir: layout::Dir) {
+        // C22 rule 2: the float has no spatial position in the tiled tree,
+        // so leaving it via a directional key always just returns focus to
+        // `prev_focus` — `dir` doesn't apply to it.
+        if self.float_focused() {
+            self.hide_float();
+            return;
+        }
         let rects = self.rects();
         if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
             self.focused = id;
@@ -1588,20 +1792,35 @@ impl<B: PaneBackend> App<B> {
         cwd: Option<PathBuf>,
         spawned_by: Option<PaneId>,
     ) -> Option<PaneId> {
-        let id = self.ws.next_pane_id();
+        let id = self.alloc_pane_id();
+        // C22: split off a pane actually in the active tab's tree.
+        // `self.focused` can be the float, which lives outside it — the
+        // interactive callers (Alt+n, picker launch) already hide the float
+        // before reaching here (apply()'s C22 rule-3 pre-step), but the
+        // control-plane spawn/fork paths have no such pre-step (they
+        // save/restore `focused` only to protect the human's on-screen
+        // view, not to pick a safe split target). Splitting "off" an id the
+        // tree doesn't contain is exactly what trips `split_pane`'s
+        // empty-tab fallback below and wipes the whole tab's layout — this
+        // fallback closes that hole for every caller at once.
+        let split_target = if self.ws.active_tab().panes.contains_key(&self.focused) {
+            self.focused
+        } else {
+            self.pane_order().first().copied()?
+        };
         let cwd = cwd.unwrap_or_else(|| {
             self.ws
                 .active_tab()
                 .panes
-                .get(&self.focused)
+                .get(&split_target)
                 .map(|s| s.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         });
         let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by };
 
-        // Split in the widest direction of the focused pane's rect.
-        let focused_rect = self.rects().iter().find(|pr| pr.id == self.focused).map(|pr| pr.rect);
-        let dir = focused_rect
+        // Split in the widest direction of the split target's rect.
+        let target_rect = self.rects().iter().find(|pr| pr.id == split_target).map(|pr| pr.rect);
+        let dir = target_rect
             .map(|r| {
                 if r.width >= r.height * 3 {
                     SplitDir::Vertical
@@ -1614,7 +1833,7 @@ impl<B: PaneBackend> App<B> {
         // Refuse a split that would produce unusably tiny panes (also the
         // trigger for the vt100 underflow crash). Silent no-op — the layout
         // is left untouched. See layout::MIN_SPLIT_* (also the C25 fit floor).
-        if let Some(r) = focused_rect {
+        if let Some(r) = target_rect {
             let too_small = match dir {
                 SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
                 SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
@@ -1624,11 +1843,10 @@ impl<B: PaneBackend> App<B> {
             }
         }
 
-        let focused = self.focused;
         let tab = self.ws.active_tab_mut();
         tab.panes.insert(id, spec.clone());
-        if !layout::split_pane(&mut tab.layout, focused, id, dir) {
-            tab.layout = LayoutNode::Pane(id); // empty tab fallback
+        if !layout::split_pane(&mut tab.layout, split_target, id, dir) {
+            tab.layout = LayoutNode::Pane(id); // empty tab fallback (now only for a genuinely-empty tab)
         }
         self.focused = id;
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
@@ -1638,6 +1856,13 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn close_pane(&mut self) {
+        // C22 rule 4: Alt+w on the float kills it for real, no confirm
+        // guard (scratch is not precious — the whole point of the confirm
+        // guard below is protecting work the float explicitly isn't).
+        if self.float_focused() {
+            self.close_float();
+            return;
+        }
         let id = self.focused;
 
         // Destructive-close guard. Closing a *busy* agent loses its in-flight
@@ -1674,7 +1899,8 @@ impl<B: PaneBackend> App<B> {
 
     fn new_tab(&mut self) {
         self.exit_zoom(); // C21: any tab change exits zoom
-        let id = self.ws.next_pane_id();
+        self.hide_float(); // C22 rule 2: "any tab change" hides the float too
+        let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
         panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None });
@@ -1691,6 +1917,7 @@ impl<B: PaneBackend> App<B> {
     fn go_to_tab(&mut self, i: usize) {
         if i < self.ws.tabs.len() {
             self.exit_zoom(); // C21: any (real) tab change exits zoom
+            self.hide_float(); // C22 rule 2: any tab change hides the float
             self.ws.active_tab = i;
             self.spawn_active_tab();
             self.focused = self.pane_order().first().copied().unwrap_or(self.focused);
@@ -1719,7 +1946,9 @@ impl<B: PaneBackend> App<B> {
     /// C19: every pane whose runtime status is `NeedsInput` — the exact
     /// predicate `needs_input_count` uses, so the ring's size can never
     /// disagree with the hint bar's advertised N. Ordered by (tab index
-    /// ascending, position within that tab's `pane_order()`).
+    /// ascending, position within that tab's `pane_order()`); the float
+    /// (C22), if needy, is last — `needs_input_count` counts `runtimes`
+    /// directly (float included), so it must be too.
     fn attention_ring(&self) -> Vec<PaneId> {
         let mut ring = Vec::new();
         for tab in &self.ws.tabs {
@@ -1729,6 +1958,11 @@ impl<B: PaneBackend> App<B> {
                 self.runtimes.get(id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false)
             }));
         }
+        if let Some(f) = &self.float {
+            if self.runtimes.get(&f.id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false) {
+                ring.push(f.id);
+            }
+        }
         ring
     }
 
@@ -1736,6 +1970,13 @@ impl<B: PaneBackend> App<B> {
     /// wrapping past the end back to the first; a focused pane that isn't in
     /// the ring jumps straight to the first member.
     fn jump_attention(&mut self) {
+        // C22 rule 2: leaving the float via Alt+a always just returns focus
+        // to `prev_focus` — it does not additionally ring-jump in the same
+        // press (no explicit target was requested, unlike a tab switch).
+        if self.float_focused() {
+            self.hide_float();
+            return;
+        }
         let ring = self.attention_ring();
         if ring.is_empty() {
             self.flash = Some(("nothing needs you".into(), Instant::now()));
@@ -1757,11 +1998,19 @@ impl<B: PaneBackend> App<B> {
     /// lazy spawn included) when it lives outside the active one — which
     /// also exits zoom, per C21's tab-switch rule. A same-tab jump keeps
     /// zoom (zoom follows focus). Either way, expand the target out of any
-    /// collapsed stack, same as any other focus move.
+    /// collapsed stack, same as any other focus move. C22: a jump landing on
+    /// the float shows it (recording where focus came from as `prev_focus`).
     fn focus_attention_target(&mut self, target: PaneId) {
         if let Some(ti) = self.tab_of(target) {
             if ti != self.ws.active_tab {
                 self.go_to_tab(ti);
+            }
+        }
+        if self.is_float(target) {
+            let from = self.focused;
+            if let Some(f) = &mut self.float {
+                f.shown = true;
+                f.prev_focus = from;
             }
         }
         self.focused = target;
@@ -1803,6 +2052,113 @@ impl<B: PaneBackend> App<B> {
         };
     }
 
+    // -- float (C22) ---------------------------------------------------------
+
+    /// Alt+f: first press spawns the float (a shell in the focused pane's
+    /// cwd, preset title "scratch") and shows+focuses it; later presses
+    /// hide/show it (the process stays alive while hidden). Refuses (flash,
+    /// no state change) when the body is too small for the geometry
+    /// formula to place a sane rect — checked here so both the first spawn
+    /// and a later re-show are covered (the terminal may have shrunk while
+    /// the float was hidden).
+    fn toggle_float(&mut self) {
+        if self.float_focused() {
+            self.hide_float();
+            return;
+        }
+        let body = self.body_area();
+        if !Self::float_fits(body) {
+            self.flash = Some(("no room for float".into(), Instant::now()));
+            return;
+        }
+        match &mut self.float {
+            Some(f) => {
+                f.shown = true;
+                f.prev_focus = self.focused;
+                self.focused = f.id;
+            }
+            None => self.spawn_float(),
+        }
+    }
+
+    fn spawn_float(&mut self) {
+        let id = self.alloc_pane_id();
+        let cwd = self
+            .find_spec(self.focused)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let prev_focus = self.focused;
+        let spec = PaneSpec {
+            adapter: "shell".into(),
+            cwd,
+            session: None,
+            title: Some("scratch".into()),
+            spawned_by: None,
+        };
+        self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
+        self.focused = id;
+        // display_rects, not rects: the float isn't in the tiled tree, so
+        // only the zoom-aware/float-aware display list knows its rect.
+        if let Some(pr) = self.display_rects().iter().find(|pr| pr.id == id).copied() {
+            self.spawn_pane(id, &spec, pr.rect);
+        }
+    }
+
+    /// C22 rules 2/3: hide the float (if shown) and restore focus to
+    /// whatever was focused before it appeared — the single mechanism
+    /// behind Alt+f's toggle-off, every focus-moving/structural action that
+    /// must not leave it focused, and a mouse click landing outside its
+    /// rect. A no-op when the float isn't currently shown.
+    fn hide_float(&mut self) {
+        let Some(f) = &mut self.float else { return };
+        if !f.shown {
+            return;
+        }
+        f.shown = false;
+        let back = f.prev_focus;
+        self.focused = if self.ws.active_tab().panes.contains_key(&back) {
+            back
+        } else {
+            // prev_focus may have been closed via the control plane while
+            // the float was up — fall back to whatever's on screen now,
+            // same recovery `close_pane_id` uses.
+            self.pane_order().first().copied().unwrap_or(0)
+        };
+    }
+
+    /// C22 rule 4: Alt+w on the float kills it for real and clears the slot
+    /// — unlike hiding, no undo entry (scratch is not precious).
+    fn close_float(&mut self) {
+        let Some(f) = self.float.take() else { return };
+        if let Some(mut rt) = self.runtimes.remove(&f.id) {
+            rt.kill();
+        }
+        self.tokens.remove(&f.id);
+        self.dead.remove(&f.id);
+        self.pending_input.remove(&f.id);
+        self.raw.remove(&f.id);
+        self.focused = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
+            f.prev_focus
+        } else {
+            self.pane_order().first().copied().unwrap_or(0)
+        };
+        self.flash = Some(("scratch closed".into(), Instant::now()));
+    }
+
+    // -- raw pass-through (C23) -----------------------------------------------
+
+    /// Alt+Shift+p: toggle the focused pane's raw membership — the same
+    /// chord both enters and exits it ("the key that got you in gets you
+    /// out"), and it is reachable via ordinary `translate()` dispatch
+    /// (`apply`) regardless of whether the pane is currently raw, since
+    /// entering raw must work from a cooked pane in the first place.
+    fn toggle_raw(&mut self) {
+        let focused = self.focused;
+        if !self.raw.remove(&focused) {
+            self.raw.insert(focused);
+        }
+    }
+
     // -- modes -------------------------------------------------------------
 
     /// Keys while in a non-Normal mode. Returns true when consumed.
@@ -1837,6 +2193,9 @@ impl<B: PaneBackend> App<B> {
         // the match below, where `Mode::Feed`'s arm already holds
         // `self.mode` mutably borrowed.
         let feed_page = (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize;
+        // C24: the focused pane's current inner grid, for clamping the copy
+        // cursor — same borrow-ordering reason as `feed_page` above.
+        let (copy_h, copy_w) = self.focused_inner_dims();
         match &mut self.mode {
             Mode::Normal => false,
             Mode::Rename { buffer, target } => {
@@ -1884,6 +2243,7 @@ impl<B: PaneBackend> App<B> {
                         let adapter = items[(*selection).min(items.len() - 1)];
                         self.mode = Mode::Normal;
                         self.exit_zoom(); // C21: "picker launch" is a structural action
+                        self.hide_float(); // C22 rule 3: ditto
                         self.new_pane_with(adapter);
                         self.relayout();
                         self.save();
@@ -1920,11 +2280,66 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
-            Mode::Copy => {
-                // Selection is mouse-driven; keys just exit.
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.mode = Mode::Normal;
-                    self.selection = None;
+            // C24: keyboard copy cursor + selection, alongside the existing
+            // mouse-drag path (both write `self.selection`; a drag also
+            // moves the cursor, see `begin_selection`/`extend_selection`).
+            Mode::Copy { cursor } => {
+                match key.code {
+                    KeyCode::Char('h') | KeyCode::Left => cursor.1 = cursor.1.saturating_sub(1),
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        cursor.1 = (cursor.1 + 1).min(copy_w.saturating_sub(1))
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => cursor.0 = cursor.0.saturating_sub(1),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        cursor.0 = (cursor.0 + 1).min(copy_h.saturating_sub(1))
+                    }
+                    KeyCode::Char('0') => cursor.1 = 0,
+                    KeyCode::Char('$') => cursor.1 = copy_w.saturating_sub(1),
+                    _ => {}
+                }
+                // A motion above extends an active selection to the new
+                // cursor (v's "movement extends the selection" rule) — kept
+                // out of the motion arms themselves so it applies uniformly
+                // without repeating it six times.
+                if matches!(
+                    key.code,
+                    KeyCode::Char('h' | 'l' | 'k' | 'j' | '0' | '$')
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Up
+                        | KeyCode::Down
+                ) {
+                    if let Some(sel) = &mut self.selection {
+                        sel.cursor = *cursor;
+                    }
+                    return true;
+                }
+                match key.code {
+                    KeyCode::Char('v') => {
+                        let focused = self.focused;
+                        let anchor = *cursor;
+                        if self.selection.is_some() {
+                            self.selection = None; // toggle off: clear the anchor
+                        } else {
+                            self.selection =
+                                Some(Selection { pane: focused, anchor, cursor: anchor, dragging: false });
+                        }
+                    }
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        if self.selection.is_some() {
+                            // finish_selection needs the whole &mut self —
+                            // `cursor`'s last use was above, so its borrow
+                            // of `self.mode` has already ended.
+                            self.pending_yank = self.finish_selection();
+                        } else {
+                            self.flash = Some(("nothing selected".into(), Instant::now()));
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.mode = Mode::Normal;
+                        self.selection = None;
+                    }
+                    _ => {}
                 }
                 true
             }
@@ -3856,5 +4271,581 @@ mod tests {
     #[test]
     fn feed_overlay_size_clamps_on_a_tiny_body() {
         assert_eq!(feed_overlay_size(Rect::new(0, 1, 20, 6)), (16, 2));
+    }
+
+    // -- C22 floating scratch pane --------------------------------------------
+
+    #[test]
+    fn float_first_toggle_spawns_shows_and_focuses_a_shell_titled_scratch() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert_ne!(float_id, real_pane);
+        assert!(app.float.as_ref().unwrap().shown);
+        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+        let spec = app.find_spec(float_id).expect("float spec");
+        assert_eq!(spec.adapter, "shell");
+        assert_eq!(spec.title.as_deref(), Some("scratch"));
+        assert!(app.runtimes.contains_key(&float_id), "must actually spawn");
+        // Free correctness via the shared spawn_pane hook (no float-specific
+        // feed code needed).
+        assert!(app.feed().back().unwrap().text.starts_with("spawned scratch (shell)"));
+    }
+
+    #[test]
+    fn float_second_toggle_hides_it_without_killing_the_process() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat); // spawn + show
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide
+        assert_eq!(app.focused, real_pane);
+        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.runtimes.contains_key(&float_id), "process stays alive while hidden");
+    }
+
+    #[test]
+    fn float_third_toggle_reshows_the_same_pane_not_a_fresh_spawn() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide
+        app.apply(Action::ToggleFloat); // show again
+        assert_eq!(app.focused, float_id);
+        assert!(app.float.as_ref().unwrap().shown);
+        assert_eq!(app.runtimes.len(), 2, "no second float spawned (real pane + float only)");
+    }
+
+    #[test]
+    fn float_geometry_matches_the_c22_worked_example() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(80, 24)); // body -> 80x22 -> float 48x13, per C22
+        app.apply(Action::ToggleFloat);
+        let rect = app.display_rects()[0].rect;
+        assert_eq!((rect.width, rect.height), (48, 13));
+    }
+
+    #[test]
+    fn float_toggle_refuses_when_the_body_is_too_small() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(39, 20)); // body width 39 < the 40-col floor
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.is_none(), "must not spawn below the refusal floor");
+        assert_eq!(app.flash(), Some("no room for float"));
+    }
+
+    #[test]
+    fn alloc_pane_id_accounts_for_the_float() {
+        let (mut app, _) = mk_app(shell_ws()); // pane 1
+        app.apply(Action::ToggleFloat); // float takes id 2
+        let float_id = app.focused;
+        assert_eq!(float_id, 2);
+        app.apply(Action::ToggleFloat); // hide it, focus back to pane 1
+        app.apply(Action::NewPane);
+        assert_eq!(
+            app.focused, 3,
+            "ws.next_pane_id() alone would say 2 here — the float's own id, a collision"
+        );
+    }
+
+    #[test]
+    fn float_rule1_shown_routes_normally_rename_works_like_any_pane() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::RenamePane);
+        assert!(matches!(app.mode, Mode::Rename { target: RenameTarget::Pane, .. }));
+        // The buffer starts prefilled with the current title ("scratch",
+        // like any titled pane) — clear it before typing the replacement.
+        for _ in 0.."scratch".len() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        for c in "notes".chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.find_spec(float_id).unwrap().title.as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn float_rule2_focus_dir_hides_it_and_returns_to_prev_focus() {
+        let (mut app, _) = mk_app(shell_ws()); // single real pane
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::Focus(crate::core::layout::Dir::Right));
+        assert_eq!(app.focused, real_pane);
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_jump_attention_hides_it_and_returns_to_prev_focus_without_also_jumping() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        let real_pane = app.focused;
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleFloat); // float focused, prev_focus = 2
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, real_pane, "Alt+a from the float returns to prev_focus, not a ring jump");
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_tab_change_hides_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.as_ref().unwrap().shown);
+        app.apply(Action::GoToTab(0));
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_mouse_click_outside_hides_it_and_lands_on_what_it_hit() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert_ne!(float_id, 1);
+        app.on_click(1);
+        assert_eq!(app.focused, 1);
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule2_mouse_click_on_the_float_itself_is_not_outside() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.on_click(float_id);
+        assert_eq!(app.focused, float_id);
+        assert!(app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_rule3_structural_action_hides_float_first_and_does_not_wipe_the_tab_layout() {
+        // The regression under test: without hiding the float first,
+        // spawn_child would try to split off the float's id (not in the
+        // tree), trip split_pane's empty-tab fallback, and replace the
+        // whole tab's layout with just the new pane — losing panes 1 and 2.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab0: panes 1,2
+        let real_panes_before = app.ws.tabs[0].panes.len();
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert_ne!(float_id, 1);
+        assert_ne!(float_id, 2);
+
+        app.apply(Action::NewPane); // Alt+n while the float is focused
+
+        assert_eq!(app.ws.tabs[0].panes.len(), real_panes_before + 1);
+        let order = app.pane_order();
+        assert!(order.contains(&1) && order.contains(&2), "original panes must stay reachable: {order:?}");
+        assert!(!app.float.as_ref().unwrap().shown);
+    }
+
+    #[test]
+    fn float_hides_before_cycle_layout_too() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.as_ref().unwrap().shown);
+        app.apply(Action::CycleLayout);
+        assert!(!app.float.as_ref().unwrap().shown);
+        assert_eq!(app.pane_order().len(), 2, "the real 2-pane tab is untouched");
+    }
+
+    #[test]
+    fn float_hides_before_picker_launch_but_not_when_merely_opening_it() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1,2
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.as_ref().unwrap().shown);
+        app.apply(Action::QuickLaunch);
+        assert!(app.float.as_ref().unwrap().shown, "opening the picker alone must not hide the float");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter)); // launches the first item
+        assert!(!app.float.as_ref().unwrap().shown, "picker launch (C22 rule 3) hides it");
+        let order = app.pane_order();
+        assert!(order.contains(&1) && order.contains(&2), "original panes survive: {order:?}");
+    }
+
+    #[test]
+    fn control_spawn_while_float_focused_does_not_wipe_the_tab_layout() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab0: panes 1,2
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        let order = app.pane_order();
+        assert!(order.contains(&1) && order.contains(&2), "control spawn must not wipe the tab layout: {order:?}");
+        assert_eq!(app.focused, float_id, "the human's focus/float must be undisturbed by a control spawn");
+    }
+
+    #[test]
+    fn float_rule3_alt_z_refuses_instead_of_hiding_and_zooming_behind_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleZoom);
+        assert!(!app.zoomed(), "must not zoom");
+        assert!(app.float.as_ref().unwrap().shown, "must not hide the float either");
+        assert_eq!(app.focused, float_id);
+        assert_eq!(app.flash(), Some("can't zoom the float"));
+    }
+
+    #[test]
+    fn float_rule4_alt_w_kills_it_for_real_with_no_undo_entry() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let undo_depth_before = app.undo.len();
+        app.apply(Action::ClosePane);
+        assert!(app.float.is_none());
+        assert!(!app.runtimes.contains_key(&float_id));
+        assert_eq!(app.focused, real_pane);
+        assert_eq!(app.undo.len(), undo_depth_before, "scratch is not precious — no undo entry");
+        assert_eq!(app.flash(), Some("scratch closed"));
+        app.apply(Action::Undo); // must not somehow resurrect it
+        assert!(app.float.is_none());
+    }
+
+    #[test]
+    fn float_close_confirm_is_skipped_even_while_busy() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::Working);
+        app.apply(Action::ClosePane); // must close immediately, no confirm arm
+        assert!(app.float.is_none());
+        assert!(!app.runtimes.contains_key(&float_id));
+    }
+
+    #[test]
+    fn float_is_first_in_the_display_list_when_shown() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let rects = app.display_rects();
+        assert_eq!(rects[0].id, float_id, "float must be first — topmost priority for hit_test");
+        assert_eq!(rects.len(), 3, "float + both real panes");
+    }
+
+    #[test]
+    fn display_rects_omits_the_float_when_hidden() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::ToggleFloat); // hide
+        let rects = app.display_rects();
+        let float_id = app.float.as_ref().unwrap().id;
+        assert!(rects.iter().all(|pr| pr.id != float_id));
+    }
+
+    #[test]
+    fn float_shown_above_a_still_active_zoom_keeps_the_zoomed_pane_in_the_display_list() {
+        // C21 "keeps zoom" + C22 rule 1: showing the float on top of an
+        // already-zoomed pane doesn't disturb the zoom underneath.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        app.apply(Action::ToggleZoom); // zoom on pane 2
+        assert!(app.zoomed());
+        app.apply(Action::ToggleFloat); // float shows on top
+        let float_id = app.focused;
+        assert!(app.zoomed(), "zoom must still be active underneath");
+        let rects = app.display_rects();
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].id, float_id);
+        assert_eq!(rects[1].id, 2, "the zoom target stays pane 2, not the float");
+        assert_eq!(rects[1].rect, app.body_area());
+    }
+
+    #[test]
+    fn attention_ring_includes_the_float_last_when_needy() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1,2, focus 2
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide it, focus back to pane 2
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.attention_ring(), vec![1, float_id]);
+        assert_eq!(app.attention_ring().len(), app.needs_input_count());
+    }
+
+    #[test]
+    fn jump_to_a_needy_float_shows_it_and_records_where_focus_came_from() {
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide, focus back to real_pane
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, float_id);
+        assert!(app.float.as_ref().unwrap().shown);
+        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+    }
+
+    #[test]
+    fn control_close_of_the_float_is_refused() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let reply =
+            app.handle_control(Request { token: ct, method: Method::Close { pane: float_id, force: true } });
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot close the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(app.float.as_ref().unwrap().shown, "the float must survive the refused close");
+    }
+
+    #[test]
+    fn find_spec_learns_the_float_send_and_read_work_by_id() {
+        use crate::core::control::{Method, ReadMode, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert!(app.find_spec(float_id).is_some());
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Send { pane: float_id, text: "hi".into(), submit: false },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.runtimes.get(&float_id).unwrap().input, b"hi");
+        let reply =
+            app.handle_control(Request { token: ct, method: Method::Read { pane: float_id, mode: ReadMode::Screen } });
+        assert!(matches!(reply, Reply::Ok { .. }));
+    }
+
+    #[test]
+    fn float_never_appears_in_ctl_list() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request { token: ct, method: Method::List });
+        let Reply::Ok { ok } = reply else { panic!("expected ok") };
+        let ids: Vec<u64> = ok.as_array().unwrap().iter().map(|v| v["pane"].as_u64().unwrap()).collect();
+        assert!(!ids.contains(&float_id));
+    }
+
+    #[test]
+    fn float_is_never_persisted_to_the_saved_workspace() {
+        let (mut app, store) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert!(saved.tabs.iter().all(|t| !t.panes.contains_key(&float_id)));
+    }
+
+    #[test]
+    fn dead_float_relaunches_via_respawn_focused() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.runtimes.get_mut(&float_id).unwrap().kill();
+        assert!(app.focused_dead());
+        app.respawn_focused(false);
+        assert!(!app.focused_dead());
+        assert_eq!(app.focused, float_id);
+    }
+
+    // -- C23 raw pass-through --------------------------------------------------
+
+    #[test]
+    fn toggle_raw_action_flips_membership_on_the_focused_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        assert!(!app.is_raw(id));
+        app.apply(Action::ToggleRaw);
+        assert!(app.is_raw(id));
+        app.apply(Action::ToggleRaw);
+        assert!(!app.is_raw(id));
+    }
+
+    #[test]
+    fn raw_routing_active_requires_normal_mode_raw_and_alive() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        assert!(!app.raw_routing_active(), "not raw yet");
+        app.apply(Action::ToggleRaw);
+        assert!(app.raw_routing_active());
+
+        app.mode = Mode::Help;
+        assert!(!app.raw_routing_active(), "only applies in Normal mode");
+        app.mode = Mode::Normal;
+        assert!(app.raw_routing_active());
+
+        app.runtimes.get_mut(&id).unwrap().kill();
+        assert!(!app.raw_routing_active(), "a dead pane never raw-routes");
+    }
+
+    #[test]
+    fn close_pane_id_cleans_up_stale_raw_membership() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.apply(Action::ToggleRaw);
+        assert!(app.is_raw(id));
+        app.apply(Action::ClosePane);
+        assert!(!app.is_raw(id));
+    }
+
+    // -- C24 keyboard copy mode -------------------------------------------------
+
+    /// Extract the C24 cursor from `Mode::Copy`, panicking with a clear
+    /// message otherwise — every test in this section drives copy mode via
+    /// `Action::CopyMode` first, so this should always match.
+    fn copy_cursor(app: &App<FakePane>) -> (u16, u16) {
+        match &app.mode {
+            Mode::Copy { cursor } => *cursor,
+            _ => panic!("expected Mode::Copy"),
+        }
+    }
+
+    #[test]
+    fn copy_mode_cursor_starts_bottom_left_of_the_focused_pane() {
+        // 100x30 term, single pane fills the body (100x28) -> inner 98x26.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        assert_eq!(copy_cursor(&app), (25, 0));
+    }
+
+    #[test]
+    fn copy_cursor_motions_clamp_to_the_inner_grid() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode); // cursor (25, 0), grid 26 rows x 98 cols
+        for _ in 0..30 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char('k'))); // up, clamps at row 0
+        }
+        assert_eq!(copy_cursor(&app), (0, 0));
+        for _ in 0..120 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char('l'))); // right, clamps at col 97
+        }
+        assert_eq!(copy_cursor(&app), (0, 97));
+        for _ in 0..40 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Down)); // clamps at row 25
+        }
+        assert_eq!(copy_cursor(&app), (25, 97));
+        for _ in 0..120 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Left)); // clamps at col 0
+        }
+        assert_eq!(copy_cursor(&app), (25, 0));
+    }
+
+    #[test]
+    fn copy_cursor_0_and_dollar_jump_to_column_bounds() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('$')));
+        assert_eq!(copy_cursor(&app).1, 97);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('0')));
+        assert_eq!(copy_cursor(&app).1, 0);
+    }
+
+    #[test]
+    fn copy_v_toggles_anchor_and_movement_extends_the_selection() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode); // cursor (25, 0)
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v'))); // anchor at (25, 0)
+        let sel = app.selection.expect("v sets an anchor");
+        assert_eq!(sel.anchor, (25, 0));
+        assert_eq!(sel.cursor, (25, 0));
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('k')));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('k')));
+        let sel = app.selection.expect("still selecting");
+        assert_eq!(sel.anchor, (25, 0), "anchor stays put");
+        assert_eq!(sel.cursor, (23, 0), "movement extends to the new cursor");
+        assert_eq!(copy_cursor(&app), (23, 0));
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v'))); // toggle off
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn copy_y_yanks_with_a_selection_and_stashes_it_for_the_clipboard() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.runtimes.get_mut(&1).unwrap().grab = "yanked text".into();
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v')));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.selection.is_none());
+        assert_eq!(app.take_pending_yank().as_deref(), Some("yanked text"));
+        assert!(app.flash().unwrap().starts_with("copied"));
+    }
+
+    #[test]
+    fn copy_enter_also_yanks_same_as_y() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.runtimes.get_mut(&1).unwrap().grab = "abc".into();
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v')));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.take_pending_yank().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn copy_y_without_a_selection_flashes_and_stays_in_copy_mode() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(matches!(app.mode, Mode::Copy { .. }), "must stay in copy mode");
+        assert_eq!(app.flash(), Some("nothing selected"));
+        assert!(app.take_pending_yank().is_none());
+    }
+
+    #[test]
+    fn copy_esc_and_q_clear_the_selection_and_exit() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        for closer in [KeyCode::Esc, KeyCode::Char('q')] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::CopyMode);
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char('v')));
+            assert!(app.selection.is_some());
+            app.handle_mode_key(KeyEvent::from(closer));
+            assert!(matches!(app.mode, Mode::Normal));
+            assert!(app.selection.is_none());
+        }
+    }
+
+    #[test]
+    fn copy_mouse_drag_replaces_the_keyboard_selection_and_moves_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('v'))); // keyboard anchor at (25, 0)
+        assert_eq!(app.selection.unwrap().anchor, (25, 0));
+
+        // A fresh mouse drag starts an entirely new selection, overwriting
+        // the keyboard one, and also moves the Mode::Copy cursor (C24: "a
+        // drag also moves the cursor to the drag point").
+        app.begin_selection(1, 3, 4);
+        app.extend_selection(5, 6);
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor, (3, 4));
+        assert_eq!(sel.cursor, (5, 6));
+        assert_eq!(copy_cursor(&app), (5, 6));
     }
 }
