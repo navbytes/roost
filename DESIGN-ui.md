@@ -553,6 +553,16 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
     `hjkl move` · `v mark` · `y/↵ yank` · `drag select` · `Esc exit`
     (63 columns — fits beside the right segment at 100 cols).
   - Zoomed Normal keeps the standard seven pairs (they all still work).
+- **[Amended 2026-07-27, SPEC-ux U17 — the copy list carries the whole
+  vocabulary]:** the copy-mode list becomes, in this (= yield) order:
+  `hjkl move` · `w/b/e word` · `0/$ ends` · `v/V mark` · `y/↵ yank` ·
+  `drag select` · `Esc exit` — **83 columns**, so it still fits beside the
+  right segment at the 100-col floor (pinned by
+  `hint_pairs_copy_mode_is_the_c24_list_amended_by_u17`). `w/b/e` and `V`
+  are new keys (C24 amendment below); `0`/`$` are not — they had existed
+  since C24 while appearing in no hint and no help row, which is the same
+  as not existing. Labels are deliberately terse (`ends`, `mark`) to buy
+  the columns: the full wording lives one keystroke away under `Alt+?`.
 
 ### C10 — Flash message
 
@@ -1120,6 +1130,59 @@ reading order).
   · Esc exit`.
 - Unit tests: motion clamping; `0`/`$`; anchor toggle and extension;
   yank-with/without-selection; Esc clears; drag-replaces-keyboard-selection.
+
+**[Amended 2026-07-27, SPEC-ux U17 — the key set grows by four]:** "the
+brief's minimum, nothing more" is superseded. Copy mode was the one place a
+user goes to *do* something with an agent's output, and it could only be
+walked one cell at a time. Added:
+- **`V` — line select.** Selects the cursor's whole row: anchor
+  `(row, 0)`, cursor `(row, inner_width − 1)`, which the mode cursor also
+  moves to. Deliberately **absolute, not a toggle** like `v`: it always
+  (re)takes the current line, so pressing it again is idempotent and
+  `j`/`k` then extend by whole rows. `v` and `Esc` remain the ways to
+  clear. Rationale: "grab what the agent just said" is the gesture people
+  reach for first, and it should never need a clear-then-mark dance.
+- **`w` / `b` / `e` — word motions**, whitespace-delimited (vim's WORD, the
+  same tokenizer `find_url_at` uses, so `w` and Alt+click agree on where a
+  token starts). They walk **within the cursor's row only** and clamp at
+  both ends rather than wrapping onto a neighbour: the cursor lives in
+  visible-grid cell space, and a motion that silently changed rows would
+  break the selection model. Pure `word_forward`/`word_back`/`word_end`,
+  unit-tested at both clamps.
+- Motions extend an active selection under the existing uniform rule — no
+  new selection semantics.
+- The hint list and the `Alt+c` help row now name every one of these keys,
+  `0`/`$` included (C9 amendment above; C15/§8's row reads
+  `copy mode (hjkl w b e 0 $ v V y) / scroll mode`).
+
+### C24b — Mode entry chords toggle — [Added 2026-07-27, SPEC-ux U18]
+
+**Current:** `handle_mode_key` special-cases exactly one chord — C20's
+Alt+e closes the feed. Every other Alt chord resets `mode` to Normal and
+falls through to its global binding, so a mode's *own* entry chord
+re-enters it: Alt+c in copy mode discards the cursor and selection for a
+fresh one, Alt+PageUp in scroll mode snaps the view to the live tail and
+calls that scroll mode, Alt+? in Help closes and reopens the overlay.
+
+**Target:**
+- **A mode's own entry chord exits it.** The rule is universal, not a
+  per-mode carve-out: Alt+r / Alt+Shift+r (Rename), Alt+Enter (Picker),
+  Alt+PageUp (Scroll), Alt+c (Copy), Alt+? (Help), Alt+e (Feed).
+- **Derived from the binding table, not a copy of it.** The check runs the
+  incoming key through `input::translate` and compares the resulting
+  `Action` against `mode_entry_action(mode)`, so rebinding a chord moves
+  its toggle with it and the two can never disagree.
+- **Toggling off *is* exiting.** Both routes go through one `exit_mode`:
+  Scroll snaps `set_scrollback(0)`, Copy drops its selection, the rest just
+  return to Normal — identical to what that mode's `Esc` does, pinned by
+  `esc_and_the_entry_chord_leave_identical_state`.
+- **Nothing else changes.** A chord that is *not* the current mode's entry
+  chord still breaks out to its global binding, mode reset and U9's
+  scroll-snap (with its Alt+c exemption) included. The consumed toggle
+  returns `true`, so it is never re-dispatched.
+- Rename's toggle cancels (Esc semantics), discarding the buffer: an
+  explicit second Alt+r is a deliberate act, unlike U8's stray click, which
+  still may not throw unsaved text away.
 
 ### C25 — Canned layout cycle (Alt+g) — [Added 2026-07-22, fleet features]
 

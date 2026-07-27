@@ -87,9 +87,15 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'static str, &'static str)> {
     match mode {
         // C24: keyboard cursor + mouse drag, replacing the old two-pair list.
+        // [Amended, U17] The mode's whole vocabulary is now on the bar: the
+        // word motions and `V` are new, and `0`/`$` had existed since C24
+        // while appearing in no hint and no help row — a binding nothing
+        // advertises may as well not exist.
         Mode::Copy { .. } => vec![
             ("hjkl", "move"),
-            ("v", "mark"),
+            ("w/b/e", "word"),
+            ("0/$", "ends"),
+            ("v/V", "mark"),
             ("y/↵", "yank"),
             ("drag", "select"),
             ("Esc", "exit"),
@@ -354,7 +360,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
     ("Alt+i / Alt+m", "previous / next tab (wraps)"),
     ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-    ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
+    ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y) / scroll mode"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
     ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
@@ -1613,11 +1619,32 @@ mod tests {
         assert_eq!(pairs[0], ("Alt+?", "keys"));
     }
 
+    /// C24's list as amended by U17: the mode's whole vocabulary, and it
+    /// still has to fit beside the right segment at the 100-col floor —
+    /// a hint bar that clips its own mode's keys is the U17 bug restated.
     #[test]
-    fn hint_pairs_copy_mode_is_the_c24_five_pair_list() {
+    fn hint_pairs_copy_mode_is_the_c24_list_amended_by_u17() {
+        let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false);
         assert_eq!(
-            hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false),
-            vec![("hjkl", "move"), ("v", "mark"), ("y/↵", "yank"), ("drag", "select"), ("Esc", "exit")],
+            pairs,
+            vec![
+                ("hjkl", "move"),
+                ("w/b/e", "word"),
+                ("0/$", "ends"),
+                ("v/V", "mark"),
+                ("y/↵", "yank"),
+                ("drag", "select"),
+                ("Esc", "exit"),
+            ],
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        let right_w = super::hint_bar_right_spans(0, None, "COPY")
+            .iter()
+            .map(|s| mouse::display_width(&s.content))
+            .sum::<u16>();
+        assert!(
+            cols + right_w <= 100,
+            "copy hints are {cols} cols + {right_w} of segment; the 100-col floor clips them"
         );
     }
 
@@ -1942,7 +1969,7 @@ mod tests {
                 ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
                 ("Alt+i / Alt+m", "previous / next tab (wraps)"),
                 ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-                ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
+                ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y) / scroll mode"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
                 ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),

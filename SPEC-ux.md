@@ -271,16 +271,34 @@ amended 2026-07-27). The drive's probe now types `junk` + Ctrl+U +
 `abc def` + Ctrl+W, so `abc` survives only if both chords were honored and a
 literal insertion would show as a stray `u`/`w`.
 
-### U17 · Low · VERIFIED — copy-mode vocabulary
+### U17 · Low · FIXED (this branch) — copy-mode vocabulary
 `V` (line select) and `w/b/e` are unbound no-ops (live-confirmed); `0`/`$`
 exist but appear in no hint and not in the help overlay.
 **Proposed contract:** add `V` and `w/b/e`; list `0/$` in the copy hint.
+**Fixed:** `V` selects the cursor's whole row — absolute, not a `v`-style
+toggle, so it is idempotent and `j`/`k` then extend by rows — and `w`/`b`/`e`
+walk whitespace-delimited words (the same tokenizer `find_url_at` uses)
+within the cursor's row, clamping at both ends rather than wrapping onto a
+neighbour: the cursor lives in visible-grid cell space (C24) and a motion
+that silently changed rows would break the selection model. The hint list is
+now the mode's whole vocabulary at 83 columns —
+`hjkl move · w/b/e word · 0/$ ends · v/V mark · y/↵ yank · drag select ·
+Esc exit` — still fitting beside the right segment at the 100-col floor,
+and the `Alt+c` help row spells the keys out (C9/C24 amended 2026-07-27).
 
-### U18 · Low · CODE-VERIFIED — mode entry chords don't uniformly toggle off
+### U18 · Low · FIXED (this branch) — mode entry chords don't uniformly toggle off
 Alt+e closes the feed (special-cased); Alt+c in copy mode re-enters with a
 fresh cursor; Alt+PageUp in scroll mode resets to tail instead of exiting.
 **Proposed contract:** a mode's own entry chord exits it (generalize the Alt+e
 pattern).
+**Fixed:** the C20 carve-out became the rule for all six modes. The test is
+derived, not copied: the key runs through `input::translate` and its `Action`
+is compared with `mode_entry_action(mode)`, so a rebound chord takes its
+toggle with it. Toggling off *is* exiting — both routes go through one
+`exit_mode`, so a toggled-off Scroll snaps to the live tail and a toggled-off
+Copy drops its selection exactly as Esc does. Chords that aren't the current
+mode's still fall through to their global binding, U9's scroll-snap (and its
+Alt+c exemption) intact (C24b added 2026-07-27).
 
 ### U19 · Low · OPEN — URLs: wrapped links break Alt+click; no keyboard open
 `url_at` reads one grid row; agents constantly print wrapping URLs into narrow

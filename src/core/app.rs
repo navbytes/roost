@@ -2752,14 +2752,20 @@ impl<B: PaneBackend> App<B> {
         // would leave the pane you were reading frozen mid-history while scroll
         // keys silently drive a different pane.
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
-            // C20: Alt+e both opens and closes the feed. Handled here, before
-            // the generic reset below clears `self.mode` out from under it —
-            // otherwise `Action::ToggleFeed`, reached via the fallthrough
-            // path, could never tell the feed had just been open and would
-            // always re-open it instead of closing.
-            if matches!(self.mode, Mode::Feed { .. }) && key.code == KeyCode::Char('e') {
-                self.mode = Mode::Normal;
-                return true;
+            // U18: a mode's own entry chord toggles it OFF. C20's Alt+e had
+            // this rule special-cased for the feed; every other mode fell
+            // through to the global binding and *re-entered* — Alt+c in copy
+            // mode threw the cursor and selection away for a fresh one, and
+            // Alt+PageUp in scroll mode snapped the view to the live tail and
+            // called that "scroll mode". Both read as "the chord did
+            // nothing", which is worse than either exiting or staying.
+            // Generalized through `translate` rather than a second chord
+            // table, so the toggle can never drift from the binding.
+            if let crate::ui::input::InputResult::Action(a) = crate::ui::input::translate(key) {
+                if Some(a) == mode_entry_action(&self.mode) {
+                    self.exit_mode();
+                    return true;
+                }
             }
             // U9: Alt+c is exempt from the snap below — Scroll→Copy hands
             // the frozen view over intact, because scroll→select→yank is
@@ -2787,6 +2793,16 @@ impl<B: PaneBackend> App<B> {
         // C24: the focused pane's current inner grid, for clamping the copy
         // cursor — same borrow-ordering reason as `feed_page` above.
         let (copy_h, copy_w) = self.focused_inner_dims();
+        // U17: the text of the row the copy cursor sits on, for the w/b/e
+        // word motions. Same borrow-ordering reason again — and computed
+        // only for the three keys that need it, so an ordinary hjkl press
+        // still costs nothing.
+        let copy_row = match (&self.mode, key.code) {
+            (Mode::Copy { cursor }, KeyCode::Char('w' | 'b' | 'e')) => {
+                self.row_text(self.focused, cursor.0)
+            }
+            _ => String::new(),
+        };
         match &mut self.mode {
             Mode::Normal => false,
             Mode::Rename { buffer, target } => {
@@ -2892,12 +2908,7 @@ impl<B: PaneBackend> App<B> {
                             *offset = rt.scroll_offset();
                         }
                     }
-                    None => {
-                        if let Some(rt) = self.runtimes.get_mut(&focused) {
-                            rt.set_scrollback(0);
-                        }
-                        self.mode = Mode::Normal;
-                    }
+                    None => self.exit_mode(), // U18: one definition of leaving
                 }
                 true
             }
@@ -2916,6 +2927,17 @@ impl<B: PaneBackend> App<B> {
                     }
                     KeyCode::Char('0') => cursor.1 = 0,
                     KeyCode::Char('$') => cursor.1 = copy_w.saturating_sub(1),
+                    // U17: vim's word motions, over the row the cursor is on
+                    // — whitespace-delimited, and clamped to the row's ends
+                    // rather than wrapping to a neighbouring line (the
+                    // cursor lives in visible-grid cell space, C24).
+                    KeyCode::Char('w') => {
+                        cursor.1 = word_forward(&copy_row, cursor.1, copy_w.saturating_sub(1))
+                    }
+                    KeyCode::Char('b') => cursor.1 = word_back(&copy_row, cursor.1),
+                    KeyCode::Char('e') => {
+                        cursor.1 = word_end(&copy_row, cursor.1, copy_w.saturating_sub(1))
+                    }
                     _ => {}
                 }
                 // A motion above extends an active selection to the new
@@ -2924,7 +2946,7 @@ impl<B: PaneBackend> App<B> {
                 // without repeating it six times.
                 if matches!(
                     key.code,
-                    KeyCode::Char('h' | 'l' | 'k' | 'j' | '0' | '$')
+                    KeyCode::Char('h' | 'l' | 'k' | 'j' | '0' | '$' | 'w' | 'b' | 'e')
                         | KeyCode::Left
                         | KeyCode::Right
                         | KeyCode::Up
@@ -2945,6 +2967,24 @@ impl<B: PaneBackend> App<B> {
                             self.selection =
                                 Some(Selection { pane: focused, anchor, cursor: anchor, dragging: false });
                         }
+                    }
+                    // U17: `V` selects the cursor's whole row — the "grab
+                    // what the agent just said" gesture, and the one people
+                    // reach for first. Absolute, not a toggle like `v`: it
+                    // always (re)selects the current line, so pressing it
+                    // again is idempotent and `j`/`k` then extend by rows.
+                    // `v` and Esc are the ways to clear.
+                    KeyCode::Char('V') => {
+                        let focused = self.focused;
+                        let last = copy_w.saturating_sub(1);
+                        let row = cursor.0;
+                        cursor.1 = last;
+                        self.selection = Some(Selection {
+                            pane: focused,
+                            anchor: (row, 0),
+                            cursor: (row, last),
+                            dragging: false,
+                        });
                     }
                     KeyCode::Char('y') | KeyCode::Enter => {
                         if self.selection.is_some() {
@@ -2973,10 +3013,7 @@ impl<B: PaneBackend> App<B> {
                             rt.set_scrollback(want);
                         }
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        self.mode = Mode::Normal;
-                        self.selection = None;
-                    }
+                    KeyCode::Esc | KeyCode::Char('q') => self.exit_mode(), // U18
                     _ => {}
                 }
                 true
@@ -2999,6 +3036,35 @@ impl<B: PaneBackend> App<B> {
                 true
             }
         }
+    }
+
+    /// U18: leave the current mode exactly the way its own `Esc` does — the
+    /// one definition both that key and the mode's entry chord (pressed a
+    /// second time) go through, so a toggle-off can never leave state a
+    /// cancel would have cleaned up. `Esc`'s arms in `handle_mode_key`
+    /// mirror this; `esc_and_the_entry_chord_leave_identical_state` pins
+    /// them together.
+    fn exit_mode(&mut self) {
+        match self.mode {
+            // Snap the view back to the live tail, same as Esc/q.
+            Mode::Scroll { .. } => {
+                let focused = self.focused;
+                if let Some(rt) = self.runtimes.get_mut(&focused) {
+                    rt.set_scrollback(0);
+                }
+            }
+            // A cancelled copy takes its selection with it.
+            Mode::Copy { .. } => self.selection = None,
+            _ => {}
+        }
+        self.mode = Mode::Normal;
+    }
+
+    /// The visible text of one row of pane `id` as the copy cursor sees it
+    /// (one char per cell, trailing spaces trimmed) — the string U17's word
+    /// motions walk.
+    fn row_text(&self, id: PaneId, row: u16) -> String {
+        self.runtimes.get(&id).map(|rt| rt.grab_text((row, 0), (row, u16::MAX))).unwrap_or_default()
     }
 
     /// Clean shutdown: save workspace, kill children (their sessions live on).
@@ -3104,6 +3170,75 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// U18: the global `Action` that *enters* each mode — press that chord while
+/// the mode is already up and it exits instead of re-entering. Derived
+/// against `input::translate`'s own output rather than a second chord table,
+/// so rebinding a chord moves its toggle with it. `Normal` has no entry
+/// chord (nothing to toggle off).
+fn mode_entry_action(mode: &Mode) -> Option<Action> {
+    match mode {
+        Mode::Normal => None,
+        Mode::Rename { target: RenameTarget::Pane, .. } => Some(Action::RenamePane),
+        Mode::Rename { target: RenameTarget::Tab, .. } => Some(Action::RenameTab),
+        Mode::Picker { .. } => Some(Action::QuickLaunch),
+        Mode::Scroll { .. } => Some(Action::ScrollMode),
+        Mode::Copy { .. } => Some(Action::CopyMode),
+        Mode::Help => Some(Action::Help),
+        Mode::Feed { .. } => Some(Action::ToggleFeed),
+    }
+}
+
+/// U17 word motions, shared shape: is cell `i` of `line` whitespace? Past the
+/// end of the (trailing-space-trimmed) row counts as whitespace — the grid's
+/// blank tail is not part of any word.
+fn ws_at(chars: &[char], i: u16) -> bool {
+    chars.get(i as usize).is_none_or(|c| c.is_whitespace())
+}
+
+/// U17 `w`: the start of the next whitespace-delimited word to the right,
+/// clamped to `last` (the row's final column — copy-mode motions never leave
+/// the row they are on).
+pub fn word_forward(line: &str, col: u16, last: u16) -> u16 {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col;
+    while i <= last && !ws_at(&chars, i) {
+        i += 1;
+    }
+    while i <= last && ws_at(&chars, i) {
+        i += 1;
+    }
+    i.min(last)
+}
+
+/// U17 `b`: the start of the word at or before the cursor, clamped to 0.
+pub fn word_back(line: &str, col: u16) -> u16 {
+    let chars: Vec<char> = line.chars().collect();
+    let Some(mut i) = col.checked_sub(1) else { return 0 };
+    while i > 0 && ws_at(&chars, i) {
+        i -= 1;
+    }
+    while i > 0 && !ws_at(&chars, i - 1) {
+        i -= 1;
+    }
+    i
+}
+
+/// U17 `e`: the last cell of the next word to the right, clamped to `last`.
+pub fn word_end(line: &str, col: u16, last: u16) -> u16 {
+    let chars: Vec<char> = line.chars().collect();
+    if col >= last {
+        return last;
+    }
+    let mut i = col + 1;
+    while i < last && ws_at(&chars, i) {
+        i += 1;
+    }
+    while i < last && !ws_at(&chars, i + 1) {
+        i += 1;
+    }
+    i
 }
 
 /// U16: readline's `unix-word-rubout` over a text buffer — drop any trailing
@@ -3719,6 +3854,177 @@ mod tests {
         app.handle_mode_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(app.runtimes.get(&id).unwrap().scrollback as usize, 5);
         assert!(matches!(app.mode, Mode::Copy { .. }), "paging never leaves copy mode");
+    }
+
+    /// U17: the word motions' exact boundaries, including both clamps —
+    /// copy-mode motions live in visible-grid cell space and never wrap onto
+    /// a neighbouring row, so running off either end parks on that end.
+    #[test]
+    fn word_motions_walk_whole_words_and_clamp_at_both_row_ends() {
+        use super::{word_back, word_end, word_forward};
+        let line = "hello world  foo";
+        let last = 97; // a 98-column row: the text's blank tail is not a word
+
+        assert_eq!(word_forward(line, 0, last), 6, "start of the next word");
+        assert_eq!(word_forward(line, 6, last), 13, "a two-space gap is still one gap");
+        assert_eq!(word_forward(line, 13, last), last, "past the last word: clamped");
+        assert_eq!(word_forward("", 0, last), last, "an empty row has nowhere to go");
+
+        assert_eq!(word_back(line, last), 13, "back from the blank tail: the last word");
+        assert_eq!(word_back(line, 13), 6);
+        assert_eq!(word_back(line, 6), 0);
+        assert_eq!(word_back(line, 0), 0, "before the first word: clamped");
+        assert_eq!(word_back(line, 3), 0, "from mid-word, to that word's start");
+
+        assert_eq!(word_end(line, 0, last), 4, "end of the word we are in");
+        assert_eq!(word_end(line, 4, last), 10, "then the end of the next");
+        assert_eq!(word_end(line, 10, last), 15);
+        assert_eq!(word_end(line, 15, last), last, "no word left: clamped");
+        assert_eq!(word_end(line, last, last), last);
+    }
+
+    /// U17: `w`/`b`/`e` on the copy cursor, driven through the real key
+    /// path — they were unbound no-ops before, so a keyboard selection had
+    /// to be walked out one column at a time.
+    #[test]
+    fn copy_mode_w_b_e_move_the_cursor_by_words() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "hello world  foo".into();
+        let (_, w) = inner_dims(app.rects()[0].rect);
+        let last = w - 1;
+        app.apply(Action::CopyMode);
+        assert_eq!(copy_cursor(&app).1, 0);
+
+        let press = |app: &mut App<FakePane>, c: char| {
+            app.handle_mode_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        };
+        press(&mut app, 'w');
+        assert_eq!(copy_cursor(&app).1, 6);
+        press(&mut app, 'e');
+        assert_eq!(copy_cursor(&app).1, 10, "e lands on the last cell of that word");
+        press(&mut app, 'w');
+        assert_eq!(copy_cursor(&app).1, 13);
+        press(&mut app, 'w');
+        assert_eq!(copy_cursor(&app).1, last, "past the last word, clamped to the row end");
+        press(&mut app, 'b');
+        assert_eq!(copy_cursor(&app).1, 13);
+        for _ in 0..4 {
+            press(&mut app, 'b');
+        }
+        assert_eq!(copy_cursor(&app).1, 0, "clamped at column 0, never wrapping up a row");
+        assert!(matches!(app.mode, Mode::Copy { .. }), "motions never leave the mode");
+    }
+
+    /// U17: `V` grabs the cursor's whole line — the "copy what the agent
+    /// just said" gesture — and, like every other motion, a following
+    /// `j`/`k` extends the selection from there.
+    #[test]
+    fn copy_mode_capital_v_selects_the_whole_row_and_extends_by_lines() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let (_, w) = inner_dims(app.rects()[0].rect);
+        let last = w - 1;
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        let row = copy_cursor(&app).0;
+
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE));
+        let sel = app.selection.expect("V marks a selection");
+        assert_eq!((sel.anchor, sel.cursor), ((row, 0), (row, last)), "column 0 through the end");
+        assert!(!sel.dragging);
+        assert_eq!(copy_cursor(&app), (row, last), "the cursor rides the line's end");
+
+        // Movement extends it, exactly as it extends a `v` selection.
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selection.unwrap().cursor, (row - 1, last));
+        assert_eq!(app.selection.unwrap().anchor, (row, 0), "the anchor stays put");
+
+        // Idempotent: V again re-takes just the row the cursor is on now.
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE));
+        let sel = app.selection.unwrap();
+        assert_eq!((sel.anchor, sel.cursor), ((row - 1, 0), (row - 1, last)));
+    }
+
+    /// U18: every mode's own entry chord toggles it off. Only Alt+e had this
+    /// rule; Alt+c re-entered copy mode with a fresh cursor and Alt+PageUp
+    /// re-entered scroll mode at the live tail — both indistinguishable from
+    /// "the chord did nothing".
+    #[test]
+    fn a_modes_own_entry_chord_exits_it() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        const ALT: KeyModifiers = KeyModifiers::ALT;
+        let cases: [(Action, KeyEvent); 7] = [
+            (Action::RenamePane, KeyEvent::new(KeyCode::Char('r'), ALT)),
+            (
+                Action::RenameTab,
+                KeyEvent::new(KeyCode::Char('r'), ALT.union(KeyModifiers::SHIFT)),
+            ),
+            (Action::QuickLaunch, KeyEvent::new(KeyCode::Enter, ALT)),
+            (Action::ScrollMode, KeyEvent::new(KeyCode::PageUp, ALT)),
+            (Action::CopyMode, KeyEvent::new(KeyCode::Char('c'), ALT)),
+            (Action::Help, KeyEvent::new(KeyCode::Char('?'), ALT)),
+            (Action::ToggleFeed, KeyEvent::new(KeyCode::Char('e'), ALT)),
+        ];
+        for (enter, chord) in cases {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(enter);
+            assert!(!matches!(app.mode, Mode::Normal), "{enter:?} must open a mode");
+            let consumed = app.handle_mode_key(chord);
+            assert!(consumed, "{enter:?}: the entry chord is consumed, not re-dispatched");
+            assert!(matches!(app.mode, Mode::Normal), "{enter:?}: the chord must exit the mode");
+        }
+    }
+
+    /// U18: exiting by entry chord is exiting — the mode's own cleanup runs,
+    /// so a toggled-off scroll snaps back to the live tail and a toggled-off
+    /// copy drops its selection, exactly as Esc does.
+    #[test]
+    fn esc_and_the_entry_chord_leave_identical_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for exit in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT),
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            let id = app.focused;
+            app.apply(Action::ScrollMode);
+            app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 1);
+            app.handle_mode_key(exit);
+            assert!(matches!(app.mode, Mode::Normal));
+            assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 0, "{exit:?} snaps to live");
+        }
+        for exit in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::CopyMode);
+            app.handle_mode_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+            assert!(app.selection.is_some());
+            app.handle_mode_key(exit);
+            assert!(matches!(app.mode, Mode::Normal));
+            assert!(app.selection.is_none(), "{exit:?} drops the selection");
+        }
+    }
+
+    /// U18's generalization must not swallow chords that are NOT the current
+    /// mode's own: they still break out to their global binding, mode reset
+    /// and scroll-snap included.
+    #[test]
+    fn another_modes_entry_chord_still_falls_through_to_its_global_binding() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFeed);
+        // Alt+? is Help's chord, not the feed's: not consumed here, so the
+        // dispatcher opens Help next.
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::ALT));
+        assert!(!consumed);
+        assert!(matches!(app.mode, Mode::Normal));
+        app.apply(Action::Help);
+        assert!(matches!(app.mode, Mode::Help));
     }
 
     #[test]
