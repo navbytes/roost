@@ -107,6 +107,35 @@ pub fn translate(key: KeyEvent) -> InputResult {
     encode_key(key)
 }
 
+/// Upgrade cursor-key bytes to the SS3 application encodings when the target
+/// pane switched on DECCKM (`CSI ?1h` — zsh's line editor via `smkx`, vim,
+/// most full-screen TUIs). A real terminal transmits `ESC O A` … for the
+/// cursor keys (and xterm's PC-style Home/End) in that mode, and
+/// terminfo-driven bindings listen for exactly those bytes — e.g. zsh widgets
+/// bound to `$terminfo[kcuu1]` = `\EOA` (atuin's up-arrow search among them)
+/// never fire on the normal-mode `\E[A`. Only unmodified keys upgrade:
+/// Shift/Ctrl/Alt-modified cursor keys are never sent as SS3 by real
+/// terminals regardless of DECCKM. Called from the forward path, where the
+/// focused pane's state is known (same pattern as `kitty_upgrade`).
+pub fn app_cursor_upgrade(key: KeyEvent, bytes: Vec<u8>, app_cursor: bool) -> Vec<u8> {
+    if !app_cursor
+        || key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return bytes;
+    }
+    match key.code {
+        KeyCode::Up => b"\x1bOA".to_vec(),
+        KeyCode::Down => b"\x1bOB".to_vec(),
+        KeyCode::Right => b"\x1bOC".to_vec(),
+        KeyCode::Left => b"\x1bOD".to_vec(),
+        KeyCode::Home => b"\x1bOH".to_vec(),
+        KeyCode::End => b"\x1bOF".to_vec(),
+        _ => bytes,
+    }
+}
+
 /// Upgrade modified-Enter bytes to the kitty CSI-u encoding when the target
 /// pane negotiated the protocol (`kitty` = its disambiguate flag). Panes that
 /// never opted in keep the ESC+CR fallback from `encode_key`. Called from the
@@ -352,6 +381,35 @@ mod tests {
             translate(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             InputResult::Action(Action::QuickLaunch)
         ));
+    }
+
+    #[test]
+    fn app_cursor_upgrade_sends_ss3_only_when_the_pane_asked() {
+        // DECCKM off: bytes pass through untouched.
+        assert_eq!(app_cursor_upgrade(plain(KeyCode::Up), b"\x1b[A".to_vec(), false), b"\x1b[A");
+        // DECCKM on: every cursor key (xterm's PC-style Home/End included)
+        // switches from its `encode_key` CSI form to SS3.
+        let cases: &[(KeyCode, &[u8])] = &[
+            (KeyCode::Up, b"\x1bOA"),
+            (KeyCode::Down, b"\x1bOB"),
+            (KeyCode::Right, b"\x1bOC"),
+            (KeyCode::Left, b"\x1bOD"),
+            (KeyCode::Home, b"\x1bOH"),
+            (KeyCode::End, b"\x1bOF"),
+        ];
+        for (code, want) in cases {
+            let base = match translate(plain(*code)) {
+                InputResult::Forward(b) => b,
+                _ => panic!("{code:?} must forward"),
+            };
+            assert_eq!(&app_cursor_upgrade(plain(*code), base, true), want, "{code:?}");
+        }
+        // Modified cursor keys never become SS3 (real terminals keep CSI for
+        // those regardless of DECCKM), and non-cursor keys pass through.
+        let shift_up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app_cursor_upgrade(shift_up, b"\x1b[A".to_vec(), true), b"\x1b[A");
+        assert_eq!(app_cursor_upgrade(plain(KeyCode::Char('a')), b"a".to_vec(), true), b"a");
+        assert_eq!(app_cursor_upgrade(plain(KeyCode::PageUp), b"\x1b[5~".to_vec(), true), b"\x1b[5~");
     }
 
     #[test]

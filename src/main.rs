@@ -298,6 +298,7 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
             app.apply(Action::ToggleRaw);
         } else {
             let bytes = input::kitty_upgrade(key, input::encode_raw(key), app.focused_kitty());
+            let bytes = input::app_cursor_upgrade(key, bytes, app.focused_app_cursor());
             if !bytes.is_empty() {
                 app.forward_bytes(&bytes);
             }
@@ -314,8 +315,11 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
         InputResult::Forward(bytes) => {
             // If the focused pane negotiated the kitty keyboard protocol, upgrade
             // modified Enter from the ESC+CR fallback to the CSI-u form it asked
-            // for (Shift+Enter → CSI 13;2u, Ctrl+Enter → CSI 13;5u).
+            // for (Shift+Enter → CSI 13;2u, Ctrl+Enter → CSI 13;5u); if it set
+            // DECCKM, upgrade cursor keys to their SS3 application encodings.
+            // The two touch disjoint keys, so the order is immaterial.
             let bytes = input::kitty_upgrade(key, bytes, app.focused_kitty());
+            let bytes = input::app_cursor_upgrade(key, bytes, app.focused_app_cursor());
             app.forward_bytes(&bytes);
         }
         InputResult::Ignore => {}
@@ -550,6 +554,37 @@ mod tests {
         assert!(!app.raw_routing_active());
         handle_key(&mut app, alt(KeyCode::Char('q')));
         assert!(app.quit, "Alt+q must still quit a cooked pane");
+    }
+
+    /// The atuin regression: zsh's line editor switches DECCKM on via `smkx`
+    /// while the prompt is active and binds widgets to `$terminfo[kcuu1]` =
+    /// `\EOA` (atuin's up-arrow search among them) — a pane in that state
+    /// must receive SS3 arrows, not the normal-mode `\E[A`, or the binding
+    /// never fires. Cooked and raw routing alike.
+    #[test]
+    fn arrows_follow_the_focused_panes_application_cursor_mode() {
+        let mut app = mk_app();
+        let focused = app.focused;
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+
+        handle_key(&mut app, up);
+        assert_eq!(app.runtimes.get(&focused).unwrap().input, b"\x1b[A");
+
+        app.runtimes.get_mut(&focused).unwrap().app_cursor = true;
+        app.runtimes.get_mut(&focused).unwrap().input.clear();
+        handle_key(&mut app, up);
+        assert_eq!(app.runtimes.get(&focused).unwrap().input, b"\x1bOA");
+
+        // Raw routing forwards plain arrows through the same upgrade...
+        app.apply(Action::ToggleRaw);
+        app.runtimes.get_mut(&focused).unwrap().input.clear();
+        handle_key(&mut app, up);
+        assert_eq!(app.runtimes.get(&focused).unwrap().input, b"\x1bOA");
+        // ...while Alt+Up keeps its meta-ESC + CSI form: a modified cursor
+        // key is never sent as SS3, DECCKM or not.
+        app.runtimes.get_mut(&focused).unwrap().input.clear();
+        handle_key(&mut app, alt(KeyCode::Up));
+        assert_eq!(app.runtimes.get(&focused).unwrap().input, b"\x1b\x1b[A");
     }
 
     /// C22: float-first hit-test ordering (a click inside its centered rect

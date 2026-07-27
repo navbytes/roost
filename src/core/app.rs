@@ -779,6 +779,14 @@ impl<B: PaneBackend> App<B> {
         self.runtimes.get(&self.focused).map(|rt| rt.kitty_disambiguate()).unwrap_or(false)
     }
 
+    /// Whether the focused pane's app enabled DECCKM application cursor keys
+    /// mode, so the input layer sends cursor keys as SS3 the way a real
+    /// terminal would (zsh's `smkx`-bound widgets — atuin's up-arrow among
+    /// them — listen for exactly those sequences).
+    pub fn focused_app_cursor(&self) -> bool {
+        self.runtimes.get(&self.focused).map(|rt| rt.app_cursor_keys()).unwrap_or(false)
+    }
+
     /// Is a socket message claiming to be `id` carrying that pane's token?
     /// Guards session/status updates against cross-pane spoofing over the
     /// shared socket. Fails closed: unknown pane or missing token → rejected.

@@ -143,6 +143,11 @@ impl PaneBackend for PtyPane {
         self.kitty.disambiguate()
     }
 
+    fn app_cursor_keys(&self) -> bool {
+        // vt100 tracks DECCKM (`CSI ?1h` / `?1l`) from the pane's own output.
+        self.parser.screen().application_cursor()
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         // Typing means "I'm back" — snap to the live tail.
         if self.scroll != 0 {
