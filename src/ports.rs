@@ -203,10 +203,11 @@ pub mod fakes {
                 self.ext.unwrap_or(self.status)
             }
         }
+        /// Mirrors `StatusTracker`'s contract: an extension-reported `Exited`
+        /// is demoted to `Waiting` — only `on_exit` (the PTY EOF) marks a
+        /// pane dead.
         fn set_extension_status(&mut self, s: AgentStatus) {
-            if s == AgentStatus::Exited {
-                self.exited = true;
-            }
+            let s = if s == AgentStatus::Exited { AgentStatus::Waiting } else { s };
             self.ext = Some(s);
         }
         fn on_exit(&mut self) {

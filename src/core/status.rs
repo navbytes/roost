@@ -67,10 +67,20 @@ impl StatusTracker {
         self.exited = true;
     }
 
+    /// An extension/hook reported `s`. An `Exited` report is demoted to
+    /// `Waiting`: process death has exactly one ground truth — the PTY EOF
+    /// (`on_exit`) — and a socket "exited" is hearsay. The pane's env
+    /// (ROOST_PANE/ROOST_TOKEN) is inherited by every descendant process, so
+    /// a *nested* pi — a subagent, a one-shot `pi -p` run by the agent's own
+    /// bash tool, a pi launched by hand inside a shell pane — loads the same
+    /// global extension and reports its `session_shutdown` as this pane when
+    /// it finishes its work, while the pane's real child is alive and well.
+    /// Believing it would render a live pane dead (with Enter then killing
+    /// the live agent to "relaunch" it). When the process really is exiting,
+    /// the EOF lands moments later and marks the pane dead for real; a
+    /// session that ended without death is exactly "at rest" — Waiting.
     pub fn set_extension_status(&mut self, s: AgentStatus) {
-        if s == AgentStatus::Exited {
-            self.exited = true;
-        }
+        let s = if s == AgentStatus::Exited { AgentStatus::Waiting } else { s };
         self.extension_status = Some(s);
         self.ext_at = Some(Instant::now());
     }
@@ -163,18 +173,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extension_status_wins_and_exit_is_sticky() {
+    fn extension_status_wins_and_pty_exit_is_sticky() {
         let mut t = StatusTracker::new();
         assert_eq!(t.current(), AgentStatus::Idle);
         t.on_output();
         assert_eq!(t.current(), AgentStatus::Working);
         t.set_extension_status(AgentStatus::NeedsInput);
         assert_eq!(t.current(), AgentStatus::NeedsInput);
-        t.set_extension_status(AgentStatus::Exited);
-        t.set_extension_status(AgentStatus::Working);
-        // exited is sticky even if a late event arrives
+        // The PTY EOF marks the pane dead — sticky even if a late extension
+        // event (a slow hook's final report) arrives afterwards.
         t.on_exit();
+        t.set_extension_status(AgentStatus::Working);
         assert_eq!(t.current(), AgentStatus::Exited);
+    }
+
+    /// A socket-reported "exited" must never kill a live pane. The pane's env
+    /// is inherited by every descendant process, so a nested pi (a subagent,
+    /// a one-shot `pi -p` tool call, a pi run inside a shell pane) reports
+    /// *its* session_shutdown as this pane the moment it finishes its work —
+    /// while the pane's real child is alive. The report settles the pane to
+    /// Waiting; fresh output resurrects Working as usual. Only the PTY EOF
+    /// (`on_exit`) is terminal.
+    #[test]
+    fn extension_exited_is_advisory_and_never_kills_a_live_pane() {
+        let mut t = StatusTracker::new();
+        t.set_extension_status(AgentStatus::Working);
+        t.set_extension_status(AgentStatus::Exited);
+        assert_eq!(t.current(), AgentStatus::Waiting);
+        // The pane's real child prints again → Working, no dead relic.
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::Working);
+        t.set_extension_status(AgentStatus::Working);
+        assert_eq!(t.current(), AgentStatus::Working);
     }
 
     #[test]

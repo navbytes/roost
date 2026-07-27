@@ -11,7 +11,7 @@
  * carries the pane's ROOST_TOKEN; roost rejects any whose token doesn't match
  * the pane it claims to be, so one pane can't spoof another's status/session:
  *   { pane, token, event: "session"  , session: "<uuid>" }
- *   { pane, token, event: "status"   , status: "working" | "waiting" | "needs_input" | "exited" }
+ *   { pane, token, event: "status"   , status: "working" | "waiting" | "needs_input" }
  */
 import * as net from "node:net";
 import * as os from "node:os";
@@ -87,8 +87,15 @@ export default function (pi: ExtensionAPI) {
     if (isAsk(event.toolName)) send({ event: "status", status: "working" });
   });
 
+  // Deliberately NO status report on shutdown: "the process died" has exactly
+  // one ground truth — roost sees the pane's PTY hit EOF the moment its child
+  // exits. This extension also runs in *nested* pi processes (a subagent, a
+  // one-shot `pi -p` tool call, a pi launched by hand inside a shell pane —
+  // they all inherit ROOST_PANE/ROOST_TOKEN), so a shutdown report from here
+  // would mark the pane exited whenever a nested pi merely finished its work,
+  // while the pane's real process is alive. Roost demotes any "exited" a
+  // stale extension still sends to "waiting" for the same reason.
   pi.on("session_shutdown", async () => {
-    send({ event: "status", status: "exited" });
     sock?.end();
   });
 }

@@ -7,6 +7,12 @@
 //!   { "pane": "3", "token": "<hex>", "event": "session", "session": "<uuid>" }
 //!   { "pane": "3", "token": "<hex>", "event": "status",  "status": "working"
 //!                                    | "waiting" | "needs_input" | "exited" }
+//!
+//! "exited" is still accepted for stale extensions but is advisory only —
+//! `StatusTracker::set_extension_status` demotes it to Waiting. Process death
+//! has exactly one ground truth (the pane's PTY EOF): the pane's env is
+//! inherited by every descendant, so a nested pi finishing its work would
+//! otherwise report *its* shutdown as the pane's death.
 
 use anyhow::{bail, Result};
 use serde::Deserialize;
