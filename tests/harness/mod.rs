@@ -175,16 +175,26 @@ impl Harness {
         &self.state_dir
     }
 
-    /// Send Alt+q and wait for roost to exit on its own. Returns the elapsed
-    /// time on a clean exit; force-kills the process and returns `None` if
-    /// it's still alive after `timeout` (the historical quit-freeze
-    /// regression — ROADMAP "Alt+q freeze fix").
+    /// Quit roost the way a user would and wait for it to exit. Returns the
+    /// elapsed time on a clean exit; force-kills the process and returns
+    /// `None` if it's still alive after `timeout` (the historical
+    /// quit-freeze regression — ROADMAP "Alt+q freeze fix").
+    ///
+    /// U1 (SPEC-ux): a busy fleet arms a second-press confirm instead of
+    /// quitting, so after a grace window with roost still alive the harness
+    /// presses Alt+q once more — exactly what a user does at the prompt. A
+    /// quiet fleet exits on the first press and never reaches the second.
     pub fn quit_and_wait(&mut self, timeout: Duration) -> Option<Duration> {
         self.write_bytes(ALT_Q);
         let start = Instant::now();
+        let mut confirmed = false;
         loop {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return Some(start.elapsed());
+            }
+            if !confirmed && start.elapsed() >= Duration::from_millis(700) {
+                self.write_bytes(ALT_Q); // answer the U1 busy-quit confirm
+                confirmed = true;
             }
             if start.elapsed() >= timeout {
                 let _ = self.child.kill();

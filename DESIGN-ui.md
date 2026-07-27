@@ -276,6 +276,11 @@ extra redraw scheduling. Only Working `●` pulses — never `◆` (steady red =
 (`theme::pulse_phase(elapsed) -> Color` or equivalent) with unit tests at the
 boundaries: 0 → ACCENT, 549 → ACCENT, 550 → ACCENT_DIM, 1100 → ACCENT.
 
+[Amended 2026-07-27: one sanctioned exception to "pulse: yes" — a scrolled
+pane's corner badge shows Working steady (no pulse) while its view is frozen
+in history, per C4's N1 carve-out. The table above describes live views; C4
+owns the frozen-view composition.]
+
 ### C6 — Stack header row
 
 **Current:** none — stack members are laid out directly (`layout.rs:302–322`);
@@ -1097,9 +1102,15 @@ not a benchmark suite.
   2. **No draw starvation:** pane A's on-screen region differs between
      consecutive 500 ms samples for the whole run (the firehose visibly
      keeps flowing — bounded, not frozen).
-  3. **Clean exit under load:** send Alt+q (`0x1b q` — meta-ESC) mid-spew;
-     the roost process exits within **2 s** and no child of it survives
+  3. **Clean exit under load:** quit mid-spew; the roost process exits
+     within **2 s** of the first keypress and no child of it survives
      (the historical quit-freeze regression, ROADMAP "Alt+q freeze fix").
+     Mid-spew the fleet is busy, so per U1 (SPEC-ux) the first Alt+q arms
+     the second-press confirm — the harness's `quit_and_wait` answers it
+     like a user would (second Alt+q after a short grace window); a quiet
+     fleet still exits on the single press. [Amended 2026-07-27: U1's
+     busy-quit guard made a lone mid-spew Alt+q deliberately insufficient;
+     the 2 s budget is unchanged and now covers both presses.]
 - Skipped on runners without a functional PTY (compile-time cfg or runtime
   skip with a printed reason) — same stance as the golden-frame assessment.
 
