@@ -269,8 +269,7 @@ impl QueryResponder {
 
 /// DECRQM answer for one DEC private mode: 1 = set, 2 = reset for the modes
 /// the pane's vt100 screen genuinely tracks; 0 = "not recognized" for
-/// everything else. Mode 2026 (synchronized output) deliberately stays 0
-/// until W3 actually implements it — never claim capacity that isn't there.
+/// everything else — never claim capacity that isn't there.
 fn decrqm_value(mode: u16, screen: &vt100::Screen) -> u8 {
     match mode {
         // DECCKM — application cursor keys.
@@ -293,6 +292,17 @@ fn decrqm_value(mode: u16, screen: &vt100::Screen) -> u8 {
         // Bracketed paste.
         2004 => {
             if screen.bracketed_paste() {
+                1
+            } else {
+                2
+            }
+        }
+        // P1: synchronized output. roost now honors the bracket (the
+        // renderer presents the last complete frame while it's open), so
+        // this answers honestly instead of the pre-W3 "not recognized" — an
+        // app that asks before wrapping its redraws gets a yes it can act on.
+        2026 => {
+            if screen.synchronized_output() {
                 1
             } else {
                 2
@@ -435,10 +445,14 @@ mod tests {
             // Bracketed paste: reset by default, set after ?2004h.
             (b"", b"\x1b[?2004$p", b"\x1b[?2004;2$y"),
             (b"\x1b[?2004h", b"\x1b[?2004$p", b"\x1b[?2004;1$y"),
-            // Untracked modes — 2026 (sync output), 1004 (focus), 1049 (alt
-            // screen is tracked by vt100 but not contracted here) → 0, "not
+            // P1: synchronized output is tracked now — reset by default, set
+            // inside a bracket. (Pre-W3 this reported 0, "not recognized".)
+            (b"", b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
+            (b"\x1b[?2026h", b"\x1b[?2026$p", b"\x1b[?2026;1$y"),
+            (b"\x1b[?2026h\x1b[?2026l", b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
+            // Still untracked — 1004 (focus reporting), and 1049 (alt screen
+            // is tracked by vt100 but not contracted here) → 0, "not
             // recognized": never affirm state roost doesn't hold.
-            (b"", b"\x1b[?2026$p", b"\x1b[?2026;0$y"),
             (b"", b"\x1b[?1004$p", b"\x1b[?1004;0$y"),
         ];
         for (setup, query, reply) in cases {

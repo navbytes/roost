@@ -46,6 +46,30 @@ impl Grid {
         }
     }
 
+    /// A copy of this grid holding only its *visible* rows: the banked
+    /// scrollback is dropped and the view offset reset to the live tail.
+    /// Backs `Screen::snapshot` (SPEC-parity P1) — cloning the history too
+    /// would copy up to `scrollback_len` rows on every synchronized-output
+    /// bracket, and a snapshot is only ever presented as the current frame.
+    /// Fields are listed explicitly so a new one fails to compile here
+    /// rather than silently vanishing from snapshots.
+    // roost: added for SPEC-parity P1.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            size: self.size,
+            pos: self.pos,
+            saved_pos: self.saved_pos,
+            rows: self.rows.clone(),
+            scroll_top: self.scroll_top,
+            scroll_bottom: self.scroll_bottom,
+            origin_mode: self.origin_mode,
+            saved_origin_mode: self.saved_origin_mode,
+            scrollback: std::collections::VecDeque::new(),
+            scrollback_len: self.scrollback_len,
+            scrollback_offset: 0,
+        }
+    }
+
     fn new_row(&self) -> crate::row::Row {
         crate::row::Row::new(self.size.cols)
     }

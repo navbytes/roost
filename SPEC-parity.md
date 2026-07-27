@@ -47,7 +47,14 @@ bug). Severity is impact for a user supervising AI-agent panes.
 
 ## P0 — breaks the agent-supervision loop
 
-### P1 · CONFIRMED · High — synchronized output (mode 2026) neither honored nor forwarded
+### P1 · FIXED (this branch) · High — synchronized output (mode 2026) neither honored nor forwarded
+*Fixed: the vendored parser tracks mode 2026 and captures the last complete
+frame at the exact stream position of `?2026h` (`Screen::snapshot` — visible
+grids only, no history clone); `PtyPane` presents that frame from `screen()`
+and `grab_text` until the bracket closes, with a 150 ms staleness cap so a
+stuck bracket can never freeze a pane. DECRQM 2026 now answers 1/2 instead of
+0. e2e `tests/pane_sync_output.rs`: 29/60 `roost read` samples caught the pane
+mid-bracket before, 0/60 after.*
 Apps wrap redraws in `CSI ?2026h … ?2026l` expecting atomic presentation —
 the mechanism behind a year of "Claude Code flickers/tears in tmux" reports
 (claude-code #37283; tmux PR #4744; zellij #4693). roost's vt100 has no 2026
@@ -59,8 +66,15 @@ reaches the host.
 is open, the renderer presents that pane's *last pre-bracket* grid (with a
 staleness cap so a stuck bracket can't freeze the pane); answer DECRQM 2026
 honestly per what ships (see W2). *(The DECRQM half shipped with W2: 2026 —
-like every untracked mode — now answers `0`, "not recognized"; flip it to
-1/2 when this item lands.)*
+like every untracked mode — answered `0`, "not recognized"; W3 flipped it to
+1/2.)*
+**Split, deliberate:** the presentation view serves the surfaces that answer
+"what does this pane look like right now" — the blit, the host cursor,
+copy-mode extraction, and `roost read`'s screen mode. Scroll state, the input
+modes, and `read --full`/`--tail` stay on the live grid: the snapshot is a
+≤150 ms veneer over the visible frame, never a second terminal state (it
+carries no scrollback at all, which is also why a scrolled-back pane ignores
+it — U3's frozen view wins).
 
 ### P2 · CONFIRMED · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
 Claude Code emits desktop notifications via OSC 9 and progress via OSC 9;4

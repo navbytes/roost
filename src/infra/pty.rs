@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::agents::CommandSpec;
 use crate::core::event::AppEvent;
@@ -19,6 +20,34 @@ use crate::infra::queries::QueryResponder;
 use crate::ports::{MouseProto, Observation, PaneBackend};
 
 const SCROLLBACK_LINES: usize = 5000;
+
+/// P1: how long an open synchronized-output bracket (mode 2026) may keep the
+/// pre-bracket frame on screen. Real brackets close within a frame or two; a
+/// stuck one — an app killed mid-redraw, a bug that never sends `?2026l` —
+/// must never freeze the pane, so past the cap the live grid is presented
+/// again. Torn beats frozen.
+const SYNC_STALE_CAP: Duration = Duration::from_millis(150);
+
+/// P1: which screen to *present* — the last complete frame while a
+/// synchronized-output bracket is open and fresh, else the live grid. Pure
+/// (the cap is a parameter) so the stuck-bracket expiry is unit-testable
+/// without sleeping for real.
+fn sync_presented<'a>(
+    live: &'a vt100::Screen,
+    view: Option<&'a (vt100::Screen, Instant)>,
+    cap: Duration,
+) -> &'a vt100::Screen {
+    match view {
+        // A scrolled-back view is already frozen on history the snapshot
+        // doesn't carry (`Screen::snapshot` drops the scrollback), so
+        // presenting it would yank the pane to the live tail. While the user
+        // reads history, tearing in the tail is invisible anyway — U3's
+        // frozen view wins.
+        Some(_) if live.scrollback() > 0 => live,
+        Some((snap, opened)) if opened.elapsed() < cap => snap,
+        _ => live,
+    }
+}
 
 /// P11: host-identity env vars that must never leak into a pane. The hosting
 /// terminal (iTerm2, kitty, WezTerm, VS Code) and any outer multiplexer
@@ -73,6 +102,21 @@ pub struct PtyPane {
     /// the host window's proportionally; (0, 0) = unknown. Fed to the PTY's
     /// winsize and to the XTWINOPS 14/16t replies.
     pixels: (u16, u16),
+    /// P1: while the pane's app holds a synchronized-output bracket (mode
+    /// 2026) open, the last frame it declared complete — captured by the
+    /// parser at the exact stream position of the `?2026h` — plus when the
+    /// bracket opened (for `SYNC_STALE_CAP`). This is what `screen()` and
+    /// `grab_text` present: the app asked for its in-progress redraw not to
+    /// be shown, and a half-drawn grid is exactly what P1 measured leaking
+    /// into both the TUI and `roost read`.
+    ///
+    /// Deliberately NOT consulted by scroll state (`scroll_offset`/
+    /// `scroll_total`/`set_scrollback`/`scroll_by`), full-history reads
+    /// (`grab_all_text`), or the input-mode accessors: those answer for the
+    /// live grid, which stays the single source of truth. The snapshot is a
+    /// ≤150 ms presentation veneer over the visible frame, not a second
+    /// terminal state.
+    sync_view: Option<(vt100::Screen, Instant)>,
     /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
     /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
     /// id. Without this, a pane id that is reused (close→new) or respawned
@@ -80,6 +124,19 @@ pub struct PtyPane {
     /// and be flipped straight back to "dead", or get old bytes rendered into
     /// the new pane.
     alive: Arc<AtomicBool>,
+}
+
+impl PtyPane {
+    /// P1: the screen roost *presents* for this pane — the last complete
+    /// frame while a synchronized-output bracket is open (and fresh), else
+    /// the live grid. Every surface that shows the user what the pane looks
+    /// like right now goes through here: `screen()` (blit + host cursor) and
+    /// `grab_text` (copy-mode selection, `roost read`'s screen mode — the
+    /// surface P1 measured 31/50 torn samples on). History and state
+    /// surfaces deliberately do not; see `sync_view`.
+    fn presented(&self) -> &vt100::Screen {
+        sync_presented(self.parser.screen(), self.sync_view.as_ref(), SYNC_STALE_CAP)
+    }
 }
 
 impl PaneBackend for PtyPane {
@@ -162,6 +219,7 @@ impl PaneBackend for PtyPane {
             pid,
             queries: QueryResponder::new(),
             pixels,
+            sync_view: None,
             alive,
         })
     }
@@ -182,6 +240,17 @@ impl PaneBackend for PtyPane {
         let reply = self.queries.feed(bytes, self.parser.screen(), self.pixels);
         if !reply.is_empty() {
             self.write_input_raw(&reply);
+        }
+        // P1: adopt/retire the synchronized-output presentation view. The
+        // parser hands back a capture exactly once per bracket that opened
+        // in this chunk (a reopen replaces the previous one — the newer
+        // capture is the frame the app just finished); once no bracket is
+        // open, the live grid is current again and the veneer goes away.
+        if let Some(snap) = self.parser.take_sync_snapshot() {
+            self.sync_view = Some((snap, Instant::now()));
+        }
+        if !self.parser.screen().synchronized_output() {
+            self.sync_view = None;
         }
         self.status.on_output();
     }
@@ -302,8 +371,12 @@ impl PaneBackend for PtyPane {
         }
     }
 
+    /// P1: the *presentation* view (see `PtyPane::presented`), so the
+    /// renderer's blit and cursor placement can never show a frame the app
+    /// declared incomplete. Transparent to the caller — the renderer asks
+    /// for "the pane's screen" exactly as before.
     fn screen(&self) -> Option<&vt100::Screen> {
-        Some(self.parser.screen())
+        Some(self.presented())
     }
 
     fn set_scrollback(&mut self, lines: usize) {
@@ -356,10 +429,17 @@ impl PaneBackend for PtyPane {
         inspect::observe(self.pid?, known)
     }
 
+    /// P1: reads the *presented* frame, not the live grid — this is what the
+    /// user sees (copy-mode selection) and what `roost read` reports for the
+    /// visible screen, the exact surface P1 measured mid-bracket tearing on.
     fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
-        extract_selection(self.parser.screen(), start, end)
+        extract_selection(self.presented(), start, end)
     }
 
+    /// P1 (the other side of the split): the full history read stays on the
+    /// live grid. The presentation snapshot carries no scrollback by design,
+    /// and `read --full`/`--tail` is a question about the pane's whole
+    /// recorded output, not about the frame currently on screen.
     fn grab_all_text(&self) -> String {
         self.parser.screen().all_contents()
     }
@@ -397,14 +477,89 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_selection, scrub_host_identity, HOST_IDENTITY_VARS};
+    use super::{
+        extract_selection, scrub_host_identity, sync_presented, HOST_IDENTITY_VARS,
+        SYNC_STALE_CAP,
+    };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
+    use std::time::{Duration, Instant};
 
     fn screen_with(text: &str, rows: u16, cols: u16) -> vt100::Parser {
         let mut p = vt100::Parser::new(rows, cols, 0);
         p.process(text.as_bytes());
         p
+    }
+
+    /// P1: with no bracket open there is nothing to present but the live
+    /// grid — the veneer costs nothing in the overwhelmingly common case.
+    #[test]
+    fn sync_presents_the_live_grid_when_no_bracket_is_open() {
+        let p = screen_with("live", 4, 20);
+        let presented = sync_presented(p.screen(), None, SYNC_STALE_CAP);
+        assert!(presented.contents().contains("live"));
+    }
+
+    /// P1: a fresh bracket presents the captured frame, not the half-drawn
+    /// live grid — the whole point of mode 2026.
+    #[test]
+    fn sync_presents_the_captured_frame_while_the_bracket_is_fresh() {
+        let mut p = vt100::Parser::new(4, 20, 0);
+        p.process(b"complete");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Htorn");
+        let snap = p.take_sync_snapshot().expect("bracket open captures");
+        let view = Some((snap, Instant::now()));
+        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP);
+        assert!(presented.contents().contains("complete"));
+        assert!(!presented.contents().contains("torn"));
+    }
+
+    /// P1's safety valve: a bracket that never closes (an app killed
+    /// mid-redraw) must not freeze the pane forever. Past `SYNC_STALE_CAP`
+    /// the live grid is presented again — torn beats frozen. Pure, so the
+    /// expiry is proven without sleeping 150 ms.
+    #[test]
+    fn a_stuck_bracket_expires_at_the_staleness_cap() {
+        let mut p = vt100::Parser::new(4, 20, 0);
+        p.process(b"complete");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hhalf-drawn");
+        let snap = p.take_sync_snapshot().expect("bracket open captures");
+
+        // One tick shy of the cap: still the captured frame.
+        let fresh = Some((snap.clone(), Instant::now() - SYNC_STALE_CAP + Duration::from_millis(1)));
+        assert!(sync_presented(p.screen(), fresh.as_ref(), SYNC_STALE_CAP)
+            .contents()
+            .contains("complete"));
+
+        // Past it: the live grid, however torn — the pane keeps moving even
+        // though the app never sent `?2026l`.
+        let stale = Some((snap, Instant::now() - SYNC_STALE_CAP - Duration::from_millis(1)));
+        let presented = sync_presented(p.screen(), stale.as_ref(), SYNC_STALE_CAP);
+        assert!(presented.contents().contains("half-drawn"));
+        assert!(!presented.contents().contains("complete"));
+    }
+
+    /// P1 × U3: a scrolled-back view is already frozen on history, which the
+    /// snapshot deliberately doesn't carry — presenting it would yank the
+    /// pane to the live tail mid-read. The live (scroll-offset) grid wins.
+    #[test]
+    fn a_scrolled_view_ignores_the_sync_snapshot() {
+        let mut p = vt100::Parser::new(4, 20, 100);
+        for i in 0..20 {
+            p.process(format!("row{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hredrawing");
+        let snap = p.take_sync_snapshot().expect("bracket open captures");
+        let view = Some((snap, Instant::now()));
+        // Scrolled to the live tail: the snapshot presents as usual.
+        assert!(sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP)
+            .contents()
+            .contains("row19"));
+        // Scrolled into history: the live grid's own scrolled view wins.
+        p.set_scrollback(5);
+        assert!(p.screen().scrollback() > 0);
+        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP);
+        assert_eq!(presented.contents(), p.screen().contents());
     }
 
     /// P11: every known host-identity var is removed (whether it came from

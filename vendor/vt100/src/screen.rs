@@ -6,6 +6,43 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+// roost: synchronized output, DEC private mode 2026 (SPEC-parity P1).
+const MODE_SYNCHRONIZED_OUTPUT: u8 = 0b0010_0000;
+
+/// A side effect the processed byte stream asked for that an in-memory
+/// screen cannot carry out itself: it needs the *embedder* — the thing that
+/// owns a real host terminal, a clipboard, a notification daemon.
+///
+/// Accumulated in stream order while `process` runs and drained with
+/// [`Screen::take_effects`] (or [`crate::Parser::take_effects`]).
+// roost: the vendored parser's event surface (SPEC-parity W3). Upstream's
+// `Perform` impl can only mutate grid state, so every sequence that means
+// "do something out there" died in an unhandled arm. This is the one piece
+// of plumbing P2 (notifications), P3 (clipboard) and P7 (cursor shape) all
+// needed; the arms that produce each variant are documented at their
+// `osc_dispatch`/`csi_dispatch` sites.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Effect {
+    /// A desktop notification: OSC 9 (`9 ; body`) or OSC 777
+    /// (`777 ; notify ; title ; body`). SPEC-parity P2.
+    Notify {
+        /// Present only for OSC 777, which carries an explicit title.
+        title: Option<String>,
+        body: String,
+    },
+    /// An OSC 52 clipboard *write* (`52 ; <selection> ; <base64>`).
+    /// SPEC-parity P3. Read requests (`52 ; <selection> ; ?`) are
+    /// deliberately never surfaced — answering one would hand the
+    /// application the host clipboard's contents (a paste-theft vector).
+    Osc52Write {
+        selection: String,
+        payload_base64: String,
+    },
+    /// DECSCUSR (`CSI Ps SP q`) — the cursor shape the application wants:
+    /// 0/1 blinking block, 2 steady block, 3 blinking underline, 4 steady
+    /// underline, 5 blinking bar, 6 steady bar. SPEC-parity P7.
+    CursorShape(u8),
+}
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -80,6 +117,19 @@ pub struct Screen {
     visual_bell_count: usize,
 
     errors: usize,
+
+    // roost: pending stream effects (SPEC-parity W3), drained by the
+    // embedder via `take_effects` after each `process` call.
+    effects: Vec<Effect>,
+    // roost: the screen as it was when the currently-open synchronized-output
+    // bracket (mode 2026) opened — captured at the exact stream position of
+    // the `?2026h`, so an embedder can keep presenting the last *complete*
+    // frame while the application redraws (SPEC-parity P1). `None` outside a
+    // bracket, and once the embedder has taken it. Deliberately built with
+    // `snapshot` rather than `clone`: no banked history rides along (see
+    // `Screen::snapshot`), and the copy's own `sync_snapshot`/`effects` are
+    // always empty — no recursion, no double-delivered effects.
+    sync_snapshot: Option<Box<Screen>>,
 }
 
 impl Screen {
@@ -107,6 +157,44 @@ impl Screen {
             visual_bell_count: 0,
 
             errors: 0,
+
+            effects: Vec::new(),
+            sync_snapshot: None,
+        }
+    }
+
+    /// A copy of this screen carrying only what it takes to *present* the
+    /// current frame: the visible grids, cursor, attrs, title and modes.
+    /// The banked scrollback is deliberately left behind — a full `clone`
+    /// would deep-copy up to `scrollback_len` rows (megabytes) every time an
+    /// application opens a synchronized-output bracket, i.e. once per redraw
+    /// on a spinner. Every field is spelled out so that a new one added to
+    /// `Screen` fails to compile here rather than being silently dropped.
+    // roost: added for SPEC-parity P1.
+    fn snapshot(&self) -> Self {
+        Self {
+            grid: self.grid.snapshot(),
+            alternate_grid: self.alternate_grid.snapshot(),
+
+            attrs: self.attrs,
+            saved_attrs: self.saved_attrs,
+
+            title: self.title.clone(),
+            icon_name: self.icon_name.clone(),
+
+            modes: self.modes,
+            mouse_protocol_mode: self.mouse_protocol_mode,
+            mouse_protocol_encoding: self.mouse_protocol_encoding,
+
+            audible_bell_count: self.audible_bell_count,
+            visual_bell_count: self.visual_bell_count,
+
+            errors: self.errors,
+
+            // A snapshot is a presentation artifact, never a second event
+            // source: effects belong to the live screen alone.
+            effects: Vec::new(),
+            sync_snapshot: None,
         }
     }
 
@@ -727,6 +815,36 @@ impl Screen {
         self.mode(MODE_BRACKETED_PASTE)
     }
 
+    /// Returns whether a synchronized-output bracket is open (DEC private
+    /// mode 2026, `CSI ?2026h` … `CSI ?2026l`): the application has asked
+    /// for its in-progress redraw not to be presented until it closes.
+    // roost: added for SPEC-parity P1.
+    #[must_use]
+    pub fn synchronized_output(&self) -> bool {
+        self.mode(MODE_SYNCHRONIZED_OUTPUT)
+    }
+
+    /// Takes (clearing) the screen as it stood the instant the current
+    /// synchronized-output bracket opened. `Some` exactly once per bracket
+    /// that opened in the bytes processed since the last call; the caller
+    /// then owns that last-complete frame and may present it until
+    /// `synchronized_output` reports the bracket closed — with its own
+    /// staleness policy for a bracket that never does.
+    // roost: added for SPEC-parity P1.
+    #[must_use]
+    pub fn take_sync_snapshot(&mut self) -> Option<Self> {
+        self.sync_snapshot.take().map(|s| *s)
+    }
+
+    /// Drains the side effects (notifications, clipboard writes, cursor
+    /// shapes) requested by the bytes processed since the last call, in
+    /// stream order.
+    // roost: added for SPEC-parity W3.
+    #[must_use]
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
+
     /// Returns the currently active `MouseProtocolMode`
     #[must_use]
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
@@ -1154,6 +1272,11 @@ impl Screen {
         let audible_bell_count = self.audible_bell_count;
         let visual_bell_count = self.visual_bell_count;
         let errors = self.errors;
+        // roost: pending effects survive a reset the way the bell counts do
+        // — they are signals already handed to the embedder's queue, not
+        // screen state. The sync snapshot does NOT survive: a full reset
+        // ends any open bracket, so there is no frame left to present.
+        let effects = std::mem::take(&mut self.effects);
 
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
 
@@ -1162,6 +1285,7 @@ impl Screen {
         self.audible_bell_count = audible_bell_count;
         self.visual_bell_count = visual_bell_count;
         self.errors = errors;
+        self.effects = effects;
     }
 
     // ESC g
@@ -1318,6 +1442,18 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 &[2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                // roost: synchronized output (SPEC-parity P1). Opening a
+                // bracket captures the screen at this exact stream position
+                // — the last frame the application considered complete —
+                // for the embedder to keep presenting while the redraw
+                // runs. A redundant `?2026h` *inside* an open bracket must
+                // NOT re-capture: the screen is mid-redraw (torn) by then.
+                &[2026] => {
+                    if !self.mode(MODE_SYNCHRONIZED_OUTPUT) {
+                        self.sync_snapshot = Some(Box::new(self.snapshot()));
+                    }
+                    self.set_mode(MODE_SYNCHRONIZED_OUTPUT);
+                }
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1377,6 +1513,14 @@ impl Screen {
                     self.decrc();
                 }
                 &[2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                // roost: closing the synchronized-output bracket
+                // (SPEC-parity P1) — the redraw finished, so the live grid
+                // *is* the frame to present; drop any capture the embedder
+                // hasn't taken rather than leave a stale one behind.
+                &[2026] => {
+                    self.clear_mode(MODE_SYNCHRONIZED_OUTPUT);
+                    self.sync_snapshot = None;
+                }
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1821,4 +1965,119 @@ fn osc_param_str(params: &[&[u8]]) -> String {
         .map(|b| format!("\"{}\"", std::string::String::from_utf8_lossy(b)))
         .collect();
     strs.join(" ; ")
+}
+
+// roost: vendor-side tests for the arms this fork adds (SPEC-parity W3).
+// Upstream keeps its tests in an out-of-crate `tests/` tree that the
+// published crate this vendoring started from strips, so the fork's own
+// coverage lives in-module: `cargo test -p vt100` exercises it with nothing
+// but the crate's real dependencies.
+#[cfg(test)]
+mod roost_tests {
+    fn parser() -> crate::Parser {
+        crate::Parser::new(6, 20, 50)
+    }
+
+    // -- synchronized output, mode 2026 (SPEC-parity P1) ------------------
+
+    #[test]
+    fn mode_2026_tracks_set_and_reset() {
+        let mut p = parser();
+        assert!(!p.screen().synchronized_output());
+        p.process(b"\x1b[?2026h");
+        assert!(p.screen().synchronized_output());
+        p.process(b"\x1b[?2026l");
+        assert!(!p.screen().synchronized_output());
+    }
+
+    #[test]
+    fn sync_snapshot_captures_the_exact_pre_bracket_screen() {
+        let mut p = parser();
+        p.process(b"complete frame");
+        // One chunk: the bracket opens, the screen is cleared, the redraw
+        // begins. The capture must hold the state at the `?2026h` — not the
+        // chunk's start, not its end.
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Htorn");
+        assert!(p.screen().synchronized_output());
+        assert!(p.screen().contents().contains("torn"));
+        let snap = p.take_sync_snapshot().expect("an opened bracket captures");
+        assert!(snap.contents().contains("complete frame"));
+        assert!(!snap.contents().contains("torn"));
+        // Taken means taken: the frame is the embedder's now.
+        assert!(p.take_sync_snapshot().is_none());
+    }
+
+    #[test]
+    fn redundant_sync_open_does_not_recapture_mid_redraw() {
+        let mut p = parser();
+        p.process(b"good");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hbad\x1b[?2026h");
+        let snap = p.take_sync_snapshot().expect("the first open captured");
+        assert!(snap.contents().contains("good"));
+        assert!(!snap.contents().contains("bad"));
+    }
+
+    #[test]
+    fn sync_close_drops_an_untaken_snapshot() {
+        let mut p = parser();
+        p.process(b"old");
+        // Bracket opens and closes inside one chunk: the redraw completed,
+        // so the live screen is current and nothing needs presenting in its
+        // stead.
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew\x1b[?2026l");
+        assert!(!p.screen().synchronized_output());
+        assert!(p.take_sync_snapshot().is_none());
+        assert!(p.screen().contents().contains("new"));
+    }
+
+    #[test]
+    fn sync_reopen_captures_the_frame_the_previous_bracket_completed() {
+        let mut p = parser();
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hframe one\x1b[?2026l");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hframe two");
+        let snap = p.take_sync_snapshot().expect("the reopen captured");
+        assert!(snap.contents().contains("frame one"));
+        assert!(!snap.contents().contains("frame two"));
+        assert!(p.screen().synchronized_output());
+    }
+
+    #[test]
+    fn a_snapshot_presents_the_frame_without_carrying_history() {
+        // `Screen::snapshot` deliberately drops the banked scrollback (a
+        // full clone would copy megabytes per redraw). The visible frame,
+        // cursor state and title all survive; the history does not.
+        let mut p = parser();
+        for i in 0..30 {
+            p.process(format!("history{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b]2;the title\x07\x1b[?25l");
+        assert!(p.screen().scrollback_rows() > 0);
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Htorn");
+        let snap = p.take_sync_snapshot().expect("captured");
+        assert_eq!(snap.size(), p.screen().size());
+        assert_eq!(snap.title(), "the title");
+        assert!(snap.hide_cursor());
+        assert!(snap.contents().contains("history29"));
+        assert_eq!(snap.scrollback_rows(), 0, "history must not ride along");
+        assert_eq!(snap.scrollback(), 0);
+    }
+
+    #[test]
+    fn full_reset_ends_an_open_bracket() {
+        let mut p = parser();
+        p.process(b"\x1b[?2026h");
+        assert!(p.screen().synchronized_output());
+        p.process(b"\x1bc"); // RIS
+        assert!(!p.screen().synchronized_output());
+        assert!(p.take_sync_snapshot().is_none());
+    }
+
+    // -- the effects surface ----------------------------------------------
+
+    #[test]
+    fn effects_are_empty_for_plain_output_and_untracked_sequences() {
+        let mut p = parser();
+        p.process(b"hello\x1b[31mred\x1b[0m\x1b]2;title\x07\x07\x1b[?2026h");
+        assert!(p.take_effects().is_empty());
+    }
 }

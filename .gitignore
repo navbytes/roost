@@ -1,1 +1,6 @@
 /target
+# The vendored vt100 fork carries its own in-module tests, run with
+# `cargo test --manifest-path vendor/vt100/Cargo.toml`; that generates a
+# second lockfile and target dir which are build artifacts, not source.
+/vendor/vt100/Cargo.lock
+/vendor/vt100/target
