@@ -350,13 +350,47 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+q", "quit (workspace saved; sessions live)"),
 ];
 
-fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
-    match &app.mode {
+/// U8: the rect the current mode's modal dialog occupies on screen, or None
+/// when the mode draws none — the SAME geometry `draw_mode_overlay` paints
+/// (it reads this function too), exposed so the mouse path can hit-test
+/// against exactly what's drawn. Renderer/hitbox lockstep, §4/§5.
+pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
+    let body = app.body_area();
+    let anchor = app
+        .display_rects()
+        .iter()
+        .find(|pr| pr.id == app.focused)
+        .map(|pr| pr.rect)
+        .unwrap_or(body);
+    dialog_rect(&app.mode, body, anchor)
+}
+
+/// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
+fn dialog_rect(mode: &Mode, body: Rect, anchor: Rect) -> Option<Rect> {
+    match mode {
         // Copy mode has no centered overlay — the cursor/selection are
         // drawn in-pane (C17/C24).
+        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => None,
+        Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
+        Mode::Picker { .. } => {
+            Some(centered_near(anchor, body, 32, picker_items().len() as u16 + 2))
+        }
+        Mode::Help => {
+            let h = HELP_KEYS.len() as u16 + 2;
+            Some(centered_near(anchor, body, help_dialog_width(HELP_KEYS), h.min(body.height)))
+        }
+        Mode::Feed { .. } => {
+            let (w, h) = feed_overlay_size(body);
+            Some(centered_near(anchor, body, w, h))
+        }
+    }
+}
+
+fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
+    let Some(rect) = dialog_rect(&app.mode, body, anchor) else { return };
+    match &app.mode {
         Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => {}
         Mode::Rename { buffer, target } => {
-            let rect = centered_near(anchor, body, 44, 3);
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let heading = match target {
@@ -377,7 +411,6 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
         }
         Mode::Picker { selection } => {
             let items = picker_items();
-            let rect = centered_near(anchor, body, 32, items.len() as u16 + 2);
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
@@ -410,9 +443,6 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             // pins the ≤ 20-row hard cap this relies on (80×24 body = 22
             // rows = 20 content + 2 border, zero slack).
             let keys = HELP_KEYS;
-            let h = keys.len() as u16 + 2;
-            let w = help_dialog_width(keys);
-            let rect = centered_near(anchor, body, w, h.min(body.height));
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
@@ -433,8 +463,6 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             f.render_widget(Paragraph::new(lines), inner);
         }
         Mode::Feed { offset } => {
-            let (w, h) = feed_overlay_size(body);
-            let rect = centered_near(anchor, body, w, h);
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()

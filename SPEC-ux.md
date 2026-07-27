@@ -101,7 +101,7 @@ are unreachable by keyboard entirely.
 
 ## P1 — high-value, single-lens
 
-### U8 · Med · VERIFIED — modals don't own non-keyboard input
+### U8 · Med · FIXED (this branch) — modals don't own non-keyboard input
 Three live confirmations: (a) with Rename open, clicking another pane moved
 focus and Enter committed the title to the clicked pane — frame E1 shows `ZZZ`
 on the pane that was clicked, not the pane Alt+r opened on; (b) a bracketed
@@ -111,6 +111,19 @@ scrolls the pane under the overlay (no feed gate in `handle_mouse`).
 **Proposed contract:** while a modal mode is active — mouse: wheel scrolls the
 overlay, clicks hit overlay rows or dismiss, never mutate focus/tabs beneath;
 paste: routes to the text field if one exists, else is swallowed.
+**Fixed:** `App::modal_active` gates both non-keyboard paths in the
+composition root — `handle_mouse` routes to `App::handle_modal_mouse` (with
+the dialog's drawn rect from the new `render::modal_rect`, so hit-tests match
+the screen) and `Event::Paste` to `App::handle_paste`. Nothing beneath a
+modal is mutated any more: the wheel pages the feed by its own PgUp/PgDn step
+and is swallowed elsewhere, a click launches the picker row under it
+(`mouse::picker_row_at`) or dismisses Picker/Help/Feed, and a paste fills the
+Rename buffer (printables only) or is swallowed (C12/C14 amended 2026-07-27).
+One deviation from the proposal: an outside click does **not** cancel Rename
+— it is swallowed. Rename's buffer is unsaved work, so discarding it on a
+stray click is (a)'s harm inverted; the drive's own click-during-rename check
+wants the commit to land on the pane the dialog opened on, which a cancel
+would silently drop.
 
 ### U9 · Med · FIXED (this branch) — scrollback is keyboard-hostile
 Three connected live confirmations:
@@ -203,6 +216,8 @@ tokenizing; `o` in copy mode opens the URL under the cursor.
 No number accelerators, no type-ahead, no click; `j/k` work unhinted; the
 DESIGN.md §7 "recent cwd" column never shipped.
 **Proposed contract:** `1..9` accelerators + click-to-launch; cwd column later.
+*(Click-to-launch landed with U8's modal mouse ownership — C14 amended
+2026-07-27. The accelerators, type-ahead and cwd column stay OPEN.)*
 
 ### U21 · Low · OPEN — mouse can't resize; tabs are click-to-switch only
 No border drag-resize, no middle-click close, no drag-reorder.

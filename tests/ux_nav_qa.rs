@@ -50,6 +50,13 @@ fn sgr_wheel_up(col: u16, row: u16) -> Vec<u8> {
     format!("\x1b[<64;{};{}M", col + 1, row + 1).into_bytes()
 }
 
+/// Column every wheel probe below aims at: the right half of the 120-col
+/// harness, i.e. the FOCUSED pane of the two-way split the scroll workload
+/// (`seq 1 300`) runs in. It must track the focused pane, not a fixed half:
+/// the probes used to sit at column 30 and only found history there because
+/// U8's click-during-rename bug had moved focus to the left pane for them.
+const WHEEL_COL: u16 = 90;
+
 /// Control-plane ground truth: `roost list` against this instance.
 fn cli_list(state_dir: &std::path::Path) -> serde_json::Value {
     let out = Command::new(env!("CARGO_BIN_EXE_roost"))
@@ -427,7 +434,7 @@ fn ux_navigation_session() {
 
     // wheel/key desync: wheel up, then enter scroll mode (offset starts 0)
     for _ in 0..8 {
-        h.write_bytes(&sgr_wheel_up(30, 10));
+        h.write_bytes(&sgr_wheel_up(WHEEL_COL, 10));
     }
     settle(&mut h);
     let wheeled = h.screen().contents();
@@ -450,7 +457,7 @@ fn ux_navigation_session() {
     // wheel-scrolled pane: any indicator? (U3/N1 — search everything except
     // the hint bar, whose "Alt+←↓↑→ focus" pair would false-match '↑')
     for _ in 0..8 {
-        h.write_bytes(&sgr_wheel_up(30, 10));
+        h.write_bytes(&sgr_wheel_up(WHEEL_COL, 10));
     }
     let s = frame(&mut h, "E1: wheel-scrolled pane (any indicator?)");
     let body: String = {
@@ -521,14 +528,24 @@ fn ux_navigation_session() {
             && (0..10).any(|d| l.contains(&format!(" {d} shell")))
     });
     qa.check(ided, "feed entries carry the pane id and disambiguated name (U2)");
-    let pane_before = cli_list(&sd);
-    h.write_bytes(&sgr_wheel_up(30, 10)); // wheel over the pane area, feed open
-    h.write_bytes(&sgr_wheel_up(30, 10));
+    // U8(c): with the feed up, the wheel belongs to the FEED — the pane
+    // under the overlay must stay at its live tail. Evidence after closing
+    // the feed: no pane carries U3's `↑N` frozen-view badge token (before
+    // the modal gate, two notches froze whatever pane sat under (30, 10)).
+    h.write_bytes(&sgr_wheel_up(WHEEL_COL, 10)); // wheel over the pane area, feed open
+    h.write_bytes(&sgr_wheel_up(WHEEL_COL, 10));
     settle(&mut h);
-    h.write_bytes(&alt(b'e'));
-    settle(&mut h);
-    let _ = pane_before;
-    qa.obs("wheel while feed open: routed to the pane under the overlay, not the feed (see code path main.rs handle_mouse — no feed gate)");
+    h.write_bytes(&alt(b'e')); // close the feed
+    let s = frame(&mut h, "F2b: after wheel-under-feed (panes still live?)");
+    let body: String = {
+        let lines: Vec<&str> = s.lines().collect();
+        let n = lines.len().saturating_sub(1); // drop the hint bar's own '↑'
+        lines[..n].join("\n")
+    };
+    qa.check(
+        !body.contains('↑'),
+        "wheel with the feed open scrolls the feed, not the pane under it (U8)",
+    );
     // help overlay content
     h.write_bytes(&alt(b'?'));
     let s = frame(&mut h, "F3: help overlay");

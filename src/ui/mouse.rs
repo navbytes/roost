@@ -126,6 +126,25 @@ pub fn tab_at_x(names: &[String], bar_width: u16, status_width: u16, x: u16) -> 
     None
 }
 
+/// U8/C14: which picker row (if any) sits at (col, row), given the picker
+/// dialog's drawn rect and its item count. The dialog is a 1-cell bordered
+/// block, so item `i` occupies the single row `rect.y + 1 + i` inside the
+/// border columns — a click on the border, the title, or past the last item
+/// hits nothing. Lives here (not in the renderer) for the same reason
+/// `tab_at_x` does: hit math is mouse's job, and `render::modal_rect` feeds
+/// it the exact rect that was drawn.
+pub fn picker_row_at(rect: Rect, items: usize, col: u16, row: u16) -> Option<usize> {
+    if rect.width < 3 || rect.height < 3 {
+        return None; // no inner area to click
+    }
+    if col <= rect.x || col >= rect.x + rect.width - 1 {
+        return None; // left/right border (or outside)
+    }
+    let first = rect.y + 1;
+    let i = row.checked_sub(first)? as usize;
+    (i < items && i < (rect.height - 2) as usize).then_some(i)
+}
+
 /// The tab bar's right-aligned status text (C2): the focused pane's cwd
 /// (already `~`-abbreviated by the caller, `App::focused_cwd`) and the save
 /// indicator, split into `(prefix, save_word)` so the renderer can color
@@ -385,6 +404,30 @@ mod tests {
         assert_eq!(tab_at_x(&names, 45, 0, 39), Some(3)); // last col of tab 3 (0-based)
         assert_eq!(tab_at_x(&names, 45, 0, 40), None); // the `…` clip marker
         assert_eq!(tab_at_x(&names, 45, 0, 44), None); // past the visible tabs too
+    }
+
+    #[test]
+    fn picker_rows_are_hit_inside_the_border_only() {
+        // A 3-item picker as `render::dialog_rect` sizes it: 32 wide,
+        // items + 2 tall, so rows y+1..y+4 are the items.
+        let rect = Rect::new(34, 13, 32, 5);
+        assert_eq!(picker_row_at(rect, 3, 35, 14), Some(0));
+        assert_eq!(picker_row_at(rect, 3, 64, 15), Some(1));
+        assert_eq!(picker_row_at(rect, 3, 50, 16), Some(2));
+        // Borders: top, bottom, left, right — all miss.
+        assert_eq!(picker_row_at(rect, 3, 50, 13), None);
+        assert_eq!(picker_row_at(rect, 3, 50, 17), None);
+        assert_eq!(picker_row_at(rect, 3, 34, 14), None);
+        assert_eq!(picker_row_at(rect, 3, 65, 14), None);
+        // Outside the dialog entirely, and past the last item.
+        assert_eq!(picker_row_at(rect, 3, 5, 5), None);
+        assert_eq!(picker_row_at(rect, 2, 50, 16), None);
+    }
+
+    #[test]
+    fn a_picker_too_small_to_have_an_inside_hits_nothing() {
+        assert_eq!(picker_row_at(Rect::new(0, 0, 2, 5), 3, 1, 1), None);
+        assert_eq!(picker_row_at(Rect::new(0, 0, 32, 2), 3, 5, 1), None);
     }
 
     #[test]

@@ -1525,6 +1525,25 @@ impl<B: PaneBackend> App<B> {
     /// remainder would be interpreted as typed input (paste injection — tmux
     /// strips these too). A pane without the mode gets the bytes verbatim,
     /// exactly like a terminal with bracketed paste off.
+    /// U8(b): route a host paste by mode — the composition root's whole
+    /// `Event::Paste` handling. A modal owns the paste: `Rename` takes the
+    /// text into its buffer (printables only, so a pasted newline can't
+    /// commit the rename and no control byte can reach a title), and the
+    /// other three modals swallow it; every other mode forwards to the
+    /// focused pane exactly as before. Pre-U8 a paste during Rename went
+    /// to the pane *under* the dialog — live QA typed `PSTX` into a hidden
+    /// shell while the dialog's own buffer ignored it.
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Mode::Rename { buffer, .. } = &mut self.mode {
+            buffer.extend(text.chars().filter(|c| !c.is_control()));
+            return;
+        }
+        if self.modal_active() {
+            return; // Picker / Help / Feed: nothing to type into
+        }
+        self.forward_paste(text);
+    }
+
     pub fn forward_paste(&mut self, text: &str) {
         let id = self.focused;
         let Some(rt) = self.runtimes.get_mut(&id) else { return };
@@ -1701,6 +1720,81 @@ impl<B: PaneBackend> App<B> {
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         self.relayout();
         self.save();
+    }
+
+    /// U8: is a modal overlay up? These four modes own the whole
+    /// non-keyboard input surface — mouse and paste alike — while they are
+    /// active. Scroll/Copy are deliberately excluded: they draw no dialog,
+    /// nothing is hidden underneath them, and their mouse behavior (wheel
+    /// scrolls, drag selects) is the point.
+    pub fn modal_active(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Rename { .. } | Mode::Picker { .. } | Mode::Help | Mode::Feed { .. }
+        )
+    }
+
+    /// U8(a): the whole mouse path while a modal is up — the composition
+    /// root routes here instead of the pane/tab path (gated on
+    /// `modal_active`, the same shape copy mode already uses), so nothing
+    /// beneath the dialog can be mutated: no focus change, no tab switch, no
+    /// pane scroll, nothing forwarded to a pane's app. `dialog` is the
+    /// modal's *drawn* rect (`render::modal_rect`), so hit-testing can never
+    /// disagree with what's on screen (renderer/hitbox lockstep, §4/§5).
+    ///
+    /// Rules: the wheel scrolls the feed by its own PgUp/PgDn step and is
+    /// swallowed by every other modal; a left click outside the dialog
+    /// dismisses Picker/Feed and any click dismisses Help (C15's "any key
+    /// closes it", in mouse form); a click on a picker row selects and
+    /// launches it. `Rename` is the one carve-out — see below.
+    pub fn handle_modal_mouse(&mut self, me: crossterm::event::MouseEvent, dialog: Option<Rect>) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // The feed owns the wheel wherever the pointer sits: the panes
+        // beneath are unreachable while it's up, so position-routing would
+        // only mean "the wheel does nothing here" — and reaching the pane
+        // under the overlay is U8(c), the bug itself.
+        let page = self.feed_page();
+        let cap = self.feed.len().saturating_sub(1);
+        if let Mode::Feed { offset } = &mut self.mode {
+            match me.kind {
+                MouseEventKind::ScrollUp => *offset = (*offset + page).min(cap),
+                MouseEventKind::ScrollDown => *offset = offset.saturating_sub(page),
+                _ => {}
+            }
+        }
+        let inside = dialog.is_some_and(|r| {
+            me.column >= r.x
+                && me.column < r.x.saturating_add(r.width)
+                && me.row >= r.y
+                && me.row < r.y.saturating_add(r.height)
+        });
+        if !matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return; // wheel handled above; drag/release/motion are swallowed
+        }
+        // Rename is deliberately NOT dismissed by an outside click: its
+        // buffer is unsaved work, and throwing it away on a stray click is
+        // U8(a)'s harm inverted (the live QA script types `ZZZ`, clicks
+        // another pane, and expects the commit to land on the pane the
+        // dialog opened on). Esc/Enter stay the ways out.
+        if matches!(self.mode, Mode::Rename { .. }) {
+            return;
+        }
+        if matches!(self.mode, Mode::Picker { .. }) {
+            let rows = picker_items().len();
+            match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, rows, me.column, me.row)) {
+                Some(i) => self.picker_launch(i),
+                None if !inside => self.mode = Mode::Normal,
+                None => {}
+            }
+            return;
+        }
+        if matches!(self.mode, Mode::Help) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        if matches!(self.mode, Mode::Feed { .. }) && !inside {
+            self.mode = Mode::Normal;
+        }
     }
 
     /// Forward an encoded mouse event (wheel / click / drag) to a mouse-aware
@@ -2268,6 +2362,30 @@ impl<B: PaneBackend> App<B> {
         };
     }
 
+    /// C20: the feed overlay's paging step — half its drawn height, at least
+    /// one entry. The single source for the keyboard's PgUp/PgDn
+    /// (`handle_mode_key`) and, since U8, one wheel notch over the overlay.
+    fn feed_page(&self) -> usize {
+        (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize
+    }
+
+    /// C14: launch the picker's item `index` — leave the modal, then spawn
+    /// it with the same C21/C22 pre-steps a picker launch has always had.
+    /// Shared by the keyboard's Enter and U8's click-a-row path so the two
+    /// can't drift.
+    fn picker_launch(&mut self, index: usize) {
+        let items = picker_items();
+        let Some(adapter) = items.get(index.min(items.len().saturating_sub(1))).copied() else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        self.exit_zoom(); // C21: "picker launch" is a structural action
+        self.hide_float(); // C22 rule 3: ditto
+        self.new_pane_with(adapter);
+        self.relayout();
+        self.save();
+    }
+
     // -- float (C22) ---------------------------------------------------------
 
     /// Alt+f: first press spawns the float (a shell in the focused pane's
@@ -2417,7 +2535,7 @@ impl<B: PaneBackend> App<B> {
         // here (needs a whole `&self` via `body_area()`) rather than inside
         // the match below, where `Mode::Feed`'s arm already holds
         // `self.mode` mutably borrowed.
-        let feed_page = (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize;
+        let feed_page = self.feed_page();
         // C24: the focused pane's current inner grid, for clamping the copy
         // cursor — same borrow-ordering reason as `feed_page` above.
         let (copy_h, copy_w) = self.focused_inner_dims();
@@ -2465,13 +2583,8 @@ impl<B: PaneBackend> App<B> {
                         *selection = (*selection + 1) % items.len()
                     }
                     KeyCode::Enter => {
-                        let adapter = items[(*selection).min(items.len() - 1)];
-                        self.mode = Mode::Normal;
-                        self.exit_zoom(); // C21: "picker launch" is a structural action
-                        self.hide_float(); // C22 rule 3: ditto
-                        self.new_pane_with(adapter);
-                        self.relayout();
-                        self.save();
+                        let choice = *selection;
+                        self.picker_launch(choice);
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
@@ -3972,6 +4085,60 @@ mod tests {
         app.runtimes.get_mut(&id).unwrap().input.clear();
         app.forward_paste("x\x1b[201~evil\r");
         assert_eq!(app.runtimes.get(&id).unwrap().input, b"\x1b[200~xevil\r\x1b[201~");
+    }
+
+    /// U8(b): a paste while the rename dialog is up belongs to the dialog's
+    /// buffer, not the pane hidden underneath (live QA: `PSTX` landed in the
+    /// shell below while the buffer ignored it). Control bytes are stripped:
+    /// a pasted newline must not commit the rename, and no ESC/CR may reach
+    /// a pane title.
+    #[test]
+    fn paste_during_rename_fills_the_buffer_with_printables_only() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::RenamePane);
+        app.handle_paste("api\n\x1b[0mbox\t");
+        match &app.mode {
+            Mode::Rename { buffer, .. } => assert_eq!(buffer, "api[0mbox"),
+            _ => panic!("the rename dialog must still be up, holding the pasted text"),
+        }
+        assert!(app.runtimes.get(&id).unwrap().input.is_empty(), "the pane must see nothing");
+        app.handle_mode_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.find_spec(id).and_then(|s| s.title.clone()), Some("api[0mbox".into()));
+    }
+
+    /// The other three modals have no text field: the paste is swallowed,
+    /// never forwarded to the pane beneath.
+    #[test]
+    fn paste_is_swallowed_by_the_picker_help_and_feed_modals() {
+        for open in [Action::QuickLaunch, Action::Help, Action::ToggleFeed] {
+            let (mut app, _) = mk_app(shell_ws());
+            let id = app.focused;
+            app.apply(open);
+            app.handle_paste("PSTX");
+            assert!(
+                app.runtimes.get(&id).unwrap().input.is_empty(),
+                "{open:?} must swallow the paste"
+            );
+        }
+    }
+
+    /// ...and with no modal up, the paste still reaches the focused pane
+    /// through the unchanged `forward_paste` path (guards and all).
+    #[test]
+    fn paste_without_a_modal_still_reaches_the_focused_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.handle_paste("hello");
+        assert_eq!(app.runtimes.get(&id).unwrap().input, b"hello");
+        // Scroll mode draws no dialog and hides nothing — it keeps forwarding.
+        app.apply(Action::ScrollMode);
+        app.runtimes.get_mut(&id).unwrap().input.clear();
+        app.handle_paste("more");
+        assert_eq!(app.runtimes.get(&id).unwrap().input, b"more");
     }
 
     #[test]

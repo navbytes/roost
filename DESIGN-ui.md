@@ -473,6 +473,34 @@ modals; derived from its rules):**
 - [Amended 2026-07-22, fleet features] The feed overlay (C20) is a fourth
   C12 modal. Modals are the **topmost** chrome layer — above the float pane
   (C22) and the zoomed view (C21); stacking order is contracted in C22.
+- **[Amended 2026-07-27, SPEC-ux U8]** A modal owns the **non-keyboard**
+  input surface too, not just the keys — being topmost visually and
+  transparent to the mouse was the contradiction U8 recorded (a click during
+  Rename moved focus and redirected the commit; a paste landed in the pane
+  hidden underneath; the wheel scrolled the pane under the feed). While any
+  C12 modal is up:
+  - **Mouse.** Nothing beneath it is ever mutated: no focus change, no tab
+    switch, no pane scroll, nothing forwarded to a pane's app. The
+    composition root gates on `App::modal_active` before any pane/tab
+    routing (`main.rs::handle_mouse`, the shape copy mode already used) and
+    calls `App::handle_modal_mouse` with the dialog's **drawn** rect, which
+    comes from `render::modal_rect` — the same geometry `draw_mode_overlay`
+    paints, so hit-testing can't drift from the screen (§4/§5 lockstep).
+  - **Wheel.** The feed pages by its own PgUp/PgDn step (half the overlay
+    height, `App::feed_page` — one source for key and wheel) wherever the
+    pointer sits, since nothing beneath is reachable anyway. Every other
+    modal swallows the wheel.
+  - **Click.** Help closes on any click (its "any key closes it", in mouse
+    form); the feed closes on a click outside its rect; the picker launches
+    the row clicked (`mouse::picker_row_at`) and cancels on a click outside.
+    **Rename is the carve-out: an outside click is swallowed, not a cancel**
+    — its buffer is unsaved work, and discarding it on a stray click is
+    U8(a)'s own harm inverted. Esc/Enter stay its ways out.
+  - **Paste.** `Event::Paste` routes through `App::handle_paste`: into the
+    Rename buffer (printables only — a pasted newline must not commit the
+    rename and no control byte may reach a title), swallowed by the other
+    three, forwarded to the focused pane in every non-modal mode (Scroll and
+    Copy included: they draw no dialog and hide nothing).
 
 ### C13 — Rename dialog
 
@@ -490,6 +518,14 @@ modals; derived from its rules):**
 - unselected: `"  {item}"` fg `MUTED`.
 (The `❯`-prefix selection idiom is lifted from the mockup's approval-prompt
 markup, lines ~669–671.) Size and behavior unchanged.
+
+**[Amended 2026-07-27, SPEC-ux U8]** Clicking a row selects **and** launches
+it in one press — the picker is a launcher, so "select, then confirm" would
+be a second click for nothing. Rows are hit-tested by `mouse::picker_row_at`
+against the dialog rect C12's amendment routes in: item `i` is the single
+row `rect.y + 1 + i`, inside the border columns; the border, the title and
+any row past the last item hit nothing. The keyboard Enter and this click
+share one launch path (`App::picker_launch`), so they can't diverge.
 
 ### C15 — Help overlay
 
