@@ -226,43 +226,68 @@ pub enum Dir {
     Down,
 }
 
+/// A rect's span on the axis *perpendicular* to `dir`, as `[lo, hi)`: the
+/// columns it covers for a vertical move, the rows for a horizontal one.
+fn perp_span(r: Rect, dir: Dir) -> (i32, i32) {
+    match dir {
+        Dir::Up | Dir::Down => (r.x as i32, r.x as i32 + r.width as i32),
+        Dir::Left | Dir::Right => (r.y as i32, r.y as i32 + r.height as i32),
+    }
+}
+
 /// The pane nearest to `focused` in direction `dir`, by pane rectangles.
 /// Returns None when nothing lies that way (focus then stays put — the
 /// predictable tmux/zellij behavior, and the fix for cyclic focus feeling
 /// "inverted" relative to arrow keys). `rects` are the laid-out pane rects.
+///
+/// Direction is decided by **edges, not centers**: a candidate is "above"
+/// only if it ends at or before the focused pane begins. Comparing centers
+/// let a pane that merely *sits beside* the focused one count as above it
+/// whenever its center landed a row higher — which is exactly what happens
+/// next to a stack, where the tall side pane's center is level with the
+/// expanded member's while the stack's own collapsed rows sit far above.
+/// Alt+Up there walked sideways into the neighbour column instead of up
+/// into the stack (and the trip back down was equally surprising).
+///
+/// Among the panes genuinely on that side, prefer the ones whose
+/// perpendicular span actually overlaps the focused pane's — a pane
+/// directly above beats one above-and-off-to-the-side — then the smallest
+/// gap, then the nearest perpendicular centre. A non-overlapping pane is
+/// still eligible as a fallback, so a move never dead-ends while some pane
+/// really does lie that way. The pane id breaks exact ties so the choice is
+/// deterministic rather than dependent on rect order.
 pub fn neighbor(rects: &[PaneRect], focused: PaneId, dir: Dir) -> Option<PaneId> {
     let cur = rects.iter().find(|p| p.id == focused)?.rect;
-    let cx = cur.x as i32 + cur.width as i32 / 2;
-    let cy = cur.y as i32 + cur.height as i32 / 2;
-    let mut best: Option<(i32, PaneId)> = None;
+    let (cur_lo, cur_hi) = perp_span(cur, dir);
+    let cur_mid = (cur_lo + cur_hi) / 2;
+    // Ranked lexicographically, smaller is better: overlapping first
+    // (`false` sorts before `true`), then gap, then perpendicular distance.
+    let mut best: Option<(bool, i32, i32, PaneId)> = None;
     for p in rects {
         if p.id == focused {
             continue;
         }
         let r = p.rect;
-        let px = r.x as i32 + r.width as i32 / 2;
-        let py = r.y as i32 + r.height as i32 / 2;
-        let in_dir = match dir {
-            Dir::Left => px < cx,
-            Dir::Right => px > cx,
-            Dir::Up => py < cy,
-            Dir::Down => py > cy,
+        // Distance from the focused pane's leading edge to the candidate's
+        // trailing edge, along `dir`. Negative ⇒ the candidate overlaps or
+        // sits the other way; it is not in that direction at all.
+        let gap = match dir {
+            Dir::Up => cur.y as i32 - (r.y as i32 + r.height as i32),
+            Dir::Down => r.y as i32 - (cur.y as i32 + cur.height as i32),
+            Dir::Left => cur.x as i32 - (r.x as i32 + r.width as i32),
+            Dir::Right => r.x as i32 - (cur.x as i32 + cur.width as i32),
         };
-        if !in_dir {
+        if gap < 0 {
             continue;
         }
-        // Distance dominated by the primary axis, perpendicular offset as a
-        // tie-breaker so we pick the pane most directly in that direction.
-        let (prim, perp) = match dir {
-            Dir::Left | Dir::Right => ((cx - px).abs(), (cy - py).abs()),
-            Dir::Up | Dir::Down => ((cy - py).abs(), (cx - px).abs()),
-        };
-        let score = prim * 4 + perp;
-        if best.is_none_or(|(s, _)| score < s) {
-            best = Some((score, p.id));
+        let (lo, hi) = perp_span(r, dir);
+        let overlaps = lo < cur_hi && cur_lo < hi;
+        let key = (!overlaps, gap, ((lo + hi) / 2 - cur_mid).abs(), p.id);
+        if best.is_none_or(|b| key < b) {
+            best = Some(key);
         }
     }
-    best.map(|(_, id)| id)
+    best.map(|(_, _, _, id)| id)
 }
 
 /// If `target` is a collapsed member of any stack, expand it.
@@ -758,6 +783,61 @@ mod tests {
         // Nothing to the left of pane 1 → stay put.
         assert_eq!(neighbor(&rects, 1, Dir::Left), None);
         assert_eq!(neighbor(&rects, 2, Dir::Up), None);
+    }
+
+    /// Regression (reported from a live session): a stack in the left column
+    /// beside one full-height pane on the right. Alt+Up from the stack's
+    /// expanded member walked *sideways* into the right pane, and Alt+Up
+    /// again landed on the collapsed member — "bottom → right → top" instead
+    /// of "bottom → top" within the stack the header advertises `ALT+↑↓` for.
+    ///
+    /// The cause was center-based direction: the right pane is full height,
+    /// so its center sits one row above the expanded member's, making it
+    /// count as "above" while being 50 columns away. By edges it plainly is
+    /// not above anything.
+    #[test]
+    fn a_tall_side_pane_is_never_up_from_a_stack_member() {
+        // Left column: stack header row 0, collapsed member 7 on row 1,
+        // expanded member 9 filling rows 2..40. Right column: pane 8, rows
+        // 0..40. (Body geometry of the reported 120x40 session.)
+        let rects = vec![
+            PaneRect { id: 7, rect: Rect::new(0, 1, 50, 1), collapsed: true },
+            PaneRect { id: 9, rect: Rect::new(0, 2, 50, 38), collapsed: false },
+            PaneRect { id: 8, rect: Rect::new(50, 0, 50, 40), collapsed: false },
+        ];
+        // Up from the expanded member reaches the collapsed one, not the
+        // neighbour column — the whole point of the stack's ALT+↑↓ hint.
+        assert_eq!(neighbor(&rects, 9, Dir::Up), Some(7));
+        assert_eq!(neighbor(&rects, 7, Dir::Down), Some(9));
+        // The tall pane has nothing above or below it: focus stays put
+        // rather than teleporting into the stack's rows.
+        assert_eq!(neighbor(&rects, 8, Dir::Up), None);
+        assert_eq!(neighbor(&rects, 8, Dir::Down), None);
+        // Sideways still works, and lands on the member you can actually
+        // see rather than the 1-row collapsed title.
+        assert_eq!(neighbor(&rects, 9, Dir::Right), Some(8));
+        assert_eq!(neighbor(&rects, 8, Dir::Left), Some(9));
+    }
+
+    /// A pane directly in line beats one that is nearer but off to the side,
+    /// and a pane that overlaps nothing is still reachable when it is the
+    /// only thing that way.
+    #[test]
+    fn neighbor_prefers_the_pane_in_line_then_the_nearest() {
+        //  1 | 2      (row band 0..10)
+        //  ---+---
+        //     | 3     (row band 10..20, right half only)
+        let rects = vec![
+            PaneRect { id: 1, rect: Rect::new(0, 0, 50, 10), collapsed: false },
+            PaneRect { id: 2, rect: Rect::new(50, 0, 50, 10), collapsed: false },
+            PaneRect { id: 3, rect: Rect::new(50, 10, 50, 10), collapsed: false },
+        ];
+        // Directly above 3 is 2 — even though 1 is the same distance up, it
+        // shares no columns with 3.
+        assert_eq!(neighbor(&rects, 3, Dir::Up), Some(2));
+        // From 1, nothing shares its columns below, but 3 does lie that way:
+        // reachable as the fallback rather than a dead end.
+        assert_eq!(neighbor(&rects, 1, Dir::Down), Some(3));
     }
 
     #[test]

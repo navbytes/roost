@@ -55,7 +55,9 @@ corner badge and collapsed rows lead with the pane id (C4/C8/C20 amended
 title → the pane's **live OSC 0/2 title** → `adapter · cwd-tag`, resolved by
 `App::display_name` so every surface listed above inherits it; the live title
 is sanitized and bounded to 48 chars before the badge's own clipping. The
-same name is published to the host terminal as `roost · {focused pane}`
+same name is published to the host terminal as `roost · {id} {focused pane}`
+(the id leads there too: a project's panes often share one `shell · cwd-tag`,
+so a nameless title could not say which was focused)
 (C4 amended again 2026-07-27).
 
 ### U3 · High · FIXED (this branch) — a scrolled pane looks live (and still pulses ●)
