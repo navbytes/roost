@@ -100,6 +100,15 @@ pub trait PaneBackend: Sized {
     fn set_scrollback(&mut self, lines: usize);
     /// Wheel scrolling: positive = further into history.
     fn scroll_by(&mut self, delta: i32);
+    /// The view's current scrollback offset in rows — 0 = live tail. This
+    /// is the *grid-clamped* truth of what's on screen (U3: chrome honesty
+    /// surfaces like the `↑N` badge token must reflect the view, never a
+    /// caller's unclamped intent), read rather than reaching into backend
+    /// internals.
+    fn scroll_offset(&self) -> usize;
+    /// How many scrollback rows are actually banked — `scroll_offset`'s
+    /// honest upper bound, the M of the scroll-position hint `↑N/M` (U3).
+    fn scroll_total(&self) -> usize;
     fn mouse_proto(&self) -> MouseProto;
 
     /// Observe the pane's live working directory and any known agent running
@@ -148,6 +157,11 @@ pub mod fakes {
         pub cmd: CommandSpec,
         pub input: Vec<u8>,
         pub scrollback: i64,
+        /// Test knob: how many history rows this fake "banks" — the bound
+        /// `scroll_total()` reports. Defaults to `usize::MAX` (effectively
+        /// unbounded) so tests that never think about history keep their
+        /// exact pre-U3 behavior.
+        pub scroll_total: usize,
         status: AgentStatus,
         ext: Option<AgentStatus>,
         exited: bool,
@@ -187,6 +201,7 @@ pub mod fakes {
                 cmd: cmd.clone(),
                 input: vec![],
                 scrollback: 0,
+                scroll_total: usize::MAX,
                 status: AgentStatus::Idle,
                 ext: None,
                 exited: false,
@@ -252,6 +267,14 @@ pub mod fakes {
         }
         fn scroll_by(&mut self, delta: i32) {
             self.scrollback = (self.scrollback + delta as i64).max(0);
+        }
+        /// Like the real grid, the reported view offset never exceeds the
+        /// banked history (`scroll_total`), whatever a caller stored.
+        fn scroll_offset(&self) -> usize {
+            (self.scrollback.max(0) as usize).min(self.scroll_total)
+        }
+        fn scroll_total(&self) -> usize {
+            self.scroll_total
         }
         fn mouse_proto(&self) -> MouseProto {
             self.proto

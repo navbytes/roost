@@ -134,6 +134,17 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// Returns how many rows of scrollback are currently stored.
+    ///
+    /// This counts banked history rows, not the configured capacity;
+    /// `scrollback()` can never exceed it.
+    // roost: added for the scroll position hint (SPEC-ux U3) — the offset's
+    // honest upper bound (`↑N/M`'s M).
+    #[must_use]
+    pub fn scrollback_rows(&self) -> usize {
+        self.grid().scrollback_rows()
+    }
+
     pub(crate) fn set_scrollback(&mut self, rows: usize) {
         self.grid_mut().set_scrollback(rows);
     }

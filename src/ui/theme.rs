@@ -71,6 +71,9 @@ pub const PICKER_SELECTED: char = '❯'; // U+276F
 pub const SAVED: char = '✓'; // U+2713
 /// Tab-bar overflow clip marker.
 pub const TAB_OVERFLOW: char = '…'; // U+2026
+/// Scrollback marker (U3): leads the badge's `↑N` token and the scroll
+/// hint's `↑N/M` position whenever a pane's view is frozen in history.
+pub const SCROLLED: char = '↑'; // U+2191
 
 /// `AgentStatus` → (glyph, color, pulses) — C5's table verbatim. `pulses` is
 /// true only for `Working`; every other state is steady (in particular,

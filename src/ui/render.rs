@@ -142,9 +142,12 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
 
 /// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" —
 /// omitted at `n == 0` rather than shown as a hollow "0 needs you" — then
-/// the uppercase mode word, then one trailing space. Pure so the
-/// omission-at-zero rule is unit-testable without a `Frame`.
-fn hint_bar_right_spans(n: usize, word: &str) -> Vec<Span<'static>> {
+/// (Scroll mode only, U3) the dim `↑N/M` position, then the uppercase mode
+/// word, then one trailing space. The position rides inside the segment so
+/// C9's fit/yield machinery covers it for free: pairs drop whole before any
+/// of it clips. Pure so the omission rules are unit-testable without a
+/// `Frame`.
+fn hint_bar_right_spans(n: usize, position: Option<String>, word: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if n > 0 {
         spans.push(Span::styled(
@@ -152,6 +155,9 @@ fn hint_bar_right_spans(n: usize, word: &str) -> Vec<Span<'static>> {
             Style::default().fg(theme::ACCENT),
         ));
         spans.push(Span::raw("  "));
+    }
+    if let Some(pos) = position {
+        spans.push(Span::styled(format!("{pos} "), Style::default().fg(theme::DIM)));
     }
     spans.push(Span::styled(word.to_string(), Style::default().fg(theme::DIM)));
     spans.push(Span::raw(" "));
@@ -213,8 +219,21 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // whole until the segment fits.
     let focused_raw = app.is_raw(app.focused);
     let hints = hint_pairs(&app.mode, app.focused_dead(), focused_raw);
-    let right =
-        hint_bar_right_spans(app.needs_input_count(), mode_word(&app.mode, app.zoomed(), focused_raw));
+    // U3: Scroll mode's right segment shows where in history the view sits
+    // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
+    // can never report a phantom row the grid refused (U9's overshoot).
+    let position = match &app.mode {
+        Mode::Scroll { .. } => {
+            let (off, total) = app.scroll_position();
+            Some(format!("{}{off}/{total}", theme::SCROLLED))
+        }
+        _ => None,
+    };
+    let right = hint_bar_right_spans(
+        app.needs_input_count(),
+        position,
+        mode_word(&app.mode, app.zoomed(), focused_raw),
+    );
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
 
     let shown = fit_hint_pairs(&hints, right_w, area.width);
@@ -777,10 +796,13 @@ fn draw_pane<B: PaneBackend>(
     // reads as a watermark rather than content). Drawn on every pane,
     // focused included: occlusion of the inner app's own top-right cells is
     // accepted by design now that identity lives here, not a border title.
+    // U3: a scrolled pane's badge gains the dim ↑N token; N1: its Working
+    // glyph stops pulsing while the view is frozen (badge_glyph_color).
     let (glyph, glyph_base, pulses) = theme::status_style(status);
-    let glyph_color = if pulses { pulse } else { glyph_base };
+    let scrolled = app.scroll_offset(pr.id);
+    let glyph_color = badge_glyph_color(pulses, scrolled, pulse, glyph_base);
     let text = badge_text(pr.id, &name, &adapter, has_title);
-    if let Some((rect, spans)) = corner_badge(inner, &text, raw, glyph, glyph_color) {
+    if let Some((rect, spans)) = corner_badge(inner, &text, raw, scrolled, glyph, glyph_color) {
         f.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
 
@@ -934,13 +956,16 @@ fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
 /// the text is MUTED, the glyph carries its own C5 status color. [Amended,
 /// C23] a raw pane's badge gains a `raw` token between the text and the
 /// glyph, in its own `ACCENT_DIM` span (never folded into the MUTED text —
-/// it needs its own color). Returns the 1-row rect and the clipped spans —
-/// or `None` if the pane is too small to be worth badging. Pure so it can
-/// be unit-tested.
+/// it needs its own color). [Amended, U3] a scrolled pane's badge carries a
+/// dim `↑N` token — its grid-clamped view offset, 0 = live tail = no token
+/// — glyph-adjacent (after `raw`), same `ACCENT_DIM` family. Returns the
+/// 1-row rect and the clipped spans — or `None` if the pane is too small to
+/// be worth badging. Pure so it can be unit-tested.
 fn corner_badge(
     inner: Rect,
     text: &str,
     raw: bool,
+    scrolled: usize,
     glyph: char,
     glyph_color: Color,
 ) -> Option<(Rect, Vec<Span<'static>>)> {
@@ -950,12 +975,21 @@ fn corner_badge(
     let max = inner.width.saturating_sub(1);
     // One space of breathing room on the right edge (the trailing space in
     // the glyph part).
-    let mut parts: Vec<(String, Style)> = Vec::with_capacity(3);
-    if raw {
+    let mut parts: Vec<(String, Style)> = Vec::with_capacity(4);
+    if raw || scrolled > 0 {
         parts.push((format!(" {text} · "), Style::default().fg(theme::MUTED)));
-        parts.push(("raw ".to_string(), Style::default().fg(theme::ACCENT_DIM)));
     } else {
         parts.push((format!(" {text} "), Style::default().fg(theme::MUTED)));
+    }
+    if raw {
+        let token = if scrolled > 0 { "raw · " } else { "raw " };
+        parts.push((token.to_string(), Style::default().fg(theme::ACCENT_DIM)));
+    }
+    if scrolled > 0 {
+        parts.push((
+            format!("{}{scrolled} ", theme::SCROLLED),
+            Style::default().fg(theme::ACCENT_DIM),
+        ));
     }
     parts.push((format!("{glyph} "), Style::default().fg(glyph_color)));
     let total: u16 = parts.iter().map(|(t, _)| mouse::display_width(t)).sum();
@@ -963,6 +997,21 @@ fn corner_badge(
     let spans = clip_spans(&parts, w);
     let x = inner.x + inner.width - w;
     Some((Rect::new(x, inner.y, w, 1), spans))
+}
+
+/// N1: the badge glyph's color — the C5 pulse only while the pane's view is
+/// at the live tail. A pulsing `●` asserts "alive right now", which a frozen
+/// (scrolled) view must not do; the glyph keeps its steady base color (the
+/// status itself stays truthful — the agent IS working) while the C4 `↑N`
+/// token carries the frozen-view signal. Any path that resets the offset
+/// resumes the pulse. Collapsed rows and the tab bar keep pulsing: they
+/// show no grid, so there is no frozen view to lie about.
+fn badge_glyph_color(pulses: bool, scrolled: usize, pulse: Color, base: Color) -> Color {
+    if pulses && scrolled == 0 {
+        pulse
+    } else {
+        base
+    }
 }
 
 /// Reverse-video the cells between `a` and `b` (inclusive, pane-inner coords)
@@ -1124,7 +1173,7 @@ mod tests {
     fn badge_is_two_toned_and_right_aligned_on_top_row() {
         // inner content area at (1,1) sized 40x20 (borders excluded)
         let inner = Rect::new(1, 1, 40, 20);
-        let (rect, spans) = corner_badge(inner, "claude", false, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+        let (rect, spans) = corner_badge(inner, "claude", false, 0, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
         assert_eq!(rect.y, inner.y); // top row of the content
         assert_eq!(rect.height, 1);
         // right edge: badge ends one col shy of the inner right edge is fine;
@@ -1141,7 +1190,7 @@ mod tests {
     fn badge_clips_and_drops_the_glyph_first_when_pane_too_small() {
         let inner = Rect::new(0, 0, 6, 5);
         let (rect, spans) =
-            corner_badge(inner, "a-very-long-name", false, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+            corner_badge(inner, "a-very-long-name", false, 0, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
         let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         assert!(total <= 5); // width-1 breathing room
         assert!(rect.x >= inner.x && rect.x + rect.width <= inner.x + inner.width);
@@ -1156,7 +1205,7 @@ mod tests {
         // overflow the pane by several columns (D1). The fix must stop
         // clipping on a display-width boundary and never split a glyph.
         let inner = Rect::new(0, 0, 5, 5); // budget = inner.width - 1 = 4
-        let (rect, spans) = corner_badge(inner, "日本語", false, theme::GLYPH_IDLE, theme::DIM).unwrap();
+        let (rect, spans) = corner_badge(inner, "日本語", false, 0, theme::GLYPH_IDLE, theme::DIM).unwrap();
         let rendered_width: u16 = spans.iter().map(|s| mouse::display_width(&s.content)).sum();
         assert!(rendered_width <= 4, "clipped badge must fit its column budget, got {rendered_width}");
         assert!(rect.width <= 4);
@@ -1164,9 +1213,9 @@ mod tests {
 
     #[test]
     fn no_badge_for_tiny_or_empty() {
-        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", false, theme::GLYPH_WORKING, theme::ACCENT).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", false, theme::GLYPH_WORKING, theme::ACCENT).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", false, theme::GLYPH_WORKING, theme::ACCENT).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", false, 0, theme::GLYPH_WORKING, theme::ACCENT).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", false, 0, theme::GLYPH_WORKING, theme::ACCENT).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", false, 0, theme::GLYPH_WORKING, theme::ACCENT).is_none());
     }
 
     // -- C23 raw indication ---------------------------------------------------
@@ -1175,7 +1224,7 @@ mod tests {
     fn badge_gains_a_raw_token_in_its_own_accent_dim_color() {
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "scratch · shell", true, theme::GLYPH_IDLE, theme::DIM).unwrap();
+            corner_badge(inner, "scratch · shell", true, 0, theme::GLYPH_IDLE, theme::DIM).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" scratch · shell · raw {} ", theme::GLYPH_IDLE));
         let raw_span = spans.iter().find(|s| s.content.as_ref() == "raw ").expect("raw token span");
@@ -1187,9 +1236,69 @@ mod tests {
     #[test]
     fn badge_without_raw_has_no_raw_token() {
         let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) = corner_badge(inner, "pi", false, theme::GLYPH_IDLE, theme::DIM).unwrap();
+        let (_, spans) = corner_badge(inner, "pi", false, 0, theme::GLYPH_IDLE, theme::DIM).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("raw"));
+    }
+
+    // -- U3 scrollback indication ---------------------------------------------
+
+    #[test]
+    fn badge_gains_a_scrolled_token_in_accent_dim() {
+        // U3: a frozen view must say so — `↑N` (grid-clamped offset), same
+        // ACCENT_DIM family as the raw token, glyph-adjacent.
+        let inner = Rect::new(0, 0, 40, 20);
+        let (_, spans) =
+            corner_badge(inner, "3 pi", false, 42, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 pi · ↑42 {} ", theme::GLYPH_WORKING));
+        let token = spans.iter().find(|s| s.content.as_ref() == "↑42 ").expect("↑N token span");
+        assert_eq!(token.style.fg, Some(theme::ACCENT_DIM));
+    }
+
+    #[test]
+    fn badge_scrolled_and_raw_tokens_compose_in_order() {
+        // raw · ↑N — input state first, then view state, then the glyph.
+        let inner = Rect::new(0, 0, 40, 20);
+        let (_, spans) =
+            corner_badge(inner, "3 pi", true, 7, theme::GLYPH_IDLE, theme::DIM).unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 pi · raw · ↑7 {} ", theme::GLYPH_IDLE));
+    }
+
+    #[test]
+    fn badge_at_live_tail_has_no_scrolled_token() {
+        let inner = Rect::new(0, 0, 40, 20);
+        let (_, spans) =
+            corner_badge(inner, "3 pi", false, 0, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains('↑'), "{text}");
+    }
+
+    #[test]
+    fn badge_glyph_pulse_yields_while_the_view_is_frozen() {
+        // N1: pulsing red means "alive right now" — a scrolled pane's glyph
+        // holds the steady base color instead; the tail resumes the pulse.
+        let phase = theme::ACCENT_DIM; // pretend mid-pulse phase B
+        assert_eq!(super::badge_glyph_color(true, 0, phase, theme::ACCENT), phase);
+        assert_eq!(super::badge_glyph_color(true, 12, phase, theme::ACCENT), theme::ACCENT);
+        // Non-pulsing statuses are steady either way.
+        assert_eq!(super::badge_glyph_color(false, 0, phase, theme::FG), theme::FG);
+        assert_eq!(super::badge_glyph_color(false, 12, phase, theme::FG), theme::FG);
+    }
+
+    #[test]
+    fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
+        // U3: `↑N/M` rides inside the right segment (DIM), so C9's yield
+        // machinery covers it — and it only exists when a position is given.
+        let spans = hint_bar_right_spans(0, Some("↑12/300".into()), "SCROLL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "↑12/300 SCROLL ");
+        assert_eq!(spans[0].style.fg, Some(theme::DIM));
+
+        let spans = hint_bar_right_spans(2, Some("↑12/300".into()), "SCROLL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
     }
 
     #[test]
@@ -1335,7 +1444,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_omits_needs_segment_at_zero() {
-        let spans = hint_bar_right_spans(0, "NORMAL");
+        let spans = hint_bar_right_spans(0, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "NORMAL ");
         assert!(!text.contains('◆'));
@@ -1343,7 +1452,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
-        let spans = hint_bar_right_spans(3, "NORMAL");
+        let spans = hint_bar_right_spans(3, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style.fg, Some(theme::ACCENT));

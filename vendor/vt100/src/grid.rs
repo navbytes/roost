@@ -192,6 +192,13 @@ impl Grid {
         self.scrollback_len
     }
 
+    // roost: how many history rows are actually banked right now (distinct
+    // from scrollback_len, the configured cap) — the M of the scroll
+    // position hint `↑N/M` (SPEC-ux U3).
+    pub fn scrollback_rows(&self) -> usize {
+        self.scrollback.len()
+    }
+
     pub fn scrollback(&self) -> usize {
         self.scrollback_offset
     }

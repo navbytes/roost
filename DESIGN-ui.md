@@ -107,6 +107,11 @@ indications (`ZOOM`/`RAW`, C9) plus a plain-text `raw` badge token (C23); the
 float (C22) is chrome-identical to a pane; the copy cursor (C24) is
 modifier-based. Any new glyph appearing under `src/ui/` is a DEVIATED.
 
+**[Amended 2026-07-27, SPEC-ux U3]:** one glyph added since: `↑` U+2191
+(`theme::SCROLLED`, single-width) — the scrollback marker leading the badge's
+`↑N` token (C4) and the scroll hint's `↑N/M` position (C9). It appears only
+while a pane's view is frozen in history; no other new glyph is sanctioned.
+
 ---
 
 ## 3. Component contracts
@@ -228,6 +233,18 @@ with tests `:530–555`.
   stay (helper may evolve to return spans for the two-tone styling).
 - [Amended 2026-07-22, fleet features] A raw pane's badge additionally carries
   the `raw` token per C23.
+- **[Amended 2026-07-27, SPEC-ux U3/N1]** Whenever the pane's grid-clamped
+  scrollback offset is > 0 the badge carries a dim `↑N` token — fg
+  `ACCENT_DIM`, same family as the `raw` token, placed glyph-adjacent (after
+  `raw` when both): `"{id} {name} · ↑N {glyph}"`, raw
+  `"{id} {name} · raw · ↑N {glyph}"`. N is the *view's* offset read back from
+  the grid (`PaneBackend::scroll_offset`), never a caller's unclamped
+  counter. While the token shows, the Working glyph's C5 pulse is suppressed
+  (steady base color): pulsing red means "alive right now", which a frozen
+  view must not assert (N1) — the glyph itself keeps reporting the true
+  status, and any path that resets the offset removes the token and resumes
+  the pulse. Collapsed rows and the tab bar keep pulsing — they show no
+  grid, so there is no frozen view to lie about.
 
 ### C5 — Status glyph system + pulse
 
@@ -388,6 +405,14 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   `RAW` when the focused pane is raw (C23), `ZOOM` when zoomed (C21).
   Precedence: a real non-Normal mode word always wins; else `RAW` beats
   `ZOOM` beats `NORMAL` (input safety trumps view state).
+- **[Amended 2026-07-27, SPEC-ux U3]:** while the mode is Scroll, the right
+  segment additionally carries the position `↑N/M` fg `DIM` immediately
+  ahead of the mode word (`… needs-you segment  ↑N/M SCROLL `) — N = the
+  focused pane's grid-clamped view offset, M = its banked history rows,
+  both read from the backend (never `Mode::Scroll`'s own counter, which can
+  hold a phantom the grid refused — U9). The position rides *inside* the
+  right segment, so the existing fit/yield machinery covers it: pairs drop
+  whole before any of the segment clips.
 - **New / amended pair lists** (all obey the same styling formula):
   - Feed mode (C20): `↑↓ scroll` · `Esc close`.
   - Focused-raw Normal (C23): exactly **one** pair — `Alt+Shift+p exit raw`.
@@ -405,6 +430,13 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
 generic notices — "copied", extension updates — so it gets the neutral
 elevated treatment, not a reserved color; ok-green is banned from chrome.)
 Timing/precedence unchanged.
+
+**[Amended 2026-07-27, SPEC-ux U22]:** "timing unchanged" is superseded for
+confirm-arm prompts only: a flash that arms a destructive second-press
+confirm lives exactly `CONFIRM_WINDOW` (3 s) instead of `FLASH_WINDOW`
+(2 s), and dies early with its arm — prompt and armed window may never
+disagree in either direction. Ordinary flashes keep `FLASH_WINDOW`; styling
+and precedence are untouched.
 
 ### C11 — Alt-key warning
 

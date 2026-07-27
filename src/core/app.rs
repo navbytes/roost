@@ -1691,6 +1691,25 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// U3: pane `id`'s grid-clamped view offset — > 0 means its on-screen
+    /// grid is frozen history, which the corner badge must mark (`↑N`) and
+    /// the Working pulse must stop asserting liveness over (N1). 0 for a
+    /// pane with no runtime.
+    pub fn scroll_offset(&self, id: PaneId) -> usize {
+        self.runtimes.get(&id).map(|rt| rt.scroll_offset()).unwrap_or(0)
+    }
+
+    /// U3: the focused pane's `(view offset, banked history rows)` — the
+    /// scroll-mode hint's `↑N/M`. Read from the backend (the view's truth),
+    /// not from `Mode::Scroll`'s own counter, so the hint can never report
+    /// a phantom position the grid refused (U9's overshoot).
+    pub fn scroll_position(&self) -> (usize, usize) {
+        self.runtimes
+            .get(&self.focused)
+            .map(|rt| (rt.scroll_offset(), rt.scroll_total()))
+            .unwrap_or((0, 0))
+    }
+
     // -- dead panes --------------------------------------------------------
 
     /// True when the focused pane has no live process (spawn failed or the
@@ -4634,6 +4653,23 @@ mod tests {
 
         let line = app.feed().iter().find(|e| e.text.contains('→')).expect("no transition line");
         assert!(line.needs_input);
+    }
+
+    #[test]
+    fn scroll_offset_and_position_report_the_grid_clamped_view() {
+        // U3: honesty surfaces (badge ↑N, hint ↑N/M) read the VIEW's truth —
+        // a stored offset beyond the banked history reports as the clamp,
+        // never the caller's phantom (U9's overshoot).
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let rt = app.runtimes.get_mut(&id).unwrap();
+        rt.scroll_total = 300;
+        rt.set_scrollback(5000); // caller overshoots
+        assert_eq!(app.scroll_offset(id), 300);
+        assert_eq!(app.scroll_position(), (300, 300));
+        // Back at the tail: no offset, no token.
+        app.runtimes.get_mut(&id).unwrap().set_scrollback(0);
+        assert_eq!(app.scroll_offset(id), 0);
     }
 
     // -- U2 pane identity ---------------------------------------------------

@@ -52,7 +52,7 @@ notifications and pane-referencing flashes carry the display name, and the
 corner badge and collapsed rows lead with the pane id (C4/C8/C20 amended
 2026-07-27).
 
-### U3 · High · VERIFIED — a scrolled pane looks live (and still pulses ●)
+### U3 · High · FIXED (this branch) — a scrolled pane looks live (and still pulses ●)
 Live frame E1: a wheel-scrolled pane frozen at old output shows no indicator
 anywhere — and its badge keeps the pulsing `●` working glyph, actively asserting
 liveness while the view is stale. Wheel scrolling never enters Scroll mode, so
@@ -60,6 +60,11 @@ the `SCROLL` mode word never covers it; Scroll mode itself shows no position.
 **Proposed contract:** whenever a pane's scrollback offset > 0, its badge gains
 a dim `↑N` token (same family as the `raw` token); Scroll mode's hint shows
 `line N/M`. Any path that resets the offset removes the token.
+**Fixed:** the badge carries `↑N` (ACCENT_DIM, glyph-adjacent) whenever the
+grid-clamped offset is > 0, and Scroll mode's right segment shows `↑N/M` —
+both read via the new `PaneBackend::scroll_offset`/`scroll_total` accessors,
+so they reflect the view, never a phantom counter (C4/C9/§2 amended
+2026-07-27; N1's pulse rule rides along).
 
 ### U4 · High · OPEN — the macOS Alt trap is only caught on Apple Terminal
 `wants_alt_hint` fires solely on `TERM_PROGRAM == "Apple_Terminal"`; default
@@ -226,10 +231,14 @@ lists the real keys.
 
 ## New findings from the live session (not predicted by either review)
 
-### N1 · Med · NEW — the frozen-scroll badge still pulses ●
+### N1 · Med · FIXED (this branch) — the frozen-scroll badge still pulses ●
 Compounds U3: frame E1 shows the wheel-scrolled (frozen) pane's badge pulsing
 `●` working — the UI actively asserts liveness for a stale view. The U3 `↑N`
 token must also suppress or co-locate honestly with the status glyph.
+**Fixed:** while `↑N` shows, the badge's Working glyph holds its steady base
+color instead of pulsing — status stays truthful (the agent IS working), but
+the "alive right now" animation never plays over a frozen view; resetting the
+offset resumes it (C4 amendment 2026-07-27, `badge_glyph_color`).
 
 ### N2 · Low · NEW — Alt+o silently no-ops outside a split
 With the focused pane in a stack, Alt+o changed nothing and said nothing (the
