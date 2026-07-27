@@ -3098,19 +3098,31 @@ pub fn display_name_of(spec: &PaneSpec) -> String {
 }
 
 /// U2 + P6: the full naming chain as a pure function — explicit Alt+r title,
-/// else the pane's live OSC 0/2 title, else `{adapter} · {cwd-tag}` (the
-/// cwd's last path component, so a bank of untitled shells on the same
-/// adapter stays tellable apart).
+/// else the pane's live OSC 0/2 title (agent panes only), else
+/// `{adapter} · {cwd-tag}` (the cwd's last path component, so a bank of
+/// untitled shells on the same adapter stays tellable apart).
 ///
 /// The explicit title still wins: a name the user typed is a decision, and
 /// an app that repaints its OSC title every frame must not overwrite it.
 /// `live` is expected pre-sanitized and bounded (`App::live_title`).
+///
+/// A plain `shell` pane deliberately ignores its live title. P6 adopted OSC
+/// titles because agent CLIs publish *task status* through them (Claude
+/// Code repaints `spinner + task` continuously) — that is fleet status worth
+/// a badge. A shell's title comes from `PS1`, which by default restates
+/// `user@host: /path`: chrome that duplicates the cwd tag already shown and
+/// crowds the far narrower badge. This costs nothing for a hand-launched
+/// agent: `observe_panes` promotes a shell pane's adapter to `pi`/`claude`
+/// once it sees the agent running, so its titles start counting then (and
+/// stop when it exits and the pane demotes back).
 pub fn display_name_live(spec: &PaneSpec, live: Option<&str>) -> String {
     if let Some(title) = &spec.title {
         return title.clone();
     }
-    if let Some(live) = live.filter(|t| !t.is_empty()) {
-        return live.to_string();
+    if spec.adapter != "shell" {
+        if let Some(live) = live.filter(|t| !t.is_empty()) {
+            return live.to_string();
+        }
     }
     let cwd_tag = spec
         .cwd
@@ -5734,6 +5746,35 @@ mod tests {
         // `display_name_of` is exactly the chain with no live title.
         spec.title = None;
         assert_eq!(display_name_of(&spec), display_name_live(&spec, None));
+    }
+
+    /// P6: a plain `shell` pane ignores its live OSC title. A shell's title
+    /// comes from `PS1` — by default `user@host: /path`, which restates the
+    /// cwd tag already on the badge and crowds it. Agent panes keep adopting
+    /// theirs (that's the whole point of P6), and a hand-launched agent
+    /// inside a shell pane starts counting the moment `observe_panes`
+    /// promotes the pane's adapter.
+    #[test]
+    fn a_shell_pane_ignores_its_ps1_title_but_an_agent_pane_adopts_one() {
+        let mut spec = PaneSpec {
+            adapter: "shell".into(),
+            cwd: PathBuf::from("/home/user/rqa-work"),
+            session: None,
+            title: None,
+            spawned_by: None,
+        };
+        let ps1 = Some("user@host: ~/rqa-work");
+        assert_eq!(display_name_live(&spec, ps1), "shell · rqa-work");
+        // An explicit rename still wins over everything.
+        spec.title = Some("build".into());
+        assert_eq!(display_name_live(&spec, ps1), "build");
+        // Promoted to an agent (observe_panes saw pi running): titles count.
+        spec.title = None;
+        spec.adapter = "pi".into();
+        assert_eq!(display_name_live(&spec, Some("TASK-9 tests")), "TASK-9 tests");
+        // ...and demoting back to a shell drops the adoption again.
+        spec.adapter = "shell".into();
+        assert_eq!(display_name_live(&spec, Some("TASK-9 tests")), "shell · rqa-work");
     }
 
     /// P6: an OSC title is untrusted text headed for roost's chrome and for

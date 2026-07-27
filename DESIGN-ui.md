@@ -289,8 +289,12 @@ with tests `:530–555`.
   `{adapter} · {cwd-tag}`), the one helper every fleet surface (badge,
   collapsed rows, feed, notifications, flashes) derives pane identity from.
   **[Amended 2026-07-27, SPEC-parity P6]:** the naming chain gains a middle
-  rung — explicit Alt+r title → the pane's **live OSC 0/2 title** →
-  `{adapter} · {cwd-tag}` — resolved by `App::display_name` (the free
+  rung — explicit Alt+r title → the pane's **live OSC 0/2 title** (agent
+  panes only; a plain `shell` pane skips this rung, since its title comes
+  from `PS1` and by default restates `user@host: /path`, duplicating the cwd
+  tag and crowding the badge — a hand-launched agent still qualifies the
+  moment `observe_panes` promotes the pane's adapter, and demotes back with
+  it) → `{adapter} · {cwd-tag}` — resolved by `App::display_name` (the free
   `display_name_of` remains the chain with no live title, for the paths that
   have a spec but no runtime, e.g. a closed pane's feed line). An agent CLI
   that publishes `spinner + task` through its title therefore says what it is

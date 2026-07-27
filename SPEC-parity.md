@@ -175,10 +175,15 @@ expect. Interim: document the loss. Also fixes SPEC-ux U19's dependency on
 
 ### P6 · FIXED (this branch) · Med-High — pane OSC 0/2 titles invisible
 *Fixed: `App::display_name`'s chain is now explicit Alt+r title → the pane's
-live `screen().title()` → `adapter · cwd-tag` (`display_name_live`), so the
-badge, collapsed rows, feed lines and notifications all adopt a pane's
-published title; it is sanitized and bounded to 48 chars before the badge's
-own width clipping. roost also publishes `OSC 2 ; roost · {focused pane}` to
+live `screen().title()` (agent panes only) → `adapter · cwd-tag`
+(`display_name_live`), so the badge, collapsed rows, feed lines and
+notifications all adopt a pane's published title; it is sanitized and bounded
+to 48 chars before the badge's own width clipping. A plain `shell` pane skips
+the live rung: a shell's title is `PS1` chrome (`user@host: /path`) that
+restates the cwd tag and crowds the badge, whereas P6's value is agent CLIs
+publishing task status. A hand-launched agent loses nothing — `observe_panes`
+promotes a shell pane's adapter to `pi`/`claude` when it sees the agent
+running, and demotes when it exits. roost also publishes `OSC 2 ; roost · {focused pane}` to
 the host terminal on focus/title changes (throttled to 200 ms) and resets it
 to a plain `roost` on exit and in the panic hook. DESIGN-ui C4 and SPEC-ux U2
 amended 2026-07-27. e2e `tests/pane_titles.rs`: a pane's `OSC 2 ; TASK-X`

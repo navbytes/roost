@@ -6,9 +6,16 @@
 //! and nothing re-emitted a title to the host, so the outer tab went stale
 //! the moment roost started.
 //!
-//! Inbound: a pane's OSC 2 becomes its display name, visible on the corner
-//! badge. Outbound: roost publishes `roost · <focused pane>` to its own
-//! terminal.
+//! Inbound: an *agent* pane's OSC 2 becomes its display name, visible on the
+//! corner badge. Outbound: roost publishes `roost · <focused pane>` to its
+//! own terminal.
+//!
+//! A plain `shell` pane deliberately skips the live rung — its title is
+//! `PS1` chrome (`user@host: /path`) that restates the cwd tag already on
+//! the badge. This drive covers both sides of that line, and the crossing
+//! between them: the pane starts as a shell (title ignored), then runs a
+//! process argv-named `pi`, which `observe_panes` promotes to the pi
+//! adapter — and the same title it had been ignoring is adopted.
 
 // The shared harness is compiled per test binary; helpers other tenants use
 // are dead code from this binary's view — not real rot.
@@ -64,11 +71,29 @@ fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
     // can never satisfy the assertion — only the badge can.
     h.write_bytes(b"printf '\\033]2;TAS''K-X\\007'\r");
 
-    // Inbound: the corner badge adopts it (C4's badge leads with the pane
-    // id, so `1 TASK-X` is the exact rendered token).
-    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("1 TASK-X")).is_none() {
+    // While it is still a plain shell, that title is ignored: a shell's
+    // title is `PS1` chrome, not fleet status. Two detect ticks (2 s each)
+    // is well past any adoption that was going to happen.
+    std::thread::sleep(Duration::from_secs(5));
+    h.settle(Duration::from_secs(3));
+    let shell_frame = h.screen().contents();
+    assert!(
+        shell_frame.contains("1 shell") && !shell_frame.contains("1 TASK-X"),
+        "a shell pane must keep its adapter/cwd badge despite an OSC title:\n{shell_frame}"
+    );
+
+    // Now the pane runs an agent: `sh -c '…' pi` puts `pi` in the process's
+    // argv, which is exactly what `observe_panes` matches on, so the pane is
+    // promoted to the pi adapter — the real path for an agent launched by
+    // hand inside a shell pane.
+    h.write_bytes(b"sh -c 'sleep 300' pi\r");
+
+    // Inbound: once promoted, the corner badge adopts the title it had been
+    // ignoring (C4's badge leads with the pane id, so `1 TASK-X` is the
+    // exact rendered token). Generous: promotion waits on a 2 s detect tick.
+    if h.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 TASK-X")).is_none() {
         panic!(
-            "the pane's OSC 2 title never reached its badge:\n{}",
+            "the promoted pane's OSC 2 title never reached its badge:\n{}",
             h.screen().contents()
         );
     }
