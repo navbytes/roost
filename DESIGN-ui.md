@@ -693,6 +693,20 @@ row `rect.y + 1 + i`, inside the border columns; the border, the title and
 any row past the last item hit nothing. The keyboard Enter and this click
 share one launch path (`App::picker_launch`), so they can't diverge.
 
+**[Amended 2026-07-27, SPEC-ux U20 — number accelerators]** The picker was
+arrows-and-Enter only: two or three keystrokes to pick from a list you can
+already see in full. Rows now lead with their accelerator —
+selected `"❯ {n} {item}"`, unselected `"  {n} {item}"` (`picker_row_body`,
+shared by both arms so they can differ only in style) — and `1`..`9`
+launches that row through the same `picker_launch` the click and Enter use.
+Items past the ninth get no digit (there is no tenth accelerator) but keep
+the three columns, so the ids stay aligned. A digit past the end of the
+list is ignored and the picker stays up: the rows carry their own numbers,
+so an out-of-range press is self-evidently one and needs no flash. The
+accelerator is also on the hint bar (`1..9 launch`) — an accelerator
+nothing advertises is one nobody presses, which is what "unhinted `j/k`"
+already cost this dialog.
+
 ### C15 — Help overlay
 
 **Current:** `render.rs:194–237` — Double/Cyan; keys Yellow BOLD, desc Gray.
@@ -1154,6 +1168,17 @@ walked one cell at a time. Added:
 - The hint list and the `Alt+c` help row now name every one of these keys,
   `0`/`$` included (C9 amendment above; C15/§8's row reads
   `copy mode (hjkl w b e 0 $ v V y) / scroll mode`).
+
+**[Amended 2026-07-27, SPEC-ux U19 — `o` opens the URL under the cursor]:**
+copy mode gains one more key. Alt+click has always opened a URL, but no
+keyboard path opened one at all, so the single most common thing an agent
+prints — a link — was reachable only by leaving the keyboard. `o` looks up
+`App::url_at` at the cursor cell and, on a hit, stashes it in
+`pending_open` for the composition root to hand to the browser (core does
+no I/O — the same split `pending_yank` uses); on a miss it flashes
+`no URL under the cursor` rather than no-opping silently. Either way the
+mode stays open: opening a link is not a reason to lose your selection.
+Hint pair `o open`; help row `Alt+click / o`.
 
 ### C24b — Mode entry chords toggle — [Added 2026-07-27, SPEC-ux U18]
 

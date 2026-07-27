@@ -300,18 +300,52 @@ Copy drops its selection exactly as Esc does. Chords that aren't the current
 mode's still fall through to their global binding, U9's scroll-snap (and its
 Alt+c exemption) intact (C24b added 2026-07-27).
 
-### U19 · Low · OPEN — URLs: wrapped links break Alt+click; no keyboard open
+### U19 · Low · FIXED (this branch) — URLs: wrapped links break Alt+click; no keyboard open
 `url_at` reads one grid row; agents constantly print wrapping URLs into narrow
 panes. No keyboard path opens a URL at all.
 **Proposed contract:** join wrapped rows (vt100 `row_wrapped`) before
 tokenizing; `o` in copy mode opens the URL under the cursor.
+**Fixed:** `url_at` now reads the whole *wrapped run* a row belongs to — it
+walks back while the previous row is flagged wrapped, collects forward
+through the run, and joins via the pure `url_in_wrapped_rows`, which pads
+each non-final row back out to the pane's inner width so the column
+arithmetic stays exact and a genuinely blank tail still separates tokens
+instead of fusing them. Either end of a wrapped link now returns the whole
+URL; before, the first row opened a truncated one and every continuation row
+was a dead click. The flag comes from a new `PaneRuntime::row_wrapped`
+(default false), read off the *presented* frame like `grab_text` so the join
+agrees with what is on screen; the vendored `Screen::row_wrapped` already
+existed and is now pinned by a vendor-side test (a newline is not a wrap; a
+merely-full row is not a wrap). `o` in copy mode opens the URL under the
+cursor via `pending_open` (core does no I/O), flashing
+`no URL under the cursor` on a miss and never leaving the mode
+(C24 amended 2026-07-27).
+**Known bound (unchanged by this fix, sharpened by P15's landing):** the
+column a click or the copy cursor carries is a *cell* index, while the row
+text `grab_text` returns now holds one char per glyph — P15 skips wide
+continuation cells rather than padding them — so on a row containing CJK or
+emoji the two drift by one per wide glyph before the token. Both the U17
+word motions and this lookup index by cell. The drift is bounded and
+self-correcting in practice (URLs are ASCII, and `find_url_at` expands to
+whitespace boundaries, so a small offset still lands inside the same token),
+but a row with many wide glyphs ahead of a link can miss it. A cell→char
+map for the whole row is the fix; it belongs with U24's wide-char work, not
+here.
 
-### U20 · Low · OPEN — picker is arrows/Enter only
+### U20 · Low · FIXED (this branch) — picker is arrows/Enter only
 No number accelerators, no type-ahead, no click; `j/k` work unhinted; the
 DESIGN.md §7 "recent cwd" column never shipped.
 **Proposed contract:** `1..9` accelerators + click-to-launch; cwd column later.
 *(Click-to-launch landed with U8's modal mouse ownership — C14 amended
-2026-07-27. The accelerators, type-ahead and cwd column stay OPEN.)*
+2026-07-27.)*
+**Fixed:** `1`..`9` launch that row through the same `picker_launch` the
+click and Enter already shared, and every row now *shows* its accelerator
+(`❯ 1 pi`) — an accelerator nothing advertises is one nobody presses, which
+is exactly what unhinted `j/k` cost this dialog. The hint bar gains
+`1..9 launch`. A digit past the end of the list is ignored and the picker
+stays up: the rows are numbered, so an out-of-range press is self-evidently
+one. Type-ahead and the DESIGN.md §7 recent-cwd column stay **OPEN** — both
+are new state, not a missing binding (C14 amended 2026-07-27).
 
 ### U21 · Low · OPEN — mouse can't resize; tabs are click-to-switch only
 No border drag-resize, no middle-click close, no drag-reorder.

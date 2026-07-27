@@ -97,6 +97,9 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
             ("0/$", "ends"),
             ("v/V", "mark"),
             ("y/↵", "yank"),
+            // [Amended, U19] `o` opens the URL under the cursor — the
+            // keyboard half of Alt+click.
+            ("o", "open"),
             ("drag", "select"),
             ("Esc", "exit"),
         ],
@@ -108,7 +111,12 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
             };
             vec![("type", what), ("↵", "save"), ("Esc", "cancel")]
         }
-        Mode::Picker { .. } => vec![("↑↓", "choose"), ("↵", "open"), ("Esc", "cancel")],
+        // [Amended, U20] `1..9` joins the list: the accelerator is the
+        // fastest way through the picker and the only one that wasn't
+        // advertised anywhere.
+        Mode::Picker { .. } => {
+            vec![("↑↓", "choose"), ("↵", "open"), ("1..9", "launch"), ("Esc", "cancel")]
+        }
         Mode::Scroll { .. } => {
             vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
         }
@@ -313,6 +321,18 @@ fn dialog_title(text: &'static str) -> Line<'static> {
     Line::from(text).style(Style::default().fg(theme::FG))
 }
 
+/// C14 (U20): a picker row's text after its 1-column marker — the `1..9`
+/// accelerator, then the adapter id. Items past the ninth get no digit
+/// (there is no `Alt+10`), but keep the columns so the ids stay aligned.
+/// Pure, and shared by the selected and unselected arms so the two rows can
+/// never differ by anything but their style.
+fn picker_row_body(i: usize, item: &str) -> String {
+    match i {
+        0..=8 => format!(" {} {item}", i + 1),
+        _ => format!("   {item}"),
+    }
+}
+
 /// The help overlay's key-column prefix: the key label left-padded to a
 /// fixed column so every description lines up underneath it. Shared by the
 /// width computation and the row-rendering loop below so they can't drift.
@@ -348,7 +368,7 @@ fn help_dialog_width(keys: &[(&str, &str)]) -> u16 {
 /// closes it" and the ≤20 cap both survive untouched.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+n", "new shell pane (auto split)"),
-    ("Alt+Enter", "quick-launch picker (pi / claude / shell)"),
+    ("Alt+Enter", "quick-launch picker (pi / claude / shell; 1..9)"),
     ("Alt+←↓↑→ / hjkl", "move focus"),
     ("Alt+Shift+←↓↑→", "resize along that axis"),
     ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
@@ -360,13 +380,13 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
     ("Alt+i / Alt+m", "previous / next tab (wraps)"),
     ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-    ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y) / scroll mode"),
+    ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
     ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
     ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
     ("mouse", "wheel scrolls · click focuses · drag selects"),
-    ("Alt+click", "open the URL under the pointer"),
+    ("Alt+click / o", "open the URL under the pointer / copy cursor"),
 ];
 
 /// U23: the legend row's text, rebuilt from the `theme` glyph constants —
@@ -456,18 +476,21 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             // C14: selected row is a `❯`-prefix + FG item text, no bg
-            // highlight; unselected rows are plain MUTED text.
+            // highlight; unselected rows are plain MUTED text. [Amended,
+            // U20] Each row leads with its `1..9` accelerator — an
+            // accelerator nothing shows is one nobody presses.
             let lines: Vec<Line> = items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
+                    let body = picker_row_body(i, item);
                     if i == *selection {
                         Line::from(vec![
                             Span::styled(theme::PICKER_SELECTED.to_string(), Style::default().fg(theme::ACCENT)),
-                            Span::styled(format!(" {item}"), Style::default().fg(theme::FG)),
+                            Span::styled(body, Style::default().fg(theme::FG)),
                         ])
                     } else {
-                        Line::from(Span::styled(format!("  {item}"), Style::default().fg(theme::MUTED)))
+                        Line::from(Span::styled(format!(" {body}"), Style::default().fg(theme::MUTED)))
                     }
                 })
                 .collect();
@@ -1633,6 +1656,7 @@ mod tests {
                 ("0/$", "ends"),
                 ("v/V", "mark"),
                 ("y/↵", "yank"),
+                ("o", "open"),
                 ("drag", "select"),
                 ("Esc", "exit"),
             ],
@@ -1957,7 +1981,7 @@ mod tests {
             HELP_KEYS,
             &[
                 ("Alt+n", "new shell pane (auto split)"),
-                ("Alt+Enter", "quick-launch picker (pi / claude / shell)"),
+                ("Alt+Enter", "quick-launch picker (pi / claude / shell; 1..9)"),
                 ("Alt+←↓↑→ / hjkl", "move focus"),
                 ("Alt+Shift+←↓↑→", "resize along that axis"),
                 ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
@@ -1969,13 +1993,13 @@ mod tests {
                 ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
                 ("Alt+i / Alt+m", "previous / next tab (wraps)"),
                 ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-                ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y) / scroll mode"),
+                ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
                 ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),
                 ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
                 ("mouse", "wheel scrolls · click focuses · drag selects"),
-                ("Alt+click", "open the URL under the pointer"),
+                ("Alt+click / o", "open the URL under the pointer / copy cursor"),
             ],
         );
         assert_eq!(HELP_KEYS.len(), 20);
@@ -1995,6 +2019,31 @@ mod tests {
         assert_eq!(desc, super::status_legend_text());
         // The two glyphs the live-QA drive greps the frame for.
         assert!(desc.contains(theme::GLYPH_WORKING) && desc.contains(theme::GLYPH_EXITED));
+    }
+
+    /// U20: the picker's accelerator has to be visible to be pressed, and
+    /// both row styles must agree on where the id starts (the marker column
+    /// is the only difference between them).
+    #[test]
+    fn picker_rows_lead_with_their_number_accelerator() {
+        assert_eq!(super::picker_row_body(0, "pi"), " 1 pi");
+        assert_eq!(super::picker_row_body(2, "shell"), " 3 shell");
+        // Past the ninth there is no accelerator, but the id stays aligned.
+        assert_eq!(super::picker_row_body(9, "x"), "   x");
+        assert_eq!(
+            super::picker_row_body(9, "x").chars().count(),
+            super::picker_row_body(0, "x").chars().count(),
+        );
+    }
+
+    /// U20: the accelerator is on the hint bar too — a key you can only
+    /// find by reading the source is not a feature.
+    #[test]
+    fn hint_pairs_picker_advertises_the_number_accelerators() {
+        assert_eq!(
+            hint_pairs(&Mode::Picker { selection: 0 }, false, false),
+            vec![("↑↓", "choose"), ("↵", "open"), ("1..9", "launch"), ("Esc", "cancel")],
+        );
     }
 
     /// U23: the overlay documents the mouse — the wheel, click-to-focus,

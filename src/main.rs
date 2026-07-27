@@ -299,6 +299,11 @@ fn run(
                             let outcome = infra::clipboard::copy(&text);
                             app.flash_copy(text.chars().count(), outcome);
                         }
+                        // U19: and copy mode's `o` stashes a URL the same
+                        // way — the browser is I/O, so it happens out here.
+                        if let Some(url) = app.take_pending_open() {
+                            infra::open::open_url(&url);
+                        }
                     }
                     Event::Mouse(me) => handle_mouse(&mut app, me),
                     // Coalesce: act on the true size once, after draining.

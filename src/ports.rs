@@ -196,6 +196,15 @@ pub trait PaneBackend: Sized {
     fn grab_all_text(&self) -> String {
         self.grab_text((0, 0), (u16::MAX, u16::MAX))
     }
+
+    /// U19: does visible row `row` continue onto the next one? The terminal
+    /// grid knows — a row is flagged wrapped when the cursor ran off its
+    /// last column rather than a newline arriving — and that flag is the
+    /// only way to tell a link that wrapped from two adjacent lines that
+    /// merely look adjacent. False (never wraps) for backends with no grid.
+    fn row_wrapped(&self, _row: u16) -> bool {
+        false
+    }
 }
 
 /// Workspace persistence. Implemented by `infra::store::FsStore`.
@@ -237,6 +246,12 @@ pub mod fakes {
         /// `grab` so a test can tell a full/tail read apart from a screen
         /// read).
         pub all_text: String,
+        /// Test knob (U19): a per-row grid. When non-empty, a single-row
+        /// `grab_text` reads `rows[row]` instead of `grab`, and `row_wrapped`
+        /// reports `wrapped[row]` — enough to model a link that ran off the
+        /// end of one row and continued on the next.
+        pub rows: Vec<String>,
+        pub wrapped: Vec<bool>,
         /// Test knob: when true, `write_input`/`write_input_raw` report
         /// failure and drop the bytes — simulates a pane whose pipe died
         /// right after a status snapshot said it was still running.
@@ -282,6 +297,8 @@ pub mod fakes {
                 observation: None,
                 grab: String::new(),
                 all_text: String::new(),
+                rows: vec![],
+                wrapped: vec![],
                 fail_write: false,
                 app_cursor: false,
                 bracketed: false,
@@ -370,11 +387,17 @@ pub mod fakes {
         fn observe(&self, _known: &[String]) -> Option<Observation> {
             self.observation.clone()
         }
-        fn grab_text(&self, _start: (u16, u16), _end: (u16, u16)) -> String {
+        fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+            if !self.rows.is_empty() && start.0 == end.0 {
+                return self.rows.get(start.0 as usize).cloned().unwrap_or_default();
+            }
             self.grab.clone()
         }
         fn grab_all_text(&self) -> String {
             self.all_text.clone()
+        }
+        fn row_wrapped(&self, row: u16) -> bool {
+            self.wrapped.get(row as usize).copied().unwrap_or(false)
         }
     }
 

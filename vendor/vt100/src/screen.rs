@@ -2733,4 +2733,28 @@ mod roost_tests {
         p.process(b"\x1b[Hz");
         assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "z");
     }
+
+    // -- wrapped rows (SPEC-ux U19) ---------------------------------------
+
+    #[test]
+    fn row_wrapped_marks_only_rows_the_cursor_ran_off_the_end_of() {
+        // roost joins wrapped rows before hunting for a URL, so the flag has
+        // to mean exactly "this row continues on the next one" — a row ended
+        // by a newline, or merely full to its last column, is not wrapped.
+        let mut p = parser(); // 20 columns
+        p.process(b"12345678901234567890continued");
+        assert!(p.screen().row_wrapped(0), "the cursor ran past column 20");
+        assert!(!p.screen().row_wrapped(1), "the continuation row ends on its own");
+
+        let mut p = parser();
+        p.process(b"short\r\nnext");
+        assert!(!p.screen().row_wrapped(0), "a newline is not a wrap");
+
+        let mut p = parser();
+        p.process(b"12345678901234567890"); // exactly full, nothing after
+        assert!(!p.screen().row_wrapped(0), "full is not wrapped until a char follows");
+
+        // Off the end of the grid answers false rather than panicking.
+        assert!(!p.screen().row_wrapped(999));
+    }
 }

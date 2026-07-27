@@ -617,6 +617,13 @@ impl PaneBackend for PtyPane {
     fn grab_all_text(&self) -> String {
         self.parser.screen().all_contents()
     }
+
+    /// U19: read the wrapped flag off the *presented* frame, for the same
+    /// reason `grab_text` does — the join has to agree with the rows the
+    /// user is looking at and clicking on, not with a grid mid-redraw.
+    fn row_wrapped(&self, row: u16) -> bool {
+        self.presented().row_wrapped(row)
+    }
 }
 
 /// Pull the text between two inclusive cell coords (row, col) from a vt100

@@ -287,6 +287,11 @@ pub struct App<B: PaneBackend> {
     /// instead, since it already runs there; this field exists only because
     /// `handle_mode_key` has no such caller-side return channel.
     pending_yank: Option<String>,
+    /// U19: a URL copy mode's `o` chord asked to open, waiting for the
+    /// composition root to hand it to the browser — same core-does-no-I/O
+    /// split as `pending_yank` above (the Alt+click path opens directly in
+    /// `main.rs`, because it already runs there).
+    pending_open: Option<String>,
     /// W3: bytes roost owes its OWN terminal — pane OSC 9 notifications
     /// (P2) and OSC 52 clipboard writes (P3) forwarded on a pane's behalf.
     /// Queued rather than written because core does no I/O (module doc) and
@@ -362,6 +367,7 @@ impl<B: PaneBackend> App<B> {
             raw: HashSet::new(),
             tab_focus: HashSet::new(),
             pending_yank: None,
+            pending_open: None,
             host_out: Vec::new(),
             host_title: String::new(),
             last_host_title: None,
@@ -557,6 +563,12 @@ impl<B: PaneBackend> App<B> {
     /// `pending_yank`. Polled once per tick from the composition root.
     pub fn take_pending_yank(&mut self) -> Option<String> {
         self.pending_yank.take()
+    }
+
+    /// U19: take (clearing) the URL copy mode's `o` asked to open — see
+    /// `pending_open`. Polled beside the yank, once per tick.
+    pub fn take_pending_open(&mut self) -> Option<String> {
+        self.pending_open.take()
     }
 
     pub fn pane_order(&self) -> Vec<PaneId> {
@@ -1774,9 +1786,15 @@ impl<B: PaneBackend> App<B> {
     /// `(1, 1)` if the focused pane isn't currently displayed (shouldn't
     /// happen, but keeps the C24 cursor math panic-free either way).
     fn focused_inner_dims(&self) -> (u16, u16) {
+        self.pane_inner_dims(self.focused)
+    }
+
+    /// The same measure for any displayed pane — U19's wrapped-row join
+    /// needs the *drawn* column count of the pane a click landed in.
+    fn pane_inner_dims(&self, id: PaneId) -> (u16, u16) {
         self.display_rects()
             .iter()
-            .find(|pr| pr.id == self.focused)
+            .find(|pr| pr.id == id)
             .map(|pr| inner_dims(pr.rect))
             .unwrap_or((1, 1))
     }
@@ -1887,11 +1905,33 @@ impl<B: PaneBackend> App<B> {
             .map(|(m, _, _)| m.as_str())
     }
 
-    /// The URL under inner cell (row, col) of pane `id`, if any (for
-    /// Alt+click-to-open). Reads that row's text from the pane grid.
+    /// The URL under inner cell (row, col) of pane `id`, if any — for
+    /// Alt+click-to-open and copy mode's `o`.
+    ///
+    /// U19: reads the whole *wrapped run* the row belongs to, not one grid
+    /// row. Agents print long CI/GitHub links into narrow panes constantly,
+    /// and a link that wrapped used to open as its first row's fragment
+    /// from above the break and dead-click everywhere below it — the two
+    /// worst outcomes available: a wrong URL, and a dead affordance.
     pub fn url_at(&self, id: PaneId, row: u16, col: u16) -> Option<String> {
-        let line = self.runtimes.get(&id)?.grab_text((row, 0), (row, u16::MAX));
-        find_url_at(&line, col as usize)
+        let rt = self.runtimes.get(&id)?;
+        let (rows, width) = self.pane_inner_dims(id);
+        // Walk back to the run's first row, then collect forward through it.
+        let mut first = row;
+        while first > 0 && rt.row_wrapped(first - 1) {
+            first -= 1;
+        }
+        let mut run: Vec<String> = Vec::new();
+        let mut r = first;
+        loop {
+            run.push(rt.grab_text((r, 0), (r, u16::MAX)));
+            // A run can't outlast the grid, whatever the flags claim.
+            if !rt.row_wrapped(r) || r >= rows.saturating_sub(1) {
+                break;
+            }
+            r += 1;
+        }
+        url_in_wrapped_rows(&run, width as usize, (row - first) as usize, col as usize)
     }
 
     // -- mouse -------------------------------------------------------------
@@ -2873,6 +2913,18 @@ impl<B: PaneBackend> App<B> {
                         let choice = *selection;
                         self.picker_launch(choice);
                     }
+                    // U20: number accelerators — the picker was arrows-and-
+                    // Enter only, which is two or three keystrokes for a
+                    // list you can already see in full. A digit past the end
+                    // of the list is simply ignored: the rows carry their
+                    // own numbers (C14), so an out-of-range press is
+                    // self-evidently one, and the picker stays up.
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let i = c as usize - '1' as usize;
+                        if i < items.len() {
+                            self.picker_launch(i);
+                        }
+                    }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
                 }
@@ -2985,6 +3037,19 @@ impl<B: PaneBackend> App<B> {
                             cursor: (row, last),
                             dragging: false,
                         });
+                    }
+                    // U19: `o` opens the URL under the cursor — keyboard
+                    // parity for a verb that was mouse-only (Alt+click), so
+                    // a link an agent printed is reachable without ever
+                    // leaving the keyboard. Wrapped links included: `url_at`
+                    // joins the run either way.
+                    KeyCode::Char('o') => {
+                        let focused = self.focused;
+                        let (r, c) = *cursor;
+                        match self.url_at(focused, r, c) {
+                            Some(url) => self.pending_open = Some(url),
+                            None => self.set_flash("no URL under the cursor"),
+                        }
                     }
                     KeyCode::Char('y') | KeyCode::Enter => {
                         if self.selection.is_some() {
@@ -3170,6 +3235,34 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// U19: stitch one wrapped run of grid rows back into the single logical
+/// line the program printed, and return the URL under a cell of it. `run`
+/// holds the run's rows in order as `grab_text` returns them (trailing
+/// spaces trimmed), `width` is the pane's inner column count, and
+/// `(row, col)` is the clicked cell — `row` indexed *within the run*.
+///
+/// Every row but the last is padded back out to `width` before the join.
+/// A wrapped row is full by definition, so that padding is normally empty
+/// and only keeps the column arithmetic exact; where a tail really was
+/// blank, the restored spaces correctly keep the two rows' tokens apart
+/// instead of fusing them into one nonsense word.
+pub fn url_in_wrapped_rows(run: &[String], width: usize, row: usize, col: usize) -> Option<String> {
+    let mut line = String::new();
+    let mut at = None;
+    for (i, text) in run.iter().enumerate() {
+        if i == row {
+            at = Some(line.chars().count() + col);
+        }
+        line.push_str(text);
+        if i + 1 < run.len() {
+            for _ in text.chars().count()..width {
+                line.push(' ');
+            }
+        }
+    }
+    find_url_at(&line, at?)
 }
 
 /// U18: the global `Action` that *enters* each mode — press that chord while
@@ -5067,6 +5160,159 @@ mod tests {
         assert_eq!(find_url_at("go to https://a.co!", 10).as_deref(), Some("https://a.co"));
         // non-http tokens ignored
         assert_eq!(find_url_at("ftp://x.co here", 2), None);
+    }
+
+    /// U19: a URL that ran off the end of one row and continued on the next
+    /// is ONE token again — clicking either row returns the whole link. The
+    /// old single-row read opened the first row's fragment from above the
+    /// break and dead-clicked everything below it.
+    #[test]
+    fn url_at_joins_a_link_that_wrapped_across_two_rows() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let (_, width) = app.pane_inner_dims(id);
+        let w = width as usize;
+        // Row 3 is filled to its last column and flagged wrapped; row 4
+        // carries the rest.
+        let head = "https://ci.example.com/runs/";
+        let row3 = format!("{head}{}", "1".repeat(w - head.chars().count()));
+        let row4 = "234/logs and then some prose".to_string();
+        let whole = format!("{row3}234/logs");
+        {
+            let rt = app.runtimes.get_mut(&id).unwrap();
+            rt.rows = vec![String::new(), String::new(), String::new(), row3, row4];
+            rt.wrapped = vec![false, false, false, true, false];
+        }
+        // From the first row...
+        assert_eq!(app.url_at(id, 3, 5).as_deref(), Some(whole.as_str()));
+        // ...and from the continuation row, which used to be a dead click.
+        assert_eq!(app.url_at(id, 4, 2).as_deref(), Some(whole.as_str()));
+        // A token past the URL on the continuation row is still not a URL.
+        assert_eq!(app.url_at(id, 4, 12), None); // "and"
+    }
+
+    /// U19: an unwrapped row is still read alone — the join must not fuse
+    /// two lines that merely sit next to each other, which would invent
+    /// links out of adjacent prose.
+    #[test]
+    fn url_at_never_joins_rows_the_grid_did_not_wrap() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        {
+            let rt = app.runtimes.get_mut(&id).unwrap();
+            rt.rows = vec!["https://a.co/x".into(), "trailing".into()];
+            rt.wrapped = vec![false, false];
+        }
+        assert_eq!(app.url_at(id, 0, 3).as_deref(), Some("https://a.co/x"));
+        assert_eq!(app.url_at(id, 1, 0), None);
+    }
+
+    /// U19: the join's column arithmetic and its padding rule, in isolation
+    /// — a row whose tail really was blank keeps its tokens apart instead of
+    /// fusing them into one nonsense word.
+    #[test]
+    fn url_in_wrapped_rows_maps_columns_and_restores_trimmed_tails() {
+        use super::url_in_wrapped_rows;
+        // A real wrap: the first row is full to the pane's last column
+        // (17 of 17), so nothing was trimmed and nothing is padded back.
+        let run = vec!["https://a.co/very".to_string(), "long/path tail".to_string()];
+        let joined = "https://a.co/verylong/path";
+        assert_eq!(url_in_wrapped_rows(&run, 17, 0, 0).as_deref(), Some(joined));
+        assert_eq!(url_in_wrapped_rows(&run, 17, 1, 0).as_deref(), Some(joined));
+        // Column arithmetic: the second row's column 4 is index 21 of the
+        // join — still inside the link, and past it lands on "tail".
+        assert_eq!(url_in_wrapped_rows(&run, 17, 1, 4).as_deref(), Some(joined));
+        assert_eq!(url_in_wrapped_rows(&run, 17, 1, 10), None); // "tail"
+        // A row whose tail really was blank keeps the tokens apart: the
+        // padding restores exactly what `grab_text` trimmed, so the two
+        // rows never fuse into one nonsense word.
+        let run = vec!["https://a.co".to_string(), "notpartofit".to_string()];
+        assert_eq!(url_in_wrapped_rows(&run, 40, 0, 0).as_deref(), Some("https://a.co"));
+        assert_eq!(url_in_wrapped_rows(&run, 40, 1, 0), None);
+        // A click past the end of the run's rows finds nothing, no panic.
+        assert_eq!(url_in_wrapped_rows(&run, 40, 9, 0), None);
+    }
+
+    /// U19: `o` in copy mode opens the URL under the cursor — keyboard
+    /// parity for a verb that was mouse-only. Core stashes it; the
+    /// composition root does the I/O.
+    #[test]
+    fn copy_mode_o_stashes_the_url_under_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "go to https://a.co/x now".into();
+        app.apply(Action::CopyMode);
+        // Cursor is bottom-left; walk it onto the link with U17's `w`.
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(app.take_pending_open().as_deref(), Some("https://a.co/x"));
+        assert!(app.take_pending_open().is_none(), "taking it clears it");
+        assert!(matches!(app.mode, Mode::Copy { .. }), "opening a URL never exits the mode");
+
+        // Off the link: an honest flash rather than a silent no-op.
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(app.take_pending_open().is_none());
+        assert_eq!(app.flash(), Some("no URL under the cursor"));
+    }
+
+    /// U20: `1..9` launches that row directly — the picker was arrows-and-
+    /// Enter only, two or three keystrokes for a list you can already see.
+    #[test]
+    fn picker_number_accelerators_launch_that_row() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let items = picker_items();
+        assert!(items.len() >= 2, "this test needs a picker with a second row");
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.runtimes.len();
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Normal), "launching closes the picker");
+        assert_eq!(app.runtimes.len(), before + 1);
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.adapter.clone()),
+            Some(items[1].to_string()),
+            "the digit picks the row it labels, not the highlighted one"
+        );
+
+        // A digit past the end of the list is ignored; the picker stays up.
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.runtimes.len();
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Picker { .. }));
+        assert_eq!(app.runtimes.len(), before);
+    }
+
+    /// U20's other half: a click on a picker row launches it, through the
+    /// same `picker_launch` the keyboard uses and the same drawn rect U8's
+    /// modal gate hit-tests against.
+    #[test]
+    fn picker_click_launches_the_row_it_landed_on() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let items = picker_items();
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.runtimes.len();
+        app.apply(Action::QuickLaunch);
+        let rect = crate::ui::render::modal_rect(&app).expect("the picker draws a dialog");
+        let row = rect.y + 1 + (items.len() - 1) as u16; // the last item
+        app.handle_modal_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            Some(rect),
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.runtimes.len(), before + 1);
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.adapter.clone()),
+            Some(items[items.len() - 1].to_string()),
+        );
     }
 
     #[test]
