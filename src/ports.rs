@@ -151,6 +151,15 @@ pub trait PaneBackend: Sized {
         false
     }
 
+    /// P10: has the pane's app subscribed to focus reporting (mode 1004,
+    /// `CSI ?1004h`)? When true, roost owes it `CSI I` when it becomes the
+    /// focused pane and `CSI O` when it stops being one. A pane that never
+    /// asked must be sent nothing — those bytes would arrive as input.
+    /// Default false.
+    fn focus_events(&self) -> bool {
+        false
+    }
+
     /// W3: drain what the pane's escape traffic asked roost to do since the
     /// last call — see `PaneEffects`. Called right after `process_output`;
     /// nothing accumulates between calls. Default empty for backends with no
@@ -274,6 +283,9 @@ pub mod fakes {
         /// Test knob (P9): simulates the pane's app drawing on the alternate
         /// screen (`?1049h`).
         pub alternate_screen: bool,
+        /// Test knob (P10): simulates the pane's app having subscribed to
+        /// focus reporting (mode 1004).
+        pub focus_events: bool,
         /// The pixel geometry most recently seen — at spawn, then updated by
         /// every resize — so tests can assert the P4 pixel plumbing.
         pub pixels: (u16, u16),
@@ -315,6 +327,7 @@ pub mod fakes {
                 app_cursor: false,
                 bracketed: false,
                 alternate_screen: false,
+                focus_events: false,
                 pixels,
                 effects: PaneEffects::default(),
                 cursor_shape: None,
@@ -369,6 +382,9 @@ pub mod fakes {
         }
         fn alternate_screen(&self) -> bool {
             self.alternate_screen
+        }
+        fn focus_events(&self) -> bool {
+            self.focus_events
         }
         fn take_effects(&mut self) -> PaneEffects {
             std::mem::take(&mut self.effects)

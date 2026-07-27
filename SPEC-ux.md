@@ -272,6 +272,16 @@ Cursor motion inside the buffer stays **out of scope** and unimplemented —
 amended 2026-07-27). The drive's probe now types `junk` + Ctrl+U +
 `abc def` + Ctrl+W, so `abc` survives only if both chords were honored and a
 literal insertion would show as a stray `u`/`w`.
+**Fixed (the deferred half, 2026-07-27):** the dialog has a **point**.
+`Mode::Rename` carries a `cursor` (a char index, so a multi-byte name never
+gets sliced mid-character); `←`/`→`/`Home`/`End` move it, insertion and paste
+happen *at* it, `Backspace` takes the char behind it and `Delete` the one
+under it. That finally makes the two chords' readline names honest: `Ctrl+W`
+rubs out the word behind the point and leaves the tail alone, and `Ctrl+U`
+kills back to the start rather than clearing the buffer — "word behind point"
+means something now that there is a point. The `▏` caret renders at the point
+instead of always at the end (it was already a theme token), and the hint bar
+gains `←→ move` (C13/C9/§8 amended 2026-07-27).
 
 ### U17 · Low · FIXED (this branch) — copy-mode vocabulary
 `V` (line select) and `w/b/e` are unbound no-ops (live-confirmed); `0`/`$`
@@ -348,6 +358,33 @@ is exactly what unhinted `j/k` cost this dialog. The hint bar gains
 stays up: the rows are numbered, so an out-of-range press is self-evidently
 one. Type-ahead and the DESIGN.md §7 recent-cwd column stay **OPEN** — both
 are new state, not a missing binding (C14 amended 2026-07-27).
+**Fixed (both deferred halves, 2026-07-27):**
+- **Type-ahead.** Every printable narrows the adapter list by
+  ASCII-case-insensitive *substring* (`laud` finds `claude` — a prefix-only
+  filter makes you already know the list you came to read); `Backspace`
+  widens it back, and the live query rides in the dialog title so a
+  one-row picker always says *why* it is one row. Digits stay accelerators
+  rather than becoming filter text: no adapter id or path needs a digit
+  typed to reach it, and trading the dialog's fastest key for its rarest
+  would be a bad deal. `1..9`, the click and Enter all address the
+  **filtered** rows, so keyboard and mouse can never disagree about what
+  row 2 is. `j`/`k` stop being motions — a list you filter by typing
+  cannot reserve letters — which costs nothing advertised, since "unhinted
+  `j/k`" was this item's own opening complaint; the arrows the hint bar
+  *does* advertise are untouched.
+- **The DESIGN.md §7 recent-cwd column.** A second column of recent working
+  directories (last two path components, so sibling checkouts stay
+  distinguishable); `←`/`→` hand `↑`/`↓` between the columns, and a launch
+  uses the selected directory — opening an agent in another project no
+  longer costs a shell round-trip. The focused column marks its selection
+  with `❯` + FG; the other keeps FG without the marker, so what a launch
+  would use is readable from either side. The list is **session-only**:
+  it is seeded at startup from the workspace's own pane cwds (already
+  persisted), grows when `observe_panes` notices a pane `cd` somewhere new
+  or a launch uses a directory, and is capped at 9. Persisting it would
+  mean a `workspace.json` schema field — a migration — for a list that
+  reconstructs itself from the precious state on every start. C14/C9/§8
+  amended 2026-07-27.
 
 ### U21 · Low · OPEN — mouse can't resize; tabs are click-to-switch only
 No border drag-resize, no middle-click close, no drag-reorder.

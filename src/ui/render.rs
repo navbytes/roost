@@ -10,8 +10,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
-    feed_overlay_size, picker_items, App, FeedEntry, Mode, RenameTarget,
-    Selection, TabSummary,
+    feed_overlay_size, App, FeedEntry, Mode, RenameTarget,
+    Search, Selection, TabSummary,
 };
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, PaneRect};
@@ -104,21 +104,49 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
             ("Esc", "exit"),
         ],
         Mode::Help => vec![("Alt+?", "all keys"), ("any key", "close")],
+        // [Amended, U16] `←→` joins the list once there is a cursor to move:
+        // a text field whose caret is stuck at the end is one nobody tries
+        // to move, and the motion was the half of U16 left unimplemented.
+        // 45 columns.
         Mode::Rename { target, .. } => {
             let what = match target {
                 RenameTarget::Pane => "pane name",
                 RenameTarget::Tab => "tab name",
             };
-            vec![("type", what), ("↵", "save"), ("Esc", "cancel")]
+            vec![("type", what), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
         }
         // [Amended, U20] `1..9` joins the list: the accelerator is the
         // fastest way through the picker and the only one that wasn't
-        // advertised anywhere.
-        Mode::Picker { .. } => {
-            vec![("↑↓", "choose"), ("↵", "open"), ("1..9", "launch"), ("Esc", "cancel")]
-        }
-        Mode::Scroll { .. } => {
-            vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
+        // advertised anywhere. [Re-amended, U20 second half] and so do the
+        // type-ahead and the cwd column — 71 columns, inside the floor.
+        // `j/k` are gone from the picker (they are filter text now) and
+        // were never on this bar, so nothing advertised was lost.
+        Mode::Picker { .. } => vec![
+            ("↑↓", "choose"),
+            ("↵", "open"),
+            ("1..9", "launch"),
+            ("type", "filter"),
+            ("←→", "dir"),
+            ("Esc", "cancel"),
+        ],
+        // [Amended, P21] `/ search` and `n/N next` join the list: scroll
+        // mode is where a search starts and where its hits are walked, and
+        // an unadvertised key is an absent one. 59 columns — comfortably
+        // inside the 100-col floor alongside the right segment.
+        Mode::Scroll { .. } => vec![
+            ("↑↓", "scroll"),
+            ("PgUp/Dn", "page"),
+            ("/", "search"),
+            ("n/N", "next"),
+            ("Esc", "exit"),
+        ],
+        // [Added, P21] The search prompt's own list. `↵ keep` and
+        // `Esc cancel` are the two exits and lead the yield order; the
+        // hits-walking pair trails because it is the one that keeps
+        // working after the prompt closes (and is advertised again on the
+        // Scroll list once it does).
+        Mode::Search { .. } => {
+            vec![("type", "filter"), ("↵", "keep"), ("Esc", "cancel"), ("n/N", "next")]
         }
         // [Amended, U25] The feed's own working keys were missing from its
         // own hint: PgUp/PgDn paged and `q` closed, both unadvertised, and
@@ -164,17 +192,29 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Copy { .. } => "COPY",
         Mode::Help => "HELP",
         Mode::Feed { .. } => "FEED",
+        Mode::Search { .. } => "SEARCH",
     }
 }
 
 /// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" —
 /// omitted at `n == 0` rather than shown as a hollow "0 needs you" — then
-/// (Scroll mode only, U3) the dim `↑N/M` position, then the uppercase mode
-/// word, then one trailing space. The position rides inside the segment so
-/// C9's fit/yield machinery covers it for free: pairs drop whole before any
-/// of it clips. Pure so the omission rules are unit-testable without a
-/// `Frame`.
-fn hint_bar_right_spans(n: usize, position: Option<String>, word: &str) -> Vec<Span<'static>> {
+/// (P21) the search prompt, then (Scroll/Search, U3) the dim position, then
+/// the uppercase mode word, then one trailing space. Everything rides inside
+/// the segment so C9's fit/yield machinery covers it for free: pairs drop
+/// whole before any of it clips. Pure so the omission rules are
+/// unit-testable without a `Frame`.
+///
+/// [P21] `query` is the live search prompt (`/foo`) and is the one token on
+/// this bar drawn in `FG`: it is text the user is typing right now, and DIM
+/// input is input you cannot proofread. `position` carries `↑N/M` in Scroll
+/// mode and the `i/n` hit counter while searching — both DIM, both the same
+/// "where am I" role.
+fn hint_bar_right_spans(
+    n: usize,
+    query: Option<String>,
+    position: Option<String>,
+    word: &str,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if n > 0 {
         spans.push(Span::styled(
@@ -183,12 +223,29 @@ fn hint_bar_right_spans(n: usize, position: Option<String>, word: &str) -> Vec<S
         ));
         spans.push(Span::raw("  "));
     }
+    if let Some(q) = query {
+        spans.push(Span::styled(format!("{q} "), Style::default().fg(theme::FG)));
+    }
     if let Some(pos) = position {
         spans.push(Span::styled(format!("{pos} "), Style::default().fg(theme::DIM)));
     }
     spans.push(Span::styled(word.to_string(), Style::default().fg(theme::DIM)));
     spans.push(Span::raw(" "));
     spans
+}
+
+/// P21: the search prompt and hit counter for C9's right segment — `/query`
+/// (with the `▏` insertion caret the rename dialog already uses, so a typed
+/// prompt looks like a text field everywhere in roost) and `i/n`, or `0/0`
+/// when nothing matches. `None` for both outside a search. Pure.
+fn search_segment(search: Option<&Search>) -> (Option<String>, Option<String>) {
+    let Some(s) = search else { return (None, None) };
+    let counter = if s.matches.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", s.current + 1, s.matches.len())
+    };
+    (Some(format!("/{}{}", s.query, theme::RENAME_CURSOR)), Some(counter))
 }
 
 /// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
@@ -249,15 +306,20 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // U3: Scroll mode's right segment shows where in history the view sits
     // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
     // can never report a phantom row the grid refused (U9's overshoot).
-    let position = match &app.mode {
+    // P21: while the prompt is up the segment carries the query and the hit
+    // counter instead — the search *is* the position report, and stacking
+    // `↑N/M` beside `3/17` would be two answers to one question.
+    let (query, position) = match &app.mode {
+        Mode::Search { .. } => search_segment(app.search.as_ref()),
         Mode::Scroll { .. } => {
             let (off, total) = app.scroll_position();
-            Some(format!("{}{off}/{total}", theme::SCROLLED))
+            (None, Some(format!("{}{off}/{total}", theme::SCROLLED)))
         }
-        _ => None,
+        _ => (None, None),
     };
     let right = hint_bar_right_spans(
         app.needs_input_count(),
+        query,
         position,
         mode_word(&app.mode, app.zoomed(), focused_raw),
     );
@@ -341,6 +403,73 @@ fn picker_row_body(i: usize, item: &str) -> String {
     }
 }
 
+/// C13 (U16): the rename field's rendered text — the buffer with the `▏`
+/// caret sitting *at* the insertion point rather than always at the end.
+/// `cursor` is a char index and is clamped, so a stale value (a resize
+/// between keystrokes, a paste that shortened the buffer) renders the caret
+/// at the end instead of panicking on a bad slice. Pure so the caret's
+/// placement has a unit-test seam.
+fn rename_field(buffer: &str, cursor: usize) -> String {
+    let at = cursor.min(buffer.chars().count());
+    let byte = buffer.char_indices().nth(at).map_or(buffer.len(), |(b, _)| b);
+    format!("{}{}{}", &buffer[..byte], theme::RENAME_CURSOR, &buffer[byte..])
+}
+
+/// C14 (U20): one picker row's leading marker and text style, given whether
+/// it is its column's selection and whether that column has the keyboard.
+/// Three states, no fourth: the focused column's selection wears `❯` in
+/// `ACCENT` with `FG` text (C14's idiom, unchanged); the *other* column's
+/// selection keeps `FG` text without the marker — what a launch would use
+/// has to stay readable from either side — and everything else is `MUTED`.
+/// Pure so the three states are pinned without a `Frame`.
+fn row_marks(selected: bool, column_focused: bool) -> (Span<'static>, Style) {
+    match (selected, column_focused) {
+        (true, true) => (
+            Span::styled(theme::PICKER_SELECTED.to_string(), Style::default().fg(theme::ACCENT)),
+            Style::default().fg(theme::FG),
+        ),
+        (true, false) => (Span::raw(" "), Style::default().fg(theme::FG)),
+        _ => (Span::raw(" "), Style::default().fg(theme::MUTED)),
+    }
+}
+
+/// C14 (U20): the picker's cwd column entry for `path` — the last two path
+/// components, so `~/src/roost/vendor` reads as `roost/vendor` and a column
+/// of sibling checkouts stays distinguishable without spending the width a
+/// full path would. The root and single-component paths render whole.
+fn picker_cwd_label(path: &std::path::Path) -> String {
+    let parts: Vec<String> =
+        path.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    match parts.len() {
+        0 => "/".to_string(),
+        1 => parts[0].clone(),
+        // A top-level directory's parent IS the root, so joining blindly
+        // would spell `/tmp` as `//tmp`.
+        n if parts[n - 2] == "/" => format!("/{}", parts[n - 1]),
+        n => format!("{}/{}", parts[n - 2], parts[n - 1]),
+    }
+}
+
+/// C14 (U20): the picker dialog's width — the adapter column (a fixed 16,
+/// as before the cwd column existed) plus the widest cwd label, plus the
+/// gap and the two border columns. `centered_near` still clamps it to the
+/// screen. Pure so the sizing and the drawing can't drift.
+fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
+    const ADAPTER_COL: u16 = 16;
+    let widest = cwds
+        .iter()
+        .map(|p| mouse::display_width(&picker_cwd_label(p)))
+        .max()
+        .unwrap_or(0);
+    // Never narrower than the pre-U20 dialog: a column of short labels must
+    // not make the picker *shrink* relative to the one it replaced.
+    const MIN: u16 = 32;
+    if widest == 0 {
+        return MIN;
+    }
+    (ADAPTER_COL + 2 + widest + 2).max(MIN)
+}
+
 /// The help overlay's key-column prefix: the key label left-padded to a
 /// fixed column so every description lines up underneath it. Shared by the
 /// width computation and the row-rendering loop below so they can't drift.
@@ -376,7 +505,7 @@ fn help_dialog_width(keys: &[(&str, &str)]) -> u16 {
 /// closes it" and the ≤20 cap both survive untouched.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+n", "new shell pane (auto split)"),
-    ("Alt+Enter", "quick-launch picker (pi / claude / shell; 1..9)"),
+    ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
     ("Alt+←↓↑→ / hjkl", "move focus"),
     ("Alt+Shift+←↓↑→", "resize along that axis"),
     ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
@@ -388,7 +517,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
     ("Alt+i / Alt+m", "previous / next tab (wraps)"),
     ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-    ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
+    ("Alt+c / Alt+PgUp", "copy (hjkl wbe 0$ vV y o) / scroll — / search, n/N"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
     ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
@@ -426,18 +555,35 @@ pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
         .find(|pr| pr.id == app.focused)
         .map(|pr| pr.rect)
         .unwrap_or(body);
-    dialog_rect(&app.mode, body, anchor)
+    dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
 }
 
 /// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
-fn dialog_rect(mode: &Mode, body: Rect, anchor: Rect) -> Option<Rect> {
+/// [U20] The picker's size now depends on app state (the type-ahead filter's
+/// row count and the recent-cwd column), so it takes those as `rows`/`cwds`
+/// rather than re-deriving them — `modal_rect` and `draw_mode_overlay` pass
+/// the same values, keeping the drawn dialog and the mouse hitbox in
+/// lockstep (§4/§5).
+fn dialog_rect(
+    mode: &Mode,
+    body: Rect,
+    anchor: Rect,
+    rows: usize,
+    cwds: &[std::path::PathBuf],
+) -> Option<Rect> {
     match mode {
         // Copy mode has no centered overlay — the cursor/selection are
-        // drawn in-pane (C17/C24).
-        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => None,
+        // drawn in-pane (C17/C24). [P21] Nor does search: its prompt lives
+        // in the hint bar's right segment, so the pane it is searching
+        // stays fully visible while the query narrows.
+        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } | Mode::Search { .. } => None,
         Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
         Mode::Picker { .. } => {
-            Some(centered_near(anchor, body, 32, picker_items().len() as u16 + 2))
+            // U20: as tall as the longer of the two columns (a filter can
+            // shrink the adapter side below the cwd side), never shorter
+            // than one row — an empty result still needs a frame to say so.
+            let h = rows.max(cwds.len()).max(1) as u16 + 2;
+            Some(centered_near(anchor, body, picker_dialog_width(cwds), h))
         }
         Mode::Help => {
             let h = HELP_KEYS.len() as u16 + 2;
@@ -451,10 +597,14 @@ fn dialog_rect(mode: &Mode, body: Rect, anchor: Rect) -> Option<Rect> {
 }
 
 fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
-    let Some(rect) = dialog_rect(&app.mode, body, anchor) else { return };
+    let Some(rect) =
+        dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
+    else {
+        return;
+    };
     match &app.mode {
-        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => {}
-        Mode::Rename { buffer, target } => {
+        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } | Mode::Search { .. } => {}
+        Mode::Rename { buffer, cursor, target } => {
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let heading = match target {
@@ -468,17 +618,27 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             f.render_widget(
-                Paragraph::new(format!("{buffer}{}", theme::RENAME_CURSOR))
+                Paragraph::new(rename_field(buffer, *cursor))
                     .style(Style::default().fg(theme::FG)),
                 inner,
             );
         }
-        Mode::Picker { selection } => {
-            let items = picker_items();
+        Mode::Picker { selection, filter, cwd, on_cwd } => {
+            let items = app.picker_filtered();
+            let cwds = app.picker_cwds();
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
+            // [Amended, U20] The title carries the live type-ahead query, so
+            // a narrowed list always says *why* it is narrow — a filtered
+            // picker showing one row and no query would read as a picker
+            // that lost its adapters.
+            let heading = if filter.is_empty() {
+                " new pane — pick agent ".to_string()
+            } else {
+                format!(" new pane — {filter}{} ", theme::RENAME_CURSOR)
+            };
             let block = Block::bordered()
-                .title(dialog_title(" new pane — pick agent "))
+                .title(Line::from(Span::styled(heading, Style::default().fg(theme::FG))))
                 .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
@@ -486,20 +646,32 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             // C14: selected row is a `❯`-prefix + FG item text, no bg
             // highlight; unselected rows are plain MUTED text. [Amended,
             // U20] Each row leads with its `1..9` accelerator — an
-            // accelerator nothing shows is one nobody presses.
-            let lines: Vec<Line> = items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    let body = picker_row_body(i, item);
-                    if i == *selection {
-                        Line::from(vec![
-                            Span::styled(theme::PICKER_SELECTED.to_string(), Style::default().fg(theme::ACCENT)),
-                            Span::styled(body, Style::default().fg(theme::FG)),
-                        ])
-                    } else {
-                        Line::from(Span::styled(format!(" {body}"), Style::default().fg(theme::MUTED)))
+            // accelerator nothing shows is one nobody presses — and a
+            // second column lists the recent working directories. The
+            // column with focus marks its selection with `❯`; the other
+            // shows its selection in FG without the marker, so what will
+            // actually be launched is readable from either side.
+            const ADAPTER_COL: usize = 16;
+            let rows = items.len().max(cwds.len());
+            let lines: Vec<Line> = (0..rows)
+                .map(|i| {
+                    let mut spans: Vec<Span> = Vec::with_capacity(3);
+                    match items.get(i) {
+                        Some(item) => {
+                            let text = picker_row_body(i, item);
+                            let pad = ADAPTER_COL.saturating_sub(mouse::display_width(&text) as usize + 1);
+                            let (marker, style) = row_marks(i == *selection, !*on_cwd);
+                            spans.push(marker);
+                            spans.push(Span::styled(format!("{text}{}", " ".repeat(pad)), style));
+                        }
+                        None => spans.push(Span::raw(" ".repeat(ADAPTER_COL))),
                     }
+                    if let Some(path) = cwds.get(i) {
+                        let (marker, style) = row_marks(i == *cwd, *on_cwd);
+                        spans.push(marker);
+                        spans.push(Span::styled(format!(" {}", picker_cwd_label(path)), style));
+                    }
+                    Line::from(spans)
                 })
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
@@ -931,6 +1103,14 @@ fn draw_pane<B: PaneBackend>(
         }
     }
 
+    // P21: search hits, painted before the selection so a selection over a
+    // hit still reads as selected. C17's rule holds — modifiers only, no
+    // color tokens: hits sit on top of arbitrary program colors.
+    if let Some(search) = app.search.as_ref().filter(|s| s.pane == pr.id) {
+        let (offset, total) = app.scroll_position();
+        highlight_matches(f, inner, search, total.saturating_sub(offset));
+    }
+
     // Copy-mode selection: reverse-highlight the selected cells in this pane.
     if let Some(sel) = app.selection.filter(|s| s.pane == pr.id) {
         highlight_selection(f, inner, sel.anchor, sel.cursor);
@@ -1187,6 +1367,42 @@ fn highlight_selection(f: &mut Frame, inner: Rect, a: (u16, u16), b: (u16, u16))
             col += 1;
         }
         row += 1;
+    }
+}
+
+/// P21: paint the search hits visible in this pane. `first_line` is the
+/// haystack line index currently on the view's top row — `banked − offset`,
+/// both read from the grid — so a hit's screen row is just `line −
+/// first_line`. Every hit is `REVERSED`; the *current* one additionally
+/// `UNDERLINED`, so "which of these am I parked on" is answerable at a
+/// glance. Modifier-only by C17: hits land on arbitrary program colors, and
+/// a palette token here would be a DEVIATED.
+fn highlight_matches(f: &mut Frame, inner: Rect, search: &Search, first_line: usize) {
+    let width = search.width();
+    if width == 0 {
+        return;
+    }
+    let current = search.current_match();
+    let buf = f.buffer_mut();
+    for (i, &(line, col)) in search.matches.iter().enumerate() {
+        let Some(row) = line.checked_sub(first_line) else { continue };
+        if row >= inner.height as usize {
+            continue;
+        }
+        let is_current = current == Some(search.matches[i]) && i == search.current;
+        for c in col..col + width {
+            if c >= inner.width as usize {
+                break;
+            }
+            let Some(cell) = buf.cell_mut((inner.x + c as u16, inner.y + row as u16)) else {
+                continue;
+            };
+            let mut style = cell.style().add_modifier(Modifier::REVERSED);
+            if is_current {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            cell.set_style(style);
+        }
     }
 }
 
@@ -1524,14 +1740,92 @@ mod tests {
     fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
         // U3: `↑N/M` rides inside the right segment (DIM), so C9's yield
         // machinery covers it — and it only exists when a position is given.
-        let spans = hint_bar_right_spans(0, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(0, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "↑12/300 SCROLL ");
         assert_eq!(spans[0].style.fg, Some(theme::DIM));
 
-        let spans = hint_bar_right_spans(2, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(2, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
+    }
+
+    /// P21: the search prompt lives in C9's right segment — `/query▏` in FG
+    /// (it is live input; DIM input is input you cannot proofread) with the
+    /// DIM hit counter and the SEARCH mode word behind it. No dialog: the
+    /// pane being searched must stay visible while the query narrows.
+    #[test]
+    fn hint_bar_right_carries_the_search_prompt_and_hit_counter() {
+        use crate::core::app::Search;
+        let lines: Vec<String> = ["alpha beta", "beta beta"].map(String::from).to_vec();
+        let mut s = Search::over(lines, "beta", 1);
+        let (query, position) = super::search_segment(Some(&s));
+        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!("/beta{} 2/3 SEARCH ", theme::RENAME_CURSOR));
+        assert_eq!(spans[0].style.fg, Some(theme::FG), "the typed query is legible, not dim");
+        assert_eq!(spans[1].style.fg, Some(theme::DIM), "the counter is a position token");
+
+        // A query with no hits says so rather than hiding the counter — an
+        // empty result is the answer, not the absence of one.
+        s = Search::over(vec!["alpha beta".into()], "gamma", 0);
+        let (query, position) = super::search_segment(Some(&s));
+        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!("/gamma{} 0/0 SEARCH ", theme::RENAME_CURSOR));
+
+        // Outside a search there is no prompt at all.
+        assert_eq!(super::search_segment(None), (None, None));
+    }
+
+    /// P21: hits are painted REVERSED and the current one additionally
+    /// UNDERLINED — modifiers only (C17), and positioned by the same
+    /// `banked − offset` arithmetic the jump uses, so a hit scrolled off
+    /// the top of the view paints nothing.
+    #[test]
+    fn search_hits_are_reversed_with_the_current_one_underlined() {
+        use crate::core::app::Search;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Haystack lines 4 and 6 hold hits; the view's top row shows line 4.
+        let lines: Vec<String> = (0..8)
+            .map(|i| if i == 4 || i == 6 { "xxbetaxx".to_string() } else { "----".to_string() })
+            .collect();
+        // current = 1 → the line-6 hit.
+        let search = Search::over(lines, "beta", 1);
+        let inner = Rect::new(0, 0, 10, 4);
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::highlight_matches(f, inner, &search, 4)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // Line 4 → screen row 0, cols 2..6: reversed, not underlined.
+        for c in 2..6 {
+            let cell = buf.cell((c, 0)).unwrap();
+            assert!(cell.style().add_modifier.contains(Modifier::REVERSED), "col {c}");
+            assert!(!cell.style().add_modifier.contains(Modifier::UNDERLINED), "col {c}");
+        }
+        // Line 6 → screen row 2: the current hit, so also underlined.
+        for c in 2..6 {
+            let cell = buf.cell((c, 2)).unwrap();
+            assert!(cell.style().add_modifier.contains(Modifier::REVERSED), "col {c}");
+            assert!(cell.style().add_modifier.contains(Modifier::UNDERLINED), "col {c}");
+        }
+        // Cells outside the runs are untouched.
+        assert!(!buf.cell((1, 0)).unwrap().style().add_modifier.contains(Modifier::REVERSED));
+        assert!(!buf.cell((6, 0)).unwrap().style().add_modifier.contains(Modifier::REVERSED));
+
+        // A view scrolled past both hits paints nothing at all.
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::highlight_matches(f, inner, &search, 7)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in 0..4 {
+            for x in 0..10 {
+                assert!(!buf.cell((x, y)).unwrap().style().add_modifier.contains(Modifier::REVERSED));
+            }
+        }
     }
 
     #[test]
@@ -1695,7 +1989,7 @@ mod tests {
             ],
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        let right_w = super::hint_bar_right_spans(0, None, "COPY")
+        let right_w = super::hint_bar_right_spans(0, None, None, "COPY")
             .iter()
             .map(|s| mouse::display_width(&s.content))
             .sum::<u16>();
@@ -1725,7 +2019,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_omits_needs_segment_at_zero() {
-        let spans = hint_bar_right_spans(0, None, "NORMAL");
+        let spans = hint_bar_right_spans(0, None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "NORMAL ");
         assert!(!text.contains('◆'));
@@ -1733,7 +2027,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
-        let spans = hint_bar_right_spans(3, None, "NORMAL");
+        let spans = hint_bar_right_spans(3, None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
@@ -1776,10 +2070,10 @@ mod tests {
     fn mode_word_matches_c9_table() {
         assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
         assert_eq!(
-            mode_word(&Mode::Rename { buffer: String::new(), target: RenameTarget::Pane }, false, false),
+            mode_word(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false),
             "RENAME"
         );
-        assert_eq!(mode_word(&Mode::Picker { selection: 0 }, false, false), "PICKER");
+        assert_eq!(mode_word(&Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false }, false, false), "PICKER");
         assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, false, false), "SCROLL");
         assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false), "COPY");
         assert_eq!(mode_word(&Mode::Help, false, false), "HELP");
@@ -1880,9 +2174,9 @@ mod tests {
     #[test]
     fn hint_pairs_rename_word_differs_pane_vs_tab() {
         let pane =
-            hint_pairs(&Mode::Rename { buffer: String::new(), target: RenameTarget::Pane }, false, false);
+            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false);
         let tab =
-            hint_pairs(&Mode::Rename { buffer: String::new(), target: RenameTarget::Tab }, false, false);
+            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false);
         assert_eq!(pane[0], ("type", "pane name"));
         assert_eq!(tab[0], ("type", "tab name"));
     }
@@ -2034,12 +2328,15 @@ mod tests {
         // into one row so the ≤20 cap still holds. Wording matches §8.
         // U23 (2026-07-27): three more merges (s/o, z/f, w/u) buy the three
         // reference rows that close the table — the status legend and the
-        // two mouse rows.
+        // two mouse rows. P21 (2026-07-27): scrollback search adds no row —
+        // its `/` and `n/N` are tightened into the copy/scroll row's own
+        // description, which is what the ≤20 cap has always demanded of a
+        // new mode-local key.
         assert_eq!(
             HELP_KEYS,
             &[
                 ("Alt+n", "new shell pane (auto split)"),
-                ("Alt+Enter", "quick-launch picker (pi / claude / shell; 1..9)"),
+                ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
                 ("Alt+←↓↑→ / hjkl", "move focus"),
                 ("Alt+Shift+←↓↑→", "resize along that axis"),
                 ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
@@ -2051,7 +2348,7 @@ mod tests {
                 ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
                 ("Alt+i / Alt+m", "previous / next tab (wraps)"),
                 ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-                ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
+                ("Alt+c / Alt+PgUp", "copy (hjkl wbe 0$ vV y o) / scroll — / search, n/N"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
                 ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),
@@ -2094,14 +2391,92 @@ mod tests {
         );
     }
 
+    /// U16: the `▏` caret sits AT the insertion point, not always at the
+    /// end — the visible half of the cursor motion. Out-of-range values
+    /// clamp to the end rather than panicking on a bad slice, and the field
+    /// slices on char boundaries so a multi-byte name survives.
+    #[test]
+    fn rename_field_puts_the_caret_at_the_insertion_point() {
+        let caret = theme::RENAME_CURSOR;
+        assert_eq!(super::rename_field("abcd", 4), format!("abcd{caret}"));
+        assert_eq!(super::rename_field("abcd", 2), format!("ab{caret}cd"));
+        assert_eq!(super::rename_field("abcd", 0), format!("{caret}abcd"));
+        assert_eq!(super::rename_field("", 0), caret.to_string());
+        // Clamped, not panicking.
+        assert_eq!(super::rename_field("abcd", 99), format!("abcd{caret}"));
+        // Multi-byte: the caret lands between chars, never inside one.
+        assert_eq!(super::rename_field("héllo", 2), format!("hé{caret}llo"));
+    }
+
+    /// C14 (U20): the cwd column shows the last two path components, so a
+    /// screenful of sibling checkouts stays distinguishable without paying
+    /// for full paths.
+    #[test]
+    fn picker_cwd_labels_keep_the_last_two_components() {
+        use std::path::Path;
+        assert_eq!(super::picker_cwd_label(Path::new("/home/me/src/roost")), "src/roost");
+        assert_eq!(super::picker_cwd_label(Path::new("/tmp")), "/tmp", "no doubled slash at the root");
+        assert_eq!(super::picker_cwd_label(Path::new("roost")), "roost");
+        assert_eq!(super::picker_cwd_label(Path::new("/")), "/");
+    }
+
+    /// C14 (U20): the three row states — the focused column's selection
+    /// (marker + FG), the other column's selection (FG, no marker, so what
+    /// a launch would use stays readable), everything else MUTED.
+    #[test]
+    fn picker_rows_mark_only_the_focused_columns_selection() {
+        let (marker, style) = super::row_marks(true, true);
+        assert_eq!(marker.content.as_ref(), theme::PICKER_SELECTED.to_string());
+        assert_eq!(marker.style.fg, Some(theme::ACCENT));
+        assert_eq!(style.fg, Some(theme::FG));
+
+        let (marker, style) = super::row_marks(true, false);
+        assert_eq!(marker.content.as_ref(), " ", "no marker in the column without focus");
+        assert_eq!(style.fg, Some(theme::FG), "but still readable as the selection");
+
+        let (marker, style) = super::row_marks(false, true);
+        assert_eq!(marker.content.as_ref(), " ");
+        assert_eq!(style.fg, Some(theme::MUTED));
+    }
+
+    /// C14 (U20): the dialog grows to fit the widest cwd label, and stays
+    /// the pre-U20 32 columns when there is no cwd column to show.
+    #[test]
+    fn picker_dialog_width_covers_the_cwd_column() {
+        use std::path::PathBuf;
+        assert_eq!(super::picker_dialog_width(&[]), 32, "no cwds ⇒ the old dialog");
+        let cwds = vec![PathBuf::from("/home/me/src/roost"), PathBuf::from("/tmp")];
+        // widest label = "src/roost" (9) ⇒ 16 + 2 + 9 + 2 = 29, floored at
+        // 32: the picker must never be narrower than the one it replaced.
+        assert_eq!(super::picker_dialog_width(&cwds), 32);
+        let long = vec![PathBuf::from("/home/me/a-rather-long/checkout-name")];
+        assert_eq!(super::picker_dialog_width(&long), 16 + 2 + 27 + 2, "label = a-rather-long/checkout-name");
+    }
+
     /// U20: the accelerator is on the hint bar too — a key you can only
-    /// find by reading the source is not a feature.
+    /// find by reading the source is not a feature. Amended by U20's second
+    /// half: the type-ahead and the cwd column join it, and the list stays
+    /// inside the 100-col floor beside the right segment.
     #[test]
     fn hint_pairs_picker_advertises_the_number_accelerators() {
-        assert_eq!(
-            hint_pairs(&Mode::Picker { selection: 0 }, false, false),
-            vec![("↑↓", "choose"), ("↵", "open"), ("1..9", "launch"), ("Esc", "cancel")],
+        let pairs = hint_pairs(
+            &Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
+            false,
+            false,
         );
+        assert_eq!(
+            pairs,
+            vec![
+                ("↑↓", "choose"),
+                ("↵", "open"),
+                ("1..9", "launch"),
+                ("type", "filter"),
+                ("←→", "dir"),
+                ("Esc", "cancel"),
+            ],
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        assert_eq!(cols, 71, "C9: the picker list must stay inside the 100-col floor");
     }
 
     /// U23: the overlay documents the mouse — the wheel, click-to-focus,
@@ -2258,6 +2633,54 @@ mod tests {
             (0..100).filter_map(|x| term.backend().buffer().cell((x, 0)).map(|c| c.symbol().to_string())).collect();
         assert!(row.contains("ZOOM · "), "tab bar row was: {row:?}");
         assert!(row.trim_end().ends_with(theme::SAVED), "the save word still trails: {row:?}");
+    }
+
+    /// C14 (U20), through the real `draw`: the picker paints two columns —
+    /// numbered adapter rows on the left, recent directories on the right —
+    /// the type-ahead query rides in the title so a narrowed list says why
+    /// it is narrow, and `❯` marks only the column holding the keyboard.
+    #[test]
+    fn the_picker_draws_both_columns_and_the_live_filter() {
+        use crate::core::app::Mode;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::QuickLaunch);
+        let rows = |app: &mut App<crate::ports::fakes::FakePane>| -> Vec<String> {
+            let backend = TestBackend::new(100, 30);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let drawn = rows(&mut app).join("\n");
+        assert!(drawn.contains("pick agent"), "the unfiltered title:\n{drawn}");
+        assert!(drawn.contains("1 pi"), "the numbered adapter column:\n{drawn}");
+        // `mk_app`'s workspace lives in /tmp, so that is the seeded cwd row.
+        assert!(drawn.contains("/tmp"), "the recent-cwd column:\n{drawn}");
+        assert!(drawn.contains(theme::PICKER_SELECTED), "the adapter column has the marker");
+
+        // Type-ahead: the title carries the query and the rows narrow.
+        app.handle_mode_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let drawn = rows(&mut app).join("\n");
+        assert!(drawn.contains(&format!("p{}", theme::RENAME_CURSOR)), "the live query:\n{drawn}");
+        assert!(drawn.contains("1 pi"), "`p` keeps pi:\n{drawn}");
+        assert!(!drawn.contains("claude"), "and drops the rest:\n{drawn}");
+        assert!(!drawn.contains(" 2 "), "no second row survives the filter:\n{drawn}");
+        assert!(matches!(app.mode, Mode::Picker { .. }));
     }
 
     #[test]

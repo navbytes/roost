@@ -55,8 +55,17 @@ pub enum RenameTarget {
 /// UI mode: non-Normal modes capture all keys (see handle_mode_key).
 pub enum Mode {
     Normal,
-    Rename { buffer: String, target: RenameTarget },
-    Picker { selection: usize },
+    /// U16: a one-line text field. `cursor` is the insertion point as a
+    /// **char** index into `buffer` (0 = before the first char,
+    /// `buffer.chars().count()` = at the end) — chars, not bytes, because
+    /// every motion, edit and the `▏` caret's position are all counted in
+    /// what the user sees, and a byte index would split a multi-byte name.
+    Rename { buffer: String, cursor: usize, target: RenameTarget },
+    /// U20: the quick-launch picker. `selection` indexes the **filtered**
+    /// adapter list (`filter` is the type-ahead query, empty = everything);
+    /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
+    /// two columns `↑`/`↓` are steering.
+    Picker { selection: usize, filter: String, cwd: usize, on_cwd: bool },
     Scroll { offset: usize },
     /// Text selection — mouse drag, or the C24 keyboard cursor. `cursor` is
     /// (row, col) in the focused pane's inner cell space; both input
@@ -67,6 +76,82 @@ pub enum Mode {
     /// C20 activity-feed overlay; `offset` counts entries back from the
     /// newest (0 = live tail).
     Feed { offset: usize },
+    /// P21: the incremental scrollback-search prompt, opened with `/` from
+    /// Scroll or Copy mode. The search itself lives on `App::search` (it
+    /// outlives the prompt — `n`/`N` keep working after Enter); this only
+    /// carries what Enter and Esc need to hand the mode back: the copy
+    /// cursor to restore, or `None` for "came from Scroll mode".
+    Search { copy_cursor: Option<(u16, u16)> },
+}
+
+/// P21: one incremental search over a pane's scrollback + screen.
+///
+/// The haystack is captured **once**, when the search opens, so every
+/// keystroke re-filters a frozen buffer instead of racing the pane's live
+/// output — and so the line indices below mean the same thing from the
+/// first character typed to the last `n`. Line `i` of the haystack is the
+/// `i`-th row of the pane's whole history (`grab_all_text`, one line per
+/// grid row), which sits `total - i` rows above the live tail.
+///
+/// Bounded staleness, deliberately accepted: if the pane banks enough new
+/// output during the search to evict rows off the *front* of a full
+/// scrollback ring, capture-time indices drift by however many rows were
+/// dropped, so a jump can land a few rows off. What it can never do is lie
+/// about where the view ended up — every jump writes through
+/// `set_scrollback` and re-reads the grid-clamped result (U9), so the `↑N`
+/// badge and Scroll mode's `↑N/M` stay true whatever the arithmetic asked
+/// for. A **resize** is the one drift roost does not accept: P5's reflow
+/// rewraps the grid wholesale, so `App::refresh_search` re-captures rather
+/// than letting the indices rot (see there).
+#[derive(Debug, Clone)]
+pub struct Search {
+    /// The pane this search is about. Its offsets are meaningless anywhere
+    /// else, so leaving the pane ends the search.
+    pub pane: PaneId,
+    /// What has been typed so far. Empty = nothing to match yet.
+    pub query: String,
+    /// The pane's whole history + screen at open time, one entry per row.
+    lines: Vec<String>,
+    /// Rows banked at open time — the anchor that turns a line index into a
+    /// scrollback offset.
+    total: usize,
+    /// Every hit in reading order (oldest first): (line index, char column).
+    pub matches: Vec<(usize, usize)>,
+    /// Index into `matches` of the hit the view is parked on. Meaningless
+    /// while `matches` is empty.
+    pub current: usize,
+    /// The view offset the search opened on — what Esc puts back.
+    origin: usize,
+}
+
+impl Search {
+    /// The current hit's (line index, char column), or None with no matches.
+    pub fn current_match(&self) -> Option<(usize, usize)> {
+        self.matches.get(self.current).copied()
+    }
+
+    /// Width of a highlight run, in characters — the query's own length.
+    pub fn width(&self) -> usize {
+        self.query.chars().count()
+    }
+
+    /// A search over a literal haystack, for tests that need to *render* one
+    /// (the chrome and highlight units) without driving a whole app. The
+    /// hit list is derived, never hand-written, so a render test can't pin a
+    /// match set the finder would never produce.
+    #[cfg(test)]
+    pub fn over(lines: Vec<String>, query: &str, current: usize) -> Self {
+        let matches = find_matches(&lines, query);
+        Self {
+            pane: 1,
+            query: query.to_string(),
+            lines,
+            total: 0,
+            matches,
+            current,
+            origin: 0,
+        }
+    }
 }
 
 /// An in-progress / completed text selection within one pane. Coordinates are
@@ -120,6 +205,12 @@ const MAX_WAITS: usize = 16;
 
 /// C20: activity-feed ring buffer capacity — oldest evicted first.
 const FEED_CAP: usize = 200;
+
+/// U20: how many recent working directories the picker's second column
+/// keeps. Nine, so every one of them is reachable by the `1..9` row
+/// accelerators' worth of glancing — and so the dialog stays a thing you
+/// read in one look rather than scroll.
+const MAX_RECENT_CWDS: usize = 9;
 
 /// A closed pane or tab, kept on the undo stack so `Alt+u` can reopen it —
 /// crucially with its session id intact, so the agent resumes where it was.
@@ -187,7 +278,18 @@ pub struct App<B: PaneBackend> {
     pub ws: Workspace,
     pub runtimes: HashMap<PaneId, B>,
     pub registry: Registry,
+    /// The pane keystrokes go to. Never assign this directly — go through
+    /// `set_focus`, which is also where P10's `CSI I`/`CSI O` reports are
+    /// produced; a bare write would move focus without telling the panes.
     pub focused: PaneId,
+    /// P10: does roost's own window hold the host terminal's focus? Starts
+    /// **true** — a host that never reports focus (no mode 1004 support, a
+    /// bare PTY, another multiplexer) must not leave every pane believing it
+    /// is permanently blurred. While false, roost withholds pane-level focus
+    /// reports entirely: nothing inside roost is focused when roost isn't,
+    /// and the pane that ends up focused collects its `CSI I` the moment the
+    /// window comes back.
+    host_focused: bool,
     pub quit: bool,
     /// Spawn errors for panes whose process never started.
     pub dead: HashMap<PaneId, String>,
@@ -233,6 +335,23 @@ pub struct App<B: PaneBackend> {
     keys_seen: bool,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
+    /// P21: the live scrollback search, if one is running. Outlives the
+    /// `Mode::Search` prompt on purpose — `n`/`N` keep walking the hits back
+    /// in Scroll/Copy mode, and the renderer keeps highlighting them.
+    pub search: Option<Search>,
+    /// U20 / DESIGN.md §7: recent working directories, most recent first —
+    /// the picker's second column, so launching into a project doesn't need
+    /// a shell round-trip (`Alt+n`, `cd`, then the agent).
+    ///
+    /// **Session-only, deliberately.** Persisting it would mean a
+    /// `workspace.json` schema field, i.e. a migration, for a list that is
+    /// fully reconstructible: it is seeded at startup from the workspace's
+    /// own pane cwds (which *are* persisted) and grows as panes are
+    /// launched and `observe_panes` notices a pane `cd` somewhere new. A
+    /// restart therefore comes back with every directory the workspace
+    /// actually lives in — just not the ones a since-closed pane visited,
+    /// which is a fair price for not touching the precious state's schema.
+    recent_cwds: Vec<PathBuf>,
     /// Transient status message shown in the hint bar (e.g. "copied"), with
     /// the window it stays visible for: `FLASH_WINDOW` for ordinary notices,
     /// `CONFIRM_WINDOW` for confirm-arm prompts (U22 — prompt and arm live
@@ -344,6 +463,7 @@ impl<B: PaneBackend> App<B> {
             .ok_or_else(|| anyhow::anyhow!("cannot read /dev/urandom for the control token"))?;
         let mut app = Self {
             focused: 0,
+            host_focused: true,
             ws,
             runtimes: HashMap::new(),
             registry,
@@ -366,6 +486,8 @@ impl<B: PaneBackend> App<B> {
             alt_seen: false,
             keys_seen: false,
             selection: None,
+            search: None,
+            recent_cwds: Vec::new(),
             flash: None,
             undo: Vec::new(),
             confirm_close: None,
@@ -387,7 +509,25 @@ impl<B: PaneBackend> App<B> {
             last_host_title: None,
         };
         app.spawn_active_tab();
-        app.focused = app.pane_order().first().copied().unwrap_or(0);
+        // Through `set_focus` like every other focus move, so that method
+        // really is the only writer of `focused` (P10). Nothing is reported
+        // here: the panes were spawned microseconds ago and none has had a
+        // chance to send `?1004h` yet.
+        let first = app.pane_order().first().copied().unwrap_or(0);
+        app.set_focus(first);
+        // U20: seed the picker's recent-cwd column from the workspace that
+        // was just loaded — the directories this fleet already lives in.
+        // Reverse order so the *first* pane's cwd ends up most-recent,
+        // matching where focus just landed.
+        let seed: Vec<PathBuf> = app
+            .ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.values().map(|s| s.cwd.clone()))
+            .collect();
+        for cwd in seed.into_iter().rev() {
+            app.note_cwd(cwd);
+        }
         Ok(app)
     }
 
@@ -778,11 +918,18 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
+        // U20: directories a pane has *moved into* since we last looked —
+        // the user typing `cd ~/project` is the clearest possible statement
+        // that it is a directory they are working in, which is exactly what
+        // the picker's recent-cwd column offers back. Collected here and
+        // recorded after the loop, since `find_spec_mut` holds `self`.
+        let mut visited: Vec<PathBuf> = Vec::new();
         for (id, o) in observations {
             let Some(spec) = self.find_spec_mut(id) else { continue };
             if let Some(cwd) = o.cwd {
                 if spec.cwd != cwd {
-                    spec.cwd = cwd;
+                    spec.cwd = cwd.clone();
+                    visited.push(cwd);
                     dirty = true;
                 }
             }
@@ -809,6 +956,9 @@ impl<B: PaneBackend> App<B> {
         // cross-wiring against other panes.
         for id in promoted {
             self.pending_detect.entry(id).or_insert(SystemTime::UNIX_EPOCH);
+        }
+        for cwd in visited {
+            self.note_cwd(cwd);
         }
         if dirty {
             self.save();
@@ -1316,7 +1466,7 @@ impl<B: PaneBackend> App<B> {
         // created, spawned, and its id returned either way.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
         let id = self.spawn_child(adapter, cwd.map(PathBuf::from), owner);
-        self.focused = focused;
+        self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
             return Reply::err("spawn refused: not enough room to split");
@@ -1358,7 +1508,7 @@ impl<B: PaneBackend> App<B> {
         // or active tab.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
         let id = self.spawn_child(&spec.adapter, Some(spec.cwd), owner);
-        self.focused = focused;
+        self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
             return Reply::err("fork refused: not enough room to split");
@@ -1568,10 +1718,11 @@ impl<B: PaneBackend> App<B> {
         // that tab's focus memory before falling back to its first pane.
         if !self.ws.active_tab().panes.contains_key(&self.focused) {
             let active = self.ws.active_tab;
-            self.focused = self
+            let target = self
                 .tab_focus_target(active)
                 .or_else(|| self.pane_order().first().copied())
                 .unwrap_or(0);
+            self.set_focus(target);
         }
         true
     }
@@ -1741,8 +1892,16 @@ impl<B: PaneBackend> App<B> {
     /// to the pane *under* the dialog — live QA typed `PSTX` into a hidden
     /// shell while the dialog's own buffer ignored it.
     pub fn handle_paste(&mut self, text: &str) {
-        if let Mode::Rename { buffer, .. } = &mut self.mode {
-            buffer.extend(text.chars().filter(|c| !c.is_control()));
+        if let Mode::Rename { buffer, cursor, .. } = &mut self.mode {
+            // U16: a paste lands at the point, like typing does, and leaves
+            // the point after what it inserted — a paste that always
+            // appended would be the one edit in the dialog that ignored the
+            // cursor.
+            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+            let at = (*cursor).min(buffer.chars().count());
+            let byte = byte_at(buffer, at);
+            buffer.insert_str(byte, &clean);
+            *cursor = at + clean.chars().count();
             return;
         }
         if self.modal_active() {
@@ -1772,6 +1931,10 @@ impl<B: PaneBackend> App<B> {
         self.term_size = size;
         self.host_pixels = pixels;
         self.relayout();
+        // P21 × P5: a resize reflows the live grid, so every row index a
+        // running search captured now points somewhere else. Re-capture
+        // rather than paint hits at stale coordinates.
+        self.refresh_search();
     }
 
     /// Recompute rects and push new sizes to every pane backend. C21: driven
@@ -1975,7 +2138,7 @@ impl<B: PaneBackend> App<B> {
         if self.float_focused() && id != self.focused {
             self.hide_float();
         }
-        self.focused = id;
+        self.set_focus(id);
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         self.relayout();
         self.save();
@@ -2039,7 +2202,10 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         if matches!(self.mode, Mode::Picker { .. }) {
-            let rows = picker_items().len();
+            // U20: hit-test against the FILTERED list — the rows that are
+            // actually drawn. A click on row 2 must launch what row 2 says,
+            // whatever the type-ahead has narrowed away.
+            let rows = self.picker_filtered().len();
             match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, rows, me.column, me.row)) {
                 Some(i) => self.picker_launch(i),
                 None if !inside => self.mode = Mode::Normal,
@@ -2090,6 +2256,132 @@ impl<B: PaneBackend> App<B> {
             .get(&self.focused)
             .map(|rt| (rt.scroll_offset(), rt.scroll_total()))
             .unwrap_or((0, 0))
+    }
+
+    // -- P21: scrollback search --------------------------------------------
+
+    /// `/` from Scroll or Copy mode: capture the focused pane's whole
+    /// history + screen and open the incremental prompt over it. Re-pressing
+    /// `/` with a search already up restarts it (a fresh haystack — the
+    /// pane may have moved on), which is also what makes `/` idempotent
+    /// rather than a way to stack searches.
+    fn open_search(&mut self, copy_cursor: Option<(u16, u16)>) {
+        let pane = self.focused;
+        let Some(rt) = self.runtimes.get(&pane) else { return };
+        let lines: Vec<String> = rt.grab_all_text().lines().map(str::to_string).collect();
+        let (origin, total) = (rt.scroll_offset(), rt.scroll_total());
+        self.search = Some(Search {
+            pane,
+            query: String::new(),
+            lines,
+            total,
+            matches: Vec::new(),
+            current: 0,
+            origin,
+        });
+        self.mode = Mode::Search { copy_cursor };
+    }
+
+    /// Re-run the search against the (frozen) haystack after the query
+    /// changed, and park the view on the first hit — reading order, so
+    /// typing more characters walks *forward* from the oldest match rather
+    /// than teleporting around the buffer. An empty query puts the view back
+    /// where the search opened: backspacing to nothing is a cancel of the
+    /// filtering, not a jump to row zero.
+    fn refilter_search(&mut self) {
+        let Some(s) = &mut self.search else { return };
+        s.matches = find_matches(&s.lines, &s.query);
+        s.current = 0;
+        if s.matches.is_empty() {
+            let (pane, origin) = (s.pane, s.origin);
+            self.scroll_view_to(pane, origin);
+            return;
+        }
+        self.jump_to_match(0);
+    }
+
+    /// Park the view on hit `idx` (wrapping, so `n` past the last match
+    /// lands back on the first). The haystack's line `i` sits `total - i`
+    /// rows above the live tail; that offset goes through the U9-vetted
+    /// path — write it, then read the grid's clamp back — so the `↑N` badge
+    /// and Scroll mode's `↑N/M` describe where the view actually is, never
+    /// what the arithmetic asked for.
+    fn jump_to_match(&mut self, idx: usize) {
+        let Some(s) = &mut self.search else { return };
+        if s.matches.is_empty() {
+            return;
+        }
+        let idx = idx % s.matches.len();
+        s.current = idx;
+        let (line, _) = s.matches[idx];
+        let (pane, want) = (s.pane, s.total.saturating_sub(line));
+        self.scroll_view_to(pane, want);
+    }
+
+    /// `n` / `N`: step to the next (newer) or previous (older) hit, wrapping
+    /// at both ends. Silent with no search running or no hits — the mode's
+    /// other keys still work, and a flash per keypress would be noise.
+    fn step_match(&mut self, forward: bool) {
+        let Some(s) = &self.search else { return };
+        let n = s.matches.len();
+        if n == 0 {
+            return;
+        }
+        let next = if forward { s.current + 1 } else { s.current + n - 1 };
+        self.jump_to_match(next % n);
+    }
+
+    /// The one place a search moves a view: write the offset, then mirror
+    /// the grid's clamped answer into `Mode::Scroll`'s counter if that is
+    /// the mode we're in (or heading back to). Never a cached number — the
+    /// backend is the only thing that knows how far back the history goes.
+    fn scroll_view_to(&mut self, pane: PaneId, offset: usize) {
+        let Some(rt) = self.runtimes.get_mut(&pane) else { return };
+        rt.set_scrollback(offset);
+        let clamped = rt.scroll_offset();
+        if let Mode::Scroll { offset } = &mut self.mode {
+            *offset = clamped;
+        }
+    }
+
+    /// P21 × P5 (reflow): re-capture a running search's haystack against the
+    /// grid as it is *now*. A resize rewraps the live grid, so both the row
+    /// count and which text sits on which row change — capture-time indices
+    /// would place highlights on the wrong lines and send `n` to the wrong
+    /// place. The view is deliberately **not** re-jumped: the grid already
+    /// re-clamped the offset during the reflow, and a resize teleporting you
+    /// to a match you had scrolled away from would be its own surprise.
+    /// `current` is clamped into the new hit list, and a query that no
+    /// longer matches anything simply reports `0/0`.
+    fn refresh_search(&mut self) {
+        let Some(s) = &self.search else { return };
+        let pane = s.pane;
+        let Some(rt) = self.runtimes.get(&pane) else { return };
+        let lines: Vec<String> = rt.grab_all_text().lines().map(str::to_string).collect();
+        let total = rt.scroll_total();
+        let Some(s) = &mut self.search else { return };
+        s.matches = find_matches(&lines, &s.query);
+        s.current = s.current.min(s.matches.len().saturating_sub(1));
+        s.lines = lines;
+        s.total = total;
+    }
+
+    /// Esc: throw the search away and put the view back exactly where it was
+    /// when `/` was pressed. A cancelled search leaves no trace — not the
+    /// highlights, not the position it wandered to.
+    fn cancel_search(&mut self) {
+        let Some(s) = self.search.take() else { return };
+        self.scroll_view_to(s.pane, s.origin);
+    }
+
+    /// P21: the mode the search prompt hands back to. Scroll mode's counter
+    /// is re-seeded from the grid rather than from anything the search
+    /// remembered — the view moved, and `Mode::Scroll` mirrors the view.
+    fn mode_after_search(&self, copy_cursor: Option<(u16, u16)>) -> Mode {
+        match copy_cursor {
+            Some(cursor) => Mode::Copy { cursor },
+            None => Mode::Scroll { offset: self.scroll_offset(self.focused) },
+        }
     }
 
     // -- dead panes --------------------------------------------------------
@@ -2198,13 +2490,22 @@ impl<B: PaneBackend> App<B> {
                     .find_spec(self.focused)
                     .and_then(|s| s.title.clone())
                     .unwrap_or_default();
-                self.mode = Mode::Rename { buffer: current, target: RenameTarget::Pane };
+                let cursor = current.chars().count();
+                self.mode = Mode::Rename { buffer: current, cursor, target: RenameTarget::Pane };
             }
             Action::RenameTab => {
                 let current = self.ws.active_tab().name.clone();
-                self.mode = Mode::Rename { buffer: current, target: RenameTarget::Tab };
+                let cursor = current.chars().count();
+                self.mode = Mode::Rename { buffer: current, cursor, target: RenameTarget::Tab };
             }
-            Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
+            Action::QuickLaunch => {
+                // U20: a fresh picker every time — no sticky filter from a
+                // previous visit, and the cwd column parked on its most
+                // recent entry (which is the pane you are splitting off, so
+                // the zero-keystroke launch matches the pre-U20 behavior).
+                self.mode =
+                    Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false };
+            }
             Action::ScrollMode => {
                 // U9: seed from the pane's CURRENT view offset — entering
                 // Scroll mode after wheeling continues from the wheeled
@@ -2266,7 +2567,8 @@ impl<B: PaneBackend> App<B> {
                 self.ws.tabs.insert(i, tab);
                 self.ws.active_tab = i;
                 self.spawn_active_tab();
-                self.focused = self.pane_order().first().copied().unwrap_or(0);
+                let first = self.pane_order().first().copied().unwrap_or(0);
+                self.set_focus(first);
                 self.push_feed(format!("reopened tab {name}"), false, None);
                 // U2: flashes name what they acted on.
                 self.set_flash(format!("reopened tab {name}"));
@@ -2276,7 +2578,8 @@ impl<B: PaneBackend> App<B> {
                 // active one; split the focused pane and reuse the saved spec
                 // (session id preserved ⇒ the agent resumes).
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
-                self.focused = self.pane_order().first().copied().unwrap_or(0);
+                let first = self.pane_order().first().copied().unwrap_or(0);
+                self.set_focus(first);
                 self.restore_pane(spec);
                 // U2: `restore_pane` allocated the pane's NEW id and left it
                 // focused — label with that id, not the closed one's.
@@ -2309,9 +2612,65 @@ impl<B: PaneBackend> App<B> {
         if !layout::split_pane(&mut tab.layout, focused, id, dir) {
             tab.layout = LayoutNode::Pane(id);
         }
-        self.focused = id;
+        self.set_focus(id);
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
+        }
+    }
+
+    /// P10: move roost's focus to `id`, telling the panes involved.
+    ///
+    /// THE single writer of `self.focused` — every focus move in roost
+    /// (arrows, click, tab switch, spawn, undo, float show/hide, the
+    /// attention ring) funnels through here, so a pane that subscribed to
+    /// focus reporting can never miss a transition because some new code
+    /// path assigned the field directly. A no-op move sends nothing: `CSI O`
+    /// followed by `CSI I` for "focus stayed put" is a lie an editor would
+    /// act on (nvim's `FocusGained` autoread re-stats every buffer).
+    ///
+    /// Nothing is sent while roost's own window is blurred — see
+    /// `host_focused`. The reports are written with `write_input_raw`, not
+    /// `write_input`: they are roost speaking, not the user typing, and
+    /// yanking a scrolled-back pane to its live tail because focus moved
+    /// would undo exactly what U9 fixed.
+    fn set_focus(&mut self, id: PaneId) {
+        let old = self.focused;
+        self.focused = id;
+        // Nothing inside roost is focused while roost isn't: the old pane
+        // was already told it lost focus when the window blurred, and the
+        // new one collects its `CSI I` when the window comes back.
+        if old == id || !self.host_focused {
+            return;
+        }
+        self.report_focus(old, false);
+        self.report_focus(id, true);
+    }
+
+    /// P10: roost's own window gained/lost the host terminal's focus. The
+    /// host event is about roost as a whole; inside roost exactly one pane
+    /// holds focus, so it is that pane's event too. Idempotent — terminals
+    /// repeat focus events freely (a window manager can re-assert focus on
+    /// every raise), and a duplicate `CSI I` is a spurious wakeup.
+    pub fn on_host_focus(&mut self, focused: bool) {
+        if self.host_focused == focused {
+            return;
+        }
+        self.host_focused = focused;
+        self.report_focus(self.focused, focused);
+    }
+
+    /// P10: send one focus report to `id` — `CSI I` (gained) or `CSI O`
+    /// (lost) — but only if that pane's app asked for them with `?1004h`.
+    /// A pane that never subscribed gets nothing: to it these bytes are
+    /// input, and `\x1b[I` typed into a shell is a live command edit.
+    /// Whether a *transition* is worth reporting at all is the callers'
+    /// call (`set_focus` / `on_host_focus`); this only addresses it.
+    fn report_focus(&mut self, id: PaneId, gained: bool) {
+        let bytes: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            if rt.focus_events() {
+                rt.write_input_raw(bytes);
+            }
         }
     }
 
@@ -2326,7 +2685,7 @@ impl<B: PaneBackend> App<B> {
         }
         let rects = self.rects();
         if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
-            self.focused = id;
+            self.set_focus(id);
             layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         }
     }
@@ -2401,7 +2760,7 @@ impl<B: PaneBackend> App<B> {
         if !layout::split_pane(&mut tab.layout, split_target, id, dir) {
             tab.layout = LayoutNode::Pane(id); // empty tab fallback (now only for a genuinely-empty tab)
         }
-        self.focused = id;
+        self.set_focus(id);
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
@@ -2485,7 +2844,7 @@ impl<B: PaneBackend> App<B> {
         });
         self.ws.active_tab = self.ws.tabs.len() - 1;
         self.spawn_active_tab();
-        self.focused = id;
+        self.set_focus(id);
     }
 
     /// U11: snapshot where focus sits in the tab we're about to leave, so
@@ -2531,10 +2890,11 @@ impl<B: PaneBackend> App<B> {
         self.spawn_active_tab();
         // U11: land on the pane this tab was left on; a first visit (or a
         // remembered pane that has since closed) falls back to its first.
-        self.focused = self
+        let target = self
             .tab_focus_target(i)
             .or_else(|| self.pane_order().first().copied())
             .unwrap_or(self.focused);
+        self.set_focus(target);
     }
 
     /// U7: step `delta` tabs, wrapping at both ends — Alt+m forward, Alt+i
@@ -2641,7 +3001,7 @@ impl<B: PaneBackend> App<B> {
                 f.prev_focus = from;
             }
         }
-        self.focused = target;
+        self.set_focus(target);
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
     }
 
@@ -2692,16 +3052,67 @@ impl<B: PaneBackend> App<B> {
     /// Shared by the keyboard's Enter and U8's click-a-row path so the two
     /// can't drift.
     fn picker_launch(&mut self, index: usize) {
-        let items = picker_items();
-        let Some(adapter) = items.get(index.min(items.len().saturating_sub(1))).copied() else {
-            return;
-        };
+        // U20: `index` addresses the rows the user can actually see — the
+        // *filtered* list — so the accelerators, the click and Enter all
+        // agree with what is drawn even mid-type-ahead. An out-of-range
+        // index (a digit past the end of a narrowed list) launches nothing
+        // and leaves the picker up: the rows carry their own numbers, so it
+        // is self-evidently out of range.
+        let items = self.picker_filtered();
+        let Some(adapter) = items.get(index).cloned() else { return };
+        let cwd = self.picker_cwd();
         self.mode = Mode::Normal;
         self.exit_zoom(); // C21: "picker launch" is a structural action
         self.hide_float(); // C22 rule 3: ditto
-        self.new_pane_with(adapter);
+        self.spawn_child(&adapter, cwd.clone(), None);
+        // Launching into a directory is the strongest evidence it is one you
+        // are working in — float it to the top of the column for next time.
+        if let Some(cwd) = cwd {
+            self.note_cwd(cwd);
+        }
         self.relayout();
         self.save();
+    }
+
+    /// U20: the adapter rows the picker is currently showing — every adapter
+    /// whose id contains the type-ahead query, in registry order. An empty
+    /// query shows everything, so the pre-U20 picker is the zero-keystroke
+    /// case of this one. Matching is ASCII-case-insensitive substring, not
+    /// prefix: `laud` should find `claude`, because a picker that only
+    /// honors prefixes makes you know the list you came to read.
+    pub fn picker_filtered(&self) -> Vec<String> {
+        let filter = match &self.mode {
+            Mode::Picker { filter, .. } => filter.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        picker_items()
+            .into_iter()
+            .filter(|id| filter.is_empty() || id.to_ascii_lowercase().contains(&filter))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// U20 / DESIGN.md §7: the recent-directory column, most recent first.
+    pub fn picker_cwds(&self) -> &[PathBuf] {
+        &self.recent_cwds
+    }
+
+    /// The directory the picker would launch into right now — the selected
+    /// row of the cwd column, or `None` (inherit the focused pane's, the
+    /// pre-U20 behavior) when there is nothing to select.
+    fn picker_cwd(&self) -> Option<PathBuf> {
+        let Mode::Picker { cwd, .. } = &self.mode else { return None };
+        self.recent_cwds.get(*cwd).cloned()
+    }
+
+    /// U20: record `cwd` as the most recently used directory — move-to-front,
+    /// deduplicated, capped. The cap is `MAX_RECENT_CWDS` because the column
+    /// is a *list you read at a glance* inside a modal, not an archive; past
+    /// that a directory is faster to reach by typing it in a shell.
+    fn note_cwd(&mut self, cwd: PathBuf) {
+        self.recent_cwds.retain(|c| c != &cwd);
+        self.recent_cwds.insert(0, cwd);
+        self.recent_cwds.truncate(MAX_RECENT_CWDS);
     }
 
     // -- float (C22) ---------------------------------------------------------
@@ -2723,12 +3134,17 @@ impl<B: PaneBackend> App<B> {
             self.set_flash("no room for float");
             return;
         }
-        match &mut self.float {
-            Some(f) => {
-                f.shown = true;
-                f.prev_focus = self.focused;
-                self.focused = f.id;
-            }
+        // The float's id comes out of the borrow before `set_focus` runs:
+        // that call needs all of `self` (the report it may send goes to the
+        // runtimes map), which `&mut self.float` would still be holding.
+        let prev = self.focused;
+        let show = self.float.as_mut().map(|f| {
+            f.shown = true;
+            f.prev_focus = prev;
+            f.id
+        });
+        match show {
+            Some(id) => self.set_focus(id),
             None => self.spawn_float(),
         }
     }
@@ -2748,7 +3164,7 @@ impl<B: PaneBackend> App<B> {
             spawned_by: None,
         };
         self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
-        self.focused = id;
+        self.set_focus(id);
         // display_rects, not rects: the float isn't in the tiled tree, so
         // only the zoom-aware/float-aware display list knows its rect.
         if let Some(pr) = self.display_rects().iter().find(|pr| pr.id == id).copied() {
@@ -2768,7 +3184,7 @@ impl<B: PaneBackend> App<B> {
         }
         f.shown = false;
         let back = f.prev_focus;
-        self.focused = if self.ws.active_tab().panes.contains_key(&back) {
+        let target = if self.ws.active_tab().panes.contains_key(&back) {
             back
         } else {
             // prev_focus may have been closed via the control plane while
@@ -2776,6 +3192,7 @@ impl<B: PaneBackend> App<B> {
             // same recovery `close_pane_id` uses.
             self.pane_order().first().copied().unwrap_or(0)
         };
+        self.set_focus(target);
     }
 
     /// C22 rule 4: Alt+w on the float kills it for real and clears the slot
@@ -2789,11 +3206,12 @@ impl<B: PaneBackend> App<B> {
         self.dead.remove(&f.id);
         self.pending_input.remove(&f.id);
         self.raw.remove(&f.id);
-        self.focused = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
+        let target = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
             f.prev_focus
         } else {
             self.pane_order().first().copied().unwrap_or(0)
         };
+        self.set_focus(target);
         self.set_flash("scratch closed");
     }
 
@@ -2844,13 +3262,23 @@ impl<B: PaneBackend> App<B> {
             // live tail at the handoff, so history could never be yanked by
             // keyboard). Same special-case shape as Alt+e above; the chord
             // still falls through to the global binding, which enters Copy.
-            let scroll_to_copy =
-                matches!(self.mode, Mode::Scroll { .. }) && key.code == KeyCode::Char('c');
-            if matches!(self.mode, Mode::Scroll { .. }) && !scroll_to_copy {
+            //
+            // [P21] The search prompt is a Scroll-mode surface and rides the
+            // same two rules: its view snaps back on the way out, and the
+            // Alt+c handoff keeps it — a search *is* how you find the text
+            // you are about to select, so throwing the hits away at the
+            // handoff would break the flow the search exists to serve.
+            let looking_back =
+                matches!(self.mode, Mode::Scroll { .. } | Mode::Search { .. });
+            let scroll_to_copy = looking_back && key.code == KeyCode::Char('c');
+            if looking_back && !scroll_to_copy {
                 let focused = self.focused;
                 if let Some(rt) = self.runtimes.get_mut(&focused) {
                     rt.set_scrollback(0);
                 }
+            }
+            if !scroll_to_copy {
+                self.search = None;
             }
             self.mode = Mode::Normal;
             return false;
@@ -2873,9 +3301,38 @@ impl<B: PaneBackend> App<B> {
             }
             _ => String::new(),
         };
+        // P21: the two look-back modes share three search keys. They live
+        // ahead of the `match &mut self.mode` below because each one needs
+        // the whole `&mut self` — the pane's history, its runtime, the
+        // mode itself — which the arm-local borrows down there rule out.
+        // Copy mode hands its cursor along so Enter/Esc can put it back;
+        // Scroll mode passes None. Neither `n`, `N` nor `/` was bound in
+        // either mode before, so nothing is displaced.
+        let look_back = match self.mode {
+            Mode::Scroll { .. } => Some(None),
+            Mode::Copy { cursor } => Some(Some(cursor)),
+            _ => None,
+        };
+        if let Some(copy_cursor) = look_back {
+            match key.code {
+                KeyCode::Char('/') => {
+                    self.open_search(copy_cursor);
+                    return true;
+                }
+                KeyCode::Char('n') => {
+                    self.step_match(true);
+                    return true;
+                }
+                KeyCode::Char('N') => {
+                    self.step_match(false);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match &mut self.mode {
             Mode::Normal => false,
-            Mode::Rename { buffer, target } => {
+            Mode::Rename { buffer, cursor, target } => {
                 let target = *target;
                 // U16: the dialog used to `push` every `Char` whatever its
                 // modifiers, so Ctrl+W/Ctrl+U literally typed `w`/`u` into
@@ -2884,12 +3341,31 @@ impl<B: PaneBackend> App<B> {
                 // editor on the platform binds — and every *other* modified
                 // char is discarded: a chord roost doesn't implement must
                 // never leave its letter behind in a name.
+                //
+                // [Amended, U16 second half] There is now a **point**. Every
+                // edit below is relative to it, which is what finally makes
+                // Ctrl+W's readline name honest: "word behind point" used to
+                // be "word at the end", because there was no point.
                 let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let len = buffer.chars().count();
+                *cursor = (*cursor).min(len);
                 match key.code {
-                    // Ctrl+U — readline's unix-line-discard.
-                    KeyCode::Char('u') if ctrl => buffer.clear(),
-                    // Ctrl+W — readline's unix-word-rubout.
-                    KeyCode::Char('w') if ctrl => *buffer = erase_word(buffer),
+                    // Ctrl+U — readline's unix-line-discard: kill from the
+                    // point back to the start, keeping the tail. (It cleared
+                    // the whole buffer before, which was the same thing when
+                    // the point was always the end.)
+                    KeyCode::Char('u') if ctrl => {
+                        *buffer = buffer[byte_at(buffer, *cursor)..].to_string();
+                        *cursor = 0;
+                    }
+                    // Ctrl+W — readline's unix-word-rubout, over the text
+                    // behind the point only; whatever follows it survives.
+                    KeyCode::Char('w') if ctrl => {
+                        let at = byte_at(buffer, *cursor);
+                        let head = erase_word(&buffer[..at]);
+                        *cursor = head.chars().count();
+                        *buffer = head + &buffer[at..];
+                    }
                     // Shift is how an uppercase letter arrives (kitty CSI-u
                     // spells `A` as Shift+`a`), so it is the one modifier a
                     // plain insert may carry.
@@ -2899,12 +3375,28 @@ impl<B: PaneBackend> App<B> {
                             .difference(crossterm::event::KeyModifiers::SHIFT)
                             .is_empty() =>
                     {
-                        buffer.push(c)
+                        buffer.insert(byte_at(buffer, *cursor), c);
+                        *cursor += 1;
                     }
                     KeyCode::Char(_) => {} // any other chord: swallowed, not typed
+                    // Backspace eats the char *behind* the point, Delete the
+                    // one under it — the split every text field makes, and
+                    // impossible to offer before there was a point.
                     KeyCode::Backspace => {
-                        buffer.pop();
+                        if *cursor > 0 {
+                            *cursor -= 1;
+                            buffer.remove(byte_at(buffer, *cursor));
+                        }
                     }
+                    KeyCode::Delete => {
+                        if *cursor < len {
+                            buffer.remove(byte_at(buffer, *cursor));
+                        }
+                    }
+                    KeyCode::Left => *cursor = cursor.saturating_sub(1),
+                    KeyCode::Right => *cursor = (*cursor + 1).min(len),
+                    KeyCode::Home => *cursor = 0,
+                    KeyCode::End => *cursor = len,
                     KeyCode::Enter => {
                         let text = buffer.trim().to_string();
                         match target {
@@ -2930,30 +3422,73 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
-            Mode::Picker { selection } => {
-                let items = picker_items();
+            Mode::Picker { .. } => {
+                // U20: both column lengths, read before the mode is borrowed
+                // mutably below — the adapter list depends on the live
+                // type-ahead filter, so it can't be a constant.
+                let rows = self.picker_filtered().len();
+                let cwds = self.recent_cwds.len();
+                let Mode::Picker { selection, filter, cwd, on_cwd } = &mut self.mode else {
+                    return true;
+                };
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selection = selection.checked_sub(1).unwrap_or(items.len() - 1)
+                    // U20: digits are always accelerators, never filter
+                    // text. No adapter id or path column ever needs a digit
+                    // typed to reach it, and the accelerator is the fastest
+                    // thing in the dialog — giving it up to type-ahead
+                    // would trade the picker's best key for its rarest.
+                    // Out of range is ignored and the picker stays up: the
+                    // rows carry their own numbers (C14).
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let i = c as usize - '1' as usize;
+                        if i < rows {
+                            self.picker_launch(i);
+                        }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *selection = (*selection + 1) % items.len()
+                    // U20 type-ahead: every other printable narrows the
+                    // adapter list. This is why `j`/`k` are no longer
+                    // motions — a list you filter by typing cannot reserve
+                    // letters, and those two were never advertised anywhere
+                    // (the unhinted-`j/k` complaint U20 opened with). The
+                    // arrows, which the hint bar does advertise, are
+                    // untouched.
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        filter.push(c);
+                        *selection = 0; // the old row may not exist now
+                    }
+                    KeyCode::Char(_) => {} // any other chord: swallowed
+                    KeyCode::Backspace => {
+                        filter.pop();
+                        *selection = 0;
+                    }
+                    // ← / → move between the two columns; ↑ / ↓ move within
+                    // whichever one has them. Wrapping is per column, as
+                    // before.
+                    KeyCode::Left => *on_cwd = false,
+                    KeyCode::Right => *on_cwd = cwds > 0,
+                    KeyCode::Tab => *on_cwd = !*on_cwd && cwds > 0,
+                    KeyCode::Up => {
+                        let (sel, len) =
+                            if *on_cwd { (&mut *cwd, cwds) } else { (&mut *selection, rows) };
+                        if len > 0 {
+                            *sel = sel.checked_sub(1).unwrap_or(len - 1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        let (sel, len) =
+                            if *on_cwd { (&mut *cwd, cwds) } else { (&mut *selection, rows) };
+                        if len > 0 {
+                            *sel = (*sel + 1) % len;
+                        }
                     }
                     KeyCode::Enter => {
                         let choice = *selection;
                         self.picker_launch(choice);
-                    }
-                    // U20: number accelerators — the picker was arrows-and-
-                    // Enter only, which is two or three keystrokes for a
-                    // list you can already see in full. A digit past the end
-                    // of the list is simply ignored: the rows carry their
-                    // own numbers (C14), so an out-of-range press is
-                    // self-evidently one, and the picker stays up.
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let i = c as usize - '1' as usize;
-                        if i < items.len() {
-                            self.picker_launch(i);
-                        }
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
@@ -3148,6 +3683,50 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
+            // P21: the incremental search prompt. Every printable key is
+            // query text — including `n`, `N` and `/`, which only mean
+            // "step" once the prompt is closed; a prompt that stole letters
+            // from what you are typing would be unusable.
+            Mode::Search { copy_cursor } => {
+                let copy_cursor = *copy_cursor;
+                match key.code {
+                    // Shift is how an uppercase letter arrives under the
+                    // kitty encoding, so it is the one modifier a plain
+                    // insert may carry — same rule as the rename dialog
+                    // (U16). Any other chord is swallowed, never typed.
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        if let Some(s) = &mut self.search {
+                            s.query.push(c);
+                        }
+                        self.refilter_search();
+                    }
+                    KeyCode::Char(_) => {}
+                    KeyCode::Backspace => {
+                        if let Some(s) = &mut self.search {
+                            s.query.pop();
+                        }
+                        self.refilter_search();
+                    }
+                    // Enter accepts: the prompt closes, the view stays on
+                    // the hit it walked to, and the search itself lives on
+                    // so `n`/`N` and the highlights keep working in the
+                    // mode it hands back to.
+                    KeyCode::Enter => self.mode = self.mode_after_search(copy_cursor),
+                    // Esc cancels: the view goes back where `/` was pressed
+                    // and the search leaves no trace.
+                    KeyCode::Esc => {
+                        self.cancel_search();
+                        self.mode = self.mode_after_search(copy_cursor);
+                    }
+                    _ => {}
+                }
+                true
+            }
         }
     }
 
@@ -3170,6 +3749,9 @@ impl<B: PaneBackend> App<B> {
             Mode::Copy { .. } => self.selection = None,
             _ => {}
         }
+        // P21: and its search — the hits are line offsets into one pane's
+        // history, meaningless the moment you are no longer looking at it.
+        self.search = None;
         self.mode = Mode::Normal;
     }
 
@@ -3337,7 +3919,52 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
         Mode::Copy { .. } => Some(Action::CopyMode),
         Mode::Help => Some(Action::Help),
         Mode::Feed { .. } => Some(Action::ToggleFeed),
+        // P21: the search prompt is entered with `/`, not an Alt chord, so
+        // there is no chord for it to toggle off. Alt+PgUp while searching
+        // therefore falls through to the global binding, exactly as it
+        // would from any other non-Scroll mode.
+        Mode::Search { .. } => None,
     }
+}
+
+/// P21: every occurrence of `needle` in `lines`, in reading order (oldest
+/// line first), as (line index, **char** column). Non-overlapping within a
+/// line, the way every search UI counts them. An empty needle matches
+/// nothing — an incremental search with nothing typed has no results, not
+/// every position in the buffer.
+///
+/// Matching is ASCII-case-insensitive: `to_ascii_lowercase` is 1:1 on chars,
+/// so the column of a hit in the folded text is also its column in the real
+/// text. Full Unicode case folding is not — `İ` lowercases to two chars —
+/// and a column that doesn't survive the fold would highlight the wrong
+/// cells, which is worse than not folding Turkish dotted I.
+///
+/// Columns are char offsets, not grid cells: a row containing wide (CJK /
+/// emoji) glyphs ahead of a hit highlights that many cells to the left of
+/// it. Same bounded, documented drift `find_url_at` carries (SPEC-ux U19);
+/// the fix for both is one cell→char map per row, and it belongs with U24's
+/// wide-char work rather than here.
+pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle = needle.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let hay = line.to_ascii_lowercase();
+        for (byte, _) in hay.match_indices(&needle) {
+            out.push((i, hay[..byte].chars().count()));
+        }
+    }
+    out
+}
+
+/// U16: byte offset of char index `at` in `s` (clamped to the end) — the
+/// bridge between the rename cursor's char-space arithmetic and Rust's
+/// byte-indexed slicing. A name can hold multi-byte chars (an emoji, an
+/// accented word), and slicing one down the middle panics.
+fn byte_at(s: &str, at: usize) -> usize {
+    s.char_indices().nth(at).map_or(s.len(), |(b, _)| b)
 }
 
 /// U17 word motions, shared shape: is cell `i` of `line` whitespace? Past the
@@ -3943,6 +4570,252 @@ mod tests {
         assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 9);
         let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
         assert_eq!(offset, 9);
+    }
+
+    // -- P21: scrollback search ---------------------------------------------
+
+    fn key(c: char) -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn press(app: &mut App<FakePane>, code: crossterm::event::KeyCode) {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        app.handle_mode_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_query(app: &mut App<FakePane>, s: &str) {
+        for c in s.chars() {
+            app.handle_mode_key(key(c));
+        }
+    }
+
+    /// A pane whose history is `n` numbered lines, all of them banked — the
+    /// same shape the e2e drives with `seq`, so the offset arithmetic can be
+    /// checked exactly.
+    fn searchable_app(lines: usize) -> App<FakePane> {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let text: Vec<String> = (1..=lines).map(|i| format!("line {i}")).collect();
+        let rt = app.runtimes.get_mut(&id).unwrap();
+        rt.all_text = text.join("\n");
+        rt.scroll_total = lines;
+        app
+    }
+
+    #[test]
+    fn find_matches_reports_every_hit_in_reading_order_by_char_column() {
+        let lines: Vec<String> =
+            ["alpha beta", "no hits here", "beta beta", "BETA shouting"].map(String::from).to_vec();
+        assert_eq!(
+            find_matches(&lines, "beta"),
+            vec![(0, 6), (2, 0), (2, 5), (3, 0)],
+            "reading order, non-overlapping, ASCII-case-insensitive"
+        );
+        // An empty needle matches nothing — an incremental search with
+        // nothing typed has no results, not every position in the buffer.
+        assert!(find_matches(&lines, "").is_empty());
+        assert!(find_matches(&lines, "gamma").is_empty());
+        // Columns are char offsets, not byte offsets.
+        let wide = vec!["héllo beta".to_string()];
+        assert_eq!(find_matches(&wide, "beta"), vec![(0, 6)]);
+    }
+
+    /// P21: typing filters incrementally and parks the view on the first
+    /// hit; the offset is the one that puts that line on the view's top row.
+    #[test]
+    fn typing_a_query_jumps_the_view_to_the_first_hit() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        assert!(matches!(app.mode, Mode::Search { .. }), "`/` opens the prompt");
+        type_query(&mut app, "line 42");
+        let s = app.search.as_ref().expect("a search is running");
+        assert_eq!(s.query, "line 42");
+        // "line 42" is on haystack line 41 (0-based); "line 42x" doesn't
+        // exist in 1..=300, so there is exactly one hit.
+        assert_eq!(s.matches, vec![(41, 0)]);
+        assert_eq!(app.scroll_offset(id), 300 - 41, "the hit sits on the view's top row");
+    }
+
+    /// P21: `n` past the last hit wraps to the first, `N` before the first
+    /// wraps to the last — a search that dead-ends at the edge of the buffer
+    /// makes you retype the query to keep looking.
+    #[test]
+    fn n_and_capital_n_wrap_around_the_match_list() {
+        let mut app = searchable_app(300);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 1"); // 1, 1x, 1xx → many hits
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        let n = app.search.as_ref().unwrap().matches.len();
+        assert!(n > 3, "the fixture must have several hits, got {n}");
+        assert_eq!(app.search.as_ref().unwrap().current, 0);
+        // Walk forward off the end.
+        for _ in 0..n {
+            app.handle_mode_key(key('n'));
+        }
+        assert_eq!(app.search.as_ref().unwrap().current, 0, "`n` past the last hit wraps");
+        // ...and backward off the front.
+        app.handle_mode_key(key('N'));
+        assert_eq!(app.search.as_ref().unwrap().current, n - 1, "`N` before the first wraps");
+    }
+
+    /// P21: every jump writes through `set_scrollback` and re-reads the
+    /// grid's clamp — so a hit older than the banked history parks the view
+    /// at the top of what exists, and the `↑N/M` the bar reads says so.
+    /// Never a cached counter (U9).
+    #[test]
+    fn a_search_jump_goes_through_the_grid_clamped_path() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/')); // captures a 300-row haystack
+        // Between the capture and the jump the pane floods and the ring
+        // evicts almost all of that history — the documented drift case.
+        // The arithmetic still asks for a row that is no longer banked.
+        app.runtimes.get_mut(&id).unwrap().scroll_total = 10;
+        type_query(&mut app, "line 42"); // wants offset 300 - 41 = 259
+        assert_eq!(app.scroll_offset(id), 10, "the grid's clamp wins over the arithmetic");
+        assert_eq!(app.scroll_position(), (10, 10), "and the ↑N/M hint reports the clamp");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        let Mode::Scroll { offset } = app.mode else { panic!("Enter hands back to scroll mode") };
+        assert_eq!(offset, 10, "scroll mode's mirror is re-seeded from the grid");
+    }
+
+    /// P21: Esc restores the view the search opened on and leaves nothing
+    /// behind; Enter keeps both the position and the search (so `n`/`N` and
+    /// the highlights survive the prompt closing).
+    #[test]
+    fn esc_restores_the_pre_search_view_and_enter_keeps_it() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.wheel_scroll(id, 5);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        assert_eq!(app.scroll_offset(id), 259);
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert_eq!(app.scroll_offset(id), 5, "Esc puts the view back");
+        assert!(app.search.is_none(), "a cancelled search leaves no trace");
+        assert!(matches!(app.mode, Mode::Scroll { .. }), "and hands scroll mode back");
+
+        // Enter, by contrast, keeps both.
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert_eq!(app.scroll_offset(id), 259);
+        assert!(app.search.is_some(), "the hits outlive the prompt");
+    }
+
+    /// P21: backspacing the query back to empty is a cancel of the
+    /// filtering, not a jump to row zero — the view returns to where `/`
+    /// was pressed and the hit list empties.
+    #[test]
+    fn backspacing_to_an_empty_query_returns_the_view_to_where_search_opened() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.wheel_scroll(id, 7);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        assert_eq!(app.scroll_offset(id), 259);
+        for _ in 0.."line 42".len() {
+            press(&mut app, crossterm::event::KeyCode::Backspace);
+        }
+        assert_eq!(app.search.as_ref().unwrap().query, "");
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+        assert_eq!(app.scroll_offset(id), 7, "back to the pre-search view");
+    }
+
+    /// P21: the prompt swallows the keys that mean "step" once it closes —
+    /// `n`, `N` and `/` are query text while you are typing one.
+    #[test]
+    fn the_prompt_types_the_letters_that_are_bindings_outside_it() {
+        let mut app = searchable_app(300);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "n/N");
+        assert_eq!(app.search.as_ref().unwrap().query, "n/N");
+        assert!(matches!(app.mode, Mode::Search { .. }), "none of them closed the prompt");
+    }
+
+    /// P21: `/` works from copy mode too, and Enter/Esc hand the copy cursor
+    /// back untouched — a search is how you find the text you are about to
+    /// select, so it must not cost you your place.
+    #[test]
+    fn search_from_copy_mode_returns_the_cursor_it_borrowed() {
+        let mut app = searchable_app(300);
+        app.apply(Action::CopyMode);
+        let Mode::Copy { cursor } = app.mode else { panic!("in copy mode") };
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        let Mode::Copy { cursor: back } = app.mode else { panic!("copy mode handed back") };
+        assert_eq!(back, cursor);
+        assert!(app.search.is_some(), "and the hits survive for `n`/`N` in copy mode");
+    }
+
+    /// P21 × P5: a resize reflows the live grid, so a search's captured row
+    /// indices stop meaning anything — they are re-captured against the grid
+    /// as it is now, rather than left to paint highlights on the wrong
+    /// lines. The view is not re-jumped (the reflow already re-clamped it).
+    #[test]
+    fn a_resize_recaptures_the_searchs_haystack_instead_of_trusting_stale_rows() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        assert_eq!(app.search.as_ref().unwrap().matches, vec![(41, 0)]);
+        let after_jump = app.scroll_offset(id);
+
+        // The "reflow": the same content now occupies different rows.
+        let rt = app.runtimes.get_mut(&id).unwrap();
+        let rewrapped: Vec<String> = (1..=300).map(|i| format!("... line {i}")).collect();
+        rt.all_text = std::iter::once("banner".to_string())
+            .chain(rewrapped)
+            .collect::<Vec<_>>()
+            .join("\n");
+        rt.scroll_total = 301;
+        app.on_resize(Size::new(80, 24), (0, 0));
+
+        let s = app.search.as_ref().expect("the search survives a resize");
+        assert_eq!(s.matches, vec![(42, 4)], "hits are re-found on the reflowed grid");
+        assert_eq!(s.current, 0);
+        assert_eq!(app.scroll_offset(id), after_jump, "a resize does not re-jump the view");
+    }
+
+    /// P21: leaving the look-back modes ends the search — its hits are line
+    /// offsets into one pane's history and mean nothing once you are not
+    /// looking at it. The Scroll→Copy handoff is the documented exception
+    /// (U9's exemption: that path exists so history can be found *and* then
+    /// selected).
+    #[test]
+    fn leaving_scroll_mode_ends_the_search_except_across_the_copy_handoff() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = searchable_app(300);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, KeyCode::Enter);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search.is_none(), "Esc out of scroll mode drops the search");
+
+        // Alt+c: the frozen view AND the hits carry over into copy mode.
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, KeyCode::Enter);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+        app.apply(Action::CopyMode);
+        assert!(app.search.is_some(), "the Scroll→Copy handoff keeps the search");
+        assert_eq!(app.scroll_offset(app.focused), 259, "and its view");
+
+        // Any other Alt chord ends it (and snaps the view back).
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
+        assert!(app.search.is_none());
     }
 
     #[test]
@@ -5080,6 +5953,118 @@ mod tests {
         }
     }
 
+    // -- U16: rename cursor motion (the deferred half) ----------------------
+
+    /// The rename buffer and its cursor, for the motion tests below.
+    fn rename_state(app: &App<FakePane>) -> (String, usize) {
+        match &app.mode {
+            Mode::Rename { buffer, cursor, .. } => (buffer.clone(), *cursor),
+            _ => panic!("still renaming"),
+        }
+    }
+
+    fn rename_typing(text: &str) -> App<FakePane> {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::RenamePane);
+        for c in text.chars() {
+            app.handle_mode_key(key(c));
+        }
+        app
+    }
+
+    /// U16: Left/Right/Home/End move a real insertion point, and typing
+    /// happens *at* it — the dialog was append-only, so a typo in a long
+    /// name meant deleting back to it.
+    #[test]
+    fn rename_cursor_moves_and_insertion_happens_at_the_point() {
+        use crossterm::event::KeyCode;
+        let mut app = rename_typing("abcd");
+        assert_eq!(rename_state(&app), ("abcd".into(), 4), "the point starts at the end");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(rename_state(&app), ("abcd".into(), 2));
+        app.handle_mode_key(key('X'));
+        assert_eq!(rename_state(&app), ("abXcd".into(), 3), "inserted at the point");
+        press(&mut app, KeyCode::Home);
+        app.handle_mode_key(key('_'));
+        assert_eq!(rename_state(&app), ("_abXcd".into(), 1));
+        press(&mut app, KeyCode::End);
+        app.handle_mode_key(key('!'));
+        assert_eq!(rename_state(&app), ("_abXcd!".into(), 7));
+        // Motion clamps at both ends rather than wrapping.
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(rename_state(&app).1, 0);
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(rename_state(&app).1, 7);
+    }
+
+    /// U16: Backspace eats the char behind the point and Delete the one
+    /// under it — the split every text field makes, and one that could not
+    /// exist before there was a point.
+    #[test]
+    fn rename_backspace_and_delete_are_relative_to_the_point() {
+        use crossterm::event::KeyCode;
+        let mut app = rename_typing("abcd");
+        press(&mut app, KeyCode::Left); // between c and d
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(rename_state(&app), ("abd".into(), 2), "Backspace takes the char behind");
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(rename_state(&app), ("ab".into(), 2), "Delete takes the char under");
+        // Both are no-ops at their respective ends.
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(rename_state(&app), ("ab".into(), 2));
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(rename_state(&app), ("ab".into(), 0));
+    }
+
+    /// U16: with a point, "word behind point" finally means something —
+    /// Ctrl+W rubs out the word before the cursor and leaves the tail
+    /// alone, and Ctrl+U kills back to the start rather than the whole
+    /// buffer. Both are readline's actual definitions.
+    #[test]
+    fn rename_ctrl_w_and_ctrl_u_respect_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = rename_typing("alpha beta gamma");
+        // Park the point right after `beta`.
+        for _ in 0.." gamma".len() {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(rename_state(&app), ("alpha beta gamma".into(), 10));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            rename_state(&app),
+            ("alpha  gamma".into(), 6),
+            "the word behind the point goes; the tail stays"
+        );
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(
+            rename_state(&app),
+            (" gamma".into(), 0),
+            "Ctrl+U kills back to the start, keeping what follows the point"
+        );
+    }
+
+    /// U16: a paste lands at the point too — it would be the one edit in
+    /// the dialog that ignored the cursor otherwise. Multi-byte text keeps
+    /// the char/byte bookkeeping honest.
+    #[test]
+    fn rename_paste_inserts_at_the_point_including_multibyte() {
+        use crossterm::event::KeyCode;
+        let mut app = rename_typing("héllo");
+        press(&mut app, KeyCode::Left);
+        app.handle_paste("~ê~");
+        assert_eq!(rename_state(&app), ("héll~ê~o".into(), 7));
+        // And typing after a multi-byte insert still slices on a char
+        // boundary rather than panicking.
+        app.handle_mode_key(key('z'));
+        assert_eq!(rename_state(&app), ("héll~ê~zo".into(), 8));
+    }
+
     /// U16: everything else modified is swallowed, and Shift — how an
     /// uppercase letter arrives under kitty's CSI-u encoding — still types.
     #[test]
@@ -5141,6 +6126,119 @@ mod tests {
         app.on_click(1);
         assert_eq!(app.focused, 1);
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { expanded: 0, .. }));
+    }
+
+    // -- P10: focus reporting (DECSET 1004) ---------------------------------
+
+    /// Two panes, both spawned, with `input` cleared so only what the focus
+    /// machinery writes is left. `subscribed` says which of them ran
+    /// `?1004h`. Returns the app with pane 2 focused (the split's new pane).
+    fn focus_fixture(sub1: bool, sub2: bool) -> App<FakePane> {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // pane 2, now focused
+        for (id, sub) in [(1, sub1), (2, sub2)] {
+            let rt = app.runtimes.get_mut(&id).expect("pane spawned");
+            rt.focus_events = sub;
+            rt.input.clear();
+        }
+        app
+    }
+
+    fn pane_input(app: &App<FakePane>, id: PaneId) -> Vec<u8> {
+        app.runtimes[&id].input.clone()
+    }
+
+    /// P10: the whole point — moving roost's focus tells the pane that lost
+    /// it `CSI O` and the pane that gained it `CSI I`. Before this, a pane
+    /// running `?1004h` saw nothing across a focus round-trip, so vim's
+    /// autoread and every dim-on-blur TUI stayed asleep inside roost.
+    #[test]
+    fn a_focus_move_sends_o_to_the_pane_leaving_and_i_to_the_pane_arriving() {
+        let mut app = focus_fixture(true, true);
+        app.apply(Action::Focus(layout::Dir::Left)); // 2 → 1
+        assert_eq!(app.focused, 1);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec(), "the pane losing focus is told");
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec(), "the pane gaining focus is told");
+        // ...and back the other way, symmetrically.
+        app.apply(Action::Focus(layout::Dir::Right)); // 1 → 2
+        assert_eq!(pane_input(&app, 1), b"\x1b[I\x1b[O".to_vec());
+        assert_eq!(pane_input(&app, 2), b"\x1b[O\x1b[I".to_vec());
+    }
+
+    /// P10: a pane that never sent `?1004h` gets *nothing*. To it these
+    /// bytes are keystrokes — `\x1b[I` typed at a shell prompt is a live
+    /// command edit, which is why "just send it to everyone" is not an
+    /// option.
+    #[test]
+    fn a_pane_that_never_subscribed_is_sent_no_focus_reports() {
+        let mut app = focus_fixture(false, false);
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert!(pane_input(&app, 1).is_empty());
+        assert!(pane_input(&app, 2).is_empty());
+        // Mixed fleet: only the subscriber hears about the same move.
+        let mut app = focus_fixture(true, false);
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec());
+        assert!(pane_input(&app, 2).is_empty(), "an unsubscribed pane hears nothing");
+    }
+
+    /// P10: focus that doesn't actually move reports nothing. `CSI O` then
+    /// `CSI I` for "you still have focus" is a lie an editor acts on
+    /// (nvim re-stats every buffer on FocusGained).
+    #[test]
+    fn a_focus_move_that_goes_nowhere_reports_nothing() {
+        let mut app = focus_fixture(true, true);
+        // Pane 2 is the right half of the split: there is nothing to its
+        // right, so the move is refused and focus stays put.
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.focused, 2);
+        assert!(pane_input(&app, 1).is_empty());
+        assert!(pane_input(&app, 2).is_empty());
+    }
+
+    /// P10: the host's own focus event belongs to whichever pane is focused
+    /// inside roost — and only to it. Repeats are swallowed: window managers
+    /// re-assert focus freely and a duplicate `CSI I` is a spurious wakeup.
+    #[test]
+    fn host_focus_events_go_to_the_focused_pane_and_never_repeat() {
+        let mut app = focus_fixture(true, true);
+        app.on_host_focus(false);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec());
+        assert!(pane_input(&app, 1).is_empty(), "an unfocused pane isn't the window");
+        app.on_host_focus(false); // duplicate
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec());
+        app.on_host_focus(true);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O\x1b[I".to_vec());
+    }
+
+    /// P10: while roost's window is blurred nothing inside it is focused, so
+    /// pane-level moves stay silent — and the pane that ends up focused
+    /// collects its `CSI I` when the window comes back, not before.
+    #[test]
+    fn pane_focus_moves_stay_silent_while_the_window_is_blurred() {
+        let mut app = focus_fixture(true, true);
+        app.on_host_focus(false);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec());
+        app.apply(Action::Focus(layout::Dir::Left)); // 2 → 1, window blurred
+        assert_eq!(app.focused, 1, "focus still moves; only the reporting waits");
+        assert!(pane_input(&app, 1).is_empty());
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec(), "no second O for the old pane");
+        app.on_host_focus(true);
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec(), "the now-focused pane is told");
+    }
+
+    /// P10: the reports are roost speaking, not the user typing — they must
+    /// not snap a scrolled-back pane to its live tail (`write_input` does,
+    /// `write_input_raw` doesn't; U9's frozen view depends on the
+    /// difference).
+    #[test]
+    fn a_focus_report_does_not_yank_a_scrolled_pane_back_to_the_tail() {
+        let mut app = focus_fixture(true, true);
+        app.wheel_scroll(1, 7);
+        assert_eq!(app.runtimes[&1].scroll_offset(), 7);
+        app.apply(Action::Focus(layout::Dir::Left)); // pane 1 gains focus
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec());
+        assert_eq!(app.runtimes[&1].scroll_offset(), 7, "the frozen view survives");
     }
 
     #[test]
@@ -5370,6 +6468,143 @@ mod tests {
             app.find_spec(app.focused).map(|s| s.adapter.clone()),
             Some(items[items.len() - 1].to_string()),
         );
+    }
+
+    // -- U20: picker type-ahead + the recent-cwd column ---------------------
+
+    /// U20: typing filters the adapter list, Backspace widens it back. The
+    /// picker was a fixed list you could only walk; with three adapters that
+    /// is already two keystrokes more than naming one.
+    #[test]
+    fn picker_type_ahead_filters_the_adapter_list_and_backspace_widens_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::QuickLaunch);
+        assert_eq!(app.picker_filtered().len(), picker_items().len(), "no filter shows all");
+        app.handle_mode_key(key('l'));
+        // Substring, not prefix: `l` finds both `claude` and `shell`.
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+        app.handle_mode_key(key('a'));
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        app.handle_mode_key(key('z'));
+        assert!(app.picker_filtered().is_empty(), "a query matching nothing shows nothing");
+        assert!(matches!(app.mode, Mode::Picker { .. }), "and the picker stays up");
+        press(&mut app, crossterm::event::KeyCode::Backspace);
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        press(&mut app, crossterm::event::KeyCode::Backspace);
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+    }
+
+    /// U20: the `1..9` accelerators keep working *through* a filter — they
+    /// address the rows on screen, not the unfiltered registry, so a digit
+    /// always launches what the row it labels says.
+    #[test]
+    fn picker_accelerators_address_the_filtered_rows() {
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.runtimes.len();
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(key('l')); // → [claude, shell]
+        app.handle_mode_key(key('2')); // row 2 of the *filtered* list
+        assert!(matches!(app.mode, Mode::Normal), "launching closes the picker");
+        assert_eq!(app.runtimes.len(), before + 1);
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.adapter.clone()),
+            Some("shell".to_string()),
+        );
+
+        // A digit past the end of the *narrowed* list is ignored, and the
+        // picker stays up — the rows carry their own numbers.
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.runtimes.len();
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(key('l'));
+        app.handle_mode_key(key('3'));
+        assert!(matches!(app.mode, Mode::Picker { .. }));
+        assert_eq!(app.runtimes.len(), before);
+    }
+
+    /// U20: a click still launches the row it landed on after a filter —
+    /// the hit-test addresses the drawn rows, so keyboard and mouse can't
+    /// disagree about what row 1 is.
+    #[test]
+    fn picker_click_still_lands_on_the_right_row_after_filtering() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(key('l')); // → [claude, shell]
+        let rect = crate::ui::render::modal_rect(&app).expect("the picker draws a dialog");
+        app.handle_modal_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y + 1, // first filtered row
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            Some(rect),
+        );
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.adapter.clone()),
+            Some("claude".to_string()),
+        );
+    }
+
+    /// U20 / DESIGN.md §7: the recent-cwd column is seeded from the
+    /// workspace, grows when a pane `cd`s somewhere new, and is what the
+    /// picker launches into — so opening an agent in another project costs
+    /// no shell round-trip.
+    #[test]
+    fn picker_launches_into_the_selected_recent_directory() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        assert_eq!(app.picker_cwds(), [PathBuf::from("/tmp")], "seeded from the workspace");
+
+        // A pane cd's into a project; the next observation records it.
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().observation =
+            Some(Observation { cwd: Some(PathBuf::from("/work/proj")), agent: None });
+        app.last_detect = Instant::now() - Duration::from_secs(60);
+        app.tick();
+        assert_eq!(
+            app.picker_cwds(),
+            [PathBuf::from("/work/proj"), PathBuf::from("/tmp")],
+            "most recent first, deduplicated"
+        );
+
+        // The picker opens on the most recent, and `→` + `↓` walks to the
+        // older one; Enter launches there.
+        app.apply(Action::QuickLaunch);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.cwd.clone()),
+            Some(PathBuf::from("/tmp")),
+            "the launch uses the cwd column's selection"
+        );
+        // ...and using a directory floats it back to the top.
+        assert_eq!(app.picker_cwds()[0], PathBuf::from("/tmp"));
+    }
+
+    /// U20: `↑`/`↓` steer whichever column has the keyboard, and `←`/`→`
+    /// hand it over. Without this the second column would be unreachable.
+    #[test]
+    fn picker_arrows_steer_the_focused_column_only() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        app.note_cwd(PathBuf::from("/a"));
+        app.note_cwd(PathBuf::from("/b")); // → [/b, /a, /tmp]
+        app.apply(Action::QuickLaunch);
+        press(&mut app, KeyCode::Down);
+        let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
+        assert_eq!((*selection, *cwd, *on_cwd), (1, 0, false), "↓ moves the adapter column");
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
+        assert_eq!((*selection, *cwd, *on_cwd), (1, 2, true), "→ hands ↑↓ to the cwd column");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Up);
+        let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
+        assert_eq!((*selection, *cwd, *on_cwd), (0, 2, false), "← hands them back");
     }
 
     #[test]
