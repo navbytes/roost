@@ -71,6 +71,11 @@ grid-clamped offset is > 0, and Scroll mode's right segment shows `↑N/M` —
 both read via the new `PaneBackend::scroll_offset`/`scroll_total` accessors,
 so they reflect the view, never a phantom counter (C4/C9/§2 amended
 2026-07-27; N1's pulse rule rides along).
+**Extended (SPEC-parity P7c, same branch):** the frozen view no longer
+carries a *cursor* either — roost places the host cursor only when the pane
+is focused, alive, showing its own cursor, and at the live tail. A scrolled
+pane now shows `↑N`, a steady glyph and no cursor: three surfaces telling one
+story (C5/C4 amended again 2026-07-27).
 
 ### U4 · High · FIXED (this branch) — the macOS Alt trap is only caught on Apple Terminal
 `wants_alt_hint` fires solely on `TERM_PROGRAM == "Apple_Terminal"`; default

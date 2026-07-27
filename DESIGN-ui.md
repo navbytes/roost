@@ -372,6 +372,18 @@ pane's corner badge shows Working steady (no pulse) while its view is frozen
 in history, per C4's N1 carve-out. The table above describes live views; C4
 owns the frozen-view composition.]
 
+**[Amended 2026-07-27, SPEC-parity P7]** The same frozen-view rule governs
+the *host cursor*, which is the loudest liveness assertion roost makes.
+roost places it inside a pane only when all four hold: the pane is focused,
+it has not exited, its app has not hidden its own cursor (DECTCEM `?25l`),
+and its view is at the live tail (`scroll_offset == 0`) — the pure
+`render::should_place_cursor`. A scrolled pane therefore shows the `↑N`
+token, a steady glyph, and no cursor: three surfaces telling one consistent
+story. Additionally, the focused pane's DECSCUSR shape (`CSI Ps SP q`, 1..=6)
+is mirrored to the host terminal on change, so an editor's insert bar looks
+like a bar; a pane that asks for no shape — including the pane focus moves
+*to* — restores the terminal's default, as do exit and the panic hook.
+
 ### C6 — Stack header row
 
 **Current:** none — stack members are laid out directly (`layout.rs:302–322`);

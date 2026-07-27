@@ -192,7 +192,23 @@ re-emits it to the host (outer tab title goes stale the moment roost starts).
 OSC title over `adapter · cwd-tag`; an explicit Alt+r title still wins; roost
 sets the *host* terminal title to `roost · <active pane's display_name>`.
 
-### P7 · CONFIRMED · Med — cursor fidelity: hidden/shape/scroll all wrong
+### P7 · FIXED (this branch) · Med — cursor fidelity: hidden/shape/scroll all wrong
+*Fixed, all three facets: `should_place_cursor` (pure, in `render.rs`) gates
+host-cursor placement on focused ∧ alive ∧ `!hide_cursor()` ∧ `scroll_offset
+== 0`, so (a) a TUI that hid its cursor no longer gets a ghost one and (c) a
+scrolled-back view no longer floats a cursor over history (the same
+frozen-view surface as SPEC-ux U3/N1 — while `↑N` shows, roost stops
+asserting liveness, and a blinking cursor is the loudest such assertion). (b)
+The vendored parser gained the SP-intermediate arm, so DECSCUSR
+(`CSI Ps SP q`) becomes `Effect::CursorShape`; each pane remembers what it
+asked for, and the main loop mirrors the FOCUSED pane's shape to the host via
+crossterm `SetCursorStyle` on change only. Focusing a pane that asked for
+nothing restores the default with no special case (it simply reports `None`);
+exit and the panic hook restore it too. DESIGN-ui C4/U3 amended 2026-07-27.
+e2e `tests/pane_cursor.rs`: before, roost kept emitting `?25h` + placement
+while the pane held `?25l`, and `ESC [5 SP q` never reached the host; after,
+the hidden window contains no placement, `?25h` restores it, the shape is
+mirrored, and a focus switch emits `ESC [0 SP q`.*
 Three facets, all verified: (a) the renderer places the host cursor whenever
 the pane is focused, never consulting `screen.hide_cursor()` — a ghost cursor
 blinks over TUIs that hid theirs; (b) DECSCUSR (`CSI 5 q` etc.) dies in the

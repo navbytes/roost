@@ -214,6 +214,10 @@ pub struct PtyPane {
     /// P2: when this pane last re-emitted an OSC 9 to the host, for
     /// `HOST_NOTIFY_INTERVAL`. `None` until the first one.
     last_host_notify: Option<Instant>,
+    /// P7: the cursor shape this pane asked for via DECSCUSR (`CSI Ps SP q`),
+    /// 1..=6; `None` when it wants roost's own default. Mirrored to the host
+    /// only while the pane is focused — one terminal, one cursor.
+    cursor_shape: Option<u8>,
     /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
     /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
     /// id. Without this, a pane id that is reused (close→new) or respawned
@@ -265,11 +269,14 @@ impl PtyPane {
                     self.effects.host_writes.extend_from_slice(&bytes);
                 }
             }
-            // Declared by the W3 effects surface, routed by the item that
-            // owns it: P7 (cursor fidelity). Spelled out rather than
-            // swallowed by a catch-all so the compiler keeps pointing at
-            // this match until it lands.
-            vt100::Effect::CursorShape(_) => {}
+            // P7: DECSCUSR. Remembered per pane; only the *focused* pane's
+            // shape is mirrored to the host, by the composition root. Shape
+            // 0 is the explicit "back to the terminal default", which is
+            // exactly "this pane asks for nothing" — and so is any shape
+            // outside the range xterm defines.
+            vt100::Effect::CursorShape(shape) => {
+                self.cursor_shape = (1..=6).contains(&shape).then_some(shape);
+            }
         }
     }
 
@@ -373,6 +380,7 @@ impl PaneBackend for PtyPane {
             sync_view: None,
             effects: PaneEffects::default(),
             last_host_notify: None,
+            cursor_shape: None,
             alive,
         })
     }
@@ -531,6 +539,10 @@ impl PaneBackend for PtyPane {
 
     fn take_effects(&mut self) -> PaneEffects {
         std::mem::take(&mut self.effects)
+    }
+
+    fn cursor_shape(&self) -> Option<u8> {
+        self.cursor_shape
     }
 
     /// P1: the *presentation* view (see `PtyPane::presented`), so the

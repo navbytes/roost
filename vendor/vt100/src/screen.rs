@@ -1540,6 +1540,16 @@ impl Screen {
         }
     }
 
+    // CSI Ps SP q
+    // roost: DECSCUSR (SPEC-parity P7). Reported faithfully, including
+    // shapes outside 0..=6 — deciding what an unknown one means belongs to
+    // the embedder that owns the real terminal, not to the parser.
+    fn decscusr(&mut self, shape: u16) {
+        if let Some(shape) = u16_to_u8(shape) {
+            self.effects.push(Effect::CursorShape(shape));
+        }
+    }
+
     // CSI m
     fn sgr(&mut self, params: &vte::Params) {
         // XXX really i want to just be able to pass in a default Params
@@ -1834,6 +1844,23 @@ impl vte::Perform for Screen {
                     if log::log_enabled!(log::Level::Debug) {
                         log::debug!(
                             "unhandled csi sequence: CSI ? {} {}",
+                            param_str(params),
+                            c
+                        );
+                    }
+                }
+            },
+            // roost: the SP intermediate — DECSCUSR, `CSI Ps SP q`
+            // (SPEC-parity P7). The shape an application wants for the
+            // cursor; an embedder that owns a real terminal can mirror it.
+            // This died in the catch-all below, which is why insert-bar
+            // cursors rendered as blocks.
+            Some(b' ') => match c {
+                'q' => self.decscusr(canonicalize_params_1(params, 0)),
+                _ => {
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "unhandled csi sequence: CSI {} SP {}",
                             param_str(params),
                             c
                         );
@@ -2268,6 +2295,55 @@ mod roost_tests {
                 std::string::String::from_utf8_lossy(bytes)
             );
         }
+    }
+
+    // -- DECSCUSR cursor shape (SPEC-parity P7) ---------------------------
+
+    #[test]
+    fn decscusr_reports_the_requested_cursor_shape() {
+        // (bytes, expected shape parameter)
+        let cases: &[(&[u8], u8)] = &[
+            (b"\x1b[0 q", 0), // explicit "back to the terminal default"
+            (b"\x1b[ q", 0),  // omitted parameter means the same
+            (b"\x1b[1 q", 1), // blinking block
+            (b"\x1b[2 q", 2), // steady block
+            (b"\x1b[3 q", 3), // blinking underline
+            (b"\x1b[4 q", 4), // steady underline
+            (b"\x1b[5 q", 5), // blinking bar — what an editor's insert mode asks for
+            (b"\x1b[6 q", 6), // steady bar
+            (b"\x1b[9 q", 9), // undefined: reported as asked, the embedder decides
+        ];
+        for (bytes, shape) in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert_eq!(
+                p.take_effects(),
+                vec![crate::Effect::CursorShape(*shape)],
+                "input {:?}",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn shape_changes_are_reported_in_order_and_leave_the_grid_alone() {
+        let mut p = parser();
+        p.process(b"text\x1b[5 qmore\x1b[2 q");
+        assert_eq!(
+            p.take_effects(),
+            vec![crate::Effect::CursorShape(5), crate::Effect::CursorShape(2)]
+        );
+        assert!(p.screen().contents().contains("textmore"));
+    }
+
+    #[test]
+    fn other_sp_intermediate_sequences_are_not_shape_changes() {
+        // `CSI Ps SP @` (SL, scroll left) and friends share the intermediate
+        // but mean something else entirely; DECRQSS for DECSCUSR is a DCS,
+        // not a CSI, and must not be mistaken for a set either.
+        let mut p = parser();
+        p.process(b"\x1b[2 @\x1b[1 A\x1bP$q q\x1b\\");
+        assert!(p.take_effects().is_empty());
     }
 
     #[test]

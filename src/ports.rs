@@ -150,6 +150,14 @@ pub trait PaneBackend: Sized {
         PaneEffects::default()
     }
 
+    /// P7: the cursor shape the pane's app asked for with DECSCUSR
+    /// (`CSI Ps SP q`) — 1..=6 per xterm, `None` when it wants the
+    /// terminal's default. Only the focused pane's shape is ever mirrored to
+    /// the host: there is one real cursor. Default None.
+    fn cursor_shape(&self) -> Option<u8> {
+        None
+    }
+
     /// Terminal grid for rendering. `None` for fakes (renderer must cope).
     fn screen(&self) -> Option<&vt100::Screen>;
     fn set_scrollback(&mut self, lines: usize);
@@ -246,6 +254,8 @@ pub mod fakes {
         /// it, drive the core, assert on what the core did with them; like
         /// the real backend, draining empties it.
         pub effects: PaneEffects,
+        /// Test knob (P7): the DECSCUSR shape this pane reports.
+        pub cursor_shape: Option<u8>,
     }
 
     impl PaneBackend for FakePane {
@@ -277,6 +287,7 @@ pub mod fakes {
                 bracketed: false,
                 pixels,
                 effects: PaneEffects::default(),
+                cursor_shape: None,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -328,6 +339,9 @@ pub mod fakes {
         }
         fn take_effects(&mut self) -> PaneEffects {
             std::mem::take(&mut self.effects)
+        }
+        fn cursor_shape(&self) -> Option<u8> {
+            self.cursor_shape
         }
         fn screen(&self) -> Option<&vt100::Screen> {
             None

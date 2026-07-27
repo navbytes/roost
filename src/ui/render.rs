@@ -827,9 +827,14 @@ fn draw_pane<B: PaneBackend>(
         paint_stack_edge(f, pr.rect);
     }
 
+    // U3/N1 + P7c: the cursor's honesty gate is computed before the screen
+    // borrow, since it needs `app` immutably for the scroll offset.
+    let scrolled = app.scroll_offset(pr.id);
     if let Some(screen) = app.runtimes.get(&pr.id).and_then(|rt| rt.screen()) {
         blit_screen(f, screen, inner);
-        if focused && status != AgentStatus::Exited {
+        // P7: the host cursor is placed only when the pane is actually
+        // showing one. `should_place_cursor` holds the whole rule.
+        if should_place_cursor(focused, status, screen.hide_cursor(), scrolled) {
             let (cr, cc) = screen.cursor_position();
             let x = inner.x.saturating_add(cc);
             let y = inner.y.saturating_add(cr);
@@ -1130,6 +1135,31 @@ fn paint_copy_cursor(f: &mut Frame, inner: Rect, cursor: (u16, u16), selection: 
     }
 }
 
+/// P7: may roost place the host's single real cursor inside this pane?
+///
+/// Four conditions, each a way the old unconditional "focused ⇒ place it"
+/// rule lied:
+/// * only the focused pane may hold it — there is one cursor;
+/// * an exited pane isn't running anything to own it (pre-existing rule);
+/// * `hide_cursor` (DECTCEM `?25l`) means the app deliberately hid its
+///   cursor — roost blinking a ghost one over a TUI that hid its own is
+///   P7(a) verbatim;
+/// * a scrolled-back view (`scroll_offset > 0`) is frozen on history, so the
+///   live grid's cursor position has nothing to do with what's on screen —
+///   it would float over old output (P7(c), same frozen-view surface as
+///   SPEC-ux U3/N1: while the `↑N` token shows, roost stops asserting
+///   liveness, and a blinking cursor is the loudest such assertion).
+///
+/// Pure, so all four are unit-testable without a `Frame`.
+fn should_place_cursor(
+    focused: bool,
+    status: AgentStatus,
+    hidden: bool,
+    scroll_offset: usize,
+) -> bool {
+    focused && status != AgentStatus::Exited && !hidden && scroll_offset == 0
+}
+
 /// Copy the vt100 grid into the ratatui buffer.
 /// NOTE: wide-char (CJK/emoji) handling is approximate in the scaffold.
 fn blit_screen(f: &mut Frame, screen: &vt100::Screen, inner: Rect) {
@@ -1189,8 +1219,8 @@ mod tests {
     use super::{
         badge_text, cell_in_selection, centered_near, collapsed_name_color, collapsed_row_spans,
         corner_badge, dialog_border_style, feed_entry_spans, feed_window, help_dialog_width,
-        hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans, stack_header_text,
-        state_word, HELP_KEYS,
+        hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans, should_place_cursor,
+        stack_header_text, state_word, HELP_KEYS,
     };
     use crate::core::app::{Mode, RenameTarget};
     use crate::core::status::AgentStatus;
@@ -1271,6 +1301,30 @@ mod tests {
         let rendered_width: u16 = spans.iter().map(|s| mouse::display_width(&s.content)).sum();
         assert!(rendered_width <= 4, "clipped badge must fit its column budget, got {rendered_width}");
         assert!(rect.width <= 4);
+    }
+
+    /// P7: every way the pane can be "not showing a cursor" suppresses
+    /// roost's placement of the host's one real cursor.
+    #[test]
+    fn cursor_is_placed_only_when_the_pane_is_really_showing_one() {
+        use AgentStatus::{Exited, Working};
+        // The baseline: focused, alive, cursor visible, view at the tail.
+        assert!(should_place_cursor(true, Working, false, 0));
+
+        // Unfocused — there is one cursor and it belongs to the focused pane.
+        assert!(!should_place_cursor(false, Working, false, 0));
+        // Exited — nothing is running to own it (pre-existing rule, kept).
+        assert!(!should_place_cursor(true, Exited, false, 0));
+        // P7(a): the app hid its cursor with `?25l`; roost blinking a ghost
+        // one over it is exactly the defect.
+        assert!(!should_place_cursor(true, Working, true, 0));
+        // P7(c)/U3: the view is frozen on history, so the live grid's cursor
+        // position describes something that isn't on screen.
+        assert!(!should_place_cursor(true, Working, false, 1));
+
+        // The gates are independent — any one of them suppresses.
+        assert!(!should_place_cursor(true, Working, true, 7));
+        assert!(!should_place_cursor(false, Exited, true, 3));
     }
 
     #[test]

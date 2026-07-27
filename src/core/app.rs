@@ -921,6 +921,17 @@ impl<B: PaneBackend> App<B> {
         self.runtimes.get(&self.focused).map(|rt| rt.app_cursor_keys()).unwrap_or(false)
     }
 
+    /// P7: the DECSCUSR shape the focused pane asked for, `None` for roost's
+    /// own default. There is one real cursor, so only the focused pane's
+    /// shape is ever mirrored to the host — moving focus to a pane that
+    /// asked for nothing therefore restores the default, with no special
+    /// case. A pane whose view is scrolled back, or that hid its cursor,
+    /// isn't showing one at all; the renderer's placement gate covers that,
+    /// and a shape without a cursor is invisible either way.
+    pub fn focused_cursor_shape(&self) -> Option<u8> {
+        self.runtimes.get(&self.focused)?.cursor_shape()
+    }
+
     /// Is a socket message claiming to be `id` carrying that pane's token?
     /// Guards session/status updates against cross-pane spoofing over the
     /// shared socket. Fails closed: unknown pane or missing token → rejected.
@@ -5788,6 +5799,27 @@ mod tests {
         app.find_spec_mut(app.focused).unwrap().title = Some("second".into());
         // The skipped "first" is not replayed; the *current* name is.
         assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 second\x07"));
+    }
+
+    /// P7: only the focused pane's DECSCUSR shape is ever mirrored, so
+    /// moving focus to a pane that asked for nothing restores roost's
+    /// default with no special case.
+    #[test]
+    fn only_the_focused_panes_cursor_shape_is_mirrored() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2, focus 2
+        assert_eq!(app.focused_cursor_shape(), None, "nothing asked for by default");
+
+        app.runtimes.get_mut(&1).unwrap().cursor_shape = Some(5); // blinking bar
+        assert_eq!(app.focused_cursor_shape(), None, "pane 1 isn't focused");
+
+        app.focused = 1;
+        assert_eq!(app.focused_cursor_shape(), Some(5));
+
+        // Focusing a shape-less pane reports None — which is what restores
+        // the host default; no separate "reset" path can drift from it.
+        app.focused = 2;
+        assert_eq!(app.focused_cursor_shape(), None);
     }
 
     #[test]
