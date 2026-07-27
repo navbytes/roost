@@ -329,31 +329,56 @@ fn help_dialog_width(keys: &[(&str, &str)]) -> u16 {
 }
 
 /// C15/§8: the help overlay's row list — the canonical key table, verbatim
-/// and in this order (merged rows stay merged). Hard cap: ≤ 20 rows (§8;
-/// pinned by `help_keys_fit_the_cap`). The single source `draw_mode_overlay`
-/// reads for `Mode::Help`.
+/// and in this order (merged rows stay merged), then U23's three reference
+/// rows: the status-glyph legend and the two mouse rows. Hard cap: ≤ 20 rows
+/// (§8; pinned by `help_keys_fit_the_cap`). The single source
+/// `draw_mode_overlay` reads for `Mode::Help`.
+///
+/// U23 (2026-07-27): the overlay taught chords and nothing else — neither
+/// `●◆○·✕`, the product's core language, nor a word about the mouse, so the
+/// one surface that exists to explain roost explained only half of it. Paid
+/// for by merging three natural chord pairs (split/flip, zoom/float,
+/// close/undo) rather than by scrolling the overlay, so C15's "any key
+/// closes it" and the ≤20 cap both survive untouched.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+n", "new shell pane (auto split)"),
     ("Alt+Enter", "quick-launch picker (pi / claude / shell)"),
     ("Alt+←↓↑→ / hjkl", "move focus"),
     ("Alt+Shift+←↓↑→", "resize along that axis"),
-    ("Alt+s", "toggle split ⇄ stack"),
-    ("Alt+o", "flip split orientation"),
+    ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
     ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-    ("Alt+z", "zoom focused pane (view only; Alt+z again to exit)"),
-    ("Alt+f", "floating scratch shell (toggle)"),
+    ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
     ("Alt+a", "jump to next pane that needs you"),
     ("Alt+e", "activity feed (status / spawns / exits / control)"),
     ("Alt+r / Alt+Shift+r", "rename pane / tab"),
     ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
     ("Alt+i / Alt+m", "previous / next tab (wraps)"),
-    ("Alt+w", "close pane (confirm if busy / last)"),
-    ("Alt+u", "undo — reopen last closed pane/tab"),
+    ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
     ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
     ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
+    ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
+    ("mouse", "wheel scrolls · click focuses · drag selects"),
+    ("Alt+click", "open the URL under the pointer"),
 ];
+
+/// U23: the legend row's text, rebuilt from the `theme` glyph constants —
+/// the same table C5 renders everywhere else. `HELP_KEYS` must spell a
+/// `const` literal, so this is the drift *check* rather than the source
+/// (`help_legend_row_matches_the_theme_glyph_table`), which is why it is
+/// test-only: retheming a glyph has to break a test, not the build.
+#[cfg(test)]
+fn status_legend_text() -> String {
+    format!(
+        "{} working {} needs you {} waiting {} idle {} exited",
+        theme::GLYPH_WORKING,
+        theme::GLYPH_NEEDS_INPUT,
+        theme::GLYPH_WAITING,
+        theme::GLYPH_IDLE,
+        theme::GLYPH_EXITED,
+    )
+}
 
 /// U8: the rect the current mode's modal dialog occupies on screen, or None
 /// when the mode draws none — the SAME geometry `draw_mode_overlay` paints
@@ -1898,6 +1923,9 @@ mod tests {
         // reach chords (2026-07-27): the tab row gained Alt+0 and a
         // previous/next row joined it, paid for by merging Alt+/ and Alt+?
         // into one row so the ≤20 cap still holds. Wording matches §8.
+        // U23 (2026-07-27): three more merges (s/o, z/f, w/u) buy the three
+        // reference rows that close the table — the status legend and the
+        // two mouse rows.
         assert_eq!(
             HELP_KEYS,
             &[
@@ -1905,25 +1933,62 @@ mod tests {
                 ("Alt+Enter", "quick-launch picker (pi / claude / shell)"),
                 ("Alt+←↓↑→ / hjkl", "move focus"),
                 ("Alt+Shift+←↓↑→", "resize along that axis"),
-                ("Alt+s", "toggle split ⇄ stack"),
-                ("Alt+o", "flip split orientation"),
+                ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
                 ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-                ("Alt+z", "zoom focused pane (view only; Alt+z again to exit)"),
-                ("Alt+f", "floating scratch shell (toggle)"),
+                ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
                 ("Alt+a", "jump to next pane that needs you"),
                 ("Alt+e", "activity feed (status / spawns / exits / control)"),
                 ("Alt+r / Alt+Shift+r", "rename pane / tab"),
                 ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
                 ("Alt+i / Alt+m", "previous / next tab (wraps)"),
-                ("Alt+w", "close pane (confirm if busy / last)"),
-                ("Alt+u", "undo — reopen last closed pane/tab"),
+                ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
                 ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
                 ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),
+                ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
+                ("mouse", "wheel scrolls · click focuses · drag selects"),
+                ("Alt+click", "open the URL under the pointer"),
             ],
         );
         assert_eq!(HELP_KEYS.len(), 20);
+    }
+
+    /// U23: the legend is the C5 glyph table, not a hand-copied lookalike —
+    /// retheming a glyph must break this, not silently leave the overlay
+    /// teaching a symbol roost no longer draws.
+    #[test]
+    fn help_legend_row_matches_the_theme_glyph_table() {
+        let (key, desc) = HELP_KEYS
+            .iter()
+            .find(|(k, _)| *k == "status")
+            .copied()
+            .expect("the overlay carries a status-glyph legend row");
+        assert_eq!(key, "status");
+        assert_eq!(desc, super::status_legend_text());
+        // The two glyphs the live-QA drive greps the frame for.
+        assert!(desc.contains(theme::GLYPH_WORKING) && desc.contains(theme::GLYPH_EXITED));
+    }
+
+    /// U23: the overlay documents the mouse — the wheel, click-to-focus,
+    /// drag-select and the Alt+click URL verb, which had lived only in the
+    /// source until now.
+    #[test]
+    fn help_rows_document_every_mouse_verb() {
+        let text = HELP_KEYS.iter().map(|(k, d)| format!("{k} {d}")).collect::<Vec<_>>().join("\n");
+        for token in ["mouse", "wheel", "click", "drag", "Alt+click", "URL"] {
+            assert!(text.contains(token), "the help overlay must mention {token:?}");
+        }
+    }
+
+    /// C15 (amended U23): the overlay may never be wider than the 80-col
+    /// floor — `centered_near` would clamp it to the screen and clip a
+    /// description mid-word, the exact failure the width rule exists to
+    /// stop. The three reference rows are long; this is their guard rail.
+    #[test]
+    fn help_dialog_fits_the_eighty_column_floor() {
+        let w = help_dialog_width(HELP_KEYS);
+        assert!(w <= 80, "help overlay is {w} cols wide; the 80-col floor would clip it");
     }
 
     // -- C24 keyboard copy cursor ----------------------------------------------

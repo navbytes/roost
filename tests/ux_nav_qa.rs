@@ -357,15 +357,22 @@ fn ux_navigation_session() {
     );
 
     // ---- D. rename, picker, modal ownership ---------------------------
-    // rename swallows modifiers: Ctrl+W / Ctrl+U insert literal w / u
+    // U16 FIXED: the dialog used to push every Char whatever its modifiers,
+    // so this probe's chords typed their own letters (`abc` + Ctrl+W +
+    // Ctrl+U committed `abcwu`). Now each chord is an edit, so the probe
+    // drives both and reads the buffer they leave behind: Ctrl+U discards
+    // the junk line, then Ctrl+W rubs out the last word of `abc def` —
+    // `abc` (trimmed on commit) survives only if BOTH were honored, and
+    // any literal insertion shows up as a stray `u`/`w`.
     h.write_bytes(&alt(b'2'));
     settle(&mut h);
     let target = focused_pane(&sd);
     h.write_bytes(&alt(b'r'));
     settle(&mut h);
-    h.write_bytes(b"abc");
-    h.write_bytes(&[0x17]); // Ctrl+W
-    h.write_bytes(&[0x15]); // Ctrl+U
+    h.write_bytes(b"junk");
+    h.write_bytes(&[0x15]); // Ctrl+U: clear the line
+    h.write_bytes(b"abc def");
+    h.write_bytes(&[0x17]); // Ctrl+W: rub out the last word
     h.write_bytes(b"\r");
     settle(&mut h);
     let t = title_of(&sd, target);

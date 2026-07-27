@@ -2791,8 +2791,31 @@ impl<B: PaneBackend> App<B> {
             Mode::Normal => false,
             Mode::Rename { buffer, target } => {
                 let target = *target;
+                // U16: the dialog used to `push` every `Char` whatever its
+                // modifiers, so Ctrl+W/Ctrl+U literally typed `w`/`u` into
+                // the name (live QA: `abc` + Ctrl+W + Ctrl+U committed
+                // `abcwu`). Two chords are real edits — the two every line
+                // editor on the platform binds — and every *other* modified
+                // char is discarded: a chord roost doesn't implement must
+                // never leave its letter behind in a name.
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 match key.code {
-                    KeyCode::Char(c) => buffer.push(c),
+                    // Ctrl+U — readline's unix-line-discard.
+                    KeyCode::Char('u') if ctrl => buffer.clear(),
+                    // Ctrl+W — readline's unix-word-rubout.
+                    KeyCode::Char('w') if ctrl => *buffer = erase_word(buffer),
+                    // Shift is how an uppercase letter arrives (kitty CSI-u
+                    // spells `A` as Shift+`a`), so it is the one modifier a
+                    // plain insert may carry.
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        buffer.push(c)
+                    }
+                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
                     KeyCode::Backspace => {
                         buffer.pop();
                     }
@@ -3081,6 +3104,22 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// U16: readline's `unix-word-rubout` over a text buffer — drop any trailing
+/// whitespace, then the whitespace-delimited word in front of it. Pure, so
+/// the boundary rule is pinned without a dialog. (The rename buffer has no
+/// cursor of its own yet, so "word behind point" is always "word at the
+/// end"; cursor motion inside the buffer stays out of scope — SPEC-ux U16.)
+pub fn erase_word(buffer: &str) -> String {
+    let mut chars: Vec<char> = buffer.chars().collect();
+    while chars.last().is_some_and(|c| c.is_whitespace()) {
+        chars.pop();
+    }
+    while chars.last().is_some_and(|c| !c.is_whitespace()) {
+        chars.pop();
+    }
+    chars.into_iter().collect()
 }
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
@@ -4542,6 +4581,68 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert_eq!(app.find_spec(id).and_then(|s| s.title.clone()), Some("api[0mbox".into()));
+    }
+
+    /// U16: `unix-word-rubout`'s exact boundary rule — trailing whitespace
+    /// goes first, then one whole word; a buffer of only whitespace, or an
+    /// empty one, empties without panicking.
+    #[test]
+    fn erase_word_drops_trailing_space_then_one_word() {
+        use super::erase_word;
+        assert_eq!(erase_word("abc def"), "abc ");
+        assert_eq!(erase_word("abc def  "), "abc ");
+        assert_eq!(erase_word("abc"), "");
+        assert_eq!(erase_word("   "), "");
+        assert_eq!(erase_word(""), "");
+        // Repeated application walks back word by word, never wrapping past
+        // the start.
+        assert_eq!(erase_word(&erase_word("one two three")), "one ");
+        assert_eq!(erase_word(&erase_word(&erase_word("one two three"))), "");
+    }
+
+    /// U16: the live-QA sequence itself, at the key level. Typing `abc`
+    /// then Ctrl+W then Ctrl+U used to commit `abcwu` — the chords' letters
+    /// pushed straight into the name. Now Ctrl+W erases the word it just
+    /// typed and Ctrl+U clears the line, and no `w`/`u` is ever inserted.
+    #[test]
+    fn rename_honors_ctrl_w_and_ctrl_u_instead_of_typing_their_letters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::RenamePane);
+        for c in "abc def".chars() {
+            app.handle_mode_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        match &app.mode {
+            Mode::Rename { buffer, .. } => assert_eq!(buffer, "abc ", "Ctrl+W erases one word"),
+            _ => panic!("still renaming"),
+        }
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        match &app.mode {
+            Mode::Rename { buffer, .. } => assert_eq!(buffer, "", "Ctrl+U clears the line"),
+            _ => panic!("still renaming"),
+        }
+    }
+
+    /// U16: everything else modified is swallowed, and Shift — how an
+    /// uppercase letter arrives under kitty's CSI-u encoding — still types.
+    #[test]
+    fn rename_swallows_other_modified_chars_but_still_types_shifted_ones() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::RenamePane);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        for c in ['k', 'x', 'd'] {
+            app.handle_mode_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        }
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.find_spec(id).and_then(|s| s.title.clone()),
+            Some("Ab".into()),
+            "unimplemented Ctrl chords may not leave their letters in the name"
+        );
     }
 
     /// The other three modals have no text field: the paste is swallowed,

@@ -703,6 +703,43 @@ slack. The current list is 14 rows (`render.rs:301–316`) + 6 = 20. Any future
 chord must merge into an existing row (the `Alt+t / Alt+1..9` idiom), never
 add a 21st.
 
+**[Amended 2026-07-27, SPEC-ux U23 — the overlay stops being keys-only]:**
+"pinned to the §8 key table" is superseded: the overlay is roost's one
+explain-itself surface, and it explained only the chords. It now ends with
+**three reference rows**, after `Alt+q` and in this order:
+
+| key column | description |
+|---|---|
+| `status` | `● working ◆ needs you ○ waiting · idle ✕ exited` |
+| `mouse` | `wheel scrolls · click focuses · drag selects` |
+| `Alt+click` | `open the URL under the pointer` |
+
+- **Why a legend at all:** `●◆○·✕` is the product's core language (C5) —
+  every badge, tab summary and feed line speaks it — and nothing anywhere
+  said what the symbols mean. The row's text is the C5 table itself, pinned
+  against the `theme::GLYPH_*` constants by
+  `help_legend_row_matches_the_theme_glyph_table`, so retheming a glyph
+  breaks a test instead of quietly leaving the overlay teaching a symbol
+  roost no longer draws.
+- **Why mouse rows:** wheel/click/drag/Alt+click were implemented, live, and
+  documented nowhere a user could reach. Alt+click gets its own row because
+  it is a *chord* — it belongs in a key column, not buried in prose.
+- **The ≤ 20 cap is unchanged and still binding.** The three rows are paid
+  for by merging three natural chord pairs into one row each — the same
+  `Alt+t / Alt+1..9` idiom the cap has always demanded: `Alt+s / Alt+o`
+  (split ops), `Alt+z / Alt+f` (the two view toggles), `Alt+w / Alt+u`
+  (close and its undo). 20 rows before, 20 rows after.
+- **Rejected: scrolling the overlay** (the U23 proposal's other option). It
+  would have bought unlimited rows at the cost of C15's "any key closes it"
+  — the dismiss rule would have to carve out arrow/PgUp/PgDn keys, so the
+  one modal you open when you are lost becomes the one modal with a
+  non-obvious way out. Merging keeps the overlay a single glance.
+- **New width rule (the merge's cost, made explicit):** the reference rows
+  are long, so `help_dialog_width(HELP_KEYS)` must stay **≤ 80** — the
+  80-col floor — or `centered_near` clamps and clips a description mid-word,
+  the exact failure the 2026-07-22 width amendment exists to prevent.
+  Pinned by `help_dialog_fits_the_eighty_column_floor`.
+
 ### C16 — Dead-pane overlay
 
 **Current:** `render.rs:387–403` — error line Red fg; action bar Black on Red.
@@ -1420,6 +1457,24 @@ assigned alphabetically — i before m, previous before next.
 The overlay (C15) absorbs both rows within its ≤20 cap by merging
 `Alt+c`/`Alt+PgUp` (the two look-back modes) and `Alt+/`/`Alt+?` (the two
 help toggles) into one row each.]
+
+[Amended 2026-07-27, SPEC-ux U23 — this table is no longer the *whole* help
+overlay. The chord rows below are still rendered verbatim and in order, but
+C15's row list now continues past row 21 with three reference rows (status
+legend, mouse verbs, `Alt+click`). Rows 5+6, 8+9 and 14+15 render merged
+(`Alt+s / Alt+o`, `Alt+z / Alt+f`, `Alt+w / Alt+u`) to pay for them within
+the ≤20 cap — the chords, their meanings and their contracts are unchanged;
+only the row packing is.]
+
+[Amended 2026-07-27, SPEC-ux U16 — rename-dialog editing keys. The dialog
+is a text field, and inside it `Ctrl+U` (clear the line) and `Ctrl+W` (rub
+out the last word) are edits, matching readline's `unix-line-discard` /
+`unix-word-rubout` — the two chords every line editor on the platform
+binds. Every *other* modified char is discarded rather than inserted: an
+unimplemented chord may never leave its letter in a name (live QA committed
+the title `abcwu`). These are mode-local, not entries in this table, and
+they do not consume the chords anywhere else. Cursor motion inside the
+buffer remains unimplemented.]
 
 Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
 raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes

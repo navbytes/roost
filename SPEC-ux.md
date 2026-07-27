@@ -255,11 +255,21 @@ hitboxes stay in lockstep with what's drawn.
 
 ## P2 — polish
 
-### U16 · Low · VERIFIED — rename input swallows edit chords, append-only
+### U16 · Low · FIXED (this branch) — rename input swallows edit chords, append-only
 Live QA: typing `abc` + Ctrl+W + Ctrl+U produced the title `abcwu` — modifier
 chords insert their letter. No cursor motion of any kind.
 **Proposed contract:** discard modified chars except Ctrl+U (clear) and Ctrl+W
 (word-erase); accept paste into the buffer (see U8); cursor motion later.
+**Fixed:** the dialog's `KeyCode::Char` arm no longer ignores modifiers —
+Ctrl+U clears the buffer, Ctrl+W runs the pure `app::erase_word` (readline's
+`unix-word-rubout`: trailing whitespace, then one word), and every other
+modified char is swallowed rather than typed. Shift still inserts (it is how
+an uppercase letter arrives under kitty CSI-u). Paste already landed with U8.
+Cursor motion inside the buffer stays **out of scope** and unimplemented —
+"word behind point" is always "word at the end" until there is a point (§8
+amended 2026-07-27). The drive's probe now types `junk` + Ctrl+U +
+`abc def` + Ctrl+W, so `abc` survives only if both chords were honored and a
+literal insertion would show as a stray `u`/`w`.
 
 ### U17 · Low · VERIFIED — copy-mode vocabulary
 `V` (line select) and `w/b/e` are unbound no-ops (live-confirmed); `0`/`$`
@@ -302,11 +312,23 @@ prompts live exactly `CONFIRM_WINDOW`, and a confirm that dies early (consumed
 second press, or disarmed by another action) takes its prompt down with it.
 The heuristic-Working half stays OPEN.
 
-### U23 · Low · VERIFIED — help overlay teaches chords, nothing else
+### U23 · Low · FIXED (this branch) — help overlay teaches chords, nothing else
 Live QA: the overlay contains no status-glyph legend (`●◆○·✕` — the product's
 core language) and no mouse documentation.
 **Proposed contract:** one legend row and one mouse row; scroll the overlay on
 short terminals instead of capping content.
+**Fixed** (the merge option, not the scroll one): `HELP_KEYS` gains three
+reference rows after `Alt+q` — `status ● working ◆ needs you ○ waiting ·
+idle ✕ exited`, `mouse wheel scrolls · click focuses · drag selects`, and
+`Alt+click open the URL under the pointer` (its own row: it is a chord).
+Paid for by merging three natural chord pairs — `Alt+s / Alt+o`,
+`Alt+z / Alt+f`, `Alt+w / Alt+u` — so C15's ≤20-row cap holds unchanged at
+exactly 20. Scrolling was rejected: it would force arrow/PgUp/PgDn carve-outs
+out of "any key closes it", making the modal you open when lost the one with
+a non-obvious exit (C15 amended 2026-07-27, plus a new ≤80-col width rule so
+the longer rows can't clip mid-word). The legend's text is checked against
+the `theme::GLYPH_*` constants, so a retheme breaks a test rather than the
+lesson.
 
 ### U24 · Low · FIXED (this branch) — wide-char blit is approximate
 `render.rs` self-documents approximate CJK/emoji handling (continuation cells
