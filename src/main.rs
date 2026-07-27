@@ -103,8 +103,42 @@ fn main() -> Result<()> {
     // (the panic hook already relies on exactly that).
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    // P7: hand the cursor back the way the user's terminal had it — a pane's
+    // insert bar must not outlive roost.
+    let _ = execute!(std::io::stdout(), cursor_style(None));
+    reset_host_title();
     ratatui::restore();
     result
+}
+
+/// P6: put the host terminal's title back to a plain `roost` on the way out.
+/// While running, roost publishes `roost · <focused pane>`; leaving that
+/// behind would strand the user's tab under a pane name that no longer
+/// exists. (There is no "restore what was there before" — a terminal offers
+/// no way to read its own title back, so the honest reset is roost's own
+/// name, which is what the user launched.)
+fn reset_host_title() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b]2;roost\x07");
+    let _ = out.flush();
+}
+
+/// P7: a pane's DECSCUSR parameter as the crossterm cursor style to apply to
+/// the host. `None` — and anything outside the 1..=6 xterm defines — is the
+/// terminal's own default, which is also what roost restores when the
+/// focused pane asks for no shape, on exit, and in the panic hook.
+fn cursor_style(shape: Option<u8>) -> crossterm::cursor::SetCursorStyle {
+    use crossterm::cursor::SetCursorStyle as S;
+    match shape {
+        Some(1) => S::BlinkingBlock,
+        Some(2) => S::SteadyBlock,
+        Some(3) => S::BlinkingUnderScore,
+        Some(4) => S::SteadyUnderScore,
+        Some(5) => S::BlinkingBar,
+        Some(6) => S::SteadyBar,
+        _ => S::DefaultUserShape,
+    }
 }
 
 /// How long `main` waits synchronously for the keyboard-enhancement probe
@@ -154,6 +188,13 @@ fn install_panic_hook() {
             DisableBracketedPaste,
             DisableMouseCapture
         );
+        // P7: and the cursor shape a pane may have installed, for the same
+        // reason the flags above are popped — a crash must not leave the
+        // user's shell wearing a pane's insert bar.
+        let _ = execute!(std::io::stdout(), cursor_style(None));
+        // P6: and the window title roost took over, so a crash doesn't
+        // strand the user's tab named after a pane that no longer exists.
+        reset_host_title();
         ratatui::restore();
         original(info);
     }));
@@ -202,6 +243,10 @@ fn run(
     // drives the fleet". Cleaned up on exit.
     let control_token_path = FsStore::default_path().with_file_name("control.token");
     write_control_token(&control_token_path, app.control_token());
+
+    // P7: the cursor shape currently applied to the host terminal, so the
+    // mirror only writes on a real change.
+    let mut host_cursor_shape: Option<u8> = None;
 
     let loop_result: Result<()> = (|| {
     loop {
@@ -291,7 +336,13 @@ fn run(
                 AppEvent::Command(req, reply) => {
                     app.handle_control_msg(req, reply);
                 }
-                AppEvent::Output(id, bytes) => app.on_pty_output(id, &bytes),
+                // P2: a pane's OSC 9/777 notification pulls attention the
+                // same way a bell or an extension "needs you" does.
+                AppEvent::Output(id, bytes) => {
+                    if let Some(msg) = app.on_pty_output(id, &bytes) {
+                        notifier.notify(&msg);
+                    }
+                }
                 AppEvent::Exit(id) => {
                     if let Some(msg) = app.on_pty_exit(id) {
                         notifier.notify(&msg);
@@ -313,6 +364,31 @@ fn run(
                     }
                 }
             }
+        }
+
+        // W3: hand the host terminal what the panes asked roost to forward
+        // on their behalf — P2's re-emitted OSC 9 notifications, P3's OSC 52
+        // clipboard writes. Deliberately here, between draws: a write landing
+        // mid-frame would interleave with ratatui's own output and could be
+        // parsed as part of a cell run. The core has already rate-limited,
+        // capped and sanitized every byte.
+        let host_bytes = app.take_host_output();
+        if !host_bytes.is_empty() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&host_bytes);
+            let _ = out.flush();
+        }
+
+        // P7: mirror the FOCUSED pane's DECSCUSR shape onto the host's one
+        // real cursor — an editor's insert bar should look like a bar. Only
+        // on change, so this costs nothing per frame; moving focus to a pane
+        // that asked for no shape restores roost's default with no special
+        // case, because that pane simply reports `None`.
+        let want_shape = app.focused_cursor_shape();
+        if want_shape != host_cursor_shape {
+            host_cursor_shape = want_shape;
+            let _ = execute!(std::io::stdout(), cursor_style(want_shape));
         }
 
         // Periodic housekeeping (filesystem session detection).

@@ -46,24 +46,13 @@ version = "0.1.10"
 [dependencies.vte]
 version = "0.11.0"
 
-[dev-dependencies.nix]
-version = "0.26.2"
-
-[dev-dependencies.quickcheck]
-version = "0.9"
-
-[dev-dependencies.rand]
-version = "0.7"
-
-[dev-dependencies.serde]
-version = "1.0.152"
-features = ["derive"]
-
-[dev-dependencies.serde_json]
-version = "1.0.92"
-
-[dev-dependencies.terminal_size]
-version = "0.2.3"
-
-[dev-dependencies.vte]
-version = "0.11.0"
+# roost: upstream's dev-dependencies are removed. They served the
+# out-of-crate `tests/` tree that the published crate this vendoring started
+# from strips (see `include` above) — nothing in this fork uses them. The
+# fork's own tests live in-module (`src/screen.rs`) and need only the real
+# dependencies listed above, so they run hermetically with:
+#
+#   cargo test --manifest-path vendor/vt100/Cargo.toml
+#
+# (the generated vendor/vt100/Cargo.lock and vendor/vt100/target/ are build
+# artifacts — .gitignore keeps them out of the tree's history).

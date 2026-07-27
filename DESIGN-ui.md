@@ -288,6 +288,27 @@ with tests `:530–555`.
   the shared `core::app::display_name_of` (title, else
   `{adapter} · {cwd-tag}`), the one helper every fleet surface (badge,
   collapsed rows, feed, notifications, flashes) derives pane identity from.
+  **[Amended 2026-07-27, SPEC-parity P6]:** the naming chain gains a middle
+  rung — explicit Alt+r title → the pane's **live OSC 0/2 title** (agent
+  panes only; a plain `shell` pane skips this rung, since its title comes
+  from `PS1` and by default restates `user@host: /path`, duplicating the cwd
+  tag and crowding the badge — a hand-launched agent still qualifies the
+  moment `observe_panes` promotes the pane's adapter, and demotes back with
+  it) → `{adapter} · {cwd-tag}` — resolved by `App::display_name` (the free
+  `display_name_of` remains the chain with no live title, for the paths that
+  have a spec but no runtime, e.g. a closed pane's feed line). An agent CLI
+  that publishes `spinner + task` through its title therefore says what it is
+  doing, on the badge, in collapsed rows, in the feed, and in notifications.
+  The live title is untrusted text: control characters are stripped and it is
+  bounded to 48 characters *before* the badge's own width clipping, so a
+  paragraph-length task line degrades by clipping rather than by blowing up a
+  row. An explicit rename still wins outright — a name the user typed is a
+  decision, and an app repainting its title every frame must not overwrite
+  it. The same resolved name is published to the **host terminal** as
+  `OSC 2 ; roost · {focused pane's display name}` on focus and title changes
+  (throttled to at most one update per 200 ms), and reset to a plain `roost`
+  on exit and in the panic hook — roost's chrome and the outer tab now agree
+  on what a pane is called.
 - Style: text fg `MUTED`; glyph fg per C5 status colors, pulsing when Working.
 - Geometry: top row of the pane's inner area, right-aligned, one column of
   right breathing room — `corner_badge()` clipping behavior and its tests
@@ -354,6 +375,18 @@ boundaries: 0 → ACCENT, 549 → ACCENT, 550 → ACCENT_DIM, 1100 → ACCENT.
 pane's corner badge shows Working steady (no pulse) while its view is frozen
 in history, per C4's N1 carve-out. The table above describes live views; C4
 owns the frozen-view composition.]
+
+**[Amended 2026-07-27, SPEC-parity P7]** The same frozen-view rule governs
+the *host cursor*, which is the loudest liveness assertion roost makes.
+roost places it inside a pane only when all four hold: the pane is focused,
+it has not exited, its app has not hidden its own cursor (DECTCEM `?25l`),
+and its view is at the live tail (`scroll_offset == 0`) — the pure
+`render::should_place_cursor`. A scrolled pane therefore shows the `↑N`
+token, a steady glyph, and no cursor: three surfaces telling one consistent
+story. Additionally, the focused pane's DECSCUSR shape (`CSI Ps SP q`, 1..=6)
+is mirrored to the host terminal on change, so an editor's insert bar looks
+like a bar; a pane that asks for no shape — including the pane focus moves
+*to* — restores the terminal's default, as do exit and the panic hook.
 
 ### C6 — Stack header row
 

@@ -53,6 +53,24 @@ impl Parser {
     pub fn screen(&self) -> &crate::screen::Screen {
         &self.screen
     }
+
+    /// Takes the last-complete-frame capture made when a synchronized-output
+    /// bracket (DEC private mode 2026) opened in the processed bytes. See
+    /// [`crate::screen::Screen::take_sync_snapshot`].
+    // roost: added for SPEC-parity P1.
+    #[must_use]
+    pub fn take_sync_snapshot(&mut self) -> Option<crate::screen::Screen> {
+        self.screen.take_sync_snapshot()
+    }
+
+    /// Drains the side effects (notifications, clipboard writes, cursor
+    /// shapes) the processed bytes requested, in stream order. See
+    /// [`crate::screen::Screen::take_effects`].
+    // roost: added for SPEC-parity W3.
+    #[must_use]
+    pub fn take_effects(&mut self) -> Vec<crate::screen::Effect> {
+        self.screen.take_effects()
+    }
 }
 
 impl Default for Parser {

@@ -8,6 +8,10 @@
 //! `#[ignore]` because it is an interactive-length scenario (~30s), writes
 //! the macOS clipboard (⑤), and is meant for engagement evidence, not CI.
 
+// The shared harness is compiled per test binary; helpers other tenants use
+// (the raw host-byte capture, ...) are dead code from this binary's view —
+// not real rot.
+#[allow(dead_code)]
 mod harness;
 
 use std::process::Command;

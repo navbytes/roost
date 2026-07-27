@@ -57,4 +57,4 @@ mod term;
 pub use attrs::Color;
 pub use cell::Cell;
 pub use parser::Parser;
-pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+pub use screen::{Effect, MouseProtocolEncoding, MouseProtocolMode, Screen};

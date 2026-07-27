@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::agents::CommandSpec;
 use crate::core::event::AppEvent;
@@ -16,9 +17,128 @@ use crate::core::status::{AgentStatus, StatusTracker};
 use crate::core::workspace::PaneId;
 use crate::infra::inspect;
 use crate::infra::queries::QueryResponder;
-use crate::ports::{MouseProto, Observation, PaneBackend};
+use crate::ports::{MouseProto, Observation, PaneBackend, PaneEffects};
 
 const SCROLLBACK_LINES: usize = 5000;
+
+/// P2: at most one OSC 9 re-emission per pane per this window. An agent that
+/// notifies in a loop (or a `cat` of a log full of them) must not turn the
+/// host terminal into a notification firehose the user has to force-quit.
+const HOST_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// P2: how much of a notification body is re-emitted to the host. Long
+/// enough for a real "needs your approval to run X" line, short enough that
+/// a pane can't push a megabyte through roost's own stdout.
+const HOST_NOTIFY_CAP: usize = 200;
+
+/// P3: largest OSC 52 payload roost relays to the host, in base64
+/// characters (~75 KB of decoded text). Generous for any real "copy this
+/// file/diff" action; bounded so a pane can't push arbitrary volume through
+/// roost's own stdout. tmux caps the same path for the same reason.
+const OSC52_PAYLOAD_CAP: usize = 100_000;
+
+/// P3: the selection targets xterm defines for OSC 52 — clipboard, primary,
+/// secondary, select, and cut-buffers 0–7. Anything outside this set is not
+/// a selection roost will name in a sequence it writes to its own terminal.
+const OSC52_SELECTIONS: &str = "cpqs01234567";
+
+/// P2/P3: make text safe to embed in a sequence roost writes to its OWN
+/// terminal. A pane's payload is untrusted: left alone, an embedded ESC/BEL/
+/// ST could close roost's sequence early and have the rest interpreted as
+/// host commands (a pane repainting the user's real terminal). C0 controls
+/// are dropped outright and the result truncated to `cap` characters —
+/// truncation is on char boundaries, so a multi-byte glyph is never split.
+fn sanitize_for_host(text: &str, cap: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(cap).collect()
+}
+
+/// P2: the OSC 9 roost re-emits to its own terminal for a pane
+/// notification, or `None` when this one must be dropped — too soon after
+/// the last (`interval`), or nothing left after sanitizing. Pure (clock and
+/// limits are parameters) so the rate limit is proven without sleeping.
+fn host_notify_bytes(
+    body: &str,
+    last: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    if last.is_some_and(|t| now.duration_since(t) < interval) {
+        return None;
+    }
+    let body = sanitize_for_host(body, cap);
+    if body.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() + 5);
+    out.extend_from_slice(b"\x1b]9;");
+    out.extend_from_slice(body.as_bytes());
+    out.push(0x07);
+    Some(out)
+}
+
+/// P3: the OSC 52 roost relays to its own terminal for a pane's clipboard
+/// write, or `None` when the write must be dropped.
+///
+/// Two gates, both about roost's terminal rather than the pane's intent:
+/// * the payload must be *actual base64* (`A–Z a–z 0–9 + / =`) and within
+///   `cap` — a payload carrying ESC/BEL would close roost's own sequence
+///   early and have its tail read as host commands, and an unbounded one is
+///   a pane pushing arbitrary volume through roost's stdout;
+/// * the selection must name xterm's real targets, for the same reason.
+///
+/// A rejected write is dropped in silence: the pane already believes it
+/// copied (the lie SPEC-ux U14 documents), and roost has no channel to
+/// correct it — a rejected relay is logged at the parser boundary, and the
+/// dropped case is only reachable by a payload that isn't a clipboard write
+/// in the first place.
+fn host_clipboard_bytes(selection: &str, payload_base64: &str, cap: usize) -> Option<Vec<u8>> {
+    if payload_base64.len() > cap {
+        return None;
+    }
+    if !payload_base64.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)) {
+        return None;
+    }
+    let sel: String = selection.chars().filter(|c| OSC52_SELECTIONS.contains(*c)).collect();
+    if sel.len() != selection.chars().count() {
+        return None; // a selection field carrying anything else
+    }
+    let mut out = Vec::with_capacity(payload_base64.len() + sel.len() + 6);
+    out.extend_from_slice(b"\x1b]52;");
+    out.extend_from_slice(sel.as_bytes());
+    out.push(b';');
+    out.extend_from_slice(payload_base64.as_bytes());
+    out.push(0x07);
+    Some(out)
+}
+
+/// P1: how long an open synchronized-output bracket (mode 2026) may keep the
+/// pre-bracket frame on screen. Real brackets close within a frame or two; a
+/// stuck one — an app killed mid-redraw, a bug that never sends `?2026l` —
+/// must never freeze the pane, so past the cap the live grid is presented
+/// again. Torn beats frozen.
+const SYNC_STALE_CAP: Duration = Duration::from_millis(150);
+
+/// P1: which screen to *present* — the last complete frame while a
+/// synchronized-output bracket is open and fresh, else the live grid. Pure
+/// (the cap is a parameter) so the stuck-bracket expiry is unit-testable
+/// without sleeping for real.
+fn sync_presented<'a>(
+    live: &'a vt100::Screen,
+    view: Option<&'a (vt100::Screen, Instant)>,
+    cap: Duration,
+) -> &'a vt100::Screen {
+    match view {
+        // A scrolled-back view is already frozen on history the snapshot
+        // doesn't carry (`Screen::snapshot` drops the scrollback), so
+        // presenting it would yank the pane to the live tail. While the user
+        // reads history, tearing in the tail is invisible anyway — U3's
+        // frozen view wins.
+        Some(_) if live.scrollback() > 0 => live,
+        Some((snap, opened)) if opened.elapsed() < cap => snap,
+        _ => live,
+    }
+}
 
 /// P11: host-identity env vars that must never leak into a pane. The hosting
 /// terminal (iTerm2, kitty, WezTerm, VS Code) and any outer multiplexer
@@ -73,6 +193,31 @@ pub struct PtyPane {
     /// the host window's proportionally; (0, 0) = unknown. Fed to the PTY's
     /// winsize and to the XTWINOPS 14/16t replies.
     pixels: (u16, u16),
+    /// P1: while the pane's app holds a synchronized-output bracket (mode
+    /// 2026) open, the last frame it declared complete — captured by the
+    /// parser at the exact stream position of the `?2026h` — plus when the
+    /// bracket opened (for `SYNC_STALE_CAP`). This is what `screen()` and
+    /// `grab_text` present: the app asked for its in-progress redraw not to
+    /// be shown, and a half-drawn grid is exactly what P1 measured leaking
+    /// into both the TUI and `roost read`.
+    ///
+    /// Deliberately NOT consulted by scroll state (`scroll_offset`/
+    /// `scroll_total`/`set_scrollback`/`scroll_by`), full-history reads
+    /// (`grab_all_text`), or the input-mode accessors: those answer for the
+    /// live grid, which stays the single source of truth. The snapshot is a
+    /// ≤150 ms presentation veneer over the visible frame, not a second
+    /// terminal state.
+    sync_view: Option<(vt100::Screen, Instant)>,
+    /// W3: effects routed out of the pane's escape stream and waiting for
+    /// the core to drain them (`take_effects`).
+    effects: PaneEffects,
+    /// P2: when this pane last re-emitted an OSC 9 to the host, for
+    /// `HOST_NOTIFY_INTERVAL`. `None` until the first one.
+    last_host_notify: Option<Instant>,
+    /// P7: the cursor shape this pane asked for via DECSCUSR (`CSI Ps SP q`),
+    /// 1..=6; `None` when it wants roost's own default. Mirrored to the host
+    /// only while the pane is focused — one terminal, one cursor.
+    cursor_shape: Option<u8>,
     /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
     /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
     /// id. Without this, a pane id that is reused (close→new) or respawned
@@ -80,6 +225,76 @@ pub struct PtyPane {
     /// and be flipped straight back to "dead", or get old bytes rendered into
     /// the new pane.
     alive: Arc<AtomicBool>,
+}
+
+impl PtyPane {
+    /// P1: the screen roost *presents* for this pane — the last complete
+    /// frame while a synchronized-output bracket is open (and fresh), else
+    /// the live grid. Every surface that shows the user what the pane looks
+    /// like right now goes through here: `screen()` (blit + host cursor) and
+    /// `grab_text` (copy-mode selection, `roost read`'s screen mode — the
+    /// surface P1 measured 31/50 torn samples on). History and state
+    /// surfaces deliberately do not; see `sync_view`.
+    fn presented(&self) -> &vt100::Screen {
+        sync_presented(self.parser.screen(), self.sync_view.as_ref(), SYNC_STALE_CAP)
+    }
+
+    /// W3: turn one parser effect into roost-side consequences — attention
+    /// state here, texts and host bytes queued for the core to drain.
+    fn route_effect(&mut self, effect: vt100::Effect) {
+        match effect {
+            // P2: a notification is an explicit "I need you". It takes the
+            // same attention path as a bell (the heuristic that surfaces ◆
+            // once the pane goes quiet) — the whole reason OSC 9 vanishing
+            // was a P0: the OSC-terminating BEL is deliberately not counted
+            // as a bell, so nothing else could ever notice.
+            vt100::Effect::Notify { title, body } => {
+                self.status.on_bell();
+                let text = match &title {
+                    Some(t) if !t.is_empty() => format!("{t}: {body}"),
+                    _ => body.clone(),
+                };
+                self.effects.notifications.push(text);
+                self.queue_host_notify(&body);
+            }
+            // P3: an app inside the pane set the clipboard. roost's own copy
+            // mode already proves the host OSC 52 path works; forward the
+            // pane's write down it so "copied" stops being a lie for inner
+            // apps too (the other half of SPEC-ux U14). Reads never arrive
+            // here — the parser refuses to surface them at all.
+            vt100::Effect::Osc52Write { selection, payload_base64 } => {
+                if let Some(bytes) =
+                    host_clipboard_bytes(&selection, &payload_base64, OSC52_PAYLOAD_CAP)
+                {
+                    self.effects.host_writes.extend_from_slice(&bytes);
+                }
+            }
+            // P7: DECSCUSR. Remembered per pane; only the *focused* pane's
+            // shape is mirrored to the host, by the composition root. Shape
+            // 0 is the explicit "back to the terminal default", which is
+            // exactly "this pane asks for nothing" — and so is any shape
+            // outside the range xterm defines.
+            vt100::Effect::CursorShape(shape) => {
+                self.cursor_shape = (1..=6).contains(&shape).then_some(shape);
+            }
+        }
+    }
+
+    /// P2: re-emit the notification to the HOST terminal as an OSC 9, so the
+    /// native desktop notification the app asked for actually fires. Rate-
+    /// limited per pane and length-capped; the body is sanitized because it
+    /// is untrusted text about to ride inside a sequence roost writes to its
+    /// own terminal.
+    fn queue_host_notify(&mut self, body: &str) {
+        let now = Instant::now();
+        let Some(bytes) =
+            host_notify_bytes(body, self.last_host_notify, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP)
+        else {
+            return;
+        };
+        self.last_host_notify = Some(now);
+        self.effects.host_writes.extend_from_slice(&bytes);
+    }
 }
 
 impl PaneBackend for PtyPane {
@@ -162,6 +377,10 @@ impl PaneBackend for PtyPane {
             pid,
             queries: QueryResponder::new(),
             pixels,
+            sync_view: None,
+            effects: PaneEffects::default(),
+            last_host_notify: None,
+            cursor_shape: None,
             alive,
         })
     }
@@ -182,6 +401,22 @@ impl PaneBackend for PtyPane {
         let reply = self.queries.feed(bytes, self.parser.screen(), self.pixels);
         if !reply.is_empty() {
             self.write_input_raw(&reply);
+        }
+        // P1: adopt/retire the synchronized-output presentation view. The
+        // parser hands back a capture exactly once per bracket that opened
+        // in this chunk (a reopen replaces the previous one — the newer
+        // capture is the frame the app just finished); once no bracket is
+        // open, the live grid is current again and the veneer goes away.
+        if let Some(snap) = self.parser.take_sync_snapshot() {
+            self.sync_view = Some((snap, Instant::now()));
+        }
+        if !self.parser.screen().synchronized_output() {
+            self.sync_view = None;
+        }
+        // W3: route everything the chunk asked roost to do out there.
+        let effects = self.parser.take_effects();
+        for effect in effects {
+            self.route_effect(effect);
         }
         self.status.on_output();
     }
@@ -302,8 +537,20 @@ impl PaneBackend for PtyPane {
         }
     }
 
+    fn take_effects(&mut self) -> PaneEffects {
+        std::mem::take(&mut self.effects)
+    }
+
+    fn cursor_shape(&self) -> Option<u8> {
+        self.cursor_shape
+    }
+
+    /// P1: the *presentation* view (see `PtyPane::presented`), so the
+    /// renderer's blit and cursor placement can never show a frame the app
+    /// declared incomplete. Transparent to the caller — the renderer asks
+    /// for "the pane's screen" exactly as before.
     fn screen(&self) -> Option<&vt100::Screen> {
-        Some(self.parser.screen())
+        Some(self.presented())
     }
 
     fn set_scrollback(&mut self, lines: usize) {
@@ -356,10 +603,17 @@ impl PaneBackend for PtyPane {
         inspect::observe(self.pid?, known)
     }
 
+    /// P1: reads the *presented* frame, not the live grid — this is what the
+    /// user sees (copy-mode selection) and what `roost read` reports for the
+    /// visible screen, the exact surface P1 measured mid-bracket tearing on.
     fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
-        extract_selection(self.parser.screen(), start, end)
+        extract_selection(self.presented(), start, end)
     }
 
+    /// P1 (the other side of the split): the full history read stays on the
+    /// live grid. The presentation snapshot carries no scrollback by design,
+    /// and `read --full`/`--tail` is a question about the pane's whole
+    /// recorded output, not about the frame currently on screen.
     fn grab_all_text(&self) -> String {
         self.parser.screen().all_contents()
     }
@@ -397,14 +651,169 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_selection, scrub_host_identity, HOST_IDENTITY_VARS};
+    use super::{
+        extract_selection, host_clipboard_bytes, host_notify_bytes, sanitize_for_host,
+        scrub_host_identity, sync_presented, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP,
+        HOST_NOTIFY_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP,
+    };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
+    use std::time::{Duration, Instant};
 
     fn screen_with(text: &str, rows: u16, cols: u16) -> vt100::Parser {
         let mut p = vt100::Parser::new(rows, cols, 0);
         p.process(text.as_bytes());
         p
+    }
+
+    /// P1: with no bracket open there is nothing to present but the live
+    /// grid — the veneer costs nothing in the overwhelmingly common case.
+    #[test]
+    fn sync_presents_the_live_grid_when_no_bracket_is_open() {
+        let p = screen_with("live", 4, 20);
+        let presented = sync_presented(p.screen(), None, SYNC_STALE_CAP);
+        assert!(presented.contents().contains("live"));
+    }
+
+    /// P1: a fresh bracket presents the captured frame, not the half-drawn
+    /// live grid — the whole point of mode 2026.
+    #[test]
+    fn sync_presents_the_captured_frame_while_the_bracket_is_fresh() {
+        let mut p = vt100::Parser::new(4, 20, 0);
+        p.process(b"complete");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Htorn");
+        let snap = p.take_sync_snapshot().expect("bracket open captures");
+        let view = Some((snap, Instant::now()));
+        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP);
+        assert!(presented.contents().contains("complete"));
+        assert!(!presented.contents().contains("torn"));
+    }
+
+    /// P1's safety valve: a bracket that never closes (an app killed
+    /// mid-redraw) must not freeze the pane forever. Past `SYNC_STALE_CAP`
+    /// the live grid is presented again — torn beats frozen. Pure, so the
+    /// expiry is proven without sleeping 150 ms.
+    #[test]
+    fn a_stuck_bracket_expires_at_the_staleness_cap() {
+        let mut p = vt100::Parser::new(4, 20, 0);
+        p.process(b"complete");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hhalf-drawn");
+        let snap = p.take_sync_snapshot().expect("bracket open captures");
+
+        // One tick shy of the cap: still the captured frame.
+        let fresh = Some((snap.clone(), Instant::now() - SYNC_STALE_CAP + Duration::from_millis(1)));
+        assert!(sync_presented(p.screen(), fresh.as_ref(), SYNC_STALE_CAP)
+            .contents()
+            .contains("complete"));
+
+        // Past it: the live grid, however torn — the pane keeps moving even
+        // though the app never sent `?2026l`.
+        let stale = Some((snap, Instant::now() - SYNC_STALE_CAP - Duration::from_millis(1)));
+        let presented = sync_presented(p.screen(), stale.as_ref(), SYNC_STALE_CAP);
+        assert!(presented.contents().contains("half-drawn"));
+        assert!(!presented.contents().contains("complete"));
+    }
+
+    /// P1 × U3: a scrolled-back view is already frozen on history, which the
+    /// snapshot deliberately doesn't carry — presenting it would yank the
+    /// pane to the live tail mid-read. The live (scroll-offset) grid wins.
+    #[test]
+    fn a_scrolled_view_ignores_the_sync_snapshot() {
+        let mut p = vt100::Parser::new(4, 20, 100);
+        for i in 0..20 {
+            p.process(format!("row{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hredrawing");
+        let snap = p.take_sync_snapshot().expect("bracket open captures");
+        let view = Some((snap, Instant::now()));
+        // Scrolled to the live tail: the snapshot presents as usual.
+        assert!(sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP)
+            .contents()
+            .contains("row19"));
+        // Scrolled into history: the live grid's own scrolled view wins.
+        p.set_scrollback(5);
+        assert!(p.screen().scrollback() > 0);
+        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP);
+        assert_eq!(presented.contents(), p.screen().contents());
+    }
+
+    /// P2: the shape roost re-emits, and the two things that must never
+    /// reach the host — a body that could break out of roost's own sequence,
+    /// and an unbounded one.
+    #[test]
+    fn host_notify_is_bounded_and_cannot_break_out_of_its_sequence() {
+        let now = Instant::now();
+        let emit = |body: &str| host_notify_bytes(body, None, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP);
+
+        assert_eq!(emit("NEEDS-YOU").unwrap(), b"\x1b]9;NEEDS-YOU\x07".to_vec());
+
+        // A pane's payload is untrusted: an embedded BEL/ESC would close
+        // roost's own OSC early and let the rest be read as host commands.
+        let hostile = emit("safe\x07\x1b]0;PWNED\x07\x1b[2Jtail").unwrap();
+        assert_eq!(hostile, b"\x1b]9;safe]0;PWNED[2Jtail\x07".to_vec());
+        assert_eq!(hostile.iter().filter(|&&b| b == 0x07).count(), 1, "one terminator");
+        assert_eq!(hostile.iter().filter(|&&b| b == 0x1b).count(), 1, "one introducer");
+
+        // Length is capped in characters, on char boundaries.
+        let long = emit(&"x".repeat(HOST_NOTIFY_CAP * 3)).unwrap();
+        assert_eq!(long.len(), HOST_NOTIFY_CAP + 5);
+        let wide = emit(&"日".repeat(HOST_NOTIFY_CAP * 2)).unwrap();
+        assert!(std::str::from_utf8(&wide[4..wide.len() - 1]).is_ok(), "never split a glyph");
+
+        // Nothing printable left ⇒ nothing emitted (no empty OSC 9).
+        assert!(emit("\x07\x1b\x00").is_none());
+        assert!(emit("").is_none());
+    }
+
+    /// P2: at most one host notification per pane per interval — an agent
+    /// that notifies in a loop must not become a notification firehose.
+    #[test]
+    fn host_notify_is_rate_limited_per_pane() {
+        let now = Instant::now();
+        let cap = HOST_NOTIFY_CAP;
+        // Just inside the window: dropped.
+        let recent = Some(now - HOST_NOTIFY_INTERVAL + Duration::from_millis(1));
+        assert!(host_notify_bytes("again", recent, now, HOST_NOTIFY_INTERVAL, cap).is_none());
+        // Past it: emitted again.
+        let old = Some(now - HOST_NOTIFY_INTERVAL - Duration::from_millis(1));
+        assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+        // The first notification of a pane's life is never rate-limited.
+        assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+    }
+
+    /// P3: a pane's clipboard write is relayed verbatim to the host — and
+    /// only when it really is a clipboard write.
+    #[test]
+    fn host_clipboard_relays_writes_and_refuses_anything_else() {
+        let cap = OSC52_PAYLOAD_CAP;
+        let emit = |sel: &str, payload: &str| host_clipboard_bytes(sel, payload, cap);
+
+        // Verbatim relay, every xterm selection target.
+        assert_eq!(emit("c", "aGk=").unwrap(), b"\x1b]52;c;aGk=\x07".to_vec());
+        assert_eq!(emit("cp", "aGk=").unwrap(), b"\x1b]52;cp;aGk=\x07".to_vec());
+        assert_eq!(emit("7", "aGk=").unwrap(), b"\x1b]52;7;aGk=\x07".to_vec());
+        // An empty payload is xterm's "clear", and a legitimate write.
+        assert_eq!(emit("c", "").unwrap(), b"\x1b]52;c;\x07".to_vec());
+        // A payload right at the cap still goes; one byte over does not.
+        assert!(emit("c", &"A".repeat(cap)).is_some());
+        assert!(emit("c", &"A".repeat(cap + 1)).is_none());
+
+        // Not base64 ⇒ not a clipboard write. Critically, a payload that
+        // could close roost's own sequence and repaint the user's terminal.
+        for hostile in ["aGk=\x07\x1b]0;PWNED\x07", "hi there", "a;b", "\x1b[2J"] {
+            assert!(emit("c", hostile).is_none(), "must refuse {hostile:?}");
+        }
+        // Same for a selection field that isn't one.
+        for sel in ["c\x07x", "clipboard", "c;p"] {
+            assert!(emit(sel, "aGk=").is_none(), "must refuse selection {sel:?}");
+        }
+    }
+
+    /// P2/P3 share the sanitizer; pin that it keeps ordinary text intact.
+    #[test]
+    fn sanitize_keeps_printable_text_verbatim() {
+        assert_eq!(sanitize_for_host("run `ls -la`? (y/n)", 100), "run `ls -la`? (y/n)");
+        assert_eq!(sanitize_for_host("a\tb\nc", 100), "abc");
     }
 
     /// P11: every known host-identity var is removed (whether it came from

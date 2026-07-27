@@ -6,6 +6,43 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+// roost: synchronized output, DEC private mode 2026 (SPEC-parity P1).
+const MODE_SYNCHRONIZED_OUTPUT: u8 = 0b0010_0000;
+
+/// A side effect the processed byte stream asked for that an in-memory
+/// screen cannot carry out itself: it needs the *embedder* — the thing that
+/// owns a real host terminal, a clipboard, a notification daemon.
+///
+/// Accumulated in stream order while `process` runs and drained with
+/// [`Screen::take_effects`] (or [`crate::Parser::take_effects`]).
+// roost: the vendored parser's event surface (SPEC-parity W3). Upstream's
+// `Perform` impl can only mutate grid state, so every sequence that means
+// "do something out there" died in an unhandled arm. This is the one piece
+// of plumbing P2 (notifications), P3 (clipboard) and P7 (cursor shape) all
+// needed; the arms that produce each variant are documented at their
+// `osc_dispatch`/`csi_dispatch` sites.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Effect {
+    /// A desktop notification: OSC 9 (`9 ; body`) or OSC 777
+    /// (`777 ; notify ; title ; body`). SPEC-parity P2.
+    Notify {
+        /// Present only for OSC 777, which carries an explicit title.
+        title: Option<String>,
+        body: String,
+    },
+    /// An OSC 52 clipboard *write* (`52 ; <selection> ; <base64>`).
+    /// SPEC-parity P3. Read requests (`52 ; <selection> ; ?`) are
+    /// deliberately never surfaced — answering one would hand the
+    /// application the host clipboard's contents (a paste-theft vector).
+    Osc52Write {
+        selection: String,
+        payload_base64: String,
+    },
+    /// DECSCUSR (`CSI Ps SP q`) — the cursor shape the application wants:
+    /// 0/1 blinking block, 2 steady block, 3 blinking underline, 4 steady
+    /// underline, 5 blinking bar, 6 steady bar. SPEC-parity P7.
+    CursorShape(u8),
+}
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -80,6 +117,19 @@ pub struct Screen {
     visual_bell_count: usize,
 
     errors: usize,
+
+    // roost: pending stream effects (SPEC-parity W3), drained by the
+    // embedder via `take_effects` after each `process` call.
+    effects: Vec<Effect>,
+    // roost: the screen as it was when the currently-open synchronized-output
+    // bracket (mode 2026) opened — captured at the exact stream position of
+    // the `?2026h`, so an embedder can keep presenting the last *complete*
+    // frame while the application redraws (SPEC-parity P1). `None` outside a
+    // bracket, and once the embedder has taken it. Deliberately built with
+    // `snapshot` rather than `clone`: no banked history rides along (see
+    // `Screen::snapshot`), and the copy's own `sync_snapshot`/`effects` are
+    // always empty — no recursion, no double-delivered effects.
+    sync_snapshot: Option<Box<Screen>>,
 }
 
 impl Screen {
@@ -107,6 +157,44 @@ impl Screen {
             visual_bell_count: 0,
 
             errors: 0,
+
+            effects: Vec::new(),
+            sync_snapshot: None,
+        }
+    }
+
+    /// A copy of this screen carrying only what it takes to *present* the
+    /// current frame: the visible grids, cursor, attrs, title and modes.
+    /// The banked scrollback is deliberately left behind — a full `clone`
+    /// would deep-copy up to `scrollback_len` rows (megabytes) every time an
+    /// application opens a synchronized-output bracket, i.e. once per redraw
+    /// on a spinner. Every field is spelled out so that a new one added to
+    /// `Screen` fails to compile here rather than being silently dropped.
+    // roost: added for SPEC-parity P1.
+    fn snapshot(&self) -> Self {
+        Self {
+            grid: self.grid.snapshot(),
+            alternate_grid: self.alternate_grid.snapshot(),
+
+            attrs: self.attrs,
+            saved_attrs: self.saved_attrs,
+
+            title: self.title.clone(),
+            icon_name: self.icon_name.clone(),
+
+            modes: self.modes,
+            mouse_protocol_mode: self.mouse_protocol_mode,
+            mouse_protocol_encoding: self.mouse_protocol_encoding,
+
+            audible_bell_count: self.audible_bell_count,
+            visual_bell_count: self.visual_bell_count,
+
+            errors: self.errors,
+
+            // A snapshot is a presentation artifact, never a second event
+            // source: effects belong to the live screen alone.
+            effects: Vec::new(),
+            sync_snapshot: None,
         }
     }
 
@@ -727,6 +815,36 @@ impl Screen {
         self.mode(MODE_BRACKETED_PASTE)
     }
 
+    /// Returns whether a synchronized-output bracket is open (DEC private
+    /// mode 2026, `CSI ?2026h` … `CSI ?2026l`): the application has asked
+    /// for its in-progress redraw not to be presented until it closes.
+    // roost: added for SPEC-parity P1.
+    #[must_use]
+    pub fn synchronized_output(&self) -> bool {
+        self.mode(MODE_SYNCHRONIZED_OUTPUT)
+    }
+
+    /// Takes (clearing) the screen as it stood the instant the current
+    /// synchronized-output bracket opened. `Some` exactly once per bracket
+    /// that opened in the bytes processed since the last call; the caller
+    /// then owns that last-complete frame and may present it until
+    /// `synchronized_output` reports the bracket closed — with its own
+    /// staleness policy for a bracket that never does.
+    // roost: added for SPEC-parity P1.
+    #[must_use]
+    pub fn take_sync_snapshot(&mut self) -> Option<Self> {
+        self.sync_snapshot.take().map(|s| *s)
+    }
+
+    /// Drains the side effects (notifications, clipboard writes, cursor
+    /// shapes) requested by the bytes processed since the last call, in
+    /// stream order.
+    // roost: added for SPEC-parity W3.
+    #[must_use]
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
+
     /// Returns the currently active `MouseProtocolMode`
     #[must_use]
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
@@ -1154,6 +1272,11 @@ impl Screen {
         let audible_bell_count = self.audible_bell_count;
         let visual_bell_count = self.visual_bell_count;
         let errors = self.errors;
+        // roost: pending effects survive a reset the way the bell counts do
+        // — they are signals already handed to the embedder's queue, not
+        // screen state. The sync snapshot does NOT survive: a full reset
+        // ends any open bracket, so there is no frame left to present.
+        let effects = std::mem::take(&mut self.effects);
 
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
 
@@ -1162,6 +1285,7 @@ impl Screen {
         self.audible_bell_count = audible_bell_count;
         self.visual_bell_count = visual_bell_count;
         self.errors = errors;
+        self.effects = effects;
     }
 
     // ESC g
@@ -1318,6 +1442,18 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 &[2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                // roost: synchronized output (SPEC-parity P1). Opening a
+                // bracket captures the screen at this exact stream position
+                // — the last frame the application considered complete —
+                // for the embedder to keep presenting while the redraw
+                // runs. A redundant `?2026h` *inside* an open bracket must
+                // NOT re-capture: the screen is mid-redraw (torn) by then.
+                &[2026] => {
+                    if !self.mode(MODE_SYNCHRONIZED_OUTPUT) {
+                        self.sync_snapshot = Some(Box::new(self.snapshot()));
+                    }
+                    self.set_mode(MODE_SYNCHRONIZED_OUTPUT);
+                }
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1377,6 +1513,14 @@ impl Screen {
                     self.decrc();
                 }
                 &[2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                // roost: closing the synchronized-output bracket
+                // (SPEC-parity P1) — the redraw finished, so the live grid
+                // *is* the frame to present; drop any capture the embedder
+                // hasn't taken rather than leave a stale one behind.
+                &[2026] => {
+                    self.clear_mode(MODE_SYNCHRONIZED_OUTPUT);
+                    self.sync_snapshot = None;
+                }
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1393,6 +1537,16 @@ impl Screen {
                     }
                 }
             }
+        }
+    }
+
+    // CSI Ps SP q
+    // roost: DECSCUSR (SPEC-parity P7). Reported faithfully, including
+    // shapes outside 0..=6 — deciding what an unknown one means belongs to
+    // the embedder that owns the real terminal, not to the parser.
+    fn decscusr(&mut self, shape: u16) {
+        if let Some(shape) = u16_to_u8(shape) {
+            self.effects.push(Effect::CursorShape(shape));
         }
     }
 
@@ -1696,6 +1850,23 @@ impl vte::Perform for Screen {
                     }
                 }
             },
+            // roost: the SP intermediate — DECSCUSR, `CSI Ps SP q`
+            // (SPEC-parity P7). The shape an application wants for the
+            // cursor; an embedder that owns a real terminal can mirror it.
+            // This died in the catch-all below, which is why insert-bar
+            // cursors rendered as blocks.
+            Some(b' ') => match c {
+                'q' => self.decscusr(canonicalize_params_1(params, 0)),
+                _ => {
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "unhandled csi sequence: CSI {} SP {}",
+                            param_str(params),
+                            c
+                        );
+                    }
+                }
+            },
             Some(i) => {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
@@ -1714,6 +1885,55 @@ impl vte::Perform for Screen {
             (Some(&b"0"), Some(s)) => self.osc0(s),
             (Some(&b"1"), Some(s)) => self.osc1(s),
             (Some(&b"2"), Some(s)) => self.osc2(s),
+            // roost: OSC 9;4 is ConEmu/Windows Terminal *progress*
+            // (`9;4;state;percent`), not a notification — Claude Code emits
+            // it throughout a long turn. Recognized here so it can never be
+            // mistaken for an OSC 9 notification body, then deliberately
+            // dropped: surfacing progress as a badge percentage is its own
+            // item (SPEC-parity P2, deferred half).
+            (Some(&b"9"), Some(&b"4")) => {}
+            // roost: OSC 9 desktop notification, `9 ; body` (SPEC-parity
+            // P2). A body containing `;` arrives pre-split, so rejoin.
+            (Some(&b"9"), Some(_)) => {
+                let body = osc_join(params.get(1..).unwrap_or(&[]));
+                if !body.is_empty() {
+                    self.effects.push(Effect::Notify { title: None, body });
+                }
+            }
+            // roost: OSC 777 notification, `777 ; notify ; title ; body`
+            // (the rxvt/urxvt form Claude Code and others also emit).
+            (Some(&b"777"), Some(&b"notify")) => {
+                let title = osc_join(params.get(2..3).unwrap_or(&[]));
+                let body = osc_join(params.get(3..).unwrap_or(&[]));
+                // Title-only is legal and common enough; a notification
+                // with an empty body would say nothing, so promote it.
+                let (title, body) = if body.is_empty() {
+                    (None, title)
+                } else {
+                    (Some(title), body)
+                };
+                if !body.is_empty() {
+                    self.effects.push(Effect::Notify { title, body });
+                }
+            }
+            // roost: OSC 52 clipboard, `52 ; <selection> ; <payload>`
+            // (SPEC-parity P3). Writes are surfaced; a *read* request
+            // (payload `?`, or a truncated sequence with no payload field
+            // at all) never is — answering one would hand the application
+            // the host clipboard's contents, which is a paste-theft vector,
+            // so the effect it would need simply does not exist.
+            (Some(&b"52"), Some(sel)) => {
+                let payload_base64 = osc_join(params.get(2..).unwrap_or(&[]));
+                if params.len() < 3 || payload_base64 == "?" {
+                    log::debug!("dropped OSC 52 clipboard read request");
+                } else {
+                    self.effects.push(Effect::Osc52Write {
+                        selection: std::string::String::from_utf8_lossy(sel)
+                            .into_owned(),
+                        payload_base64,
+                    });
+                }
+            }
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
@@ -1815,10 +2035,326 @@ fn param_str(params: &vte::Params) -> String {
     strs.join(" ; ")
 }
 
+/// Rejoin OSC parameters that a `;`-bearing payload was split across.
+/// vte splits every OSC parameter on `;`, but a notification body or a
+/// base64 clipboard payload is one field that may legitimately contain the
+/// separator — putting it back is what a lenient terminal does.
+// roost: added for SPEC-parity W3 (P2's OSC 9/777, P3's OSC 52).
+fn osc_join(params: &[&[u8]]) -> String {
+    let strs: Vec<_> = params
+        .iter()
+        .map(|b| std::string::String::from_utf8_lossy(b))
+        .collect();
+    strs.join(";")
+}
+
 fn osc_param_str(params: &[&[u8]]) -> String {
     let strs: Vec<_> = params
         .iter()
         .map(|b| format!("\"{}\"", std::string::String::from_utf8_lossy(b)))
         .collect();
     strs.join(" ; ")
+}
+
+// roost: vendor-side tests for the arms this fork adds (SPEC-parity W3).
+// Upstream keeps its tests in an out-of-crate `tests/` tree that the
+// published crate this vendoring started from strips, so the fork's own
+// coverage lives in-module: `cargo test -p vt100` exercises it with nothing
+// but the crate's real dependencies.
+#[cfg(test)]
+mod roost_tests {
+    fn parser() -> crate::Parser {
+        crate::Parser::new(6, 20, 50)
+    }
+
+    // -- synchronized output, mode 2026 (SPEC-parity P1) ------------------
+
+    #[test]
+    fn mode_2026_tracks_set_and_reset() {
+        let mut p = parser();
+        assert!(!p.screen().synchronized_output());
+        p.process(b"\x1b[?2026h");
+        assert!(p.screen().synchronized_output());
+        p.process(b"\x1b[?2026l");
+        assert!(!p.screen().synchronized_output());
+    }
+
+    #[test]
+    fn sync_snapshot_captures_the_exact_pre_bracket_screen() {
+        let mut p = parser();
+        p.process(b"complete frame");
+        // One chunk: the bracket opens, the screen is cleared, the redraw
+        // begins. The capture must hold the state at the `?2026h` — not the
+        // chunk's start, not its end.
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Htorn");
+        assert!(p.screen().synchronized_output());
+        assert!(p.screen().contents().contains("torn"));
+        let snap = p.take_sync_snapshot().expect("an opened bracket captures");
+        assert!(snap.contents().contains("complete frame"));
+        assert!(!snap.contents().contains("torn"));
+        // Taken means taken: the frame is the embedder's now.
+        assert!(p.take_sync_snapshot().is_none());
+    }
+
+    #[test]
+    fn redundant_sync_open_does_not_recapture_mid_redraw() {
+        let mut p = parser();
+        p.process(b"good");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hbad\x1b[?2026h");
+        let snap = p.take_sync_snapshot().expect("the first open captured");
+        assert!(snap.contents().contains("good"));
+        assert!(!snap.contents().contains("bad"));
+    }
+
+    #[test]
+    fn sync_close_drops_an_untaken_snapshot() {
+        let mut p = parser();
+        p.process(b"old");
+        // Bracket opens and closes inside one chunk: the redraw completed,
+        // so the live screen is current and nothing needs presenting in its
+        // stead.
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew\x1b[?2026l");
+        assert!(!p.screen().synchronized_output());
+        assert!(p.take_sync_snapshot().is_none());
+        assert!(p.screen().contents().contains("new"));
+    }
+
+    #[test]
+    fn sync_reopen_captures_the_frame_the_previous_bracket_completed() {
+        let mut p = parser();
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hframe one\x1b[?2026l");
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Hframe two");
+        let snap = p.take_sync_snapshot().expect("the reopen captured");
+        assert!(snap.contents().contains("frame one"));
+        assert!(!snap.contents().contains("frame two"));
+        assert!(p.screen().synchronized_output());
+    }
+
+    #[test]
+    fn a_snapshot_presents_the_frame_without_carrying_history() {
+        // `Screen::snapshot` deliberately drops the banked scrollback (a
+        // full clone would copy megabytes per redraw). The visible frame,
+        // cursor state and title all survive; the history does not.
+        let mut p = parser();
+        for i in 0..30 {
+            p.process(format!("history{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b]2;the title\x07\x1b[?25l");
+        assert!(p.screen().scrollback_rows() > 0);
+        p.process(b"\x1b[?2026h\x1b[2J\x1b[Htorn");
+        let snap = p.take_sync_snapshot().expect("captured");
+        assert_eq!(snap.size(), p.screen().size());
+        assert_eq!(snap.title(), "the title");
+        assert!(snap.hide_cursor());
+        assert!(snap.contents().contains("history29"));
+        assert_eq!(snap.scrollback_rows(), 0, "history must not ride along");
+        assert_eq!(snap.scrollback(), 0);
+    }
+
+    #[test]
+    fn full_reset_ends_an_open_bracket() {
+        let mut p = parser();
+        p.process(b"\x1b[?2026h");
+        assert!(p.screen().synchronized_output());
+        p.process(b"\x1bc"); // RIS
+        assert!(!p.screen().synchronized_output());
+        assert!(p.take_sync_snapshot().is_none());
+    }
+
+    // -- the effects surface ----------------------------------------------
+
+    #[test]
+    fn effects_are_empty_for_plain_output_and_untracked_sequences() {
+        let mut p = parser();
+        p.process(b"hello\x1b[31mred\x1b[0m\x1b]2;title\x07\x07\x1b[?2026h");
+        assert!(p.take_effects().is_empty());
+    }
+
+    // -- OSC 9 / 777 notifications (SPEC-parity P2) -----------------------
+
+    fn notify(title: Option<&str>, body: &str) -> crate::Effect {
+        crate::Effect::Notify {
+            title: title.map(std::string::ToString::to_string),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn osc9_and_osc777_become_notify_effects() {
+        // (bytes, expected effect)
+        let cases: &[(&[u8], crate::Effect)] = &[
+            // OSC 9, BEL-terminated (the common form).
+            (b"\x1b]9;NEEDS-YOU\x07", notify(None, "NEEDS-YOU")),
+            // OSC 9, ST-terminated.
+            (b"\x1b]9;done\x1b\\", notify(None, "done")),
+            // A body carrying the parameter separator survives intact.
+            (b"\x1b]9;build failed; see log\x07", notify(None, "build failed; see log")),
+            // OSC 777 carries an explicit title.
+            (
+                b"\x1b]777;notify;claude;turn finished\x07",
+                notify(Some("claude"), "turn finished"),
+            ),
+            // ...and a title-only 777 is promoted to the body, so the
+            // notification never says nothing.
+            (b"\x1b]777;notify;just a title\x07", notify(None, "just a title")),
+        ];
+        for (bytes, want) in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert_eq!(
+                p.take_effects(),
+                vec![want.clone()],
+                "input {:?}",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn osc9_progress_and_empty_bodies_produce_nothing() {
+        let cases: &[&[u8]] = &[
+            b"\x1b]9;4;1;40\x07",     // OSC 9;4 progress (deferred, not a notification)
+            b"\x1b]9;4;0;0\x07",      // progress cleared
+            b"\x1b]9;\x07",           // empty body
+            b"\x1b]777;notify\x07",   // no title, no body
+            b"\x1b]777;notify;;\x07", // both empty
+            b"\x1b]9\x07",            // bare OSC 9, no parameters at all
+        ];
+        for bytes in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert!(
+                p.take_effects().is_empty(),
+                "input {:?} must not notify",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn notifications_accumulate_in_stream_order_and_drain_once() {
+        let mut p = parser();
+        p.process(b"\x1b]9;first\x07between\x1b]777;notify;t;second\x07");
+        assert_eq!(
+            p.take_effects(),
+            vec![notify(None, "first"), notify(Some("t"), "second")]
+        );
+        assert!(p.take_effects().is_empty(), "draining takes them");
+        // The screen itself is untouched by the notification traffic.
+        assert!(p.screen().contents().contains("between"));
+    }
+
+    // -- OSC 52 clipboard (SPEC-parity P3) --------------------------------
+
+    fn osc52(selection: &str, payload: &str) -> crate::Effect {
+        crate::Effect::Osc52Write {
+            selection: selection.to_string(),
+            payload_base64: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn osc52_writes_become_effects_with_selection_and_payload_intact() {
+        let cases: &[(&[u8], crate::Effect)] = &[
+            // The canonical form: base64 "hi" into the clipboard selection.
+            (b"\x1b]52;c;aGk=\x07", osc52("c", "aGk=")),
+            // ST-terminated, and a multi-selection target (clipboard+primary).
+            (b"\x1b]52;cp;aGk=\x1b\\", osc52("cp", "aGk=")),
+            // Empty selection means "the default" — passed through as-is.
+            (b"\x1b]52;;aGk=\x07", osc52("", "aGk=")),
+            // An empty payload is xterm's "clear the clipboard", a write.
+            (b"\x1b]52;c;\x07", osc52("c", "")),
+        ];
+        for (bytes, want) in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert_eq!(
+                p.take_effects(),
+                vec![want.clone()],
+                "input {:?}",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn osc52_read_requests_are_dropped_not_surfaced() {
+        // Answering a read hands the application the host clipboard —
+        // paste theft. There is deliberately no effect that could carry it.
+        let cases: &[&[u8]] = &[
+            b"\x1b]52;c;?\x07",  // the standard read
+            b"\x1b]52;p;?\x1b\\", // primary selection read
+            b"\x1b]52;c\x07",    // truncated: no payload field at all
+        ];
+        for bytes in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert!(
+                p.take_effects().is_empty(),
+                "input {:?} must never surface",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    // -- DECSCUSR cursor shape (SPEC-parity P7) ---------------------------
+
+    #[test]
+    fn decscusr_reports_the_requested_cursor_shape() {
+        // (bytes, expected shape parameter)
+        let cases: &[(&[u8], u8)] = &[
+            (b"\x1b[0 q", 0), // explicit "back to the terminal default"
+            (b"\x1b[ q", 0),  // omitted parameter means the same
+            (b"\x1b[1 q", 1), // blinking block
+            (b"\x1b[2 q", 2), // steady block
+            (b"\x1b[3 q", 3), // blinking underline
+            (b"\x1b[4 q", 4), // steady underline
+            (b"\x1b[5 q", 5), // blinking bar — what an editor's insert mode asks for
+            (b"\x1b[6 q", 6), // steady bar
+            (b"\x1b[9 q", 9), // undefined: reported as asked, the embedder decides
+        ];
+        for (bytes, shape) in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert_eq!(
+                p.take_effects(),
+                vec![crate::Effect::CursorShape(*shape)],
+                "input {:?}",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn shape_changes_are_reported_in_order_and_leave_the_grid_alone() {
+        let mut p = parser();
+        p.process(b"text\x1b[5 qmore\x1b[2 q");
+        assert_eq!(
+            p.take_effects(),
+            vec![crate::Effect::CursorShape(5), crate::Effect::CursorShape(2)]
+        );
+        assert!(p.screen().contents().contains("textmore"));
+    }
+
+    #[test]
+    fn other_sp_intermediate_sequences_are_not_shape_changes() {
+        // `CSI Ps SP @` (SL, scroll left) and friends share the intermediate
+        // but mean something else entirely; DECRQSS for DECSCUSR is a DCS,
+        // not a CSI, and must not be mistaken for a set either.
+        let mut p = parser();
+        p.process(b"\x1b[2 @\x1b[1 A\x1bP$q q\x1b\\");
+        assert!(p.take_effects().is_empty());
+    }
+
+    #[test]
+    fn an_osc_terminating_bel_still_does_not_count_as_a_bell() {
+        // roost's NeedsInput heuristic keys off vt100's *parsed* bell count,
+        // so a BEL consumed as an OSC string terminator must not inflate it
+        // — the notification effect is the signal, not the terminator.
+        let mut p = parser();
+        let before = p.screen().audible_bell_count();
+        p.process(b"\x1b]9;hi\x07");
+        assert_eq!(p.screen().audible_bell_count(), before);
+        assert_eq!(p.take_effects().len(), 1);
+    }
 }

@@ -47,7 +47,14 @@ bug). Severity is impact for a user supervising AI-agent panes.
 
 ## P0 — breaks the agent-supervision loop
 
-### P1 · CONFIRMED · High — synchronized output (mode 2026) neither honored nor forwarded
+### P1 · FIXED (this branch) · High — synchronized output (mode 2026) neither honored nor forwarded
+*Fixed: the vendored parser tracks mode 2026 and captures the last complete
+frame at the exact stream position of `?2026h` (`Screen::snapshot` — visible
+grids only, no history clone); `PtyPane` presents that frame from `screen()`
+and `grab_text` until the bracket closes, with a 150 ms staleness cap so a
+stuck bracket can never freeze a pane. DECRQM 2026 now answers 1/2 instead of
+0. e2e `tests/pane_sync_output.rs`: 29/60 `roost read` samples caught the pane
+mid-bracket before, 0/60 after.*
 Apps wrap redraws in `CSI ?2026h … ?2026l` expecting atomic presentation —
 the mechanism behind a year of "Claude Code flickers/tears in tmux" reports
 (claude-code #37283; tmux PR #4744; zellij #4693). roost's vt100 has no 2026
@@ -59,10 +66,30 @@ reaches the host.
 is open, the renderer presents that pane's *last pre-bracket* grid (with a
 staleness cap so a stuck bracket can't freeze the pane); answer DECRQM 2026
 honestly per what ships (see W2). *(The DECRQM half shipped with W2: 2026 —
-like every untracked mode — now answers `0`, "not recognized"; flip it to
-1/2 when this item lands.)*
+like every untracked mode — answered `0`, "not recognized"; W3 flipped it to
+1/2.)*
+**Split, deliberate:** the presentation view serves the surfaces that answer
+"what does this pane look like right now" — the blit, the host cursor,
+copy-mode extraction, and `roost read`'s screen mode. Scroll state, the input
+modes, and `read --full`/`--tail` stay on the live grid: the snapshot is a
+≤150 ms veneer over the visible frame, never a second terminal state (it
+carries no scrollback at all, which is also why a scrolled-back pane ignores
+it — U3's frozen view wins).
 
-### P2 · CONFIRMED · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
+### P2 · FIXED (this branch) · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
+*Fixed: the vendored parser turns OSC 9 (`9;body`) and OSC 777
+(`777;notify;title;body`) into `Effect::Notify`; `PtyPane` puts each one on
+the same attention path as a bell (`StatusTracker::on_bell` → ◆ once the pane
+rests) and queues a bounded re-emission to roost's own stdout — max 1 per pane
+per second, 200 chars, C0-stripped so an untrusted body can't break out of the
+sequence — written between draws by the main loop. The nudge names the pane
+via U2's `display_name` and, like every other roost notification, is skipped
+for the focused pane. e2e `tests/pane_notifications.rs`: `"status": "waiting"`
+and no `ESC ]9;` in the host capture before; `needs_input` + a verbatim
+`ESC ]9;NEEDS-YOU BEL` after.*
+***Deferred:** OSC 9;4 (progress) is recognized so it can never be mistaken
+for a notification body, then dropped — surfacing it as a badge percentage
+stays out of scope, as this item's contract already said.*
 Claude Code emits desktop notifications via OSC 9 and progress via OSC 9;4
 (claude-code #19976, #57366). roost drops them at `osc_dispatch` (only OSC
 0/1/2 handled) — and because the OSC-terminating BEL is deliberately not
@@ -75,7 +102,21 @@ attention path as a bell (badge ◆ + notifier), and (b) is optionally
 re-emitted to the host terminal so native desktop notifications fire.
 OSC 9;4 progress may be surfaced later (badge percentage) — out of scope here.
 
-### P3 · CONFIRMED · High — inner-app OSC 52 clipboard writes are discarded
+### P3 · FIXED (this branch) · High — inner-app OSC 52 clipboard writes are discarded
+*Fixed: the vendored parser surfaces `52;<sel>;<base64>` as
+`Effect::Osc52Write` and refuses to surface reads (`52;<sel>;?`, or a
+truncated sequence with no payload) at all — the effect that would carry one
+does not exist, so no future call site can accidentally answer a paste-theft
+probe. `PtyPane` relays writes to the host through the same queued
+between-draws path as P2, capped at 100 KB of base64 and validated to be
+actual base64 with a real xterm selection target — a payload carrying ESC/BEL
+would otherwise close roost's own sequence and repaint the user's terminal.
+roost's own copy-mode OSC 52 path is untouched. e2e
+`tests/pane_clipboard.rs`: `ESC ]52` absent from the whole host capture
+before, `ESC ]52;c;cm9vc3Q= BEL` verbatim after, and a `?` read still absent.*
+***Deferred:** an over-cap or malformed write is dropped silently — roost has
+no channel to tell the pane its "copied" was a lie (SPEC-ux U14's other
+half), and a user-facing flash for it is not in this wave.*
 An app inside a pane (Claude Code copy action — claude-code #63054/#63061,
 nvim+osc52, anything over SSH) sets the clipboard via `OSC 52`; roost eats it;
 the app reports "copied" over an unchanged clipboard — the same lie SPEC-ux
@@ -85,11 +126,13 @@ appeared anywhere in the captured host stream.
 **Contract:** forward pane OSC 52 writes to the host terminal (roost's own
 copy mode already proves the host path works); optionally cap size and gate
 reads (`52;c;?`) which are a paste-theft vector — forward writes, refuse reads.
-*Cross-reference (2026-07-27): the other half of this lie is closed — SPEC-ux
-U14 shipped, so roost's own copy path now reports which channel actually took
-the text (`copied N chars` / `copied N chars (OSC 52)` / `copy failed`) instead
-of flashing success unconditionally. P3, the inner-app half, stays CONFIRMED
-and open: a pane's own OSC 52 is still eaten.*
+*Cross-reference (2026-07-27): both halves of this lie are now closed on this
+branch. SPEC-ux U14 made roost's own copy path report which channel actually
+took the text (`copied N chars` / `copied N chars (OSC 52)` / `copy failed`)
+instead of flashing success unconditionally; P3 (above) stopped roost eating
+a pane's own OSC 52. The two paths stay independent — U14's outcome flash
+runs at the copy call site, while a pane's write is relayed through the
+queued host-write channel W3 introduced.*
 
 ### P4 · FIXED (this branch) · High — the terminal-query black hole
 *Fixed per Appendix B: `src/infra/queries.rs` (kitty.rs generalized) answers
@@ -130,7 +173,22 @@ expect. Interim: document the loss. Also fixes SPEC-ux U19's dependency on
 
 ## P1 — status, identity, input correctness
 
-### P6 · CONFIRMED · Med-High — pane OSC 0/2 titles invisible
+### P6 · FIXED (this branch) · Med-High — pane OSC 0/2 titles invisible
+*Fixed: `App::display_name`'s chain is now explicit Alt+r title → the pane's
+live `screen().title()` (agent panes only) → `adapter · cwd-tag`
+(`display_name_live`), so the badge, collapsed rows, feed lines and
+notifications all adopt a pane's published title; it is sanitized and bounded
+to 48 chars before the badge's own width clipping. A plain `shell` pane skips
+the live rung: a shell's title is `PS1` chrome (`user@host: /path`) that
+restates the cwd tag and crowds the badge, whereas P6's value is agent CLIs
+publishing task status. A hand-launched agent loses nothing — `observe_panes`
+promotes a shell pane's adapter to `pi`/`claude` when it sees the agent
+running, and demotes when it exits. roost also publishes `OSC 2 ; roost · {focused pane}` to
+the host terminal on focus/title changes (throttled to 200 ms) and resets it
+to a plain `roost` on exit and in the panic hook. DESIGN-ui C4 and SPEC-ux U2
+amended 2026-07-27. e2e `tests/pane_titles.rs`: a pane's `OSC 2 ; TASK-X`
+never reached its badge before; after, the badge reads `1 TASK-X` and the
+host stream carries `ESC ]2;roost · TASK-X BEL` (plus the exit reset).*
 Claude Code continuously publishes `spinner + task` via OSC 0/2 (claude-code
 #17887/#52258) — the cheapest live fleet-status text there is. vt100 already
 parses and stores it; **zero** call sites read `screen().title()`; nothing
@@ -139,7 +197,23 @@ re-emits it to the host (outer tab title goes stale the moment roost starts).
 OSC title over `adapter · cwd-tag`; an explicit Alt+r title still wins; roost
 sets the *host* terminal title to `roost · <active pane's display_name>`.
 
-### P7 · CONFIRMED · Med — cursor fidelity: hidden/shape/scroll all wrong
+### P7 · FIXED (this branch) · Med — cursor fidelity: hidden/shape/scroll all wrong
+*Fixed, all three facets: `should_place_cursor` (pure, in `render.rs`) gates
+host-cursor placement on focused ∧ alive ∧ `!hide_cursor()` ∧ `scroll_offset
+== 0`, so (a) a TUI that hid its cursor no longer gets a ghost one and (c) a
+scrolled-back view no longer floats a cursor over history (the same
+frozen-view surface as SPEC-ux U3/N1 — while `↑N` shows, roost stops
+asserting liveness, and a blinking cursor is the loudest such assertion). (b)
+The vendored parser gained the SP-intermediate arm, so DECSCUSR
+(`CSI Ps SP q`) becomes `Effect::CursorShape`; each pane remembers what it
+asked for, and the main loop mirrors the FOCUSED pane's shape to the host via
+crossterm `SetCursorStyle` on change only. Focusing a pane that asked for
+nothing restores the default with no special case (it simply reports `None`);
+exit and the panic hook restore it too. DESIGN-ui C4/U3 amended 2026-07-27.
+e2e `tests/pane_cursor.rs`: before, roost kept emitting `?25h` + placement
+while the pane held `?25l`, and `ESC [5 SP q` never reached the host; after,
+the hidden window contains no placement, `?25h` restores it, the shape is
+mirrored, and a focus switch emits `ESC [0 SP q`.*
 Three facets, all verified: (a) the renderer places the host cursor whenever
 the pane is focused, never consulting `screen.hide_cursor()` — a ghost cursor
 blinks over TUIs that hid theirs; (b) DECSCUSR (`CSI 5 q` etc.) dies in the

@@ -5,6 +5,10 @@
 //! load. This is the harness foundation's first tenant — no color/
 //! golden-frame assertions here, those stay deferred per §6.
 
+// The shared harness is compiled per test binary; helpers other tenants use
+// (the raw host-byte capture, state_dir, ...) are dead code from this
+// binary's view — not real rot.
+#[allow(dead_code)]
 mod harness;
 
 use std::time::{Duration, Instant};
