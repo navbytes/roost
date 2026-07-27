@@ -317,7 +317,17 @@ yanked paths/code back into an agent breaks them.
 **Contract:** skip wide-continuation cells during extraction (the
 `grab_all_text` path already gets this right — the two must agree).
 
-### P16 · CONFIRMED · Low-Med — SGR 2 (dim) and 9 (strikethrough) dropped
+### P16 · FIXED (this branch) · Low-Med — SGR 2 (dim) and 9 (strikethrough) dropped
+*Fixed: the vendored `Attrs` carries both, the SGR arms handle 2/9 and their
+resets, and `cell_style` maps them to `Modifier::DIM`/`CROSSED_OUT`. One
+wrinkle worth the note: ECMA-48 has no "faint off" — SGR 22 is *normal
+intensity* and ends bold and dim together, so 22 clears both and the
+escape-code diff writes the intensity pair as a unit (clear once, re-assert
+whichever half survives) instead of as two independent toggles; without that,
+dropping bold silently took a still-set dim with it (unit-proven via a
+`contents_formatted` round trip). Dimmed and struck cells are now distinct
+from unstyled ones, which they demonstrably were not. Amends DESIGN-ui C18
+(2026-07-27).*
 Verified attribute-identical to unstyled text end to end (vt100 `Attrs` has
 no field; renderer maps only bold/italic/underline/inverse). Claude Code
 leans on dim for secondary text — panes flatten into equal-weight walls.

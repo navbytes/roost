@@ -198,4 +198,18 @@ impl Cell {
     pub fn inverse(&self) -> bool {
         self.attrs.inverse()
     }
+
+    /// Returns whether the cell should be rendered with the dim (faint, SGR
+    /// 2) text attribute. roost (SPEC-parity P16).
+    #[must_use]
+    pub fn dim(&self) -> bool {
+        self.attrs.dim()
+    }
+
+    /// Returns whether the cell should be rendered with the strikethrough
+    /// (SGR 9) text attribute. roost (SPEC-parity P16).
+    #[must_use]
+    pub fn strikethrough(&self) -> bool {
+        self.attrs.strikethrough()
+    }
 }

@@ -1230,6 +1230,16 @@ fn cell_style(cell: &vt100::Cell) -> Style {
     if cell.inverse() {
         style = style.add_modifier(Modifier::REVERSED);
     }
+    // P16: dim (SGR 2) and strikethrough (SGR 9) were dropped end to end, so
+    // a pane's secondary text rendered at the same weight as its primary —
+    // roost asserting emphasis the program never asked for. Claude Code leans
+    // on dim heavily; without it a pane is one flat wall of text.
+    if cell.dim() {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if cell.strikethrough() {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
     style
 }
 
@@ -2127,6 +2137,39 @@ mod tests {
             blit_row("\u{1f600}\u{2764}\u{fe0f}y".as_bytes(), 8, 8),
             vec!["\u{1f600}", " ", "\u{2764}\u{fe0f}", " ", "y", " ", " ", " "],
         );
+    }
+
+    /// P16: `cell_style` mapped only bold/italic/underline/inverse, so dimmed
+    /// and struck text was attribute-identical to plain text — verified end to
+    /// end before the fix. Claude Code leans on dim for secondary text, so a
+    /// pane flattened into one equal-weight wall.
+    #[test]
+    fn dim_and_strikethrough_reach_ratatui_modifiers() {
+        use super::cell_style;
+
+        let mut p = vt100::Parser::new(2, 20, 0);
+        p.process(b"\x1b[2mF\x1b[22;9mS\x1b[0mP\x1b[1;2;9mA");
+        let s = p.screen();
+        let faint = cell_style(s.cell(0, 0).unwrap());
+        assert!(faint.add_modifier.contains(Modifier::DIM));
+        assert!(!faint.add_modifier.contains(Modifier::CROSSED_OUT));
+
+        let struck = cell_style(s.cell(0, 1).unwrap());
+        assert!(struck.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(!struck.add_modifier.contains(Modifier::DIM));
+
+        // The regression this item started from: plain text must stay plain.
+        let plain = cell_style(s.cell(0, 2).unwrap());
+        assert!(!plain.add_modifier.contains(Modifier::DIM));
+        assert!(!plain.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert_ne!(plain, faint, "dim must be distinguishable from unstyled");
+        assert_ne!(plain, struck, "strikethrough must be distinguishable");
+
+        // Stacking with the attributes that already worked.
+        let all = cell_style(s.cell(0, 3).unwrap());
+        for m in [Modifier::BOLD, Modifier::DIM, Modifier::CROSSED_OUT] {
+            assert!(all.add_modifier.contains(m), "missing {m:?}");
+        }
     }
 
     /// U24 guard: a wide glyph whose second half would land outside the drawn

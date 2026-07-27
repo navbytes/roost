@@ -1664,13 +1664,23 @@ impl Screen {
             match next_param!() {
                 &[0] => self.attrs = crate::attrs::Attrs::default(),
                 &[1] => self.attrs.set_bold(true),
+                // roost (SPEC-parity P16): faint/dim and strikethrough.
+                &[2] => self.attrs.set_dim(true),
                 &[3] => self.attrs.set_italic(true),
                 &[4] => self.attrs.set_underline(true),
                 &[7] => self.attrs.set_inverse(true),
-                &[22] => self.attrs.set_bold(false),
+                &[9] => self.attrs.set_strikethrough(true),
+                // SGR 22 is "normal intensity" in ECMA-48: it ends *both*
+                // bold and faint, which is why there is no separate reset for
+                // dim alone. Matching the existing 23/24/27 shape otherwise.
+                &[22] => {
+                    self.attrs.set_bold(false);
+                    self.attrs.set_dim(false);
+                }
                 &[23] => self.attrs.set_italic(false),
                 &[24] => self.attrs.set_underline(false),
                 &[27] => self.attrs.set_inverse(false),
+                &[29] => self.attrs.set_strikethrough(false),
                 &[n] if (30..=37).contains(&n) => {
                     self.attrs.fgcolor =
                         crate::attrs::Color::Idx(to_u8!(n) - 30);
@@ -2498,6 +2508,83 @@ mod roost_tests {
         assert!(s.cell(0, 0).unwrap().is_wide());
         assert!(s.cell(0, 1).unwrap().is_wide_continuation());
         assert!(!s.cell(0, 2).unwrap().is_wide_continuation());
+    }
+
+    // -- dim and strikethrough, SGR 2 / 9 (SPEC-parity P16) ---------------
+
+    #[test]
+    fn sgr_2_sets_dim_and_sgr_22_clears_it() {
+        let mut p = parser();
+        p.process(b"\x1b[2mfaint\x1b[22mplain");
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().dim());
+        assert!(!s.cell(0, 5).unwrap().dim());
+        // SGR 0 is the other reset.
+        let mut p = parser();
+        p.process(b"\x1b[2mfaint\x1b[0mplain");
+        assert!(!p.screen().cell(0, 5).unwrap().dim());
+    }
+
+    #[test]
+    fn sgr_9_sets_strikethrough_and_sgr_29_clears_it() {
+        let mut p = parser();
+        p.process(b"\x1b[9mgone\x1b[29mhere");
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().strikethrough());
+        assert!(!s.cell(0, 4).unwrap().strikethrough());
+        let mut p = parser();
+        p.process(b"\x1b[9mgone\x1b[0mhere");
+        assert!(!p.screen().cell(0, 4).unwrap().strikethrough());
+    }
+
+    #[test]
+    fn dim_and_strikethrough_are_independent_of_the_other_attributes() {
+        // A realistic agent-CLI run: everything on at once, then the two new
+        // attributes cleared while bold/italic/underline/inverse stay.
+        let mut p = parser();
+        p.process(b"\x1b[1;2;3;4;7;9mall\x1b[29mno-strike");
+        let s = p.screen();
+        let all = s.cell(0, 0).unwrap();
+        assert!(all.bold() && all.italic() && all.underline() && all.inverse());
+        assert!(all.dim() && all.strikethrough());
+        let rest = s.cell(0, 3).unwrap();
+        assert!(rest.bold() && rest.italic() && rest.underline() && rest.inverse());
+        assert!(rest.dim(), "SGR 29 must not touch intensity");
+        assert!(!rest.strikethrough());
+    }
+
+    #[test]
+    fn sgr_22_ends_both_halves_of_intensity() {
+        // ECMA-48: 22 is "normal intensity", not "bold off". A pane that
+        // dims, bolds, then sends 22 expects plain text on both counts.
+        let mut p = parser();
+        p.process(b"\x1b[1;2mboth\x1b[22mneither");
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().bold() && s.cell(0, 0).unwrap().dim());
+        assert!(!s.cell(0, 4).unwrap().bold() && !s.cell(0, 4).unwrap().dim());
+    }
+
+    #[test]
+    fn the_intensity_pair_round_trips_through_the_escape_code_diff() {
+        // `contents_formatted` re-emits attribute changes. Since SGR 22
+        // clears both halves, dropping bold while dim stays set has to
+        // re-assert the dim, or the replayed stream loses it.
+        let mut p = parser();
+        p.process(b"\x1b[1;2mA\x1b[22;2mB\x1b[9mC");
+        let formatted = p.screen().contents_formatted();
+        let mut replay = parser();
+        replay.process(&formatted);
+        let s = replay.screen();
+        for (col, (bold, dim, strike)) in
+            [(true, true, false), (false, true, false), (false, true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let cell = s.cell(0, u16::try_from(col).unwrap()).unwrap();
+            assert_eq!(cell.bold(), bold, "bold at col {col}");
+            assert_eq!(cell.dim(), dim, "dim at col {col}");
+            assert_eq!(cell.strikethrough(), strike, "strike at col {col}");
+        }
     }
 
     #[test]
