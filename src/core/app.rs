@@ -16,7 +16,7 @@ use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
-use crate::ports::{Observation, PaneBackend, StateStore};
+use crate::ports::{ClipboardOutcome, Observation, PaneBackend, StateStore};
 use crate::ui::input::Action;
 use crate::ui::render::state_word;
 
@@ -149,13 +149,18 @@ const MIN_FLOAT_BODY_ROWS: u16 = 10;
 /// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
 /// is a lazily-loaded tab whose panes haven't been spawned — deliberately
 /// distinct from `Quiet` (spawned, nothing happening) so a background tab
-/// never masquerades as idle. `render` maps each to a glyph + colour.
+/// never masquerades as idle. `Exited` (U13, closing SPEC-GAP-2) is the
+/// same honesty one step further: a tab whose agents are *dead* used to
+/// render the Quiet blank, so a background tab full of corpses looked
+/// exactly like a background tab with nothing to say. `render` maps each to
+/// a glyph + colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabSummary {
     NeedsInput,
     Working,
     Unknown,
     Waiting,
+    Exited,
     Quiet,
 }
 
@@ -794,18 +799,20 @@ impl<B: PaneBackend> App<B> {
     pub fn tab_summary(&self, tab_index: usize) -> TabSummary {
         let Some(tab) = self.ws.tabs.get(tab_index) else { return TabSummary::Quiet };
         let mut any_unknown = false;
-        let (mut needs, mut working, mut waiting) = (false, false, false);
+        let (mut needs, mut working, mut waiting, mut exited) = (false, false, false, false);
         for id in tab.panes.keys() {
             match self.runtimes.get(id) {
                 Some(rt) => match rt.status() {
                     AgentStatus::NeedsInput => needs = true,
                     AgentStatus::Working => working = true,
                     AgentStatus::Waiting => waiting = true,
-                    _ => {}
+                    AgentStatus::Exited => exited = true, // U13
+                    AgentStatus::Idle => {}
                 },
                 // No runtime and not a known spawn-failure ⇒ not spawned yet.
                 None if !self.dead.contains_key(id) => any_unknown = true,
-                None => {}
+                // A recorded spawn failure is a dead pane too (U13).
+                None => exited = true,
             }
         }
         if needs {
@@ -816,6 +823,10 @@ impl<B: PaneBackend> App<B> {
             TabSummary::Working
         } else if waiting {
             TabSummary::Waiting
+        } else if exited {
+            // U13: ranked below Waiting (a live agent outranks a corpse) and
+            // above Quiet (a dead pane is news; an idle one isn't).
+            TabSummary::Exited
         } else {
             TabSummary::Quiet
         }
@@ -1667,9 +1678,34 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// Finish the drag: extract the selected text, set a "copied" flash, and
-    /// leave copy mode. Returns the text to hand to the clipboard (None when
-    /// the selection is empty).
+    /// U14: the hint-bar text for a finished copy of `chars` characters,
+    /// given which clipboard channel actually took it. The flash used to
+    /// fire at extraction time and claim `copied N chars` unconditionally —
+    /// while `clipboard::copy` discarded both channels' results, so an
+    /// empty clipboard reported a successful copy. Pure, so the wording is
+    /// pinned without touching a clipboard.
+    pub fn copy_flash_text(chars: usize, outcome: ClipboardOutcome) -> String {
+        match outcome {
+            ClipboardOutcome::Native => format!("copied {chars} chars"),
+            // Sent, unacknowledged: OSC 52 has no reply, and the terminal
+            // may not be listening. The qualifier is the whole point — it
+            // tells you where to look when the paste comes up empty.
+            ClipboardOutcome::Osc52 => format!("copied {chars} chars (OSC 52)"),
+            ClipboardOutcome::Failed => "copy failed".to_string(),
+        }
+    }
+
+    /// U14: flash the result of a copy the composition root just performed
+    /// (core has no clipboard I/O of its own — same division as
+    /// `pending_yank`). Both copy paths, mouse and keyboard, end here.
+    pub fn flash_copy(&mut self, chars: usize, outcome: ClipboardOutcome) {
+        self.set_flash(Self::copy_flash_text(chars, outcome));
+    }
+
+    /// Finish the drag: extract the selected text and leave copy mode.
+    /// Returns the text to hand to the clipboard (None when the selection
+    /// is empty). U14: the "copied" flash is *not* set here — it is set by
+    /// the caller once the clipboard has actually answered (`flash_copy`).
     pub fn finish_selection(&mut self) -> Option<String> {
         let sel = self.selection.as_mut()?;
         sel.dragging = false;
@@ -1680,7 +1716,6 @@ impl<B: PaneBackend> App<B> {
         if text.is_empty() {
             return None;
         }
-        self.set_flash(format!("copied {} chars", text.chars().count()));
         Some(text)
     }
 
@@ -3074,6 +3109,72 @@ mod tests {
         assert_eq!(app.tab_summary(0), TabSummary::Unknown);
     }
 
+    /// U13 (closes SPEC-GAP-2): a tab whose agents are dead says so instead
+    /// of rendering the Quiet blank — one transient bell, then silence, was
+    /// the entire signal a background tab full of corpses used to get.
+    #[test]
+    fn tab_summary_reports_exited_and_ranks_it_between_waiting_and_quiet() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2 in one tab
+        assert_eq!(app.tab_summary(0), TabSummary::Quiet);
+
+        app.runtimes.get_mut(&1).unwrap().kill(); // pane 1 dies
+        assert_eq!(app.tab_summary(0), TabSummary::Exited, "a dead pane is news");
+
+        // A live pane with something to say outranks a corpse...
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.tab_summary(0), TabSummary::Waiting);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Working);
+        assert_eq!(app.tab_summary(0), TabSummary::Working);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.tab_summary(0), TabSummary::NeedsInput);
+        // ...and an idle one does not: Idle is "nothing to report", the
+        // corpse is the only news on the tab.
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Idle);
+        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+        // Every pane dead is still Exited, never Quiet.
+        app.runtimes.get_mut(&2).unwrap().kill();
+        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+    }
+
+    /// A pane whose *spawn* failed has no runtime at all — it is dead, not
+    /// unspawned, and must not read as `Unknown` (nor drag the tab to it).
+    #[test]
+    fn tab_summary_counts_a_failed_spawn_as_exited_not_unknown() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        app.runtimes.remove(&id);
+        app.dead.insert(id, "spawn-fail requested".into());
+        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+    }
+
+    /// U14: the flash says what actually happened. A native helper that
+    /// exited clean is an unqualified copy; OSC 52 alone is flagged (sent,
+    /// unacknowledged — the one channel that works over SSH, and the one
+    /// that can silently do nothing); neither is an honest failure.
+    #[test]
+    fn copy_flash_text_names_the_channel_that_took_it() {
+        assert_eq!(App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Native), "copied 13 chars");
+        assert_eq!(
+            App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Osc52),
+            "copied 13 chars (OSC 52)"
+        );
+        assert_eq!(App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Failed), "copy failed");
+        // A failure never quotes a count — there is no N to have copied.
+        assert!(!App::<FakePane>::copy_flash_text(0, ClipboardOutcome::Failed).contains('0'));
+    }
+
+    /// The flash lands on the bar for both copy paths, and only after the
+    /// clipboard has answered.
+    #[test]
+    fn flash_copy_puts_the_real_outcome_on_the_bar() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.flash_copy(4, ClipboardOutcome::Osc52);
+        assert_eq!(app.flash(), Some("copied 4 chars (OSC 52)"));
+        app.flash_copy(4, ClipboardOutcome::Failed);
+        assert_eq!(app.flash(), Some("copy failed"));
+    }
+
     #[test]
     fn needs_input_count_is_0_1_many_and_spans_every_tab() {
         let (mut app, _) = mk_app(shell_ws());
@@ -4266,7 +4367,11 @@ mod tests {
         assert_eq!(app.finish_selection().as_deref(), Some("selected text"));
         assert!(!app.in_copy_mode()); // exited on copy
         assert!(app.selection.is_none());
-        assert!(app.flash().is_some()); // "copied N chars"
+        // U14: the flash is the caller's job now — extraction claims
+        // nothing until the clipboard has actually answered.
+        assert!(app.flash().is_none());
+        app.flash_copy(13, ClipboardOutcome::Native);
+        assert_eq!(app.flash(), Some("copied 13 chars"));
     }
 
     #[test]
@@ -6042,7 +6147,9 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
         assert!(app.selection.is_none());
         assert_eq!(app.take_pending_yank().as_deref(), Some("yanked text"));
-        assert!(app.flash().unwrap().starts_with("copied"));
+        // U14: same for the keyboard path — the yank is stashed for the
+        // composition root, which flashes the clipboard's real answer.
+        assert!(app.flash().is_none());
     }
 
     #[test]

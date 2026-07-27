@@ -244,8 +244,11 @@ fn run(
                         // text on the app (core has no clipboard I/O of its
                         // own); hand it to the OS clipboard here, same as
                         // the mouse path does inline in `handle_copy_mouse`.
+                        // U14: flash what the clipboard actually did, once
+                        // it has answered — never an optimistic "copied".
                         if let Some(text) = app.take_pending_yank() {
-                            infra::clipboard::copy(&text);
+                            let outcome = infra::clipboard::copy(&text);
+                            app.flash_copy(text.chars().count(), outcome);
                         }
                     }
                     Event::Mouse(me) => handle_mouse(&mut app, me),
@@ -493,7 +496,8 @@ fn handle_copy_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::Mou
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let Some(text) = app.finish_selection() {
-                infra::clipboard::copy(&text);
+                let outcome = infra::clipboard::copy(&text); // U14
+                app.flash_copy(text.chars().count(), outcome);
             }
         }
         _ => {}

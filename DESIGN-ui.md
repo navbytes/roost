@@ -283,6 +283,19 @@ Red); tab variant `:271–280`; no animation.
 TabSummary variant: NeedsInput/Working/Waiting as above; Unknown `·` `DIM`;
 Quiet renders a single space (both semantics unchanged).
 
+**[Amended 2026-07-27, SPEC-ux U13 — closes SPEC-GAP-2]** The TabSummary
+table gains **Exited `✕` `ACCENT_DIM`** — the same glyph and colour as the
+`AgentStatus` row above it, because C5 is one table and a tab of corpses may
+not read differently from a corpse. It ranks **between Waiting and Quiet**:
+a live agent with anything to say outranks a dead one, and a dead one
+outranks silence. A pane counts as exited when its runtime reports `Exited`
+*or* when its spawn failed outright (a recorded `App::dead` entry — no
+runtime, but not unspawned either, so it must not read as `Unknown`). Before
+this, a background tab whose agents had all died rendered the Quiet blank:
+one transient bell, then a tab that looked idle forever (§7 SPEC-GAP-2).
+Quiet keeps the blank cell — it is now the only summary that draws nothing,
+and it means what it says.
+
 **Pulse spec:** period **1100 ms**, 50% duty, two phases: elapsed-ms in
 `[0, 550) → ACCENT`, `[550, 1100) → ACCENT_DIM`, repeating. Phase is computed
 from one shared clock (elapsed since app start), so **all pulsing glyphs flip
@@ -452,6 +465,17 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
 generic notices — "copied", extension updates — so it gets the neutral
 elevated treatment, not a reserved color; ok-green is banned from chrome.)
 Timing/precedence unchanged.
+
+**[Amended 2026-07-27, SPEC-ux U14]:** Styling and timing are untouched, but
+the *copy* flash's wording is now contracted — it was the one flash that
+could lie, firing at extraction time while `clipboard::copy` discarded both
+channels' results. It reads `copied N chars` only when a native helper
+exited successfully, `copied N chars (OSC 52)` when the escape went out
+unacknowledged (the SSH/tmux channel — it may equally have vanished into a
+terminal that ignores it), and `copy failed` when neither landed, with no
+count to quote. The text comes from the pure `App::copy_flash_text`, and
+both copy paths (mouse release, keyboard `y`/`↵`) flash only *after* the
+clipboard has answered.
 
 **[Amended 2026-07-27, SPEC-ux U22]:** "timing unchanged" is superseded for
 confirm-arm prompts only: a flash that arms a destructive second-press
@@ -1175,9 +1199,10 @@ not a benchmark suite.
   exit-code plumbing (`status.rs` `exited: bool`; `on_pty_exit` carries no
   code). Contracted as bare `exited` (C8). Optional follow-up: thread the
   child's exit status through `PaneBackend`/`on_pty_exit` into `StatusTracker`.
-- **SPEC-GAP-2 — no tab-level Exited.** `TabSummary` has no Exited variant, so
-  a tab whose panes all exited shows a blank (Quiet) glyph. Semantics
-  unchanged by this restyle; flagged for a later product call.
+- **SPEC-GAP-2 — no tab-level Exited.** ~~`TabSummary` has no Exited variant,
+  so a tab whose panes all exited shows a blank (Quiet) glyph.~~ **CLOSED
+  2026-07-27** by SPEC-ux U13: `TabSummary::Exited` → `✕` `ACCENT_DIM`,
+  ranked between Waiting and Quiet (C5 amended, same date).
 - **SPEC-GAP-3 — collapsed-row task detail.** Mockup's `running build` is
   task-level detail roost doesn't have; the state-word table (C8) is the
   honest substitute.

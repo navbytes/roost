@@ -85,6 +85,11 @@ appeared anywhere in the captured host stream.
 **Contract:** forward pane OSC 52 writes to the host terminal (roost's own
 copy mode already proves the host path works); optionally cap size and gate
 reads (`52;c;?`) which are a paste-theft vector — forward writes, refuse reads.
+*Cross-reference (2026-07-27): the other half of this lie is closed — SPEC-ux
+U14 shipped, so roost's own copy path now reports which channel actually took
+the text (`copied N chars` / `copied N chars (OSC 52)` / `copy failed`) instead
+of flashing success unconditionally. P3, the inner-app half, stays CONFIRMED
+and open: a pane's own OSC 52 is still eaten.*
 
 ### P4 · FIXED (this branch) · High — the terminal-query black hole
 *Fixed per Appendix B: `src/infra/queries.rs` (kitty.rs generalized) answers

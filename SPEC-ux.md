@@ -178,17 +178,31 @@ mid-turn all the same.
 **Fixed:** `close_pane`'s guard now uses the shared `is_busy` predicate
 (`Working || NeedsInput`), the same one Alt+q's U1 guard counts with.
 
-### U13 · Med · OPEN — tab summary has no Exited state
+### U13 · Med · FIXED (this branch) — tab summary has no Exited state
 A background tab full of dead agents shows a blank glyph (SPEC-GAP-2,
 DESIGN-ui §7): one transient bell, then silence.
 **Proposed contract:** `TabSummary::Exited` → `✕` (ACCENT_DIM), ranked between
 Waiting and Quiet.
+**Fixed:** exactly that — `TabSummary::Exited` renders C5's `✕` in
+ACCENT_DIM (the same row the per-pane glyph uses, since C5 is one table),
+ranked below Waiting and above Quiet, and counting a failed spawn as dead
+rather than `Unknown`. Quiet's blank now means only "nothing to report"
+(C5 amended 2026-07-27; DESIGN-ui §7 SPEC-GAP-2 closed).
 
-### U14 · Med · OPEN — "copied N chars" can be a lie
+### U14 · Med · FIXED (this branch) — "copied N chars" can be a lie
 The flash fires on extraction; `clipboard::copy` discards both channels'
 results (live_qa historically showed the flash with an empty clipboard).
 **Proposed contract:** report the channel that actually ran — `copied N chars
 (OSC 52)` when no native helper succeeded, an explicit failure otherwise.
+**Fixed:** `clipboard::copy` returns a `ports::ClipboardOutcome` —
+`Native` only when a helper *exited successfully* (spawning is not success:
+xclip with no `$DISPLAY` was the old false positive), `Osc52` when just the
+escape went out (fire-and-forget, so "sent, unacknowledged" is the most it
+can honestly claim), `Failed` when neither landed. The flash moved out of
+`finish_selection` to the composition root, which sets it once the clipboard
+has answered: `copied N chars` / `copied N chars (OSC 52)` / `copy failed`
+(C10 amended 2026-07-27). Both channels still fire on every copy — roost's
+own OSC 52 emission is unchanged; only the reporting is.
 
 ### U15 · Med · VERIFIED — hiding hints hides the only mode indication
 Live QA: with hints hidden (Alt+/), a zoomed pane shows `ZOOM` nowhere — it is

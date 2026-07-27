@@ -90,14 +90,16 @@ pub fn status_style(status: AgentStatus) -> (char, Color, bool) {
 }
 
 /// `TabSummary` → (glyph, color) — C5's tab-bar variant. Same colors as the
-/// `AgentStatus` table; `Unknown` reuses the idle dot, `Quiet` is a blank
-/// space (its color is unused by callers).
+/// `AgentStatus` table; `Unknown` reuses the idle dot, `Exited` reuses the
+/// dim-red `✕` (U13), `Quiet` is a blank space (its color is unused by
+/// callers).
 pub fn tab_summary_style(summary: TabSummary) -> (char, Color) {
     match summary {
         TabSummary::NeedsInput => (GLYPH_NEEDS_INPUT, ACCENT),
         TabSummary::Working => (GLYPH_WORKING, ACCENT),
         TabSummary::Waiting => (GLYPH_WAITING, FG),
         TabSummary::Unknown => (GLYPH_IDLE, DIM),
+        TabSummary::Exited => (GLYPH_EXITED, ACCENT_DIM),
         TabSummary::Quiet => (' ', DIM),
     }
 }
@@ -150,6 +152,35 @@ mod tests {
         assert_eq!(tab_summary_style(TabSummary::Working), (GLYPH_WORKING, ACCENT));
         assert_eq!(tab_summary_style(TabSummary::Waiting), (GLYPH_WAITING, FG));
         assert_eq!(tab_summary_style(TabSummary::Unknown), (GLYPH_IDLE, DIM));
+        assert_eq!(tab_summary_style(TabSummary::Exited), (GLYPH_EXITED, ACCENT_DIM));
         assert_eq!(tab_summary_style(TabSummary::Quiet), (' ', DIM));
+    }
+
+    /// U13: the tab-bar Exited variant is the same glyph *and* the same dim
+    /// red as the per-pane `AgentStatus::Exited` — C5 is one table, so a
+    /// tab of corpses can't read differently from a pane corpse. And it
+    /// stays steady: only Working ever pulses.
+    #[test]
+    fn tab_exited_matches_the_pane_exited_row_and_never_pulses() {
+        let (pane_glyph, pane_color, pulses) = status_style(AgentStatus::Exited);
+        assert_eq!(tab_summary_style(TabSummary::Exited), (pane_glyph, pane_color));
+        assert!(!pulses);
+    }
+
+    /// Every summary but Quiet draws a real glyph — Quiet's blank is the
+    /// one deliberate "nothing to report" cell (U13 gave the tab that used
+    /// to fall into it for being dead its own mark).
+    #[test]
+    fn only_quiet_renders_a_blank_tab_glyph() {
+        for s in [
+            TabSummary::NeedsInput,
+            TabSummary::Working,
+            TabSummary::Waiting,
+            TabSummary::Unknown,
+            TabSummary::Exited,
+        ] {
+            assert_ne!(tab_summary_style(s).0, ' ', "{s:?} must have a glyph");
+        }
+        assert_eq!(tab_summary_style(TabSummary::Quiet).0, ' ');
     }
 }
