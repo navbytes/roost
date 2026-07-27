@@ -585,12 +585,19 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         app.on_click(pane.id);
     }
 
-    let proto = app
+    // P9: the wheel's destination depends on more than the mouse protocol —
+    // an alternate-screen app with no protocol gets arrow keys, since its
+    // grid has no scrollback for roost to move.
+    let state = app
         .runtimes
         .get(&pane.id)
-        .map(|rt| rt.mouse_proto())
-        .unwrap_or(ports::MouseProto::None);
-    match mouse::route_mouse(proto, &pane, &me) {
+        .map(|rt| mouse::PaneMouseState {
+            proto: rt.mouse_proto(),
+            alternate_screen: rt.alternate_screen(),
+            app_cursor_keys: rt.app_cursor_keys(),
+        })
+        .unwrap_or_default();
+    match mouse::route_mouse(state, &pane, &me) {
         MouseAction::Forward(bytes) => app.forward_mouse(pane.id, &bytes),
         MouseAction::Scroll(delta) => app.wheel_scroll(pane.id, delta),
         MouseAction::None => {}

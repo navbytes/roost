@@ -37,9 +37,11 @@ bug). Severity is impact for a user supervising AI-agent panes.
 - **W4 · Input gating** — P12, P13. Two guards in `translate`; P13's fix is
   the same change as SPEC-ux U5 (meta-ESC fallthrough via `encode_raw`).
 - **W5 · Scroll/zoom state truth** — P5, P9, P14 (folds into/amends SPEC-ux
-  U9), P7's scrolled-cursor facet (belongs with U3/N1). **P5 shipped** — the
-  live grid reflows on resize (scrollback keeps its historical width, the
-  alternate screen never reflows); amends DESIGN-ui C21 (2026-07-27).
+  U9), P7's scrolled-cursor facet (belongs with U3/N1). **P5 + P9 shipped** —
+  the live grid reflows on resize (scrollback keeps its historical width, the
+  alternate screen never reflows), and the wheel over a protocol-less
+  alternate-screen app becomes arrow keys; amends DESIGN-ui C21 and §5
+  (2026-07-27). P14 remains open.
 - **W6 · Width & styling fidelity** — P15, P16, P17, P19 (+ SPEC-ux U24 as one
   bundle: unify unicode-width, fix continuation cells in blit *and*
   extraction, add missing SGR/REP arms). **Shipped** — all five FIXED; amends
@@ -257,7 +259,23 @@ host-side kitty flags — an architecture decision, not a patch.
 subset), and grow the subset deliberately: next increments are CSI-u Esc
 (`\x1b[27u`) and Ctrl/Alt letter combos under disambiguate.
 
-### P9 · CONFIRMED · Med — wheel is dead over alternate-screen apps
+### P9 · FIXED (this branch) · Med — wheel is dead over alternate-screen apps
+*Fixed: `route_mouse` now takes a `PaneMouseState` (protocol + alternate
+screen + DECCKM) instead of the protocol alone, and a wheel tick over a pane
+that is on the alternate screen with `MouseProto::None` becomes
+`ALT_SCROLL_KEYS` (3) Up/Down presses forwarded to the app — the DECSET 1007
+convention, and the same three lines the wheel moves roost's own scrollback
+by, so it feels identical either side of the alternate screen. The bytes come
+from the keyboard path's own encoders (`encode_raw` + `app_cursor_upgrade`),
+so a pager driven through `smkx` gets the SS3 forms it is listening for. The
+other two branches are untouched: a primary-screen pane still scrolls roost's
+scrollback, and an app that asked for mouse reporting still gets its SGR
+event verbatim (asking for the wheel means wanting the wheel). New
+`PaneBackend::alternate_screen` reads vt100's existing 1049/47 tracking off
+the LIVE screen, never the P1 presentation veneer. DESIGN-ui §5 amended
+2026-07-27. e2e `tests/pane_wheel_alt_screen.rs`: before, fifteen wheel-down
+events over `less` on a 400-line file left it on `L001`; after, the file
+scrolls.*
 `man`/`less` without mouse mode: wheel events route to roost-side scrollback,
 but the alternate grid has scrollback capacity 0 — the view never moves and
 the app receives nothing (measured byte-level: zero bytes from six wheel

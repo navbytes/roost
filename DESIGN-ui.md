@@ -1409,6 +1409,25 @@ Every px-only construct in the mockup, and its cell-level fate:
   zoom-follows-focus work. Raw mode (C23) alters the **key path only** —
   mouse routing, mouse capture, paste, and the vt100 blit are untouched by
   it.
+- **[Amended 2026-07-27, SPEC-parity P9 — where a wheel tick goes]** Wheel
+  routing has three answers, not two, and `mouse::route_mouse` decides all of
+  them from one `PaneMouseState` (mouse protocol · alternate screen · DECCKM)
+  so the decision stays in one pure, tested place:
+  1. the pane's app speaks SGR mouse reporting → forward the encoded event,
+     unchanged (asking for the wheel means wanting the wheel);
+  2. no protocol, **alternate screen** (`?1049h`/`?47h` — `man`, `less`,
+     vim) → forward `ALT_SCROLL_KEYS` = 3 Up/Down presses, encoded by the
+     keyboard path's own `encode_raw` + `app_cursor_upgrade` (so a pager
+     driven through `smkx` gets `ESC O A/B`). That grid has scrollback
+     capacity 0, so roost-side scrolling there could only ever be a no-op —
+     measured as zero bytes reaching the pane from six wheel events. This is
+     the DECSET 1007 / `alternate-scroll` convention every peer settled on;
+  3. otherwise → scroll roost's own scrollback by `WHEEL_LINES` = 3, exactly
+     as before. The two 3s are deliberately the same number: one notch moves
+     a pager by what it moves history by.
+  The C15 help row (`wheel scrolls · click focuses · drag selects`) is
+  unchanged and now true in more places. Clicks over a protocol-less pane
+  remain roost's, alternate screen or not.
 
 ---
 

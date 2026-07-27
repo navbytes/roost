@@ -12,16 +12,23 @@
 //!
 //! The tab bar row is handled separately (click to switch tabs).
 
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthStr;
 
 use crate::core::layout::PaneRect;
 use crate::ports::MouseProto;
-use crate::ui::theme;
+use crate::ui::{input, theme};
 
 /// Lines per wheel notch for roost-side scrolling (tmux uses 3).
 pub const WHEEL_LINES: i32 = 3;
+
+/// P9: arrow keys one wheel notch becomes over an alternate-screen app that
+/// never asked for mouse reporting — the DECSET 1007 convention peers settled
+/// on (tmux's `alternate-scroll`). Deliberately the same 3 as `WHEEL_LINES`:
+/// the wheel should move a pager by exactly what it moves roost's own
+/// scrollback by, so it feels the same either side of the alternate screen.
+pub const ALT_SCROLL_KEYS: usize = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MouseAction {
@@ -264,24 +271,71 @@ pub fn status_fit<'a>(
     None
 }
 
-/// Route a mouse event over a pane to either the inner app or roost's
-/// scrollback. Focus (a roost concern) is decided by the caller.
-pub fn route_mouse(proto: MouseProto, pane: &PaneRect, me: &MouseEvent) -> MouseAction {
+/// What roost knows about the pane an event landed on, as far as routing is
+/// concerned. `proto` alone was enough while the only answers were "forward
+/// it" and "scroll roost's buffer"; P9 needs a third (see `route_mouse`), and
+/// two more facts to pick it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneMouseState {
+    /// What the pane's inner application asked for, mouse-wise.
+    pub proto: MouseProto,
+    /// Is it drawing on the alternate screen (`?1049h`)? That grid has no
+    /// scrollback, so roost-side scrolling there is a guaranteed no-op.
+    pub alternate_screen: bool,
+    /// Has it switched on DECCKM (`?1h`)? Decides `ESC O A` vs `ESC [ A` for
+    /// the arrow keys P9 synthesizes — the same choice the keyboard path
+    /// makes (`input::app_cursor_upgrade`).
+    pub app_cursor_keys: bool,
+}
+
+impl Default for PaneMouseState {
+    /// A pane roost has no runtime for: no protocol, no alternate screen.
+    fn default() -> Self {
+        Self { proto: MouseProto::None, alternate_screen: false, app_cursor_keys: false }
+    }
+}
+
+/// Route a mouse event over a pane to the inner app or to roost's scrollback.
+/// Focus (a roost concern) is decided by the caller.
+///
+/// P9: the wheel over an alternate-screen app with no mouse protocol becomes
+/// arrow keys. `man`/`less` never ask for mouse reporting, and their grid has
+/// scrollback capacity 0 — so routing the wheel to roost's own scrollback
+/// moved nothing and told the application nothing (measured: zero bytes from
+/// six wheel events). Every real terminal answers this the same way, via
+/// DECSET 1007 / tmux's `alternate-scroll`.
+pub fn route_mouse(state: PaneMouseState, pane: &PaneRect, me: &MouseEvent) -> MouseAction {
     if pane.collapsed {
         // A collapsed stack bar has no scrollable content and no inner app.
         return MouseAction::None;
     }
-    match proto {
+    match state.proto {
         MouseProto::Sgr => match encode_sgr(pane.rect, me) {
             Some(bytes) => MouseAction::Forward(bytes),
             None => MouseAction::None,
         },
         MouseProto::None => match me.kind {
+            MouseEventKind::ScrollUp if state.alternate_screen => {
+                MouseAction::Forward(alt_scroll_keys(KeyCode::Up, state.app_cursor_keys))
+            }
+            MouseEventKind::ScrollDown if state.alternate_screen => {
+                MouseAction::Forward(alt_scroll_keys(KeyCode::Down, state.app_cursor_keys))
+            }
             MouseEventKind::ScrollUp => MouseAction::Scroll(WHEEL_LINES),
             MouseEventKind::ScrollDown => MouseAction::Scroll(-WHEEL_LINES),
             _ => MouseAction::None, // plain app: clicks are roost's (focus)
         },
     }
+}
+
+/// P9: one wheel notch as `ALT_SCROLL_KEYS` presses of `code`. Encoded by the
+/// keyboard path's own functions, so the application receives exactly the
+/// bytes a real Up/Down would send it — SS3 when it asked for DECCKM, which
+/// is what a pager driven through `smkx` is listening for.
+fn alt_scroll_keys(code: KeyCode, app_cursor: bool) -> Vec<u8> {
+    let key = KeyEvent::new(code, KeyModifiers::NONE);
+    let once = input::app_cursor_upgrade(key, input::encode_raw(key), app_cursor);
+    once.repeat(ALT_SCROLL_KEYS)
 }
 
 /// Translate screen coords to 1-based coords inside the pane's inner area
@@ -360,6 +414,21 @@ mod tests {
         MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE }
     }
 
+    /// A pane whose app asked for nothing: no mouse protocol, primary screen.
+    fn plain() -> PaneMouseState {
+        PaneMouseState::default()
+    }
+
+    /// A pane whose app speaks SGR mouse reporting.
+    fn sgr() -> PaneMouseState {
+        PaneMouseState { proto: MouseProto::Sgr, ..PaneMouseState::default() }
+    }
+
+    /// P9: a pager — alternate screen, no mouse protocol.
+    fn pager(app_cursor: bool) -> PaneMouseState {
+        PaneMouseState { alternate_screen: true, app_cursor_keys: app_cursor, ..plain() }
+    }
+
     #[test]
     fn hit_test_picks_correct_pane() {
         let rects = vec![pr(1, 0, 1, 50, 29, false), pr(2, 50, 1, 50, 29, false)];
@@ -372,11 +441,11 @@ mod tests {
     fn wheel_over_plain_app_scrolls_roost_side() {
         let pane = pr(1, 0, 1, 50, 29, false);
         assert_eq!(
-            route_mouse(MouseProto::None, &pane, &ev(MouseEventKind::ScrollUp, 5, 5)),
+            route_mouse(plain(), &pane, &ev(MouseEventKind::ScrollUp, 5, 5)),
             MouseAction::Scroll(WHEEL_LINES)
         );
         assert_eq!(
-            route_mouse(MouseProto::None, &pane, &ev(MouseEventKind::ScrollDown, 5, 5)),
+            route_mouse(plain(), &pane, &ev(MouseEventKind::ScrollDown, 5, 5)),
             MouseAction::Scroll(-WHEEL_LINES)
         );
     }
@@ -385,7 +454,7 @@ mod tests {
     fn click_on_plain_app_is_not_forwarded() {
         let pane = pr(1, 0, 1, 50, 29, false);
         assert_eq!(
-            route_mouse(MouseProto::None, &pane, &ev(MouseEventKind::Down(MouseButton::Left), 5, 5)),
+            route_mouse(plain(), &pane, &ev(MouseEventKind::Down(MouseButton::Left), 5, 5)),
             MouseAction::None
         );
     }
@@ -394,7 +463,7 @@ mod tests {
     fn wheel_over_mouse_aware_app_forwards_sgr() {
         let pane = pr(1, 10, 5, 40, 20, false);
         // screen (12, 7) → inner cell (2, 2), 1-based
-        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::ScrollUp, 12, 7)) {
+        match route_mouse(sgr(), &pane, &ev(MouseEventKind::ScrollUp, 12, 7)) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<64;2;2M"),
             other => panic!("expected forward, got {other:?}"),
         }
@@ -404,18 +473,18 @@ mod tests {
     fn click_and_drag_forward_to_mouse_aware_app() {
         let pane = pr(1, 10, 5, 40, 20, false);
         // left press at inner (2,2)
-        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::Down(MouseButton::Left), 12, 7))
+        match route_mouse(sgr(), &pane, &ev(MouseEventKind::Down(MouseButton::Left), 12, 7))
         {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<0;2;2M"),
             other => panic!("{other:?}"),
         }
         // release → trailing 'm'
-        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::Up(MouseButton::Left), 12, 7)) {
+        match route_mouse(sgr(), &pane, &ev(MouseEventKind::Up(MouseButton::Left), 12, 7)) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<0;2;2m"),
             other => panic!("{other:?}"),
         }
         // left drag → button + motion flag (0 + 32)
-        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::Drag(MouseButton::Left), 13, 8))
+        match route_mouse(sgr(), &pane, &ev(MouseEventKind::Drag(MouseButton::Left), 13, 8))
         {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<32;3;3M"),
             other => panic!("{other:?}"),
@@ -428,7 +497,7 @@ mod tests {
         let mut e = ev(MouseEventKind::Down(MouseButton::Right), 5, 5);
         e.modifiers = KeyModifiers::CONTROL; // +16, right button = 2 → 18
         // pane at (0,0): inner origin (1,1), so screen (5,5) → inner cell (5,5)
-        match route_mouse(MouseProto::Sgr, &pane, &e) {
+        match route_mouse(sgr(), &pane, &e) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<18;5;5M"),
             other => panic!("{other:?}"),
         }
@@ -444,7 +513,7 @@ mod tests {
         // the SGR range is 1..=38 by 1..=18.
         let pane = pr(1, 10, 5, 40, 20, false);
         let fwd = |col, row| match route_mouse(
-            MouseProto::Sgr,
+            sgr(),
             &pane,
             &ev(MouseEventKind::Drag(MouseButton::Left), col, row),
         ) {
@@ -466,17 +535,69 @@ mod tests {
     #[test]
     fn a_pane_with_no_inner_area_still_clamps_to_cell_one() {
         let pane = pr(1, 0, 0, 1, 1, false);
-        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::ScrollUp, 9, 9)) {
+        match route_mouse(sgr(), &pane, &ev(MouseEventKind::ScrollUp, 9, 9)) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<64;1;1M"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// P9: the wheel over `man`/`less` — alternate screen, no mouse protocol.
+    /// Scrolling roost's own buffer there is a guaranteed no-op (that grid has
+    /// scrollback capacity 0), so the tick reaches the app as arrow keys.
+    #[test]
+    fn the_wheel_over_an_alternate_screen_app_becomes_arrow_keys() {
+        let pane = pr(1, 0, 1, 50, 29, false);
+        assert_eq!(
+            route_mouse(pager(false), &pane, &ev(MouseEventKind::ScrollDown, 5, 5)),
+            MouseAction::Forward(b"\x1b[B\x1b[B\x1b[B".to_vec())
+        );
+        assert_eq!(
+            route_mouse(pager(false), &pane, &ev(MouseEventKind::ScrollUp, 5, 5)),
+            MouseAction::Forward(b"\x1b[A\x1b[A\x1b[A".to_vec())
+        );
+        // A pager driven through `smkx` (DECCKM) listens for the SS3 forms —
+        // the same upgrade the keyboard path applies to a real arrow key.
+        assert_eq!(
+            route_mouse(pager(true), &pane, &ev(MouseEventKind::ScrollDown, 5, 5)),
+            MouseAction::Forward(b"\x1bOB\x1bOB\x1bOB".to_vec())
+        );
+        // One notch is worth the same three lines either side of the
+        // alternate screen.
+        assert_eq!(ALT_SCROLL_KEYS, WHEEL_LINES as usize);
+        // Clicks over such an app are still roost's (focus), as before.
+        assert_eq!(
+            route_mouse(pager(false), &pane, &ev(MouseEventKind::Down(MouseButton::Left), 5, 5)),
+            MouseAction::None
+        );
+    }
+
+    /// The other two branches are unchanged by P9: a primary-screen app still
+    /// scrolls roost's scrollback, and an app that speaks SGR still gets the
+    /// encoded event verbatim — alternate screen or not, since asking for
+    /// mouse reporting means it wants the wheel itself.
+    #[test]
+    fn only_a_protocol_less_alternate_screen_pane_gets_arrow_keys() {
+        let pane = pr(1, 0, 1, 50, 29, false);
+        assert_eq!(
+            route_mouse(plain(), &pane, &ev(MouseEventKind::ScrollUp, 5, 5)),
+            MouseAction::Scroll(WHEEL_LINES),
+            "primary screen: roost's own scrollback, as always"
+        );
+        let sgr_pager = PaneMouseState { proto: MouseProto::Sgr, ..pager(true) };
+        assert_eq!(
+            route_mouse(sgr_pager, &pane, &ev(MouseEventKind::ScrollUp, 5, 5)),
+            // Pane at (0, 1) ⇒ inner origin (1, 2), so screen (5, 5) is the
+            // inner cell (5, 4) — the encoding is untouched by P9.
+            MouseAction::Forward(b"\x1b[<64;5;4M".to_vec()),
+            "an app that asked for the wheel gets the wheel"
+        );
     }
 
     #[test]
     fn collapsed_bars_forward_nothing() {
         let pane = pr(1, 0, 1, 50, 1, true);
         assert_eq!(
-            route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::ScrollUp, 5, 1)),
+            route_mouse(sgr(), &pane, &ev(MouseEventKind::ScrollUp, 5, 1)),
             MouseAction::None
         );
     }
