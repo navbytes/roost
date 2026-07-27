@@ -99,14 +99,17 @@ fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
     }
 
     // Outbound: roost publishes the focused pane's name as the host
-    // terminal's own title. `wait_for_host_bytes` rather than a one-shot
-    // read: the update is throttled, so it may lag the badge by a tick.
+    // terminal's own title, led by the pane id exactly like the badge — a
+    // window title reading only `shell · cwd` cannot say which of a
+    // project's identically-named panes is focused. `wait_for_host_bytes`
+    // rather than a one-shot read: the update is throttled, so it may lag
+    // the badge by a tick.
     let published = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
-        contains(b, "\x1b]2;roost · TASK-X\x07".as_bytes())
+        contains(b, "\x1b]2;roost · 1 TASK-X\x07".as_bytes())
     });
     assert!(
         published,
-        "roost never published `roost · TASK-X` as the host title; tail:\n{}",
+        "roost never published `roost · 1 TASK-X` as the host title; tail:\n{}",
         String::from_utf8_lossy(&tail(&h.host_bytes(), 400))
     );
 

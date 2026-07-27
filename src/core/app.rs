@@ -1633,12 +1633,18 @@ impl<B: PaneBackend> App<B> {
         std::mem::take(&mut self.host_out)
     }
 
-    /// P6: keep the host terminal's title at `roost · {focused pane}`. Queues
-    /// an OSC 2 only when the text actually changes, and no more often than
-    /// `HOST_TITLE_INTERVAL` — an agent that republishes its OSC title on
+    /// P6: keep the host terminal's title at `roost · {id} {focused pane}`.
+    /// Queues an OSC 2 only when the text actually changes, and no more often
+    /// than `HOST_TITLE_INTERVAL` — an agent that republishes its OSC title on
     /// every spinner frame would otherwise repaint the host title bar ~30x a
     /// second. A change skipped by the throttle is picked up on the next
     /// call, since the comparison is against what was last *published*.
+    ///
+    /// The pane id leads the name, exactly as it does on the badge and in
+    /// collapsed rows (C4/C8): a fleet of untitled panes in one project all
+    /// render the same `shell · {cwd-tag}`, so without the id the window
+    /// title cannot say *which* of them is focused — and the id is the join
+    /// key to `roost send <id>` besides. `feed_label` builds the same pair.
     fn sync_host_title(&mut self) {
         if self.last_host_title.is_some_and(|t| t.elapsed() < HOST_TITLE_INTERVAL) {
             return;
@@ -1646,7 +1652,7 @@ impl<B: PaneBackend> App<B> {
         // `display_name` is already sanitized and bounded (`live_title`), and
         // an Alt+r title comes from roost's own rename buffer — so nothing
         // here can carry a control byte into the sequence.
-        let want = format!("roost · {}", self.display_name(self.focused));
+        let want = format!("roost · {}", self.feed_label(self.focused));
         if want == self.host_title {
             return;
         }
@@ -6498,35 +6504,34 @@ mod tests {
     }
 
     /// P6: the host terminal's title follows the focused pane — published
-    /// once per change, through the same queue as every other host write.
+    /// once per change, through the same queue as every other host write,
+    /// and led by the pane id exactly like the badge.
     #[test]
     fn host_title_follows_focus_and_live_title() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1 | 2, focus 2
 
-        let want = format!("\x1b]2;roost · {}\x07", app.display_name(2));
+        let want = format!("\x1b]2;roost · {}\x07", app.feed_label(2));
         assert!(host_contains(&mut app, want.as_bytes()), "first frame publishes a title");
         // Unchanged ⇒ nothing republished (the throttle's companion rule).
         app.last_host_title = None;
         assert!(!host_contains(&mut app, b"\x1b]2;"));
 
-        // A focus move renames the host window. (Both fixture panes are
-        // `shell · tmp`, so give the target a name of its own first —
-        // otherwise the title genuinely doesn't change and republishing
-        // would be the bug.)
-        app.find_spec_mut(1).unwrap().title = Some("TASK-7".into());
+        // The id is what makes the title usable: both fixture panes are
+        // `shell · tmp`, so a name alone could not say which is focused —
+        // and a focus move between them would publish nothing at all.
         app.focused = 1;
         app.last_host_title = None;
         assert!(
-            host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 TASK-7\x07"),
-            "focus change republishes"
+            host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 1 shell \xc2\xb7 tmp\x07"),
+            "a focus move between same-named panes still renames the window"
         );
 
         // A rename of the focused pane takes the same path — as does a live
         // OSC title, since both resolve through `display_name`.
         app.find_spec_mut(1).unwrap().title = Some("TASK-8".into());
         app.last_host_title = None;
-        assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 TASK-8\x07"));
+        assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 1 TASK-8\x07"));
     }
 
     /// P6: the throttle — an agent republishing its OSC title on every
@@ -6543,7 +6548,7 @@ mod tests {
         app.last_host_title = Some(Instant::now() - HOST_TITLE_INTERVAL - Duration::from_millis(1));
         app.find_spec_mut(app.focused).unwrap().title = Some("second".into());
         // The skipped "first" is not replayed; the *current* name is.
-        assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 second\x07"));
+        assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 1 second\x07"));
     }
 
     /// P7: only the focused pane's DECSCUSR shape is ever mirrored, so

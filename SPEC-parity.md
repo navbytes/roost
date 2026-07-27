@@ -184,7 +184,7 @@ the live rung: a shell's title is `PS1` chrome (`user@host: /path`) that
 restates the cwd tag and crowds the badge, whereas P6's value is agent CLIs
 publishing task status. A hand-launched agent loses nothing — `observe_panes`
 promotes a shell pane's adapter to `pi`/`claude` when it sees the agent
-running, and demotes when it exits. roost also publishes `OSC 2 ; roost · {focused pane}` to
+running, and demotes when it exits. roost also publishes `OSC 2 ; roost · {id} {focused pane}` to
 the host terminal on focus/title changes (throttled to 200 ms) and resets it
 to a plain `roost` on exit and in the panic hook. DESIGN-ui C4 and SPEC-ux U2
 amended 2026-07-27. e2e `tests/pane_titles.rs`: a pane's `OSC 2 ; TASK-X`
