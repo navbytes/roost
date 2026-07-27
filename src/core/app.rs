@@ -1820,7 +1820,14 @@ impl<B: PaneBackend> App<B> {
                 self.mode = Mode::Rename { buffer: current, target: RenameTarget::Tab };
             }
             Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
-            Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
+            Action::ScrollMode => {
+                // U9: seed from the pane's CURRENT view offset — entering
+                // Scroll mode after wheeling continues from the wheeled
+                // position; a zero seed made the first keypress snap the
+                // view from there back toward the live tail.
+                let offset = self.scroll_offset(self.focused);
+                self.mode = Mode::Scroll { offset };
+            }
             Action::CopyMode => {
                 // C24: cursor starts bottom-left of the focused pane's inner
                 // grid (C22 rule 1: targets the float like any pane when
@@ -2359,7 +2366,16 @@ impl<B: PaneBackend> App<B> {
                 self.mode = Mode::Normal;
                 return true;
             }
-            if matches!(self.mode, Mode::Scroll { .. }) {
+            // U9: Alt+c is exempt from the snap below — Scroll→Copy hands
+            // the frozen view over intact, because scroll→select→yank is
+            // THE keyboard path for copying history (the wheel→Alt+c route
+            // already preserved the view; the keyboard route snapped to the
+            // live tail at the handoff, so history could never be yanked by
+            // keyboard). Same special-case shape as Alt+e above; the chord
+            // still falls through to the global binding, which enters Copy.
+            let scroll_to_copy =
+                matches!(self.mode, Mode::Scroll { .. }) && key.code == KeyCode::Char('c');
+            if matches!(self.mode, Mode::Scroll { .. }) && !scroll_to_copy {
                 let focused = self.focused;
                 if let Some(rt) = self.runtimes.get_mut(&focused) {
                     rt.set_scrollback(0);
@@ -2435,20 +2451,32 @@ impl<B: PaneBackend> App<B> {
             }
             Mode::Scroll { offset } => {
                 let page = (self.term_size.height / 2).max(1) as usize;
+                let focused = self.focused;
+                // U9: base the arithmetic on the view's CURRENT offset (the
+                // grid auto-advances it as new lines bank while scrolled),
+                // and after every write read the grid-clamped value back —
+                // the mode offset is a mirror of the view, never an
+                // independent counter free to overshoot into a phantom
+                // (~240 banked Down presses before the screen moved).
+                let cur = self
+                    .runtimes
+                    .get(&focused)
+                    .map(|rt| rt.scroll_offset())
+                    .unwrap_or(*offset);
                 let new_offset = match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => Some(*offset + 1),
-                    KeyCode::Down | KeyCode::Char('j') => Some(offset.saturating_sub(1)),
-                    KeyCode::PageUp => Some(*offset + page),
-                    KeyCode::PageDown => Some(offset.saturating_sub(page)),
+                    KeyCode::Up | KeyCode::Char('k') => Some(cur + 1),
+                    KeyCode::Down | KeyCode::Char('j') => Some(cur.saturating_sub(1)),
+                    KeyCode::PageUp => Some(cur + page),
+                    KeyCode::PageDown => Some(cur.saturating_sub(page)),
                     KeyCode::Esc | KeyCode::Char('q') => None,
                     _ => return true,
                 };
-                let focused = self.focused;
                 match new_offset {
                     Some(n) => {
                         *offset = n;
                         if let Some(rt) = self.runtimes.get_mut(&focused) {
                             rt.set_scrollback(n);
+                            *offset = rt.scroll_offset();
                         }
                     }
                     None => {
@@ -2513,6 +2541,23 @@ impl<B: PaneBackend> App<B> {
                             self.pending_yank = self.finish_selection();
                         } else {
                             self.set_flash("nothing selected");
+                        }
+                    }
+                    // U9: page the VIEW by the pane's inner height (grid-
+                    // clamped) — history is now reachable while selecting.
+                    // The cursor and selection stay in visible-grid cell
+                    // space and extraction still reads the visible grid
+                    // (C24's what-you-see-is-what-yanks limit stands).
+                    KeyCode::PageUp | KeyCode::PageDown => {
+                        let focused = self.focused;
+                        let view_page = copy_h.max(1) as usize;
+                        if let Some(rt) = self.runtimes.get_mut(&focused) {
+                            let cur = rt.scroll_offset();
+                            let want = match key.code {
+                                KeyCode::PageUp => cur + view_page,
+                                _ => cur.saturating_sub(view_page),
+                            };
+                            rt.set_scrollback(want);
                         }
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
@@ -2929,6 +2974,91 @@ mod tests {
         assert_eq!(app.flash(), None);
         app.set_flash("copied 3 chars");
         assert_eq!(app.flash.as_ref().unwrap().2, FLASH_WINDOW);
+    }
+
+    #[test]
+    fn scroll_mode_offset_clamps_to_banked_history_no_overshoot() {
+        // U9 (overshoot): paging past the top of history must clamp BOTH
+        // the view and the mode's mirrored offset — one Down after that
+        // moves the view immediately, instead of burning ~240 presses
+        // against a phantom counter.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().scroll_total = 10;
+        app.apply(Action::ScrollMode);
+        // term height 30 ⇒ page 15; two PageUps ask for 30, history has 10.
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 10);
+        let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
+        assert_eq!(offset, 10, "mode offset mirrors the clamp, not the ask");
+        // One Down moves the view immediately.
+        app.handle_mode_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 9);
+        let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
+        assert_eq!(offset, 9);
+    }
+
+    #[test]
+    fn entering_scroll_mode_seeds_from_the_wheeled_offset() {
+        // U9 (wheel/keys desync): Scroll mode continues from the wheeled
+        // position — the first Up goes one line FURTHER back, instead of
+        // snapping the view from the wheeled offset to 1.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.wheel_scroll(id, 24);
+        app.apply(Action::ScrollMode);
+        let Mode::Scroll { offset } = app.mode else { panic!("scroll mode") };
+        assert_eq!(offset, 24, "seeded from the pane's current view offset");
+        app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 25);
+    }
+
+    #[test]
+    fn alt_c_from_scroll_mode_preserves_the_scrolled_view() {
+        // U9 (scroll→copy snap): the Alt-chord snap exempts the copy
+        // transition, so scroll→select→yank works on history — the view a
+        // wheel→Alt+c handoff always kept now survives the keyboard route
+        // too. (Any other Alt chord still snaps: pinned by
+        // `scrolling_then_a_global_chord_snaps_the_pane_back_to_live`.)
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.wheel_scroll(id, 5);
+        app.apply(Action::ScrollMode);
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert!(!consumed, "Alt+c falls through to the global CopyMode binding");
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 5, "no snap at the handoff");
+        app.apply(Action::CopyMode); // what the fallthrough dispatches
+        assert!(matches!(app.mode, Mode::Copy { .. }));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 5, "copy opens on the frozen view");
+    }
+
+    #[test]
+    fn copy_mode_pages_the_view_by_pane_height_and_clamps() {
+        // U9: PgUp/PgDn in copy mode walk the view through history by the
+        // pane's inner height, clamped to what's banked; motions/selection
+        // stay in visible-grid cell space (C24).
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let (rows, _) = inner_dims(app.rects()[0].rect);
+        let page = rows as usize;
+        app.runtimes.get_mut(&id).unwrap().scroll_total = page + 5;
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback as usize, page);
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(
+            app.runtimes.get(&id).unwrap().scrollback as usize,
+            page + 5,
+            "second page clamps to the banked history"
+        );
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback as usize, 5);
+        assert!(matches!(app.mode, Mode::Copy { .. }), "paging never leaves copy mode");
     }
 
     #[test]

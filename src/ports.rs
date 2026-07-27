@@ -262,11 +262,15 @@ pub mod fakes {
         fn screen(&self) -> Option<&vt100::Screen> {
             None
         }
+        /// U9: models the real backend's clamp-and-read-back — the stored
+        /// offset is what the "grid" (`scroll_total` banked rows) accepted,
+        /// never the caller's unclamped ask.
         fn set_scrollback(&mut self, lines: usize) {
-            self.scrollback = lines as i64;
+            self.scrollback = lines.min(self.scroll_total) as i64;
         }
         fn scroll_by(&mut self, delta: i32) {
-            self.scrollback = (self.scrollback + delta as i64).max(0);
+            let want = (self.scrollback + delta as i64).max(0) as usize;
+            self.scrollback = want.min(self.scroll_total) as i64;
         }
         /// Like the real grid, the reported view offset never exceeds the
         /// banked history (`scroll_total`), whatever a caller stored.

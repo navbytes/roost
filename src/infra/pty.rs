@@ -254,14 +254,24 @@ impl PaneBackend for PtyPane {
     }
 
     fn set_scrollback(&mut self, lines: usize) {
-        self.scroll = lines;
         self.parser.set_scrollback(lines);
+        // U9: mirror the grid-clamped value back, never the caller's ask —
+        // a stored offset past the banked history is a phantom the view
+        // ignores, which is exactly what burned ~240 keypresses of
+        // overshoot before the screen moved.
+        self.scroll = self.parser.screen().scrollback();
     }
 
     fn scroll_by(&mut self, delta: i32) {
-        self.scroll =
-            (self.scroll as i64 + delta as i64).clamp(0, SCROLLBACK_LINES as i64) as usize;
-        self.parser.set_scrollback(self.scroll);
+        // U9: base the arithmetic on the grid's CURRENT offset, not the
+        // last value we stored — while scrolled, the grid auto-advances
+        // the offset as new lines bank (the view stays pinned on content),
+        // so a stale base would yank the view toward the tail on the next
+        // wheel click. Then read the clamp back, same as set_scrollback.
+        let cur = self.parser.screen().scrollback() as i64;
+        let want = (cur + i64::from(delta)).max(0) as usize;
+        self.parser.set_scrollback(want);
+        self.scroll = self.parser.screen().scrollback();
     }
 
     /// The grid-clamped offset, NOT `self.scroll`: the roost-side counter

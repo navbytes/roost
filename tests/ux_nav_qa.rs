@@ -424,8 +424,8 @@ fn ux_navigation_session() {
     }
     settle(&mut h);
     let wheeled = h.screen().contents();
-    h.write_bytes(b"\x1b[5;3~"); // scroll mode (offset: 0 while view is at 24)
-    h.write_bytes(b"\x1b[A"); // Up -> sets view to offset 1
+    h.write_bytes(b"\x1b[5;3~"); // scroll mode (U9: seeds from the wheeled offset)
+    h.write_bytes(b"\x1b[A"); // Up -> one line further back, not a snap to 1
     settle(&mut h);
     let after_key = h.screen().contents();
     qa.check(

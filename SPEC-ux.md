@@ -109,7 +109,7 @@ scrolls the pane under the overlay (no feed gate in `handle_mouse`).
 overlay, clicks hit overlay rows or dismiss, never mutate focus/tabs beneath;
 paste: routes to the text field if one exists, else is swallowed.
 
-### U9 · Med · VERIFIED — scrollback is keyboard-hostile
+### U9 · Med · FIXED (this branch) — scrollback is keyboard-hostile
 Three connected live confirmations:
 - **Overshoot:** Scroll-mode offset is unclamped while the view clamps — after
   paging past the top, ~240 Down presses were burned before the view moved.
@@ -122,6 +122,13 @@ Three connected live confirmations:
 value back into both the runtime and the mode offset; Scroll-mode entry seeds
 `offset` from the pane's current offset; Scroll→Copy preserves the view; copy
 mode gains PgUp/PgDn view paging (and the wheel while selecting).
+**Fixed:** every `set_scrollback`/`scroll_by` reads the grid clamp back (and
+bases arithmetic on the view's current offset); Scroll-mode entry seeds from
+the pane's offset and every keypress mirrors the clamp into the mode offset;
+Alt+c is exempted from the Alt-chord snap so Scroll→Copy keeps the frozen
+view; copy mode pages the view with PgUp/PgDn by pane height (C24 amended
+2026-07-27). The wheel-while-selecting half of the proposal is not in this
+wave (mouse-path routing in copy mode is untouched).
 
 ### U10 · Med · VERIFIED — dead-pane `f` destroys the session, bare
 Live QA: `f` on a dead pane respawned fresh instantly — a single unshifted key,

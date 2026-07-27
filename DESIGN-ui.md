@@ -848,6 +848,14 @@ reading order).
   limit, shared with the mouse path and documented: the **visible grid
   only** — no scrollback paging inside copy mode (deliberately left out;
   Scroll mode remains a separate concern).
+  **[Amended 2026-07-27, SPEC-ux U9]:** "no scrollback paging" is
+  superseded — `PgUp`/`PgDn` in copy mode page the **view** by the pane's
+  inner height (grid-clamped), and Alt+c from Scroll mode hands the frozen
+  view over intact (the Alt-chord snap exempts exactly the copy
+  transition), so history can be yanked by keyboard. The visible-grid
+  extraction limit itself **stands**: cursor and selection live in visible
+  cell space, and yanking grabs what is on screen at yank time — paging
+  moves the paper under them, what you see is what yanks.
 - **Mouse drag still works in copy mode** and simply replaces the keyboard
   selection (both write `app.selection`); a drag also moves the cursor to
   the drag point, so the two methods interleave without surprises.
@@ -1122,8 +1130,9 @@ not a benchmark suite.
   persistence / feed filtering / feed search (200-entry ring is the whole
   product, C20) · sub-2 s status-transition granularity in the feed (single
   tick-diff source beats double-reporting, C20) · per-tab zoom flags (one
-  app-level bool, C21) · copy-mode scrollback paging (visible grid only,
-  same as the mouse path, C24) · layout-cycle undo (C25) · a close-whole-tab
+  app-level bool, C21) · ~~copy-mode scrollback paging~~ [superseded
+  2026-07-27 by SPEC-ux U9 — PgUp/PgDn view paging shipped, C24 amendment;
+  the visible-grid *extraction* limit stands] · layout-cycle undo (C25) · a close-whole-tab
   gesture (C26 — tabs die by last-pane close only) · a TUI broadcast key
   (fat-finger safety — CLI only, per brief; grammar lives in PLAN F2) ·
   configurable keys for any of the above (zero-config stands).
