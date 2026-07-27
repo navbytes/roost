@@ -1469,6 +1469,30 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// Forward a host paste to the focused pane. A pane whose app switched on
+    /// bracketed paste (mode 2004) gets the text wrapped in the
+    /// `ESC[200~`/`ESC[201~` guards it asked for — that's what lets zsh/vim/
+    /// agent TUIs insert pasted newlines instead of executing them line by
+    /// line. Any guard sequence *inside* the pasted text is stripped first:
+    /// left alone, an embedded `ESC[201~` would end the bracket early and the
+    /// remainder would be interpreted as typed input (paste injection — tmux
+    /// strips these too). A pane without the mode gets the bytes verbatim,
+    /// exactly like a terminal with bracketed paste off.
+    pub fn forward_paste(&mut self, text: &str) {
+        let id = self.focused;
+        let Some(rt) = self.runtimes.get_mut(&id) else { return };
+        if rt.bracketed_paste() {
+            let clean = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+            let mut bytes = Vec::with_capacity(clean.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(clean.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            rt.write_input(&bytes);
+        } else {
+            rt.write_input(text.as_bytes());
+        }
+    }
+
     pub fn on_resize(&mut self, size: Size) {
         self.term_size = size;
         self.relayout();
@@ -3473,6 +3497,28 @@ mod tests {
         // The real death still lands: PTY EOF is the one true exit signal.
         app.on_pty_exit(id);
         assert!(app.focused_dead());
+    }
+
+    /// Host pastes: a pane whose app enabled bracketed paste (mode 2004)
+    /// gets the guards it asked for — with any guard embedded in the pasted
+    /// text stripped, so a hostile paste can't end the bracket early and
+    /// have its remainder land as typed keystrokes (paste injection). A pane
+    /// without the mode gets the bytes verbatim.
+    #[test]
+    fn paste_is_guarded_only_for_bracketed_panes_and_embedded_guards_strip() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.forward_paste("a\nb");
+        assert_eq!(app.runtimes.get(&id).unwrap().input, b"a\nb");
+
+        app.runtimes.get_mut(&id).unwrap().input.clear();
+        app.runtimes.get_mut(&id).unwrap().bracketed = true;
+        app.forward_paste("a\nb");
+        assert_eq!(app.runtimes.get(&id).unwrap().input, b"\x1b[200~a\nb\x1b[201~");
+
+        app.runtimes.get_mut(&id).unwrap().input.clear();
+        app.forward_paste("x\x1b[201~evil\r");
+        assert_eq!(app.runtimes.get(&id).unwrap().input, b"\x1b[200~xevil\r\x1b[201~");
     }
 
     #[test]

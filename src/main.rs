@@ -17,8 +17,9 @@ mod ui;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use std::sync::mpsc;
@@ -61,6 +62,13 @@ fn main() -> Result<()> {
     // Without mouse capture the hosting terminal consumes wheel events and
     // scrolls its own buffer — content *outside* the TUI. Capture them.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // Ask the host terminal to wrap pastes in the 200~/201~ guards so a paste
+    // arrives as one Event::Paste instead of a keystroke flood — without
+    // this, every newline in pasted text lands as a pressed Enter (a
+    // multi-line prompt pasted into an agent pane submits line by line).
+    // The guards are re-applied per pane in `App::forward_paste`, but only
+    // for panes whose app actually switched mode 2004 on.
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     // Negotiate the enhanced (kitty) keyboard protocol so Shift+Enter and
     // Ctrl+Enter arrive as distinct key events — a bare terminal collapses
     // both to a plain CR, making "newline vs submit" impossible to tell apart.
@@ -77,7 +85,7 @@ fn main() -> Result<()> {
     if kbd_enhanced {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -111,6 +119,7 @@ fn install_panic_hook() {
         let _ = execute!(
             std::io::stdout(),
             PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
             DisableMouseCapture
         );
         ratatui::restore();
@@ -191,7 +200,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                     Event::Mouse(me) => handle_mouse(&mut app, me),
                     // Coalesce: act on the true size once, after draining.
                     Event::Resize(..) => resized = true,
-                    Event::Paste(s) => app.forward_bytes(s.as_bytes()),
+                    Event::Paste(s) => app.forward_paste(&s),
                     _ => {}
                 }
                 if !crossterm::event::poll(Duration::ZERO)? {
