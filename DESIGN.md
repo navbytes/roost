@@ -157,7 +157,9 @@ Ground truth from pi's docs:
 | `agent_start` | status = **Working** |
 | `agent_end` | status = **Waiting** (agent finished a turn; ball is in your court) |
 | `tool_call` on user-facing asks / `ctx.ui.confirm` flows | status = **Needs input** |
-| `session_shutdown` | status = **Exited** |
+| `session_shutdown` | close the socket; no status report |
+
+`session_shutdown` deliberately reports nothing: **Exited** has exactly one ground truth — the pane's PTY hitting EOF when its child dies. The extension also runs in *nested* pi processes (a subagent, a one-shot `pi -p` tool call, a pi launched inside a `shell` pane — all inherit `ROOST_PANE`/`ROOST_TOKEN`), so a shutdown report would falsely mark the pane exited whenever a nested pi merely finished its work. Roost demotes any "exited" a stale extension still sends to **Waiting** for the same reason.
 
 Transport: the extension writes newline-delimited JSON to a unix socket roost owns (`$XDG_RUNTIME_DIR/roost.sock`), identified by pane via a `ROOST_PANE` env var roost sets when spawning the PTY. If the socket is absent (pi run outside roost), the extension no-ops instantly — zero cost.
 

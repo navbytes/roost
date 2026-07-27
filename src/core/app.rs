@@ -2877,7 +2877,7 @@ mod tests {
         // lingers with AgentStatus::Exited (see on_pty_exit); still present
         // in `runtimes`, so a naive "present ⇒ running" check would wrongly
         // include it.
-        app.runtimes.get_mut(&exited).unwrap().set_extension_status(AgentStatus::Exited);
+        app.on_pty_exit(exited);
         // Lazy, never-spawned pane: spec present, no runtime at all — same
         // idiom as tab_summary_unknown_for_unspawned_needs_input_wins.
         app.runtimes.remove(&never_spawned);
@@ -3440,6 +3440,31 @@ mod tests {
         assert!(app.on_status(1, AgentStatus::NeedsInput).is_some());
         // ...but still never for the focused pane.
         assert!(app.on_status(2, AgentStatus::NeedsInput).is_none());
+    }
+
+    /// Regression: a descendant pi (a subagent, a one-shot `pi -p` tool
+    /// call, a pi run by hand inside a shell pane) inherits the pane's
+    /// ROOST_* env, so the moment it finishes its work and exits, its
+    /// extension reports session_shutdown → "exited" *as this pane* over
+    /// the socket — while the pane's real child is alive. That report must
+    /// not brick the pane: no dead-pane keyboard interception (Enter there
+    /// kills the live agent to "relaunch" it), no exit notification, and
+    /// the next real signal recovers the badge. Only the PTY EOF is death.
+    #[test]
+    fn socket_exited_from_a_nested_agent_does_not_kill_a_live_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.on_status(id, AgentStatus::Working);
+        // The nested pi finishes its work: session_shutdown → "exited".
+        assert!(app.on_status(id, AgentStatus::Exited).is_none());
+        assert!(!app.focused_dead(), "socket 'exited' must not enter the dead-pane key path");
+        assert_eq!(app.runtimes.get(&id).unwrap().status(), AgentStatus::Waiting);
+        // The pane's own agent keeps going — status recovers, nothing sticky.
+        app.on_status(id, AgentStatus::Working);
+        assert_eq!(app.runtimes.get(&id).unwrap().status(), AgentStatus::Working);
+        // The real death still lands: PTY EOF is the one true exit signal.
+        app.on_pty_exit(id);
+        assert!(app.focused_dead());
     }
 
     #[test]
@@ -4303,7 +4328,7 @@ mod tests {
         assert_eq!(app.feed().iter().filter(|e| e.text.contains('→')).count(), 1);
 
         // A transition *to* Exited is suppressed — the exit hook owns it.
-        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Exited);
+        app.on_pty_exit(id);
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
         app.tick();
         assert_eq!(
