@@ -37,7 +37,9 @@ bug). Severity is impact for a user supervising AI-agent panes.
 - **W4 · Input gating** — P12, P13. Two guards in `translate`; P13's fix is
   the same change as SPEC-ux U5 (meta-ESC fallthrough via `encode_raw`).
 - **W5 · Scroll/zoom state truth** — P5, P9, P14 (folds into/amends SPEC-ux
-  U9), P7's scrolled-cursor facet (belongs with U3/N1).
+  U9), P7's scrolled-cursor facet (belongs with U3/N1). **P5 shipped** — the
+  live grid reflows on resize (scrollback keeps its historical width, the
+  alternate screen never reflows); amends DESIGN-ui C21 (2026-07-27).
 - **W6 · Width & styling fidelity** — P15, P16, P17, P19 (+ SPEC-ux U24 as one
   bundle: unify unicode-width, fix continuation cells in blit *and*
   extraction, add missing SGR/REP arms). **Shipped** — all five FIXED; amends
@@ -158,7 +160,25 @@ stream-order requirement, what to deliberately NOT answer, pixel-geometry
 plumbing, and the client-side startup fix — is in **Appendix B**. This is
 implementation-ready.
 
-### P5 · CONFIRMED · High (destructive) — no reflow; a zoom round-trip truncates the grid
+### P5 · FIXED (this branch) · High (destructive) — no reflow; a zoom round-trip truncates the grid
+*Fixed by option (a), scoped to the live grid: `Grid::set_size_reflowing`
+rebuilds the logical lines from the rows' wrap flags and lays them out again
+at the new width — narrowing wraps, widening rejoins, cells copied whole so
+colors/bold survive, a 2-column glyph that doesn't fit moving down whole, and
+the cursor mapped to the same logical character (clamped into the grid if the
+rewrap pushed it out). Rows a narrowing pushes off the top bank into the
+scrollback like ordinary scrolling, but only after the screen's own blank
+rows below the cursor are spent — so the common case banks nothing and the
+round-trip is exactly lossless. **Scrollback rows keep their historical
+width** (no history rewrap): the same veneer-vs-second-state split P1's
+snapshot draws, and the documented price of not opening the full-history
+problem. The **alternate grid never reflows** (nor does a grid with a scroll
+region set) — those apps repaint on SIGWINCH. `PtyPane::resize` re-reads the
+grid's scroll clamp so U3's `↑N` stays truthful. U19's `row_wrapped` now
+survives resizes too. DESIGN-ui C21 amended 2026-07-27. e2e
+`tests/pane_reflow.rs`: before, `roost read --tail` after unzoom showed
+`Q7HEAD` + 52 columns and no `Q7TAIL` at all; after, the line wraps intact and
+re-zooming rejoins it onto one row.*
 `Grid::set_size` hard-truncates rows in place and clears wrap flags; zoom
 deliberately resizes the pane's PTY to full-body and back.
 **Measured:** a 110-char line printed *while zoomed* (118 cols) lost its tail

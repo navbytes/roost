@@ -465,6 +465,13 @@ impl PaneBackend for PtyPane {
             pixel_height: pixels.1,
         });
         self.parser.set_size(rows, cols);
+        // U3/U9 × P5: a resize reflows the live grid, which can bank rows the
+        // rewrap pushed off the top — so the view's offset moves with them.
+        // Read the grid's clamp back rather than keeping the pre-resize
+        // number, exactly as `set_scrollback`/`scroll_by` do: the `↑N` badge
+        // and the scroll-mode hint are built on this value and must describe
+        // the view, never a stale one.
+        self.scroll = self.parser.screen().scrollback();
     }
 
     fn hangup(&mut self) {

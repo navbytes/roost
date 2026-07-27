@@ -1003,6 +1003,31 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
   trigger clears the flag; focus-move-under-zoom retargets the display list;
   PTY resize targets.
 
+**[Amended 2026-07-27, SPEC-parity P5 — the round trip is lossless]** Zoom
+resizing the pane's PTY both ways is only safe because the resize itself now
+preserves the grid: the vendored parser **reflows the live grid** on a size
+change, rebuilding the logical lines from the rows' wrap flags and laying
+them out again at the new width (narrowing wraps, widening rejoins,
+attributes and wide glyphs carried whole). Before, unzooming hard-truncated
+every column past the tiled width — a 110-column line printed at 118 lost its
+tail permanently, and pre-zoom wrapped lines never rejoined. Two limits are
+deliberate and contracted:
+- **Scrollback keeps its historical width.** Only the live grid rewraps;
+  rows already banked stay as they were banked, and rows a narrowing pushes
+  off the top are banked at the new width (so history can be mixed-width
+  after a round-trip). Same veneer-vs-second-state split C4's P1 snapshot
+  draws — it buys the lossless round-trip without a full history rewrap. A
+  narrowing spends the screen's own blank rows first, so the common case
+  (a shell with room below the prompt) banks nothing at all.
+- **The alternate screen is never reflowed**, nor is a grid with a scroll
+  region set: those applications own their canvas and repaint on SIGWINCH, so
+  a rewrap would only fight the redraw already on its way.
+"No reflow churn while reading" above is unchanged and means what it always
+did — hidden panes are not resized at all while zoomed, so nothing rewraps
+behind the zoomed view. C4's `↑N` token and C9's `↑N/M` stay honest across a
+resize: the offset is re-read from the grid's own clamp afterwards, never
+carried over.
+
 ### C22 — Floating scratch pane (Alt+f) — [Added 2026-07-22, fleet features]
 
 **Current:** no floating anything. All panes live in a tab's layout tree;

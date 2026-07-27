@@ -79,6 +79,44 @@ impl Row {
         self.wrapped = wrap;
     }
 
+    /// roost (SPEC-parity P5): a row built from cells a reflow has already
+    /// laid out, padded to `cols` with blanks. `wrapped` says whether the
+    /// logical line continues on the row below — the flag the whole rewrap
+    /// turns on, and the reason this can't go through `resize` (which clears
+    /// it).
+    pub fn from_cells(
+        mut cells: Vec<crate::cell::Cell>,
+        cols: u16,
+        wrapped: bool,
+    ) -> Self {
+        cells.resize(usize::from(cols), crate::cell::Cell::default());
+        Self { cells, wrapped }
+    }
+
+    /// roost (SPEC-parity P5): the row's cells up to and including the last
+    /// one with contents — the part a reflow treats as the line's text.
+    ///
+    /// Everything past it was never written (or has been erased), so it is
+    /// padding at the row's *current* width: carrying it into a rewrapped
+    /// logical line would turn every short line into a full-width block of
+    /// blanks. A deliberately printed space has contents and survives; an
+    /// untouched cell does not.
+    pub fn content_cells(&self) -> &[crate::cell::Cell] {
+        let end = self
+            .cells
+            .iter()
+            .rposition(crate::cell::Cell::has_contents)
+            .map_or(0, |i| i + 1);
+        &self.cells[..end]
+    }
+
+    /// roost (SPEC-parity P5): does this row hold nothing at all? A rewrap
+    /// that has to shed rows sheds these — from below the cursor — before it
+    /// banks anything into history.
+    pub fn is_blank(&self) -> bool {
+        self.cells.iter().all(|c| !c.has_contents())
+    }
+
     pub fn wrapped(&self) -> bool {
         self.wrapped
     }

@@ -204,8 +204,22 @@ impl Screen {
         }
     }
 
+    /// roost (SPEC-parity P5): the primary grid *reflows* — its logical lines
+    /// are rewrapped to the new width, in both directions, so nothing is lost
+    /// when a pane is resized (zoom deliberately resizes a pane's PTY to the
+    /// full body and back).
+    ///
+    /// The alternate grid deliberately does not. An alternate-screen
+    /// application owns every cell of its canvas and repaints it on SIGWINCH;
+    /// rewrapping underneath would fight the redraw it is already sending, and
+    /// no real terminal reflows there either. The rule is per grid, not per
+    /// mode: the primary grid holds the shell's output whether or not an
+    /// application is currently borrowing the screen, and it rewraps either
+    /// way — so what the shell sees on `?1049l` is the same content it would
+    /// have had if the app had never run.
     pub(crate) fn set_size(&mut self, rows: u16, cols: u16) {
-        self.grid.set_size(crate::grid::Size { rows, cols });
+        self.grid
+            .set_size_reflowing(crate::grid::Size { rows, cols });
         self.alternate_grid
             .set_size(crate::grid::Size { rows, cols });
     }
@@ -2756,5 +2770,239 @@ mod roost_tests {
 
         // Off the end of the grid answers false rather than panicking.
         assert!(!p.screen().row_wrapped(999));
+    }
+
+    // -- reflow (SPEC-parity P5) ------------------------------------------
+
+    /// The row texts currently on screen, trailing blanks trimmed, so a test
+    /// can assert exactly where a rewrapped line broke.
+    fn rows_of(s: &crate::Screen) -> Vec<String> {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .map(|mut r| {
+                while r.ends_with(' ') {
+                    r.pop();
+                }
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn narrowing_wraps_a_long_line_and_widening_rejoins_it() {
+        // P5's defect in miniature: a line printed at one width, then asked
+        // to live at another (zoom resizes a pane's PTY both ways). Before,
+        // `set_size` truncated the row in place and the tail was gone — from
+        // the screen, from `roost read`, from re-zooming.
+        let mut p = crate::Parser::new(6, 40, 100);
+        let line = "0123456789".repeat(3); // 30 columns
+        p.process(line.as_bytes());
+        assert_eq!(rows_of(p.screen())[0], line);
+
+        p.set_size(6, 20);
+        let rows = rows_of(p.screen());
+        assert_eq!(rows[0], "01234567890123456789", "the first 20 columns");
+        assert_eq!(rows[1], "0123456789", "the tail wrapped, it did not vanish");
+        assert!(p.screen().row_wrapped(0), "the break is a wrap, not a newline");
+        assert!(p.screen().contents().contains(&line), "no characters lost");
+
+        // ...and back. Widening rejoins what narrowing split.
+        p.set_size(6, 40);
+        let rows = rows_of(p.screen());
+        assert_eq!(rows[0], line, "the halves rejoined onto one row");
+        assert_eq!(rows[1], "", "and nothing was left behind on the second");
+        assert!(!p.screen().row_wrapped(0));
+    }
+
+    #[test]
+    fn a_rewrapped_line_keeps_its_attributes() {
+        // Reflow copies cells, not characters: a colored/bold run that
+        // rewraps onto the next row is still colored and bold there. A
+        // characters-only rewrap would repaint every log as plain text on
+        // each resize.
+        let mut p = crate::Parser::new(6, 40, 100);
+        p.process(b"\x1b[1;31m");
+        p.process("x".repeat(30).as_bytes());
+        p.process(b"\x1b[0m");
+
+        p.set_size(6, 20);
+        let tail = p.screen().cell(1, 0).expect("the wrapped tail is on row 1");
+        assert_eq!(tail.contents(), "x");
+        assert!(tail.bold(), "bold must survive the rewrap");
+        assert_eq!(tail.fgcolor(), crate::Color::Idx(1), "and so must the color");
+        // The rejoin carries them back the other way too.
+        p.set_size(6, 40);
+        let joined = p.screen().cell(0, 25).expect("all 30 columns are back on row 0");
+        assert!(joined.bold() && joined.fgcolor() == crate::Color::Idx(1));
+    }
+
+    #[test]
+    fn a_wide_glyph_at_the_wrap_boundary_moves_whole() {
+        // Half a glyph on each row isn't representable in the grid (and no
+        // real terminal does it): the row ends one column short instead.
+        let mut p = crate::Parser::new(4, 10, 100);
+        p.process("abc\u{65e5}\u{672c}\u{8a9e}".as_bytes()); // 3 + 3×2 columns
+
+        p.set_size(4, 4);
+        let s = p.screen();
+        assert_eq!(s.cell(0, 0).unwrap().contents(), "a");
+        assert_eq!(s.cell(0, 2).unwrap().contents(), "c");
+        let boundary = s.cell(0, 3).expect("the last column of the wrapped row");
+        assert!(
+            !boundary.has_contents() && !boundary.is_wide_continuation(),
+            "the 2-column glyph must not be split across the boundary, got {:?}",
+            boundary.contents()
+        );
+        assert_eq!(s.cell(1, 0).unwrap().contents(), "\u{65e5}", "it moved whole");
+        assert!(s.cell(1, 0).unwrap().is_wide());
+        assert!(s.cell(1, 1).unwrap().is_wide_continuation(), "with its own continuation");
+        assert_eq!(s.cell(1, 2).unwrap().contents(), "\u{672c}");
+        assert_eq!(s.cell(2, 0).unwrap().contents(), "\u{8a9e}");
+        assert!(p.screen().contents().contains("abc\u{65e5}\u{672c}\u{8a9e}"));
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_same_logical_character() {
+        // The cursor is a position in the *line*, not in the grid: after a
+        // rewrap it must still name the character it named before.
+        let mut p = crate::Parser::new(6, 40, 100);
+        p.process(b"abcdefghij\x1b[1;4H"); // park it on 'd' (row 1, col 4)
+        assert_eq!(p.screen().cursor_position(), (0, 3));
+        assert_eq!(p.screen().cell(0, 3).unwrap().contents(), "d");
+
+        p.set_size(6, 4); // rows become "abcd", "efgh", "ij"
+        let (row, col) = p.screen().cursor_position();
+        assert_eq!(p.screen().cell(row, col).unwrap().contents(), "d");
+        assert_eq!((row, col), (0, 3));
+
+        p.set_size(6, 6); // and again, to a width that splits differently
+        let (row, col) = p.screen().cursor_position();
+        assert_eq!(p.screen().cell(row, col).unwrap().contents(), "d");
+
+        // A cursor sitting past the end of the text keeps its distance from
+        // it — a shell prompt is exactly this case.
+        let mut p = crate::Parser::new(6, 40, 100);
+        p.process(b"$ ");
+        assert_eq!(p.screen().cursor_position(), (0, 2));
+        p.set_size(6, 20);
+        assert_eq!(p.screen().cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn the_alternate_screen_is_never_reflowed() {
+        // An alternate-screen app owns its canvas and repaints on SIGWINCH;
+        // rewrapping underneath would fight the redraw it is already sending.
+        let mut p = crate::Parser::new(6, 40, 100);
+        p.process(b"\x1b[?1049h"); // enter the alternate screen
+        p.process("0123456789".repeat(3).as_bytes());
+        assert!(p.screen().alternate_screen());
+
+        p.set_size(6, 20);
+        let rows = rows_of(p.screen());
+        assert_eq!(rows[0], "01234567890123456789", "truncated in place");
+        assert_eq!(rows[1], "", "no rewrap: nothing moved to the next row");
+        assert!(!p.screen().row_wrapped(0));
+    }
+
+    #[test]
+    fn the_primary_grid_reflows_even_while_an_app_borrows_the_screen() {
+        // The rule is per grid, not per mode: what the shell gets back on
+        // `?1049l` is the content it would have had if the app never ran.
+        let mut p = crate::Parser::new(6, 40, 100);
+        let line = "0123456789".repeat(3);
+        p.process(line.as_bytes());
+        p.process(b"\x1b[?1049h");
+        p.set_size(6, 20);
+        p.process(b"\x1b[?1049l");
+        assert!(!p.screen().alternate_screen());
+        assert!(p.screen().contents().contains(&line), "the shell's line survived");
+        assert!(p.screen().row_wrapped(0));
+    }
+
+    #[test]
+    fn a_rewrap_sheds_blank_rows_before_it_banks_live_content() {
+        // The empty tail of a screen is room a narrowing may use for free.
+        // Banking instead would push live content into a history that is
+        // never rewrapped — so the widening trip back could not rejoin it,
+        // and P5's round-trip would still lose the line.
+        let mut p = crate::Parser::new(6, 40, 100);
+        let line = "0123456789".repeat(3);
+        p.process(line.as_bytes());
+        assert_eq!(p.screen().scrollback_rows(), 0);
+
+        p.set_size(6, 20); // one more row needed, five blank ones available
+        assert_eq!(p.screen().scrollback_rows(), 0, "nothing had to be banked");
+        p.set_size(6, 40);
+        assert_eq!(rows_of(p.screen())[0], line, "so the round-trip is lossless");
+    }
+
+    #[test]
+    fn rows_a_narrowing_pushes_off_the_top_go_to_the_scrollback() {
+        // With no blank room left, a rewrap that needs more rows scrolls the
+        // grid exactly like ordinary output does — into the history, oldest
+        // first, cursor following its own line down.
+        let mut p = crate::Parser::new(4, 20, 100);
+        for i in 0..4 {
+            p.process(format!("line{i}-{}", "x".repeat(13)).as_bytes());
+            if i < 3 {
+                p.process(b"\r\n");
+            }
+        }
+        assert_eq!(p.screen().scrollback_rows(), 0);
+        let (cursor_row, _) = p.screen().cursor_position();
+        assert_eq!(cursor_row, 3);
+
+        p.set_size(4, 10); // every line now needs two rows: 8 rows for 4
+        assert_eq!(p.screen().scrollback_rows(), 4, "the overflow banked");
+        assert_eq!(p.screen().cursor_position().0, 3, "the cursor stayed in the grid");
+        // `all_contents` is row-by-row (history has no wrap flags to honor),
+        // so put the rows back together to read the logical lines out of it.
+        let all = p.screen().all_contents();
+        let joined: String = all.lines().collect::<Vec<_>>().concat();
+        for i in 0..4 {
+            let want = format!("line{i}-{}", "x".repeat(13));
+            assert!(joined.contains(&want), "line{i} lost columns to the rewrap: {all:?}");
+        }
+    }
+
+    #[test]
+    fn a_scrolled_view_stays_clamped_and_pinned_across_a_rewrap() {
+        // U3/U9: the `↑N` badge reads the grid's own clamp, so a resize may
+        // never leave the offset naming history that isn't there.
+        let mut p = crate::Parser::new(4, 20, 100);
+        for i in 0..20 {
+            p.process(format!("row{i}-{}\r\n", "y".repeat(12)).as_bytes());
+        }
+        let banked = p.screen().scrollback_rows();
+        p.set_scrollback(5);
+        assert_eq!(p.screen().scrollback(), 5);
+
+        p.set_size(4, 10);
+        let offset = p.screen().scrollback();
+        assert!(
+            offset <= p.screen().scrollback_rows(),
+            "offset {offset} past the {} banked rows",
+            p.screen().scrollback_rows()
+        );
+        assert!(p.screen().scrollback_rows() >= banked, "history only grows here");
+        // Snapping back to the tail still works, from either side.
+        p.set_scrollback(0);
+        assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn a_rewrap_survives_degenerate_sizes() {
+        // The 1x1 floor `Grid::new`/`set_size` clamp to is reachable from a
+        // pane squeezed to nothing; a wide glyph there has nowhere to go.
+        let mut p = crate::Parser::new(6, 20, 50);
+        p.process("ab\u{65e5}cd".as_bytes());
+        p.set_size(1, 1);
+        assert_eq!(p.screen().size(), (1, 1));
+        p.process(b"z");
+        p.set_size(6, 20);
+        assert_eq!(p.screen().size(), (6, 20));
+        // Wide-flag bookkeeping stayed consistent through both trips.
+        p.process(b"\x1b[Hq");
+        assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "q");
     }
 }

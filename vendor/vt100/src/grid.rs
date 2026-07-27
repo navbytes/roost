@@ -90,10 +90,48 @@ impl Grid {
         self.size
     }
 
+    /// Resize without reflowing: rows are truncated/padded in place and every
+    /// wrap flag is dropped. This is what the *alternate* grid gets — an
+    /// alternate-screen application repaints on SIGWINCH and a rewrap would
+    /// only fight the redraw it is about to send (SPEC-parity P5).
     pub fn set_size(&mut self, size: Size) {
+        self.resize_to(size, false);
+    }
+
+    /// roost (SPEC-parity P5): resize *and* rewrap.
+    ///
+    /// The rows are read back into the logical lines the application actually
+    /// printed (a row's `wrapped` flag means "this line continues below"),
+    /// each line is laid out again at the new width — attributes, wide glyphs
+    /// and all — and the result is written back. Narrowing therefore wraps a
+    /// long line instead of hard-truncating it, and widening rejoins the
+    /// pieces, so a zoom round-trip is lossless.
+    ///
+    /// Deliberately **live grid only**: rows already banked in the scrollback
+    /// keep the width they were banked at, and rows this rewrap pushes off the
+    /// top are banked at the new one. That is the same veneer-vs-second-state
+    /// split `Screen::snapshot` draws for P1 — it buys a lossless round-trip
+    /// without taking on a full history rewrap (and the mixed-width history it
+    /// leaves behind is the nuance P5 already documents).
+    pub fn set_size_reflowing(&mut self, size: Size) {
+        self.resize_to(size, true);
+    }
+
+    fn resize_to(&mut self, size: Size, reflow: bool) {
         // roost hardening: clamp to a 1x1 floor (see Grid::new).
         let size = Size { rows: size.rows.max(1), cols: size.cols.max(1) };
-        if size.cols != self.size.cols {
+        // A scroll region means an application is driving this grid as a
+        // fixed-geometry canvas (a status line pinned outside a scrolling
+        // area). Like an alternate-screen app it repaints on SIGWINCH, and
+        // rewrapping under it would fight that redraw — so it resizes the old
+        // way. Checked before `scroll_bottom` is retargeted below, i.e.
+        // against the region as the application set it.
+        let reflowing = reflow
+            && size != self.size
+            && !self.rows.is_empty()
+            && !self.scroll_region_active();
+
+        if size.cols != self.size.cols && !reflowing {
             for row in &mut self.rows {
                 row.wrap(false);
             }
@@ -103,9 +141,16 @@ impl Grid {
             self.scroll_bottom = size.rows - 1;
         }
 
+        if reflowing {
+            // Rewrites `rows` to exactly `size` and maps the cursor with it.
+            self.rewrap(size);
+        }
+
         self.size = size;
-        for row in &mut self.rows {
-            row.resize(size.cols, crate::cell::Cell::default());
+        if !reflowing {
+            for row in &mut self.rows {
+                row.resize(size.cols, crate::cell::Cell::default());
+            }
         }
         self.rows.resize(usize::from(size.rows), self.new_row());
 
@@ -119,6 +164,102 @@ impl Grid {
         self.row_clamp_top(false);
         self.row_clamp_bottom(false);
         self.col_clamp();
+        // roost hardening: a saved cursor (DECSC) that a resize left outside
+        // the grid is dereferenced unconditionally the moment DECRC restores
+        // it. Clamping keeps a shrunken pane from panicking the multiplexer.
+        self.saved_pos.row = self.saved_pos.row.min(size.rows - 1);
+        self.saved_pos.col = self.saved_pos.col.min(size.cols - 1);
+        // roost (SPEC-ux U3/U9): the view offset must stay inside the history
+        // it points at, so the `↑N` badge keeps telling the truth across a
+        // resize. Callers read the clamp back rather than trusting a cache.
+        self.scrollback_offset =
+            self.scrollback_offset.min(self.scrollback.len());
+    }
+
+    /// SPEC-parity P5: rebuild `rows` as `new` by rewrapping the live grid's
+    /// logical lines. Also updates `pos` (and banks whatever no longer fits).
+    fn rewrap(&mut self, new: Size) {
+        // 1. Read the rows back into logical lines, noting which one the
+        //    cursor is in and how far along it sits.
+        let cursor = self.pos;
+        let mut lines: Vec<(Vec<crate::cell::Cell>, bool)> = Vec::new();
+        let mut line: Vec<crate::cell::Cell> = Vec::new();
+        let mut open = false;
+        let mut cursor_line = 0;
+        let mut cursor_off = 0;
+        for (i, row) in self.rows.iter().enumerate() {
+            if i == usize::from(cursor.row) {
+                cursor_line = lines.len();
+                cursor_off = line.len() + usize::from(cursor.col);
+            }
+            line.extend_from_slice(row.content_cells());
+            open = row.wrapped();
+            if !open {
+                lines.push((std::mem::take(&mut line), false));
+            }
+        }
+        if open {
+            // The bottom row is still wrapping: the line runs past the grid,
+            // so its last row keeps the flag.
+            lines.push((line, true));
+        }
+
+        // 2. Lay every line out again at the new width, tracking the cursor.
+        let mut rows: Vec<crate::row::Row> = Vec::with_capacity(self.rows.len());
+        let mut cursor_row = 0;
+        let mut cursor_col = 0;
+        for (i, (cells, wrapped_tail)) in lines.into_iter().enumerate() {
+            let track = (i == cursor_line).then_some(cursor_off);
+            let base = rows.len();
+            let (laid, at) = lay_out(&cells, new.cols, wrapped_tail, track);
+            if let Some((row, col)) = at {
+                cursor_row = base + row;
+                cursor_col = col;
+            }
+            rows.extend(laid);
+        }
+
+        // 3. Fit the result to the grid. Blank rows below the cursor are the
+        //    screen's own empty tail — shedding those first is what keeps a
+        //    narrowing from pushing live content into a history that is never
+        //    rewrapped (and so could never rejoin on the way back).
+        let want = usize::from(new.rows);
+        while rows.len() > want
+            && rows.len() > cursor_row + 1
+            && rows.last().is_some_and(|r| r.is_blank() && !r.wrapped())
+        {
+            rows.pop();
+        }
+        // Whatever still doesn't fit scrolls off the top exactly like ordinary
+        // output does — into the scrollback, oldest first.
+        let banked = rows.len().saturating_sub(want);
+        if banked > 0 {
+            for row in rows.drain(..banked) {
+                if self.scrollback_len > 0 {
+                    self.scrollback.push_back(row);
+                }
+            }
+            while self.scrollback.len() > self.scrollback_len {
+                self.scrollback.pop_front();
+            }
+            if self.scrollback_offset > 0 {
+                // A scrolled-back view stays pinned on the rows it was
+                // reading, exactly as `scroll_up` keeps it there.
+                self.scrollback_offset =
+                    self.scrollback.len().min(self.scrollback_offset + banked);
+            }
+            // A rewrap that pushed the cursor above the top of the grid
+            // clamps into it rather than addressing history.
+            cursor_row = cursor_row.saturating_sub(banked);
+        }
+        rows.resize(want, crate::row::Row::new(new.cols));
+        self.rows = rows;
+        self.pos = Pos {
+            // Both are already in range; the clamps are the load-bearing
+            // guarantee that `pos` names a real cell after any rewrap.
+            row: u16::try_from(cursor_row.min(want - 1)).unwrap_or(0),
+            col: cursor_col.min(new.cols - 1),
+        };
     }
 
     pub fn pos(&self) -> Pos {
@@ -767,6 +908,86 @@ impl Grid {
             self.pos.col = self.size.cols - 1;
         }
     }
+}
+
+/// A column index as the grid stores it. Every caller passes a column inside
+/// a grid whose width is a `u16`, so the conversion can't actually fail.
+fn col_index(col: usize) -> u16 {
+    u16::try_from(col).unwrap_or(u16::MAX)
+}
+
+/// roost (SPEC-parity P5): lay one logical line out at `cols` columns.
+///
+/// Returns the rows it occupies — each padded to `cols`, each but the last
+/// flagged wrapped (the last carries `wrapped_tail`, for a line that still
+/// runs past the bottom of the grid) — and, when `cursor` names a column
+/// offset into the line, where that offset landed, as `(row within the line,
+/// column)`.
+///
+/// Two properties this function exists to guarantee:
+///
+/// * a cell is copied whole, so a rewrapped line keeps its colors, bold, dim
+///   and every other attribute — reflow that preserved only characters would
+///   repaint a colored log as plain text on every resize;
+/// * a two-column glyph is never split across the boundary. When it doesn't
+///   fit, the row ends one column short and the whole glyph moves down —
+///   what every real terminal does, and half a glyph per row isn't
+///   representable in the grid anyway. Continuation cells are dropped on the
+///   way in and regenerated on the way out, so each one always sits beside
+///   the glyph it belongs to at the *new* width.
+fn lay_out(
+    cells: &[crate::cell::Cell],
+    cols: u16,
+    wrapped_tail: bool,
+    cursor: Option<usize>,
+) -> (Vec<crate::row::Row>, Option<(usize, u16)>) {
+    let width = usize::from(cols);
+    let mut rows: Vec<crate::row::Row> = Vec::new();
+    let mut cur: Vec<crate::cell::Cell> = Vec::new();
+    let mut at: Option<(usize, u16)> = None;
+
+    for (i, cell) in cells.iter().enumerate() {
+        if cell.is_wide_continuation() {
+            // Bookkeeping for the old width; the glyph before it gets a fresh
+            // continuation below. A cursor parked on one stays on its glyph.
+            if cursor == Some(i) && at.is_none() {
+                at = Some((rows.len(), col_index(cur.len().saturating_sub(1))));
+            }
+            continue;
+        }
+        let cell_width = if cell.is_wide() { 2 } else { 1 };
+        if cell_width > width {
+            continue; // a wide glyph in a one-column grid has nowhere to go
+        }
+        if cur.len() + cell_width > width {
+            rows.push(crate::row::Row::from_cells(
+                std::mem::take(&mut cur),
+                cols,
+                true,
+            ));
+        }
+        if cursor == Some(i) && at.is_none() {
+            at = Some((rows.len(), col_index(cur.len())));
+        }
+        cur.push(cell.clone());
+        if cell_width > 1 {
+            let mut continuation = crate::cell::Cell::default();
+            continuation.set_wide_continuation(true);
+            cur.push(continuation);
+        }
+    }
+
+    if at.is_none() {
+        if let Some(off) = cursor {
+            // The cursor sits past the line's text — a fresh prompt, or a
+            // cursor parked in the blank tail of a row. It keeps its distance
+            // from the end of the content, wrapping the way text does.
+            let total = cur.len() + off.saturating_sub(cells.len());
+            at = Some((rows.len() + total / width, col_index(total % width)));
+        }
+    }
+    rows.push(crate::row::Row::from_cells(cur, cols, wrapped_tail));
+    (rows, at)
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
