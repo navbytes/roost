@@ -66,13 +66,21 @@ both read via the new `PaneBackend::scroll_offset`/`scroll_total` accessors,
 so they reflect the view, never a phantom counter (C4/C9/§2 amended
 2026-07-27; N1's pulse rule rides along).
 
-### U4 · High · OPEN — the macOS Alt trap is only caught on Apple Terminal
+### U4 · High · FIXED (this branch) — the macOS Alt trap is only caught on Apple Terminal
 `wants_alt_hint` fires solely on `TERM_PROGRAM == "Apple_Terminal"`; default
 iTerm2 (the README's recommended terminal) swallows Option identically and gets
 no warning — every advertised chord silently no-ops in the first minute.
 **Proposed contract:** warn on any terminal when keys are arriving but zero Alt
 has ever been seen (or on the Option-accent signature `ñƒå∂…`), with a
 per-terminal instruction line.
+**Fixed:** the trigger is the evidence — `wants_alt_hint(alt_seen,
+keys_seen, elapsed)`, no terminal allowlist — so any terminal with the
+setting off warns inside the same 8 s window, and one Alt key ever ends it.
+The accent-signature half proved unnecessary: those accents *are* keys with
+no Alt on them, so the failed chord that produced `∫` is itself what raises
+the bar. Wording is per terminal from roost's own (host) `TERM_PROGRAM`:
+real menu paths for `Apple_Terminal` and `iTerm.app`, a terminal-agnostic
+line otherwise — never a wrong path (C11 amended 2026-07-27).
 
 ### U5 · High · FIXED (this branch) — unbound Alt chords are swallowed, not forwarded
 *Fixed with SPEC-parity P13 (one change): `translate()`'s unmatched-Alt arm
@@ -98,12 +106,21 @@ pair, that pair is the help pair — and `Alt+r rename` trails, dropping first.
 At the live-QA width (120 cols with `◆ N needs you` up) the help pair now
 survives (C9 amended 2026-07-27; total width still 100 columns).
 
-### U7 · Med · VERIFIED — tab reachability dead ends
+### U7 · Med · FIXED (this branch) — tab reachability dead ends
 Live QA: Alt+9 (no such tab) and Alt+0 (unbound) both no-op silently; no
 next/prev-tab chord exists; overflow-clipped tabs aren't clickable. Tabs ≥ 10
 are unreachable by keyboard entirely.
 **Proposed contract:** next/prev-tab chords from the documented free-key pool;
 `Alt+0` → tab 10 or last-tab; the strip scrolls to keep the active tab visible.
+**Fixed:** all three. `Alt+i`/`Alt+m` step previous/next with wrap-around and
+`Alt+0` jumps to the last tab, whatever its number — chords taken from §8's
+free pool after excluding the readline-critical `b`/`d` (live since U5),
+C23's reserved `p`, and the clipboard letters `v/x/y` (§8 amendment
+2026-07-27 justifies the pick). The strip scrolls: `mouse::tab_strip` picks
+the leftmost window that still fits the active tab whole, `…` marks each end
+that hides tabs (never a tab, never clickable), and `tab_at_x` reads the same
+layout, so a click on a scrolled strip selects the real tab index (C2 amended
+2026-07-27). Tabs ≥ 10 are reachable, and the active tab is always on screen.
 
 ## P1 — high-value, single-lens
 

@@ -89,34 +89,94 @@ pub fn effective_status_width(names: &[String], bar_width: u16, status_width: u1
     }
 }
 
-/// How many of `bar_width`'s columns, starting at 0, are occupied by fully
-/// drawn tabs — i.e. where the renderer stops and (if anything didn't fit)
-/// draws the single `…` clip marker. Everything from here to the right edge
-/// (the ellipsis, the gap, the status area) belongs to no tab.
-pub fn tabs_visible_width(names: &[String], bar_width: u16, status_width: u16) -> u16 {
-    let budget = bar_width.saturating_sub(effective_status_width(names, bar_width, status_width));
-    let mut used = 0u16;
-    for (i, name) in names.iter().enumerate() {
-        let w = tab_width(i, name);
-        if used.saturating_add(w) > budget {
+/// C2 (U7): the window of tabs actually drawn on the bar. The strip
+/// scrolls so the ACTIVE tab is always visible — before this, tab 10 of 12
+/// could be selected (by chord, by `Alt+a`'s jump) while the bar still
+/// showed tabs 1–4 and nothing said where you were. One `…` marks each end
+/// that hides tabs, keeping the overflow marker's meaning unchanged: it is
+/// never a tab, and clicking it switches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabStrip {
+    /// First tab drawn.
+    pub start: usize,
+    /// One past the last fully drawn tab.
+    pub end: usize,
+    /// Column the first drawn tab starts at — 1 when a left `…` is drawn.
+    pub x0: u16,
+    /// Columns through the last drawn tab (`x0` included); where the right
+    /// `…`, the gap and the status area begin.
+    pub width: u16,
+    pub left_marker: bool,
+    pub right_marker: bool,
+}
+
+/// The leftmost tab to draw so that `active` fits in `budget` columns: the
+/// smallest such start, so the strip scrolls by the least it can and keeps
+/// as much history on screen as possible (the active tab then rides the
+/// right edge, like tmux's window list). 0 whenever everything fits.
+fn tab_scroll_start(names: &[String], budget: u16, active: usize) -> usize {
+    if total_tabs_width(names) <= budget {
+        return 0;
+    }
+    let mut start = 0usize;
+    while start < active.min(names.len()) {
+        let x0 = u16::from(start > 0); // the left `…` costs a column
+        let span: u16 = (start..=active).map(|i| tab_width(i, &names[i])).sum();
+        if x0.saturating_add(span) <= budget {
             break;
         }
-        used += w;
+        start += 1;
     }
-    used
+    start
+}
+
+/// C2: lay out the tab strip for this bar. `status_width` is the fitted
+/// width of the right status area (`status_fit`), which tabs win against
+/// exactly as before.
+pub fn tab_strip(names: &[String], bar_width: u16, status_width: u16, active: usize) -> TabStrip {
+    let budget = bar_width.saturating_sub(effective_status_width(names, bar_width, status_width));
+    let start = tab_scroll_start(names, budget, active);
+    let x0 = u16::from(start > 0);
+    let mut width = x0.min(budget);
+    let mut end = start;
+    for (i, name) in names.iter().enumerate().skip(start) {
+        let w = tab_width(i, name);
+        if width.saturating_add(w) > budget {
+            break;
+        }
+        width += w;
+        end = i + 1;
+    }
+    TabStrip {
+        start,
+        end,
+        x0,
+        width,
+        left_marker: start > 0,
+        // Opportunistic, exactly as before: the marker is drawn only when a
+        // spare column is left for it (it is never allowed to displace a tab).
+        right_marker: end < names.len() && width < budget,
+    }
 }
 
 /// Which tab (if any) sits at column `x` on the tab bar row (C2: tabs start
-/// at `x = 0` — the brand block is gone). `bar_width`/`status_width` bound
-/// this the same way the renderer clips overflow (`tabs_visible_width`), so
-/// a click on the `…` marker, the gap, or the right-aligned status area
-/// correctly switches nothing.
-pub fn tab_at_x(names: &[String], bar_width: u16, status_width: u16, x: u16) -> Option<usize> {
-    if x >= tabs_visible_width(names, bar_width, status_width) {
+/// at `x = 0` — the brand block is gone — or at `x = 1` when the strip has
+/// scrolled and a left `…` leads it). Reads the same `tab_strip` the
+/// renderer draws from, so a click on either `…` marker, the gap, or the
+/// right-aligned status area correctly switches nothing.
+pub fn tab_at_x(
+    names: &[String],
+    bar_width: u16,
+    status_width: u16,
+    active: usize,
+    x: u16,
+) -> Option<usize> {
+    let strip = tab_strip(names, bar_width, status_width, active);
+    if x < strip.x0 || x >= strip.width {
         return None;
     }
-    let mut cur = 0u16;
-    for (i, name) in names.iter().enumerate() {
+    let mut cur = strip.x0;
+    for (i, name) in names.iter().enumerate().take(strip.end).skip(strip.start) {
         let w = tab_width(i, name);
         if x < cur + w {
             return Some(i);
@@ -177,7 +237,7 @@ pub struct StatusFit<'a> {
     pub mode: Option<&'a str>,
     pub cwd: Option<&'a str>,
     /// Columns this content occupies — feed it to `tab_at_x` /
-    /// `tabs_visible_width` as their `status_width` argument.
+    /// `tab_at_x` as its `status_width` argument.
     pub width: u16,
 }
 
@@ -378,12 +438,12 @@ mod tests {
         // spans cols 13..25 ("2 api" is 5 chars + 7). Generous bar width, no
         // status area, so this pins the base hit-math with nothing else in play.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 100, 0, 0), Some(0)); // start of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(0)); // last col of tab 0 (its gutter)
-        assert_eq!(tab_at_x(&names, 100, 0, 13), Some(1)); // first col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 24), Some(1)); // last col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 25), None); // past the end
-        assert_eq!(tab_at_x(&names, 100, 0, 200), None);
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 0), Some(0)); // start of tab 0
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0)); // last col of tab 0 (its gutter)
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(1)); // first col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 24), Some(1)); // last col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 25), None); // past the end
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 200), None);
     }
 
     #[test]
@@ -395,8 +455,8 @@ mod tests {
         // misindex clicks past the glyph's real width.
         let names = vec!["日本".to_string()];
         assert_eq!(tab_width(0, "日本"), 13);
-        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(0)); // last col of the tab
-        assert_eq!(tab_at_x(&names, 100, 0, 13), None); // just past it
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0)); // last col of the tab
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), None); // just past it
     }
 
     #[test]
@@ -406,8 +466,8 @@ mod tests {
         // tab 1 must start at col 12, not the char-count answer of 11.
         let names = vec!["🦀x".to_string(), "b".to_string()];
         assert_eq!(tab_width(0, "🦀x"), 12);
-        assert_eq!(tab_at_x(&names, 100, 0, 11), Some(0)); // last col of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(1)); // first col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 11), Some(0)); // last col of tab 0
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(1)); // first col of tab 1
     }
 
     #[test]
@@ -415,9 +475,9 @@ mod tests {
         // +7 gutter (2026-07-23): two tabs are 25 cols (13 + 12); a 10-col
         // status area then occupies cols 25..35.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 35, 10, 24), Some(1)); // last tab col
-        assert_eq!(tab_at_x(&names, 35, 10, 25), None); // status area starts here
-        assert_eq!(tab_at_x(&names, 35, 10, 34), None); // status area, last col
+        assert_eq!(tab_at_x(&names, 35, 10, 0, 24), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, 35, 10, 0, 25), None); // status area starts here
+        assert_eq!(tab_at_x(&names, 35, 10, 0, 34), None); // status area, last col
     }
 
     #[test]
@@ -426,8 +486,8 @@ mod tests {
         // status area (25+10=35 > 25) — C2 says the status area drops first,
         // so tab 1 (cols 13..25) stays fully clickable and nothing clips.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 25, 10, 24), Some(1));
-        assert_eq!(tab_at_x(&names, 25, 10, 25), None); // past both tabs, no status shown
+        assert_eq!(tab_at_x(&names, 25, 10, 0, 24), Some(1));
+        assert_eq!(tab_at_x(&names, 25, 10, 0, 25), None); // past both tabs, no status shown
     }
 
     #[test]
@@ -437,10 +497,10 @@ mod tests {
         // fits exactly four tabs (40 cols) before the fifth would overflow,
         // leaving spare columns for the `…` clip marker at col 40.
         let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
-        assert_eq!(tabs_visible_width(&names, 45, 0), 40);
-        assert_eq!(tab_at_x(&names, 45, 0, 39), Some(3)); // last col of tab 3 (0-based)
-        assert_eq!(tab_at_x(&names, 45, 0, 40), None); // the `…` clip marker
-        assert_eq!(tab_at_x(&names, 45, 0, 44), None); // past the visible tabs too
+        assert_eq!(tab_strip(&names, 45, 0, 0).width, 40);
+        assert_eq!(tab_at_x(&names, 45, 0, 0, 39), Some(3)); // last col of tab 3 (0-based)
+        assert_eq!(tab_at_x(&names, 45, 0, 0, 40), None); // the `…` clip marker
+        assert_eq!(tab_at_x(&names, 45, 0, 0, 44), None); // past the visible tabs too
     }
 
     #[test]
@@ -465,6 +525,77 @@ mod tests {
     fn a_picker_too_small_to_have_an_inside_hits_nothing() {
         assert_eq!(picker_row_at(Rect::new(0, 0, 2, 5), 3, 1, 1), None);
         assert_eq!(picker_row_at(Rect::new(0, 0, 32, 2), 3, 5, 1), None);
+    }
+
+    /// U7: ten tabs in a 45-col bar. The strip scrolls to whichever window
+    /// contains the active tab, and it is the *least* it can scroll (the
+    /// active tab rides the right edge, earlier tabs stay on screen).
+    #[test]
+    fn the_strip_scrolls_the_least_it_can_to_keep_the_active_tab_visible() {
+        let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
+        // Tab 0 active: nothing scrolls, four tabs fit (40 of 45 cols).
+        let strip = tab_strip(&names, 45, 0, 0);
+        assert_eq!((strip.start, strip.end, strip.x0), (0, 4, 0));
+        assert!(!strip.left_marker && strip.right_marker);
+        // Tab 3 is the last that fits unscrolled — still no scroll.
+        assert_eq!(tab_strip(&names, 45, 0, 3).start, 0);
+        // Tab 4 forces it: start=1 (the left `…` costs a column, so tabs
+        // 1..4 = 40 + 1 = 41 <= 45), and both ends now hide tabs.
+        let strip = tab_strip(&names, 45, 0, 4);
+        assert_eq!((strip.start, strip.end, strip.x0), (1, 5, 1));
+        assert!(strip.left_marker && strip.right_marker);
+        // The last tab (index 9, an 11-col label) is reachable and drawn.
+        let strip = tab_strip(&names, 45, 0, 9);
+        assert!(strip.end == names.len(), "the active tab must be inside the window");
+        assert!(strip.start > 0 && strip.left_marker);
+        assert!(!strip.right_marker, "nothing is hidden past the last tab");
+    }
+
+    /// Whatever the scroll, the active tab is always fully drawn — the
+    /// property the whole feature exists for. Swept over every tab and a
+    /// band of widths, including ones too narrow for even one tab.
+    #[test]
+    fn the_active_tab_is_always_inside_the_drawn_window() {
+        let names: Vec<String> = (0..12).map(|i| format!("tab{i}")).collect();
+        for active in 0..names.len() {
+            for bar in 12..=140u16 {
+                let strip = tab_strip(&names, bar, 0, active);
+                let fits_one = tab_width(active, &names[active]) + strip.x0 <= bar;
+                if fits_one {
+                    assert!(
+                        (strip.start..strip.end).contains(&active),
+                        "bar={bar} active={active}: window {}..{} misses it",
+                        strip.start,
+                        strip.end
+                    );
+                }
+                assert!(strip.width <= bar, "bar={bar} active={active}: strip overflows");
+            }
+        }
+    }
+
+    /// Hitboxes follow the scroll: on a scrolled strip, column 0 is the
+    /// left `…` (no tab), the first drawn tab starts at column 1, and the
+    /// indexes returned are the real tab numbers — not window offsets.
+    #[test]
+    fn clicks_land_on_the_scrolled_strips_real_tab_indexes() {
+        let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
+        let strip = tab_strip(&names, 45, 0, 4);
+        assert_eq!((strip.start, strip.x0), (1, 1));
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 0), None, "the left `…` is not a tab");
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 1), Some(1), "first drawn tab, at its real index");
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 10), Some(1), "...through its last column");
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 11), Some(2));
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 40), Some(4), "the active tab is clickable");
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 41), None, "past the window: the right `…`");
+        // Exhaustive agreement with the drawn strip: every column either
+        // maps to a tab inside the window, or to nothing.
+        for x in 0..45u16 {
+            match tab_at_x(&names, 45, 0, 4, x) {
+                Some(i) => assert!((strip.start..strip.end).contains(&i), "x={x} hit tab {i}"),
+                None => assert!(x < strip.x0 || x >= strip.width, "x={x} should have hit a tab"),
+            }
+        }
     }
 
     #[test]
@@ -526,8 +657,8 @@ mod tests {
         let names = vec!["main".to_string(), "api".to_string()]; // tabs: 0..25
         let bar = 25 + status_width(Some("ZOOM"), None, true);
         let fit = status_fit(Some("ZOOM"), None, true, &names, bar).unwrap();
-        assert_eq!(tab_at_x(&names, bar, fit.width, 24), Some(1)); // last tab col
-        assert_eq!(tab_at_x(&names, bar, fit.width, 25), None); // status area
+        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 24), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 25), None); // status area
     }
 
     #[test]
@@ -536,10 +667,10 @@ mod tests {
         // fixed cols = 13, occupying the whole visible width.
         let names = vec!["solo".to_string()];
         assert_eq!(tab_width(0, "solo"), 13);
-        assert_eq!(tabs_visible_width(&names, 100, 0), 13);
-        assert_eq!(tab_at_x(&names, 100, 0, 0), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 12), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 13), None); // just past the only tab
+        assert_eq!(tab_strip(&names, 100, 0, 0).width, 13);
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 0), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), None); // just past the only tab
     }
 
     #[test]
@@ -548,10 +679,10 @@ mod tests {
         // math (which never divides) doesn't panic on the degenerate input.
         let none: Vec<String> = vec![];
         assert_eq!(total_tabs_width(&none), 0);
-        assert_eq!(tab_at_x(&none, 40, 0, 0), None);
+        assert_eq!(tab_at_x(&none, 40, 0, 0, 0), None);
 
         let one = vec!["solo".to_string()];
-        assert_eq!(tabs_visible_width(&one, 0, 0), 0);
-        assert_eq!(tab_at_x(&one, 0, 0, 0), None);
+        assert_eq!(tab_strip(&one, 0, 0, 0).width, 0);
+        assert_eq!(tab_at_x(&one, 0, 0, 0, 0), None);
     }
 }

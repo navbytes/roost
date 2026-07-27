@@ -86,6 +86,15 @@ fn title_of(state_dir: &std::path::Path, pane: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Which tab the focused pane lives in (U7's reach probes).
+fn focused_tab(state_dir: &std::path::Path) -> u64 {
+    cli_list(state_dir)
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["focused"] == true))
+        .and_then(|p| p["tab"].as_u64())
+        .unwrap_or(0)
+}
+
 fn pane_count(state_dir: &std::path::Path) -> usize {
     cli_list(state_dir).as_array().map(|a| a.len()).unwrap_or(0)
 }
@@ -316,12 +325,36 @@ fn ux_navigation_session() {
         h.write_bytes(&alt(b'z'));
         settle(&mut h);
     }
-    // unreachable tabs: Alt+9 with 2 tabs, Alt+0 unbound
+    // U7: tab reach. Alt+9 still names a tab that doesn't exist (silent
+    // no-op); Alt+0 is the last tab whatever its number, and Alt+m/Alt+i
+    // step with wrap — the routes to tabs the digit row can't name.
+    h.write_bytes(&alt(b'1'));
+    settle(&mut h);
+    let first = focused_tab(&sd);
     h.write_bytes(&alt(b'9'));
     settle(&mut h);
+    qa.check(
+        focused_tab(&sd) == first,
+        &format!("Alt+9 with no ninth tab stays put (tab {first}) (U7)"),
+    );
     h.write_bytes(&alt(b'0'));
     settle(&mut h);
-    qa.obs("Alt+9 (no such tab) no-ops silently; Alt+0 is unbound so U5 now forwards it to the pane — still no next/prev-tab chord, tabs ≥ 10 keyboard-unreachable (U7)");
+    let last = focused_tab(&sd);
+    qa.check(last > first, &format!("Alt+0 jumps to the last tab ({first} -> {last}) (U7)"));
+    h.write_bytes(&alt(b'm'));
+    settle(&mut h);
+    let wrapped = focused_tab(&sd);
+    qa.check(
+        wrapped == first,
+        &format!("Alt+m past the last tab wraps to the first ({last} -> {wrapped}) (U7)"),
+    );
+    h.write_bytes(&alt(b'i'));
+    settle(&mut h);
+    let back = focused_tab(&sd);
+    qa.check(
+        back == last,
+        &format!("Alt+i past the first tab wraps to the last ({wrapped} -> {back}) (U7)"),
+    );
 
     // ---- D. rename, picker, modal ownership ---------------------------
     // rename swallows modifiers: Ctrl+W / Ctrl+U insert literal w / u

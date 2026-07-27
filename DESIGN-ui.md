@@ -191,6 +191,29 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
 - Mouse unit tests (`mouse.rs:250–260`) are rewritten to the new offsets **in
   the same change** as the renderer (lockstep rule, §4).
 
+**[Amended 2026-07-27, SPEC-ux U7 — the strip scrolls to the active tab]**
+Overflow above ("tabs render left-to-right; the first tab that would collide
+is not drawn") described a strip anchored at tab 1, which meant the active
+tab could be off-screen entirely — selected by chord or by `Alt+a`'s
+cross-tab jump, with nothing on the bar saying where you were, and (per U7)
+unclickable to get back. The strip now scrolls: `mouse::tab_strip` picks the
+**leftmost** window that still fits the active tab whole, so it scrolls the
+least it can and keeps as much history on screen as possible (the active tab
+rides the right edge until later tabs pull it back).
+- Marker semantics are unchanged, just no longer right-only: a single `…`
+  fg `MUTED` marks *each* end that hides tabs. The leading one occupies
+  column 0 and is paid for out of the tab budget (`TabStrip::x0` = 1 when
+  scrolled); the trailing one stays opportunistic — drawn only if a spare
+  column remains, never displacing a tab. Neither is ever a tab: clicking
+  either switches nothing.
+- Hitboxes ride the same layout: `tab_at_x` reads `tab_strip` and returns
+  **real tab indexes**, not window offsets, so a click on the first drawn
+  tab of a scrolled strip selects that tab and not tab 1 (§4/§5 lockstep;
+  the worked example above still describes the unscrolled case).
+- The window is derived from the active tab every frame, never stored: there
+  is no scroll state to drift, and no way to be looking at a strip that
+  doesn't contain where you are.
+
 **[Amended 2026-07-27, SPEC-ux U15 — the status area carries the mode word
 when the hint bar can't]** The right status area becomes
 `"{MODE} · {cwd} · {save}"`: the C9 mode word leads it fg `MUTED` (state
@@ -525,6 +548,24 @@ and precedence are untouched.
 **Target:** same text, fg `FG` on bg `ACCENT_DIM` — "roost-level problem"
 bars (this and the dead-pane bar, C16) share the dim-accent treatment. The
 mockup's `warn` yellow is program-output-only and must not be used.
+
+**[Amended 2026-07-27, SPEC-ux U4 — trigger and wording]** Styling is
+unchanged; what fires the bar, and what it says, are now contracted:
+- **Trigger: evidence, not an allowlist.** Show it while keys are arriving
+  and *not one of them has carried Alt*, inside the existing startup window
+  (`ALT_HINT_WINDOW`, 8 s). Any terminal qualifies — gating on
+  `TERM_PROGRAM == "Apple_Terminal"` left iTerm2, the README's own
+  recommendation, silent while it swallowed Option identically. The trigger
+  is also self-timing: with Option-as-Meta off, the chord the user just
+  tried arrives as an unmodified key (Option+b → `∫`), so the failed chord
+  is itself the evidence that raises the bar. One Alt key ever — or the
+  window running out — ends it for the session, as before.
+- **Wording: per terminal, from roost's own `TERM_PROGRAM`** (the host's
+  value; panes are handed `TERM_PROGRAM=roost`, but that is the child's
+  environment, not this process's). `Apple_Terminal` → Terminal > Settings >
+  Profiles > Keyboard, "Use Option as Meta Key"; `iTerm.app` → iTerm2 >
+  Settings > Profiles > Keys, Left Option = `Esc+`. Anything else gets a
+  terminal-agnostic line — never a menu path that terminal doesn't have.
 
 ### C12 — Modal system (shared)
 
@@ -1282,7 +1323,8 @@ only the C9-curated subsets.
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
 | 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
-| 13 | `Alt+t / Alt+1..9` | new tab / go to tab | C2 |
+| 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
+| 13b | `Alt+i / Alt+m` | **previous / next tab (wraps)** | C2 |
 | 14 | `Alt+w` | close pane (confirm if busy / last) | — |
 | 15 | `Alt+u` | undo — reopen last closed pane/tab | C26 |
 | 16 | `Alt+c` | copy mode (hjkl+v+y, or drag) | C17/C24 |
@@ -1297,6 +1339,25 @@ translate() and advertised by C9's hint bar but missing from this canonical
 table. The C15 help overlay's ≤20-content-row cap counts key ROWS, some of
 which pair two chords — the overlay stays within cap.]
 
+[Amended 2026-07-27, SPEC-ux U7 — tab reachability. `Alt+1..9` stops at
+nine, so tabs 10+ had **no keyboard route at all**, and Alt+0/Alt+9 both
+no-opped silently in live QA. Three chords close it: `Alt+0` takes the digit
+row's own "and the rest" slot (last tab, whatever its number), and
+`Alt+i`/`Alt+m` step previous/next with wrap-around, so any tab is a few
+presses away and neither end is a dead end.
+**Why i and m**, from the free pool `b d i m p v x y 0 PgDn`: `b`/`d` are
+struck out by this table's own last line (readline word ops, the
+most-missed bindings — and since U5 they really do reach the shell, so
+taking them now would be a live regression, not a theoretical one); `p` is
+`Alt+Shift+p`'s lowercase twin, left free by C23 so the raw toggle has no
+near-miss; `v`/`x`/`y` are the clipboard letters, reserved for copy-mode
+vocabulary (`y` is already the yank key inside C24); `PgDn` would pair
+asymmetrically with `Alt+PgUp` = scroll mode. That leaves `i` and `m`,
+assigned alphabetically — i before m, previous before next.
+The overlay (C15) absorbs both rows within its ≤20 cap by merging
+`Alt+c`/`Alt+PgUp` (the two look-back modes) and `Alt+/`/`Alt+?` (the two
+help toggles) into one row each.]
+
 Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
 raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes
 capture their own keys (C9 lists them).
@@ -1304,7 +1365,8 @@ capture their own keys (C9 lists them).
 Control-plane only, no key by design: `roost send --all TEXT [--enter]`
 (broadcast — PLAN F2; surfaces in chrome only as a C20 `ctl` feed line).
 
-Free Alt keys remaining after this engagement: `b d i m p v x y 0 PgDn`.
+Free Alt keys remaining after this engagement: `b d p v x y PgDn`
+(`i m 0` were taken by U7, 2026-07-27).
 Collision flags (all already swallowed by roost today, `input.rs:72–77`;
 raw mode C23 is the remedy): `Alt+f` readline forward-word · `Alt+a` zsh
 accept-and-hold · `Alt+b/d` left deliberately free (readline word ops — the

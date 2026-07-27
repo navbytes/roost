@@ -13,6 +13,12 @@ pub enum Action {
     Focus(Dir),
     NewTab,
     GoToTab(usize),
+    /// U7: step to the next / previous tab, wrapping at both ends — the
+    /// only keyboard route to tabs 10+ (`Alt+1..9` runs out at nine).
+    NextTab,
+    PrevTab,
+    /// U7: jump to the last tab (`Alt+0`), whatever its number.
+    LastTab,
     ToggleStack,
     /// Flip the focused pane's split between vertical and horizontal.
     FlipSplit,
@@ -105,6 +111,15 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('f') => Some(Action::ToggleFloat),
             KeyCode::PageUp => Some(Action::ScrollMode),
             KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
+            // U7: tabs 10+ had no keyboard route at all. `Alt+0` closes the
+            // digit row's own gap (last tab, the "and the rest" slot), and
+            // Alt+i/Alt+m step the strip. Both letters come from §8's free
+            // pool, and both survive U5: they were unbound, so they used to
+            // forward to the pane — now they're roost's, like every other
+            // chord in this table. See §8's amendment for why these two.
+            KeyCode::Char('0') => Some(Action::LastTab),
+            KeyCode::Char('i') => Some(Action::PrevTab),
+            KeyCode::Char('m') => Some(Action::NextTab),
             KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
             KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
             KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
@@ -714,7 +729,7 @@ mod tests {
             ('.', &[0x1b, b'.']), // readline yank-last-arg
             ('p', &[0x1b, b'p']),
             ('x', &[0x1b, b'x']),
-            ('0', &[0x1b, b'0']), // Alt+0: no tab 0 chord exists (U7) — pane's
+            ('v', &[0x1b, b'v']), // still free after U7 took i/m/0
         ];
         for (c, want) in cases {
             match translate(alt(KeyCode::Char(*c))) {
@@ -757,6 +772,9 @@ mod tests {
             (alt(KeyCode::Char('f')), Action::ToggleFloat),
             (alt(KeyCode::PageUp), Action::ScrollMode),
             (alt(KeyCode::Char('3')), Action::GoToTab(2)),
+            (alt(KeyCode::Char('0')), Action::LastTab), // U7
+            (alt(KeyCode::Char('i')), Action::PrevTab),
+            (alt(KeyCode::Char('m')), Action::NextTab),
             (alt(KeyCode::Right), Action::Focus(Dir::Right)),
             (alt(KeyCode::Char('h')), Action::Focus(Dir::Left)),
             (alt(KeyCode::Char('j')), Action::Focus(Dir::Down)),

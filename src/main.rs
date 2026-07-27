@@ -234,6 +234,10 @@ fn run(
             loop {
                 match crossterm::event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        // U4: every key is evidence roost is being typed at;
+                        // an Alt-modified one is evidence the Alt layer
+                        // survives the terminal. The warning bar needs both.
+                        app.note_key_seen();
                         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
                             app.note_alt_seen();
                         }
@@ -443,7 +447,9 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
             )
             .map(|f| f.width)
             .unwrap_or(0);
-            if let Some(i) = mouse::tab_at_x(&names, bar_width, status_w, me.column) {
+            if let Some(i) =
+                mouse::tab_at_x(&names, bar_width, status_w, app.ws.active_tab, me.column)
+            {
                 app.apply(input::Action::GoToTab(i));
             }
         }
@@ -582,6 +588,9 @@ mod tests {
             alt(KeyCode::Char('f')),
             alt(KeyCode::PageUp),
             alt(KeyCode::Char('5')),
+            alt(KeyCode::Char('0')),
+            alt(KeyCode::Char('i')),
+            alt(KeyCode::Char('m')),
             alt(KeyCode::Right),
             alt(KeyCode::Left),
             alt(KeyCode::Up),

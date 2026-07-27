@@ -198,11 +198,11 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
 
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     if app.show_alt_hint() {
+        // C11/U4: same bar, per-terminal wording — the app knows the host's
+        // TERM_PROGRAM and picks the real menu path where there is one.
         f.render_widget(
-            Paragraph::new(
-                " Alt keys aren't reaching roost? Enable \"Use Option as Meta Key\" in Terminal > Settings > Profiles > Keyboard ",
-            )
-            .style(Style::default().fg(theme::FG).bg(theme::ACCENT_DIM)),
+            Paragraph::new(app.alt_hint_line())
+                .style(Style::default().fg(theme::FG).bg(theme::ACCENT_DIM)),
             area,
         );
         return;
@@ -345,13 +345,13 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+a", "jump to next pane that needs you"),
     ("Alt+e", "activity feed (status / spawns / exits / control)"),
     ("Alt+r / Alt+Shift+r", "rename pane / tab"),
-    ("Alt+t / Alt+1..9", "new tab / go to tab"),
+    ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
+    ("Alt+i / Alt+m", "previous / next tab (wraps)"),
     ("Alt+w", "close pane (confirm if busy / last)"),
     ("Alt+u", "undo — reopen last closed pane/tab"),
-    ("Alt+c", "copy mode (hjkl+v+y, or drag)"),
-    ("Alt+PgUp", "scroll mode"),
+    ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
-    ("Alt+/", "toggle hint bar"),
+    ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
 ];
 
@@ -583,17 +583,22 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
     let fit = mouse::status_fit(tab_status_word(app), cwd.as_deref(), saved, &names, area.width);
     let status_w = fit.map(|f| f.width).unwrap_or(0);
     let show_status = mouse::effective_status_width(&names, area.width, status_w) > 0;
-    let tabs_end = mouse::tabs_visible_width(&names, area.width, status_w);
-    let total_tabs_w = mouse::total_tabs_width(&names);
+    // U7: the drawn window — scrolled so the active tab is always visible.
+    // `tab_at_x` reads the same layout, so hitboxes follow the scroll.
+    let strip = mouse::tab_strip(&names, area.width, status_w, app.ws.active_tab);
 
-    // Left to right, one 7-part span group per tab (marker/label/glyph/
-    // separator), stopping exactly where `tabs_visible_width` says to.
-    let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 3);
+    let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 4);
     let mut used = 0u16;
-    for (i, tab) in app.ws.tabs.iter().enumerate() {
-        if used >= tabs_end {
-            break;
-        }
+    // A leading `…` when the strip has scrolled past earlier tabs (C2's
+    // marker, now at whichever end is hiding tabs). It occupies column 0,
+    // which is why `TabStrip::x0` exists.
+    if strip.left_marker {
+        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), Style::default().fg(theme::MUTED)));
+        used += strip.x0;
+    }
+    // Left to right, one 8-part span group per tab (marker/label/glyph/
+    // separator/gutter), stopping exactly where `tab_strip` says to.
+    for (i, tab) in app.ws.tabs.iter().enumerate().take(strip.end).skip(strip.start) {
         let active = i == app.ws.active_tab;
         let summary = app.tab_summary(i);
         let (glyph, base_color) = tab_summary_badge(summary);
@@ -602,10 +607,9 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
         used += mouse::tab_width(i, &tab.name);
     }
 
-    // A single `…` marks the clip point when at least one tab didn't fit and
-    // there's a spare column to show it in (overflow, C2).
-    let budget = if show_status { area.width.saturating_sub(status_w) } else { area.width };
-    if used < total_tabs_w && used < budget {
+    // ...and a trailing `…` when tabs remain past the right edge and a
+    // spare column is left to show it in (overflow, C2).
+    if strip.right_marker {
         spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), Style::default().fg(theme::MUTED)));
         used += 1;
     }
@@ -1803,8 +1807,11 @@ mod tests {
 
     #[test]
     fn help_keys_match_the_c8_key_table_verbatim_and_in_order() {
-        // The exact §8 table — six new rows (a/e/z/f/Shift+p/g) folded into
-        // the prior 14-row list at their §8 positions; wording matches §8.
+        // The exact §8 table — six fleet rows (a/e/z/f/Shift+p/g) folded
+        // into the prior 14-row list at their §8 positions, then U7's tab
+        // reach chords (2026-07-27): the tab row gained Alt+0 and a
+        // previous/next row joined it, paid for by merging Alt+/ and Alt+?
+        // into one row so the ≤20 cap still holds. Wording matches §8.
         assert_eq!(
             HELP_KEYS,
             &[
@@ -1820,13 +1827,13 @@ mod tests {
                 ("Alt+a", "jump to next pane that needs you"),
                 ("Alt+e", "activity feed (status / spawns / exits / control)"),
                 ("Alt+r / Alt+Shift+r", "rename pane / tab"),
-                ("Alt+t / Alt+1..9", "new tab / go to tab"),
+                ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
+                ("Alt+i / Alt+m", "previous / next tab (wraps)"),
                 ("Alt+w", "close pane (confirm if busy / last)"),
                 ("Alt+u", "undo — reopen last closed pane/tab"),
-                ("Alt+c", "copy mode (hjkl+v+y, or drag)"),
-                ("Alt+PgUp", "scroll mode"),
+                ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
-                ("Alt+/", "toggle hint bar"),
+                ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),
             ],
         );

@@ -208,6 +208,10 @@ pub struct App<B: PaneBackend> {
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
     /// they are (or the window has simply run out).
     alt_seen: bool,
+    /// U4: set the first time ANY key event arrives. Keys flowing with no
+    /// Alt among them is the evidence the alt-trap warning now triggers on,
+    /// instead of an allowlist of terminals known to eat Option.
+    keys_seen: bool,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
     /// Transient status message shown in the hint bar (e.g. "copied"), with
@@ -318,6 +322,7 @@ impl<B: PaneBackend> App<B> {
             home: dirs::home_dir(),
             started: Instant::now(),
             alt_seen: false,
+            keys_seen: false,
             selection: None,
             flash: None,
             undo: Vec::new(),
@@ -385,17 +390,32 @@ impl<B: PaneBackend> App<B> {
         self.alt_seen = true;
     }
 
-    /// Stock Terminal.app doesn't send Alt as a modifier until the user turns
-    /// on "Use Option as Meta Key" — with it off, every Alt+key roost relies
-    /// on silently does nothing, and there's no other signal to tell the user
-    /// why. `TERM_PROGRAM` reliably names Terminal.app, so nudge for the first
-    /// few seconds unless an Alt key has already gotten through.
+    /// U4: record that *some* key arrived — the evidence half of the
+    /// alt-trap trigger. Keys flowing with no Alt among them is what
+    /// "the terminal is eating the Alt layer" looks like from in here.
+    pub fn note_key_seen(&mut self) {
+        self.keys_seen = true;
+    }
+
+    /// C11/U4: should the "Alt keys aren't reaching roost" bar be up? Many
+    /// terminals don't send Alt as a modifier until told to (stock
+    /// Terminal.app's "Use Option as Meta Key", iTerm2's Left Option =
+    /// `Esc+`) — with it off, every Alt chord roost relies on silently does
+    /// nothing and there is no other signal saying why. Gating this on
+    /// `TERM_PROGRAM == "Apple_Terminal"` only meant the README's own
+    /// recommended terminal (iTerm2) never warned; the trigger is now the
+    /// evidence itself, on any terminal (see `wants_alt_hint`).
     pub fn show_alt_hint(&self) -> bool {
-        wants_alt_hint(
-            self.alt_seen,
-            self.started.elapsed(),
-            std::env::var("TERM_PROGRAM").ok().as_deref(),
-        )
+        wants_alt_hint(self.alt_seen, self.keys_seen, self.started.elapsed())
+    }
+
+    /// C11/U4: the warning's text, with the real menu path for terminals
+    /// whose setting we know. Reads roost's OWN `TERM_PROGRAM` — the host
+    /// terminal's identity. (Panes are handed `TERM_PROGRAM=roost` by
+    /// `infra::pty`, but that is the child's environment; this process still
+    /// sees what the host set, which is exactly what must be named here.)
+    pub fn alt_hint_line(&self) -> &'static str {
+        alt_hint_line(std::env::var("TERM_PROGRAM").ok().as_deref())
     }
 
     /// Time since app start — the shared clock chrome uses for the
@@ -1973,6 +1993,9 @@ impl<B: PaneBackend> App<B> {
             Action::Focus(dir) => self.focus_dir(dir),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
+            Action::NextTab => self.step_tab(1),
+            Action::PrevTab => self.step_tab(-1),
+            Action::LastTab => self.go_to_tab(self.ws.tabs.len().saturating_sub(1)),
             Action::ToggleStack => {
                 let focused = self.focused;
                 layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
@@ -2329,6 +2352,21 @@ impl<B: PaneBackend> App<B> {
             .tab_focus_target(i)
             .or_else(|| self.pane_order().first().copied())
             .unwrap_or(self.focused);
+    }
+
+    /// U7: step `delta` tabs, wrapping at both ends — Alt+m forward, Alt+i
+    /// back. Wrapping is what makes the strip navigable with two keys: no
+    /// dead end at either edge, and tabs past the ninth (unreachable by
+    /// digit) are always a few presses away. A single tab wraps onto itself
+    /// and `go_to_tab`'s same-tab rule (U11) makes that the no-op it should
+    /// be — zoom and the float survive.
+    fn step_tab(&mut self, delta: isize) {
+        let n = self.ws.tabs.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.ws.active_tab as isize + delta).rem_euclid(n as isize) as usize;
+        self.go_to_tab(next);
     }
 
     /// C21: leave zoom (a pure view flag). Called by every documented exit
@@ -2990,8 +3028,34 @@ fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode 
 
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
 /// without depending on process env vars or wall-clock time.
-fn wants_alt_hint(alt_seen: bool, elapsed: Duration, term_program: Option<&str>) -> bool {
-    !alt_seen && elapsed < ALT_HINT_WINDOW && term_program == Some("Apple_Terminal")
+///
+/// U4: the trigger is evidence, not an allowlist — keys are arriving and
+/// not one of them has carried Alt, inside the startup window. That covers
+/// every terminal with the setting off (the old `TERM_PROGRAM ==
+/// "Apple_Terminal"` test left iTerm2, the README's recommendation, silent),
+/// and it fires at exactly the right moment: when Option-as-Meta is off, the
+/// chord you just tried arrives as an unmodified key (Option+b → `∫`), so
+/// the failed chord is itself the evidence. One Alt key ever, or the window
+/// running out, ends it for the session.
+fn wants_alt_hint(alt_seen: bool, keys_seen: bool, elapsed: Duration) -> bool {
+    !alt_seen && keys_seen && elapsed < ALT_HINT_WINDOW
+}
+
+/// C11/U4: the warning line for a given host `TERM_PROGRAM` — the real menu
+/// path where we know it, a terminal-agnostic line otherwise. Pure, so the
+/// wording is pinned without touching the environment.
+fn alt_hint_line(term_program: Option<&str>) -> &'static str {
+    match term_program {
+        Some("Apple_Terminal") => {
+            " Alt keys aren't reaching roost? Enable \"Use Option as Meta Key\" in Terminal > Settings > Profiles > Keyboard "
+        }
+        Some("iTerm.app") => {
+            " Alt keys aren't reaching roost? Set Left Option key to \"Esc+\" in iTerm2 > Settings > Profiles > Keys "
+        }
+        _ => {
+            " Alt keys aren't reaching roost? Turn on your terminal's Option/Alt-as-Meta setting (send Esc+) "
+        }
+    }
 }
 
 /// Pure decision behind `App::focused_cwd`: abbreviate a `$HOME`-rooted path
@@ -4678,11 +4742,53 @@ mod tests {
 
     #[test]
     fn alt_hint_gates_on_seen_time_and_terminal() {
-        assert!(wants_alt_hint(false, Duration::from_secs(1), Some("Apple_Terminal")));
-        assert!(!wants_alt_hint(true, Duration::from_secs(1), Some("Apple_Terminal")));
-        assert!(!wants_alt_hint(false, ALT_HINT_WINDOW, Some("Apple_Terminal")));
-        assert!(!wants_alt_hint(false, Duration::from_secs(1), Some("iTerm.app")));
-        assert!(!wants_alt_hint(false, Duration::from_secs(1), None));
+        // U4: keys arriving with no Alt among them fires it — on ANY
+        // terminal, since that IS the symptom (the old Apple_Terminal-only
+        // test left iTerm2, the README's recommendation, silent).
+        assert!(wants_alt_hint(false, true, Duration::from_secs(1)));
+        // One Alt key ever ends it, and it never fires before any key: an
+        // untouched roost has no evidence of anything.
+        assert!(!wants_alt_hint(true, true, Duration::from_secs(1)));
+        assert!(!wants_alt_hint(false, false, Duration::from_secs(1)));
+        // The startup window still bounds it, at the boundary and past it.
+        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW));
+        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW + Duration::from_secs(60)));
+        assert!(wants_alt_hint(false, true, ALT_HINT_WINDOW - Duration::from_millis(1)));
+    }
+
+    /// C11/U4: the bar names the real setting for terminals we know, and
+    /// stays terminal-agnostic (never a wrong menu path) otherwise.
+    #[test]
+    fn the_alt_warning_names_the_right_menu_for_the_terminals_it_knows() {
+        let apple = alt_hint_line(Some("Apple_Terminal"));
+        assert!(apple.contains("Use Option as Meta Key") && apple.contains("Terminal > Settings"));
+        let iterm = alt_hint_line(Some("iTerm.app"));
+        assert!(iterm.contains("Esc+") && iterm.contains("iTerm2 > Settings > Profiles > Keys"));
+        for other in [Some("WezTerm"), Some("ghostty"), None] {
+            let line = alt_hint_line(other);
+            assert!(line.contains("Alt keys aren't reaching roost?"), "{other:?}");
+            assert!(!line.contains("Terminal > Settings"), "{other:?} must not get a wrong path");
+            assert!(!line.contains("iTerm2"), "{other:?} must not get a wrong path");
+        }
+        // Every variant is a full-width bar line: padded both ends (C11).
+        for t in [Some("Apple_Terminal"), Some("iTerm.app"), None] {
+            let line = alt_hint_line(t);
+            assert!(line.starts_with(' ') && line.ends_with(' '), "{t:?}");
+        }
+    }
+
+    /// The trigger end-to-end on a real `App`: silent until a key arrives,
+    /// up while keys flow without Alt, gone for good once one carries Alt.
+    #[test]
+    fn the_alt_warning_appears_on_the_first_alt_less_key_and_dies_on_the_first_alt() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert!(!app.show_alt_hint(), "nothing typed yet — nothing to warn about");
+        app.note_key_seen();
+        assert!(app.show_alt_hint());
+        app.note_alt_seen();
+        assert!(!app.show_alt_hint(), "Alt got through — the warning is wrong now");
+        app.note_key_seen();
+        assert!(!app.show_alt_hint(), "and it stays gone for the session");
     }
 
     #[test]
@@ -4933,6 +5039,58 @@ mod tests {
         assert!(app.zoomed());
         app.apply(Action::GoToTab(0));
         assert!(!app.zoomed());
+    }
+
+    // ---- U7: tab reachability -------------------------------------------
+
+    /// Alt+m / Alt+i step the strip and wrap at both ends — with `Alt+1..9`
+    /// stopping at nine and no cycle chord at all, tabs 10+ were reachable
+    /// by nothing but the mouse (and only if they happened to be drawn).
+    #[test]
+    fn next_and_prev_tab_chords_step_and_wrap_at_both_ends() {
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..2 {
+            app.apply(Action::NewTab); // three tabs, active = 2
+        }
+        assert_eq!(app.ws.active_tab, 2);
+        app.apply(Action::NextTab);
+        assert_eq!(app.ws.active_tab, 0, "next wraps past the end");
+        app.apply(Action::PrevTab);
+        assert_eq!(app.ws.active_tab, 2, "previous wraps past the start");
+        app.apply(Action::PrevTab);
+        assert_eq!(app.ws.active_tab, 1);
+        app.apply(Action::NextTab);
+        assert_eq!(app.ws.active_tab, 2);
+    }
+
+    /// `Alt+0` is the digit row's "and the rest" slot: the last tab,
+    /// whatever its number — including past the ninth.
+    #[test]
+    fn alt_zero_jumps_to_the_last_tab_however_many_there_are() {
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..11 {
+            app.apply(Action::NewTab); // twelve tabs
+        }
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.ws.active_tab, 0);
+        app.apply(Action::LastTab);
+        assert_eq!(app.ws.active_tab, 11, "tab 12 has no digit of its own");
+        // Alt+9 still means the ninth tab, not the last.
+        app.apply(Action::GoToTab(8));
+        assert_eq!(app.ws.active_tab, 8);
+    }
+
+    /// With one tab, every reach chord is the same no-op the same-tab digit
+    /// is (U11) — zoom and the float survive, nothing "switches".
+    #[test]
+    fn tab_reach_chords_on_a_lone_tab_preserve_view_state() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleZoom);
+        for action in [Action::NextTab, Action::PrevTab, Action::LastTab] {
+            app.apply(action);
+            assert_eq!(app.ws.active_tab, 0, "{action:?}");
+            assert!(app.zoomed(), "{action:?} must not exit zoom on a lone tab");
+        }
     }
 
     // ---- U11: per-tab focus memory + same-tab digit ----------------------
