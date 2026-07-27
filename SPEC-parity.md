@@ -167,7 +167,10 @@ round-trip). Supersedes the SPEC-ux "deliberately-scoped" note with evidence.
 focus changes to panes that asked; enable host focus events and forward them
 to the focused pane; vim autoread / TUI dim-on-blur start working.
 
-### P11 · CONFIRMED · Med — host identity env leaks into panes
+### P11 · FIXED (this branch) · Med — host identity env leaks into panes
+*Fixed: `PtyPane::spawn` scrubs the 13 known identity vars and sets
+`TERM_PROGRAM=roost` + `TERM_PROGRAM_VERSION`; verified end to end by
+`tests/pane_env.rs` (a pane dumps its env under a fully-leaky host).*
 `TERM_PROGRAM=iTerm.app`, `KITTY_WINDOW_ID`, `ITERM_SESSION_ID`, `TMUX` all
 arrive verbatim inside panes (only `TERM` is overridden). Apps then negotiate
 proprietary protocols (iTerm2 images, kitty graphics, tmux DCS passthrough)

@@ -51,6 +51,16 @@ impl Harness {
     /// a sandboxed runner with no `/dev/ptmx`) — callers should skip, not
     /// fail, in that case.
     pub fn try_spawn(workspace_json: &str) -> Result<Self, String> {
+        Self::try_spawn_with_env(workspace_json, &[])
+    }
+
+    /// Like `try_spawn`, but with extra env vars set on the roost process
+    /// itself — for scenarios asserting what a pane child does (or doesn't)
+    /// inherit from its host, e.g. the SPEC-parity P11 identity scrub.
+    pub fn try_spawn_with_env(
+        workspace_json: &str,
+        envs: &[(&str, &str)],
+    ) -> Result<Self, String> {
         let state_dir = fresh_state_dir();
         std::fs::write(state_dir.join("workspace.json"), workspace_json)
             .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
@@ -69,6 +79,11 @@ impl Harness {
         cmd.env("TERM", "xterm-256color");
         // Never let a test run mutate the developer's real ~/.pi extension.
         cmd.env("ROOST_NO_EXT_INSTALL", "1");
+        // Scenario-specific extras last, so a scenario can override any of
+        // the defaults above.
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
 
         let child = pair
             .slave
