@@ -187,7 +187,18 @@ pub struct App<B: PaneBackend> {
     pub ws: Workspace,
     pub runtimes: HashMap<PaneId, B>,
     pub registry: Registry,
+    /// The pane keystrokes go to. Never assign this directly — go through
+    /// `set_focus`, which is also where P10's `CSI I`/`CSI O` reports are
+    /// produced; a bare write would move focus without telling the panes.
     pub focused: PaneId,
+    /// P10: does roost's own window hold the host terminal's focus? Starts
+    /// **true** — a host that never reports focus (no mode 1004 support, a
+    /// bare PTY, another multiplexer) must not leave every pane believing it
+    /// is permanently blurred. While false, roost withholds pane-level focus
+    /// reports entirely: nothing inside roost is focused when roost isn't,
+    /// and the pane that ends up focused collects its `CSI I` the moment the
+    /// window comes back.
+    host_focused: bool,
     pub quit: bool,
     /// Spawn errors for panes whose process never started.
     pub dead: HashMap<PaneId, String>,
@@ -344,6 +355,7 @@ impl<B: PaneBackend> App<B> {
             .ok_or_else(|| anyhow::anyhow!("cannot read /dev/urandom for the control token"))?;
         let mut app = Self {
             focused: 0,
+            host_focused: true,
             ws,
             runtimes: HashMap::new(),
             registry,
@@ -387,7 +399,12 @@ impl<B: PaneBackend> App<B> {
             last_host_title: None,
         };
         app.spawn_active_tab();
-        app.focused = app.pane_order().first().copied().unwrap_or(0);
+        // Through `set_focus` like every other focus move, so that method
+        // really is the only writer of `focused` (P10). Nothing is reported
+        // here: the panes were spawned microseconds ago and none has had a
+        // chance to send `?1004h` yet.
+        let first = app.pane_order().first().copied().unwrap_or(0);
+        app.set_focus(first);
         Ok(app)
     }
 
@@ -1316,7 +1333,7 @@ impl<B: PaneBackend> App<B> {
         // created, spawned, and its id returned either way.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
         let id = self.spawn_child(adapter, cwd.map(PathBuf::from), owner);
-        self.focused = focused;
+        self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
             return Reply::err("spawn refused: not enough room to split");
@@ -1358,7 +1375,7 @@ impl<B: PaneBackend> App<B> {
         // or active tab.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
         let id = self.spawn_child(&spec.adapter, Some(spec.cwd), owner);
-        self.focused = focused;
+        self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
             return Reply::err("fork refused: not enough room to split");
@@ -1568,10 +1585,11 @@ impl<B: PaneBackend> App<B> {
         // that tab's focus memory before falling back to its first pane.
         if !self.ws.active_tab().panes.contains_key(&self.focused) {
             let active = self.ws.active_tab;
-            self.focused = self
+            let target = self
                 .tab_focus_target(active)
                 .or_else(|| self.pane_order().first().copied())
                 .unwrap_or(0);
+            self.set_focus(target);
         }
         true
     }
@@ -1975,7 +1993,7 @@ impl<B: PaneBackend> App<B> {
         if self.float_focused() && id != self.focused {
             self.hide_float();
         }
-        self.focused = id;
+        self.set_focus(id);
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         self.relayout();
         self.save();
@@ -2266,7 +2284,8 @@ impl<B: PaneBackend> App<B> {
                 self.ws.tabs.insert(i, tab);
                 self.ws.active_tab = i;
                 self.spawn_active_tab();
-                self.focused = self.pane_order().first().copied().unwrap_or(0);
+                let first = self.pane_order().first().copied().unwrap_or(0);
+                self.set_focus(first);
                 self.push_feed(format!("reopened tab {name}"), false, None);
                 // U2: flashes name what they acted on.
                 self.set_flash(format!("reopened tab {name}"));
@@ -2276,7 +2295,8 @@ impl<B: PaneBackend> App<B> {
                 // active one; split the focused pane and reuse the saved spec
                 // (session id preserved ⇒ the agent resumes).
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
-                self.focused = self.pane_order().first().copied().unwrap_or(0);
+                let first = self.pane_order().first().copied().unwrap_or(0);
+                self.set_focus(first);
                 self.restore_pane(spec);
                 // U2: `restore_pane` allocated the pane's NEW id and left it
                 // focused — label with that id, not the closed one's.
@@ -2309,9 +2329,65 @@ impl<B: PaneBackend> App<B> {
         if !layout::split_pane(&mut tab.layout, focused, id, dir) {
             tab.layout = LayoutNode::Pane(id);
         }
-        self.focused = id;
+        self.set_focus(id);
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
+        }
+    }
+
+    /// P10: move roost's focus to `id`, telling the panes involved.
+    ///
+    /// THE single writer of `self.focused` — every focus move in roost
+    /// (arrows, click, tab switch, spawn, undo, float show/hide, the
+    /// attention ring) funnels through here, so a pane that subscribed to
+    /// focus reporting can never miss a transition because some new code
+    /// path assigned the field directly. A no-op move sends nothing: `CSI O`
+    /// followed by `CSI I` for "focus stayed put" is a lie an editor would
+    /// act on (nvim's `FocusGained` autoread re-stats every buffer).
+    ///
+    /// Nothing is sent while roost's own window is blurred — see
+    /// `host_focused`. The reports are written with `write_input_raw`, not
+    /// `write_input`: they are roost speaking, not the user typing, and
+    /// yanking a scrolled-back pane to its live tail because focus moved
+    /// would undo exactly what U9 fixed.
+    fn set_focus(&mut self, id: PaneId) {
+        let old = self.focused;
+        self.focused = id;
+        // Nothing inside roost is focused while roost isn't: the old pane
+        // was already told it lost focus when the window blurred, and the
+        // new one collects its `CSI I` when the window comes back.
+        if old == id || !self.host_focused {
+            return;
+        }
+        self.report_focus(old, false);
+        self.report_focus(id, true);
+    }
+
+    /// P10: roost's own window gained/lost the host terminal's focus. The
+    /// host event is about roost as a whole; inside roost exactly one pane
+    /// holds focus, so it is that pane's event too. Idempotent — terminals
+    /// repeat focus events freely (a window manager can re-assert focus on
+    /// every raise), and a duplicate `CSI I` is a spurious wakeup.
+    pub fn on_host_focus(&mut self, focused: bool) {
+        if self.host_focused == focused {
+            return;
+        }
+        self.host_focused = focused;
+        self.report_focus(self.focused, focused);
+    }
+
+    /// P10: send one focus report to `id` — `CSI I` (gained) or `CSI O`
+    /// (lost) — but only if that pane's app asked for them with `?1004h`.
+    /// A pane that never subscribed gets nothing: to it these bytes are
+    /// input, and `\x1b[I` typed into a shell is a live command edit.
+    /// Whether a *transition* is worth reporting at all is the callers'
+    /// call (`set_focus` / `on_host_focus`); this only addresses it.
+    fn report_focus(&mut self, id: PaneId, gained: bool) {
+        let bytes: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            if rt.focus_events() {
+                rt.write_input_raw(bytes);
+            }
         }
     }
 
@@ -2326,7 +2402,7 @@ impl<B: PaneBackend> App<B> {
         }
         let rects = self.rects();
         if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
-            self.focused = id;
+            self.set_focus(id);
             layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         }
     }
@@ -2401,7 +2477,7 @@ impl<B: PaneBackend> App<B> {
         if !layout::split_pane(&mut tab.layout, split_target, id, dir) {
             tab.layout = LayoutNode::Pane(id); // empty tab fallback (now only for a genuinely-empty tab)
         }
-        self.focused = id;
+        self.set_focus(id);
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
@@ -2485,7 +2561,7 @@ impl<B: PaneBackend> App<B> {
         });
         self.ws.active_tab = self.ws.tabs.len() - 1;
         self.spawn_active_tab();
-        self.focused = id;
+        self.set_focus(id);
     }
 
     /// U11: snapshot where focus sits in the tab we're about to leave, so
@@ -2531,10 +2607,11 @@ impl<B: PaneBackend> App<B> {
         self.spawn_active_tab();
         // U11: land on the pane this tab was left on; a first visit (or a
         // remembered pane that has since closed) falls back to its first.
-        self.focused = self
+        let target = self
             .tab_focus_target(i)
             .or_else(|| self.pane_order().first().copied())
             .unwrap_or(self.focused);
+        self.set_focus(target);
     }
 
     /// U7: step `delta` tabs, wrapping at both ends — Alt+m forward, Alt+i
@@ -2641,7 +2718,7 @@ impl<B: PaneBackend> App<B> {
                 f.prev_focus = from;
             }
         }
-        self.focused = target;
+        self.set_focus(target);
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
     }
 
@@ -2723,12 +2800,17 @@ impl<B: PaneBackend> App<B> {
             self.set_flash("no room for float");
             return;
         }
-        match &mut self.float {
-            Some(f) => {
-                f.shown = true;
-                f.prev_focus = self.focused;
-                self.focused = f.id;
-            }
+        // The float's id comes out of the borrow before `set_focus` runs:
+        // that call needs all of `self` (the report it may send goes to the
+        // runtimes map), which `&mut self.float` would still be holding.
+        let prev = self.focused;
+        let show = self.float.as_mut().map(|f| {
+            f.shown = true;
+            f.prev_focus = prev;
+            f.id
+        });
+        match show {
+            Some(id) => self.set_focus(id),
             None => self.spawn_float(),
         }
     }
@@ -2748,7 +2830,7 @@ impl<B: PaneBackend> App<B> {
             spawned_by: None,
         };
         self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
-        self.focused = id;
+        self.set_focus(id);
         // display_rects, not rects: the float isn't in the tiled tree, so
         // only the zoom-aware/float-aware display list knows its rect.
         if let Some(pr) = self.display_rects().iter().find(|pr| pr.id == id).copied() {
@@ -2768,7 +2850,7 @@ impl<B: PaneBackend> App<B> {
         }
         f.shown = false;
         let back = f.prev_focus;
-        self.focused = if self.ws.active_tab().panes.contains_key(&back) {
+        let target = if self.ws.active_tab().panes.contains_key(&back) {
             back
         } else {
             // prev_focus may have been closed via the control plane while
@@ -2776,6 +2858,7 @@ impl<B: PaneBackend> App<B> {
             // same recovery `close_pane_id` uses.
             self.pane_order().first().copied().unwrap_or(0)
         };
+        self.set_focus(target);
     }
 
     /// C22 rule 4: Alt+w on the float kills it for real and clears the slot
@@ -2789,11 +2872,12 @@ impl<B: PaneBackend> App<B> {
         self.dead.remove(&f.id);
         self.pending_input.remove(&f.id);
         self.raw.remove(&f.id);
-        self.focused = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
+        let target = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
             f.prev_focus
         } else {
             self.pane_order().first().copied().unwrap_or(0)
         };
+        self.set_focus(target);
         self.set_flash("scratch closed");
     }
 
@@ -5141,6 +5225,119 @@ mod tests {
         app.on_click(1);
         assert_eq!(app.focused, 1);
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { expanded: 0, .. }));
+    }
+
+    // -- P10: focus reporting (DECSET 1004) ---------------------------------
+
+    /// Two panes, both spawned, with `input` cleared so only what the focus
+    /// machinery writes is left. `subscribed` says which of them ran
+    /// `?1004h`. Returns the app with pane 2 focused (the split's new pane).
+    fn focus_fixture(sub1: bool, sub2: bool) -> App<FakePane> {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // pane 2, now focused
+        for (id, sub) in [(1, sub1), (2, sub2)] {
+            let rt = app.runtimes.get_mut(&id).expect("pane spawned");
+            rt.focus_events = sub;
+            rt.input.clear();
+        }
+        app
+    }
+
+    fn pane_input(app: &App<FakePane>, id: PaneId) -> Vec<u8> {
+        app.runtimes[&id].input.clone()
+    }
+
+    /// P10: the whole point — moving roost's focus tells the pane that lost
+    /// it `CSI O` and the pane that gained it `CSI I`. Before this, a pane
+    /// running `?1004h` saw nothing across a focus round-trip, so vim's
+    /// autoread and every dim-on-blur TUI stayed asleep inside roost.
+    #[test]
+    fn a_focus_move_sends_o_to_the_pane_leaving_and_i_to_the_pane_arriving() {
+        let mut app = focus_fixture(true, true);
+        app.apply(Action::Focus(layout::Dir::Left)); // 2 → 1
+        assert_eq!(app.focused, 1);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec(), "the pane losing focus is told");
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec(), "the pane gaining focus is told");
+        // ...and back the other way, symmetrically.
+        app.apply(Action::Focus(layout::Dir::Right)); // 1 → 2
+        assert_eq!(pane_input(&app, 1), b"\x1b[I\x1b[O".to_vec());
+        assert_eq!(pane_input(&app, 2), b"\x1b[O\x1b[I".to_vec());
+    }
+
+    /// P10: a pane that never sent `?1004h` gets *nothing*. To it these
+    /// bytes are keystrokes — `\x1b[I` typed at a shell prompt is a live
+    /// command edit, which is why "just send it to everyone" is not an
+    /// option.
+    #[test]
+    fn a_pane_that_never_subscribed_is_sent_no_focus_reports() {
+        let mut app = focus_fixture(false, false);
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert!(pane_input(&app, 1).is_empty());
+        assert!(pane_input(&app, 2).is_empty());
+        // Mixed fleet: only the subscriber hears about the same move.
+        let mut app = focus_fixture(true, false);
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec());
+        assert!(pane_input(&app, 2).is_empty(), "an unsubscribed pane hears nothing");
+    }
+
+    /// P10: focus that doesn't actually move reports nothing. `CSI O` then
+    /// `CSI I` for "you still have focus" is a lie an editor acts on
+    /// (nvim re-stats every buffer on FocusGained).
+    #[test]
+    fn a_focus_move_that_goes_nowhere_reports_nothing() {
+        let mut app = focus_fixture(true, true);
+        // Pane 2 is the right half of the split: there is nothing to its
+        // right, so the move is refused and focus stays put.
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.focused, 2);
+        assert!(pane_input(&app, 1).is_empty());
+        assert!(pane_input(&app, 2).is_empty());
+    }
+
+    /// P10: the host's own focus event belongs to whichever pane is focused
+    /// inside roost — and only to it. Repeats are swallowed: window managers
+    /// re-assert focus freely and a duplicate `CSI I` is a spurious wakeup.
+    #[test]
+    fn host_focus_events_go_to_the_focused_pane_and_never_repeat() {
+        let mut app = focus_fixture(true, true);
+        app.on_host_focus(false);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec());
+        assert!(pane_input(&app, 1).is_empty(), "an unfocused pane isn't the window");
+        app.on_host_focus(false); // duplicate
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec());
+        app.on_host_focus(true);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O\x1b[I".to_vec());
+    }
+
+    /// P10: while roost's window is blurred nothing inside it is focused, so
+    /// pane-level moves stay silent — and the pane that ends up focused
+    /// collects its `CSI I` when the window comes back, not before.
+    #[test]
+    fn pane_focus_moves_stay_silent_while_the_window_is_blurred() {
+        let mut app = focus_fixture(true, true);
+        app.on_host_focus(false);
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec());
+        app.apply(Action::Focus(layout::Dir::Left)); // 2 → 1, window blurred
+        assert_eq!(app.focused, 1, "focus still moves; only the reporting waits");
+        assert!(pane_input(&app, 1).is_empty());
+        assert_eq!(pane_input(&app, 2), b"\x1b[O".to_vec(), "no second O for the old pane");
+        app.on_host_focus(true);
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec(), "the now-focused pane is told");
+    }
+
+    /// P10: the reports are roost speaking, not the user typing — they must
+    /// not snap a scrolled-back pane to its live tail (`write_input` does,
+    /// `write_input_raw` doesn't; U9's frozen view depends on the
+    /// difference).
+    #[test]
+    fn a_focus_report_does_not_yank_a_scrolled_pane_back_to_the_tail() {
+        let mut app = focus_fixture(true, true);
+        app.wheel_scroll(1, 7);
+        assert_eq!(app.runtimes[&1].scroll_offset(), 7);
+        app.apply(Action::Focus(layout::Dir::Left)); // pane 1 gains focus
+        assert_eq!(pane_input(&app, 1), b"\x1b[I".to_vec());
+        assert_eq!(app.runtimes[&1].scroll_offset(), 7, "the frozen view survives");
     }
 
     #[test]

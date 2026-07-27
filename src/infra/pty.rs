@@ -443,6 +443,14 @@ impl PaneBackend for PtyPane {
         self.parser.screen().alternate_screen()
     }
 
+    /// P10: read off the *live* grid, not the presented frame, for exactly
+    /// the reason above — a focus subscription is input-protocol state the
+    /// app owns right now, and a stale picture of the screen could deny a
+    /// pane the reports it just asked for.
+    fn focus_events(&self) -> bool {
+        self.parser.screen().focus_events()
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         // Typing means "I'm back" — snap to the live tail.
         if self.scroll != 0 {

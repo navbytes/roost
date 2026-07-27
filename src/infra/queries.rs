@@ -20,7 +20,8 @@
 //! - DSR 5 (status) → `CSI 0n`; DSR 6 (cursor position) →
 //!   `CSI {row+1};{col+1}R` from the pane screen's current cursor.
 //! - DECRQM `CSI ? Pd $p` → `CSI ? Pd;{value} $y` for the modes the vt100
-//!   screen actually tracks (1 DECCKM, 25 DECTCEM, 2004 bracketed paste);
+//!   screen actually tracks (1 DECCKM, 25 DECTCEM, 1004 focus reporting,
+//!   2004 bracketed paste, 2026 synchronized output);
 //!   every untracked mode honestly reports 0 ("not recognized") rather than
 //!   affirming state roost doesn't hold.
 //! - XTVERSION `CSI > q` → `DCS >|roost {version} ST`.
@@ -289,6 +290,16 @@ fn decrqm_value(mode: u16, screen: &vt100::Screen) -> u8 {
                 1
             }
         }
+        // P10: focus reporting. roost delivers `CSI I`/`CSI O` to panes that
+        // subscribe, so this joins the honestly-answerable set — an app that
+        // probes before trusting the mode now gets a yes it can act on.
+        1004 => {
+            if screen.focus_events() {
+                1
+            } else {
+                2
+            }
+        }
         // Bracketed paste.
         2004 => {
             if screen.bracketed_paste() {
@@ -450,10 +461,15 @@ mod tests {
             (b"", b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
             (b"\x1b[?2026h", b"\x1b[?2026$p", b"\x1b[?2026;1$y"),
             (b"\x1b[?2026h\x1b[?2026l", b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
-            // Still untracked — 1004 (focus reporting), and 1049 (alt screen
-            // is tracked by vt100 but not contracted here) → 0, "not
-            // recognized": never affirm state roost doesn't hold.
-            (b"", b"\x1b[?1004$p", b"\x1b[?1004;0$y"),
+            // P10: focus reporting is tracked now — reset by default, set
+            // after ?1004h. (Pre-P10 this reported 0, "not recognized".)
+            (b"", b"\x1b[?1004$p", b"\x1b[?1004;2$y"),
+            (b"\x1b[?1004h", b"\x1b[?1004$p", b"\x1b[?1004;1$y"),
+            (b"\x1b[?1004h\x1b[?1004l", b"\x1b[?1004$p", b"\x1b[?1004;2$y"),
+            // Still untracked — 1049 (alt screen is tracked by vt100 but not
+            // contracted here) → 0, "not recognized": never affirm state
+            // roost doesn't hold.
+            (b"", b"\x1b[?1049$p", b"\x1b[?1049;0$y"),
         ];
         for (setup, query, reply) in cases {
             let mut p = blank();

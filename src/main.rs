@@ -17,9 +17,9 @@ mod ui;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use std::sync::mpsc;
@@ -69,6 +69,14 @@ fn main() -> Result<()> {
     // The guards are re-applied per pane in `App::forward_paste`, but only
     // for panes whose app actually switched mode 2004 on.
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // P10: ask the host to report when roost's own window gains/loses focus
+    // (DEC private mode 1004). roost forwards that to the focused pane, and
+    // synthesizes the same reports when focus moves *between* panes, so a
+    // pane app that subscribed sees focus changes at both levels — vim's
+    // autoread, a TUI that dims when unfocused, the agent CLIs. A host that
+    // doesn't support the mode simply never sends the events; nothing else
+    // depends on them (see `App::host_focused`).
+    let _ = execute!(std::io::stdout(), EnableFocusChange);
     // Negotiate the enhanced (kitty) keyboard protocol so Shift+Enter and
     // Ctrl+Enter arrive as distinct key events — a bare terminal collapses
     // both to a plain CR, making "newline vs submit" impossible to tell apart.
@@ -102,7 +110,8 @@ fn main() -> Result<()> {
     // here — and popping with nothing pushed is a no-op terminals ignore
     // (the panic hook already relies on exactly that).
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    let _ =
+        execute!(std::io::stdout(), DisableBracketedPaste, DisableFocusChange, DisableMouseCapture);
     // P7: hand the cursor back the way the user's terminal had it — a pane's
     // insert bar must not outlive roost.
     let _ = execute!(std::io::stdout(), cursor_style(None));
@@ -186,6 +195,10 @@ fn install_panic_hook() {
             std::io::stdout(),
             PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
+            // P10: and the focus reporting roost switched on, for the same
+            // reason — a crash must not leave the user's shell being told
+            // about every focus change by a terminal nobody is listening to.
+            DisableFocusChange,
             DisableMouseCapture
         );
         // P7: and the cursor shape a pane may have installed, for the same
@@ -306,6 +319,11 @@ fn run(
                         }
                     }
                     Event::Mouse(me) => handle_mouse(&mut app, me),
+                    // P10: roost's window changed focus — the focused pane
+                    // owns that event (inside roost, exactly one pane has
+                    // focus), and only if it subscribed.
+                    Event::FocusGained => app.on_host_focus(true),
+                    Event::FocusLost => app.on_host_focus(false),
                     // Coalesce: act on the true size once, after draining.
                     Event::Resize(..) => resized = true,
                     // U8(b): a modal owns the paste — into the rename buffer,

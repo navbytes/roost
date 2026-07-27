@@ -8,6 +8,10 @@ const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
 // roost: synchronized output, DEC private mode 2026 (SPEC-parity P1).
 const MODE_SYNCHRONIZED_OUTPUT: u8 = 0b0010_0000;
+// roost: focus reporting, DEC private mode 1004 (SPEC-parity P10). Purely a
+// subscription flag — nothing about the grid changes when it is set; the
+// embedder reads it to decide whether this pane is owed `CSI I`/`CSI O`.
+const MODE_FOCUS_EVENT: u8 = 0b0100_0000;
 
 /// A side effect the processed byte stream asked for that an in-memory
 /// screen cannot carry out itself: it needs the *embedder* — the thing that
@@ -844,6 +848,20 @@ impl Screen {
         self.mode(MODE_SYNCHRONIZED_OUTPUT)
     }
 
+    /// Returns whether the application asked to be told about focus changes
+    /// (DEC private mode 1004, `CSI ?1004h` … `CSI ?1004l`) — i.e. whether
+    /// it expects `CSI I` on focus-in and `CSI O` on focus-out.
+    ///
+    /// The screen only *records* the subscription: it has no idea what has
+    /// focus, so producing the reports is the embedder's job. An application
+    /// that never asked must never be sent them (the bytes would land in its
+    /// stdin as garbage input).
+    // roost: added for SPEC-parity P10.
+    #[must_use]
+    pub fn focus_events(&self) -> bool {
+        self.mode(MODE_FOCUS_EVENT)
+    }
+
     /// Takes (clearing) the screen as it stood the instant the current
     /// synchronized-output bracket opened. `Some` exactly once per bracket
     /// that opened in the bytes processed since the last call; the caller
@@ -1550,6 +1568,10 @@ impl Screen {
                     self.set_mouse_mode(MouseProtocolMode::ButtonMotion);
                 }
                 &[1003] => self.set_mouse_mode(MouseProtocolMode::AnyMotion),
+                // roost: focus reporting (SPEC-parity P10) — the app wants
+                // `CSI I`/`CSI O` when it gains/loses focus. Recorded here,
+                // acted on by the embedder (see `focus_events`).
+                &[1004] => self.set_mode(MODE_FOCUS_EVENT),
                 &[1005] => {
                     self.set_mouse_encoding(MouseProtocolEncoding::Utf8);
                 }
@@ -1622,6 +1644,8 @@ impl Screen {
                 &[1003] => {
                     self.clear_mouse_mode(MouseProtocolMode::AnyMotion);
                 }
+                // roost: end of the focus-reporting subscription (P10).
+                &[1004] => self.clear_mode(MODE_FOCUS_EVENT),
                 &[1005] => {
                     self.clear_mouse_encoding(MouseProtocolEncoding::Utf8);
                 }
@@ -2197,6 +2221,34 @@ fn osc_param_str(params: &[&[u8]]) -> String {
 mod roost_tests {
     fn parser() -> crate::Parser {
         crate::Parser::new(6, 20, 50)
+    }
+
+    // -- focus reporting, mode 1004 (SPEC-parity P10) ---------------------
+
+    #[test]
+    fn mode_1004_tracks_set_and_reset() {
+        let mut p = parser();
+        assert!(!p.screen().focus_events(), "nobody is subscribed by default");
+        p.process(b"\x1b[?1004h");
+        assert!(p.screen().focus_events());
+        p.process(b"\x1b[?1004l");
+        assert!(!p.screen().focus_events());
+    }
+
+    #[test]
+    fn mode_1004_is_independent_of_the_other_modes_and_leaves_the_grid_alone() {
+        let mut p = parser();
+        p.process(b"hello\x1b[?1004h");
+        // A subscription changes nothing about what is on screen...
+        assert!(p.screen().contents().contains("hello"));
+        // ...and shares no bit with its neighbours in the mode word.
+        assert!(p.screen().focus_events());
+        assert!(!p.screen().bracketed_paste());
+        assert!(!p.screen().synchronized_output());
+        assert!(!p.screen().application_cursor());
+        p.process(b"\x1b[?2004h\x1b[?1004l");
+        assert!(p.screen().bracketed_paste());
+        assert!(!p.screen().focus_events(), "?1004l must not disturb ?2004");
     }
 
     // -- synchronized output, mode 2026 (SPEC-parity P1) ------------------

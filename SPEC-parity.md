@@ -284,7 +284,16 @@ events; `less` screen byte-identical). tmux #1333 → #4952 is this exact saga.
 to 3× arrow keys per tick (the DECSET 1007 convention). All needed state is
 already exposed on the backend.
 
-### P10 · CONFIRMED · Med — focus reporting (?1004) absent at all three layers
+### P10 · FIXED (this branch) · Med — focus reporting (?1004) absent at all three layers
+*Fixed at all three: the vendored parser tracks mode 1004 (`Screen::focus_events`,
+DECRQM now answers it honestly), `main` enables/disables host focus events
+alongside mouse+paste+kitty (panic hook included), and `App::set_focus` — now
+the single writer of `focused` — sends `CSI O` to the pane leaving and `CSI I`
+to the pane arriving, to subscribers only, via `write_input_raw` so a scrolled
+view survives. A blurred window withholds pane-level reports; the focused pane
+collects its `CSI I` when the window returns. e2e `tests/pane_focus.rs`: a
+`?1004h` + `cat -v` pane saw neither `^[[O` nor `^[[I` across a focus
+round-trip before, both after.*
 roost never enables host focus events, has no FocusGained/Lost arms, doesn't
 parse `?1004h` from panes, and synthesizes nothing on pane switches —
 verified end to end (a `?1004h` pane saw no `CSI I`/`CSI O` across a focus
