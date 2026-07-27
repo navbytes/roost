@@ -153,7 +153,7 @@ protect.
 **Proposed contract:** keep the old session id until the fresh session produces
 a new one, or guard `f` with the same second-press confirm as busy-close.
 
-### U11 · Med · CODE-VERIFIED (zoom kill VERIFIED) — same-tab digit resets state; no per-tab focus memory
+### U11 · Med · FIXED (this branch) — same-tab digit resets state; no per-tab focus memory
 Live QA confirmed the observable half: pressing Alt+1 while already on tab 1
 exited zoom. The same unguarded `go_to_tab` path resets focus to the tab's
 first pane and hides the float, and tab switches always land on the first pane
@@ -161,6 +161,15 @@ first pane and hides the float, and tab switches always land on the first pane
 the first pane, so those halves are pinned by code, not frames.
 **Proposed contract:** same-tab digit is a no-op; each tab remembers
 `last_focused` (session-only) and returns to it.
+**Fixed:** `go_to_tab` returns immediately when the target is already
+active — zoom, the float and focus all survive — and a real switch now
+snapshots the tab it leaves (`remember_tab_focus`) and restores the tab it
+enters (`tab_focus_target`), falling back to the first pane only when a tab
+has no memory yet or its remembered pane has closed. The memory is a set of
+pane ids rather than a per-index map, so it travels with a tab across close /
+reorder / undo instead of with the index it happened to occupy (a closed pane
+is forgotten, since ids are recycled); landing on a tab because another one
+closed honors it too (C2 amended 2026-07-27).
 
 ### U12 · Med · FIXED (this branch) — `◆ NeedsInput` panes close without the busy guard
 The Alt+w confirm checks only `Working`; an agent blocked on your approval is

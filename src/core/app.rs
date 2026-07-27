@@ -249,6 +249,16 @@ pub struct App<B: PaneBackend> {
     /// C23: panes currently in raw (hard pass-through) mode, by id.
     /// Per-pane, session-only — never persisted.
     raw: HashSet<PaneId>,
+    /// U11: the pane each tab returns focus to when you come back to it —
+    /// session-only, never persisted. Held as a **set of pane ids** rather
+    /// than a map keyed by tab index, because `ws.tabs` has no stable
+    /// identity and indexes shift on close/reorder/undo: a tab's entry is
+    /// simply the one remembered id that tab still owns (pane ids are
+    /// unique workspace-wide), so a vanished tab can never hand its memory
+    /// to a different one. The invariant "at most one entry per tab" is
+    /// maintained by `remember_tab_focus`, and `close_pane_id` forgets a
+    /// closed pane so a recycled id can't resurrect a stale memory.
+    tab_focus: HashSet<PaneId>,
     /// C24: text most recently yanked via the keyboard copy-mode `y`/`Enter`
     /// chord, waiting for the composition root to hand it to the OS
     /// clipboard — core has no I/O of its own (module doc). The mouse path
@@ -316,6 +326,7 @@ impl<B: PaneBackend> App<B> {
             feed: VecDeque::new(),
             float: None,
             raw: HashSet::new(),
+            tab_focus: HashSet::new(),
             pending_yank: None,
         };
         app.spawn_active_tab();
@@ -1393,6 +1404,10 @@ impl<B: PaneBackend> App<B> {
         self.raw.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
+        // U11: a closed pane is no longer anyone's focus memory — pane ids
+        // are recycled (`next_pane_id` is a max+1), so a stale entry could
+        // otherwise be inherited by an unrelated pane in another tab.
+        self.tab_focus.remove(&id);
         let empty = layout::remove_pane(&mut tab.layout, id);
         if empty && self.ws.tabs.len() > 1 {
             self.ws.tabs.remove(ti);
@@ -1425,9 +1440,15 @@ impl<B: PaneBackend> App<B> {
         // The active tab's membership may have changed out from under
         // `focused` (its pane closed, or its tab shifted/removed above) —
         // keep focus inside whatever tab is now on screen rather than
-        // routing keystrokes to a pane in a tab nobody's looking at.
+        // routing keystrokes to a pane in a tab nobody's looking at. U11:
+        // being moved onto a tab is a tab switch like any other, so honor
+        // that tab's focus memory before falling back to its first pane.
         if !self.ws.active_tab().panes.contains_key(&self.focused) {
-            self.focused = self.pane_order().first().copied().unwrap_or(0);
+            let active = self.ws.active_tab;
+            self.focused = self
+                .tab_focus_target(active)
+                .or_else(|| self.pane_order().first().copied())
+                .unwrap_or(0);
         }
         true
     }
@@ -1999,6 +2020,7 @@ impl<B: PaneBackend> App<B> {
         match closed {
             Closed::Tab { index, tab } => {
                 let name = tab.name.clone();
+                self.remember_tab_focus(); // U11: reopening a tab leaves this one
                 let i = index.min(self.ws.tabs.len());
                 self.ws.tabs.insert(i, tab);
                 self.ws.active_tab = i;
@@ -2210,6 +2232,7 @@ impl<B: PaneBackend> App<B> {
     fn new_tab(&mut self) {
         self.exit_zoom(); // C21: any tab change exits zoom
         self.hide_float(); // C22 rule 2: "any tab change" hides the float too
+        self.remember_tab_focus(); // U11: Alt+t leaves a tab like any switch
         let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
@@ -2224,14 +2247,53 @@ impl<B: PaneBackend> App<B> {
         self.focused = id;
     }
 
-    fn go_to_tab(&mut self, i: usize) {
-        if i < self.ws.tabs.len() {
-            self.exit_zoom(); // C21: any (real) tab change exits zoom
-            self.hide_float(); // C22 rule 2: any tab change hides the float
-            self.ws.active_tab = i;
-            self.spawn_active_tab();
-            self.focused = self.pane_order().first().copied().unwrap_or(self.focused);
+    /// U11: snapshot where focus sits in the tab we're about to leave, so
+    /// coming back returns here. Called with `ws.active_tab` still pointing
+    /// at the tab being left. Clearing that tab's panes out of the set
+    /// first keeps the "at most one entry per tab" invariant `tab_focus`
+    /// relies on; the float (which belongs to no tab) is never stored.
+    fn remember_tab_focus(&mut self) {
+        let focused = self.focused;
+        let ids: Vec<PaneId> = self.ws.active_tab().panes.keys().copied().collect();
+        if !ids.contains(&focused) {
+            return; // the float, or a tab mid-edit — nothing honest to store
         }
+        for id in ids {
+            self.tab_focus.remove(&id);
+        }
+        self.tab_focus.insert(focused);
+    }
+
+    /// U11: the pane tab `i` should return focus to — its remembered pane
+    /// if that pane is still alive in it, else None (callers fall back to
+    /// the tab's first pane).
+    fn tab_focus_target(&self, i: usize) -> Option<PaneId> {
+        let tab = self.ws.tabs.get(i)?;
+        tab.panes.keys().find(|id| self.tab_focus.contains(id)).copied()
+    }
+
+    fn go_to_tab(&mut self, i: usize) {
+        if i >= self.ws.tabs.len() {
+            return;
+        }
+        // U11: the digit for the tab you're already on is a no-op. It used
+        // to run the whole switch: live QA pressed Alt+1 on tab 1 and lost
+        // zoom, and the same path hid the float and reset focus to the
+        // tab's first pane — a "switch" to nowhere, destroying view state.
+        if i == self.ws.active_tab {
+            return;
+        }
+        self.exit_zoom(); // C21: any (real) tab change exits zoom
+        self.hide_float(); // C22 rule 2: any tab change hides the float
+        self.remember_tab_focus(); // after hide_float: never store the float
+        self.ws.active_tab = i;
+        self.spawn_active_tab();
+        // U11: land on the pane this tab was left on; a first visit (or a
+        // remembered pane that has since closed) falls back to its first.
+        self.focused = self
+            .tab_focus_target(i)
+            .or_else(|| self.pane_order().first().copied())
+            .unwrap_or(self.focused);
     }
 
     /// C21: leave zoom (a pure view flag). Called by every documented exit
@@ -4766,6 +4828,127 @@ mod tests {
         assert!(app.zoomed());
         app.apply(Action::GoToTab(0));
         assert!(!app.zoomed());
+    }
+
+    // ---- U11: per-tab focus memory + same-tab digit ----------------------
+
+    /// The digit for the tab you're already on changes nothing: zoom, the
+    /// float and focus all survive. (Live QA: Alt+1 on tab 1 exited zoom;
+    /// the same path also hid the float and reset focus to the first pane.)
+    #[test]
+    fn a_same_tab_digit_is_a_no_op_and_keeps_zoom_float_and_focus() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2 in tab 0, focus 2
+        app.apply(Action::ToggleZoom);
+        let focused = app.focused;
+        app.apply(Action::GoToTab(0)); // already here
+        assert!(app.zoomed(), "the same-tab digit must not exit zoom");
+        assert_eq!(app.focused, focused, "...nor reset focus to the first pane");
+
+        app.apply(Action::ToggleZoom); // leave zoom, raise the float instead
+        app.apply(Action::ToggleFloat);
+        let float = app.focused;
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, float, "the same-tab digit must not hide the float");
+        // An out-of-range digit stays the silent no-op it always was.
+        app.apply(Action::GoToTab(9));
+        assert_eq!(app.focused, float);
+    }
+
+    /// Each tab returns to the pane it was left on, both ways, repeatedly.
+    #[test]
+    fn each_tab_returns_focus_to_the_pane_it_was_left_on() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 0: panes 1 | 2
+        let tab0 = app.focused; // 2 — deliberately not the first pane
+        app.apply(Action::NewTab); // tab 1
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // tab 1: three panes
+        let tab1 = app.focused;
+        assert_ne!(tab0, tab1);
+
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, tab0, "tab 0 must return to the pane it was left on");
+        app.apply(Action::GoToTab(1));
+        assert_eq!(app.focused, tab1, "tab 1 likewise");
+        // ...and the memory keeps tracking, not just the first round trip.
+        app.apply(Action::Focus(layout::Dir::Up));
+        let moved = app.focused;
+        assert_ne!(moved, tab1);
+        app.apply(Action::GoToTab(0));
+        app.apply(Action::GoToTab(1));
+        assert_eq!(app.focused, moved);
+    }
+
+    /// A first visit — and a tab whose remembered pane has since closed —
+    /// falls back to the tab's first pane, never to a stale or foreign id.
+    #[test]
+    fn tab_focus_falls_back_to_the_first_pane_when_the_memory_is_gone() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 0: panes 1 | 2, focus 2
+        app.apply(Action::NewTab); // tab 1 — never visited before
+        assert_eq!(app.focused, 3, "a brand-new tab focuses its own pane");
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, 2);
+        // Close the remembered pane from the other side, then come back.
+        app.apply(Action::GoToTab(1));
+        let removed = app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Close { pane: 2, force: true },
+        });
+        assert!(matches!(removed, Reply::Ok { .. }), "{removed:?}");
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, 1, "a closed memory falls back to the tab's first pane");
+    }
+
+    /// Closing a tab shifts every later index down — the memory must follow
+    /// the tab, not the index it happened to sit at.
+    #[test]
+    fn tab_focus_memory_survives_a_tab_closing_ahead_of_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // tab 1
+        app.apply(Action::NewTab); // tab 2
+        app.apply(Action::NewPane); // tab 2: two panes
+        let remembered = app.focused;
+        app.apply(Action::GoToTab(0));
+        // Close tab 1 outright: tab 2's panes shift down to index 1.
+        app.apply(Action::GoToTab(1));
+        let doomed = app.focused;
+        app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Close { pane: doomed, force: true },
+        });
+        assert_eq!(app.ws.tabs.len(), 2, "the emptied tab is gone");
+        // Being moved onto the surviving tab honors its memory...
+        assert_eq!(app.focused, remembered, "landing on a tab uses its memory");
+        // ...and so does a deliberate switch back, at its new index.
+        app.apply(Action::GoToTab(0));
+        app.apply(Action::GoToTab(1)); // the tab formerly known as 2
+        assert_eq!(app.focused, remembered, "the memory travelled with the tab");
+    }
+
+    /// Undo reopens a closed tab with fresh pane ids, so there is nothing
+    /// to remember — it must land on the reopened tab's first pane and
+    /// leave every other tab's memory intact.
+    #[test]
+    fn reopening_a_closed_tab_lands_on_its_first_pane_and_leaks_no_memory() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 0: panes 1 | 2
+        let tab0 = app.focused;
+        app.apply(Action::NewTab); // tab 1, pane 3
+        let doomed = app.focused;
+        app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Close { pane: doomed, force: true },
+        });
+        assert_eq!(app.ws.tabs.len(), 1);
+        app.apply(Action::Undo);
+        assert_eq!(app.ws.tabs.len(), 2);
+        assert_eq!(app.ws.active_tab, 1);
+        let reopened = app.pane_order().first().copied().unwrap();
+        assert_eq!(app.focused, reopened, "the reopened tab lands on its first pane");
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, tab0, "the surviving tab kept its own memory");
     }
 
     #[test]

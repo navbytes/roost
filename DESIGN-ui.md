@@ -191,6 +191,23 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
 - Mouse unit tests (`mouse.rs:250–260`) are rewritten to the new offsets **in
   the same change** as the renderer (lockstep rule, §4).
 
+**[Amended 2026-07-27, SPEC-ux U11 — what a tab switch means]** The bar shows
+tabs; these two rules say what selecting one does, and they hold for every
+selector (digit, click, `Alt+a`'s cross-tab jump, being moved onto a tab when
+another closes):
+- **Selecting the active tab is a no-op.** Not "a switch that happens to end
+  where it started": `go_to_tab` returns before touching anything. Live QA
+  pressed Alt+1 while on tab 1 and lost zoom; the same path also hid the
+  float and reset focus to the tab's first pane. Out-of-range digits stay the
+  silent no-op they were.
+- **Each tab returns focus to the pane it was left on** (`App::tab_focus`,
+  session-only, never persisted — a fresh launch starts on each tab's first
+  pane). Fallback to the tab's first pane when a tab has no memory yet or its
+  remembered pane has since closed. The memory is held as a set of pane ids,
+  not a map keyed by tab index: `ws.tabs` has no stable identity and indexes
+  shift on close/reorder/undo, so a tab's entry is the one remembered id that
+  tab still owns — a vanished tab can never hand its memory to another.
+
 ### C3 — Pane borders
 
 **Current:** `render.rs:344–351` — focused = status-colored + BOLD, unfocused
