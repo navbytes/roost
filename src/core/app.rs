@@ -67,6 +67,82 @@ pub enum Mode {
     /// C20 activity-feed overlay; `offset` counts entries back from the
     /// newest (0 = live tail).
     Feed { offset: usize },
+    /// P21: the incremental scrollback-search prompt, opened with `/` from
+    /// Scroll or Copy mode. The search itself lives on `App::search` (it
+    /// outlives the prompt — `n`/`N` keep working after Enter); this only
+    /// carries what Enter and Esc need to hand the mode back: the copy
+    /// cursor to restore, or `None` for "came from Scroll mode".
+    Search { copy_cursor: Option<(u16, u16)> },
+}
+
+/// P21: one incremental search over a pane's scrollback + screen.
+///
+/// The haystack is captured **once**, when the search opens, so every
+/// keystroke re-filters a frozen buffer instead of racing the pane's live
+/// output — and so the line indices below mean the same thing from the
+/// first character typed to the last `n`. Line `i` of the haystack is the
+/// `i`-th row of the pane's whole history (`grab_all_text`, one line per
+/// grid row), which sits `total - i` rows above the live tail.
+///
+/// Bounded staleness, deliberately accepted: if the pane banks enough new
+/// output during the search to evict rows off the *front* of a full
+/// scrollback ring, capture-time indices drift by however many rows were
+/// dropped, so a jump can land a few rows off. What it can never do is lie
+/// about where the view ended up — every jump writes through
+/// `set_scrollback` and re-reads the grid-clamped result (U9), so the `↑N`
+/// badge and Scroll mode's `↑N/M` stay true whatever the arithmetic asked
+/// for. A **resize** is the one drift roost does not accept: P5's reflow
+/// rewraps the grid wholesale, so `App::refresh_search` re-captures rather
+/// than letting the indices rot (see there).
+#[derive(Debug, Clone)]
+pub struct Search {
+    /// The pane this search is about. Its offsets are meaningless anywhere
+    /// else, so leaving the pane ends the search.
+    pub pane: PaneId,
+    /// What has been typed so far. Empty = nothing to match yet.
+    pub query: String,
+    /// The pane's whole history + screen at open time, one entry per row.
+    lines: Vec<String>,
+    /// Rows banked at open time — the anchor that turns a line index into a
+    /// scrollback offset.
+    total: usize,
+    /// Every hit in reading order (oldest first): (line index, char column).
+    pub matches: Vec<(usize, usize)>,
+    /// Index into `matches` of the hit the view is parked on. Meaningless
+    /// while `matches` is empty.
+    pub current: usize,
+    /// The view offset the search opened on — what Esc puts back.
+    origin: usize,
+}
+
+impl Search {
+    /// The current hit's (line index, char column), or None with no matches.
+    pub fn current_match(&self) -> Option<(usize, usize)> {
+        self.matches.get(self.current).copied()
+    }
+
+    /// Width of a highlight run, in characters — the query's own length.
+    pub fn width(&self) -> usize {
+        self.query.chars().count()
+    }
+
+    /// A search over a literal haystack, for tests that need to *render* one
+    /// (the chrome and highlight units) without driving a whole app. The
+    /// hit list is derived, never hand-written, so a render test can't pin a
+    /// match set the finder would never produce.
+    #[cfg(test)]
+    pub fn over(lines: Vec<String>, query: &str, current: usize) -> Self {
+        let matches = find_matches(&lines, query);
+        Self {
+            pane: 1,
+            query: query.to_string(),
+            lines,
+            total: 0,
+            matches,
+            current,
+            origin: 0,
+        }
+    }
 }
 
 /// An in-progress / completed text selection within one pane. Coordinates are
@@ -244,6 +320,10 @@ pub struct App<B: PaneBackend> {
     keys_seen: bool,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
+    /// P21: the live scrollback search, if one is running. Outlives the
+    /// `Mode::Search` prompt on purpose — `n`/`N` keep walking the hits back
+    /// in Scroll/Copy mode, and the renderer keeps highlighting them.
+    pub search: Option<Search>,
     /// Transient status message shown in the hint bar (e.g. "copied"), with
     /// the window it stays visible for: `FLASH_WINDOW` for ordinary notices,
     /// `CONFIRM_WINDOW` for confirm-arm prompts (U22 — prompt and arm live
@@ -378,6 +458,7 @@ impl<B: PaneBackend> App<B> {
             alt_seen: false,
             keys_seen: false,
             selection: None,
+            search: None,
             flash: None,
             undo: Vec::new(),
             confirm_close: None,
@@ -1790,6 +1871,10 @@ impl<B: PaneBackend> App<B> {
         self.term_size = size;
         self.host_pixels = pixels;
         self.relayout();
+        // P21 × P5: a resize reflows the live grid, so every row index a
+        // running search captured now points somewhere else. Re-capture
+        // rather than paint hits at stale coordinates.
+        self.refresh_search();
     }
 
     /// Recompute rects and push new sizes to every pane backend. C21: driven
@@ -2108,6 +2193,132 @@ impl<B: PaneBackend> App<B> {
             .get(&self.focused)
             .map(|rt| (rt.scroll_offset(), rt.scroll_total()))
             .unwrap_or((0, 0))
+    }
+
+    // -- P21: scrollback search --------------------------------------------
+
+    /// `/` from Scroll or Copy mode: capture the focused pane's whole
+    /// history + screen and open the incremental prompt over it. Re-pressing
+    /// `/` with a search already up restarts it (a fresh haystack — the
+    /// pane may have moved on), which is also what makes `/` idempotent
+    /// rather than a way to stack searches.
+    fn open_search(&mut self, copy_cursor: Option<(u16, u16)>) {
+        let pane = self.focused;
+        let Some(rt) = self.runtimes.get(&pane) else { return };
+        let lines: Vec<String> = rt.grab_all_text().lines().map(str::to_string).collect();
+        let (origin, total) = (rt.scroll_offset(), rt.scroll_total());
+        self.search = Some(Search {
+            pane,
+            query: String::new(),
+            lines,
+            total,
+            matches: Vec::new(),
+            current: 0,
+            origin,
+        });
+        self.mode = Mode::Search { copy_cursor };
+    }
+
+    /// Re-run the search against the (frozen) haystack after the query
+    /// changed, and park the view on the first hit — reading order, so
+    /// typing more characters walks *forward* from the oldest match rather
+    /// than teleporting around the buffer. An empty query puts the view back
+    /// where the search opened: backspacing to nothing is a cancel of the
+    /// filtering, not a jump to row zero.
+    fn refilter_search(&mut self) {
+        let Some(s) = &mut self.search else { return };
+        s.matches = find_matches(&s.lines, &s.query);
+        s.current = 0;
+        if s.matches.is_empty() {
+            let (pane, origin) = (s.pane, s.origin);
+            self.scroll_view_to(pane, origin);
+            return;
+        }
+        self.jump_to_match(0);
+    }
+
+    /// Park the view on hit `idx` (wrapping, so `n` past the last match
+    /// lands back on the first). The haystack's line `i` sits `total - i`
+    /// rows above the live tail; that offset goes through the U9-vetted
+    /// path — write it, then read the grid's clamp back — so the `↑N` badge
+    /// and Scroll mode's `↑N/M` describe where the view actually is, never
+    /// what the arithmetic asked for.
+    fn jump_to_match(&mut self, idx: usize) {
+        let Some(s) = &mut self.search else { return };
+        if s.matches.is_empty() {
+            return;
+        }
+        let idx = idx % s.matches.len();
+        s.current = idx;
+        let (line, _) = s.matches[idx];
+        let (pane, want) = (s.pane, s.total.saturating_sub(line));
+        self.scroll_view_to(pane, want);
+    }
+
+    /// `n` / `N`: step to the next (newer) or previous (older) hit, wrapping
+    /// at both ends. Silent with no search running or no hits — the mode's
+    /// other keys still work, and a flash per keypress would be noise.
+    fn step_match(&mut self, forward: bool) {
+        let Some(s) = &self.search else { return };
+        let n = s.matches.len();
+        if n == 0 {
+            return;
+        }
+        let next = if forward { s.current + 1 } else { s.current + n - 1 };
+        self.jump_to_match(next % n);
+    }
+
+    /// The one place a search moves a view: write the offset, then mirror
+    /// the grid's clamped answer into `Mode::Scroll`'s counter if that is
+    /// the mode we're in (or heading back to). Never a cached number — the
+    /// backend is the only thing that knows how far back the history goes.
+    fn scroll_view_to(&mut self, pane: PaneId, offset: usize) {
+        let Some(rt) = self.runtimes.get_mut(&pane) else { return };
+        rt.set_scrollback(offset);
+        let clamped = rt.scroll_offset();
+        if let Mode::Scroll { offset } = &mut self.mode {
+            *offset = clamped;
+        }
+    }
+
+    /// P21 × P5 (reflow): re-capture a running search's haystack against the
+    /// grid as it is *now*. A resize rewraps the live grid, so both the row
+    /// count and which text sits on which row change — capture-time indices
+    /// would place highlights on the wrong lines and send `n` to the wrong
+    /// place. The view is deliberately **not** re-jumped: the grid already
+    /// re-clamped the offset during the reflow, and a resize teleporting you
+    /// to a match you had scrolled away from would be its own surprise.
+    /// `current` is clamped into the new hit list, and a query that no
+    /// longer matches anything simply reports `0/0`.
+    fn refresh_search(&mut self) {
+        let Some(s) = &self.search else { return };
+        let pane = s.pane;
+        let Some(rt) = self.runtimes.get(&pane) else { return };
+        let lines: Vec<String> = rt.grab_all_text().lines().map(str::to_string).collect();
+        let total = rt.scroll_total();
+        let Some(s) = &mut self.search else { return };
+        s.matches = find_matches(&lines, &s.query);
+        s.current = s.current.min(s.matches.len().saturating_sub(1));
+        s.lines = lines;
+        s.total = total;
+    }
+
+    /// Esc: throw the search away and put the view back exactly where it was
+    /// when `/` was pressed. A cancelled search leaves no trace — not the
+    /// highlights, not the position it wandered to.
+    fn cancel_search(&mut self) {
+        let Some(s) = self.search.take() else { return };
+        self.scroll_view_to(s.pane, s.origin);
+    }
+
+    /// P21: the mode the search prompt hands back to. Scroll mode's counter
+    /// is re-seeded from the grid rather than from anything the search
+    /// remembered — the view moved, and `Mode::Scroll` mirrors the view.
+    fn mode_after_search(&self, copy_cursor: Option<(u16, u16)>) -> Mode {
+        match copy_cursor {
+            Some(cursor) => Mode::Copy { cursor },
+            None => Mode::Scroll { offset: self.scroll_offset(self.focused) },
+        }
     }
 
     // -- dead panes --------------------------------------------------------
@@ -2928,13 +3139,23 @@ impl<B: PaneBackend> App<B> {
             // live tail at the handoff, so history could never be yanked by
             // keyboard). Same special-case shape as Alt+e above; the chord
             // still falls through to the global binding, which enters Copy.
-            let scroll_to_copy =
-                matches!(self.mode, Mode::Scroll { .. }) && key.code == KeyCode::Char('c');
-            if matches!(self.mode, Mode::Scroll { .. }) && !scroll_to_copy {
+            //
+            // [P21] The search prompt is a Scroll-mode surface and rides the
+            // same two rules: its view snaps back on the way out, and the
+            // Alt+c handoff keeps it — a search *is* how you find the text
+            // you are about to select, so throwing the hits away at the
+            // handoff would break the flow the search exists to serve.
+            let looking_back =
+                matches!(self.mode, Mode::Scroll { .. } | Mode::Search { .. });
+            let scroll_to_copy = looking_back && key.code == KeyCode::Char('c');
+            if looking_back && !scroll_to_copy {
                 let focused = self.focused;
                 if let Some(rt) = self.runtimes.get_mut(&focused) {
                     rt.set_scrollback(0);
                 }
+            }
+            if !scroll_to_copy {
+                self.search = None;
             }
             self.mode = Mode::Normal;
             return false;
@@ -2957,6 +3178,35 @@ impl<B: PaneBackend> App<B> {
             }
             _ => String::new(),
         };
+        // P21: the two look-back modes share three search keys. They live
+        // ahead of the `match &mut self.mode` below because each one needs
+        // the whole `&mut self` — the pane's history, its runtime, the
+        // mode itself — which the arm-local borrows down there rule out.
+        // Copy mode hands its cursor along so Enter/Esc can put it back;
+        // Scroll mode passes None. Neither `n`, `N` nor `/` was bound in
+        // either mode before, so nothing is displaced.
+        let look_back = match self.mode {
+            Mode::Scroll { .. } => Some(None),
+            Mode::Copy { cursor } => Some(Some(cursor)),
+            _ => None,
+        };
+        if let Some(copy_cursor) = look_back {
+            match key.code {
+                KeyCode::Char('/') => {
+                    self.open_search(copy_cursor);
+                    return true;
+                }
+                KeyCode::Char('n') => {
+                    self.step_match(true);
+                    return true;
+                }
+                KeyCode::Char('N') => {
+                    self.step_match(false);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match &mut self.mode {
             Mode::Normal => false,
             Mode::Rename { buffer, target } => {
@@ -3232,6 +3482,50 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
+            // P21: the incremental search prompt. Every printable key is
+            // query text — including `n`, `N` and `/`, which only mean
+            // "step" once the prompt is closed; a prompt that stole letters
+            // from what you are typing would be unusable.
+            Mode::Search { copy_cursor } => {
+                let copy_cursor = *copy_cursor;
+                match key.code {
+                    // Shift is how an uppercase letter arrives under the
+                    // kitty encoding, so it is the one modifier a plain
+                    // insert may carry — same rule as the rename dialog
+                    // (U16). Any other chord is swallowed, never typed.
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        if let Some(s) = &mut self.search {
+                            s.query.push(c);
+                        }
+                        self.refilter_search();
+                    }
+                    KeyCode::Char(_) => {}
+                    KeyCode::Backspace => {
+                        if let Some(s) = &mut self.search {
+                            s.query.pop();
+                        }
+                        self.refilter_search();
+                    }
+                    // Enter accepts: the prompt closes, the view stays on
+                    // the hit it walked to, and the search itself lives on
+                    // so `n`/`N` and the highlights keep working in the
+                    // mode it hands back to.
+                    KeyCode::Enter => self.mode = self.mode_after_search(copy_cursor),
+                    // Esc cancels: the view goes back where `/` was pressed
+                    // and the search leaves no trace.
+                    KeyCode::Esc => {
+                        self.cancel_search();
+                        self.mode = self.mode_after_search(copy_cursor);
+                    }
+                    _ => {}
+                }
+                true
+            }
         }
     }
 
@@ -3254,6 +3548,9 @@ impl<B: PaneBackend> App<B> {
             Mode::Copy { .. } => self.selection = None,
             _ => {}
         }
+        // P21: and its search — the hits are line offsets into one pane's
+        // history, meaningless the moment you are no longer looking at it.
+        self.search = None;
         self.mode = Mode::Normal;
     }
 
@@ -3421,7 +3718,44 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
         Mode::Copy { .. } => Some(Action::CopyMode),
         Mode::Help => Some(Action::Help),
         Mode::Feed { .. } => Some(Action::ToggleFeed),
+        // P21: the search prompt is entered with `/`, not an Alt chord, so
+        // there is no chord for it to toggle off. Alt+PgUp while searching
+        // therefore falls through to the global binding, exactly as it
+        // would from any other non-Scroll mode.
+        Mode::Search { .. } => None,
     }
+}
+
+/// P21: every occurrence of `needle` in `lines`, in reading order (oldest
+/// line first), as (line index, **char** column). Non-overlapping within a
+/// line, the way every search UI counts them. An empty needle matches
+/// nothing — an incremental search with nothing typed has no results, not
+/// every position in the buffer.
+///
+/// Matching is ASCII-case-insensitive: `to_ascii_lowercase` is 1:1 on chars,
+/// so the column of a hit in the folded text is also its column in the real
+/// text. Full Unicode case folding is not — `İ` lowercases to two chars —
+/// and a column that doesn't survive the fold would highlight the wrong
+/// cells, which is worse than not folding Turkish dotted I.
+///
+/// Columns are char offsets, not grid cells: a row containing wide (CJK /
+/// emoji) glyphs ahead of a hit highlights that many cells to the left of
+/// it. Same bounded, documented drift `find_url_at` carries (SPEC-ux U19);
+/// the fix for both is one cell→char map per row, and it belongs with U24's
+/// wide-char work rather than here.
+pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle = needle.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let hay = line.to_ascii_lowercase();
+        for (byte, _) in hay.match_indices(&needle) {
+            out.push((i, hay[..byte].chars().count()));
+        }
+    }
+    out
 }
 
 /// U17 word motions, shared shape: is cell `i` of `line` whitespace? Past the
@@ -4027,6 +4361,252 @@ mod tests {
         assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 9);
         let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
         assert_eq!(offset, 9);
+    }
+
+    // -- P21: scrollback search ---------------------------------------------
+
+    fn key(c: char) -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn press(app: &mut App<FakePane>, code: crossterm::event::KeyCode) {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        app.handle_mode_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_query(app: &mut App<FakePane>, s: &str) {
+        for c in s.chars() {
+            app.handle_mode_key(key(c));
+        }
+    }
+
+    /// A pane whose history is `n` numbered lines, all of them banked — the
+    /// same shape the e2e drives with `seq`, so the offset arithmetic can be
+    /// checked exactly.
+    fn searchable_app(lines: usize) -> App<FakePane> {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let text: Vec<String> = (1..=lines).map(|i| format!("line {i}")).collect();
+        let rt = app.runtimes.get_mut(&id).unwrap();
+        rt.all_text = text.join("\n");
+        rt.scroll_total = lines;
+        app
+    }
+
+    #[test]
+    fn find_matches_reports_every_hit_in_reading_order_by_char_column() {
+        let lines: Vec<String> =
+            ["alpha beta", "no hits here", "beta beta", "BETA shouting"].map(String::from).to_vec();
+        assert_eq!(
+            find_matches(&lines, "beta"),
+            vec![(0, 6), (2, 0), (2, 5), (3, 0)],
+            "reading order, non-overlapping, ASCII-case-insensitive"
+        );
+        // An empty needle matches nothing — an incremental search with
+        // nothing typed has no results, not every position in the buffer.
+        assert!(find_matches(&lines, "").is_empty());
+        assert!(find_matches(&lines, "gamma").is_empty());
+        // Columns are char offsets, not byte offsets.
+        let wide = vec!["héllo beta".to_string()];
+        assert_eq!(find_matches(&wide, "beta"), vec![(0, 6)]);
+    }
+
+    /// P21: typing filters incrementally and parks the view on the first
+    /// hit; the offset is the one that puts that line on the view's top row.
+    #[test]
+    fn typing_a_query_jumps_the_view_to_the_first_hit() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        assert!(matches!(app.mode, Mode::Search { .. }), "`/` opens the prompt");
+        type_query(&mut app, "line 42");
+        let s = app.search.as_ref().expect("a search is running");
+        assert_eq!(s.query, "line 42");
+        // "line 42" is on haystack line 41 (0-based); "line 42x" doesn't
+        // exist in 1..=300, so there is exactly one hit.
+        assert_eq!(s.matches, vec![(41, 0)]);
+        assert_eq!(app.scroll_offset(id), 300 - 41, "the hit sits on the view's top row");
+    }
+
+    /// P21: `n` past the last hit wraps to the first, `N` before the first
+    /// wraps to the last — a search that dead-ends at the edge of the buffer
+    /// makes you retype the query to keep looking.
+    #[test]
+    fn n_and_capital_n_wrap_around_the_match_list() {
+        let mut app = searchable_app(300);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 1"); // 1, 1x, 1xx → many hits
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        let n = app.search.as_ref().unwrap().matches.len();
+        assert!(n > 3, "the fixture must have several hits, got {n}");
+        assert_eq!(app.search.as_ref().unwrap().current, 0);
+        // Walk forward off the end.
+        for _ in 0..n {
+            app.handle_mode_key(key('n'));
+        }
+        assert_eq!(app.search.as_ref().unwrap().current, 0, "`n` past the last hit wraps");
+        // ...and backward off the front.
+        app.handle_mode_key(key('N'));
+        assert_eq!(app.search.as_ref().unwrap().current, n - 1, "`N` before the first wraps");
+    }
+
+    /// P21: every jump writes through `set_scrollback` and re-reads the
+    /// grid's clamp — so a hit older than the banked history parks the view
+    /// at the top of what exists, and the `↑N/M` the bar reads says so.
+    /// Never a cached counter (U9).
+    #[test]
+    fn a_search_jump_goes_through_the_grid_clamped_path() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/')); // captures a 300-row haystack
+        // Between the capture and the jump the pane floods and the ring
+        // evicts almost all of that history — the documented drift case.
+        // The arithmetic still asks for a row that is no longer banked.
+        app.runtimes.get_mut(&id).unwrap().scroll_total = 10;
+        type_query(&mut app, "line 42"); // wants offset 300 - 41 = 259
+        assert_eq!(app.scroll_offset(id), 10, "the grid's clamp wins over the arithmetic");
+        assert_eq!(app.scroll_position(), (10, 10), "and the ↑N/M hint reports the clamp");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        let Mode::Scroll { offset } = app.mode else { panic!("Enter hands back to scroll mode") };
+        assert_eq!(offset, 10, "scroll mode's mirror is re-seeded from the grid");
+    }
+
+    /// P21: Esc restores the view the search opened on and leaves nothing
+    /// behind; Enter keeps both the position and the search (so `n`/`N` and
+    /// the highlights survive the prompt closing).
+    #[test]
+    fn esc_restores_the_pre_search_view_and_enter_keeps_it() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.wheel_scroll(id, 5);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        assert_eq!(app.scroll_offset(id), 259);
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert_eq!(app.scroll_offset(id), 5, "Esc puts the view back");
+        assert!(app.search.is_none(), "a cancelled search leaves no trace");
+        assert!(matches!(app.mode, Mode::Scroll { .. }), "and hands scroll mode back");
+
+        // Enter, by contrast, keeps both.
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert_eq!(app.scroll_offset(id), 259);
+        assert!(app.search.is_some(), "the hits outlive the prompt");
+    }
+
+    /// P21: backspacing the query back to empty is a cancel of the
+    /// filtering, not a jump to row zero — the view returns to where `/`
+    /// was pressed and the hit list empties.
+    #[test]
+    fn backspacing_to_an_empty_query_returns_the_view_to_where_search_opened() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.wheel_scroll(id, 7);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        assert_eq!(app.scroll_offset(id), 259);
+        for _ in 0.."line 42".len() {
+            press(&mut app, crossterm::event::KeyCode::Backspace);
+        }
+        assert_eq!(app.search.as_ref().unwrap().query, "");
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+        assert_eq!(app.scroll_offset(id), 7, "back to the pre-search view");
+    }
+
+    /// P21: the prompt swallows the keys that mean "step" once it closes —
+    /// `n`, `N` and `/` are query text while you are typing one.
+    #[test]
+    fn the_prompt_types_the_letters_that_are_bindings_outside_it() {
+        let mut app = searchable_app(300);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "n/N");
+        assert_eq!(app.search.as_ref().unwrap().query, "n/N");
+        assert!(matches!(app.mode, Mode::Search { .. }), "none of them closed the prompt");
+    }
+
+    /// P21: `/` works from copy mode too, and Enter/Esc hand the copy cursor
+    /// back untouched — a search is how you find the text you are about to
+    /// select, so it must not cost you your place.
+    #[test]
+    fn search_from_copy_mode_returns_the_cursor_it_borrowed() {
+        let mut app = searchable_app(300);
+        app.apply(Action::CopyMode);
+        let Mode::Copy { cursor } = app.mode else { panic!("in copy mode") };
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        let Mode::Copy { cursor: back } = app.mode else { panic!("copy mode handed back") };
+        assert_eq!(back, cursor);
+        assert!(app.search.is_some(), "and the hits survive for `n`/`N` in copy mode");
+    }
+
+    /// P21 × P5: a resize reflows the live grid, so a search's captured row
+    /// indices stop meaning anything — they are re-captured against the grid
+    /// as it is now, rather than left to paint highlights on the wrong
+    /// lines. The view is not re-jumped (the reflow already re-clamped it).
+    #[test]
+    fn a_resize_recaptures_the_searchs_haystack_instead_of_trusting_stale_rows() {
+        let mut app = searchable_app(300);
+        let id = app.focused;
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        assert_eq!(app.search.as_ref().unwrap().matches, vec![(41, 0)]);
+        let after_jump = app.scroll_offset(id);
+
+        // The "reflow": the same content now occupies different rows.
+        let rt = app.runtimes.get_mut(&id).unwrap();
+        let rewrapped: Vec<String> = (1..=300).map(|i| format!("... line {i}")).collect();
+        rt.all_text = std::iter::once("banner".to_string())
+            .chain(rewrapped)
+            .collect::<Vec<_>>()
+            .join("\n");
+        rt.scroll_total = 301;
+        app.on_resize(Size::new(80, 24), (0, 0));
+
+        let s = app.search.as_ref().expect("the search survives a resize");
+        assert_eq!(s.matches, vec![(42, 4)], "hits are re-found on the reflowed grid");
+        assert_eq!(s.current, 0);
+        assert_eq!(app.scroll_offset(id), after_jump, "a resize does not re-jump the view");
+    }
+
+    /// P21: leaving the look-back modes ends the search — its hits are line
+    /// offsets into one pane's history and mean nothing once you are not
+    /// looking at it. The Scroll→Copy handoff is the documented exception
+    /// (U9's exemption: that path exists so history can be found *and* then
+    /// selected).
+    #[test]
+    fn leaving_scroll_mode_ends_the_search_except_across_the_copy_handoff() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = searchable_app(300);
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, KeyCode::Enter);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search.is_none(), "Esc out of scroll mode drops the search");
+
+        // Alt+c: the frozen view AND the hits carry over into copy mode.
+        app.apply(Action::ScrollMode);
+        app.handle_mode_key(key('/'));
+        type_query(&mut app, "line 42");
+        press(&mut app, KeyCode::Enter);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+        app.apply(Action::CopyMode);
+        assert!(app.search.is_some(), "the Scroll→Copy handoff keeps the search");
+        assert_eq!(app.scroll_offset(app.focused), 259, "and its view");
+
+        // Any other Alt chord ends it (and snaps the view back).
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
+        assert!(app.search.is_none());
     }
 
     #[test]

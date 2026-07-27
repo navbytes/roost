@@ -46,7 +46,8 @@ bug). Severity is impact for a user supervising AI-agent panes.
   bundle: unify unicode-width, fix continuation cells in blit *and*
   extraction, add missing SGR/REP arms). **Shipped** — all five FIXED; amends
   DESIGN-ui C18 (2026-07-27).
-- **W7 · Mouse & shell polish** — P18, P20, P21. P18 shipped; P20/P21 open.
+- **W7 · Mouse & shell polish** — P18, P20, P21. P18/P20 shipped; P21's
+  search half shipped (dump-to-editor deferred, see the item).
 
 ---
 
@@ -449,7 +450,24 @@ well as left and top, so a latched drag past its pane's edge reports the
 pane's last cell instead of a coordinate outside the grid the inner app
 believes it has.
 
-### P21 · GAP · Low — no scrollback search, no dump-to-editor
+### P21 · FIXED (search half, this branch) · Low — no scrollback search, no dump-to-editor
+*Fixed: `/` in Scroll **and** Copy mode opens an incremental search over the
+focused pane's `grab_all_text` (history + screen, captured once at open so
+every keystroke filters a frozen haystack); typing narrows, Enter keeps the
+result, Esc restores the pre-search view, `n`/`N` walk the hits with
+wrap-around at both ends. Every jump writes through `set_scrollback` and
+re-reads the grid's clamp (the U9-vetted path), so `↑N` and `↑N/M` stay
+truthful even when the arithmetic asks for a row the ring has evicted. Hits
+are `REVERSED` in-pane with the current one additionally `UNDERLINED` (C17's
+modifier-only rule); the prompt `/query▏` + `i/n` counter + `SEARCH` rides
+inside C9's right segment, so the pane stays fully visible while the query
+narrows (C9/C15/§8 amended 2026-07-27). e2e `tests/scrollback_search.rs`: a
+pane prints 300 numbered lines, `/mark-42` jumps the view to a line ~258 rows
+back — before, `/` was an unbound no-op and no prompt existed.*
+***Deferred:** dump-to-editor. It is a separate verb with its own questions
+(which editor, which file, what happens to a 5000-line dump), and
+`roost read --full` already answers the "get it out of roost" need it was
+sketched against.*
 Every peer ships search; roost's only history export is `roost read --full`.
 **Contract (sketch):** `/` in Scroll/Copy mode = incremental search over
 `grab_all_text`, jumps setting the (P14-vetted) offset; a dump-to-editor verb

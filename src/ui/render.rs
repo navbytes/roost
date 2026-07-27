@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
     feed_overlay_size, picker_items, App, FeedEntry, Mode, RenameTarget,
-    Selection, TabSummary,
+    Search, Selection, TabSummary,
 };
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, PaneRect};
@@ -117,8 +117,24 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
         Mode::Picker { .. } => {
             vec![("↑↓", "choose"), ("↵", "open"), ("1..9", "launch"), ("Esc", "cancel")]
         }
-        Mode::Scroll { .. } => {
-            vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
+        // [Amended, P21] `/ search` and `n/N next` join the list: scroll
+        // mode is where a search starts and where its hits are walked, and
+        // an unadvertised key is an absent one. 59 columns — comfortably
+        // inside the 100-col floor alongside the right segment.
+        Mode::Scroll { .. } => vec![
+            ("↑↓", "scroll"),
+            ("PgUp/Dn", "page"),
+            ("/", "search"),
+            ("n/N", "next"),
+            ("Esc", "exit"),
+        ],
+        // [Added, P21] The search prompt's own list. `↵ keep` and
+        // `Esc cancel` are the two exits and lead the yield order; the
+        // hits-walking pair trails because it is the one that keeps
+        // working after the prompt closes (and is advertised again on the
+        // Scroll list once it does).
+        Mode::Search { .. } => {
+            vec![("type", "filter"), ("↵", "keep"), ("Esc", "cancel"), ("n/N", "next")]
         }
         // [Amended, U25] The feed's own working keys were missing from its
         // own hint: PgUp/PgDn paged and `q` closed, both unadvertised, and
@@ -164,17 +180,29 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Copy { .. } => "COPY",
         Mode::Help => "HELP",
         Mode::Feed { .. } => "FEED",
+        Mode::Search { .. } => "SEARCH",
     }
 }
 
 /// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" —
 /// omitted at `n == 0` rather than shown as a hollow "0 needs you" — then
-/// (Scroll mode only, U3) the dim `↑N/M` position, then the uppercase mode
-/// word, then one trailing space. The position rides inside the segment so
-/// C9's fit/yield machinery covers it for free: pairs drop whole before any
-/// of it clips. Pure so the omission rules are unit-testable without a
-/// `Frame`.
-fn hint_bar_right_spans(n: usize, position: Option<String>, word: &str) -> Vec<Span<'static>> {
+/// (P21) the search prompt, then (Scroll/Search, U3) the dim position, then
+/// the uppercase mode word, then one trailing space. Everything rides inside
+/// the segment so C9's fit/yield machinery covers it for free: pairs drop
+/// whole before any of it clips. Pure so the omission rules are
+/// unit-testable without a `Frame`.
+///
+/// [P21] `query` is the live search prompt (`/foo`) and is the one token on
+/// this bar drawn in `FG`: it is text the user is typing right now, and DIM
+/// input is input you cannot proofread. `position` carries `↑N/M` in Scroll
+/// mode and the `i/n` hit counter while searching — both DIM, both the same
+/// "where am I" role.
+fn hint_bar_right_spans(
+    n: usize,
+    query: Option<String>,
+    position: Option<String>,
+    word: &str,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if n > 0 {
         spans.push(Span::styled(
@@ -183,12 +211,29 @@ fn hint_bar_right_spans(n: usize, position: Option<String>, word: &str) -> Vec<S
         ));
         spans.push(Span::raw("  "));
     }
+    if let Some(q) = query {
+        spans.push(Span::styled(format!("{q} "), Style::default().fg(theme::FG)));
+    }
     if let Some(pos) = position {
         spans.push(Span::styled(format!("{pos} "), Style::default().fg(theme::DIM)));
     }
     spans.push(Span::styled(word.to_string(), Style::default().fg(theme::DIM)));
     spans.push(Span::raw(" "));
     spans
+}
+
+/// P21: the search prompt and hit counter for C9's right segment — `/query`
+/// (with the `▏` insertion caret the rename dialog already uses, so a typed
+/// prompt looks like a text field everywhere in roost) and `i/n`, or `0/0`
+/// when nothing matches. `None` for both outside a search. Pure.
+fn search_segment(search: Option<&Search>) -> (Option<String>, Option<String>) {
+    let Some(s) = search else { return (None, None) };
+    let counter = if s.matches.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", s.current + 1, s.matches.len())
+    };
+    (Some(format!("/{}{}", s.query, theme::RENAME_CURSOR)), Some(counter))
 }
 
 /// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
@@ -249,15 +294,20 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // U3: Scroll mode's right segment shows where in history the view sits
     // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
     // can never report a phantom row the grid refused (U9's overshoot).
-    let position = match &app.mode {
+    // P21: while the prompt is up the segment carries the query and the hit
+    // counter instead — the search *is* the position report, and stacking
+    // `↑N/M` beside `3/17` would be two answers to one question.
+    let (query, position) = match &app.mode {
+        Mode::Search { .. } => search_segment(app.search.as_ref()),
         Mode::Scroll { .. } => {
             let (off, total) = app.scroll_position();
-            Some(format!("{}{off}/{total}", theme::SCROLLED))
+            (None, Some(format!("{}{off}/{total}", theme::SCROLLED)))
         }
-        _ => None,
+        _ => (None, None),
     };
     let right = hint_bar_right_spans(
         app.needs_input_count(),
+        query,
         position,
         mode_word(&app.mode, app.zoomed(), focused_raw),
     );
@@ -388,7 +438,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
     ("Alt+i / Alt+m", "previous / next tab (wraps)"),
     ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-    ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
+    ("Alt+c / Alt+PgUp", "copy (hjkl wbe 0$ vV y o) / scroll — / search, n/N"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
     ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
@@ -433,8 +483,10 @@ pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
 fn dialog_rect(mode: &Mode, body: Rect, anchor: Rect) -> Option<Rect> {
     match mode {
         // Copy mode has no centered overlay — the cursor/selection are
-        // drawn in-pane (C17/C24).
-        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => None,
+        // drawn in-pane (C17/C24). [P21] Nor does search: its prompt lives
+        // in the hint bar's right segment, so the pane it is searching
+        // stays fully visible while the query narrows.
+        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } | Mode::Search { .. } => None,
         Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
         Mode::Picker { .. } => {
             Some(centered_near(anchor, body, 32, picker_items().len() as u16 + 2))
@@ -453,7 +505,7 @@ fn dialog_rect(mode: &Mode, body: Rect, anchor: Rect) -> Option<Rect> {
 fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
     let Some(rect) = dialog_rect(&app.mode, body, anchor) else { return };
     match &app.mode {
-        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => {}
+        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } | Mode::Search { .. } => {}
         Mode::Rename { buffer, target } => {
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
@@ -931,6 +983,14 @@ fn draw_pane<B: PaneBackend>(
         }
     }
 
+    // P21: search hits, painted before the selection so a selection over a
+    // hit still reads as selected. C17's rule holds — modifiers only, no
+    // color tokens: hits sit on top of arbitrary program colors.
+    if let Some(search) = app.search.as_ref().filter(|s| s.pane == pr.id) {
+        let (offset, total) = app.scroll_position();
+        highlight_matches(f, inner, search, total.saturating_sub(offset));
+    }
+
     // Copy-mode selection: reverse-highlight the selected cells in this pane.
     if let Some(sel) = app.selection.filter(|s| s.pane == pr.id) {
         highlight_selection(f, inner, sel.anchor, sel.cursor);
@@ -1187,6 +1247,42 @@ fn highlight_selection(f: &mut Frame, inner: Rect, a: (u16, u16), b: (u16, u16))
             col += 1;
         }
         row += 1;
+    }
+}
+
+/// P21: paint the search hits visible in this pane. `first_line` is the
+/// haystack line index currently on the view's top row — `banked − offset`,
+/// both read from the grid — so a hit's screen row is just `line −
+/// first_line`. Every hit is `REVERSED`; the *current* one additionally
+/// `UNDERLINED`, so "which of these am I parked on" is answerable at a
+/// glance. Modifier-only by C17: hits land on arbitrary program colors, and
+/// a palette token here would be a DEVIATED.
+fn highlight_matches(f: &mut Frame, inner: Rect, search: &Search, first_line: usize) {
+    let width = search.width();
+    if width == 0 {
+        return;
+    }
+    let current = search.current_match();
+    let buf = f.buffer_mut();
+    for (i, &(line, col)) in search.matches.iter().enumerate() {
+        let Some(row) = line.checked_sub(first_line) else { continue };
+        if row >= inner.height as usize {
+            continue;
+        }
+        let is_current = current == Some(search.matches[i]) && i == search.current;
+        for c in col..col + width {
+            if c >= inner.width as usize {
+                break;
+            }
+            let Some(cell) = buf.cell_mut((inner.x + c as u16, inner.y + row as u16)) else {
+                continue;
+            };
+            let mut style = cell.style().add_modifier(Modifier::REVERSED);
+            if is_current {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            cell.set_style(style);
+        }
     }
 }
 
@@ -1524,14 +1620,92 @@ mod tests {
     fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
         // U3: `↑N/M` rides inside the right segment (DIM), so C9's yield
         // machinery covers it — and it only exists when a position is given.
-        let spans = hint_bar_right_spans(0, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(0, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "↑12/300 SCROLL ");
         assert_eq!(spans[0].style.fg, Some(theme::DIM));
 
-        let spans = hint_bar_right_spans(2, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(2, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
+    }
+
+    /// P21: the search prompt lives in C9's right segment — `/query▏` in FG
+    /// (it is live input; DIM input is input you cannot proofread) with the
+    /// DIM hit counter and the SEARCH mode word behind it. No dialog: the
+    /// pane being searched must stay visible while the query narrows.
+    #[test]
+    fn hint_bar_right_carries_the_search_prompt_and_hit_counter() {
+        use crate::core::app::Search;
+        let lines: Vec<String> = ["alpha beta", "beta beta"].map(String::from).to_vec();
+        let mut s = Search::over(lines, "beta", 1);
+        let (query, position) = super::search_segment(Some(&s));
+        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!("/beta{} 2/3 SEARCH ", theme::RENAME_CURSOR));
+        assert_eq!(spans[0].style.fg, Some(theme::FG), "the typed query is legible, not dim");
+        assert_eq!(spans[1].style.fg, Some(theme::DIM), "the counter is a position token");
+
+        // A query with no hits says so rather than hiding the counter — an
+        // empty result is the answer, not the absence of one.
+        s = Search::over(vec!["alpha beta".into()], "gamma", 0);
+        let (query, position) = super::search_segment(Some(&s));
+        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!("/gamma{} 0/0 SEARCH ", theme::RENAME_CURSOR));
+
+        // Outside a search there is no prompt at all.
+        assert_eq!(super::search_segment(None), (None, None));
+    }
+
+    /// P21: hits are painted REVERSED and the current one additionally
+    /// UNDERLINED — modifiers only (C17), and positioned by the same
+    /// `banked − offset` arithmetic the jump uses, so a hit scrolled off
+    /// the top of the view paints nothing.
+    #[test]
+    fn search_hits_are_reversed_with_the_current_one_underlined() {
+        use crate::core::app::Search;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Haystack lines 4 and 6 hold hits; the view's top row shows line 4.
+        let lines: Vec<String> = (0..8)
+            .map(|i| if i == 4 || i == 6 { "xxbetaxx".to_string() } else { "----".to_string() })
+            .collect();
+        // current = 1 → the line-6 hit.
+        let search = Search::over(lines, "beta", 1);
+        let inner = Rect::new(0, 0, 10, 4);
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::highlight_matches(f, inner, &search, 4)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // Line 4 → screen row 0, cols 2..6: reversed, not underlined.
+        for c in 2..6 {
+            let cell = buf.cell((c, 0)).unwrap();
+            assert!(cell.style().add_modifier.contains(Modifier::REVERSED), "col {c}");
+            assert!(!cell.style().add_modifier.contains(Modifier::UNDERLINED), "col {c}");
+        }
+        // Line 6 → screen row 2: the current hit, so also underlined.
+        for c in 2..6 {
+            let cell = buf.cell((c, 2)).unwrap();
+            assert!(cell.style().add_modifier.contains(Modifier::REVERSED), "col {c}");
+            assert!(cell.style().add_modifier.contains(Modifier::UNDERLINED), "col {c}");
+        }
+        // Cells outside the runs are untouched.
+        assert!(!buf.cell((1, 0)).unwrap().style().add_modifier.contains(Modifier::REVERSED));
+        assert!(!buf.cell((6, 0)).unwrap().style().add_modifier.contains(Modifier::REVERSED));
+
+        // A view scrolled past both hits paints nothing at all.
+        let backend = TestBackend::new(10, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::highlight_matches(f, inner, &search, 7)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in 0..4 {
+            for x in 0..10 {
+                assert!(!buf.cell((x, y)).unwrap().style().add_modifier.contains(Modifier::REVERSED));
+            }
+        }
     }
 
     #[test]
@@ -1695,7 +1869,7 @@ mod tests {
             ],
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        let right_w = super::hint_bar_right_spans(0, None, "COPY")
+        let right_w = super::hint_bar_right_spans(0, None, None, "COPY")
             .iter()
             .map(|s| mouse::display_width(&s.content))
             .sum::<u16>();
@@ -1725,7 +1899,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_omits_needs_segment_at_zero() {
-        let spans = hint_bar_right_spans(0, None, "NORMAL");
+        let spans = hint_bar_right_spans(0, None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "NORMAL ");
         assert!(!text.contains('◆'));
@@ -1733,7 +1907,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
-        let spans = hint_bar_right_spans(3, None, "NORMAL");
+        let spans = hint_bar_right_spans(3, None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
@@ -2034,7 +2208,10 @@ mod tests {
         // into one row so the ≤20 cap still holds. Wording matches §8.
         // U23 (2026-07-27): three more merges (s/o, z/f, w/u) buy the three
         // reference rows that close the table — the status legend and the
-        // two mouse rows.
+        // two mouse rows. P21 (2026-07-27): scrollback search adds no row —
+        // its `/` and `n/N` are tightened into the copy/scroll row's own
+        // description, which is what the ≤20 cap has always demanded of a
+        // new mode-local key.
         assert_eq!(
             HELP_KEYS,
             &[
@@ -2051,7 +2228,7 @@ mod tests {
                 ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
                 ("Alt+i / Alt+m", "previous / next tab (wraps)"),
                 ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-                ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
+                ("Alt+c / Alt+PgUp", "copy (hjkl wbe 0$ vV y o) / scroll — / search, n/N"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
                 ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),
