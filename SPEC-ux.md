@@ -86,11 +86,17 @@ passthrough.
 (reuse `encode_raw`); bound chords stay roost's; raw mode remains the escape
 hatch for the chords roost does own.
 
-### U6 · Med · VERIFIED — the discoverability hint is dropped first
+### U6 · Med · FIXED (this branch) — the discoverability hint is dropped first
 The hint bar's yield order drops `Alt+? keys` exactly when the bar gets busy
 (`◆ N needs you` appearing at 120 cols) — the moment a new user most needs it.
 **Proposed contract:** `Alt+? keys` yields last among pairs (or `Alt+r rename`
 drops first).
+**Fixed:** both, since the list order *is* the yield order (pairs drop whole
+from the right): the seven pairs are unchanged in content and re-ordered so
+`Alt+? keys` leads — the last pair to yield, so at any width that fits one
+pair, that pair is the help pair — and `Alt+r rename` trails, dropping first.
+At the live-QA width (120 cols with `◆ N needs you` up) the help pair now
+survives (C9 amended 2026-07-27; total width still 100 columns).
 
 ### U7 · Med · VERIFIED — tab reachability dead ends
 Live QA: Alt+9 (no such tab) and Alt+0 (unbound) both no-op silently; no
@@ -204,11 +210,20 @@ has answered: `copied N chars` / `copied N chars (OSC 52)` / `copy failed`
 (C10 amended 2026-07-27). Both channels still fire on every copy — roost's
 own OSC 52 emission is unchanged; only the reporting is.
 
-### U15 · Med · VERIFIED — hiding hints hides the only mode indication
+### U15 · Med · FIXED (this branch) — hiding hints hides the only mode indication
 Live QA: with hints hidden (Alt+/), a zoomed pane shows `ZOOM` nowhere — it is
 indistinguishable from a one-pane tab; SCROLL is likewise invisible.
 **Proposed contract:** with hints hidden, non-Normal mode words (and ZOOM) move
 to the tab-bar right status; or any non-Normal mode temporarily reshows the bar.
+**Fixed** (the first option — the bar stays hidden when you hid it): whenever
+the hint bar isn't drawn (Alt+/, or a terminal too short to spare the row),
+any mode word other than `NORMAL` — real modes plus the `ZOOM`/`RAW`
+pseudo-states — leads the tab bar's right status segment,
+`ZOOM · ~/work · saved ✓` (`render::tab_status_word`). The width math is
+shared with the existing segment via the new `mouse::status_fit`, which also
+gives the area one extra yield rung: the cwd drops before the mode word (C2
+amended 2026-07-27), and `tab_at_x` is fed the same fitted width so tab
+hitboxes stay in lockstep with what's drawn.
 
 ## P2 — polish
 

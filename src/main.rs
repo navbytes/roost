@@ -430,7 +430,19 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
             let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
             let bar_width = app.body_area().width;
-            let status_w = mouse::status_width(app.focused_cwd().as_deref(), app.last_save_ok());
+            // U15: the status area may now carry a mode word, which widens
+            // it — hit-testing reads the exact same fit the renderer drew
+            // (§4/§5 lockstep) so the clickable span can't drift.
+            let cwd = app.focused_cwd();
+            let status_w = mouse::status_fit(
+                ui::render::tab_status_word(app),
+                cwd.as_deref(),
+                app.last_save_ok(),
+                &names,
+                bar_width,
+            )
+            .map(|f| f.width)
+            .unwrap_or(0);
             if let Some(i) = mouse::tab_at_x(&names, bar_width, status_w, me.column) {
                 app.apply(input::Action::GoToTab(i));
             }

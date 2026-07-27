@@ -145,26 +145,63 @@ pub fn picker_row_at(rect: Rect, items: usize, col: u16, row: u16) -> Option<usi
     (i < items && i < (rect.height - 2) as usize).then_some(i)
 }
 
-/// The tab bar's right-aligned status text (C2): the focused pane's cwd
-/// (already `~`-abbreviated by the caller, `App::focused_cwd`) and the save
-/// indicator, split into `(prefix, save_word)` so the renderer can color
-/// them independently. `prefix` is `"{cwd} · "`, or empty when there's no
-/// cwd to show (the segment is omitted, not blanked).
-pub fn status_parts(cwd: Option<&str>, save_ok: bool) -> (String, String) {
+/// The tab bar's right-aligned status text (C2): the mode word (U15 — only
+/// when the hint bar isn't carrying it), the focused pane's cwd (already
+/// `~`-abbreviated by the caller, `App::focused_cwd`) and the save
+/// indicator, split into `(mode, cwd, save_word)` so the renderer can color
+/// them independently. `mode`/`cwd` are `"{x} · "`, or empty when there's
+/// nothing to show (that part is omitted, not blanked).
+pub fn status_parts(mode: Option<&str>, cwd: Option<&str>, save_ok: bool) -> (String, String, String) {
     let save_word = if save_ok {
         format!("saved {}", theme::SAVED)
     } else {
         format!("save failed {}", theme::GLYPH_EXITED)
     };
-    let prefix = cwd.map(|c| format!("{c} · ")).unwrap_or_default();
-    (prefix, save_word)
+    let sep = |s: &str| format!("{s} · ");
+    (mode.map(sep).unwrap_or_default(), cwd.map(sep).unwrap_or_default(), save_word)
 }
 
 /// On-screen width of `status_parts`' output, including the C2 trailing
 /// space — the column span `tab_at_x` treats as off-limits for tab clicks.
-pub fn status_width(cwd: Option<&str>, save_ok: bool) -> u16 {
-    let (prefix, save_word) = status_parts(cwd, save_ok);
-    display_width(&prefix) + display_width(&save_word) + 1
+pub fn status_width(mode: Option<&str>, cwd: Option<&str>, save_ok: bool) -> u16 {
+    let (m, c, save_word) = status_parts(mode, cwd, save_ok);
+    display_width(&m) + display_width(&c) + display_width(&save_word) + 1
+}
+
+/// What the status area actually shows at this bar width, after C2's yield
+/// ladder — the single computation the renderer and the click hit-test
+/// share, so they can't disagree about which columns belong to tabs
+/// (§4/§5 lockstep).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusFit<'a> {
+    pub mode: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    /// Columns this content occupies — feed it to `tab_at_x` /
+    /// `tabs_visible_width` as their `status_width` argument.
+    pub width: u16,
+}
+
+/// C2 + U15: fit the status area alongside the tabs. Tabs still win
+/// outright (a status area that can't fit is dropped whole, `None`), but
+/// **within** the area the cwd yields before the mode word: the word is a
+/// modal-safety affordance — with the hint bar hidden it is the only thing
+/// telling you you're in ZOOM/RAW/COPY — while the cwd is context you can
+/// get by looking at the pane. Returns the content plus its exact width.
+pub fn status_fit<'a>(
+    mode: Option<&'a str>,
+    cwd: Option<&'a str>,
+    save_ok: bool,
+    names: &[String],
+    bar_width: u16,
+) -> Option<StatusFit<'a>> {
+    let tabs = total_tabs_width(names);
+    for (m, c) in [(mode, cwd), (mode, None)] {
+        let width = status_width(m, c, save_ok);
+        if tabs.saturating_add(width) <= bar_width {
+            return Some(StatusFit { mode: m, cwd: c, width });
+        }
+    }
+    None
 }
 
 /// Route a mouse event over a pane to either the inner app or roost's
@@ -432,14 +469,65 @@ mod tests {
 
     #[test]
     fn status_parts_formats_cwd_and_save_state() {
-        let (prefix, save) = status_parts(Some("~/work"), true);
+        let (mode, prefix, save) = status_parts(None, Some("~/work"), true);
+        assert_eq!(mode, "");
         assert_eq!(prefix, "~/work · ");
         assert_eq!(save, format!("saved {}", theme::SAVED));
-        assert_eq!(status_width(Some("~/work"), true), display_width(&prefix) + display_width(&save) + 1);
+        assert_eq!(
+            status_width(None, Some("~/work"), true),
+            display_width(&prefix) + display_width(&save) + 1
+        );
 
-        let (prefix, save) = status_parts(None, false);
+        let (_, prefix, save) = status_parts(None, None, false);
         assert_eq!(prefix, "");
         assert_eq!(save, format!("save failed {}", theme::GLYPH_EXITED));
+    }
+
+    /// U15: with the hint bar gone, the mode word leads the status area —
+    /// `ZOOM · ~/work · saved ✓` — and it costs the width `tab_at_x` must
+    /// then treat as off-limits.
+    #[test]
+    fn status_parts_lead_with_the_mode_word_when_the_hint_bar_is_gone() {
+        let (mode, cwd, save) = status_parts(Some("ZOOM"), Some("~/work"), true);
+        assert_eq!(mode, "ZOOM · ");
+        assert_eq!(cwd, "~/work · ");
+        assert_eq!(format!("{mode}{cwd}{save}"), format!("ZOOM · ~/work · saved {}", theme::SAVED));
+        assert_eq!(
+            status_width(Some("ZOOM"), Some("~/work"), true),
+            status_width(None, Some("~/work"), true) + display_width("ZOOM · ")
+        );
+    }
+
+    /// C2's ladder, U15 order: everything fits → drop the cwd (context)
+    /// before the mode word (safety affordance) → drop the whole area
+    /// (tabs still win outright).
+    #[test]
+    fn the_status_area_yields_its_cwd_before_its_mode_word() {
+        let names = vec!["main".to_string(), "api".to_string()]; // 25 cols of tabs
+        let full = status_width(Some("ZOOM"), Some("~/work"), true); // 24
+        let no_cwd = status_width(Some("ZOOM"), None, true); // 15
+
+        let fit = status_fit(Some("ZOOM"), Some("~/work"), true, &names, 25 + full).unwrap();
+        assert_eq!((fit.mode, fit.cwd, fit.width), (Some("ZOOM"), Some("~/work"), full));
+
+        // One column short of the full form: the cwd goes, the word stays.
+        let fit = status_fit(Some("ZOOM"), Some("~/work"), true, &names, 25 + full - 1).unwrap();
+        assert_eq!((fit.mode, fit.cwd, fit.width), (Some("ZOOM"), None, no_cwd));
+
+        // Not even the word fits beside the tabs: no status area at all.
+        assert_eq!(status_fit(Some("ZOOM"), Some("~/work"), true, &names, 25 + no_cwd - 1), None);
+    }
+
+    /// The fitted width is what bounds tab clicks — a wider status area
+    /// (mode word present) takes its columns away from the tab hitboxes,
+    /// exactly as it takes them away from the drawn tabs.
+    #[test]
+    fn a_mode_word_in_the_status_area_shrinks_the_clickable_tab_span() {
+        let names = vec!["main".to_string(), "api".to_string()]; // tabs: 0..25
+        let bar = 25 + status_width(Some("ZOOM"), None, true);
+        let fit = status_fit(Some("ZOOM"), None, true, &names, bar).unwrap();
+        assert_eq!(tab_at_x(&names, bar, fit.width, 24), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, bar, fit.width, 25), None); // status area
     }
 
     #[test]

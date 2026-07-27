@@ -191,6 +191,27 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
 - Mouse unit tests (`mouse.rs:250–260`) are rewritten to the new offsets **in
   the same change** as the renderer (lockstep rule, §4).
 
+**[Amended 2026-07-27, SPEC-ux U15 — the status area carries the mode word
+when the hint bar can't]** The right status area becomes
+`"{MODE} · {cwd} · {save}"`: the C9 mode word leads it fg `MUTED` (state
+reads a step brighter than the context beside it; still inside the ink ramp,
+never the accent — it is not an alarm), followed by the existing cwd fg `DIM`
+and save word. The word is present **iff the hint bar is not drawn** — hidden
+via Alt+/ or squeezed out by a terminal under 3 rows — **and** it is not
+`NORMAL`; real modes and the `ZOOM`/`RAW` pseudo-states all qualify. With
+hints hidden, a zoomed pane was previously indistinguishable from a one-pane
+tab and SCROLL/COPY/RAW vanished entirely (live QA), which made the mode word
+— a modal-safety affordance — conditional on an unrelated toggle.
+Consequences for this contract's width math, all shared by
+`mouse::status_fit` so the renderer and `tab_at_x` cannot disagree:
+- Overflow gains one rung *inside* the status area, **ahead** of the existing
+  drop: full → `{MODE} · {save}` (the cwd yields first: the word is safety,
+  the cwd is context you can also read off the pane) → no status area at all.
+  Tabs still win outright over whatever is left.
+- The wider area takes its columns from the tab hitboxes exactly as it takes
+  them from the drawn tabs — `tab_at_x` is fed the fitted width, so clicks
+  and pixels stay in lockstep (§4/§5).
+
 **[Amended 2026-07-27, SPEC-ux U11 — what a tab switch means]** The bar shows
 tabs; these two rules say what selecting one does, and they hold for every
 selector (digit, click, `Alt+a`'s cross-tab jump, being moved onto a tab when
@@ -440,6 +461,19 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   `RAW` when the focused pane is raw (C23), `ZOOM` when zoomed (C21).
   Precedence: a real non-Normal mode word always wins; else `RAW` beats
   `ZOOM` beats `NORMAL` (input safety trumps view state).
+- **[Amended 2026-07-27, SPEC-ux U6 — pair order is the yield order]:** the
+  seven Normal-mode pairs are unchanged in content but re-ordered to
+  `Alt+? keys` · `Alt+n new` · `Alt+↵ launch` · `Alt+s stack` ·
+  `Alt+←↓↑→ focus` · `Alt+w close` · `Alt+r rename`. Since pairs drop whole
+  from the right, the list order *is* the yield order, and the old one
+  dropped `Alt+? keys` first — at 120 cols, the moment `◆ N needs you`
+  appeared (live QA), i.e. exactly when a new user under pressure most needs
+  the pointer to every binding that just vanished. It now leads, so it is
+  the **last** pair to yield: at any width that fits one pair, that pair is
+  the help pair. `Alt+r rename` trails and drops first — the one pair whose
+  absence costs nothing that isn't a keystroke away under `Alt+?`. Total
+  width is unchanged (100 columns), so the "gains NOTHING" bullet above
+  still holds.
 - **[Amended 2026-07-27, SPEC-ux U3]:** while the mode is Scroll, the right
   segment additionally carries the position `↑N/M` fg `DIM` immediately
   ahead of the mode word (`… needs-you segment  ↑N/M SCROLL `) — N = the
