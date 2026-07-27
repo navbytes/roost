@@ -78,6 +78,15 @@ pub trait PaneBackend: Sized {
         false
     }
 
+    /// Has the pane's app switched on DECCKM application cursor keys mode
+    /// (`CSI ?1h` — what zsh's line editor via `smkx`, vim, and most
+    /// full-screen TUIs do)? When true, roost sends unmodified cursor keys as
+    /// SS3 (`ESC O A` …) the way a real terminal would; otherwise the normal
+    /// CSI forms. Default false.
+    fn app_cursor_keys(&self) -> bool {
+        false
+    }
+
     /// Terminal grid for rendering. `None` for fakes (renderer must cope).
     fn screen(&self) -> Option<&vt100::Screen>;
     fn set_scrollback(&mut self, lines: usize);
@@ -147,6 +156,9 @@ pub mod fakes {
         /// failure and drop the bytes — simulates a pane whose pipe died
         /// right after a status snapshot said it was still running.
         pub fail_write: bool,
+        /// Test knob: simulates the pane's app having enabled DECCKM
+        /// application cursor keys mode.
+        pub app_cursor: bool,
     }
 
     impl PaneBackend for FakePane {
@@ -172,6 +184,7 @@ pub mod fakes {
                 grab: String::new(),
                 all_text: String::new(),
                 fail_write: false,
+                app_cursor: false,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -212,6 +225,9 @@ pub mod fakes {
         }
         fn on_exit(&mut self) {
             self.exited = true;
+        }
+        fn app_cursor_keys(&self) -> bool {
+            self.app_cursor
         }
         fn screen(&self) -> Option<&vt100::Screen> {
             None
