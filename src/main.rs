@@ -234,6 +234,10 @@ fn run(
             loop {
                 match crossterm::event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        // U4: every key is evidence roost is being typed at;
+                        // an Alt-modified one is evidence the Alt layer
+                        // survives the terminal. The warning bar needs both.
+                        app.note_key_seen();
                         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
                             app.note_alt_seen();
                         }
@@ -244,14 +248,19 @@ fn run(
                         // text on the app (core has no clipboard I/O of its
                         // own); hand it to the OS clipboard here, same as
                         // the mouse path does inline in `handle_copy_mouse`.
+                        // U14: flash what the clipboard actually did, once
+                        // it has answered — never an optimistic "copied".
                         if let Some(text) = app.take_pending_yank() {
-                            infra::clipboard::copy(&text);
+                            let outcome = infra::clipboard::copy(&text);
+                            app.flash_copy(text.chars().count(), outcome);
                         }
                     }
                     Event::Mouse(me) => handle_mouse(&mut app, me),
                     // Coalesce: act on the true size once, after draining.
                     Event::Resize(..) => resized = true,
-                    Event::Paste(s) => app.forward_paste(&s),
+                    // U8(b): a modal owns the paste — into the rename buffer,
+                    // or swallowed — else it forwards to the focused pane.
+                    Event::Paste(s) => app.handle_paste(&s),
                     _ => {}
                 }
                 if !crossterm::event::poll(Duration::ZERO)? {
@@ -406,6 +415,17 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
+    // U8(a): so does a modal (Rename/Picker/Help/Feed) — gated here, ahead
+    // of every pane and tab-bar path below, so a click can't move focus or
+    // switch a tab beneath the dialog and the wheel can't scroll the pane
+    // under an overlay. `modal_rect` hands over the dialog's *drawn* rect
+    // so the hit-test matches what's on screen.
+    if app.modal_active() {
+        let dialog = ui::render::modal_rect(app);
+        app.handle_modal_mouse(me, dialog);
+        return;
+    }
+
     // Tab bar (top row): click a tab to switch to it. Clicks past the last
     // visible tab — the `…` overflow marker, the gap, or the right-aligned
     // status area — hit no tab; `mouse::tab_at_x` clamps to what's actually
@@ -414,8 +434,22 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
             let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
             let bar_width = app.body_area().width;
-            let status_w = mouse::status_width(app.focused_cwd().as_deref(), app.last_save_ok());
-            if let Some(i) = mouse::tab_at_x(&names, bar_width, status_w, me.column) {
+            // U15: the status area may now carry a mode word, which widens
+            // it — hit-testing reads the exact same fit the renderer drew
+            // (§4/§5 lockstep) so the clickable span can't drift.
+            let cwd = app.focused_cwd();
+            let status_w = mouse::status_fit(
+                ui::render::tab_status_word(app),
+                cwd.as_deref(),
+                app.last_save_ok(),
+                &names,
+                bar_width,
+            )
+            .map(|f| f.width)
+            .unwrap_or(0);
+            if let Some(i) =
+                mouse::tab_at_x(&names, bar_width, status_w, app.ws.active_tab, me.column)
+            {
                 app.apply(input::Action::GoToTab(i));
             }
         }
@@ -480,7 +514,8 @@ fn handle_copy_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::Mou
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let Some(text) = app.finish_selection() {
-                infra::clipboard::copy(&text);
+                let outcome = infra::clipboard::copy(&text); // U14
+                app.flash_copy(text.chars().count(), outcome);
             }
         }
         _ => {}
@@ -500,6 +535,7 @@ fn inner_cell(rect: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::app::Mode;
     use crate::core::workspace::Workspace;
     use crate::ports::fakes::{FakePane, MemStore};
     use crate::ui::input::Action;
@@ -552,6 +588,9 @@ mod tests {
             alt(KeyCode::Char('f')),
             alt(KeyCode::PageUp),
             alt(KeyCode::Char('5')),
+            alt(KeyCode::Char('0')),
+            alt(KeyCode::Char('i')),
+            alt(KeyCode::Char('m')),
             alt(KeyCode::Right),
             alt(KeyCode::Left),
             alt(KeyCode::Up),
@@ -653,6 +692,140 @@ mod tests {
         app.runtimes.get_mut(&focused).unwrap().input.clear();
         handle_key(&mut app, alt(KeyCode::Up));
         assert_eq!(app.runtimes.get(&focused).unwrap().input, b"\x1b\x1b[A");
+    }
+
+    // ---- U8: modals own the non-keyboard input surface -------------------
+
+    fn click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    fn wheel_up(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// U8(a), the live-QA reproduction: Alt+r on one pane, a click on
+    /// another, Enter. The title must land on the pane the dialog opened on
+    /// — before the gate the click moved focus and Enter committed `ZZZ` to
+    /// the *clicked* pane (SPEC-ux frame E1).
+    #[test]
+    fn a_click_during_rename_neither_moves_focus_nor_redirects_the_commit() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // panes 1 | 2, focus 2
+        let target = app.focused;
+        app.apply(Action::RenamePane);
+        for c in "ZZZ".chars() {
+            app.handle_mode_key(key(KeyCode::Char(c)));
+        }
+        handle_mouse(&mut app, click(5, 5)); // pane 1's area, outside the dialog
+
+        assert_eq!(app.focused, target, "the click must not move focus beneath the modal");
+        assert!(matches!(app.mode, Mode::Rename { .. }), "the dialog must still be up");
+
+        app.handle_mode_key(key(KeyCode::Enter));
+        assert_eq!(app.find_spec(target).and_then(|s| s.title.clone()), Some("ZZZ".into()));
+        assert_eq!(app.find_spec(1).and_then(|s| s.title.clone()), None, "pane 1 must be untouched");
+    }
+
+    /// A modal click never reaches the tab bar either (row 0).
+    #[test]
+    fn a_click_on_the_tab_bar_during_a_modal_switches_nothing() {
+        let mut app = mk_app();
+        app.apply(Action::NewTab); // two tabs, active = 1
+        app.apply(Action::Help);
+        handle_mouse(&mut app, click(1, 0)); // tab 1's cells
+        assert_eq!(app.ws.active_tab, 1, "tab switching must not happen under a modal");
+    }
+
+    /// U8(c): the wheel belongs to the feed while it's open — it pages the
+    /// overlay and leaves every pane at its live tail.
+    #[test]
+    fn the_wheel_pages_the_feed_and_never_the_pane_under_it() {
+        let mut app = mk_app();
+        for _ in 0..3 {
+            app.apply(Action::NewPane); // each spawn banks one feed entry
+        }
+        let pane = app.focused;
+        app.apply(Action::ToggleFeed);
+        handle_mouse(&mut app, wheel_up(5, 5)); // over a pane, feed open
+
+        match app.mode {
+            Mode::Feed { offset } => assert!(offset > 0, "the wheel must scroll the feed back"),
+            _ => panic!("the feed must stay open"),
+        }
+        assert_eq!(app.runtimes.get(&pane).unwrap().scrollback, 0, "the pane must stay live");
+    }
+
+    /// Every other modal swallows the wheel outright.
+    #[test]
+    fn the_wheel_is_swallowed_by_the_other_modals() {
+        for open in [Action::RenamePane, Action::QuickLaunch, Action::Help] {
+            let mut app = mk_app();
+            let pane = app.focused;
+            app.apply(open);
+            handle_mouse(&mut app, wheel_up(5, 5));
+            assert_eq!(
+                app.runtimes.get(&pane).unwrap().scrollback,
+                0,
+                "{open:?} must not let the wheel reach the pane"
+            );
+        }
+    }
+
+    /// C14 + U8: clicking a picker row selects and launches that adapter;
+    /// clicking outside cancels, like Esc.
+    #[test]
+    fn a_picker_row_click_launches_it_and_an_outside_click_cancels() {
+        let mut app = mk_app();
+        app.apply(Action::QuickLaunch);
+        let rect = ui::render::modal_rect(&app).expect("the picker draws a dialog");
+        handle_mouse(&mut app, click(rect.x, rect.y)); // the border: neither row nor outside
+        assert!(matches!(app.mode, Mode::Picker { .. }), "a border click does nothing");
+
+        let below = app.body_area().bottom() - 1;
+        handle_mouse(&mut app, click(0, below)); // outside
+        assert!(matches!(app.mode, Mode::Normal), "an outside click cancels the picker");
+        assert_eq!(app.rects().len(), 1, "cancelling launches nothing");
+
+        app.apply(Action::QuickLaunch);
+        let rect = ui::render::modal_rect(&app).expect("the picker draws a dialog");
+        let items = crate::core::app::picker_items();
+        handle_mouse(&mut app, click(rect.x + 1, rect.y + 1 + (items.len() - 1) as u16));
+        assert!(matches!(app.mode, Mode::Normal), "launching leaves the modal");
+        assert_eq!(app.rects().len(), 2, "the clicked row spawned a pane");
+        let spawned = app.focused;
+        assert_eq!(app.find_spec(spawned).map(|s| s.adapter.clone()), Some(items[items.len() - 1].into()));
+    }
+
+    /// Help closes on any click (C15's "any key closes it", in mouse form);
+    /// the feed closes on a click outside it and ignores one inside.
+    #[test]
+    fn help_closes_on_any_click_and_the_feed_only_on_an_outside_one() {
+        let mut app = mk_app();
+        app.apply(Action::Help);
+        let rect = ui::render::modal_rect(&app).expect("help draws a dialog");
+        handle_mouse(&mut app, click(rect.x + 1, rect.y + 1));
+        assert!(matches!(app.mode, Mode::Normal), "any click dismisses help");
+
+        app.apply(Action::ToggleFeed);
+        let rect = ui::render::modal_rect(&app).expect("the feed draws a dialog");
+        handle_mouse(&mut app, click(rect.x + 1, rect.y + 1));
+        assert!(matches!(app.mode, Mode::Feed { .. }), "a click inside the feed keeps it open");
+        let below = app.body_area().bottom() - 1;
+        handle_mouse(&mut app, click(0, below));
+        assert!(matches!(app.mode, Mode::Normal), "a click outside closes the feed");
     }
 
     /// C22: float-first hit-test ordering (a click inside its centered rect

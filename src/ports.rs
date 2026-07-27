@@ -28,6 +28,28 @@ pub struct Observation {
     pub agent: Option<String>,
 }
 
+/// U14: which clipboard channel actually took a copy. roost writes to both
+/// (a native helper *and* OSC 52) and used to discard both results, so the
+/// hint bar said "copied N chars" whether or not anything landed. The two
+/// channels are not equally knowable, and the variants say exactly that:
+/// a native helper reports an exit status, while OSC 52 is fire-and-forget
+/// — the terminal may honor it, ignore it, or not be listening at all, and
+/// there is no reply. Lives here (not in `infra`) because it is the
+/// vocabulary the core's flash text is written against; `infra::clipboard`
+/// produces it, `core::app::copy_flash_text` consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardOutcome {
+    /// A native helper (pbcopy / wl-copy / xclip / xsel) exited successfully
+    /// — the system clipboard really holds the text.
+    Native,
+    /// No native helper succeeded, but the OSC 52 sequence went out. It is
+    /// the only channel that works over SSH/tmux, and the honest report is
+    /// "sent, unacknowledged".
+    Osc52,
+    /// Neither channel got the text anywhere.
+    Failed,
+}
+
 /// What the pane's inner application asked for, mouse-wise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseProto {

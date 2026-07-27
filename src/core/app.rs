@@ -16,7 +16,7 @@ use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
-use crate::ports::{Observation, PaneBackend, StateStore};
+use crate::ports::{ClipboardOutcome, Observation, PaneBackend, StateStore};
 use crate::ui::input::Action;
 use crate::ui::render::state_word;
 
@@ -149,13 +149,18 @@ const MIN_FLOAT_BODY_ROWS: u16 = 10;
 /// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
 /// is a lazily-loaded tab whose panes haven't been spawned — deliberately
 /// distinct from `Quiet` (spawned, nothing happening) so a background tab
-/// never masquerades as idle. `render` maps each to a glyph + colour.
+/// never masquerades as idle. `Exited` (U13, closing SPEC-GAP-2) is the
+/// same honesty one step further: a tab whose agents are *dead* used to
+/// render the Quiet blank, so a background tab full of corpses looked
+/// exactly like a background tab with nothing to say. `render` maps each to
+/// a glyph + colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabSummary {
     NeedsInput,
     Working,
     Unknown,
     Waiting,
+    Exited,
     Quiet,
 }
 
@@ -203,6 +208,10 @@ pub struct App<B: PaneBackend> {
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
     /// they are (or the window has simply run out).
     alt_seen: bool,
+    /// U4: set the first time ANY key event arrives. Keys flowing with no
+    /// Alt among them is the evidence the alt-trap warning now triggers on,
+    /// instead of an allowlist of terminals known to eat Option.
+    keys_seen: bool,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
     /// Transient status message shown in the hint bar (e.g. "copied"), with
@@ -249,6 +258,16 @@ pub struct App<B: PaneBackend> {
     /// C23: panes currently in raw (hard pass-through) mode, by id.
     /// Per-pane, session-only — never persisted.
     raw: HashSet<PaneId>,
+    /// U11: the pane each tab returns focus to when you come back to it —
+    /// session-only, never persisted. Held as a **set of pane ids** rather
+    /// than a map keyed by tab index, because `ws.tabs` has no stable
+    /// identity and indexes shift on close/reorder/undo: a tab's entry is
+    /// simply the one remembered id that tab still owns (pane ids are
+    /// unique workspace-wide), so a vanished tab can never hand its memory
+    /// to a different one. The invariant "at most one entry per tab" is
+    /// maintained by `remember_tab_focus`, and `close_pane_id` forgets a
+    /// closed pane so a recycled id can't resurrect a stale memory.
+    tab_focus: HashSet<PaneId>,
     /// C24: text most recently yanked via the keyboard copy-mode `y`/`Enter`
     /// chord, waiting for the composition root to hand it to the OS
     /// clipboard — core has no I/O of its own (module doc). The mouse path
@@ -303,6 +322,7 @@ impl<B: PaneBackend> App<B> {
             home: dirs::home_dir(),
             started: Instant::now(),
             alt_seen: false,
+            keys_seen: false,
             selection: None,
             flash: None,
             undo: Vec::new(),
@@ -316,6 +336,7 @@ impl<B: PaneBackend> App<B> {
             feed: VecDeque::new(),
             float: None,
             raw: HashSet::new(),
+            tab_focus: HashSet::new(),
             pending_yank: None,
         };
         app.spawn_active_tab();
@@ -369,17 +390,32 @@ impl<B: PaneBackend> App<B> {
         self.alt_seen = true;
     }
 
-    /// Stock Terminal.app doesn't send Alt as a modifier until the user turns
-    /// on "Use Option as Meta Key" — with it off, every Alt+key roost relies
-    /// on silently does nothing, and there's no other signal to tell the user
-    /// why. `TERM_PROGRAM` reliably names Terminal.app, so nudge for the first
-    /// few seconds unless an Alt key has already gotten through.
+    /// U4: record that *some* key arrived — the evidence half of the
+    /// alt-trap trigger. Keys flowing with no Alt among them is what
+    /// "the terminal is eating the Alt layer" looks like from in here.
+    pub fn note_key_seen(&mut self) {
+        self.keys_seen = true;
+    }
+
+    /// C11/U4: should the "Alt keys aren't reaching roost" bar be up? Many
+    /// terminals don't send Alt as a modifier until told to (stock
+    /// Terminal.app's "Use Option as Meta Key", iTerm2's Left Option =
+    /// `Esc+`) — with it off, every Alt chord roost relies on silently does
+    /// nothing and there is no other signal saying why. Gating this on
+    /// `TERM_PROGRAM == "Apple_Terminal"` only meant the README's own
+    /// recommended terminal (iTerm2) never warned; the trigger is now the
+    /// evidence itself, on any terminal (see `wants_alt_hint`).
     pub fn show_alt_hint(&self) -> bool {
-        wants_alt_hint(
-            self.alt_seen,
-            self.started.elapsed(),
-            std::env::var("TERM_PROGRAM").ok().as_deref(),
-        )
+        wants_alt_hint(self.alt_seen, self.keys_seen, self.started.elapsed())
+    }
+
+    /// C11/U4: the warning's text, with the real menu path for terminals
+    /// whose setting we know. Reads roost's OWN `TERM_PROGRAM` — the host
+    /// terminal's identity. (Panes are handed `TERM_PROGRAM=roost` by
+    /// `infra::pty`, but that is the child's environment; this process still
+    /// sees what the host set, which is exactly what must be named here.)
+    pub fn alt_hint_line(&self) -> &'static str {
+        alt_hint_line(std::env::var("TERM_PROGRAM").ok().as_deref())
     }
 
     /// Time since app start — the shared clock chrome uses for the
@@ -783,18 +819,20 @@ impl<B: PaneBackend> App<B> {
     pub fn tab_summary(&self, tab_index: usize) -> TabSummary {
         let Some(tab) = self.ws.tabs.get(tab_index) else { return TabSummary::Quiet };
         let mut any_unknown = false;
-        let (mut needs, mut working, mut waiting) = (false, false, false);
+        let (mut needs, mut working, mut waiting, mut exited) = (false, false, false, false);
         for id in tab.panes.keys() {
             match self.runtimes.get(id) {
                 Some(rt) => match rt.status() {
                     AgentStatus::NeedsInput => needs = true,
                     AgentStatus::Working => working = true,
                     AgentStatus::Waiting => waiting = true,
-                    _ => {}
+                    AgentStatus::Exited => exited = true, // U13
+                    AgentStatus::Idle => {}
                 },
                 // No runtime and not a known spawn-failure ⇒ not spawned yet.
                 None if !self.dead.contains_key(id) => any_unknown = true,
-                None => {}
+                // A recorded spawn failure is a dead pane too (U13).
+                None => exited = true,
             }
         }
         if needs {
@@ -805,6 +843,10 @@ impl<B: PaneBackend> App<B> {
             TabSummary::Working
         } else if waiting {
             TabSummary::Waiting
+        } else if exited {
+            // U13: ranked below Waiting (a live agent outranks a corpse) and
+            // above Quiet (a dead pane is news; an idle one isn't).
+            TabSummary::Exited
         } else {
             TabSummary::Quiet
         }
@@ -1393,6 +1435,10 @@ impl<B: PaneBackend> App<B> {
         self.raw.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
+        // U11: a closed pane is no longer anyone's focus memory — pane ids
+        // are recycled (`next_pane_id` is a max+1), so a stale entry could
+        // otherwise be inherited by an unrelated pane in another tab.
+        self.tab_focus.remove(&id);
         let empty = layout::remove_pane(&mut tab.layout, id);
         if empty && self.ws.tabs.len() > 1 {
             self.ws.tabs.remove(ti);
@@ -1425,9 +1471,15 @@ impl<B: PaneBackend> App<B> {
         // The active tab's membership may have changed out from under
         // `focused` (its pane closed, or its tab shifted/removed above) —
         // keep focus inside whatever tab is now on screen rather than
-        // routing keystrokes to a pane in a tab nobody's looking at.
+        // routing keystrokes to a pane in a tab nobody's looking at. U11:
+        // being moved onto a tab is a tab switch like any other, so honor
+        // that tab's focus memory before falling back to its first pane.
         if !self.ws.active_tab().panes.contains_key(&self.focused) {
-            self.focused = self.pane_order().first().copied().unwrap_or(0);
+            let active = self.ws.active_tab;
+            self.focused = self
+                .tab_focus_target(active)
+                .or_else(|| self.pane_order().first().copied())
+                .unwrap_or(0);
         }
         true
     }
@@ -1525,6 +1577,25 @@ impl<B: PaneBackend> App<B> {
     /// remainder would be interpreted as typed input (paste injection — tmux
     /// strips these too). A pane without the mode gets the bytes verbatim,
     /// exactly like a terminal with bracketed paste off.
+    /// U8(b): route a host paste by mode — the composition root's whole
+    /// `Event::Paste` handling. A modal owns the paste: `Rename` takes the
+    /// text into its buffer (printables only, so a pasted newline can't
+    /// commit the rename and no control byte can reach a title), and the
+    /// other three modals swallow it; every other mode forwards to the
+    /// focused pane exactly as before. Pre-U8 a paste during Rename went
+    /// to the pane *under* the dialog — live QA typed `PSTX` into a hidden
+    /// shell while the dialog's own buffer ignored it.
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Mode::Rename { buffer, .. } = &mut self.mode {
+            buffer.extend(text.chars().filter(|c| !c.is_control()));
+            return;
+        }
+        if self.modal_active() {
+            return; // Picker / Help / Feed: nothing to type into
+        }
+        self.forward_paste(text);
+    }
+
     pub fn forward_paste(&mut self, text: &str) {
         let id = self.focused;
         let Some(rt) = self.runtimes.get_mut(&id) else { return };
@@ -1627,9 +1698,34 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// Finish the drag: extract the selected text, set a "copied" flash, and
-    /// leave copy mode. Returns the text to hand to the clipboard (None when
-    /// the selection is empty).
+    /// U14: the hint-bar text for a finished copy of `chars` characters,
+    /// given which clipboard channel actually took it. The flash used to
+    /// fire at extraction time and claim `copied N chars` unconditionally —
+    /// while `clipboard::copy` discarded both channels' results, so an
+    /// empty clipboard reported a successful copy. Pure, so the wording is
+    /// pinned without touching a clipboard.
+    pub fn copy_flash_text(chars: usize, outcome: ClipboardOutcome) -> String {
+        match outcome {
+            ClipboardOutcome::Native => format!("copied {chars} chars"),
+            // Sent, unacknowledged: OSC 52 has no reply, and the terminal
+            // may not be listening. The qualifier is the whole point — it
+            // tells you where to look when the paste comes up empty.
+            ClipboardOutcome::Osc52 => format!("copied {chars} chars (OSC 52)"),
+            ClipboardOutcome::Failed => "copy failed".to_string(),
+        }
+    }
+
+    /// U14: flash the result of a copy the composition root just performed
+    /// (core has no clipboard I/O of its own — same division as
+    /// `pending_yank`). Both copy paths, mouse and keyboard, end here.
+    pub fn flash_copy(&mut self, chars: usize, outcome: ClipboardOutcome) {
+        self.set_flash(Self::copy_flash_text(chars, outcome));
+    }
+
+    /// Finish the drag: extract the selected text and leave copy mode.
+    /// Returns the text to hand to the clipboard (None when the selection
+    /// is empty). U14: the "copied" flash is *not* set here — it is set by
+    /// the caller once the clipboard has actually answered (`flash_copy`).
     pub fn finish_selection(&mut self) -> Option<String> {
         let sel = self.selection.as_mut()?;
         sel.dragging = false;
@@ -1640,7 +1736,6 @@ impl<B: PaneBackend> App<B> {
         if text.is_empty() {
             return None;
         }
-        self.set_flash(format!("copied {} chars", text.chars().count()));
         Some(text)
     }
 
@@ -1701,6 +1796,81 @@ impl<B: PaneBackend> App<B> {
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         self.relayout();
         self.save();
+    }
+
+    /// U8: is a modal overlay up? These four modes own the whole
+    /// non-keyboard input surface — mouse and paste alike — while they are
+    /// active. Scroll/Copy are deliberately excluded: they draw no dialog,
+    /// nothing is hidden underneath them, and their mouse behavior (wheel
+    /// scrolls, drag selects) is the point.
+    pub fn modal_active(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Rename { .. } | Mode::Picker { .. } | Mode::Help | Mode::Feed { .. }
+        )
+    }
+
+    /// U8(a): the whole mouse path while a modal is up — the composition
+    /// root routes here instead of the pane/tab path (gated on
+    /// `modal_active`, the same shape copy mode already uses), so nothing
+    /// beneath the dialog can be mutated: no focus change, no tab switch, no
+    /// pane scroll, nothing forwarded to a pane's app. `dialog` is the
+    /// modal's *drawn* rect (`render::modal_rect`), so hit-testing can never
+    /// disagree with what's on screen (renderer/hitbox lockstep, §4/§5).
+    ///
+    /// Rules: the wheel scrolls the feed by its own PgUp/PgDn step and is
+    /// swallowed by every other modal; a left click outside the dialog
+    /// dismisses Picker/Feed and any click dismisses Help (C15's "any key
+    /// closes it", in mouse form); a click on a picker row selects and
+    /// launches it. `Rename` is the one carve-out — see below.
+    pub fn handle_modal_mouse(&mut self, me: crossterm::event::MouseEvent, dialog: Option<Rect>) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // The feed owns the wheel wherever the pointer sits: the panes
+        // beneath are unreachable while it's up, so position-routing would
+        // only mean "the wheel does nothing here" — and reaching the pane
+        // under the overlay is U8(c), the bug itself.
+        let page = self.feed_page();
+        let cap = self.feed.len().saturating_sub(1);
+        if let Mode::Feed { offset } = &mut self.mode {
+            match me.kind {
+                MouseEventKind::ScrollUp => *offset = (*offset + page).min(cap),
+                MouseEventKind::ScrollDown => *offset = offset.saturating_sub(page),
+                _ => {}
+            }
+        }
+        let inside = dialog.is_some_and(|r| {
+            me.column >= r.x
+                && me.column < r.x.saturating_add(r.width)
+                && me.row >= r.y
+                && me.row < r.y.saturating_add(r.height)
+        });
+        if !matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return; // wheel handled above; drag/release/motion are swallowed
+        }
+        // Rename is deliberately NOT dismissed by an outside click: its
+        // buffer is unsaved work, and throwing it away on a stray click is
+        // U8(a)'s harm inverted (the live QA script types `ZZZ`, clicks
+        // another pane, and expects the commit to land on the pane the
+        // dialog opened on). Esc/Enter stay the ways out.
+        if matches!(self.mode, Mode::Rename { .. }) {
+            return;
+        }
+        if matches!(self.mode, Mode::Picker { .. }) {
+            let rows = picker_items().len();
+            match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, rows, me.column, me.row)) {
+                Some(i) => self.picker_launch(i),
+                None if !inside => self.mode = Mode::Normal,
+                None => {}
+            }
+            return;
+        }
+        if matches!(self.mode, Mode::Help) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        if matches!(self.mode, Mode::Feed { .. }) && !inside {
+            self.mode = Mode::Normal;
+        }
     }
 
     /// Forward an encoded mouse event (wheel / click / drag) to a mouse-aware
@@ -1823,6 +1993,9 @@ impl<B: PaneBackend> App<B> {
             Action::Focus(dir) => self.focus_dir(dir),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
+            Action::NextTab => self.step_tab(1),
+            Action::PrevTab => self.step_tab(-1),
+            Action::LastTab => self.go_to_tab(self.ws.tabs.len().saturating_sub(1)),
             Action::ToggleStack => {
                 let focused = self.focused;
                 layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
@@ -1905,6 +2078,7 @@ impl<B: PaneBackend> App<B> {
         match closed {
             Closed::Tab { index, tab } => {
                 let name = tab.name.clone();
+                self.remember_tab_focus(); // U11: reopening a tab leaves this one
                 let i = index.min(self.ws.tabs.len());
                 self.ws.tabs.insert(i, tab);
                 self.ws.active_tab = i;
@@ -2116,6 +2290,7 @@ impl<B: PaneBackend> App<B> {
     fn new_tab(&mut self) {
         self.exit_zoom(); // C21: any tab change exits zoom
         self.hide_float(); // C22 rule 2: "any tab change" hides the float too
+        self.remember_tab_focus(); // U11: Alt+t leaves a tab like any switch
         let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
@@ -2130,14 +2305,68 @@ impl<B: PaneBackend> App<B> {
         self.focused = id;
     }
 
-    fn go_to_tab(&mut self, i: usize) {
-        if i < self.ws.tabs.len() {
-            self.exit_zoom(); // C21: any (real) tab change exits zoom
-            self.hide_float(); // C22 rule 2: any tab change hides the float
-            self.ws.active_tab = i;
-            self.spawn_active_tab();
-            self.focused = self.pane_order().first().copied().unwrap_or(self.focused);
+    /// U11: snapshot where focus sits in the tab we're about to leave, so
+    /// coming back returns here. Called with `ws.active_tab` still pointing
+    /// at the tab being left. Clearing that tab's panes out of the set
+    /// first keeps the "at most one entry per tab" invariant `tab_focus`
+    /// relies on; the float (which belongs to no tab) is never stored.
+    fn remember_tab_focus(&mut self) {
+        let focused = self.focused;
+        let ids: Vec<PaneId> = self.ws.active_tab().panes.keys().copied().collect();
+        if !ids.contains(&focused) {
+            return; // the float, or a tab mid-edit — nothing honest to store
         }
+        for id in ids {
+            self.tab_focus.remove(&id);
+        }
+        self.tab_focus.insert(focused);
+    }
+
+    /// U11: the pane tab `i` should return focus to — its remembered pane
+    /// if that pane is still alive in it, else None (callers fall back to
+    /// the tab's first pane).
+    fn tab_focus_target(&self, i: usize) -> Option<PaneId> {
+        let tab = self.ws.tabs.get(i)?;
+        tab.panes.keys().find(|id| self.tab_focus.contains(id)).copied()
+    }
+
+    fn go_to_tab(&mut self, i: usize) {
+        if i >= self.ws.tabs.len() {
+            return;
+        }
+        // U11: the digit for the tab you're already on is a no-op. It used
+        // to run the whole switch: live QA pressed Alt+1 on tab 1 and lost
+        // zoom, and the same path hid the float and reset focus to the
+        // tab's first pane — a "switch" to nowhere, destroying view state.
+        if i == self.ws.active_tab {
+            return;
+        }
+        self.exit_zoom(); // C21: any (real) tab change exits zoom
+        self.hide_float(); // C22 rule 2: any tab change hides the float
+        self.remember_tab_focus(); // after hide_float: never store the float
+        self.ws.active_tab = i;
+        self.spawn_active_tab();
+        // U11: land on the pane this tab was left on; a first visit (or a
+        // remembered pane that has since closed) falls back to its first.
+        self.focused = self
+            .tab_focus_target(i)
+            .or_else(|| self.pane_order().first().copied())
+            .unwrap_or(self.focused);
+    }
+
+    /// U7: step `delta` tabs, wrapping at both ends — Alt+m forward, Alt+i
+    /// back. Wrapping is what makes the strip navigable with two keys: no
+    /// dead end at either edge, and tabs past the ninth (unreachable by
+    /// digit) are always a few presses away. A single tab wraps onto itself
+    /// and `go_to_tab`'s same-tab rule (U11) makes that the no-op it should
+    /// be — zoom and the float survive.
+    fn step_tab(&mut self, delta: isize) {
+        let n = self.ws.tabs.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.ws.active_tab as isize + delta).rem_euclid(n as isize) as usize;
+        self.go_to_tab(next);
     }
 
     /// C21: leave zoom (a pure view flag). Called by every documented exit
@@ -2266,6 +2495,30 @@ impl<B: PaneBackend> App<B> {
             Mode::Feed { .. } => Mode::Normal,
             _ => Mode::Feed { offset: 0 },
         };
+    }
+
+    /// C20: the feed overlay's paging step — half its drawn height, at least
+    /// one entry. The single source for the keyboard's PgUp/PgDn
+    /// (`handle_mode_key`) and, since U8, one wheel notch over the overlay.
+    fn feed_page(&self) -> usize {
+        (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize
+    }
+
+    /// C14: launch the picker's item `index` — leave the modal, then spawn
+    /// it with the same C21/C22 pre-steps a picker launch has always had.
+    /// Shared by the keyboard's Enter and U8's click-a-row path so the two
+    /// can't drift.
+    fn picker_launch(&mut self, index: usize) {
+        let items = picker_items();
+        let Some(adapter) = items.get(index.min(items.len().saturating_sub(1))).copied() else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        self.exit_zoom(); // C21: "picker launch" is a structural action
+        self.hide_float(); // C22 rule 3: ditto
+        self.new_pane_with(adapter);
+        self.relayout();
+        self.save();
     }
 
     // -- float (C22) ---------------------------------------------------------
@@ -2417,7 +2670,7 @@ impl<B: PaneBackend> App<B> {
         // here (needs a whole `&self` via `body_area()`) rather than inside
         // the match below, where `Mode::Feed`'s arm already holds
         // `self.mode` mutably borrowed.
-        let feed_page = (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize;
+        let feed_page = self.feed_page();
         // C24: the focused pane's current inner grid, for clamping the copy
         // cursor — same borrow-ordering reason as `feed_page` above.
         let (copy_h, copy_w) = self.focused_inner_dims();
@@ -2465,13 +2718,8 @@ impl<B: PaneBackend> App<B> {
                         *selection = (*selection + 1) % items.len()
                     }
                     KeyCode::Enter => {
-                        let adapter = items[(*selection).min(items.len() - 1)];
-                        self.mode = Mode::Normal;
-                        self.exit_zoom(); // C21: "picker launch" is a structural action
-                        self.hide_float(); // C22 rule 3: ditto
-                        self.new_pane_with(adapter);
-                        self.relayout();
-                        self.save();
+                        let choice = *selection;
+                        self.picker_launch(choice);
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
@@ -2780,8 +3028,34 @@ fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode 
 
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
 /// without depending on process env vars or wall-clock time.
-fn wants_alt_hint(alt_seen: bool, elapsed: Duration, term_program: Option<&str>) -> bool {
-    !alt_seen && elapsed < ALT_HINT_WINDOW && term_program == Some("Apple_Terminal")
+///
+/// U4: the trigger is evidence, not an allowlist — keys are arriving and
+/// not one of them has carried Alt, inside the startup window. That covers
+/// every terminal with the setting off (the old `TERM_PROGRAM ==
+/// "Apple_Terminal"` test left iTerm2, the README's recommendation, silent),
+/// and it fires at exactly the right moment: when Option-as-Meta is off, the
+/// chord you just tried arrives as an unmodified key (Option+b → `∫`), so
+/// the failed chord is itself the evidence. One Alt key ever, or the window
+/// running out, ends it for the session.
+fn wants_alt_hint(alt_seen: bool, keys_seen: bool, elapsed: Duration) -> bool {
+    !alt_seen && keys_seen && elapsed < ALT_HINT_WINDOW
+}
+
+/// C11/U4: the warning line for a given host `TERM_PROGRAM` — the real menu
+/// path where we know it, a terminal-agnostic line otherwise. Pure, so the
+/// wording is pinned without touching the environment.
+fn alt_hint_line(term_program: Option<&str>) -> &'static str {
+    match term_program {
+        Some("Apple_Terminal") => {
+            " Alt keys aren't reaching roost? Enable \"Use Option as Meta Key\" in Terminal > Settings > Profiles > Keyboard "
+        }
+        Some("iTerm.app") => {
+            " Alt keys aren't reaching roost? Set Left Option key to \"Esc+\" in iTerm2 > Settings > Profiles > Keys "
+        }
+        _ => {
+            " Alt keys aren't reaching roost? Turn on your terminal's Option/Alt-as-Meta setting (send Esc+) "
+        }
+    }
 }
 
 /// Pure decision behind `App::focused_cwd`: abbreviate a `$HOME`-rooted path
@@ -2897,6 +3171,72 @@ mod tests {
         // Not spawned (no runtime, no recorded failure) → Unknown, never idle.
         app.runtimes.remove(&id);
         assert_eq!(app.tab_summary(0), TabSummary::Unknown);
+    }
+
+    /// U13 (closes SPEC-GAP-2): a tab whose agents are dead says so instead
+    /// of rendering the Quiet blank — one transient bell, then silence, was
+    /// the entire signal a background tab full of corpses used to get.
+    #[test]
+    fn tab_summary_reports_exited_and_ranks_it_between_waiting_and_quiet() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2 in one tab
+        assert_eq!(app.tab_summary(0), TabSummary::Quiet);
+
+        app.runtimes.get_mut(&1).unwrap().kill(); // pane 1 dies
+        assert_eq!(app.tab_summary(0), TabSummary::Exited, "a dead pane is news");
+
+        // A live pane with something to say outranks a corpse...
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.tab_summary(0), TabSummary::Waiting);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Working);
+        assert_eq!(app.tab_summary(0), TabSummary::Working);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.tab_summary(0), TabSummary::NeedsInput);
+        // ...and an idle one does not: Idle is "nothing to report", the
+        // corpse is the only news on the tab.
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Idle);
+        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+        // Every pane dead is still Exited, never Quiet.
+        app.runtimes.get_mut(&2).unwrap().kill();
+        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+    }
+
+    /// A pane whose *spawn* failed has no runtime at all — it is dead, not
+    /// unspawned, and must not read as `Unknown` (nor drag the tab to it).
+    #[test]
+    fn tab_summary_counts_a_failed_spawn_as_exited_not_unknown() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        app.runtimes.remove(&id);
+        app.dead.insert(id, "spawn-fail requested".into());
+        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+    }
+
+    /// U14: the flash says what actually happened. A native helper that
+    /// exited clean is an unqualified copy; OSC 52 alone is flagged (sent,
+    /// unacknowledged — the one channel that works over SSH, and the one
+    /// that can silently do nothing); neither is an honest failure.
+    #[test]
+    fn copy_flash_text_names_the_channel_that_took_it() {
+        assert_eq!(App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Native), "copied 13 chars");
+        assert_eq!(
+            App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Osc52),
+            "copied 13 chars (OSC 52)"
+        );
+        assert_eq!(App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Failed), "copy failed");
+        // A failure never quotes a count — there is no N to have copied.
+        assert!(!App::<FakePane>::copy_flash_text(0, ClipboardOutcome::Failed).contains('0'));
+    }
+
+    /// The flash lands on the bar for both copy paths, and only after the
+    /// clipboard has answered.
+    #[test]
+    fn flash_copy_puts_the_real_outcome_on_the_bar() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.flash_copy(4, ClipboardOutcome::Osc52);
+        assert_eq!(app.flash(), Some("copied 4 chars (OSC 52)"));
+        app.flash_copy(4, ClipboardOutcome::Failed);
+        assert_eq!(app.flash(), Some("copy failed"));
     }
 
     #[test]
@@ -3974,6 +4314,60 @@ mod tests {
         assert_eq!(app.runtimes.get(&id).unwrap().input, b"\x1b[200~xevil\r\x1b[201~");
     }
 
+    /// U8(b): a paste while the rename dialog is up belongs to the dialog's
+    /// buffer, not the pane hidden underneath (live QA: `PSTX` landed in the
+    /// shell below while the buffer ignored it). Control bytes are stripped:
+    /// a pasted newline must not commit the rename, and no ESC/CR may reach
+    /// a pane title.
+    #[test]
+    fn paste_during_rename_fills_the_buffer_with_printables_only() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::RenamePane);
+        app.handle_paste("api\n\x1b[0mbox\t");
+        match &app.mode {
+            Mode::Rename { buffer, .. } => assert_eq!(buffer, "api[0mbox"),
+            _ => panic!("the rename dialog must still be up, holding the pasted text"),
+        }
+        assert!(app.runtimes.get(&id).unwrap().input.is_empty(), "the pane must see nothing");
+        app.handle_mode_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.find_spec(id).and_then(|s| s.title.clone()), Some("api[0mbox".into()));
+    }
+
+    /// The other three modals have no text field: the paste is swallowed,
+    /// never forwarded to the pane beneath.
+    #[test]
+    fn paste_is_swallowed_by_the_picker_help_and_feed_modals() {
+        for open in [Action::QuickLaunch, Action::Help, Action::ToggleFeed] {
+            let (mut app, _) = mk_app(shell_ws());
+            let id = app.focused;
+            app.apply(open);
+            app.handle_paste("PSTX");
+            assert!(
+                app.runtimes.get(&id).unwrap().input.is_empty(),
+                "{open:?} must swallow the paste"
+            );
+        }
+    }
+
+    /// ...and with no modal up, the paste still reaches the focused pane
+    /// through the unchanged `forward_paste` path (guards and all).
+    #[test]
+    fn paste_without_a_modal_still_reaches_the_focused_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.handle_paste("hello");
+        assert_eq!(app.runtimes.get(&id).unwrap().input, b"hello");
+        // Scroll mode draws no dialog and hides nothing — it keeps forwarding.
+        app.apply(Action::ScrollMode);
+        app.runtimes.get_mut(&id).unwrap().input.clear();
+        app.handle_paste("more");
+        assert_eq!(app.runtimes.get(&id).unwrap().input, b"more");
+    }
+
     #[test]
     fn toggle_stack_then_click_expands_member() {
         let (mut app, _) = mk_app(shell_ws());
@@ -4037,7 +4431,11 @@ mod tests {
         assert_eq!(app.finish_selection().as_deref(), Some("selected text"));
         assert!(!app.in_copy_mode()); // exited on copy
         assert!(app.selection.is_none());
-        assert!(app.flash().is_some()); // "copied N chars"
+        // U14: the flash is the caller's job now — extraction claims
+        // nothing until the clipboard has actually answered.
+        assert!(app.flash().is_none());
+        app.flash_copy(13, ClipboardOutcome::Native);
+        assert_eq!(app.flash(), Some("copied 13 chars"));
     }
 
     #[test]
@@ -4344,11 +4742,53 @@ mod tests {
 
     #[test]
     fn alt_hint_gates_on_seen_time_and_terminal() {
-        assert!(wants_alt_hint(false, Duration::from_secs(1), Some("Apple_Terminal")));
-        assert!(!wants_alt_hint(true, Duration::from_secs(1), Some("Apple_Terminal")));
-        assert!(!wants_alt_hint(false, ALT_HINT_WINDOW, Some("Apple_Terminal")));
-        assert!(!wants_alt_hint(false, Duration::from_secs(1), Some("iTerm.app")));
-        assert!(!wants_alt_hint(false, Duration::from_secs(1), None));
+        // U4: keys arriving with no Alt among them fires it — on ANY
+        // terminal, since that IS the symptom (the old Apple_Terminal-only
+        // test left iTerm2, the README's recommendation, silent).
+        assert!(wants_alt_hint(false, true, Duration::from_secs(1)));
+        // One Alt key ever ends it, and it never fires before any key: an
+        // untouched roost has no evidence of anything.
+        assert!(!wants_alt_hint(true, true, Duration::from_secs(1)));
+        assert!(!wants_alt_hint(false, false, Duration::from_secs(1)));
+        // The startup window still bounds it, at the boundary and past it.
+        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW));
+        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW + Duration::from_secs(60)));
+        assert!(wants_alt_hint(false, true, ALT_HINT_WINDOW - Duration::from_millis(1)));
+    }
+
+    /// C11/U4: the bar names the real setting for terminals we know, and
+    /// stays terminal-agnostic (never a wrong menu path) otherwise.
+    #[test]
+    fn the_alt_warning_names_the_right_menu_for_the_terminals_it_knows() {
+        let apple = alt_hint_line(Some("Apple_Terminal"));
+        assert!(apple.contains("Use Option as Meta Key") && apple.contains("Terminal > Settings"));
+        let iterm = alt_hint_line(Some("iTerm.app"));
+        assert!(iterm.contains("Esc+") && iterm.contains("iTerm2 > Settings > Profiles > Keys"));
+        for other in [Some("WezTerm"), Some("ghostty"), None] {
+            let line = alt_hint_line(other);
+            assert!(line.contains("Alt keys aren't reaching roost?"), "{other:?}");
+            assert!(!line.contains("Terminal > Settings"), "{other:?} must not get a wrong path");
+            assert!(!line.contains("iTerm2"), "{other:?} must not get a wrong path");
+        }
+        // Every variant is a full-width bar line: padded both ends (C11).
+        for t in [Some("Apple_Terminal"), Some("iTerm.app"), None] {
+            let line = alt_hint_line(t);
+            assert!(line.starts_with(' ') && line.ends_with(' '), "{t:?}");
+        }
+    }
+
+    /// The trigger end-to-end on a real `App`: silent until a key arrives,
+    /// up while keys flow without Alt, gone for good once one carries Alt.
+    #[test]
+    fn the_alt_warning_appears_on_the_first_alt_less_key_and_dies_on_the_first_alt() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert!(!app.show_alt_hint(), "nothing typed yet — nothing to warn about");
+        app.note_key_seen();
+        assert!(app.show_alt_hint());
+        app.note_alt_seen();
+        assert!(!app.show_alt_hint(), "Alt got through — the warning is wrong now");
+        app.note_key_seen();
+        assert!(!app.show_alt_hint(), "and it stays gone for the session");
     }
 
     #[test]
@@ -4599,6 +5039,179 @@ mod tests {
         assert!(app.zoomed());
         app.apply(Action::GoToTab(0));
         assert!(!app.zoomed());
+    }
+
+    // ---- U7: tab reachability -------------------------------------------
+
+    /// Alt+m / Alt+i step the strip and wrap at both ends — with `Alt+1..9`
+    /// stopping at nine and no cycle chord at all, tabs 10+ were reachable
+    /// by nothing but the mouse (and only if they happened to be drawn).
+    #[test]
+    fn next_and_prev_tab_chords_step_and_wrap_at_both_ends() {
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..2 {
+            app.apply(Action::NewTab); // three tabs, active = 2
+        }
+        assert_eq!(app.ws.active_tab, 2);
+        app.apply(Action::NextTab);
+        assert_eq!(app.ws.active_tab, 0, "next wraps past the end");
+        app.apply(Action::PrevTab);
+        assert_eq!(app.ws.active_tab, 2, "previous wraps past the start");
+        app.apply(Action::PrevTab);
+        assert_eq!(app.ws.active_tab, 1);
+        app.apply(Action::NextTab);
+        assert_eq!(app.ws.active_tab, 2);
+    }
+
+    /// `Alt+0` is the digit row's "and the rest" slot: the last tab,
+    /// whatever its number — including past the ninth.
+    #[test]
+    fn alt_zero_jumps_to_the_last_tab_however_many_there_are() {
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..11 {
+            app.apply(Action::NewTab); // twelve tabs
+        }
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.ws.active_tab, 0);
+        app.apply(Action::LastTab);
+        assert_eq!(app.ws.active_tab, 11, "tab 12 has no digit of its own");
+        // Alt+9 still means the ninth tab, not the last.
+        app.apply(Action::GoToTab(8));
+        assert_eq!(app.ws.active_tab, 8);
+    }
+
+    /// With one tab, every reach chord is the same no-op the same-tab digit
+    /// is (U11) — zoom and the float survive, nothing "switches".
+    #[test]
+    fn tab_reach_chords_on_a_lone_tab_preserve_view_state() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleZoom);
+        for action in [Action::NextTab, Action::PrevTab, Action::LastTab] {
+            app.apply(action);
+            assert_eq!(app.ws.active_tab, 0, "{action:?}");
+            assert!(app.zoomed(), "{action:?} must not exit zoom on a lone tab");
+        }
+    }
+
+    // ---- U11: per-tab focus memory + same-tab digit ----------------------
+
+    /// The digit for the tab you're already on changes nothing: zoom, the
+    /// float and focus all survive. (Live QA: Alt+1 on tab 1 exited zoom;
+    /// the same path also hid the float and reset focus to the first pane.)
+    #[test]
+    fn a_same_tab_digit_is_a_no_op_and_keeps_zoom_float_and_focus() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2 in tab 0, focus 2
+        app.apply(Action::ToggleZoom);
+        let focused = app.focused;
+        app.apply(Action::GoToTab(0)); // already here
+        assert!(app.zoomed(), "the same-tab digit must not exit zoom");
+        assert_eq!(app.focused, focused, "...nor reset focus to the first pane");
+
+        app.apply(Action::ToggleZoom); // leave zoom, raise the float instead
+        app.apply(Action::ToggleFloat);
+        let float = app.focused;
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, float, "the same-tab digit must not hide the float");
+        // An out-of-range digit stays the silent no-op it always was.
+        app.apply(Action::GoToTab(9));
+        assert_eq!(app.focused, float);
+    }
+
+    /// Each tab returns to the pane it was left on, both ways, repeatedly.
+    #[test]
+    fn each_tab_returns_focus_to_the_pane_it_was_left_on() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 0: panes 1 | 2
+        let tab0 = app.focused; // 2 — deliberately not the first pane
+        app.apply(Action::NewTab); // tab 1
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // tab 1: three panes
+        let tab1 = app.focused;
+        assert_ne!(tab0, tab1);
+
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, tab0, "tab 0 must return to the pane it was left on");
+        app.apply(Action::GoToTab(1));
+        assert_eq!(app.focused, tab1, "tab 1 likewise");
+        // ...and the memory keeps tracking, not just the first round trip.
+        app.apply(Action::Focus(layout::Dir::Up));
+        let moved = app.focused;
+        assert_ne!(moved, tab1);
+        app.apply(Action::GoToTab(0));
+        app.apply(Action::GoToTab(1));
+        assert_eq!(app.focused, moved);
+    }
+
+    /// A first visit — and a tab whose remembered pane has since closed —
+    /// falls back to the tab's first pane, never to a stale or foreign id.
+    #[test]
+    fn tab_focus_falls_back_to_the_first_pane_when_the_memory_is_gone() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 0: panes 1 | 2, focus 2
+        app.apply(Action::NewTab); // tab 1 — never visited before
+        assert_eq!(app.focused, 3, "a brand-new tab focuses its own pane");
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, 2);
+        // Close the remembered pane from the other side, then come back.
+        app.apply(Action::GoToTab(1));
+        let removed = app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Close { pane: 2, force: true },
+        });
+        assert!(matches!(removed, Reply::Ok { .. }), "{removed:?}");
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, 1, "a closed memory falls back to the tab's first pane");
+    }
+
+    /// Closing a tab shifts every later index down — the memory must follow
+    /// the tab, not the index it happened to sit at.
+    #[test]
+    fn tab_focus_memory_survives_a_tab_closing_ahead_of_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // tab 1
+        app.apply(Action::NewTab); // tab 2
+        app.apply(Action::NewPane); // tab 2: two panes
+        let remembered = app.focused;
+        app.apply(Action::GoToTab(0));
+        // Close tab 1 outright: tab 2's panes shift down to index 1.
+        app.apply(Action::GoToTab(1));
+        let doomed = app.focused;
+        app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Close { pane: doomed, force: true },
+        });
+        assert_eq!(app.ws.tabs.len(), 2, "the emptied tab is gone");
+        // Being moved onto the surviving tab honors its memory...
+        assert_eq!(app.focused, remembered, "landing on a tab uses its memory");
+        // ...and so does a deliberate switch back, at its new index.
+        app.apply(Action::GoToTab(0));
+        app.apply(Action::GoToTab(1)); // the tab formerly known as 2
+        assert_eq!(app.focused, remembered, "the memory travelled with the tab");
+    }
+
+    /// Undo reopens a closed tab with fresh pane ids, so there is nothing
+    /// to remember — it must land on the reopened tab's first pane and
+    /// leave every other tab's memory intact.
+    #[test]
+    fn reopening_a_closed_tab_lands_on_its_first_pane_and_leaks_no_memory() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 0: panes 1 | 2
+        let tab0 = app.focused;
+        app.apply(Action::NewTab); // tab 1, pane 3
+        let doomed = app.focused;
+        app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Close { pane: doomed, force: true },
+        });
+        assert_eq!(app.ws.tabs.len(), 1);
+        app.apply(Action::Undo);
+        assert_eq!(app.ws.tabs.len(), 2);
+        assert_eq!(app.ws.active_tab, 1);
+        let reopened = app.pane_order().first().copied().unwrap();
+        assert_eq!(app.focused, reopened, "the reopened tab lands on its first pane");
+        app.apply(Action::GoToTab(0));
+        assert_eq!(app.focused, tab0, "the surviving tab kept its own memory");
     }
 
     #[test]
@@ -5692,7 +6305,9 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
         assert!(app.selection.is_none());
         assert_eq!(app.take_pending_yank().as_deref(), Some("yanked text"));
-        assert!(app.flash().unwrap().starts_with("copied"));
+        // U14: same for the keyboard path — the yank is stashed for the
+        // composition root, which flashes the clipboard's real answer.
+        assert!(app.flash().is_none());
     }
 
     #[test]

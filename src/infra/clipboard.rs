@@ -6,14 +6,29 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Copy `text` to the clipboard via every available channel.
-pub fn copy(text: &str) {
-    let _ = native_copy(text);
-    emit_osc52(text);
+use crate::ports::ClipboardOutcome;
+
+/// Copy `text` to the clipboard via every available channel, and report
+/// which one actually took it (U14). Both channels still fire on every
+/// copy — the emission is unchanged; what changed is that the results are
+/// no longer thrown away, so the hint bar can stop claiming a copy that
+/// never happened.
+pub fn copy(text: &str) -> ClipboardOutcome {
+    let native = native_copy(text);
+    let osc52 = emit_osc52(text);
+    match (native, osc52) {
+        (true, _) => ClipboardOutcome::Native,
+        (false, true) => ClipboardOutcome::Osc52,
+        (false, false) => ClipboardOutcome::Failed,
+    }
 }
 
-/// Pipe `text` into the first clipboard helper that exists. Returns whether
-/// one was spawned successfully.
+/// Pipe `text` into the first clipboard helper that succeeds. Returns
+/// whether one actually took the text: spawning is not success — a helper
+/// can exist and still fail (no `$DISPLAY` for xclip, no compositor for
+/// wl-copy, a broken pipe), and the old "we spawned something" answer is
+/// exactly how an empty clipboard got reported as `copied N chars`. A
+/// helper that fails is skipped in favour of the next candidate.
 fn native_copy(text: &str) -> bool {
     // (program, args) candidates in preference order.
     let candidates: &[(&str, &[&str])] = &[
@@ -23,16 +38,19 @@ fn native_copy(text: &str) -> bool {
         ("xsel", &["--clipboard", "--input"]),
     ];
     for (prog, args) in candidates {
-        match Command::new(prog).args(*args).stdin(Stdio::piped()).spawn() {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
-                }
-                // Reap so we don't leak a zombie.
-                let _ = child.wait();
-                return true;
-            }
-            Err(_) => continue, // not installed — try the next
+        let Ok(mut child) = Command::new(prog).args(*args).stdin(Stdio::piped()).spawn() else {
+            continue; // not installed — try the next
+        };
+        // The pipe must be dropped (closed) before waiting, or the helper
+        // sits on a stdin that never reaches EOF and `wait` deadlocks.
+        let wrote = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(text.as_bytes()).is_ok(),
+            None => false,
+        };
+        // Reap either way so we don't leak a zombie.
+        let exited_ok = matches!(child.wait(), Ok(status) if status.success());
+        if wrote && exited_ok {
+            return true;
         }
     }
     false
@@ -40,12 +58,14 @@ fn native_copy(text: &str) -> bool {
 
 /// Write an OSC 52 clipboard-set sequence to stdout. Modern terminals
 /// (iTerm2 w/ setting, kitty, wezterm, alacritty, tmux) copy it to the system
-/// clipboard; terminals that don't support it ignore the sequence.
-fn emit_osc52(text: &str) {
+/// clipboard; terminals that don't support it ignore the sequence. Returns
+/// whether the bytes made it out of this process — that is the *most* this
+/// channel can ever know (there is no acknowledgement to wait for), which is
+/// why its flash says "(OSC 52)" rather than an unqualified "copied".
+fn emit_osc52(text: &str) -> bool {
     let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
     let mut out = std::io::stdout();
-    let _ = out.write_all(seq.as_bytes());
-    let _ = out.flush();
+    out.write_all(seq.as_bytes()).and_then(|()| out.flush()).is_ok()
 }
 
 /// Minimal standard base64 (no external dep).

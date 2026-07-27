@@ -111,14 +111,19 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
         }
         Mode::Normal if focused_raw => vec![("Alt+Shift+p", "exit raw")],
+        // [Amended, U6] Same seven pairs, reordered: pairs drop whole from
+        // the right, so `Alt+? keys` leads (it is the last thing to yield —
+        // it's the way to everything that already dropped) and `Alt+r
+        // rename` trails (first to go — the one pair whose absence costs a
+        // user nothing they can't find under Alt+?).
         Mode::Normal => vec![
+            ("Alt+?", "keys"),
             ("Alt+n", "new"),
             ("Alt+↵", "launch"),
             ("Alt+s", "stack"),
             ("Alt+←↓↑→", "focus"),
-            ("Alt+r", "rename"),
             ("Alt+w", "close"),
-            ("Alt+?", "keys"),
+            ("Alt+r", "rename"),
         ],
     }
 }
@@ -193,11 +198,11 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
 
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     if app.show_alt_hint() {
+        // C11/U4: same bar, per-terminal wording — the app knows the host's
+        // TERM_PROGRAM and picks the real menu path where there is one.
         f.render_widget(
-            Paragraph::new(
-                " Alt keys aren't reaching roost? Enable \"Use Option as Meta Key\" in Terminal > Settings > Profiles > Keyboard ",
-            )
-            .style(Style::default().fg(theme::FG).bg(theme::ACCENT_DIM)),
+            Paragraph::new(app.alt_hint_line())
+                .style(Style::default().fg(theme::FG).bg(theme::ACCENT_DIM)),
             area,
         );
         return;
@@ -340,23 +345,57 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+a", "jump to next pane that needs you"),
     ("Alt+e", "activity feed (status / spawns / exits / control)"),
     ("Alt+r / Alt+Shift+r", "rename pane / tab"),
-    ("Alt+t / Alt+1..9", "new tab / go to tab"),
+    ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
+    ("Alt+i / Alt+m", "previous / next tab (wraps)"),
     ("Alt+w", "close pane (confirm if busy / last)"),
     ("Alt+u", "undo — reopen last closed pane/tab"),
-    ("Alt+c", "copy mode (hjkl+v+y, or drag)"),
-    ("Alt+PgUp", "scroll mode"),
+    ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
-    ("Alt+/", "toggle hint bar"),
+    ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
 ];
 
-fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
-    match &app.mode {
+/// U8: the rect the current mode's modal dialog occupies on screen, or None
+/// when the mode draws none — the SAME geometry `draw_mode_overlay` paints
+/// (it reads this function too), exposed so the mouse path can hit-test
+/// against exactly what's drawn. Renderer/hitbox lockstep, §4/§5.
+pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
+    let body = app.body_area();
+    let anchor = app
+        .display_rects()
+        .iter()
+        .find(|pr| pr.id == app.focused)
+        .map(|pr| pr.rect)
+        .unwrap_or(body);
+    dialog_rect(&app.mode, body, anchor)
+}
+
+/// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
+fn dialog_rect(mode: &Mode, body: Rect, anchor: Rect) -> Option<Rect> {
+    match mode {
         // Copy mode has no centered overlay — the cursor/selection are
         // drawn in-pane (C17/C24).
+        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => None,
+        Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
+        Mode::Picker { .. } => {
+            Some(centered_near(anchor, body, 32, picker_items().len() as u16 + 2))
+        }
+        Mode::Help => {
+            let h = HELP_KEYS.len() as u16 + 2;
+            Some(centered_near(anchor, body, help_dialog_width(HELP_KEYS), h.min(body.height)))
+        }
+        Mode::Feed { .. } => {
+            let (w, h) = feed_overlay_size(body);
+            Some(centered_near(anchor, body, w, h))
+        }
+    }
+}
+
+fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
+    let Some(rect) = dialog_rect(&app.mode, body, anchor) else { return };
+    match &app.mode {
         Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } => {}
         Mode::Rename { buffer, target } => {
-            let rect = centered_near(anchor, body, 44, 3);
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let heading = match target {
@@ -377,7 +416,6 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
         }
         Mode::Picker { selection } => {
             let items = picker_items();
-            let rect = centered_near(anchor, body, 32, items.len() as u16 + 2);
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
@@ -410,9 +448,6 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             // pins the ≤ 20-row hard cap this relies on (80×24 body = 22
             // rows = 20 content + 2 border, zero slack).
             let keys = HELP_KEYS;
-            let h = keys.len() as u16 + 2;
-            let w = help_dialog_width(keys);
-            let rect = centered_near(anchor, body, w, h.min(body.height));
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
@@ -433,8 +468,6 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             f.render_widget(Paragraph::new(lines), inner);
         }
         Mode::Feed { offset } => {
-            let (w, h) = feed_overlay_size(body);
-            let rect = centered_near(anchor, body, w, h);
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             let block = Block::bordered()
@@ -527,23 +560,45 @@ fn local_hh_mm_ss(t: std::time::SystemTime) -> String {
 /// "{cwd} · {save}" status area. Column bookkeeping here is the renderer
 /// half of the mouse-hitbox lockstep rule (DESIGN-ui.md §4/§5) —
 /// `mouse::tab_width`/`tab_at_x` mirror this exactly and change together.
+/// U15: the mode word the TAB BAR carries, if any. With the hint bar drawn
+/// it carries the word itself and this is None; with the bar hidden (Alt+/)
+/// or squeezed out by a short terminal, any word other than `NORMAL` — a
+/// real mode, or the `ZOOM`/`RAW` pseudo-states — moves here. Otherwise a
+/// zoomed pane with hints off is indistinguishable from a one-pane tab, and
+/// RAW/COPY become unescapable-looking (live QA: `ZOOM` appeared nowhere).
+/// Pure enough to hit-test against: the click path reads this too, so the
+/// status area's width can't differ between the two.
+pub fn tab_status_word<B: PaneBackend>(app: &App<B>) -> Option<&'static str> {
+    if app.hints_shown() {
+        return None; // C9's right segment already says it
+    }
+    let word = mode_word(&app.mode, app.zoomed(), app.is_raw(app.focused));
+    (word != "NORMAL").then_some(word)
+}
+
 fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: Color) {
     let cwd = app.focused_cwd();
     let saved = app.last_save_ok();
-    let status_w = mouse::status_width(cwd.as_deref(), saved);
     let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
+    let fit = mouse::status_fit(tab_status_word(app), cwd.as_deref(), saved, &names, area.width);
+    let status_w = fit.map(|f| f.width).unwrap_or(0);
     let show_status = mouse::effective_status_width(&names, area.width, status_w) > 0;
-    let tabs_end = mouse::tabs_visible_width(&names, area.width, status_w);
-    let total_tabs_w = mouse::total_tabs_width(&names);
+    // U7: the drawn window — scrolled so the active tab is always visible.
+    // `tab_at_x` reads the same layout, so hitboxes follow the scroll.
+    let strip = mouse::tab_strip(&names, area.width, status_w, app.ws.active_tab);
 
-    // Left to right, one 7-part span group per tab (marker/label/glyph/
-    // separator), stopping exactly where `tabs_visible_width` says to.
-    let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 3);
+    let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 4);
     let mut used = 0u16;
-    for (i, tab) in app.ws.tabs.iter().enumerate() {
-        if used >= tabs_end {
-            break;
-        }
+    // A leading `…` when the strip has scrolled past earlier tabs (C2's
+    // marker, now at whichever end is hiding tabs). It occupies column 0,
+    // which is why `TabStrip::x0` exists.
+    if strip.left_marker {
+        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), Style::default().fg(theme::MUTED)));
+        used += strip.x0;
+    }
+    // Left to right, one 8-part span group per tab (marker/label/glyph/
+    // separator/gutter), stopping exactly where `tab_strip` says to.
+    for (i, tab) in app.ws.tabs.iter().enumerate().take(strip.end).skip(strip.start) {
         let active = i == app.ws.active_tab;
         let summary = app.tab_summary(i);
         let (glyph, base_color) = tab_summary_badge(summary);
@@ -552,19 +607,24 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
         used += mouse::tab_width(i, &tab.name);
     }
 
-    // A single `…` marks the clip point when at least one tab didn't fit and
-    // there's a spare column to show it in (overflow, C2).
-    let budget = if show_status { area.width.saturating_sub(status_w) } else { area.width };
-    if used < total_tabs_w && used < budget {
+    // ...and a trailing `…` when tabs remain past the right edge and a
+    // spare column is left to show it in (overflow, C2).
+    if strip.right_marker {
         spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), Style::default().fg(theme::MUTED)));
         used += 1;
     }
 
-    if show_status {
-        let (prefix, save_word) = mouse::status_parts(cwd.as_deref(), saved);
+    if let Some(fit) = fit.filter(|_| show_status) {
+        let (mode_word, prefix, save_word) = mouse::status_parts(fit.mode, fit.cwd, saved);
         let pad = area.width.saturating_sub(used).saturating_sub(status_w);
         if pad > 0 {
             spans.push(Span::raw(" ".repeat(pad as usize)));
+        }
+        // U15: the mode word reads a step brighter than the cwd beside it —
+        // it's state, not context — while staying inside the ink ramp (no
+        // new token, and never the accent: it isn't an alarm).
+        if !mode_word.is_empty() {
+            spans.push(Span::styled(mode_word, Style::default().fg(theme::MUTED)));
         }
         if !prefix.is_empty() {
             spans.push(Span::styled(prefix, Style::default().fg(theme::DIM)));
@@ -1402,18 +1462,44 @@ mod tests {
 
     #[test]
     fn hint_pairs_normal_mode_is_exactly_the_seven_c9_pairs() {
+        // U6 order (C9 amended 2026-07-27): `Alt+? keys` first so it yields
+        // last, `Alt+r rename` last so it drops first.
         assert_eq!(
             hint_pairs(&Mode::Normal, false, false),
             vec![
+                ("Alt+?", "keys"),
                 ("Alt+n", "new"),
                 ("Alt+↵", "launch"),
                 ("Alt+s", "stack"),
                 ("Alt+←↓↑→", "focus"),
-                ("Alt+r", "rename"),
                 ("Alt+w", "close"),
-                ("Alt+?", "keys"),
+                ("Alt+r", "rename"),
             ],
         );
+    }
+
+    /// U6, the live-QA case that started it: at 120 columns with the
+    /// needs-you segment up (`◆ 1 needs you · Alt+a  NORMAL `, 30 cols),
+    /// the bar used to drop `Alt+? keys` — the discoverability pointer —
+    /// exactly when the fleet got busy. Now `Alt+r rename` goes first and
+    /// the help pair survives; under enough pressure to drop six pairs, the
+    /// one still standing is `Alt+? keys`.
+    #[test]
+    fn the_help_pair_is_the_last_hint_to_yield_and_rename_the_first() {
+        let pairs = hint_pairs(&Mode::Normal, false, false);
+        let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
+        let right_w = " ◆ 1 needs you · Alt+a  NORMAL ".chars().count() as u16 - 1;
+
+        let shown = super::fit_hint_pairs(&pairs, right_w, 120);
+        assert_eq!(shown, pairs.len() - 1, "exactly one pair yields at 120 cols");
+        assert!(!pairs[..shown].contains(&("Alt+r", "rename")), "rename drops first");
+        assert!(pairs[..shown].contains(&("Alt+?", "keys")), "the help pair survives");
+
+        // Squeeze until a single pair is left: it must be the help pair.
+        let width = right_w + pw(&pairs[0]);
+        let shown = super::fit_hint_pairs(&pairs, right_w, width);
+        assert_eq!(shown, 1);
+        assert_eq!(pairs[0], ("Alt+?", "keys"));
     }
 
     #[test]
@@ -1721,8 +1807,11 @@ mod tests {
 
     #[test]
     fn help_keys_match_the_c8_key_table_verbatim_and_in_order() {
-        // The exact §8 table — six new rows (a/e/z/f/Shift+p/g) folded into
-        // the prior 14-row list at their §8 positions; wording matches §8.
+        // The exact §8 table — six fleet rows (a/e/z/f/Shift+p/g) folded
+        // into the prior 14-row list at their §8 positions, then U7's tab
+        // reach chords (2026-07-27): the tab row gained Alt+0 and a
+        // previous/next row joined it, paid for by merging Alt+/ and Alt+?
+        // into one row so the ≤20 cap still holds. Wording matches §8.
         assert_eq!(
             HELP_KEYS,
             &[
@@ -1738,13 +1827,13 @@ mod tests {
                 ("Alt+a", "jump to next pane that needs you"),
                 ("Alt+e", "activity feed (status / spawns / exits / control)"),
                 ("Alt+r / Alt+Shift+r", "rename pane / tab"),
-                ("Alt+t / Alt+1..9", "new tab / go to tab"),
+                ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
+                ("Alt+i / Alt+m", "previous / next tab (wraps)"),
                 ("Alt+w", "close pane (confirm if busy / last)"),
                 ("Alt+u", "undo — reopen last closed pane/tab"),
-                ("Alt+c", "copy mode (hjkl+v+y, or drag)"),
-                ("Alt+PgUp", "scroll mode"),
+                ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
-                ("Alt+/", "toggle hint bar"),
+                ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),
             ],
         );
@@ -1829,6 +1918,61 @@ mod tests {
         let ws = Workspace::default_in(PathBuf::from("/tmp"));
         App::<crate::ports::fakes::FakePane>::new(ws, agents::registry(), Box::new(store), tx, size, (0, 0), None)
             .unwrap()
+    }
+
+    /// U15: hiding the hint bar used to hide the only mode indication
+    /// there was — a zoomed pane with hints off read as a one-pane tab, and
+    /// SCROLL/COPY/RAW vanished entirely. The word moves to the tab bar
+    /// exactly when the bar isn't carrying it, and only when there's
+    /// something to say (plain Normal reports nothing, as always).
+    #[test]
+    fn the_tab_bar_carries_the_mode_word_only_when_the_hint_bar_is_gone() {
+        use crate::ui::input::Action;
+        use ratatui::layout::Size;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleZoom);
+        assert!(app.hints_shown());
+        assert_eq!(super::tab_status_word(&app), None, "the hint bar has it");
+
+        app.apply(Action::ToggleHints); // Alt+/
+        assert_eq!(super::tab_status_word(&app), Some("ZOOM"));
+        app.apply(Action::ToggleZoom);
+        assert_eq!(super::tab_status_word(&app), None, "plain Normal says nothing");
+
+        // Real modes and the other pseudo-state come along too.
+        app.apply(Action::ScrollMode);
+        assert_eq!(super::tab_status_word(&app), Some("SCROLL"));
+        app.mode = Mode::Normal;
+        app.apply(Action::ToggleRaw);
+        assert_eq!(super::tab_status_word(&app), Some("RAW"));
+        app.apply(Action::ToggleRaw);
+
+        // A terminal too short for the hint bar is "the bar is absent" too.
+        let mut tiny = mk_app(Size::new(100, 2));
+        tiny.apply(Action::ToggleZoom);
+        assert!(!tiny.hints_shown());
+        assert_eq!(super::tab_status_word(&tiny), Some("ZOOM"));
+    }
+
+    /// ...and it actually reaches the screen: the drawn tab bar carries
+    /// `ZOOM · {cwd} · saved ✓` once hints are off.
+    #[test]
+    fn a_zoomed_pane_with_hints_hidden_still_says_zoom_on_the_tab_bar() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleZoom);
+        app.apply(Action::ToggleHints);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let row: String =
+            (0..100).filter_map(|x| term.backend().buffer().cell((x, 0)).map(|c| c.symbol().to_string())).collect();
+        assert!(row.contains("ZOOM · "), "tab bar row was: {row:?}");
+        assert!(row.trim_end().ends_with(theme::SAVED), "the save word still trails: {row:?}");
     }
 
     #[test]

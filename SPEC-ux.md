@@ -66,13 +66,21 @@ both read via the new `PaneBackend::scroll_offset`/`scroll_total` accessors,
 so they reflect the view, never a phantom counter (C4/C9/§2 amended
 2026-07-27; N1's pulse rule rides along).
 
-### U4 · High · OPEN — the macOS Alt trap is only caught on Apple Terminal
+### U4 · High · FIXED (this branch) — the macOS Alt trap is only caught on Apple Terminal
 `wants_alt_hint` fires solely on `TERM_PROGRAM == "Apple_Terminal"`; default
 iTerm2 (the README's recommended terminal) swallows Option identically and gets
 no warning — every advertised chord silently no-ops in the first minute.
 **Proposed contract:** warn on any terminal when keys are arriving but zero Alt
 has ever been seen (or on the Option-accent signature `ñƒå∂…`), with a
 per-terminal instruction line.
+**Fixed:** the trigger is the evidence — `wants_alt_hint(alt_seen,
+keys_seen, elapsed)`, no terminal allowlist — so any terminal with the
+setting off warns inside the same 8 s window, and one Alt key ever ends it.
+The accent-signature half proved unnecessary: those accents *are* keys with
+no Alt on them, so the failed chord that produced `∫` is itself what raises
+the bar. Wording is per terminal from roost's own (host) `TERM_PROGRAM`:
+real menu paths for `Apple_Terminal` and `iTerm.app`, a terminal-agnostic
+line otherwise — never a wrong path (C11 amended 2026-07-27).
 
 ### U5 · High · FIXED (this branch) — unbound Alt chords are swallowed, not forwarded
 *Fixed with SPEC-parity P13 (one change): `translate()`'s unmatched-Alt arm
@@ -86,22 +94,37 @@ passthrough.
 (reuse `encode_raw`); bound chords stay roost's; raw mode remains the escape
 hatch for the chords roost does own.
 
-### U6 · Med · VERIFIED — the discoverability hint is dropped first
+### U6 · Med · FIXED (this branch) — the discoverability hint is dropped first
 The hint bar's yield order drops `Alt+? keys` exactly when the bar gets busy
 (`◆ N needs you` appearing at 120 cols) — the moment a new user most needs it.
 **Proposed contract:** `Alt+? keys` yields last among pairs (or `Alt+r rename`
 drops first).
+**Fixed:** both, since the list order *is* the yield order (pairs drop whole
+from the right): the seven pairs are unchanged in content and re-ordered so
+`Alt+? keys` leads — the last pair to yield, so at any width that fits one
+pair, that pair is the help pair — and `Alt+r rename` trails, dropping first.
+At the live-QA width (120 cols with `◆ N needs you` up) the help pair now
+survives (C9 amended 2026-07-27; total width still 100 columns).
 
-### U7 · Med · VERIFIED — tab reachability dead ends
+### U7 · Med · FIXED (this branch) — tab reachability dead ends
 Live QA: Alt+9 (no such tab) and Alt+0 (unbound) both no-op silently; no
 next/prev-tab chord exists; overflow-clipped tabs aren't clickable. Tabs ≥ 10
 are unreachable by keyboard entirely.
 **Proposed contract:** next/prev-tab chords from the documented free-key pool;
 `Alt+0` → tab 10 or last-tab; the strip scrolls to keep the active tab visible.
+**Fixed:** all three. `Alt+i`/`Alt+m` step previous/next with wrap-around and
+`Alt+0` jumps to the last tab, whatever its number — chords taken from §8's
+free pool after excluding the readline-critical `b`/`d` (live since U5),
+C23's reserved `p`, and the clipboard letters `v/x/y` (§8 amendment
+2026-07-27 justifies the pick). The strip scrolls: `mouse::tab_strip` picks
+the leftmost window that still fits the active tab whole, `…` marks each end
+that hides tabs (never a tab, never clickable), and `tab_at_x` reads the same
+layout, so a click on a scrolled strip selects the real tab index (C2 amended
+2026-07-27). Tabs ≥ 10 are reachable, and the active tab is always on screen.
 
 ## P1 — high-value, single-lens
 
-### U8 · Med · VERIFIED — modals don't own non-keyboard input
+### U8 · Med · FIXED (this branch) — modals don't own non-keyboard input
 Three live confirmations: (a) with Rename open, clicking another pane moved
 focus and Enter committed the title to the clicked pane — frame E1 shows `ZZZ`
 on the pane that was clicked, not the pane Alt+r opened on; (b) a bracketed
@@ -111,6 +134,19 @@ scrolls the pane under the overlay (no feed gate in `handle_mouse`).
 **Proposed contract:** while a modal mode is active — mouse: wheel scrolls the
 overlay, clicks hit overlay rows or dismiss, never mutate focus/tabs beneath;
 paste: routes to the text field if one exists, else is swallowed.
+**Fixed:** `App::modal_active` gates both non-keyboard paths in the
+composition root — `handle_mouse` routes to `App::handle_modal_mouse` (with
+the dialog's drawn rect from the new `render::modal_rect`, so hit-tests match
+the screen) and `Event::Paste` to `App::handle_paste`. Nothing beneath a
+modal is mutated any more: the wheel pages the feed by its own PgUp/PgDn step
+and is swallowed elsewhere, a click launches the picker row under it
+(`mouse::picker_row_at`) or dismisses Picker/Help/Feed, and a paste fills the
+Rename buffer (printables only) or is swallowed (C12/C14 amended 2026-07-27).
+One deviation from the proposal: an outside click does **not** cancel Rename
+— it is swallowed. Rename's buffer is unsaved work, so discarding it on a
+stray click is (a)'s harm inverted; the drive's own click-during-rename check
+wants the commit to land on the pane the dialog opened on, which a cancel
+would silently drop.
 
 ### U9 · Med · FIXED (this branch) — scrollback is keyboard-hostile
 Three connected live confirmations:
@@ -140,7 +176,7 @@ protect.
 **Proposed contract:** keep the old session id until the fresh session produces
 a new one, or guard `f` with the same second-press confirm as busy-close.
 
-### U11 · Med · CODE-VERIFIED (zoom kill VERIFIED) — same-tab digit resets state; no per-tab focus memory
+### U11 · Med · FIXED (this branch) — same-tab digit resets state; no per-tab focus memory
 Live QA confirmed the observable half: pressing Alt+1 while already on tab 1
 exited zoom. The same unguarded `go_to_tab` path resets focus to the tab's
 first pane and hides the float, and tab switches always land on the first pane
@@ -148,6 +184,15 @@ first pane and hides the float, and tab switches always land on the first pane
 the first pane, so those halves are pinned by code, not frames.
 **Proposed contract:** same-tab digit is a no-op; each tab remembers
 `last_focused` (session-only) and returns to it.
+**Fixed:** `go_to_tab` returns immediately when the target is already
+active — zoom, the float and focus all survive — and a real switch now
+snapshots the tab it leaves (`remember_tab_focus`) and restores the tab it
+enters (`tab_focus_target`), falling back to the first pane only when a tab
+has no memory yet or its remembered pane has closed. The memory is a set of
+pane ids rather than a per-index map, so it travels with a tab across close /
+reorder / undo instead of with the index it happened to occupy (a closed pane
+is forgotten, since ids are recycled); landing on a tab because another one
+closed honors it too (C2 amended 2026-07-27).
 
 ### U12 · Med · FIXED (this branch) — `◆ NeedsInput` panes close without the busy guard
 The Alt+w confirm checks only `Working`; an agent blocked on your approval is
@@ -156,23 +201,46 @@ mid-turn all the same.
 **Fixed:** `close_pane`'s guard now uses the shared `is_busy` predicate
 (`Working || NeedsInput`), the same one Alt+q's U1 guard counts with.
 
-### U13 · Med · OPEN — tab summary has no Exited state
+### U13 · Med · FIXED (this branch) — tab summary has no Exited state
 A background tab full of dead agents shows a blank glyph (SPEC-GAP-2,
 DESIGN-ui §7): one transient bell, then silence.
 **Proposed contract:** `TabSummary::Exited` → `✕` (ACCENT_DIM), ranked between
 Waiting and Quiet.
+**Fixed:** exactly that — `TabSummary::Exited` renders C5's `✕` in
+ACCENT_DIM (the same row the per-pane glyph uses, since C5 is one table),
+ranked below Waiting and above Quiet, and counting a failed spawn as dead
+rather than `Unknown`. Quiet's blank now means only "nothing to report"
+(C5 amended 2026-07-27; DESIGN-ui §7 SPEC-GAP-2 closed).
 
-### U14 · Med · OPEN — "copied N chars" can be a lie
+### U14 · Med · FIXED (this branch) — "copied N chars" can be a lie
 The flash fires on extraction; `clipboard::copy` discards both channels'
 results (live_qa historically showed the flash with an empty clipboard).
 **Proposed contract:** report the channel that actually ran — `copied N chars
 (OSC 52)` when no native helper succeeded, an explicit failure otherwise.
+**Fixed:** `clipboard::copy` returns a `ports::ClipboardOutcome` —
+`Native` only when a helper *exited successfully* (spawning is not success:
+xclip with no `$DISPLAY` was the old false positive), `Osc52` when just the
+escape went out (fire-and-forget, so "sent, unacknowledged" is the most it
+can honestly claim), `Failed` when neither landed. The flash moved out of
+`finish_selection` to the composition root, which sets it once the clipboard
+has answered: `copied N chars` / `copied N chars (OSC 52)` / `copy failed`
+(C10 amended 2026-07-27). Both channels still fire on every copy — roost's
+own OSC 52 emission is unchanged; only the reporting is.
 
-### U15 · Med · VERIFIED — hiding hints hides the only mode indication
+### U15 · Med · FIXED (this branch) — hiding hints hides the only mode indication
 Live QA: with hints hidden (Alt+/), a zoomed pane shows `ZOOM` nowhere — it is
 indistinguishable from a one-pane tab; SCROLL is likewise invisible.
 **Proposed contract:** with hints hidden, non-Normal mode words (and ZOOM) move
 to the tab-bar right status; or any non-Normal mode temporarily reshows the bar.
+**Fixed** (the first option — the bar stays hidden when you hid it): whenever
+the hint bar isn't drawn (Alt+/, or a terminal too short to spare the row),
+any mode word other than `NORMAL` — real modes plus the `ZOOM`/`RAW`
+pseudo-states — leads the tab bar's right status segment,
+`ZOOM · ~/work · saved ✓` (`render::tab_status_word`). The width math is
+shared with the existing segment via the new `mouse::status_fit`, which also
+gives the area one extra yield rung: the cwd drops before the mode word (C2
+amended 2026-07-27), and `tab_at_x` is fed the same fitted width so tab
+hitboxes stay in lockstep with what's drawn.
 
 ## P2 — polish
 
@@ -203,6 +271,8 @@ tokenizing; `o` in copy mode opens the URL under the cursor.
 No number accelerators, no type-ahead, no click; `j/k` work unhinted; the
 DESIGN.md §7 "recent cwd" column never shipped.
 **Proposed contract:** `1..9` accelerators + click-to-launch; cwd column later.
+*(Click-to-launch landed with U8's modal mouse ownership — C14 amended
+2026-07-27. The accelerators, type-ahead and cwd column stay OPEN.)*
 
 ### U21 · Low · OPEN — mouse can't resize; tabs are click-to-switch only
 No border drag-resize, no middle-click close, no drag-reorder.
