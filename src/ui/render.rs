@@ -1827,7 +1827,7 @@ mod tests {
         let store = MemStore::default();
         let (tx, _rx) = mpsc::sync_channel(64);
         let ws = Workspace::default_in(PathBuf::from("/tmp"));
-        App::<crate::ports::fakes::FakePane>::new(ws, agents::registry(), Box::new(store), tx, size, None)
+        App::<crate::ports::fakes::FakePane>::new(ws, agents::registry(), Box::new(store), tx, size, (0, 0), None)
             .unwrap()
     }
 

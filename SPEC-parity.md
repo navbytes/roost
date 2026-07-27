@@ -58,7 +58,9 @@ reaches the host.
 **Contract:** track mode 2026 in the vendored parser; while a pane's bracket
 is open, the renderer presents that pane's *last pre-bracket* grid (with a
 staleness cap so a stuck bracket can't freeze the pane); answer DECRQM 2026
-honestly per what ships (see W2).
+honestly per what ships (see W2). *(The DECRQM half shipped with W2: 2026 —
+like every untracked mode — now answers `0`, "not recognized"; flip it to
+1/2 when this item lands.)*
 
 ### P2 · CONFIRMED · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
 Claude Code emits desktop notifications via OSC 9 and progress via OSC 9;4
@@ -84,7 +86,13 @@ appeared anywhere in the captured host stream.
 copy mode already proves the host path works); optionally cap size and gate
 reads (`52;c;?`) which are a paste-theft vector — forward writes, refuse reads.
 
-### P4 · CONFIRMED (measured end to end) · High — the terminal-query black hole
+### P4 · FIXED (this branch) · High — the terminal-query black hole
+*Fixed per Appendix B: `src/infra/queries.rs` (kitty.rs generalized) answers
+DA1/DA2/DSR 5·6/DECRQM/XTVERSION/XTWINOPS 18t (14/16t only with real pixel
+geometry, now plumbed host→pane through spawn/resize into PTY winsize);
+replies post-parse, stream-order. roost's own startup no longer blocks on
+the enhancement probe (259 ms vs 2011 ms first frame in the harness gate;
+e2e: `tests/pane_queries.rs`).*
 roost answers exactly one query (kitty `CSI ?u`) and swallows DA1, DSR-CPR
 `6n`, DECRQM, XTVERSION, XTWINOPS 14/16/18t, XTGETTCAP — worse than answering
 nothing: crossterm-0.28's `supports_keyboard_enhancement()` gets its kitty
@@ -167,7 +175,10 @@ round-trip). Supersedes the SPEC-ux "deliberately-scoped" note with evidence.
 focus changes to panes that asked; enable host focus events and forward them
 to the focused pane; vim autoread / TUI dim-on-blur start working.
 
-### P11 · CONFIRMED · Med — host identity env leaks into panes
+### P11 · FIXED (this branch) · Med — host identity env leaks into panes
+*Fixed: `PtyPane::spawn` scrubs the 13 known identity vars and sets
+`TERM_PROGRAM=roost` + `TERM_PROGRAM_VERSION`; verified end to end by
+`tests/pane_env.rs` (a pane dumps its env under a fully-leaky host).*
 `TERM_PROGRAM=iTerm.app`, `KITTY_WINDOW_ID`, `ITERM_SESSION_ID`, `TMUX` all
 arrive verbatim inside panes (only `TERM` is overridden). Apps then negotiate
 proprietary protocols (iTerm2 images, kitty graphics, tmux DCS passthrough)
@@ -176,7 +187,10 @@ that roost swallows — enlarging P1/P2/P3/P8's blast radius.
 `TERM_PROGRAM=roost` (+ version var) so apps can adapt deliberately.
 Sequence this first — it's small and de-risks everything in W2/W3.
 
-### P12 · CONFIRMED · Med — Ctrl+`-` forwards a bare Enter (accidental submit)
+### P12 · FIXED (this branch) · Med — Ctrl+`-` forwards a bare Enter (accidental submit)
+*Fixed: `encode_key`'s Ctrl arm now runs through a C0 collision gate
+(`ctrl_byte`) — letters/`@ [ \ ] ^ _`/space keep the mask, `?` → DEL,
+`-`/`/` → 0x1F, everything else forwards nothing.*
 `encode_key`'s blanket `& 0x1f` maps Ctrl+`-` → `0x0D` (CR — submits the
 half-written prompt in any agent CLI) and Ctrl+`/` → `0x0F` (readline
 operate-and-get-next). The same mask is *coincidentally correct* for
@@ -185,7 +199,10 @@ operate-and-get-next). The same mask is *coincidentally correct* for
 Ctrl+digits and other non-C0-mappable punctuation forward nothing rather than
 a wrong control byte.
 
-### P13 · CONFIRMED · Med (raised) — Ctrl+Alt+key triggers Alt actions
+### P13 · FIXED (this branch) · Med (raised) — Ctrl+Alt+key triggers Alt actions
+*Fixed with SPEC-ux U5 (one change): the chord table now requires CONTROL
+absent — Ctrl+Alt forwards as meta-ESC + ctrl byte, and unmatched plain-Alt
+printables forward as meta-ESC, both via `encode_raw`.*
 The chord table matches on ALT alone: `C-M-f` toggles the float, **`C-M-w`
 closes a pane** — destructive collision with emacs/readline muscle memory.
 **Contract:** chords match only when CONTROL is absent; Ctrl+Alt+printables

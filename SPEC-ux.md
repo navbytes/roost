@@ -74,14 +74,17 @@ no warning — every advertised chord silently no-ops in the first minute.
 has ever been seen (or on the Option-accent signature `ñƒå∂…`), with a
 per-terminal instruction line.
 
-### U5 · High · VERIFIED — unbound Alt chords are swallowed, not forwarded
+### U5 · High · FIXED (this branch) — unbound Alt chords are swallowed, not forwarded
+*Fixed with SPEC-parity P13 (one change): `translate()`'s unmatched-Alt arm
+now forwards printables as meta-ESC via `encode_raw`; the QA drive's Alt+b
+probe flipped from an observation to a passing check.*
 Live QA: with `cat` running, Alt+b produced nothing in the pane (`^[b` absent);
 in raw mode the same key forwards fine. `Alt+b/d` are documented as "left free
 for readline" yet die at `translate()`'s `Ignore` arm — not chrome, not
 passthrough.
-**Proposed contract:** unmatched Alt+printables forward as meta-ESC (reuse
-`encode_raw`); bound chords stay roost's; raw mode remains the escape hatch for
-the chords roost does own.
+**Contract (now implemented):** unmatched Alt+printables forward as meta-ESC
+(reuse `encode_raw`); bound chords stay roost's; raw mode remains the escape
+hatch for the chords roost does own.
 
 ### U6 · Med · VERIFIED — the discoverability hint is dropped first
 The hint bar's yield order drops `Alt+? keys` exactly when the bar gets busy

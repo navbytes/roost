@@ -15,10 +15,45 @@ use crate::core::event::AppEvent;
 use crate::core::status::{AgentStatus, StatusTracker};
 use crate::core::workspace::PaneId;
 use crate::infra::inspect;
-use crate::infra::kitty::KittyKeyboard;
+use crate::infra::queries::QueryResponder;
 use crate::ports::{MouseProto, Observation, PaneBackend};
 
 const SCROLLBACK_LINES: usize = 5000;
+
+/// P11: host-identity env vars that must never leak into a pane. The hosting
+/// terminal (iTerm2, kitty, WezTerm, VS Code) and any outer multiplexer
+/// (tmux, zellij) advertise themselves through these; a pane child that sees
+/// them sniffs the *host's* identity and negotiates proprietary protocols
+/// (iTerm2 inline images, kitty graphics, tmux DCS passthrough) that roost
+/// swallows. roost is the pane's terminal — it scrubs these at spawn and
+/// presents its own identity instead (`scrub_host_identity`).
+const HOST_IDENTITY_VARS: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "TMUX",
+    "TMUX_PANE",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "VSCODE_INJECTION",
+];
+
+/// P11: drop the host terminal's identity from a pane child's environment and
+/// present roost's own, so apps adapt to the terminal they are *actually*
+/// talking to. TERM and the ROOST_* vars are deliberately not touched here —
+/// `spawn` owns those, unchanged.
+fn scrub_host_identity(cmd: &mut CommandBuilder) {
+    for var in HOST_IDENTITY_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.env("TERM_PROGRAM", "roost");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+}
 
 pub struct PtyPane {
     master: Box<dyn MasterPty + Send>,
@@ -30,9 +65,14 @@ pub struct PtyPane {
     scroll: usize,
     /// The pane's child pid, for OS observation (live cwd / running agent).
     pid: Option<u32>,
-    /// Tracks the kitty keyboard flags this pane negotiated, so roost can
+    /// Answers the pane's terminal queries (DA1, DSR, DECRQM, XTWINOPS, …)
+    /// and tracks the kitty keyboard flags it negotiated, so roost can
     /// forward modified keys (Shift/Ctrl+Enter) in the encoding it asked for.
-    kitty: KittyKeyboard,
+    queries: QueryResponder,
+    /// The pane's pixel geometry (width, height), derived by the core from
+    /// the host window's proportionally; (0, 0) = unknown. Fed to the PTY's
+    /// winsize and to the XTWINOPS 14/16t replies.
+    pixels: (u16, u16),
     /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
     /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
     /// id. Without this, a pane id that is reused (close→new) or respawned
@@ -50,11 +90,12 @@ impl PaneBackend for PtyPane {
         spec: &CommandSpec,
         rows: u16,
         cols: u16,
+        pixels: (u16, u16),
         tx: SyncSender<AppEvent>,
     ) -> Result<Self> {
         let pty = native_pty_system();
         let pair = pty
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize { rows, cols, pixel_width: pixels.0, pixel_height: pixels.1 })
             .context("openpty")?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
@@ -62,6 +103,8 @@ impl PaneBackend for PtyPane {
             cmd.arg(a);
         }
         cmd.cwd(&spec.cwd);
+        // P11: no host-identity leaks — the pane's terminal is roost.
+        scrub_host_identity(&mut cmd);
         cmd.env("TERM", "xterm-256color");
         // Pane identity for the status socket (roost.ts pi extension /
         // Claude Code hooks) — design doc §6.1.
@@ -117,18 +160,13 @@ impl PaneBackend for PtyPane {
             status: StatusTracker::new(),
             scroll: 0,
             pid,
-            kitty: KittyKeyboard::new(),
+            queries: QueryResponder::new(),
+            pixels,
             alive,
         })
     }
 
     fn process_output(&mut self, bytes: &[u8]) {
-        // Answer the pane's kitty-keyboard queries and track the flags it
-        // pushes, so modified keys reach it in the encoding it negotiated.
-        let reply = self.kitty.feed(bytes);
-        if !reply.is_empty() {
-            self.write_input_raw(&reply);
-        }
         // vt100 counts *parsed* bells, so a 0x07 consumed as an OSC string
         // terminator (ESC ] … BEL) doesn't count — only a real bell does.
         let bells_before = self.parser.screen().audible_bell_count();
@@ -136,11 +174,20 @@ impl PaneBackend for PtyPane {
         if self.parser.screen().audible_bell_count() != bells_before {
             self.status.on_bell();
         }
+        // Answer the pane's terminal queries (and track its kitty keyboard
+        // flags) — AFTER the chunk is parsed, so stateful replies (DSR 6
+        // cursor position, DECRQM mode values) reflect the state the app
+        // just finished establishing in this very chunk, not the state one
+        // chunk ago. Replies land in stream-encounter order.
+        let reply = self.queries.feed(bytes, self.parser.screen(), self.pixels);
+        if !reply.is_empty() {
+            self.write_input_raw(&reply);
+        }
         self.status.on_output();
     }
 
     fn kitty_disambiguate(&self) -> bool {
-        self.kitty.disambiguate()
+        self.queries.disambiguate()
     }
 
     fn app_cursor_keys(&self) -> bool {
@@ -171,11 +218,17 @@ impl PaneBackend for PtyPane {
         ok
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
+    fn resize(&mut self, rows: u16, cols: u16, pixels: (u16, u16)) {
         if rows == 0 || cols == 0 {
             return;
         }
-        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        self.pixels = pixels;
+        let _ = self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: pixels.0,
+            pixel_height: pixels.1,
+        });
         self.parser.set_size(rows, cols);
     }
 
@@ -344,12 +397,50 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 
 #[cfg(test)]
 mod tests {
-    use super::extract_selection;
+    use super::{extract_selection, scrub_host_identity, HOST_IDENTITY_VARS};
+    use portable_pty::CommandBuilder;
+    use std::ffi::OsStr;
 
     fn screen_with(text: &str, rows: u16, cols: u16) -> vt100::Parser {
         let mut p = vt100::Parser::new(rows, cols, 0);
         p.process(text.as_bytes());
         p
+    }
+
+    /// P11: every known host-identity var is removed (whether it came from
+    /// the inherited base env or was set on the builder — same map), and
+    /// roost's own identity is presented in its place.
+    #[test]
+    fn scrub_host_identity_removes_leaks_and_presents_roost() {
+        let mut cmd = CommandBuilder::new("true");
+        for var in HOST_IDENTITY_VARS {
+            cmd.env(var, "leaked-from-host");
+        }
+        scrub_host_identity(&mut cmd);
+        for var in HOST_IDENTITY_VARS {
+            match *var {
+                "TERM_PROGRAM" => {
+                    assert_eq!(cmd.get_env(var), Some(OsStr::new("roost")));
+                }
+                "TERM_PROGRAM_VERSION" => {
+                    assert_eq!(cmd.get_env(var), Some(OsStr::new(env!("CARGO_PKG_VERSION"))));
+                }
+                _ => assert!(cmd.get_env(var).is_none(), "{var} must be scrubbed"),
+            }
+        }
+    }
+
+    /// P11 keeps TERM/ROOST_* behavior unchanged: the scrub itself never
+    /// touches them (`spawn` sets TERM=xterm-256color and ROOST_PANE after,
+    /// exactly as before).
+    #[test]
+    fn scrub_host_identity_leaves_term_and_roost_vars_alone() {
+        let mut cmd = CommandBuilder::new("true");
+        cmd.env("TERM", "host-term");
+        cmd.env("ROOST_PANE", "7");
+        scrub_host_identity(&mut cmd);
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("host-term")));
+        assert_eq!(cmd.get_env("ROOST_PANE"), Some(OsStr::new("7")));
     }
 
     #[test]
