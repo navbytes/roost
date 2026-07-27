@@ -17,9 +17,54 @@ use crate::core::status::{AgentStatus, StatusTracker};
 use crate::core::workspace::PaneId;
 use crate::infra::inspect;
 use crate::infra::queries::QueryResponder;
-use crate::ports::{MouseProto, Observation, PaneBackend};
+use crate::ports::{MouseProto, Observation, PaneBackend, PaneEffects};
 
 const SCROLLBACK_LINES: usize = 5000;
+
+/// P2: at most one OSC 9 re-emission per pane per this window. An agent that
+/// notifies in a loop (or a `cat` of a log full of them) must not turn the
+/// host terminal into a notification firehose the user has to force-quit.
+const HOST_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// P2: how much of a notification body is re-emitted to the host. Long
+/// enough for a real "needs your approval to run X" line, short enough that
+/// a pane can't push a megabyte through roost's own stdout.
+const HOST_NOTIFY_CAP: usize = 200;
+
+/// P2/P3: make text safe to embed in a sequence roost writes to its OWN
+/// terminal. A pane's payload is untrusted: left alone, an embedded ESC/BEL/
+/// ST could close roost's sequence early and have the rest interpreted as
+/// host commands (a pane repainting the user's real terminal). C0 controls
+/// are dropped outright and the result truncated to `cap` characters —
+/// truncation is on char boundaries, so a multi-byte glyph is never split.
+fn sanitize_for_host(text: &str, cap: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(cap).collect()
+}
+
+/// P2: the OSC 9 roost re-emits to its own terminal for a pane
+/// notification, or `None` when this one must be dropped — too soon after
+/// the last (`interval`), or nothing left after sanitizing. Pure (clock and
+/// limits are parameters) so the rate limit is proven without sleeping.
+fn host_notify_bytes(
+    body: &str,
+    last: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    if last.is_some_and(|t| now.duration_since(t) < interval) {
+        return None;
+    }
+    let body = sanitize_for_host(body, cap);
+    if body.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() + 5);
+    out.extend_from_slice(b"\x1b]9;");
+    out.extend_from_slice(body.as_bytes());
+    out.push(0x07);
+    Some(out)
+}
 
 /// P1: how long an open synchronized-output bracket (mode 2026) may keep the
 /// pre-bracket frame on screen. Real brackets close within a frame or two; a
@@ -117,6 +162,12 @@ pub struct PtyPane {
     /// ≤150 ms presentation veneer over the visible frame, not a second
     /// terminal state.
     sync_view: Option<(vt100::Screen, Instant)>,
+    /// W3: effects routed out of the pane's escape stream and waiting for
+    /// the core to drain them (`take_effects`).
+    effects: PaneEffects,
+    /// P2: when this pane last re-emitted an OSC 9 to the host, for
+    /// `HOST_NOTIFY_INTERVAL`. `None` until the first one.
+    last_host_notify: Option<Instant>,
     /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
     /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
     /// id. Without this, a pane id that is reused (close→new) or respawned
@@ -136,6 +187,48 @@ impl PtyPane {
     /// surfaces deliberately do not; see `sync_view`.
     fn presented(&self) -> &vt100::Screen {
         sync_presented(self.parser.screen(), self.sync_view.as_ref(), SYNC_STALE_CAP)
+    }
+
+    /// W3: turn one parser effect into roost-side consequences — attention
+    /// state here, texts and host bytes queued for the core to drain.
+    fn route_effect(&mut self, effect: vt100::Effect) {
+        match effect {
+            // P2: a notification is an explicit "I need you". It takes the
+            // same attention path as a bell (the heuristic that surfaces ◆
+            // once the pane goes quiet) — the whole reason OSC 9 vanishing
+            // was a P0: the OSC-terminating BEL is deliberately not counted
+            // as a bell, so nothing else could ever notice.
+            vt100::Effect::Notify { title, body } => {
+                self.status.on_bell();
+                let text = match &title {
+                    Some(t) if !t.is_empty() => format!("{t}: {body}"),
+                    _ => body.clone(),
+                };
+                self.effects.notifications.push(text);
+                self.queue_host_notify(&body);
+            }
+            // Declared by the W3 effects surface, routed by the items that
+            // own them: P3 (clipboard forwarding) and P7 (cursor fidelity).
+            // Spelled out rather than swallowed by a catch-all so the
+            // compiler keeps pointing at this match until they land.
+            vt100::Effect::Osc52Write { .. } | vt100::Effect::CursorShape(_) => {}
+        }
+    }
+
+    /// P2: re-emit the notification to the HOST terminal as an OSC 9, so the
+    /// native desktop notification the app asked for actually fires. Rate-
+    /// limited per pane and length-capped; the body is sanitized because it
+    /// is untrusted text about to ride inside a sequence roost writes to its
+    /// own terminal.
+    fn queue_host_notify(&mut self, body: &str) {
+        let now = Instant::now();
+        let Some(bytes) =
+            host_notify_bytes(body, self.last_host_notify, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP)
+        else {
+            return;
+        };
+        self.last_host_notify = Some(now);
+        self.effects.host_writes.extend_from_slice(&bytes);
     }
 }
 
@@ -220,6 +313,8 @@ impl PaneBackend for PtyPane {
             queries: QueryResponder::new(),
             pixels,
             sync_view: None,
+            effects: PaneEffects::default(),
+            last_host_notify: None,
             alive,
         })
     }
@@ -251,6 +346,11 @@ impl PaneBackend for PtyPane {
         }
         if !self.parser.screen().synchronized_output() {
             self.sync_view = None;
+        }
+        // W3: route everything the chunk asked roost to do out there.
+        let effects = self.parser.take_effects();
+        for effect in effects {
+            self.route_effect(effect);
         }
         self.status.on_output();
     }
@@ -371,6 +471,10 @@ impl PaneBackend for PtyPane {
         }
     }
 
+    fn take_effects(&mut self) -> PaneEffects {
+        std::mem::take(&mut self.effects)
+    }
+
     /// P1: the *presentation* view (see `PtyPane::presented`), so the
     /// renderer's blit and cursor placement can never show a frame the app
     /// declared incomplete. Transparent to the caller — the renderer asks
@@ -478,7 +582,8 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_selection, scrub_host_identity, sync_presented, HOST_IDENTITY_VARS,
+        extract_selection, host_notify_bytes, sanitize_for_host, scrub_host_identity,
+        sync_presented, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL,
         SYNC_STALE_CAP,
     };
     use portable_pty::CommandBuilder;
@@ -560,6 +665,57 @@ mod tests {
         assert!(p.screen().scrollback() > 0);
         let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP);
         assert_eq!(presented.contents(), p.screen().contents());
+    }
+
+    /// P2: the shape roost re-emits, and the two things that must never
+    /// reach the host — a body that could break out of roost's own sequence,
+    /// and an unbounded one.
+    #[test]
+    fn host_notify_is_bounded_and_cannot_break_out_of_its_sequence() {
+        let now = Instant::now();
+        let emit = |body: &str| host_notify_bytes(body, None, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP);
+
+        assert_eq!(emit("NEEDS-YOU").unwrap(), b"\x1b]9;NEEDS-YOU\x07".to_vec());
+
+        // A pane's payload is untrusted: an embedded BEL/ESC would close
+        // roost's own OSC early and let the rest be read as host commands.
+        let hostile = emit("safe\x07\x1b]0;PWNED\x07\x1b[2Jtail").unwrap();
+        assert_eq!(hostile, b"\x1b]9;safe]0;PWNED[2Jtail\x07".to_vec());
+        assert_eq!(hostile.iter().filter(|&&b| b == 0x07).count(), 1, "one terminator");
+        assert_eq!(hostile.iter().filter(|&&b| b == 0x1b).count(), 1, "one introducer");
+
+        // Length is capped in characters, on char boundaries.
+        let long = emit(&"x".repeat(HOST_NOTIFY_CAP * 3)).unwrap();
+        assert_eq!(long.len(), HOST_NOTIFY_CAP + 5);
+        let wide = emit(&"日".repeat(HOST_NOTIFY_CAP * 2)).unwrap();
+        assert!(std::str::from_utf8(&wide[4..wide.len() - 1]).is_ok(), "never split a glyph");
+
+        // Nothing printable left ⇒ nothing emitted (no empty OSC 9).
+        assert!(emit("\x07\x1b\x00").is_none());
+        assert!(emit("").is_none());
+    }
+
+    /// P2: at most one host notification per pane per interval — an agent
+    /// that notifies in a loop must not become a notification firehose.
+    #[test]
+    fn host_notify_is_rate_limited_per_pane() {
+        let now = Instant::now();
+        let cap = HOST_NOTIFY_CAP;
+        // Just inside the window: dropped.
+        let recent = Some(now - HOST_NOTIFY_INTERVAL + Duration::from_millis(1));
+        assert!(host_notify_bytes("again", recent, now, HOST_NOTIFY_INTERVAL, cap).is_none());
+        // Past it: emitted again.
+        let old = Some(now - HOST_NOTIFY_INTERVAL - Duration::from_millis(1));
+        assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+        // The first notification of a pane's life is never rate-limited.
+        assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+    }
+
+    /// P2/P3 share the sanitizer; pin that it keeps ordinary text intact.
+    #[test]
+    fn sanitize_keeps_printable_text_verbatim() {
+        assert_eq!(sanitize_for_host("run `ls -la`? (y/n)", 100), "run `ls -la`? (y/n)");
+        assert_eq!(sanitize_for_host("a\tb\nc", 100), "abc");
     }
 
     /// P11: every known host-identity var is removed (whether it came from

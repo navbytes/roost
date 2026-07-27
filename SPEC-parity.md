@@ -76,7 +76,20 @@ modes, and `read --full`/`--tail` stay on the live grid: the snapshot is a
 carries no scrollback at all, which is also why a scrolled-back pane ignores
 it — U3's frozen view wins).
 
-### P2 · CONFIRMED · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
+### P2 · FIXED (this branch) · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
+*Fixed: the vendored parser turns OSC 9 (`9;body`) and OSC 777
+(`777;notify;title;body`) into `Effect::Notify`; `PtyPane` puts each one on
+the same attention path as a bell (`StatusTracker::on_bell` → ◆ once the pane
+rests) and queues a bounded re-emission to roost's own stdout — max 1 per pane
+per second, 200 chars, C0-stripped so an untrusted body can't break out of the
+sequence — written between draws by the main loop. The nudge names the pane
+via U2's `display_name` and, like every other roost notification, is skipped
+for the focused pane. e2e `tests/pane_notifications.rs`: `"status": "waiting"`
+and no `ESC ]9;` in the host capture before; `needs_input` + a verbatim
+`ESC ]9;NEEDS-YOU BEL` after.*
+***Deferred:** OSC 9;4 (progress) is recognized so it can never be mistaken
+for a notification body, then dropped — surfacing it as a badge percentage
+stays out of scope, as this item's contract already said.*
 Claude Code emits desktop notifications via OSC 9 and progress via OSC 9;4
 (claude-code #19976, #57366). roost drops them at `osc_dispatch` (only OSC
 0/1/2 handled) — and because the OSC-terminating BEL is deliberately not

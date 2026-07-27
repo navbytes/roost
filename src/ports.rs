@@ -50,6 +50,24 @@ pub enum ClipboardOutcome {
     Failed,
 }
 
+/// W3: what a pane's escape traffic asked roost to do on its behalf, drained
+/// after each chunk of output. The pane's terminal state machine can't carry
+/// these out itself — they need the thing that owns a host terminal, a
+/// notification daemon, a clipboard.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PaneEffects {
+    /// P2: OSC 9 / OSC 777 notification bodies, in stream order. The pane's
+    /// attention state (the bell heuristic → `◆`) is already updated by the
+    /// backend; these are the *texts*, for the notifier.
+    pub notifications: Vec<String>,
+    /// Bytes roost must forward verbatim to the HOST terminal's own output —
+    /// P2's re-emitted OSC 9 (so native desktop notifications fire) and P3's
+    /// OSC 52 clipboard writes. Already rate-limited, capped and sanitized
+    /// by the backend; the composition root only has to write them between
+    /// frames.
+    pub host_writes: Vec<u8>,
+}
+
 /// What the pane's inner application asked for, mouse-wise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseProto {
@@ -122,6 +140,14 @@ pub trait PaneBackend: Sized {
     /// for, so pasted newlines insert instead of submitting. Default false.
     fn bracketed_paste(&self) -> bool {
         false
+    }
+
+    /// W3: drain what the pane's escape traffic asked roost to do since the
+    /// last call — see `PaneEffects`. Called right after `process_output`;
+    /// nothing accumulates between calls. Default empty for backends with no
+    /// escape stream to interpret.
+    fn take_effects(&mut self) -> PaneEffects {
+        PaneEffects::default()
     }
 
     /// Terminal grid for rendering. `None` for fakes (renderer must cope).
@@ -216,6 +242,10 @@ pub mod fakes {
         /// The pixel geometry most recently seen — at spawn, then updated by
         /// every resize — so tests can assert the P4 pixel plumbing.
         pub pixels: (u16, u16),
+        /// Test knob (W3): the effects the next `take_effects` drains. Set
+        /// it, drive the core, assert on what the core did with them; like
+        /// the real backend, draining empties it.
+        pub effects: PaneEffects,
     }
 
     impl PaneBackend for FakePane {
@@ -246,6 +276,7 @@ pub mod fakes {
                 app_cursor: false,
                 bracketed: false,
                 pixels,
+                effects: PaneEffects::default(),
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -294,6 +325,9 @@ pub mod fakes {
         }
         fn bracketed_paste(&self) -> bool {
             self.bracketed
+        }
+        fn take_effects(&mut self) -> PaneEffects {
+            std::mem::take(&mut self.effects)
         }
         fn screen(&self) -> Option<&vt100::Screen> {
             None

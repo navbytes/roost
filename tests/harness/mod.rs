@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
@@ -42,6 +42,13 @@ pub struct Harness {
     rx: mpsc::Receiver<Vec<u8>>,
     parser: vt100::Parser,
     state_dir: PathBuf,
+    /// Every byte roost has written to its host terminal this session, in
+    /// order, *before* any parsing. `screen()` answers "what does the user
+    /// see"; this answers "what did roost actually emit" — the only way to
+    /// assert on sequences that leave no mark on the grid (SPEC-parity W3:
+    /// the re-emitted OSC 9/52, the host title, cursor-shape mirroring).
+    /// Written by the reader thread, so it stays current without draining.
+    raw: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Harness {
@@ -99,12 +106,20 @@ impl Harness {
             pair.master.take_writer().map_err(|e| format!("take pty writer: {e}"))?;
 
         let (tx, rx) = mpsc::channel();
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let reader_raw = raw.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break, // PTY closed (child exited) or read error
                     Ok(n) => {
+                        // Bank the raw bytes first: a scenario asserting on
+                        // what roost *emitted* must see them even if nobody
+                        // ever drains the parser channel.
+                        if let Ok(mut r) = reader_raw.lock() {
+                            r.extend_from_slice(&buf[..n]);
+                        }
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break; // Harness dropped, nobody left to read
                         }
@@ -113,7 +128,40 @@ impl Harness {
             }
         });
 
-        Ok(Self { child, writer, rx, parser: vt100::Parser::new(ROWS, COLS, 0), state_dir })
+        Ok(Self {
+            child,
+            writer,
+            rx,
+            parser: vt100::Parser::new(ROWS, COLS, 0),
+            state_dir,
+            raw,
+        })
+    }
+
+    /// Everything roost has written to its host terminal so far, unparsed.
+    /// See the `raw` field: this is the seam for asserting on sequences that
+    /// never reach the grid.
+    pub fn host_bytes(&self) -> Vec<u8> {
+        self.raw.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// Poll until roost's raw host output satisfies `pred`, or bail out after
+    /// `timeout`. Returns whether it matched.
+    pub fn wait_for_host_bytes(
+        &mut self,
+        timeout: Duration,
+        mut pred: impl FnMut(&[u8]) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        loop {
+            if pred(&self.host_bytes()) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
     }
 
     /// Pull all currently-buffered PTY output into the parser without

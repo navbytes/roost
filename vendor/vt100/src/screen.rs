@@ -1858,6 +1858,37 @@ impl vte::Perform for Screen {
             (Some(&b"0"), Some(s)) => self.osc0(s),
             (Some(&b"1"), Some(s)) => self.osc1(s),
             (Some(&b"2"), Some(s)) => self.osc2(s),
+            // roost: OSC 9;4 is ConEmu/Windows Terminal *progress*
+            // (`9;4;state;percent`), not a notification — Claude Code emits
+            // it throughout a long turn. Recognized here so it can never be
+            // mistaken for an OSC 9 notification body, then deliberately
+            // dropped: surfacing progress as a badge percentage is its own
+            // item (SPEC-parity P2, deferred half).
+            (Some(&b"9"), Some(&b"4")) => {}
+            // roost: OSC 9 desktop notification, `9 ; body` (SPEC-parity
+            // P2). A body containing `;` arrives pre-split, so rejoin.
+            (Some(&b"9"), Some(_)) => {
+                let body = osc_join(params.get(1..).unwrap_or(&[]));
+                if !body.is_empty() {
+                    self.effects.push(Effect::Notify { title: None, body });
+                }
+            }
+            // roost: OSC 777 notification, `777 ; notify ; title ; body`
+            // (the rxvt/urxvt form Claude Code and others also emit).
+            (Some(&b"777"), Some(&b"notify")) => {
+                let title = osc_join(params.get(2..3).unwrap_or(&[]));
+                let body = osc_join(params.get(3..).unwrap_or(&[]));
+                // Title-only is legal and common enough; a notification
+                // with an empty body would say nothing, so promote it.
+                let (title, body) = if body.is_empty() {
+                    (None, title)
+                } else {
+                    (Some(title), body)
+                };
+                if !body.is_empty() {
+                    self.effects.push(Effect::Notify { title, body });
+                }
+            }
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
@@ -1957,6 +1988,19 @@ fn param_str(params: &vte::Params) -> String {
         })
         .collect();
     strs.join(" ; ")
+}
+
+/// Rejoin OSC parameters that a `;`-bearing payload was split across.
+/// vte splits every OSC parameter on `;`, but a notification body or a
+/// base64 clipboard payload is one field that may legitimately contain the
+/// separator — putting it back is what a lenient terminal does.
+// roost: added for SPEC-parity W3 (P2's OSC 9/777, P3's OSC 52).
+fn osc_join(params: &[&[u8]]) -> String {
+    let strs: Vec<_> = params
+        .iter()
+        .map(|b| std::string::String::from_utf8_lossy(b))
+        .collect();
+    strs.join(";")
 }
 
 fn osc_param_str(params: &[&[u8]]) -> String {
@@ -2079,5 +2123,91 @@ mod roost_tests {
         let mut p = parser();
         p.process(b"hello\x1b[31mred\x1b[0m\x1b]2;title\x07\x07\x1b[?2026h");
         assert!(p.take_effects().is_empty());
+    }
+
+    // -- OSC 9 / 777 notifications (SPEC-parity P2) -----------------------
+
+    fn notify(title: Option<&str>, body: &str) -> crate::Effect {
+        crate::Effect::Notify {
+            title: title.map(std::string::ToString::to_string),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn osc9_and_osc777_become_notify_effects() {
+        // (bytes, expected effect)
+        let cases: &[(&[u8], crate::Effect)] = &[
+            // OSC 9, BEL-terminated (the common form).
+            (b"\x1b]9;NEEDS-YOU\x07", notify(None, "NEEDS-YOU")),
+            // OSC 9, ST-terminated.
+            (b"\x1b]9;done\x1b\\", notify(None, "done")),
+            // A body carrying the parameter separator survives intact.
+            (b"\x1b]9;build failed; see log\x07", notify(None, "build failed; see log")),
+            // OSC 777 carries an explicit title.
+            (
+                b"\x1b]777;notify;claude;turn finished\x07",
+                notify(Some("claude"), "turn finished"),
+            ),
+            // ...and a title-only 777 is promoted to the body, so the
+            // notification never says nothing.
+            (b"\x1b]777;notify;just a title\x07", notify(None, "just a title")),
+        ];
+        for (bytes, want) in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert_eq!(
+                p.take_effects(),
+                vec![want.clone()],
+                "input {:?}",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn osc9_progress_and_empty_bodies_produce_nothing() {
+        let cases: &[&[u8]] = &[
+            b"\x1b]9;4;1;40\x07",     // OSC 9;4 progress (deferred, not a notification)
+            b"\x1b]9;4;0;0\x07",      // progress cleared
+            b"\x1b]9;\x07",           // empty body
+            b"\x1b]777;notify\x07",   // no title, no body
+            b"\x1b]777;notify;;\x07", // both empty
+            b"\x1b]9\x07",            // bare OSC 9, no parameters at all
+        ];
+        for bytes in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert!(
+                p.take_effects().is_empty(),
+                "input {:?} must not notify",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn notifications_accumulate_in_stream_order_and_drain_once() {
+        let mut p = parser();
+        p.process(b"\x1b]9;first\x07between\x1b]777;notify;t;second\x07");
+        assert_eq!(
+            p.take_effects(),
+            vec![notify(None, "first"), notify(Some("t"), "second")]
+        );
+        assert!(p.take_effects().is_empty(), "draining takes them");
+        // The screen itself is untouched by the notification traffic.
+        assert!(p.screen().contents().contains("between"));
+    }
+
+    #[test]
+    fn an_osc_terminating_bel_still_does_not_count_as_a_bell() {
+        // roost's NeedsInput heuristic keys off vt100's *parsed* bell count,
+        // so a BEL consumed as an OSC string terminator must not inflate it
+        // — the notification effect is the signal, not the terminator.
+        let mut p = parser();
+        let before = p.screen().audible_bell_count();
+        p.process(b"\x1b]9;hi\x07");
+        assert_eq!(p.screen().audible_bell_count(), before);
+        assert_eq!(p.take_effects().len(), 1);
     }
 }

@@ -275,6 +275,12 @@ pub struct App<B: PaneBackend> {
     /// instead, since it already runs there; this field exists only because
     /// `handle_mode_key` has no such caller-side return channel.
     pending_yank: Option<String>,
+    /// W3: bytes roost owes its OWN terminal — pane OSC 9 notifications
+    /// (P2) and OSC 52 clipboard writes (P3) forwarded on a pane's behalf.
+    /// Queued rather than written because core does no I/O (module doc) and
+    /// because host writes must land *between* frames, never inside one.
+    /// Drained each loop iteration by `take_host_output`.
+    host_out: Vec<u8>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -338,6 +344,7 @@ impl<B: PaneBackend> App<B> {
             raw: HashSet::new(),
             tab_focus: HashSet::new(),
             pending_yank: None,
+            host_out: Vec::new(),
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -1494,8 +1501,15 @@ impl<B: PaneBackend> App<B> {
 
     // -- event handling ----------------------------------------------------
 
-    pub fn on_pty_output(&mut self, id: PaneId, bytes: &[u8]) {
-        if let Some(rt) = self.runtimes.get_mut(&id) {
+    /// Returns a notification message when the pane's escape traffic asked
+    /// for one (P2: OSC 9 / OSC 777) and the pane isn't focused — same
+    /// policy as `on_status`/`on_pty_exit`: a pane you're already looking at
+    /// doesn't need to be announced. The pane's *attention state* (◆) and
+    /// the host re-emission are unconditional; only the roost-side nudge is
+    /// gated.
+    pub fn on_pty_output(&mut self, id: PaneId, bytes: &[u8]) -> Option<String> {
+        let effects = {
+            let rt = self.runtimes.get_mut(&id)?;
             rt.process_output(bytes);
             // First output ⇒ the agent is alive and reading its stdin: flush
             // any buffered spawn-time initial_input now (exactly once). A
@@ -1505,7 +1519,32 @@ impl<B: PaneBackend> App<B> {
             if let Some(pending) = self.pending_input.remove(&id) {
                 rt.write_input(&pending);
             }
+            rt.take_effects()
+        };
+        // W3: bytes bound for the host terminal are queued, never written
+        // from here — core has no I/O of its own, and the composition root
+        // must place them between frames rather than mid-draw.
+        self.host_out.extend_from_slice(&effects.host_writes);
+        // A chunk can carry several notifications (an agent that re-notifies
+        // as its state changes); the newest is the one that's still true, so
+        // it's the one the user is told about — the rest already did their
+        // job by marking the pane as needing attention.
+        let body = effects.notifications.into_iter().next_back()?;
+        if id == self.focused {
+            return None;
         }
+        // U2: the shared display name, so a notification names the pane the
+        // same way the badge and the feed do.
+        Some(format!("{}: {}", self.display_name(id), body))
+    }
+
+    /// W3: drain the bytes roost owes the HOST terminal — pane OSC 9
+    /// notifications (P2) and OSC 52 clipboard writes (P3), already
+    /// rate-limited/capped/sanitized by the backend. The composition root
+    /// writes these between draws; queueing them keeps core I/O-free and
+    /// guarantees nothing lands in the middle of a frame.
+    pub fn take_host_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.host_out)
     }
 
     /// Returns a notification message when a *non-focused* pane exits — an
@@ -3102,6 +3141,55 @@ mod tests {
 
     fn shell_ws() -> Workspace {
         Workspace::default_in(PathBuf::from("/tmp"))
+    }
+
+    /// P2: a pane's OSC 9/777 notification reaches the user through the same
+    /// two channels a bell does — a nudge naming the pane (U2's display
+    /// name), and the host re-emission queued for the composition root. The
+    /// focused pane is deliberately not announced (you're looking at it),
+    /// matching `on_status`/`on_pty_exit`.
+    #[test]
+    fn a_pane_notification_names_the_pane_and_queues_the_host_re_emission() {
+        let (mut app, _s) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2, focus 2
+        assert_eq!(app.focused, 2);
+
+        let name = app.display_name(1);
+        app.runtimes.get_mut(&1).unwrap().effects = crate::ports::PaneEffects {
+            notifications: vec!["NEEDS-YOU".to_string()],
+            host_writes: b"\x1b]9;NEEDS-YOU\x07".to_vec(),
+        };
+        let msg = app.on_pty_output(1, b"whatever").expect("unfocused pane notifies");
+        assert_eq!(msg, format!("{name}: NEEDS-YOU"));
+        assert_eq!(app.take_host_output(), b"\x1b]9;NEEDS-YOU\x07".to_vec());
+        assert!(app.take_host_output().is_empty(), "draining takes it");
+
+        // The focused pane's notification still forwards to the host (the
+        // app asked its terminal for it) but raises no roost-side nudge.
+        app.runtimes.get_mut(&2).unwrap().effects = crate::ports::PaneEffects {
+            notifications: vec!["also me".to_string()],
+            host_writes: b"\x1b]9;also me\x07".to_vec(),
+        };
+        assert!(app.on_pty_output(2, b"x").is_none());
+        assert_eq!(app.take_host_output(), b"\x1b]9;also me\x07".to_vec());
+    }
+
+    /// P2: several notifications in one chunk — the newest is the one still
+    /// true, so that's what the user is told; the rest have already done
+    /// their job by marking the pane as needing attention.
+    #[test]
+    fn the_newest_notification_in_a_chunk_is_the_one_reported() {
+        let (mut app, _s) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.runtimes.get_mut(&1).unwrap().effects = crate::ports::PaneEffects {
+            notifications: vec!["stale".into(), "current".into()],
+            host_writes: Vec::new(),
+        };
+        let msg = app.on_pty_output(1, b"x").expect("notifies");
+        assert!(msg.ends_with(": current"), "got {msg}");
+        // No notification at all ⇒ no nudge, and output handling is
+        // otherwise unchanged.
+        assert!(app.on_pty_output(1, b"x").is_none());
     }
 
     #[test]

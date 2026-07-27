@@ -291,7 +291,13 @@ fn run(
                 AppEvent::Command(req, reply) => {
                     app.handle_control_msg(req, reply);
                 }
-                AppEvent::Output(id, bytes) => app.on_pty_output(id, &bytes),
+                // P2: a pane's OSC 9/777 notification pulls attention the
+                // same way a bell or an extension "needs you" does.
+                AppEvent::Output(id, bytes) => {
+                    if let Some(msg) = app.on_pty_output(id, &bytes) {
+                        notifier.notify(&msg);
+                    }
+                }
                 AppEvent::Exit(id) => {
                     if let Some(msg) = app.on_pty_exit(id) {
                         notifier.notify(&msg);
@@ -313,6 +319,20 @@ fn run(
                     }
                 }
             }
+        }
+
+        // W3: hand the host terminal what the panes asked roost to forward
+        // on their behalf — P2's re-emitted OSC 9 notifications, P3's OSC 52
+        // clipboard writes. Deliberately here, between draws: a write landing
+        // mid-frame would interleave with ratatui's own output and could be
+        // parsed as part of a cell run. The core has already rate-limited,
+        // capped and sanitized every byte.
+        let host_bytes = app.take_host_output();
+        if !host_bytes.is_empty() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&host_bytes);
+            let _ = out.flush();
         }
 
         // Periodic housekeeping (filesystem session detection).
