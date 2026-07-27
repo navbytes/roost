@@ -255,35 +255,97 @@ hitboxes stay in lockstep with what's drawn.
 
 ## P2 — polish
 
-### U16 · Low · VERIFIED — rename input swallows edit chords, append-only
+### U16 · Low · FIXED (this branch) — rename input swallows edit chords, append-only
 Live QA: typing `abc` + Ctrl+W + Ctrl+U produced the title `abcwu` — modifier
 chords insert their letter. No cursor motion of any kind.
 **Proposed contract:** discard modified chars except Ctrl+U (clear) and Ctrl+W
 (word-erase); accept paste into the buffer (see U8); cursor motion later.
+**Fixed:** the dialog's `KeyCode::Char` arm no longer ignores modifiers —
+Ctrl+U clears the buffer, Ctrl+W runs the pure `app::erase_word` (readline's
+`unix-word-rubout`: trailing whitespace, then one word), and every other
+modified char is swallowed rather than typed. Shift still inserts (it is how
+an uppercase letter arrives under kitty CSI-u). Paste already landed with U8.
+Cursor motion inside the buffer stays **out of scope** and unimplemented —
+"word behind point" is always "word at the end" until there is a point (§8
+amended 2026-07-27). The drive's probe now types `junk` + Ctrl+U +
+`abc def` + Ctrl+W, so `abc` survives only if both chords were honored and a
+literal insertion would show as a stray `u`/`w`.
 
-### U17 · Low · VERIFIED — copy-mode vocabulary
+### U17 · Low · FIXED (this branch) — copy-mode vocabulary
 `V` (line select) and `w/b/e` are unbound no-ops (live-confirmed); `0`/`$`
 exist but appear in no hint and not in the help overlay.
 **Proposed contract:** add `V` and `w/b/e`; list `0/$` in the copy hint.
+**Fixed:** `V` selects the cursor's whole row — absolute, not a `v`-style
+toggle, so it is idempotent and `j`/`k` then extend by rows — and `w`/`b`/`e`
+walk whitespace-delimited words (the same tokenizer `find_url_at` uses)
+within the cursor's row, clamping at both ends rather than wrapping onto a
+neighbour: the cursor lives in visible-grid cell space (C24) and a motion
+that silently changed rows would break the selection model. The hint list is
+now the mode's whole vocabulary at 83 columns —
+`hjkl move · w/b/e word · 0/$ ends · v/V mark · y/↵ yank · drag select ·
+Esc exit` — still fitting beside the right segment at the 100-col floor,
+and the `Alt+c` help row spells the keys out (C9/C24 amended 2026-07-27).
 
-### U18 · Low · CODE-VERIFIED — mode entry chords don't uniformly toggle off
+### U18 · Low · FIXED (this branch) — mode entry chords don't uniformly toggle off
 Alt+e closes the feed (special-cased); Alt+c in copy mode re-enters with a
 fresh cursor; Alt+PageUp in scroll mode resets to tail instead of exiting.
 **Proposed contract:** a mode's own entry chord exits it (generalize the Alt+e
 pattern).
+**Fixed:** the C20 carve-out became the rule for all six modes. The test is
+derived, not copied: the key runs through `input::translate` and its `Action`
+is compared with `mode_entry_action(mode)`, so a rebound chord takes its
+toggle with it. Toggling off *is* exiting — both routes go through one
+`exit_mode`, so a toggled-off Scroll snaps to the live tail and a toggled-off
+Copy drops its selection exactly as Esc does. Chords that aren't the current
+mode's still fall through to their global binding, U9's scroll-snap (and its
+Alt+c exemption) intact (C24b added 2026-07-27).
 
-### U19 · Low · OPEN — URLs: wrapped links break Alt+click; no keyboard open
+### U19 · Low · FIXED (this branch) — URLs: wrapped links break Alt+click; no keyboard open
 `url_at` reads one grid row; agents constantly print wrapping URLs into narrow
 panes. No keyboard path opens a URL at all.
 **Proposed contract:** join wrapped rows (vt100 `row_wrapped`) before
 tokenizing; `o` in copy mode opens the URL under the cursor.
+**Fixed:** `url_at` now reads the whole *wrapped run* a row belongs to — it
+walks back while the previous row is flagged wrapped, collects forward
+through the run, and joins via the pure `url_in_wrapped_rows`, which pads
+each non-final row back out to the pane's inner width so the column
+arithmetic stays exact and a genuinely blank tail still separates tokens
+instead of fusing them. Either end of a wrapped link now returns the whole
+URL; before, the first row opened a truncated one and every continuation row
+was a dead click. The flag comes from a new `PaneRuntime::row_wrapped`
+(default false), read off the *presented* frame like `grab_text` so the join
+agrees with what is on screen; the vendored `Screen::row_wrapped` already
+existed and is now pinned by a vendor-side test (a newline is not a wrap; a
+merely-full row is not a wrap). `o` in copy mode opens the URL under the
+cursor via `pending_open` (core does no I/O), flashing
+`no URL under the cursor` on a miss and never leaving the mode
+(C24 amended 2026-07-27).
+**Known bound (unchanged by this fix, sharpened by P15's landing):** the
+column a click or the copy cursor carries is a *cell* index, while the row
+text `grab_text` returns now holds one char per glyph — P15 skips wide
+continuation cells rather than padding them — so on a row containing CJK or
+emoji the two drift by one per wide glyph before the token. Both the U17
+word motions and this lookup index by cell. The drift is bounded and
+self-correcting in practice (URLs are ASCII, and `find_url_at` expands to
+whitespace boundaries, so a small offset still lands inside the same token),
+but a row with many wide glyphs ahead of a link can miss it. A cell→char
+map for the whole row is the fix; it belongs with U24's wide-char work, not
+here.
 
-### U20 · Low · OPEN — picker is arrows/Enter only
+### U20 · Low · FIXED (this branch) — picker is arrows/Enter only
 No number accelerators, no type-ahead, no click; `j/k` work unhinted; the
 DESIGN.md §7 "recent cwd" column never shipped.
 **Proposed contract:** `1..9` accelerators + click-to-launch; cwd column later.
 *(Click-to-launch landed with U8's modal mouse ownership — C14 amended
-2026-07-27. The accelerators, type-ahead and cwd column stay OPEN.)*
+2026-07-27.)*
+**Fixed:** `1`..`9` launch that row through the same `picker_launch` the
+click and Enter already shared, and every row now *shows* its accelerator
+(`❯ 1 pi`) — an accelerator nothing advertises is one nobody presses, which
+is exactly what unhinted `j/k` cost this dialog. The hint bar gains
+`1..9 launch`. A digit past the end of the list is ignored and the picker
+stays up: the rows are numbered, so an out-of-range press is self-evidently
+one. Type-ahead and the DESIGN.md §7 recent-cwd column stay **OPEN** — both
+are new state, not a missing binding (C14 amended 2026-07-27).
 
 ### U21 · Low · OPEN — mouse can't resize; tabs are click-to-switch only
 No border drag-resize, no middle-click close, no drag-reorder.
@@ -302,11 +364,23 @@ prompts live exactly `CONFIRM_WINDOW`, and a confirm that dies early (consumed
 second press, or disarmed by another action) takes its prompt down with it.
 The heuristic-Working half stays OPEN.
 
-### U23 · Low · VERIFIED — help overlay teaches chords, nothing else
+### U23 · Low · FIXED (this branch) — help overlay teaches chords, nothing else
 Live QA: the overlay contains no status-glyph legend (`●◆○·✕` — the product's
 core language) and no mouse documentation.
 **Proposed contract:** one legend row and one mouse row; scroll the overlay on
 short terminals instead of capping content.
+**Fixed** (the merge option, not the scroll one): `HELP_KEYS` gains three
+reference rows after `Alt+q` — `status ● working ◆ needs you ○ waiting ·
+idle ✕ exited`, `mouse wheel scrolls · click focuses · drag selects`, and
+`Alt+click open the URL under the pointer` (its own row: it is a chord).
+Paid for by merging three natural chord pairs — `Alt+s / Alt+o`,
+`Alt+z / Alt+f`, `Alt+w / Alt+u` — so C15's ≤20-row cap holds unchanged at
+exactly 20. Scrolling was rejected: it would force arrow/PgUp/PgDn carve-outs
+out of "any key closes it", making the modal you open when lost the one with
+a non-obvious exit (C15 amended 2026-07-27, plus a new ≤80-col width rule so
+the longer rows can't clip mid-word). The legend's text is checked against
+the `theme::GLYPH_*` constants, so a retheme breaks a test rather than the
+lesson.
 
 ### U24 · Low · FIXED (this branch) — wide-char blit is approximate
 `render.rs` self-documents approximate CJK/emoji handling (continuation cells
@@ -331,11 +405,25 @@ without the guard the clipped glyph is emitted). Golden frame added —
 a pane and asserts the host's grid carries each one intact, one wide cell plus
 an empty continuation apiece. (Amends DESIGN-ui C18, 2026-07-27.)
 
-### U25 · Low · OPEN — the feed can't act
+### U25 · Low · FIXED (this branch) — the feed can't act
 Feed entries aren't actionable (no jump-to-pane) and its hint omits its own
 working keys (PgUp/PgDn/q).
 **Proposed contract:** entries carry `PaneId`; Enter focuses that pane; hint
 lists the real keys.
+**Fixed:** `FeedEntry` carries `pane: Option<PaneId>` — `Some` for
+spawn/status/exit lines (a dead pane is exactly where you want to land),
+`None` for closes and `ctl` lines (a closed pane is gone, and `Alt+u`, not a
+jump, is that line's recovery path). Enter focuses it through
+`focus_attention_target`, the same helper Alt+a's ring uses, so the jump
+crosses tabs, expands stacks and shows the float like every other jump; ids
+are recycled, so it re-checks the pane exists first and otherwise flashes
+`that pane is gone` / `no pane on that line` without moving or closing.
+The selected entry is the window's last row by construction (`offset`
+already meant "entries back from the newest"), now marked with the picker's
+`❯` in the leading column the row rule already spent on a space — zero
+columns. The hint is the feed's real key set:
+`↑↓ select · PgUp/Dn page · ↵ go to pane · q/Esc close` (C20/C9 amended
+2026-07-27).
 
 ## New findings from the live session (not predicted by either review)
 

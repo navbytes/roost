@@ -299,6 +299,11 @@ fn run(
                             let outcome = infra::clipboard::copy(&text);
                             app.flash_copy(text.chars().count(), outcome);
                         }
+                        // U19: and copy mode's `o` stashes a URL the same
+                        // way — the browser is I/O, so it happens out here.
+                        if let Some(url) = app.take_pending_open() {
+                            infra::open::open_url(&url);
+                        }
                     }
                     Event::Mouse(me) => handle_mouse(&mut app, me),
                     // Coalesce: act on the true size once, after draining.
@@ -535,7 +540,33 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
     // C21/§5: zoom-aware — while zoomed, the display list is just the
     // zoomed pane, so body clicks/wheel can only ever hit it.
     let rects = app.display_rects();
-    let Some(pane) = mouse::hit_test(&rects, me.column, me.row) else { return };
+    // P20: a gesture belongs to the pane its button-down landed in, for as
+    // long as it lasts. Re-hit-testing every event meant a drag that crossed
+    // a border switched target mid-gesture — the origin app never saw its
+    // release (left stuck mid-selection) while the neighbour got orphan
+    // drag/up events for a press it never received. Copy mode already
+    // latched this way (`handle_copy_mouse` follows `selection.pane`); this
+    // is the same rule for the forwarding path. Coordinates outside the
+    // latched pane are clamped to its grid by `mouse::route_mouse`.
+    let pane = match me.kind {
+        MouseEventKind::Down(_) => {
+            let hit = mouse::hit_test(&rects, me.column, me.row);
+            app.set_mouse_latch(hit.map(|p| p.id));
+            hit
+        }
+        // Follow the latch wherever the pointer wandered. No latch means the
+        // press never landed in a pane (the tab bar, a modal, outside the
+        // body) — an orphan drag/release belongs to nobody.
+        MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+            app.mouse_latch().and_then(|id| rects.iter().find(|p| p.id == id).copied())
+        }
+        // Wheel and bare motion aren't part of a button gesture.
+        _ => mouse::hit_test(&rects, me.column, me.row),
+    };
+    if matches!(me.kind, MouseEventKind::Up(_)) {
+        app.set_mouse_latch(None); // the gesture ends here, whatever it hit
+    }
+    let Some(pane) = pane else { return };
 
     // Alt+click a URL to open it in the browser (roost owns the Alt layer).
     if matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
@@ -902,6 +933,89 @@ mod tests {
         let below = app.body_area().bottom() - 1;
         handle_mouse(&mut app, click(0, below));
         assert!(matches!(app.mode, Mode::Normal), "a click outside closes the feed");
+    }
+
+    // ---- P20: gestures latch to the pane they started in -----------------
+
+    fn drag(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    fn release(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// P20: a drag that crosses a pane border stays with the pane it started
+    /// in. Every event used to be re-hit-tested, so the origin app never saw
+    /// its release (left stuck mid-selection) while the neighbour got orphan
+    /// drag/up events for a press it never received.
+    #[test]
+    fn a_drag_that_crosses_a_border_stays_with_the_pane_it_started_in() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // panes 1 | 2, side by side
+        for id in [1u64, 2] {
+            let rt = app.runtimes.get_mut(&id).unwrap();
+            rt.proto = ports::MouseProto::Sgr;
+            rt.input.clear();
+        }
+        let rects = app.display_rects();
+        let a = rects.iter().find(|p| p.id == 1).unwrap().rect;
+        let b = rects.iter().find(|p| p.id == 2).unwrap().rect;
+        let row = a.y + 2;
+
+        handle_mouse(&mut app, click(a.x + 2, row)); // press in A
+        handle_mouse(&mut app, drag(b.x + 2, row)); // drag into B
+        handle_mouse(&mut app, release(b.x + 4, row)); // release over B
+
+        let a_input = String::from_utf8(app.runtimes.get(&1).unwrap().input.clone()).unwrap();
+        assert_eq!(
+            a_input.matches('\x1b').count(),
+            3,
+            "the origin pane sees the whole gesture, release included: {a_input:?}"
+        );
+        assert!(a_input.ends_with('m'), "...and the release really is a release");
+        assert!(
+            app.runtimes.get(&2).unwrap().input.is_empty(),
+            "the neighbour sees nothing: it was never pressed in"
+        );
+        // The coordinates B's columns would have produced are clamped into
+        // A's grid, so the origin app is never told about a cell it lacks.
+        let inner_w = a.width - 2;
+        assert!(
+            !a_input.contains(&format!(";{};", inner_w + 1)),
+            "forwarded columns stay inside A's {inner_w}-column grid: {a_input:?}"
+        );
+        assert_eq!(app.mouse_latch(), None, "the release ends the gesture");
+    }
+
+    /// P20: a drag or release with no press behind it belongs to nobody —
+    /// it must not be hit-tested into whatever pane the pointer happens to
+    /// be over. (The press that landed on the tab bar is the everyday case.)
+    #[test]
+    fn an_orphan_drag_or_release_is_delivered_to_no_pane() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane);
+        for id in [1u64, 2] {
+            let rt = app.runtimes.get_mut(&id).unwrap();
+            rt.proto = ports::MouseProto::Sgr;
+            rt.input.clear();
+        }
+        let rects = app.display_rects();
+        let a = rects.iter().find(|p| p.id == 1).unwrap().rect;
+        handle_mouse(&mut app, click(1, 0)); // press on the tab bar
+        handle_mouse(&mut app, drag(a.x + 2, a.y + 2));
+        handle_mouse(&mut app, release(a.x + 2, a.y + 2));
+        assert!(app.runtimes.get(&1).unwrap().input.is_empty());
+        assert!(app.runtimes.get(&2).unwrap().input.is_empty());
     }
 
     /// C22: float-first hit-test ordering (a click inside its centered rect

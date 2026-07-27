@@ -553,6 +553,26 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
     `hjkl move` · `v mark` · `y/↵ yank` · `drag select` · `Esc exit`
     (63 columns — fits beside the right segment at 100 cols).
   - Zoomed Normal keeps the standard seven pairs (they all still work).
+- **[Amended 2026-07-27, SPEC-ux U17 — the copy list carries the whole
+  vocabulary]:** the copy-mode list becomes, in this (= yield) order:
+  `hjkl move` · `w/b/e word` · `0/$ ends` · `v/V mark` · `y/↵ yank` ·
+  `drag select` · `Esc exit` — **83 columns**, so it still fits beside the
+  right segment at the 100-col floor (pinned by
+  `hint_pairs_copy_mode_is_the_c24_list_amended_by_u17`). `w/b/e` and `V`
+  are new keys (C24 amendment below); `0`/`$` are not — they had existed
+  since C24 while appearing in no hint and no help row, which is the same
+  as not existing. Labels are deliberately terse (`ends`, `mark`) to buy
+  the columns: the full wording lives one keystroke away under `Alt+?`.
+  **[Re-amended 2026-07-27, SPEC-ux U19]** `o open` joins the list after
+  `y/↵ yank` (92 columns with it — still inside the floor).
+- **[Amended 2026-07-27, SPEC-ux U20 — picker]:** the picker's list becomes
+  `↑↓ choose` · `↵ open` · `1..9 launch` · `Esc cancel` (48 columns).
+- **[Amended 2026-07-27, SPEC-ux U25 — feed]:** the feed's two-pair list
+  becomes `↑↓ select` · `PgUp/Dn page` · `↵ go to pane` · `q/Esc close`
+  (56 columns). `PgUp`/`PgDn` and `q` were **already implemented** and
+  advertised nowhere; `↵` is new (C20 amendment). `scroll` becomes `select`
+  because with an actionable entry the arrows move a cursor, not a view —
+  the hint has to name what the key now does.
 
 ### C10 — Flash message
 
@@ -683,6 +703,20 @@ row `rect.y + 1 + i`, inside the border columns; the border, the title and
 any row past the last item hit nothing. The keyboard Enter and this click
 share one launch path (`App::picker_launch`), so they can't diverge.
 
+**[Amended 2026-07-27, SPEC-ux U20 — number accelerators]** The picker was
+arrows-and-Enter only: two or three keystrokes to pick from a list you can
+already see in full. Rows now lead with their accelerator —
+selected `"❯ {n} {item}"`, unselected `"  {n} {item}"` (`picker_row_body`,
+shared by both arms so they can differ only in style) — and `1`..`9`
+launches that row through the same `picker_launch` the click and Enter use.
+Items past the ninth get no digit (there is no tenth accelerator) but keep
+the three columns, so the ids stay aligned. A digit past the end of the
+list is ignored and the picker stays up: the rows carry their own numbers,
+so an out-of-range press is self-evidently one and needs no flash. The
+accelerator is also on the hint bar (`1..9 launch`) — an accelerator
+nothing advertises is one nobody presses, which is what "unhinted `j/k`"
+already cost this dialog.
+
 ### C15 — Help overlay
 
 **Current:** `render.rs:194–237` — Double/Cyan; keys Yellow BOLD, desc Gray.
@@ -702,6 +736,43 @@ is 22 rows; 20 content + 2 border = 22 — the overlay fits exactly with zero
 slack. The current list is 14 rows (`render.rs:301–316`) + 6 = 20. Any future
 chord must merge into an existing row (the `Alt+t / Alt+1..9` idiom), never
 add a 21st.
+
+**[Amended 2026-07-27, SPEC-ux U23 — the overlay stops being keys-only]:**
+"pinned to the §8 key table" is superseded: the overlay is roost's one
+explain-itself surface, and it explained only the chords. It now ends with
+**three reference rows**, after `Alt+q` and in this order:
+
+| key column | description |
+|---|---|
+| `status` | `● working ◆ needs you ○ waiting · idle ✕ exited` |
+| `mouse` | `wheel scrolls · click focuses · drag selects` |
+| `Alt+click` | `open the URL under the pointer` |
+
+- **Why a legend at all:** `●◆○·✕` is the product's core language (C5) —
+  every badge, tab summary and feed line speaks it — and nothing anywhere
+  said what the symbols mean. The row's text is the C5 table itself, pinned
+  against the `theme::GLYPH_*` constants by
+  `help_legend_row_matches_the_theme_glyph_table`, so retheming a glyph
+  breaks a test instead of quietly leaving the overlay teaching a symbol
+  roost no longer draws.
+- **Why mouse rows:** wheel/click/drag/Alt+click were implemented, live, and
+  documented nowhere a user could reach. Alt+click gets its own row because
+  it is a *chord* — it belongs in a key column, not buried in prose.
+- **The ≤ 20 cap is unchanged and still binding.** The three rows are paid
+  for by merging three natural chord pairs into one row each — the same
+  `Alt+t / Alt+1..9` idiom the cap has always demanded: `Alt+s / Alt+o`
+  (split ops), `Alt+z / Alt+f` (the two view toggles), `Alt+w / Alt+u`
+  (close and its undo). 20 rows before, 20 rows after.
+- **Rejected: scrolling the overlay** (the U23 proposal's other option). It
+  would have bought unlimited rows at the cost of C15's "any key closes it"
+  — the dismiss rule would have to carve out arrow/PgUp/PgDn keys, so the
+  one modal you open when you are lost becomes the one modal with a
+  non-obvious way out. Merging keeps the overlay a single glance.
+- **New width rule (the merge's cost, made explicit):** the reference rows
+  are long, so `help_dialog_width(HELP_KEYS)` must stay **≤ 80** — the
+  80-col floor — or `centered_near` clamps and clips a description mid-word,
+  the exact failure the 2026-07-22 width amendment exists to prevent.
+  Pinned by `help_dialog_fits_the_eighty_column_floor`.
 
 ### C16 — Dead-pane overlay
 
@@ -856,6 +927,32 @@ extension events (`app.rs:1081`) or is polled from `StatusTracker`
 - Unit tests: ring cap eviction at 200; taxonomy hooks fire (status diff on
   tick, ctl entry on an audited control call, exit-suppression rule); the
   NeedsInput-line styling rule; offset clamping.
+
+**[Amended 2026-07-27, SPEC-ux U25 — entries are actionable]:** the feed
+told you what happened and then left you to go find it by hand, which for a
+fleet surface is half a feature.
+- **`FeedEntry` carries `pane: Option<PaneId>`** — the pane the line is
+  *about*. `Some` for `spawn`, `status` and `exit` (a dead pane is exactly
+  where you want to land); **`None`** for `close`/`reopened tab`/`ctl`: a
+  closed pane is gone and `Alt+u` is that line's recovery path, and a `ctl`
+  line is about a request, not a pane. The id is a jump target, not a
+  guarantee — ids are recycled (`next_pane_id` is a max+1), so Enter
+  re-checks the pane exists before moving.
+- **`Enter` focuses that pane** through `focus_attention_target` — the same
+  helper C19's ring uses — so a jump out of the feed switches tabs, expands
+  collapsed stacks and shows the float exactly like `Alt+a` does, and the
+  feed closes behind it. A line with no pane flashes `no pane on that
+  line`; a stale id flashes `that pane is gone`. Neither moves focus and
+  neither closes the overlay: a no-op you can see beats a silent one.
+- **The selected entry is the window's last row** — `offset` already means
+  "how many entries back from the newest", and `feed_window` ends at
+  `len − 1 − offset`, so the cursor the arrows move *is* the bottom visible
+  line. It is now marked: the row's leading column carries `❯` fg `ACCENT`
+  instead of a space (the C14 picker idiom, reused). Zero columns spent —
+  the leading space was already in the row rule — so `" HH:MM:SS  {text}"`
+  is otherwise untouched, `◆ ` prefix included.
+- Hint pairs per the C9 amendment; the arrows' label becomes `select`,
+  since with an actionable entry they move a cursor rather than a view.
 
 ### C21 — Pane zoom (Alt+z) — [Added 2026-07-22, fleet features]
 
@@ -1083,6 +1180,70 @@ reading order).
   · Esc exit`.
 - Unit tests: motion clamping; `0`/`$`; anchor toggle and extension;
   yank-with/without-selection; Esc clears; drag-replaces-keyboard-selection.
+
+**[Amended 2026-07-27, SPEC-ux U17 — the key set grows by four]:** "the
+brief's minimum, nothing more" is superseded. Copy mode was the one place a
+user goes to *do* something with an agent's output, and it could only be
+walked one cell at a time. Added:
+- **`V` — line select.** Selects the cursor's whole row: anchor
+  `(row, 0)`, cursor `(row, inner_width − 1)`, which the mode cursor also
+  moves to. Deliberately **absolute, not a toggle** like `v`: it always
+  (re)takes the current line, so pressing it again is idempotent and
+  `j`/`k` then extend by whole rows. `v` and `Esc` remain the ways to
+  clear. Rationale: "grab what the agent just said" is the gesture people
+  reach for first, and it should never need a clear-then-mark dance.
+- **`w` / `b` / `e` — word motions**, whitespace-delimited (vim's WORD, the
+  same tokenizer `find_url_at` uses, so `w` and Alt+click agree on where a
+  token starts). They walk **within the cursor's row only** and clamp at
+  both ends rather than wrapping onto a neighbour: the cursor lives in
+  visible-grid cell space, and a motion that silently changed rows would
+  break the selection model. Pure `word_forward`/`word_back`/`word_end`,
+  unit-tested at both clamps.
+- Motions extend an active selection under the existing uniform rule — no
+  new selection semantics.
+- The hint list and the `Alt+c` help row now name every one of these keys,
+  `0`/`$` included (C9 amendment above; C15/§8's row reads
+  `copy mode (hjkl w b e 0 $ v V y) / scroll mode`).
+
+**[Amended 2026-07-27, SPEC-ux U19 — `o` opens the URL under the cursor]:**
+copy mode gains one more key. Alt+click has always opened a URL, but no
+keyboard path opened one at all, so the single most common thing an agent
+prints — a link — was reachable only by leaving the keyboard. `o` looks up
+`App::url_at` at the cursor cell and, on a hit, stashes it in
+`pending_open` for the composition root to hand to the browser (core does
+no I/O — the same split `pending_yank` uses); on a miss it flashes
+`no URL under the cursor` rather than no-opping silently. Either way the
+mode stays open: opening a link is not a reason to lose your selection.
+Hint pair `o open`; help row `Alt+click / o`.
+
+### C24b — Mode entry chords toggle — [Added 2026-07-27, SPEC-ux U18]
+
+**Current:** `handle_mode_key` special-cases exactly one chord — C20's
+Alt+e closes the feed. Every other Alt chord resets `mode` to Normal and
+falls through to its global binding, so a mode's *own* entry chord
+re-enters it: Alt+c in copy mode discards the cursor and selection for a
+fresh one, Alt+PageUp in scroll mode snaps the view to the live tail and
+calls that scroll mode, Alt+? in Help closes and reopens the overlay.
+
+**Target:**
+- **A mode's own entry chord exits it.** The rule is universal, not a
+  per-mode carve-out: Alt+r / Alt+Shift+r (Rename), Alt+Enter (Picker),
+  Alt+PageUp (Scroll), Alt+c (Copy), Alt+? (Help), Alt+e (Feed).
+- **Derived from the binding table, not a copy of it.** The check runs the
+  incoming key through `input::translate` and compares the resulting
+  `Action` against `mode_entry_action(mode)`, so rebinding a chord moves
+  its toggle with it and the two can never disagree.
+- **Toggling off *is* exiting.** Both routes go through one `exit_mode`:
+  Scroll snaps `set_scrollback(0)`, Copy drops its selection, the rest just
+  return to Normal — identical to what that mode's `Esc` does, pinned by
+  `esc_and_the_entry_chord_leave_identical_state`.
+- **Nothing else changes.** A chord that is *not* the current mode's entry
+  chord still breaks out to its global binding, mode reset and U9's
+  scroll-snap (with its Alt+c exemption) included. The consumed toggle
+  returns `true`, so it is never re-dispatched.
+- Rename's toggle cancels (Esc semantics), discarding the buffer: an
+  explicit second Alt+r is a deliberate act, unlike U8's stray click, which
+  still may not throw unsaved text away.
 
 ### C25 — Canned layout cycle (Alt+g) — [Added 2026-07-22, fleet features]
 
@@ -1420,6 +1581,33 @@ assigned alphabetically — i before m, previous before next.
 The overlay (C15) absorbs both rows within its ≤20 cap by merging
 `Alt+c`/`Alt+PgUp` (the two look-back modes) and `Alt+/`/`Alt+?` (the two
 help toggles) into one row each.]
+
+[Amended 2026-07-27, SPEC-ux U23 — this table is no longer the *whole* help
+overlay. The chord rows below are still rendered verbatim and in order, but
+C15's row list now continues past row 21 with three reference rows (status
+legend, mouse verbs, `Alt+click`). Rows 5+6, 8+9 and 14+15 render merged
+(`Alt+s / Alt+o`, `Alt+z / Alt+f`, `Alt+w / Alt+u`) to pay for them within
+the ≤20 cap — the chords, their meanings and their contracts are unchanged;
+only the row packing is.]
+
+[Amended 2026-07-27, SPEC-ux U16 — rename-dialog editing keys. The dialog
+is a text field, and inside it `Ctrl+U` (clear the line) and `Ctrl+W` (rub
+out the last word) are edits, matching readline's `unix-line-discard` /
+`unix-word-rubout` — the two chords every line editor on the platform
+binds. Every *other* modified char is discarded rather than inserted: an
+unimplemented chord may never leave its letter in a name (live QA committed
+the title `abcwu`). These are mode-local, not entries in this table, and
+they do not consume the chords anywhere else. Cursor motion inside the
+buffer remains unimplemented.]
+
+[Amended 2026-07-27, SPEC-ux U17/U19/U20/U25 — mode-local keys. None of
+these are Alt chords, so none join the table above; they are listed here so
+the canonical page still knows they exist. Copy mode (C24): `w`/`b`/`e`
+word motions, `V` line select, `o` open the URL under the cursor, alongside
+the pre-existing `0`/`$`. Picker (C14): `1`..`9` launch that row. Feed
+(C20): `Enter` focuses the selected entry's pane, and the long-implemented
+`PgUp`/`PgDn`/`q` are now advertised. Every one of them is reachable from
+the C15 overlay's rows.]
 
 Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
 raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes

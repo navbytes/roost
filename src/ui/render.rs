@@ -87,10 +87,19 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'static str, &'static str)> {
     match mode {
         // C24: keyboard cursor + mouse drag, replacing the old two-pair list.
+        // [Amended, U17] The mode's whole vocabulary is now on the bar: the
+        // word motions and `V` are new, and `0`/`$` had existed since C24
+        // while appearing in no hint and no help row — a binding nothing
+        // advertises may as well not exist.
         Mode::Copy { .. } => vec![
             ("hjkl", "move"),
-            ("v", "mark"),
+            ("w/b/e", "word"),
+            ("0/$", "ends"),
+            ("v/V", "mark"),
             ("y/↵", "yank"),
+            // [Amended, U19] `o` opens the URL under the cursor — the
+            // keyboard half of Alt+click.
+            ("o", "open"),
             ("drag", "select"),
             ("Esc", "exit"),
         ],
@@ -102,11 +111,24 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
             };
             vec![("type", what), ("↵", "save"), ("Esc", "cancel")]
         }
-        Mode::Picker { .. } => vec![("↑↓", "choose"), ("↵", "open"), ("Esc", "cancel")],
+        // [Amended, U20] `1..9` joins the list: the accelerator is the
+        // fastest way through the picker and the only one that wasn't
+        // advertised anywhere.
+        Mode::Picker { .. } => {
+            vec![("↑↓", "choose"), ("↵", "open"), ("1..9", "launch"), ("Esc", "cancel")]
+        }
         Mode::Scroll { .. } => {
             vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
         }
-        Mode::Feed { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
+        // [Amended, U25] The feed's own working keys were missing from its
+        // own hint: PgUp/PgDn paged and `q` closed, both unadvertised, and
+        // Enter is new. A mode whose hint omits its keys has no keys.
+        Mode::Feed { .. } => vec![
+            ("↑↓", "select"),
+            ("PgUp/Dn", "page"),
+            ("↵", "go to pane"),
+            ("q/Esc", "close"),
+        ],
         Mode::Normal if focused_dead => {
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
         }
@@ -307,6 +329,18 @@ fn dialog_title(text: &'static str) -> Line<'static> {
     Line::from(text).style(Style::default().fg(theme::FG))
 }
 
+/// C14 (U20): a picker row's text after its 1-column marker — the `1..9`
+/// accelerator, then the adapter id. Items past the ninth get no digit
+/// (there is no `Alt+10`), but keep the columns so the ids stay aligned.
+/// Pure, and shared by the selected and unselected arms so the two rows can
+/// never differ by anything but their style.
+fn picker_row_body(i: usize, item: &str) -> String {
+    match i {
+        0..=8 => format!(" {} {item}", i + 1),
+        _ => format!("   {item}"),
+    }
+}
+
 /// The help overlay's key-column prefix: the key label left-padded to a
 /// fixed column so every description lines up underneath it. Shared by the
 /// width computation and the row-rendering loop below so they can't drift.
@@ -329,31 +363,56 @@ fn help_dialog_width(keys: &[(&str, &str)]) -> u16 {
 }
 
 /// C15/§8: the help overlay's row list — the canonical key table, verbatim
-/// and in this order (merged rows stay merged). Hard cap: ≤ 20 rows (§8;
-/// pinned by `help_keys_fit_the_cap`). The single source `draw_mode_overlay`
-/// reads for `Mode::Help`.
+/// and in this order (merged rows stay merged), then U23's three reference
+/// rows: the status-glyph legend and the two mouse rows. Hard cap: ≤ 20 rows
+/// (§8; pinned by `help_keys_fit_the_cap`). The single source
+/// `draw_mode_overlay` reads for `Mode::Help`.
+///
+/// U23 (2026-07-27): the overlay taught chords and nothing else — neither
+/// `●◆○·✕`, the product's core language, nor a word about the mouse, so the
+/// one surface that exists to explain roost explained only half of it. Paid
+/// for by merging three natural chord pairs (split/flip, zoom/float,
+/// close/undo) rather than by scrolling the overlay, so C15's "any key
+/// closes it" and the ≤20 cap both survive untouched.
 const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+n", "new shell pane (auto split)"),
-    ("Alt+Enter", "quick-launch picker (pi / claude / shell)"),
+    ("Alt+Enter", "quick-launch picker (pi / claude / shell; 1..9)"),
     ("Alt+←↓↑→ / hjkl", "move focus"),
     ("Alt+Shift+←↓↑→", "resize along that axis"),
-    ("Alt+s", "toggle split ⇄ stack"),
-    ("Alt+o", "flip split orientation"),
+    ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
     ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-    ("Alt+z", "zoom focused pane (view only; Alt+z again to exit)"),
-    ("Alt+f", "floating scratch shell (toggle)"),
+    ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
     ("Alt+a", "jump to next pane that needs you"),
     ("Alt+e", "activity feed (status / spawns / exits / control)"),
     ("Alt+r / Alt+Shift+r", "rename pane / tab"),
     ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
     ("Alt+i / Alt+m", "previous / next tab (wraps)"),
-    ("Alt+w", "close pane (confirm if busy / last)"),
-    ("Alt+u", "undo — reopen last closed pane/tab"),
-    ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
+    ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
+    ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
     ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
     ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
     ("Alt+q", "quit (workspace saved; sessions live)"),
+    ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
+    ("mouse", "wheel scrolls · click focuses · drag selects"),
+    ("Alt+click / o", "open the URL under the pointer / copy cursor"),
 ];
+
+/// U23: the legend row's text, rebuilt from the `theme` glyph constants —
+/// the same table C5 renders everywhere else. `HELP_KEYS` must spell a
+/// `const` literal, so this is the drift *check* rather than the source
+/// (`help_legend_row_matches_the_theme_glyph_table`), which is why it is
+/// test-only: retheming a glyph has to break a test, not the build.
+#[cfg(test)]
+fn status_legend_text() -> String {
+    format!(
+        "{} working {} needs you {} waiting {} idle {} exited",
+        theme::GLYPH_WORKING,
+        theme::GLYPH_NEEDS_INPUT,
+        theme::GLYPH_WAITING,
+        theme::GLYPH_IDLE,
+        theme::GLYPH_EXITED,
+    )
+}
 
 /// U8: the rect the current mode's modal dialog occupies on screen, or None
 /// when the mode draws none — the SAME geometry `draw_mode_overlay` paints
@@ -425,18 +484,21 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             // C14: selected row is a `❯`-prefix + FG item text, no bg
-            // highlight; unselected rows are plain MUTED text.
+            // highlight; unselected rows are plain MUTED text. [Amended,
+            // U20] Each row leads with its `1..9` accelerator — an
+            // accelerator nothing shows is one nobody presses.
             let lines: Vec<Line> = items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
+                    let body = picker_row_body(i, item);
                     if i == *selection {
                         Line::from(vec![
                             Span::styled(theme::PICKER_SELECTED.to_string(), Style::default().fg(theme::ACCENT)),
-                            Span::styled(format!(" {item}"), Style::default().fg(theme::FG)),
+                            Span::styled(body, Style::default().fg(theme::FG)),
                         ])
                     } else {
-                        Line::from(Span::styled(format!("  {item}"), Style::default().fg(theme::MUTED)))
+                        Line::from(Span::styled(format!(" {body}"), Style::default().fg(theme::MUTED)))
                     }
                 })
                 .collect();
@@ -500,11 +562,23 @@ fn draw_feed_entries(f: &mut Frame, feed: &VecDeque<FeedEntry>, offset: usize, i
         return;
     }
     let range = feed_window(feed.len(), offset, inner.height as usize);
+    // U25: the window's last row IS the selected entry (`feed_window` ends
+    // at `len - 1 - offset`), so the marker can't drift from what Enter acts
+    // on — both read the same number.
+    let selected = range.end.saturating_sub(1);
     let lines: Vec<Line> = feed
         .iter()
+        .enumerate()
         .skip(range.start)
         .take(range.len())
-        .map(|e| Line::from(feed_entry_spans(&local_hh_mm_ss(e.at), &e.text, e.needs_input)))
+        .map(|(i, e)| {
+            Line::from(feed_entry_spans(
+                &local_hh_mm_ss(e.at),
+                &e.text,
+                e.needs_input,
+                i == selected,
+            ))
+        })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -527,8 +601,21 @@ fn feed_window(len: usize, offset: usize, rows: usize) -> std::ops::Range<usize>
 /// except a status line landing on NeedsInput, which gets the `◆ ` ACCENT
 /// prefix and FG text (the one red in the feed, same meaning as everywhere,
 /// C5). Pure so the exception is unit-tested without a `Frame`.
-fn feed_entry_spans(hhmmss: &str, text: &str, needs_input: bool) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(format!(" {hhmmss}  "), Style::default().fg(theme::DIM))];
+/// [Amended, U25] The row's leading column is now a selection marker: `❯`
+/// ACCENT on the entry Enter would act on, a space on every other row. Same
+/// `❯` idiom as the picker (C14), and it costs no columns — the leading
+/// space was already there.
+fn feed_entry_spans(
+    hhmmss: &str,
+    text: &str,
+    needs_input: bool,
+    selected: bool,
+) -> Vec<Span<'static>> {
+    let marker = if selected { theme::PICKER_SELECTED } else { ' ' };
+    let mut spans = vec![
+        Span::styled(marker.to_string(), Style::default().fg(theme::ACCENT)),
+        Span::styled(format!("{hhmmss}  "), Style::default().fg(theme::DIM)),
+    ];
     if needs_input {
         spans.push(Span::styled(
             format!("{} ", theme::GLYPH_NEEDS_INPUT),
@@ -1588,11 +1675,33 @@ mod tests {
         assert_eq!(pairs[0], ("Alt+?", "keys"));
     }
 
+    /// C24's list as amended by U17: the mode's whole vocabulary, and it
+    /// still has to fit beside the right segment at the 100-col floor —
+    /// a hint bar that clips its own mode's keys is the U17 bug restated.
     #[test]
-    fn hint_pairs_copy_mode_is_the_c24_five_pair_list() {
+    fn hint_pairs_copy_mode_is_the_c24_list_amended_by_u17() {
+        let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false);
         assert_eq!(
-            hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false),
-            vec![("hjkl", "move"), ("v", "mark"), ("y/↵", "yank"), ("drag", "select"), ("Esc", "exit")],
+            pairs,
+            vec![
+                ("hjkl", "move"),
+                ("w/b/e", "word"),
+                ("0/$", "ends"),
+                ("v/V", "mark"),
+                ("y/↵", "yank"),
+                ("o", "open"),
+                ("drag", "select"),
+                ("Esc", "exit"),
+            ],
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        let right_w = super::hint_bar_right_spans(0, None, "COPY")
+            .iter()
+            .map(|s| mouse::display_width(&s.content))
+            .sum::<u16>();
+        assert!(
+            cols + right_w <= 100,
+            "copy hints are {cols} cols + {right_w} of segment; the 100-col floor clips them"
         );
     }
 
@@ -1745,11 +1854,20 @@ mod tests {
         assert_ne!(dead, hint_pairs(&Mode::Normal, false, false));
     }
 
+    /// C20's list as amended by U25: every key the feed actually answers to.
+    /// PgUp/PgDn and `q` worked all along while appearing nowhere, and Enter
+    /// is new — the whole point of making entries actionable is that people
+    /// can tell they are.
     #[test]
-    fn hint_pairs_feed_mode_is_scroll_and_close() {
+    fn hint_pairs_feed_mode_lists_every_key_the_feed_answers_to() {
         assert_eq!(
             hint_pairs(&Mode::Feed { offset: 0 }, false, false),
-            vec![("↑↓", "scroll"), ("Esc", "close")]
+            vec![
+                ("↑↓", "select"),
+                ("PgUp/Dn", "page"),
+                ("↵", "go to pane"),
+                ("q/Esc", "close"),
+            ],
         );
     }
 
@@ -1854,24 +1972,40 @@ mod tests {
 
     #[test]
     fn feed_entry_spans_default_styling_is_dim_timestamp_muted_text() {
-        let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false);
+        let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false, false);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, " 12:34:56  spawned shell (shell)");
-        assert_eq!(spans[0].style.fg, Some(theme::DIM));
-        assert_eq!(spans[1].style.fg, Some(theme::MUTED));
+        assert_eq!(spans[1].style.fg, Some(theme::DIM));
+        assert_eq!(spans[2].style.fg, Some(theme::MUTED));
+    }
+
+    /// U25: the selected entry — the one Enter acts on — is marked, in the
+    /// leading column the unselected rows spend on a space, so the row's
+    /// width and every column after it are unchanged.
+    #[test]
+    fn feed_entry_spans_mark_the_selected_row_without_shifting_a_column() {
+        let plain = feed_entry_spans("12:34:56", "spawned shell", false, false);
+        let picked = feed_entry_spans("12:34:56", "spawned shell", false, true);
+        let text = |v: &[super::Span]| -> String { v.iter().map(|s| s.content.as_ref()).collect() };
+        assert_eq!(text(&picked), format!("{}12:34:56  spawned shell", theme::PICKER_SELECTED));
+        assert_eq!(text(&plain).chars().count(), text(&picked).chars().count());
+        assert_eq!(picked[0].style.fg, Some(theme::ACCENT));
+        // Everything past the marker is styled identically either way.
+        assert_eq!(picked[1].style, plain[1].style);
+        assert_eq!(picked[2].style, plain[2].style);
     }
 
     #[test]
     fn feed_entry_spans_needs_input_line_gets_the_accent_diamond_and_fg_text() {
-        let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true);
+        let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true, false);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             text,
             format!(" 12:34:56  {} pi: waiting → needs you", theme::GLYPH_NEEDS_INPUT)
         );
-        assert_eq!(spans[0].style.fg, Some(theme::DIM));
-        assert_eq!(spans[1].style.fg, Some(theme::ACCENT));
-        assert_eq!(spans[2].style.fg, Some(theme::FG));
+        assert_eq!(spans[1].style.fg, Some(theme::DIM));
+        assert_eq!(spans[2].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[3].style.fg, Some(theme::FG));
     }
 
     #[test]
@@ -1898,32 +2032,97 @@ mod tests {
         // reach chords (2026-07-27): the tab row gained Alt+0 and a
         // previous/next row joined it, paid for by merging Alt+/ and Alt+?
         // into one row so the ≤20 cap still holds. Wording matches §8.
+        // U23 (2026-07-27): three more merges (s/o, z/f, w/u) buy the three
+        // reference rows that close the table — the status legend and the
+        // two mouse rows.
         assert_eq!(
             HELP_KEYS,
             &[
                 ("Alt+n", "new shell pane (auto split)"),
-                ("Alt+Enter", "quick-launch picker (pi / claude / shell)"),
+                ("Alt+Enter", "quick-launch picker (pi / claude / shell; 1..9)"),
                 ("Alt+←↓↑→ / hjkl", "move focus"),
                 ("Alt+Shift+←↓↑→", "resize along that axis"),
-                ("Alt+s", "toggle split ⇄ stack"),
-                ("Alt+o", "flip split orientation"),
+                ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
                 ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-                ("Alt+z", "zoom focused pane (view only; Alt+z again to exit)"),
-                ("Alt+f", "floating scratch shell (toggle)"),
+                ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
                 ("Alt+a", "jump to next pane that needs you"),
                 ("Alt+e", "activity feed (status / spawns / exits / control)"),
                 ("Alt+r / Alt+Shift+r", "rename pane / tab"),
                 ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
                 ("Alt+i / Alt+m", "previous / next tab (wraps)"),
-                ("Alt+w", "close pane (confirm if busy / last)"),
-                ("Alt+u", "undo — reopen last closed pane/tab"),
-                ("Alt+c / Alt+PgUp", "copy mode (hjkl+v+y, or drag) / scroll mode"),
+                ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
+                ("Alt+c / Alt+PgUp", "copy mode (hjkl w b e 0 $ v V y o) / scroll mode"),
                 ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
                 ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
                 ("Alt+q", "quit (workspace saved; sessions live)"),
+                ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
+                ("mouse", "wheel scrolls · click focuses · drag selects"),
+                ("Alt+click / o", "open the URL under the pointer / copy cursor"),
             ],
         );
         assert_eq!(HELP_KEYS.len(), 20);
+    }
+
+    /// U23: the legend is the C5 glyph table, not a hand-copied lookalike —
+    /// retheming a glyph must break this, not silently leave the overlay
+    /// teaching a symbol roost no longer draws.
+    #[test]
+    fn help_legend_row_matches_the_theme_glyph_table() {
+        let (key, desc) = HELP_KEYS
+            .iter()
+            .find(|(k, _)| *k == "status")
+            .copied()
+            .expect("the overlay carries a status-glyph legend row");
+        assert_eq!(key, "status");
+        assert_eq!(desc, super::status_legend_text());
+        // The two glyphs the live-QA drive greps the frame for.
+        assert!(desc.contains(theme::GLYPH_WORKING) && desc.contains(theme::GLYPH_EXITED));
+    }
+
+    /// U20: the picker's accelerator has to be visible to be pressed, and
+    /// both row styles must agree on where the id starts (the marker column
+    /// is the only difference between them).
+    #[test]
+    fn picker_rows_lead_with_their_number_accelerator() {
+        assert_eq!(super::picker_row_body(0, "pi"), " 1 pi");
+        assert_eq!(super::picker_row_body(2, "shell"), " 3 shell");
+        // Past the ninth there is no accelerator, but the id stays aligned.
+        assert_eq!(super::picker_row_body(9, "x"), "   x");
+        assert_eq!(
+            super::picker_row_body(9, "x").chars().count(),
+            super::picker_row_body(0, "x").chars().count(),
+        );
+    }
+
+    /// U20: the accelerator is on the hint bar too — a key you can only
+    /// find by reading the source is not a feature.
+    #[test]
+    fn hint_pairs_picker_advertises_the_number_accelerators() {
+        assert_eq!(
+            hint_pairs(&Mode::Picker { selection: 0 }, false, false),
+            vec![("↑↓", "choose"), ("↵", "open"), ("1..9", "launch"), ("Esc", "cancel")],
+        );
+    }
+
+    /// U23: the overlay documents the mouse — the wheel, click-to-focus,
+    /// drag-select and the Alt+click URL verb, which had lived only in the
+    /// source until now.
+    #[test]
+    fn help_rows_document_every_mouse_verb() {
+        let text = HELP_KEYS.iter().map(|(k, d)| format!("{k} {d}")).collect::<Vec<_>>().join("\n");
+        for token in ["mouse", "wheel", "click", "drag", "Alt+click", "URL"] {
+            assert!(text.contains(token), "the help overlay must mention {token:?}");
+        }
+    }
+
+    /// C15 (amended U23): the overlay may never be wider than the 80-col
+    /// floor — `centered_near` would clamp it to the screen and clip a
+    /// description mid-word, the exact failure the width rule exists to
+    /// stop. The three reference rows are long; this is their guard rail.
+    #[test]
+    fn help_dialog_fits_the_eighty_column_floor() {
+        let w = help_dialog_width(HELP_KEYS);
+        assert!(w <= 80, "help overlay is {w} cols wide; the 80-col floor would clip it");
     }
 
     // -- C24 keyboard copy cursor ----------------------------------------------
