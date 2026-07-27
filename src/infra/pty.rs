@@ -31,6 +31,17 @@ const HOST_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
 /// a pane can't push a megabyte through roost's own stdout.
 const HOST_NOTIFY_CAP: usize = 200;
 
+/// P3: largest OSC 52 payload roost relays to the host, in base64
+/// characters (~75 KB of decoded text). Generous for any real "copy this
+/// file/diff" action; bounded so a pane can't push arbitrary volume through
+/// roost's own stdout. tmux caps the same path for the same reason.
+const OSC52_PAYLOAD_CAP: usize = 100_000;
+
+/// P3: the selection targets xterm defines for OSC 52 — clipboard, primary,
+/// secondary, select, and cut-buffers 0–7. Anything outside this set is not
+/// a selection roost will name in a sequence it writes to its own terminal.
+const OSC52_SELECTIONS: &str = "cpqs01234567";
+
 /// P2/P3: make text safe to embed in a sequence roost writes to its OWN
 /// terminal. A pane's payload is untrusted: left alone, an embedded ESC/BEL/
 /// ST could close roost's sequence early and have the rest interpreted as
@@ -62,6 +73,41 @@ fn host_notify_bytes(
     let mut out = Vec::with_capacity(body.len() + 5);
     out.extend_from_slice(b"\x1b]9;");
     out.extend_from_slice(body.as_bytes());
+    out.push(0x07);
+    Some(out)
+}
+
+/// P3: the OSC 52 roost relays to its own terminal for a pane's clipboard
+/// write, or `None` when the write must be dropped.
+///
+/// Two gates, both about roost's terminal rather than the pane's intent:
+/// * the payload must be *actual base64* (`A–Z a–z 0–9 + / =`) and within
+///   `cap` — a payload carrying ESC/BEL would close roost's own sequence
+///   early and have its tail read as host commands, and an unbounded one is
+///   a pane pushing arbitrary volume through roost's stdout;
+/// * the selection must name xterm's real targets, for the same reason.
+///
+/// A rejected write is dropped in silence: the pane already believes it
+/// copied (the lie SPEC-ux U14 documents), and roost has no channel to
+/// correct it — a rejected relay is logged at the parser boundary, and the
+/// dropped case is only reachable by a payload that isn't a clipboard write
+/// in the first place.
+fn host_clipboard_bytes(selection: &str, payload_base64: &str, cap: usize) -> Option<Vec<u8>> {
+    if payload_base64.len() > cap {
+        return None;
+    }
+    if !payload_base64.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)) {
+        return None;
+    }
+    let sel: String = selection.chars().filter(|c| OSC52_SELECTIONS.contains(*c)).collect();
+    if sel.len() != selection.chars().count() {
+        return None; // a selection field carrying anything else
+    }
+    let mut out = Vec::with_capacity(payload_base64.len() + sel.len() + 6);
+    out.extend_from_slice(b"\x1b]52;");
+    out.extend_from_slice(sel.as_bytes());
+    out.push(b';');
+    out.extend_from_slice(payload_base64.as_bytes());
     out.push(0x07);
     Some(out)
 }
@@ -207,11 +253,23 @@ impl PtyPane {
                 self.effects.notifications.push(text);
                 self.queue_host_notify(&body);
             }
-            // Declared by the W3 effects surface, routed by the items that
-            // own them: P3 (clipboard forwarding) and P7 (cursor fidelity).
-            // Spelled out rather than swallowed by a catch-all so the
-            // compiler keeps pointing at this match until they land.
-            vt100::Effect::Osc52Write { .. } | vt100::Effect::CursorShape(_) => {}
+            // P3: an app inside the pane set the clipboard. roost's own copy
+            // mode already proves the host OSC 52 path works; forward the
+            // pane's write down it so "copied" stops being a lie for inner
+            // apps too (the other half of SPEC-ux U14). Reads never arrive
+            // here — the parser refuses to surface them at all.
+            vt100::Effect::Osc52Write { selection, payload_base64 } => {
+                if let Some(bytes) =
+                    host_clipboard_bytes(&selection, &payload_base64, OSC52_PAYLOAD_CAP)
+                {
+                    self.effects.host_writes.extend_from_slice(&bytes);
+                }
+            }
+            // Declared by the W3 effects surface, routed by the item that
+            // owns it: P7 (cursor fidelity). Spelled out rather than
+            // swallowed by a catch-all so the compiler keeps pointing at
+            // this match until it lands.
+            vt100::Effect::CursorShape(_) => {}
         }
     }
 
@@ -582,9 +640,9 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_selection, host_notify_bytes, sanitize_for_host, scrub_host_identity,
-        sync_presented, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL,
-        SYNC_STALE_CAP,
+        extract_selection, host_clipboard_bytes, host_notify_bytes, sanitize_for_host,
+        scrub_host_identity, sync_presented, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP,
+        HOST_NOTIFY_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -709,6 +767,34 @@ mod tests {
         assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
         // The first notification of a pane's life is never rate-limited.
         assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+    }
+
+    /// P3: a pane's clipboard write is relayed verbatim to the host — and
+    /// only when it really is a clipboard write.
+    #[test]
+    fn host_clipboard_relays_writes_and_refuses_anything_else() {
+        let cap = OSC52_PAYLOAD_CAP;
+        let emit = |sel: &str, payload: &str| host_clipboard_bytes(sel, payload, cap);
+
+        // Verbatim relay, every xterm selection target.
+        assert_eq!(emit("c", "aGk=").unwrap(), b"\x1b]52;c;aGk=\x07".to_vec());
+        assert_eq!(emit("cp", "aGk=").unwrap(), b"\x1b]52;cp;aGk=\x07".to_vec());
+        assert_eq!(emit("7", "aGk=").unwrap(), b"\x1b]52;7;aGk=\x07".to_vec());
+        // An empty payload is xterm's "clear", and a legitimate write.
+        assert_eq!(emit("c", "").unwrap(), b"\x1b]52;c;\x07".to_vec());
+        // A payload right at the cap still goes; one byte over does not.
+        assert!(emit("c", &"A".repeat(cap)).is_some());
+        assert!(emit("c", &"A".repeat(cap + 1)).is_none());
+
+        // Not base64 ⇒ not a clipboard write. Critically, a payload that
+        // could close roost's own sequence and repaint the user's terminal.
+        for hostile in ["aGk=\x07\x1b]0;PWNED\x07", "hi there", "a;b", "\x1b[2J"] {
+            assert!(emit("c", hostile).is_none(), "must refuse {hostile:?}");
+        }
+        // Same for a selection field that isn't one.
+        for sel in ["c\x07x", "clipboard", "c;p"] {
+            assert!(emit(sel, "aGk=").is_none(), "must refuse selection {sel:?}");
+        }
     }
 
     /// P2/P3 share the sanitizer; pin that it keeps ordinary text intact.

@@ -1889,6 +1889,24 @@ impl vte::Perform for Screen {
                     self.effects.push(Effect::Notify { title, body });
                 }
             }
+            // roost: OSC 52 clipboard, `52 ; <selection> ; <payload>`
+            // (SPEC-parity P3). Writes are surfaced; a *read* request
+            // (payload `?`, or a truncated sequence with no payload field
+            // at all) never is — answering one would hand the application
+            // the host clipboard's contents, which is a paste-theft vector,
+            // so the effect it would need simply does not exist.
+            (Some(&b"52"), Some(sel)) => {
+                let payload_base64 = osc_join(params.get(2..).unwrap_or(&[]));
+                if params.len() < 3 || payload_base64 == "?" {
+                    log::debug!("dropped OSC 52 clipboard read request");
+                } else {
+                    self.effects.push(Effect::Osc52Write {
+                        selection: std::string::String::from_utf8_lossy(sel)
+                            .into_owned(),
+                        payload_base64,
+                    });
+                }
+            }
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
@@ -2197,6 +2215,59 @@ mod roost_tests {
         assert!(p.take_effects().is_empty(), "draining takes them");
         // The screen itself is untouched by the notification traffic.
         assert!(p.screen().contents().contains("between"));
+    }
+
+    // -- OSC 52 clipboard (SPEC-parity P3) --------------------------------
+
+    fn osc52(selection: &str, payload: &str) -> crate::Effect {
+        crate::Effect::Osc52Write {
+            selection: selection.to_string(),
+            payload_base64: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn osc52_writes_become_effects_with_selection_and_payload_intact() {
+        let cases: &[(&[u8], crate::Effect)] = &[
+            // The canonical form: base64 "hi" into the clipboard selection.
+            (b"\x1b]52;c;aGk=\x07", osc52("c", "aGk=")),
+            // ST-terminated, and a multi-selection target (clipboard+primary).
+            (b"\x1b]52;cp;aGk=\x1b\\", osc52("cp", "aGk=")),
+            // Empty selection means "the default" — passed through as-is.
+            (b"\x1b]52;;aGk=\x07", osc52("", "aGk=")),
+            // An empty payload is xterm's "clear the clipboard", a write.
+            (b"\x1b]52;c;\x07", osc52("c", "")),
+        ];
+        for (bytes, want) in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert_eq!(
+                p.take_effects(),
+                vec![want.clone()],
+                "input {:?}",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn osc52_read_requests_are_dropped_not_surfaced() {
+        // Answering a read hands the application the host clipboard —
+        // paste theft. There is deliberately no effect that could carry it.
+        let cases: &[&[u8]] = &[
+            b"\x1b]52;c;?\x07",  // the standard read
+            b"\x1b]52;p;?\x1b\\", // primary selection read
+            b"\x1b]52;c\x07",    // truncated: no payload field at all
+        ];
+        for bytes in cases {
+            let mut p = parser();
+            p.process(bytes);
+            assert!(
+                p.take_effects().is_empty(),
+                "input {:?} must never surface",
+                std::string::String::from_utf8_lossy(bytes)
+            );
+        }
     }
 
     #[test]

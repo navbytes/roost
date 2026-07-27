@@ -102,7 +102,21 @@ attention path as a bell (badge ◆ + notifier), and (b) is optionally
 re-emitted to the host terminal so native desktop notifications fire.
 OSC 9;4 progress may be surfaced later (badge percentage) — out of scope here.
 
-### P3 · CONFIRMED · High — inner-app OSC 52 clipboard writes are discarded
+### P3 · FIXED (this branch) · High — inner-app OSC 52 clipboard writes are discarded
+*Fixed: the vendored parser surfaces `52;<sel>;<base64>` as
+`Effect::Osc52Write` and refuses to surface reads (`52;<sel>;?`, or a
+truncated sequence with no payload) at all — the effect that would carry one
+does not exist, so no future call site can accidentally answer a paste-theft
+probe. `PtyPane` relays writes to the host through the same queued
+between-draws path as P2, capped at 100 KB of base64 and validated to be
+actual base64 with a real xterm selection target — a payload carrying ESC/BEL
+would otherwise close roost's own sequence and repaint the user's terminal.
+roost's own copy-mode OSC 52 path is untouched. e2e
+`tests/pane_clipboard.rs`: `ESC ]52` absent from the whole host capture
+before, `ESC ]52;c;cm9vc3Q= BEL` verbatim after, and a `?` read still absent.*
+***Deferred:** an over-cap or malformed write is dropped silently — roost has
+no channel to tell the pane its "copied" was a lie (SPEC-ux U14's other
+half), and a user-facing flash for it is not in this wave.*
 An app inside a pane (Claude Code copy action — claude-code #63054/#63061,
 nvim+osc52, anything over SSH) sets the clipboard via `OSC 52`; roost eats it;
 the app reports "copied" over an unchanged clipboard — the same lie SPEC-ux
@@ -112,11 +126,13 @@ appeared anywhere in the captured host stream.
 **Contract:** forward pane OSC 52 writes to the host terminal (roost's own
 copy mode already proves the host path works); optionally cap size and gate
 reads (`52;c;?`) which are a paste-theft vector — forward writes, refuse reads.
-*Cross-reference (2026-07-27): the other half of this lie is closed — SPEC-ux
-U14 shipped, so roost's own copy path now reports which channel actually took
-the text (`copied N chars` / `copied N chars (OSC 52)` / `copy failed`) instead
-of flashing success unconditionally. P3, the inner-app half, stays CONFIRMED
-and open: a pane's own OSC 52 is still eaten.*
+*Cross-reference (2026-07-27): both halves of this lie are now closed on this
+branch. SPEC-ux U14 made roost's own copy path report which channel actually
+took the text (`copied N chars` / `copied N chars (OSC 52)` / `copy failed`)
+instead of flashing success unconditionally; P3 (above) stopped roost eating
+a pane's own OSC 52. The two paths stay independent — U14's outcome flash
+runs at the copy call site, while a pane's write is relayed through the
+queued host-write channel W3 introduced.*
 
 ### P4 · FIXED (this branch) · High — the terminal-query black hole
 *Fixed per Appendix B: `src/infra/queries.rs` (kitty.rs generalized) answers
