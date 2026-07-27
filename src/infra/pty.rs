@@ -148,6 +148,11 @@ impl PaneBackend for PtyPane {
         self.parser.screen().application_cursor()
     }
 
+    fn bracketed_paste(&self) -> bool {
+        // vt100 tracks mode 2004 (`CSI ?2004h` / `?2004l`) the same way.
+        self.parser.screen().bracketed_paste()
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         // Typing means "I'm back" — snap to the live tail.
         if self.scroll != 0 {

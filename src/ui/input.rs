@@ -158,6 +158,30 @@ pub fn kitty_upgrade(key: KeyEvent, bytes: Vec<u8>, kitty: bool) -> Vec<u8> {
 /// `kitty_upgrade` on the way out.
 fn encode_key(key: KeyEvent) -> InputResult {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // xterm's modifier parameter: 1 + shift(1) + alt(2) + ctrl(4). Alt never
+    // reaches this table — in cooked routing it's roost's own chord layer,
+    // and `encode_raw` strips it before delegating here — so only Shift/Ctrl
+    // contribute (xm ∈ {1, 2, 5, 6}). xm == 1 means "unmodified": the keys
+    // below keep their bare legacy forms, exactly as a terminal would.
+    let xm = 1 + u8::from(shift) + 4 * u8::from(ctrl);
+    // A navigation key with xm > 1 becomes `CSI 1;xm X` (Ctrl+Right = word
+    // jump in readline/zsh arrives as `\x1b[1;5C`); a tilde key becomes
+    // `CSI n;xm ~`. Unmodified, both keep the exact bytes they always sent.
+    let csi = |ch: u8| -> Vec<u8> {
+        if xm == 1 {
+            vec![0x1b, b'[', ch]
+        } else {
+            format!("\x1b[1;{xm}{}", ch as char).into_bytes()
+        }
+    };
+    let tilde = |n: u8| -> Vec<u8> {
+        if xm == 1 {
+            format!("\x1b[{n}~").into_bytes()
+        } else {
+            format!("\x1b[{n};{xm}~").into_bytes()
+        }
+    };
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) if ctrl => {
             let b = (c.to_ascii_lowercase() as u8) & 0x1f;
@@ -182,16 +206,31 @@ fn encode_key(key: KeyEvent) -> InputResult {
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Up => csi(b'A'),
+        KeyCode::Down => csi(b'B'),
+        KeyCode::Right => csi(b'C'),
+        KeyCode::Left => csi(b'D'),
+        KeyCode::Home => csi(b'H'),
+        KeyCode::End => csi(b'F'),
+        KeyCode::PageUp => tilde(5),
+        KeyCode::PageDown => tilde(6),
+        KeyCode::Delete => tilde(3),
+        KeyCode::Insert => tilde(2),
+        // xterm PC-style function keys. F1–F4 are SS3 P/Q/R/S bare (that's
+        // independent of DECCKM) and `CSI 1;xm P` … modified; F5–F12 are
+        // tilde keys with xterm's historical gaps (no 16~, no 22~).
+        KeyCode::F(n @ 1..=4) => {
+            let ch = b'P' + (n - 1);
+            if xm == 1 {
+                vec![0x1b, b'O', ch]
+            } else {
+                format!("\x1b[1;{xm}{}", ch as char).into_bytes()
+            }
+        }
+        KeyCode::F(n @ 5..=12) => {
+            const TILDE: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+            tilde(TILDE[n as usize - 5])
+        }
         _ => return InputResult::Ignore,
     };
     InputResult::Forward(bytes)
@@ -410,6 +449,71 @@ mod tests {
         assert_eq!(app_cursor_upgrade(shift_up, b"\x1b[A".to_vec(), true), b"\x1b[A");
         assert_eq!(app_cursor_upgrade(plain(KeyCode::Char('a')), b"a".to_vec(), true), b"a");
         assert_eq!(app_cursor_upgrade(plain(KeyCode::PageUp), b"\x1b[5~".to_vec(), true), b"\x1b[5~");
+    }
+
+    #[test]
+    fn function_keys_encode_xterm_pc_style() {
+        let cases: &[(u8, &[u8])] = &[
+            (1, b"\x1bOP"),
+            (2, b"\x1bOQ"),
+            (3, b"\x1bOR"),
+            (4, b"\x1bOS"),
+            (5, b"\x1b[15~"),
+            (6, b"\x1b[17~"),
+            (7, b"\x1b[18~"),
+            (8, b"\x1b[19~"),
+            (9, b"\x1b[20~"),
+            (10, b"\x1b[21~"),
+            (11, b"\x1b[23~"),
+            (12, b"\x1b[24~"),
+        ];
+        for (n, want) in cases {
+            match translate(plain(KeyCode::F(*n))) {
+                InputResult::Forward(b) => assert_eq!(&b, want, "F{n}"),
+                _ => panic!("F{n} must forward, not be swallowed"),
+            }
+        }
+        // Modified F-keys follow the same xterm modifier scheme as nav keys.
+        match translate(KeyEvent::new(KeyCode::F(1), KeyModifiers::SHIFT)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b[1;2P"),
+            _ => panic!(),
+        }
+        match translate(KeyEvent::new(KeyCode::F(5), KeyModifiers::CONTROL)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b[15;5~"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn modified_navigation_keys_carry_xterm_modifiers() {
+        let ctrl = KeyModifiers::CONTROL;
+        let shift = KeyModifiers::SHIFT;
+        let cases: &[(KeyCode, KeyModifiers, &[u8])] = &[
+            (KeyCode::Right, ctrl, b"\x1b[1;5C"), // readline/zsh word jump
+            (KeyCode::Left, ctrl, b"\x1b[1;5D"),
+            (KeyCode::Up, shift, b"\x1b[1;2A"),
+            (KeyCode::Down, shift.union(ctrl), b"\x1b[1;6B"),
+            (KeyCode::Home, ctrl, b"\x1b[1;5H"),
+            (KeyCode::End, shift, b"\x1b[1;2F"),
+            (KeyCode::Delete, ctrl, b"\x1b[3;5~"),
+            (KeyCode::Insert, shift, b"\x1b[2;2~"),
+            (KeyCode::PageUp, shift, b"\x1b[5;2~"),
+            (KeyCode::PageDown, ctrl, b"\x1b[6;5~"),
+        ];
+        for (code, mods, want) in cases {
+            match translate(KeyEvent::new(*code, *mods)) {
+                InputResult::Forward(b) => assert_eq!(&b, want, "{code:?} + {mods:?}"),
+                _ => panic!("{code:?} + {mods:?} must forward"),
+            }
+        }
+        // Unmodified forms keep the exact bytes they always sent.
+        match translate(plain(KeyCode::Right)) {
+            InputResult::Forward(b) => assert_eq!(b, b"\x1b[C"),
+            _ => panic!(),
+        }
+        // And a modified cursor key never takes the DECCKM SS3 form.
+        let ctrl_right = KeyEvent::new(KeyCode::Right, ctrl);
+        assert_eq!(app_cursor_upgrade(ctrl_right, b"\x1b[1;5C".to_vec(), true), b"\x1b[1;5C");
     }
 
     #[test]

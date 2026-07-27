@@ -21,6 +21,15 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 export default function (pi: ExtensionAPI) {
   const pane = process.env.ROOST_PANE;
   if (!pane) return; // not running inside roost
+  // Only the pane's own interactive agent may report. The ROOST_* env is
+  // inherited by every descendant process, so a *nested* pi — a subagent, a
+  // one-shot `pi -p` run by a tool of the pane's agent (pi's or even a
+  // claude pane's) — would otherwise authenticate as the pane, overwrite its
+  // persisted session id with its own (breaking resume into the wrong
+  // conversation) and flap its status. Nested invocations run with piped
+  // stdio; the agent that owns the pane — including one launched by hand in
+  // a shell pane — runs on the pane's tty.
+  if (!process.stdout.isTTY) return;
   // Per-pane secret roost issued to this child; every message must carry it or
   // roost drops it (prevents one pane spoofing another over the shared socket).
   const token = process.env.ROOST_TOKEN ?? "";

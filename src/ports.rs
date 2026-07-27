@@ -87,6 +87,14 @@ pub trait PaneBackend: Sized {
         false
     }
 
+    /// Has the pane's app switched on bracketed paste (mode 2004 — modern
+    /// shells, editors, and agent TUIs all do)? When true, roost delivers a
+    /// host paste wrapped in the `ESC[200~`/`ESC[201~` guards the app asked
+    /// for, so pasted newlines insert instead of submitting. Default false.
+    fn bracketed_paste(&self) -> bool {
+        false
+    }
+
     /// Terminal grid for rendering. `None` for fakes (renderer must cope).
     fn screen(&self) -> Option<&vt100::Screen>;
     fn set_scrollback(&mut self, lines: usize);
@@ -159,6 +167,9 @@ pub mod fakes {
         /// Test knob: simulates the pane's app having enabled DECCKM
         /// application cursor keys mode.
         pub app_cursor: bool,
+        /// Test knob: simulates the pane's app having enabled bracketed
+        /// paste (mode 2004).
+        pub bracketed: bool,
     }
 
     impl PaneBackend for FakePane {
@@ -185,6 +196,7 @@ pub mod fakes {
                 all_text: String::new(),
                 fail_write: false,
                 app_cursor: false,
+                bracketed: false,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -228,6 +240,9 @@ pub mod fakes {
         }
         fn app_cursor_keys(&self) -> bool {
             self.app_cursor
+        }
+        fn bracketed_paste(&self) -> bool {
+            self.bracketed
         }
         fn screen(&self) -> Option<&vt100::Screen> {
             None
