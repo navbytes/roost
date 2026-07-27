@@ -561,8 +561,15 @@ impl<B: PaneBackend> App<B> {
                 }
                 // C20: spawn owns the pane's "birth" line — diff_statuses
                 // deliberately stays silent on a pane's first observation.
-                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
-                self.push_feed(format!("spawned {name} ({})", spec.adapter), false);
+                // U2: led by the pane id; the `({adapter})` suffix only for
+                // titled panes (an untitled display name already ends in the
+                // adapter/cwd tag — C4's no-dup rule).
+                let label = format!("{id} {}", display_name_of(spec));
+                let line = match &spec.title {
+                    Some(_) => format!("spawned {label} ({})", spec.adapter),
+                    None => format!("spawned {label}"),
+                };
+                self.push_feed(line, false);
             }
             Err(e) => {
                 self.dead.insert(id, e.to_string());
@@ -627,12 +634,14 @@ impl<B: PaneBackend> App<B> {
                 None => {} // first observation: spawn owns birth, no line
                 Some(old) if old == status || status == AgentStatus::Exited => {}
                 Some(old) => {
-                    let name = self
-                        .find_spec(id)
-                        .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
-                        .unwrap_or_else(|| format!("pane {id}"));
-                    let text =
-                        format!("{name}: {} → {}", state_word(old), state_word(status));
+                    // U2: `{id} {display_name}`, so four identical shells'
+                    // transitions stop being indistinguishable in the feed.
+                    let text = format!(
+                        "{}: {} → {}",
+                        self.feed_label(id),
+                        state_word(old),
+                        state_word(status)
+                    );
                     self.push_feed(text, status == AgentStatus::NeedsInput);
                 }
             }
@@ -708,6 +717,25 @@ impl<B: PaneBackend> App<B> {
             .flat_map(|t| t.panes.values())
             .filter_map(|s| s.session.clone())
             .collect()
+    }
+
+    /// U2: the one display name for pane `id`, used by every fleet surface
+    /// (corner badge, collapsed rows, feed lines, notifications, flashes) —
+    /// `display_name_of` on its spec, else `pane {id}` for a pane that no
+    /// longer has one (already closed by the time an event lands).
+    pub fn display_name(&self, id: PaneId) -> String {
+        self.find_spec(id).map(display_name_of).unwrap_or_else(|| format!("pane {id}"))
+    }
+
+    /// U2: a feed entry's pane label — the pane id (the join key for
+    /// `roost send <id>`) ahead of the display name, e.g. `3 shell · roost`.
+    /// Falls back to `pane {id}` when the spec is already gone (no bare
+    /// doubled `{id} pane {id}`).
+    fn feed_label(&self, id: PaneId) -> String {
+        match self.find_spec(id) {
+            Some(spec) => format!("{id} {}", display_name_of(spec)),
+            None => format!("pane {id}"),
+        }
     }
 
     /// C22: learns the float — `send`/`read`/badges/rename/respawn by id
@@ -1380,8 +1408,10 @@ impl<B: PaneBackend> App<B> {
             self.spawn_active_tab();
         } else if !empty {
             if let Some(spec) = spec {
-                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
-                self.push_feed(format!("closed {name}"), false);
+                // U2: the spec is already out of the tree, so the label is
+                // built from the captured spec (same `{id} {name}` shape as
+                // `feed_label`).
+                self.push_feed(format!("closed {id} {}", display_name_of(&spec)), false);
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
@@ -1431,16 +1461,16 @@ impl<B: PaneBackend> App<B> {
         // workspace by the time its process EOFs — that Exit is expected, so
         // there's no name to report: nothing to log (the close hook already
         // did) or notify about.
-        let spec = self.find_spec(id)?;
-        let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+        self.find_spec(id)?;
         // C20: the feed logs every exit, focused pane included — unlike the
         // notification below, which only nudges for an *unfocused* pane (a
-        // focused one's recovery hint is already on screen).
-        self.push_feed(format!("{name} exited"), false);
+        // focused one's recovery hint is already on screen). U2: the feed
+        // line carries the pane id; the notification the display name.
+        self.push_feed(format!("{} exited", self.feed_label(id)), false);
         if id == self.focused {
             return None;
         }
-        Some(format!("{name} exited"))
+        Some(format!("{} exited", self.display_name(id)))
     }
 
     /// Session id reported exactly by an agent-side extension.
@@ -1464,11 +1494,9 @@ impl<B: PaneBackend> App<B> {
             _ => false,
         };
         if became_needy && id != self.focused {
-            let name = self
-                .find_spec(id)
-                .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
-                .unwrap_or_else(|| format!("pane {id}"));
-            Some(format!("{name} is waiting for you"))
+            // U2: the shared display name — "shell · roost is waiting for
+            // you", not an anonymous "shell is waiting for you".
+            Some(format!("{} is waiting for you", self.display_name(id)))
         } else {
             None
         }
@@ -1828,18 +1856,21 @@ impl<B: PaneBackend> App<B> {
                 self.spawn_active_tab();
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.push_feed(format!("reopened tab {name}"), false);
-                self.set_flash("reopened tab");
+                // U2: flashes name what they acted on.
+                self.set_flash(format!("reopened tab {name}"));
             }
             Closed::Pane { tab_index, spec } => {
                 // Restore into its original tab if it still exists, else the
                 // active one; split the focused pane and reuse the saved spec
                 // (session id preserved ⇒ the agent resumes).
-                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.restore_pane(spec);
-                self.push_feed(format!("reopened {name}"), false);
-                self.set_flash("reopened pane");
+                // U2: `restore_pane` allocated the pane's NEW id and left it
+                // focused — label with that id, not the closed one's.
+                let restored = self.focused;
+                self.push_feed(format!("reopened {}", self.feed_label(restored)), false);
+                self.set_flash(format!("reopened {}", self.display_name(restored)));
             }
         }
     }
@@ -1987,9 +2018,10 @@ impl<B: PaneBackend> App<B> {
         if (is_busy || would_quit) && !armed {
             self.confirm_close = Some(Instant::now());
             let msg = if would_quit {
-                "last pane — Alt+w again to quit roost"
+                "last pane — Alt+w again to quit roost".to_string()
             } else {
-                "agent busy — Alt+w again to close"
+                // U2: name which agent the close would interrupt.
+                format!("{} busy — Alt+w again to close", self.display_name(id))
             };
             self.set_confirm_flash(msg);
             return;
@@ -2599,6 +2631,25 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
+}
+
+/// U2: a pane's display name from its spec — the custom title when set, else
+/// `{adapter} · {cwd-tag}` (the cwd's last path component), so a bank of
+/// untitled shells on the same adapter stays tellable apart. This was the
+/// corner badge's render-local fallback; it's shared here so the badge, the
+/// collapsed rows, the feed, notifications, and flashes can never drift
+/// apart on what a pane is called (C4's amendment points at this fn).
+pub fn display_name_of(spec: &PaneSpec) -> String {
+    if let Some(title) = &spec.title {
+        return title.clone();
+    }
+    let cwd_tag = spec
+        .cwd
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| format!(" · {f}"))
+        .unwrap_or_default();
+    format!("{}{cwd_tag}", spec.adapter)
 }
 
 /// U12's busy predicate, shared by the Alt+w and Alt+q destructive guards so
@@ -3367,13 +3418,15 @@ mod tests {
 
         let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
         assert_eq!(transitions.len(), 2, "{:?}", app.feed());
-        let alpha = transitions.iter().find(|e| e.text.starts_with("alpha:")).expect("alpha's own line");
-        assert_eq!(alpha.text, "alpha: idle → working");
+        // U2: transition lines lead with the pane id, then the display name.
+        let alpha = transitions.iter().find(|e| e.text.contains("alpha:")).expect("alpha's own line");
+        assert_eq!(alpha.text, format!("{a} alpha: idle → working"));
         assert!(!alpha.needs_input);
-        let charlie = transitions.iter().find(|e| e.text.starts_with("charlie:")).expect("charlie's own line");
-        assert_eq!(charlie.text, "charlie: idle → needs you");
+        let charlie =
+            transitions.iter().find(|e| e.text.contains("charlie:")).expect("charlie's own line");
+        assert_eq!(charlie.text, format!("{c} charlie: idle → needs you"));
         assert!(charlie.needs_input);
-        assert!(!transitions.iter().any(|e| e.text.starts_with("bravo:")), "unchanged pane must stay silent");
+        assert!(!transitions.iter().any(|e| e.text.contains("bravo:")), "unchanged pane must stay silent");
 
         // The broadcast's one ctl line must still be exactly one — untouched by the tick.
         assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
@@ -4583,13 +4636,86 @@ mod tests {
         assert!(line.needs_input);
     }
 
+    // -- U2 pane identity ---------------------------------------------------
+
     #[test]
-    fn spawn_pushes_a_feed_line_naming_the_adapter() {
+    fn display_name_of_is_title_else_adapter_cwd_tag() {
+        let mut spec = PaneSpec {
+            adapter: "pi".into(),
+            cwd: PathBuf::from("/home/user/rqa-work"),
+            session: None,
+            title: None,
+            spawned_by: None,
+        };
+        assert_eq!(display_name_of(&spec), "pi · rqa-work");
+        spec.title = Some("worker1".into());
+        assert_eq!(display_name_of(&spec), "worker1");
+        // A cwd with no final component (e.g. `/`) degrades to the bare
+        // adapter, no dangling separator.
+        spec.title = None;
+        spec.cwd = PathBuf::from("/");
+        assert_eq!(display_name_of(&spec), "pi");
+    }
+
+    #[test]
+    fn display_name_and_feed_label_fall_back_for_a_specless_pane() {
+        let (app, _) = mk_app(shell_ws());
+        assert_eq!(app.display_name(99), "pane 99");
+        assert_eq!(app.feed_label(99), "pane 99"); // not "99 pane 99"
+        assert_eq!(app.feed_label(1), "1 shell · tmp");
+    }
+
+    #[test]
+    fn notifications_carry_the_display_name() {
+        // U2: "shell · tmp is waiting for you", not an anonymous "shell is
+        // waiting for you" — same helper as every other fleet surface.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2, so pane 1 is unfocused
+        let msg = app.on_status(1, AgentStatus::NeedsInput);
+        assert_eq!(msg.as_deref(), Some("shell · tmp is waiting for you"));
+    }
+
+    #[test]
+    fn exit_feed_line_has_the_id_and_the_exit_notification_the_name() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2
+        let msg = app.on_pty_exit(1); // unfocused pane exits ⇒ notification
+        assert_eq!(msg.as_deref(), Some("shell · tmp exited"));
+        assert_eq!(app.feed().back().unwrap().text, "1 shell · tmp exited");
+    }
+
+    #[test]
+    fn reopened_flash_and_feed_line_name_the_restored_pane() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
+        app.apply(Action::ClosePane); // quiet pane closes instantly
+        app.apply(Action::Undo);
+        let restored = app.focused;
+        assert_eq!(app.flash(), Some("reopened shell · tmp"));
+        assert_eq!(app.feed().back().unwrap().text, format!("reopened {restored} shell · tmp"));
+    }
+
+    #[test]
+    fn busy_close_confirm_flash_names_the_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // Working
+        app.apply(Action::ClosePane); // armed
+        assert_eq!(app.flash(), Some("shell · tmp busy — Alt+w again to close"));
+    }
+
+    #[test]
+    fn spawn_pushes_a_feed_line_with_id_and_display_name() {
+        // U2: `spawned {id} {display_name}` — the untitled display name
+        // (`shell · tmp`) already ends in the adapter/cwd tag, so no
+        // `(shell)` suffix (C4's no-dup rule); titled spawns keep it (see
+        // the float's `spawned N scratch (shell)` test).
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
         let last = app.feed().back().expect("spawn should push a feed line");
-        assert!(last.text.starts_with("spawned "), "{}", last.text);
-        assert!(last.text.contains("(shell)"), "{}", last.text);
+        assert_eq!(last.text, format!("spawned {id} shell · tmp"));
         assert!(!last.needs_input);
     }
 
@@ -4768,8 +4894,8 @@ mod tests {
         assert_eq!(spec.title.as_deref(), Some("scratch"));
         assert!(app.runtimes.contains_key(&float_id), "must actually spawn");
         // Free correctness via the shared spawn_pane hook (no float-specific
-        // feed code needed).
-        assert!(app.feed().back().unwrap().text.starts_with("spawned scratch (shell)"));
+        // feed code needed). U2: titled spawn = `spawned {id} {title} ({adapter})`.
+        assert_eq!(app.feed().back().unwrap().text, format!("spawned {float_id} scratch (shell)"));
     }
 
     #[test]

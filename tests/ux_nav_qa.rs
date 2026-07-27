@@ -503,10 +503,17 @@ fn ux_navigation_session() {
     // feed overlay + wheel-under test
     h.write_bytes(&alt(b'e'));
     let s = frame(&mut h, "F2: activity feed");
-    qa.obs(&format!(
-        "feed entries name unnamed panes ambiguously ('shell' with no id): {}",
-        s.matches("shell").count() > 2
-    ));
+    // U2: feed entries must carry `{id} {display_name}` — a digit-led label
+    // ahead of the name — instead of four indistinguishable bare "shell"
+    // lines. Scoped to real feed rows (they contain a transition arrow or
+    // "spawned"): the corner badges elsewhere on the frame also carry the
+    // cwd tag and (post-U2) ids, and must not satisfy this check for the
+    // feed.
+    let ided = s.lines().any(|l| {
+        (l.contains('→') || l.contains("spawned"))
+            && (0..10).any(|d| l.contains(&format!(" {d} shell")))
+    });
+    qa.check(ided, "feed entries carry the pane id and disambiguated name (U2)");
     let pane_before = cli_list(&sd);
     h.write_bytes(&sgr_wheel_up(30, 10)); // wheel over the pane area, feed open
     h.write_bytes(&sgr_wheel_up(30, 10));

@@ -10,7 +10,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
-    feed_overlay_size, picker_items, App, FeedEntry, Mode, RenameTarget, Selection, TabSummary,
+    display_name_of, feed_overlay_size, picker_items, App, FeedEntry, Mode, RenameTarget,
+    Selection, TabSummary,
 };
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, PaneRect};
@@ -631,15 +632,17 @@ fn collapsed_name_color(status: AgentStatus) -> Color {
     }
 }
 
-/// C4's no-dup rule: an untitled pane's display `name` is the adapter/cwd
-/// fallback built in `draw_pane`, which already embeds the adapter — so
-/// appending `· {adapter}` again would duplicate it ("pi · repo · pi"). Only
-/// a custom title needs the adapter spelled out separately.
-fn badge_text(name: &str, adapter: &str, has_title: bool) -> String {
+/// C4 (amended, U2): the badge leads with the pane id — the join key for
+/// `roost send <id>`, which previously appeared nowhere in the TUI. No-dup
+/// rule: an untitled pane's display `name` (`display_name_of`) already
+/// embeds the adapter — so appending `· {adapter}` again would duplicate it
+/// ("pi · repo · pi"). Only a custom title needs the adapter spelled out
+/// separately.
+fn badge_text(id: layout::PaneId, name: &str, adapter: &str, has_title: bool) -> String {
     if has_title {
-        format!("{name} · {adapter}")
+        format!("{id} {name} · {adapter}")
     } else {
-        name.to_string()
+        format!("{id} {name}")
     }
 }
 
@@ -707,23 +710,18 @@ fn draw_pane<B: PaneBackend>(
             .unwrap_or(AgentStatus::Exited);
         let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
         let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
-        // Untitled panes on the same adapter are otherwise indistinguishable
-        // (same badge, same idle glyph) — tag them with the cwd's last path
-        // component so a bank of fresh shells can be told apart at a glance.
-        let name = spec.and_then(|s| s.title.clone()).unwrap_or_else(|| {
-            let cwd_tag = spec
-                .and_then(|s| s.cwd.file_name())
-                .and_then(|f| f.to_str())
-                .map(|f| format!(" · {f}"))
-                .unwrap_or_default();
-            format!("{adapter}{cwd_tag}")
-        });
+        // U2: the shared display name (title, else `adapter · cwd-tag`) —
+        // one helper for every fleet surface, `core::app::display_name_of`,
+        // so the badge can never drift from what the feed/notifications
+        // call the same pane. Untitled panes on the same adapter are
+        // otherwise indistinguishable at a glance.
+        let name = spec.map(display_name_of).unwrap_or_else(|| "?".into());
         (status, name, has_title, adapter)
     };
 
     if pr.collapsed {
         // C8: collapsed stack member — a single-row fleet-view bar.
-        draw_collapsed_row(f, pr.rect, focused, status, &name, &adapter, has_title, raw, pulse);
+        draw_collapsed_row(f, pr.rect, focused, status, pr.id, &name, &adapter, has_title, raw, pulse);
         return;
     }
 
@@ -781,7 +779,7 @@ fn draw_pane<B: PaneBackend>(
     // accepted by design now that identity lives here, not a border title.
     let (glyph, glyph_base, pulses) = theme::status_style(status);
     let glyph_color = if pulses { pulse } else { glyph_base };
-    let text = badge_text(&name, &adapter, has_title);
+    let text = badge_text(pr.id, &name, &adapter, has_title);
     if let Some((rect, spans)) = corner_badge(inner, &text, raw, glyph, glyph_color) {
         f.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
@@ -824,16 +822,20 @@ fn paint_stack_edge(f: &mut Frame, rect: Rect) {
 }
 
 /// C8: one collapsed stack row's spans for the given width — marker, status
-/// glyph, and name on the left; the right-aligned dim "adapter · word"
-/// segment when there's room. The right segment drops first when narrow; if
-/// even the left side overflows, the name (last in `left`) is what visibly
-/// clips. Pure so the width-shedding order is unit-testable.
+/// glyph, pane id, and name on the left; the right-aligned dim
+/// "adapter · word" segment when there's room. The right segment drops first
+/// when narrow; if even the left side overflows, the id+name (last in
+/// `left`) is what visibly clips. Pure so the width-shedding order is
+/// unit-testable.
+///
+/// [Amended, U2] the left side carries the pane id ahead of the name — the
+/// `roost send <id>` join key, same placement as the corner badge (C4).
 ///
 /// No-dup rule (C8, mirrors C4's `badge_text`): an untitled pane's `name` is
-/// the adapter/cwd fallback built in `draw_pane`, which already embeds the
-/// adapter — so the right segment drops the `{adapter} · ` prefix and shows
-/// just the state word (`has_title` false). A custom title doesn't embed the
-/// adapter, so titled panes keep the full `"{adapter} · {word}"`.
+/// the shared `display_name_of` fallback, which already embeds the adapter —
+/// so the right segment drops the `{adapter} · ` prefix and shows just the
+/// state word (`has_title` false). A custom title doesn't embed the adapter,
+/// so titled panes keep the full `"{adapter} · {word}"`.
 /// [Amended, C23] a raw pane's right segment gains a `raw · ` prefix ahead
 /// of whichever of the above it would otherwise be.
 #[allow(clippy::too_many_arguments)]
@@ -841,6 +843,7 @@ fn collapsed_row_spans(
     width: u16,
     focused: bool,
     status: AgentStatus,
+    id: layout::PaneId,
     name: &str,
     adapter: &str,
     has_title: bool,
@@ -856,7 +859,7 @@ fn collapsed_row_spans(
     let left: Vec<(String, Style)> = vec![
         marker,
         (glyph.to_string(), Style::default().fg(glyph_color)),
-        (format!(" {name}"), Style::default().fg(collapsed_name_color(status))),
+        (format!(" {id} {name}"), Style::default().fg(collapsed_name_color(status))),
     ];
     let left_w: u16 = left.iter().map(|(t, _)| mouse::display_width(t)).sum();
     let right = if has_title {
@@ -887,6 +890,7 @@ fn draw_collapsed_row(
     rect: Rect,
     focused: bool,
     status: AgentStatus,
+    id: layout::PaneId,
     name: &str,
     adapter: &str,
     has_title: bool,
@@ -895,7 +899,8 @@ fn draw_collapsed_row(
 ) {
     let (_, base, pulses) = theme::status_style(status);
     let glyph_color = if pulses { pulse } else { base };
-    let spans = collapsed_row_spans(rect.width, focused, status, name, adapter, has_title, raw, glyph_color);
+    let spans =
+        collapsed_row_spans(rect.width, focused, status, id, name, adapter, has_title, raw, glyph_color);
     let style = if focused { Style::default().bg(theme::RULE) } else { Style::default() };
     f.render_widget(Paragraph::new(Line::from(spans)).style(style), rect);
 }
@@ -1108,10 +1113,11 @@ mod tests {
 
     #[test]
     fn badge_no_dup_rule_pins_c4() {
+        // U2: every badge leads with the pane id (the `roost send <id>` key).
         // Untitled fallback name already embeds the adapter — don't repeat it.
-        assert_eq!(badge_text("pi · myrepo", "pi", false), "pi · myrepo");
+        assert_eq!(badge_text(3, "pi · myrepo", "pi", false), "3 pi · myrepo");
         // A custom title doesn't embed the adapter — spell it out.
-        assert_eq!(badge_text("worker1", "claude", true), "worker1 · claude");
+        assert_eq!(badge_text(7, "worker1", "claude", true), "7 worker1 · claude");
     }
 
     #[test]
@@ -1207,7 +1213,7 @@ mod tests {
     #[test]
     fn collapsed_row_shows_right_segment_when_it_fits() {
         let spans =
-            collapsed_row_spans(40, false, AgentStatus::Working, "pi", "pi", true, false, theme::ACCENT);
+            collapsed_row_spans(40, false, AgentStatus::Working, 2, "pi", "pi", true, false, theme::ACCENT);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("pi · working "));
     }
@@ -1219,7 +1225,7 @@ mod tests {
         // right segment is the bare state word — "your turn", not
         // "shell · your turn". [DESIGN-ui.md amended 2026-07-22, ux #3.]
         let spans =
-            collapsed_row_spans(40, false, AgentStatus::Waiting, "shell", "shell", false, false, theme::FG);
+            collapsed_row_spans(40, false, AgentStatus::Waiting, 2, "shell", "shell", false, false, theme::FG);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("your turn "));
         assert!(!text.contains("shell ·"));
@@ -1228,12 +1234,13 @@ mod tests {
     #[test]
     fn collapsed_row_drops_right_segment_before_clipping_name() {
         let name = "a-fairly-long-pane-name";
-        // Exactly enough room for "marker + glyph + ' ' + name", nothing more.
-        let left_w = 3 + name.chars().count() as u16;
+        // Exactly enough room for "marker + glyph + ' ' + id + ' ' + name",
+        // nothing more (U2: the id rides with the name on the left).
+        let left_w = 5 + name.chars().count() as u16;
         let spans =
-            collapsed_row_spans(left_w, false, AgentStatus::Idle, name, "shell", true, false, theme::DIM);
+            collapsed_row_spans(left_w, false, AgentStatus::Idle, 2, name, "shell", true, false, theme::DIM);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, format!(" · {name}"));
+        assert_eq!(text, format!(" · 2 {name}"));
         assert!(!text.contains("shell"));
     }
 
@@ -1243,6 +1250,7 @@ mod tests {
             4,
             false,
             AgentStatus::Waiting,
+            2,
             "a-very-long-pane-name",
             "shell",
             true,
@@ -1257,19 +1265,19 @@ mod tests {
     #[test]
     fn collapsed_row_focused_marker_is_accent() {
         let spans =
-            collapsed_row_spans(40, true, AgentStatus::Working, "pi", "pi", true, false, theme::ACCENT);
+            collapsed_row_spans(40, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::ACCENT);
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
     }
 
     #[test]
     fn collapsed_row_raw_gains_the_prefix_ahead_of_the_usual_right_segment() {
-        let titled = collapsed_row_spans(60, false, AgentStatus::Working, "pi", "pi", true, true, theme::ACCENT);
+        let titled = collapsed_row_spans(60, false, AgentStatus::Working, 2, "pi", "pi", true, true, theme::ACCENT);
         let text: String = titled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · pi · working "), "{text}");
 
         let untitled =
-            collapsed_row_spans(60, false, AgentStatus::Waiting, "shell", "shell", false, true, theme::FG);
+            collapsed_row_spans(60, false, AgentStatus::Waiting, 2, "shell", "shell", false, true, theme::FG);
         let text: String = untitled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · your turn "), "{text}");
     }
@@ -1519,7 +1527,7 @@ mod tests {
     #[test]
     fn collapsed_row_spans_at_zero_width_is_empty_not_panicking() {
         let spans =
-            collapsed_row_spans(0, true, AgentStatus::Working, "pi", "pi", true, false, theme::ACCENT);
+            collapsed_row_spans(0, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::ACCENT);
         assert!(spans.is_empty());
     }
 

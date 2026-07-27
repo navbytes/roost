@@ -211,11 +211,17 @@ with tests `:530–555`.
 - Drawn on **every** non-collapsed pane, focused included (suppression branch
   at `:376` removed; occlusion of the inner app's top-right cells is accepted
   by design).
-- Content: `"{name} · {adapter} {glyph}"` — where `name` is the existing
-  display name (`title`, else the adapter/cwd fallback built at `:304–312`).
-  When the pane has no custom title the fallback already contains the adapter,
-  so the ` · {adapter}` segment is skipped (no `"pi · repo · pi"` dup):
-  untitled badge = `"{name} {glyph}"`.
+- Content: `"{id} {name} · {adapter} {glyph}"` — where `name` is the display
+  name (`title`, else the adapter/cwd fallback). When the pane has no custom
+  title the fallback already contains the adapter, so the ` · {adapter}`
+  segment is skipped (no `"pi · repo · pi"` dup): untitled badge =
+  `"{id} {name} {glyph}"`.
+  **[Amended 2026-07-27, SPEC-ux U2]:** the badge leads with the pane id —
+  the join key for `roost send <id>`, which previously appeared nowhere in
+  the TUI — and the display-name fallback is no longer render-local: it is
+  the shared `core::app::display_name_of` (title, else
+  `{adapter} · {cwd-tag}`), the one helper every fleet surface (badge,
+  collapsed rows, feed, notifications, flashes) derives pane identity from.
 - Style: text fg `MUTED`; glyph fg per C5 status colors, pulsing when Working.
 - Geometry: top row of the pane's inner area, right-aligned, one column of
   right breathing room — `corner_badge()` clipping behavior and its tests
@@ -299,11 +305,13 @@ nothing announces "this region is a stack".
 focused = Black on status-color bg, unfocused = status-color fg.
 
 **Target:**
-- Row format: `marker(1) + glyph(1) + " " + name + fill + "{adapter} · {word}" + " "`
+- Row format: `marker(1) + glyph(1) + " " + id + " " + name + fill + "{adapter} · {word}" + " "`
   with the right segment right-aligned.
+  **[Amended 2026-07-27, SPEC-ux U2]:** the pane id rides ahead of the name
+  (same placement as the C4 badge), styled with the name.
   - marker: `▎` fg `ACCENT` when the row is the focused pane, else `" "`.
   - glyph: per C5 (color + Working pulse).
-  - name fg by state: Working/NeedsInput → `FG`; Waiting/Idle → `MUTED`;
+  - id + name fg by state: Working/NeedsInput → `FG`; Waiting/Idle → `MUTED`;
     Exited → `DIM`.
   - right segment fg `DIM`; adapter = `PaneSpec.adapter`.
   - No-dup rule (mirrors C4): when the pane is untitled and its fallback name
@@ -567,11 +575,19 @@ extension events (`app.rs:1081`) or is polled from `StatusTracker`
 
   | kind | hook (single source each — no double reporting) | line text |
   |---|---|---|
-  | `status` | the 2 s housekeeping tick (`app.rs:367–401`): App keeps a last-known-status map for spawned panes and diffs it *before* the `pending_detect` early-return. One source for all transitions — extension-pushed and heuristic alike — at ≤ 2 s granularity (documented; a sub-2 s flicker may be missed, accepted). Transitions **to Exited are suppressed** here (the `exit` hook owns that). First observation of a pane logs nothing (`spawn` owns birth). | `{name}: {old} → {new}` using the C8 state words |
-  | `spawn` | `spawn_pane` success (`app.rs:349–358`) — covers Alt+n, picker, control spawn/fork, undo restore, respawn | `spawned {name} ({adapter})` |
-  | `close` | `close_pane_id` (`app.rs:980–1028`) and `undo_close` (`app.rs:1309–1333`) | `closed {name}` / `closed tab {name}` / `reopened {name}` / `reopened tab {name}` |
-  | `exit` | `on_pty_exit` (`app.rs:1058–1072`), including the focused pane (unlike the notifier) | `{name} exited` |
+  | `status` | the 2 s housekeeping tick (`app.rs:367–401`): App keeps a last-known-status map for spawned panes and diffs it *before* the `pending_detect` early-return. One source for all transitions — extension-pushed and heuristic alike — at ≤ 2 s granularity (documented; a sub-2 s flicker may be missed, accepted). Transitions **to Exited are suppressed** here (the `exit` hook owns that). First observation of a pane logs nothing (`spawn` owns birth). | `{id} {name}: {old} → {new}` using the C8 state words |
+  | `spawn` | `spawn_pane` success (`app.rs:349–358`) — covers Alt+n, picker, control spawn/fork, undo restore, respawn | `spawned {id} {name} ({adapter})`, the suffix for titled panes only |
+  | `close` | `close_pane_id` (`app.rs:980–1028`) and `undo_close` (`app.rs:1309–1333`) | `closed {id} {name}` / `closed tab {name}` / `reopened {id} {name}` / `reopened tab {name}` |
+  | `exit` | `on_pty_exit` (`app.rs:1058–1072`), including the focused pane (unlike the notifier) | `{id} {name} exited` |
   | `ctl` | `audit()` (`app.rs:675–695`, becomes `&mut self`; feed push happens even when there is no socket dir) — the same sanitized `method_summary` as `control.log`, so broadcast and every other control verb land here with zero extra code | `ctl {principal}: {summary} → {ok\|err}` |
+
+  **[Amended 2026-07-27, SPEC-ux U2]:** pane-referencing lines lead with the
+  pane id (`{id} {name}` via `App::feed_label`; `name` is the shared
+  `display_name_of`) — live QA showed four identical `shell: working → your
+  turn` lines with no way to tell the panes apart. Tab lines keep the tab
+  name; a pane whose spec is already gone degrades to `pane {id}`. The
+  spawn line's `({adapter})` suffix is titled-only (C4's no-dup rule — an
+  untitled display name already ends in the adapter/cwd tag).
 
   Session-detection events are deliberately excluded (noise, not action).
 - **Geometry:** centered on `body_area()`;
@@ -751,9 +767,10 @@ can never see them.
   trap the user).
 - **Indication (must be visible on the pane even when unfocused):**
   - Corner badge (C4): the badge text gains a `raw` token —
-    titled: `"{name} · {adapter} · raw {glyph}"`, untitled:
-    `"{name} · raw {glyph}"` — the `raw` token fg `ACCENT_DIM` (the
-    "roost stepped back" color family, C11/C16).
+    titled: `"{id} {name} · {adapter} · raw {glyph}"`, untitled:
+    `"{id} {name} · raw {glyph}"` — the `raw` token fg `ACCENT_DIM` (the
+    "roost stepped back" color family, C11/C16). [Id prefix per C4's U2
+    amendment, 2026-07-27.]
   - Collapsed stack row (C8): right segment gains the prefix →
     `"raw · {word}"`.
   - Hint bar while a raw pane is focused and mode is Normal: mode word

@@ -37,7 +37,7 @@ NeedsInput` predicate, shared `is_busy`), flashing `N agent(s) busy — Alt+q
 again to quit` ("busy", matching the Alt+w flash family, since the guard
 covers ◆ too); a quiet fleet still quits on one press.
 
-### U2 · High · VERIFIED — panes have no identity on fleet surfaces
+### U2 · High · FIXED (this branch) — panes have no identity on fleet surfaces
 Live feed frame: `spawned shell (shell)` ×2 and `shell: working → your turn` ×4,
 indistinguishable; notifications say "shell is waiting for you"; the pane id —
 the join key for `roost send <id>` — appears nowhere in the TUI. The corner
@@ -46,6 +46,11 @@ notifications, and flashes don't use it.
 **Proposed contract:** one `display_name(id)` helper (title, else
 `adapter · cwd-tag`), used by feed lines, notifications, and flashes; pane id
 shown in the badge, collapsed rows, and feed entries.
+**Fixed:** the badge's fallback moved to a shared `core::app::display_name_of`
+(+ `App::display_name`/`feed_label`); feed lines lead with `{id} {name}`,
+notifications and pane-referencing flashes carry the display name, and the
+corner badge and collapsed rows lead with the pane id (C4/C8/C20 amended
+2026-07-27).
 
 ### U3 · High · VERIFIED — a scrolled pane looks live (and still pulses ●)
 Live frame E1: a wheel-scrolled pane frozen at old output shows no indicator
