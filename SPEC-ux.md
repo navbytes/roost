@@ -51,6 +51,12 @@ shown in the badge, collapsed rows, and feed entries.
 notifications and pane-referencing flashes carry the display name, and the
 corner badge and collapsed rows lead with the pane id (C4/C8/C20 amended
 2026-07-27).
+**Extended (SPEC-parity P6, same branch):** the chain is now explicit Alt+r
+title → the pane's **live OSC 0/2 title** → `adapter · cwd-tag`, resolved by
+`App::display_name` so every surface listed above inherits it; the live title
+is sanitized and bounded to 48 chars before the badge's own clipping. The
+same name is published to the host terminal as `roost · {focused pane}`
+(C4 amended again 2026-07-27).
 
 ### U3 · High · FIXED (this branch) — a scrolled pane looks live (and still pulses ●)
 Live frame E1: a wheel-scrolled pane frozen at old output shows no indicator

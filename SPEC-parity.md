@@ -173,7 +173,17 @@ expect. Interim: document the loss. Also fixes SPEC-ux U19's dependency on
 
 ## P1 — status, identity, input correctness
 
-### P6 · CONFIRMED · Med-High — pane OSC 0/2 titles invisible
+### P6 · FIXED (this branch) · Med-High — pane OSC 0/2 titles invisible
+*Fixed: `App::display_name`'s chain is now explicit Alt+r title → the pane's
+live `screen().title()` → `adapter · cwd-tag` (`display_name_live`), so the
+badge, collapsed rows, feed lines and notifications all adopt a pane's
+published title; it is sanitized and bounded to 48 chars before the badge's
+own width clipping. roost also publishes `OSC 2 ; roost · {focused pane}` to
+the host terminal on focus/title changes (throttled to 200 ms) and resets it
+to a plain `roost` on exit and in the panic hook. DESIGN-ui C4 and SPEC-ux U2
+amended 2026-07-27. e2e `tests/pane_titles.rs`: a pane's `OSC 2 ; TASK-X`
+never reached its badge before; after, the badge reads `1 TASK-X` and the
+host stream carries `ESC ]2;roost · TASK-X BEL` (plus the exit reset).*
 Claude Code continuously publishes `spinner + task` via OSC 0/2 (claude-code
 #17887/#52258) — the cheapest live fleet-status text there is. vt100 already
 parses and stores it; **zero** call sites read `screen().title()`; nothing

@@ -103,8 +103,22 @@ fn main() -> Result<()> {
     // (the panic hook already relies on exactly that).
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    reset_host_title();
     ratatui::restore();
     result
+}
+
+/// P6: put the host terminal's title back to a plain `roost` on the way out.
+/// While running, roost publishes `roost · <focused pane>`; leaving that
+/// behind would strand the user's tab under a pane name that no longer
+/// exists. (There is no "restore what was there before" — a terminal offers
+/// no way to read its own title back, so the honest reset is roost's own
+/// name, which is what the user launched.)
+fn reset_host_title() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b]2;roost\x07");
+    let _ = out.flush();
 }
 
 /// How long `main` waits synchronously for the keyboard-enhancement probe
@@ -154,6 +168,9 @@ fn install_panic_hook() {
             DisableBracketedPaste,
             DisableMouseCapture
         );
+        // P6: and the window title roost took over, so a crash doesn't
+        // strand the user's tab named after a pane that no longer exists.
+        reset_host_title();
         ratatui::restore();
         original(info);
     }));

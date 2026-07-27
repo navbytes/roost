@@ -22,6 +22,18 @@ use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// P6: how much of a pane's live OSC 0/2 title is adopted as its display
+/// name. Claude Code publishes `spinner + task` continuously, and a task
+/// line can be a paragraph; every fleet surface that shows a display name
+/// (badge, collapsed row, feed, notification, host title) needs a bound it
+/// can lay out against. The corner badge clips visually on top of this.
+const LIVE_TITLE_CAP: usize = 48;
+
+/// P6: minimum spacing between host-terminal title updates. An agent that
+/// republishes its OSC title on every spinner frame would otherwise have
+/// roost repaint the host's title bar ~30x a second.
+const HOST_TITLE_INTERVAL: Duration = Duration::from_millis(200);
+
 /// How long the "Alt keys aren't reaching roost" hint stays up on a fresh
 /// launch before we assume the user isn't going to press one / already saw it.
 const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
@@ -281,6 +293,12 @@ pub struct App<B: PaneBackend> {
     /// because host writes must land *between* frames, never inside one.
     /// Drained each loop iteration by `take_host_output`.
     host_out: Vec<u8>,
+    /// P6: the host terminal title roost last published, and when. The outer
+    /// tab/window title otherwise goes stale the moment roost starts — it
+    /// should read `roost · <focused pane>` and follow both focus moves and
+    /// the pane's own live OSC title.
+    host_title: String,
+    last_host_title: Option<Instant>,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -345,6 +363,8 @@ impl<B: PaneBackend> App<B> {
             tab_focus: HashSet::new(),
             pending_yank: None,
             host_out: Vec::new(),
+            host_title: String::new(),
+            last_host_title: None,
         };
         app.spawn_active_tab();
         app.focused = app.pane_order().first().copied().unwrap_or(0);
@@ -769,12 +789,28 @@ impl<B: PaneBackend> App<B> {
             .collect()
     }
 
-    /// U2: the one display name for pane `id`, used by every fleet surface
-    /// (corner badge, collapsed rows, feed lines, notifications, flashes) —
-    /// `display_name_of` on its spec, else `pane {id}` for a pane that no
-    /// longer has one (already closed by the time an event lands).
+    /// U2 (amended, P6): the one display name for pane `id`, used by every
+    /// fleet surface (corner badge, collapsed rows, feed lines,
+    /// notifications, flashes, and the host terminal's own title).
+    ///
+    /// The chain is: explicit Alt+r title → the pane's **live OSC 0/2
+    /// title** → `adapter · cwd-tag`. The live title is the cheapest fleet
+    /// status text there is — Claude Code publishes `spinner + task` through
+    /// it continuously — and vt100 has been storing it all along with zero
+    /// call sites reading it (P6). `pane {id}` for a pane that no longer has
+    /// a spec (already closed by the time an event lands).
     pub fn display_name(&self, id: PaneId) -> String {
-        self.find_spec(id).map(display_name_of).unwrap_or_else(|| format!("pane {id}"))
+        let Some(spec) = self.find_spec(id) else { return format!("pane {id}") };
+        display_name_live(spec, self.live_title(id).as_deref())
+    }
+
+    /// P6: the pane's current OSC 0/2 title, sanitized and bounded — `None`
+    /// when the pane has published none (or nothing usable). Split out so
+    /// the naming chain stays a pure function of (spec, live title).
+    fn live_title(&self, id: PaneId) -> Option<String> {
+        let raw = self.runtimes.get(&id)?.screen()?.title();
+        let title = sanitize_title(raw, LIVE_TITLE_CAP);
+        (!title.is_empty()).then_some(title)
     }
 
     /// U2: a feed entry's pane label — the pane id (the join key for
@@ -783,7 +819,9 @@ impl<B: PaneBackend> App<B> {
     /// doubled `{id} pane {id}`).
     fn feed_label(&self, id: PaneId) -> String {
         match self.find_spec(id) {
-            Some(spec) => format!("{id} {}", display_name_of(spec)),
+            // P6: through `display_name`, so a feed line names a pane by its
+            // live OSC title exactly like the badge does.
+            Some(_) => format!("{id} {}", self.display_name(id)),
             None => format!("pane {id}"),
         }
     }
@@ -1539,12 +1577,37 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// W3: drain the bytes roost owes the HOST terminal — pane OSC 9
-    /// notifications (P2) and OSC 52 clipboard writes (P3), already
-    /// rate-limited/capped/sanitized by the backend. The composition root
+    /// notifications (P2), OSC 52 clipboard writes (P3) and the window title
+    /// (P6), already rate-limited/capped/sanitized. The composition root
     /// writes these between draws; queueing them keeps core I/O-free and
     /// guarantees nothing lands in the middle of a frame.
     pub fn take_host_output(&mut self) -> Vec<u8> {
+        self.sync_host_title();
         std::mem::take(&mut self.host_out)
+    }
+
+    /// P6: keep the host terminal's title at `roost · {focused pane}`. Queues
+    /// an OSC 2 only when the text actually changes, and no more often than
+    /// `HOST_TITLE_INTERVAL` — an agent that republishes its OSC title on
+    /// every spinner frame would otherwise repaint the host title bar ~30x a
+    /// second. A change skipped by the throttle is picked up on the next
+    /// call, since the comparison is against what was last *published*.
+    fn sync_host_title(&mut self) {
+        if self.last_host_title.is_some_and(|t| t.elapsed() < HOST_TITLE_INTERVAL) {
+            return;
+        }
+        // `display_name` is already sanitized and bounded (`live_title`), and
+        // an Alt+r title comes from roost's own rename buffer — so nothing
+        // here can carry a control byte into the sequence.
+        let want = format!("roost · {}", self.display_name(self.focused));
+        if want == self.host_title {
+            return;
+        }
+        self.last_host_title = Some(Instant::now());
+        self.host_title = want;
+        self.host_out.extend_from_slice(b"\x1b]2;");
+        self.host_out.extend_from_slice(self.host_title.as_bytes());
+        self.host_out.push(0x07);
     }
 
     /// Returns a notification message when a *non-focused* pane exits — an
@@ -3020,8 +3083,23 @@ fn inner_dims(rect: Rect) -> (u16, u16) {
 /// collapsed rows, the feed, notifications, and flashes can never drift
 /// apart on what a pane is called (C4's amendment points at this fn).
 pub fn display_name_of(spec: &PaneSpec) -> String {
+    display_name_live(spec, None)
+}
+
+/// U2 + P6: the full naming chain as a pure function — explicit Alt+r title,
+/// else the pane's live OSC 0/2 title, else `{adapter} · {cwd-tag}` (the
+/// cwd's last path component, so a bank of untitled shells on the same
+/// adapter stays tellable apart).
+///
+/// The explicit title still wins: a name the user typed is a decision, and
+/// an app that repaints its OSC title every frame must not overwrite it.
+/// `live` is expected pre-sanitized and bounded (`App::live_title`).
+pub fn display_name_live(spec: &PaneSpec, live: Option<&str>) -> String {
     if let Some(title) = &spec.title {
         return title.clone();
+    }
+    if let Some(live) = live.filter(|t| !t.is_empty()) {
+        return live.to_string();
     }
     let cwd_tag = spec
         .cwd
@@ -3030,6 +3108,15 @@ pub fn display_name_of(spec: &PaneSpec) -> String {
         .map(|f| format!(" · {f}"))
         .unwrap_or_default();
     format!("{}{cwd_tag}", spec.adapter)
+}
+
+/// P6: a pane's OSC title is untrusted text bound for roost's chrome (and,
+/// for the focused pane, for a sequence roost writes to its own terminal).
+/// Drop control characters, collapse surrounding whitespace, and bound the
+/// length in characters — on char boundaries, so a multi-byte glyph is never
+/// split. Pure, so the bound is testable without a terminal.
+fn sanitize_title(raw: &str, cap: usize) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(cap).collect::<String>().trim().to_string()
 }
 
 /// U12's busy predicate, shared by the Alt+w and Alt+q destructive guards so
@@ -3161,8 +3248,9 @@ mod tests {
         };
         let msg = app.on_pty_output(1, b"whatever").expect("unfocused pane notifies");
         assert_eq!(msg, format!("{name}: NEEDS-YOU"));
-        assert_eq!(app.take_host_output(), b"\x1b]9;NEEDS-YOU\x07".to_vec());
-        assert!(app.take_host_output().is_empty(), "draining takes it");
+        // `contains`, not equality: the same queue also carries P6's host
+        // title, whose own gate is `host_title_follows_focus_and_live_title`.
+        assert!(host_contains(&mut app, b"\x1b]9;NEEDS-YOU\x07"));
 
         // The focused pane's notification still forwards to the host (the
         // app asked its terminal for it) but raises no roost-side nudge.
@@ -3171,7 +3259,15 @@ mod tests {
             host_writes: b"\x1b]9;also me\x07".to_vec(),
         };
         assert!(app.on_pty_output(2, b"x").is_none());
-        assert_eq!(app.take_host_output(), b"\x1b]9;also me\x07".to_vec());
+        assert!(host_contains(&mut app, b"\x1b]9;also me\x07"));
+        // Draining takes it: nothing is re-emitted on the next pass.
+        assert!(!host_contains(&mut app, b"\x1b]9;"));
+    }
+
+    /// Drain the host queue once and report whether it carried `needle`.
+    fn host_contains(app: &mut App<FakePane>, needle: &[u8]) -> bool {
+        let out = app.take_host_output();
+        out.windows(needle.len()).any(|w| w == needle)
     }
 
     /// P2: several notifications in one chunk — the newest is the one still
@@ -5600,6 +5696,98 @@ mod tests {
         spec.title = None;
         spec.cwd = PathBuf::from("/");
         assert_eq!(display_name_of(&spec), "pi");
+    }
+
+    /// P6: the amended chain — explicit Alt+r title beats the pane's live
+    /// OSC 0/2 title, which beats `adapter · cwd-tag`. The precedence is the
+    /// whole contract: an app repainting its title every frame must never
+    /// overwrite a name the user typed.
+    #[test]
+    fn display_name_chain_prefers_explicit_title_then_live_osc_title() {
+        let mut spec = PaneSpec {
+            adapter: "claude".into(),
+            cwd: PathBuf::from("/home/user/rqa-work"),
+            session: None,
+            title: None,
+            spawned_by: None,
+        };
+        // No title anywhere: the adapter/cwd fallback, unchanged.
+        assert_eq!(display_name_live(&spec, None), "claude · rqa-work");
+        // The pane publishes one: it wins over the fallback.
+        assert_eq!(display_name_live(&spec, Some("TASK-42 refactor")), "TASK-42 refactor");
+        // An empty live title is not a name — fall through.
+        assert_eq!(display_name_live(&spec, Some("")), "claude · rqa-work");
+        // An explicit rename beats a live title, however busy the app is.
+        spec.title = Some("worker1".into());
+        assert_eq!(display_name_live(&spec, Some("TASK-42 refactor")), "worker1");
+        // `display_name_of` is exactly the chain with no live title.
+        spec.title = None;
+        assert_eq!(display_name_of(&spec), display_name_live(&spec, None));
+    }
+
+    /// P6: an OSC title is untrusted text headed for roost's chrome and for
+    /// a sequence roost writes to its own terminal — bounded and stripped.
+    #[test]
+    fn a_live_title_is_sanitized_and_bounded() {
+        assert_eq!(sanitize_title("  spinner · build  ", 48), "spinner · build");
+        // Control bytes (an ESC that could break out of roost's own OSC 2)
+        // never survive.
+        assert_eq!(sanitize_title("safe\x1b]0;PWNED\x07", 48), "safe]0;PWNED");
+        // Bounded in characters, on char boundaries.
+        assert_eq!(sanitize_title(&"x".repeat(200), 48).chars().count(), 48);
+        let wide = sanitize_title(&"日".repeat(200), 48);
+        assert_eq!(wide.chars().count(), 48);
+        // Nothing usable left ⇒ empty, which the chain treats as "no title".
+        assert_eq!(sanitize_title("\x07\x1b", 48), "");
+    }
+
+    /// P6: the host terminal's title follows the focused pane — published
+    /// once per change, through the same queue as every other host write.
+    #[test]
+    fn host_title_follows_focus_and_live_title() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2, focus 2
+
+        let want = format!("\x1b]2;roost · {}\x07", app.display_name(2));
+        assert!(host_contains(&mut app, want.as_bytes()), "first frame publishes a title");
+        // Unchanged ⇒ nothing republished (the throttle's companion rule).
+        app.last_host_title = None;
+        assert!(!host_contains(&mut app, b"\x1b]2;"));
+
+        // A focus move renames the host window. (Both fixture panes are
+        // `shell · tmp`, so give the target a name of its own first —
+        // otherwise the title genuinely doesn't change and republishing
+        // would be the bug.)
+        app.find_spec_mut(1).unwrap().title = Some("TASK-7".into());
+        app.focused = 1;
+        app.last_host_title = None;
+        assert!(
+            host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 TASK-7\x07"),
+            "focus change republishes"
+        );
+
+        // A rename of the focused pane takes the same path — as does a live
+        // OSC title, since both resolve through `display_name`.
+        app.find_spec_mut(1).unwrap().title = Some("TASK-8".into());
+        app.last_host_title = None;
+        assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 TASK-8\x07"));
+    }
+
+    /// P6: the throttle — an agent republishing its OSC title on every
+    /// spinner frame must not repaint the host title bar ~30x a second, and
+    /// a change it skips must still be published on the next pass.
+    #[test]
+    fn host_title_updates_are_throttled_but_never_lost() {
+        let (mut app, _) = mk_app(shell_ws());
+        let _ = app.take_host_output(); // publish the initial title
+
+        app.find_spec_mut(app.focused).unwrap().title = Some("first".into());
+        assert!(!host_contains(&mut app, b"\x1b]2;"), "too soon after the last publish");
+
+        app.last_host_title = Some(Instant::now() - HOST_TITLE_INTERVAL - Duration::from_millis(1));
+        app.find_spec_mut(app.focused).unwrap().title = Some("second".into());
+        // The skipped "first" is not replayed; the *current* name is.
+        assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 second\x07"));
     }
 
     #[test]

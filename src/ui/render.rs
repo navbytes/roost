@@ -10,7 +10,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
-    display_name_of, feed_overlay_size, picker_items, App, FeedEntry, Mode, RenameTarget,
+    feed_overlay_size, picker_items, App, FeedEntry, Mode, RenameTarget,
     Selection, TabSummary,
 };
 use crate::core::status::AgentStatus;
@@ -789,12 +789,14 @@ fn draw_pane<B: PaneBackend>(
             .unwrap_or(AgentStatus::Exited);
         let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
         let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
-        // U2: the shared display name (title, else `adapter · cwd-tag`) —
-        // one helper for every fleet surface, `core::app::display_name_of`,
-        // so the badge can never drift from what the feed/notifications
-        // call the same pane. Untitled panes on the same adapter are
-        // otherwise indistinguishable at a glance.
-        let name = spec.map(display_name_of).unwrap_or_else(|| "?".into());
+        // U2 (amended, P6): the shared display name — explicit title, else
+        // the pane's live OSC 0/2 title, else `adapter · cwd-tag`. One
+        // helper for every fleet surface, `App::display_name`, so the badge
+        // can never drift from what the feed/notifications/host title call
+        // the same pane. Untitled panes on the same adapter are otherwise
+        // indistinguishable at a glance; a pane publishing a live task line
+        // now says what it's doing.
+        let name = if spec.is_some() { app.display_name(pr.id) } else { "?".into() };
         (status, name, has_title, adapter)
     };
 
