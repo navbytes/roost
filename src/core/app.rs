@@ -187,6 +187,10 @@ pub struct App<B: PaneBackend> {
     last_save_ok: bool,
     tx: SyncSender<AppEvent>,
     term_size: Size,
+    /// P4: the host window's pixel geometry (width, height) as last reported
+    /// by the terminal; (0, 0) when the host doesn't report pixels. Panes get
+    /// a proportional share (`pane_pixels`) at spawn and on every resize.
+    host_pixels: (u16, u16),
     /// Freshly launched agent panes we still owe a session id.
     pending_detect: HashMap<PaneId, SystemTime>,
     last_detect: Instant,
@@ -265,6 +269,7 @@ impl<B: PaneBackend> App<B> {
         store: Box<dyn StateStore>,
         tx: SyncSender<AppEvent>,
         term_size: Size,
+        host_pixels: (u16, u16),
         sock_path: Option<PathBuf>,
     ) -> Result<Self> {
         // A loaded workspace.json may be hand-edited, partially migrated, or
@@ -291,6 +296,7 @@ impl<B: PaneBackend> App<B> {
             last_save_ok: true,
             tx,
             term_size,
+            host_pixels,
             pending_detect: HashMap::new(),
             last_detect: Instant::now(),
             sock_path,
@@ -550,7 +556,8 @@ impl<B: PaneBackend> App<B> {
         }
 
         let (rows, cols) = inner_dims(rect);
-        match B::spawn(id, &cmd, rows, cols, self.tx.clone()) {
+        let pixels = self.pane_pixels(rows, cols);
+        match B::spawn(id, &cmd, rows, cols, pixels, self.tx.clone()) {
             Ok(rt) => {
                 self.runtimes.insert(id, rt);
                 self.dead.remove(&id);
@@ -1533,8 +1540,11 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    pub fn on_resize(&mut self, size: Size) {
+    /// `pixels` is the host window's pixel geometry, re-read alongside the
+    /// cell size — the two travel together on every real resize.
+    pub fn on_resize(&mut self, size: Size, pixels: (u16, u16)) {
         self.term_size = size;
+        self.host_pixels = pixels;
         self.relayout();
     }
 
@@ -1548,10 +1558,29 @@ impl<B: PaneBackend> App<B> {
                 continue;
             }
             let (rows, cols) = inner_dims(pr.rect);
+            let pixels = self.pane_pixels(rows, cols);
             if let Some(rt) = self.runtimes.get_mut(&pr.id) {
-                rt.resize(rows, cols);
+                rt.resize(rows, cols, pixels);
             }
         }
+    }
+
+    /// P4: a pane's pixel geometry — a proportional share of the host
+    /// window's, scaled by the pane's cell size (`host_px * pane_cells /
+    /// host_cells`). (0, 0) whenever the host geometry is unknown: the
+    /// honest "no pixels" stays 0 all the way down to the PTY winsize and
+    /// the XTWINOPS 14/16t silence.
+    fn pane_pixels(&self, rows: u16, cols: u16) -> (u16, u16) {
+        let (host_w, host_h) = self.host_pixels;
+        let (host_cols, host_rows) = (self.term_size.width, self.term_size.height);
+        if host_w == 0 || host_h == 0 || host_cols == 0 || host_rows == 0 {
+            return (0, 0);
+        }
+        let scale = |px: u16, cells: u16, host_cells: u16| -> u16 {
+            (u32::from(px) * u32::from(cells) / u32::from(host_cells))
+                .min(u32::from(u16::MAX)) as u16
+        };
+        (scale(host_w, cols, host_cols), scale(host_h, rows, host_rows))
     }
 
     /// The focused pane's inner (border-excluded) cell dimensions as
@@ -2790,6 +2819,7 @@ mod tests {
             Box::new(store.clone()),
             tx,
             Size::new(100, 30),
+            (0, 0),
             None,
         )
         .unwrap();
@@ -2809,6 +2839,50 @@ mod tests {
         assert_eq!(app.runtimes.len(), 2);
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes.len(), 2);
+    }
+
+    /// P4 pixel plumbing: a pane's pixel geometry is a proportional share of
+    /// the host window's, delivered at spawn and refreshed by every resize;
+    /// an unknown host geometry stays an honest (0, 0) throughout.
+    #[test]
+    fn pane_pixels_flow_proportionally_through_spawn_and_resize() {
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        // Host: 100x30 cells, 1000x600 px → 10 px/col, 20 px/row.
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (1000, 600),
+            None,
+        )
+        .unwrap();
+        let id = app.pane_order()[0];
+        // Single pane: body 100x28 (tab + hint rows off), inner 98x26 →
+        // (1000*98/100, 600*26/30).
+        let px = app.runtimes.get(&id).unwrap().pixels;
+        assert_eq!(px, (980, 520), "spawn-time pixels");
+
+        // Host resize: both cell and pixel geometry refresh proportionally —
+        // inner 48x26 of a 50x30 host → (500*48/50, 600*26/30).
+        app.on_resize(Size::new(50, 30), (500, 600));
+        let px = app.runtimes.get(&id).unwrap().pixels;
+        assert_eq!(px, (480, 520), "post-resize pixels");
+
+        // Host stops reporting pixels: panes drop to the honest zero.
+        app.on_resize(Size::new(50, 30), (0, 0));
+        assert_eq!(app.runtimes.get(&id).unwrap().pixels, (0, 0));
+    }
+
+    /// P4: with no host pixel geometry (the common CI/harness case), spawn
+    /// delivers (0, 0) — never an invented size.
+    #[test]
+    fn unknown_host_pixels_spawn_as_zero() {
+        let (app, _) = mk_app(shell_ws()); // mk_app passes host_pixels (0, 0)
+        let id = app.pane_order()[0];
+        assert_eq!(app.runtimes.get(&id).unwrap().pixels, (0, 0));
     }
 
     #[test]
@@ -3414,6 +3488,7 @@ mod tests {
             Box::new(store),
             tx,
             Size::new(100, 30),
+            (0, 0),
             Some(dir.join("roost.sock")),
         )
         .unwrap();
@@ -3472,6 +3547,7 @@ mod tests {
             Box::new(store),
             tx,
             Size::new(100, 30),
+            (0, 0),
             Some(dir.join("roost.sock")),
         )
         .unwrap();
@@ -4043,7 +4119,7 @@ mod tests {
     #[test]
     fn hint_bar_hidden_on_tiny_terminal() {
         let (mut app, _) = mk_app(shell_ws());
-        app.on_resize(Size::new(80, 2)); // no room for tab + hint + body
+        app.on_resize(Size::new(80, 2), (0, 0)); // no room for tab + hint + body
         assert!(!app.hints_shown());
         // body_area must not underflow
         assert!(app.body_area().height <= 2);
@@ -4122,7 +4198,8 @@ mod tests {
         let store = MemStore::default();
         let (tx, _rx) = mpsc::sync_channel(64);
         let mut app =
-            App::<FakePane>::new(ws, registry, Box::new(store), tx, Size::new(100, 30), None).unwrap();
+            App::<FakePane>::new(ws, registry, Box::new(store), tx, Size::new(100, 30), (0, 0), None)
+                .unwrap();
 
         // Pane 1 "spawned" before either file existed (widest window); pane 2
         // "spawned" after file_a but before file_b — the precise ordering
@@ -4337,6 +4414,7 @@ mod tests {
             Box::new(FailingStore),
             tx,
             Size::new(100, 30),
+            (0, 0),
             None,
         )
         .unwrap();
@@ -4617,7 +4695,7 @@ mod tests {
     #[test]
     fn cycle_layout_skips_an_unfit_arrangement_and_applies_the_next() {
         let (mut app, _) = mk_app(shell_ws());
-        app.on_resize(Size::new(80, 22)); // body ~80x20: main+stack's 0.4 column (32) < the 36 floor
+        app.on_resize(Size::new(80, 22), (0, 0)); // body ~80x20: main+stack's 0.4 column (32) < the 36 floor
         app.apply(Action::NewPane); // 2 panes
 
         app.apply(Action::CycleLayout); // 1st: grid (0.5/0.5) fits
@@ -4643,7 +4721,7 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         app.apply(Action::NewPane); // 3 panes, organically nested splits
-        app.on_resize(Size::new(30, 10)); // body far below the 36x10 floor for any arrangement
+        app.on_resize(Size::new(30, 10), (0, 0)); // body far below the 36x10 floor for any arrangement
         let before = format!("{:?}", app.ws.tabs[0].layout);
         app.apply(Action::CycleLayout);
         assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
@@ -5035,7 +5113,7 @@ mod tests {
     fn feed_overlay_size_is_72x16_at_the_80x24_floor() {
         // C20: "At the 80×24 floor: 72×16, fits."
         let (mut app, _) = mk_app(shell_ws());
-        app.on_resize(Size::new(80, 24));
+        app.on_resize(Size::new(80, 24), (0, 0));
         assert_eq!(feed_overlay_size(app.body_area()), (72, 16));
     }
 
@@ -5091,7 +5169,7 @@ mod tests {
     #[test]
     fn float_geometry_matches_the_c22_worked_example() {
         let (mut app, _) = mk_app(shell_ws());
-        app.on_resize(Size::new(80, 24)); // body -> 80x22 -> float 48x13, per C22
+        app.on_resize(Size::new(80, 24), (0, 0)); // body -> 80x22 -> float 48x13, per C22
         app.apply(Action::ToggleFloat);
         let rect = app.display_rects()[0].rect;
         assert_eq!((rect.width, rect.height), (48, 13));
@@ -5100,7 +5178,7 @@ mod tests {
     #[test]
     fn float_toggle_refuses_when_the_body_is_too_small() {
         let (mut app, _) = mk_app(shell_ws());
-        app.on_resize(Size::new(39, 20)); // body width 39 < the 40-col floor
+        app.on_resize(Size::new(39, 20), (0, 0)); // body width 39 < the 40-col floor
         app.apply(Action::ToggleFloat);
         assert!(app.float.is_none(), "must not spawn below the refusal floor");
         assert_eq!(app.flash(), Some("no room for float"));

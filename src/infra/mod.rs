@@ -4,9 +4,9 @@
 pub mod clipboard;
 pub mod extension;
 pub mod inspect;
-pub mod kitty;
 pub mod notify;
 pub mod open;
 pub mod pty;
+pub mod queries;
 pub mod sock;
 pub mod store;

@@ -58,7 +58,9 @@ reaches the host.
 **Contract:** track mode 2026 in the vendored parser; while a pane's bracket
 is open, the renderer presents that pane's *last pre-bracket* grid (with a
 staleness cap so a stuck bracket can't freeze the pane); answer DECRQM 2026
-honestly per what ships (see W2).
+honestly per what ships (see W2). *(The DECRQM half shipped with W2: 2026 —
+like every untracked mode — now answers `0`, "not recognized"; flip it to
+1/2 when this item lands.)*
 
 ### P2 · CONFIRMED · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
 Claude Code emits desktop notifications via OSC 9 and progress via OSC 9;4
@@ -84,7 +86,13 @@ appeared anywhere in the captured host stream.
 copy mode already proves the host path works); optionally cap size and gate
 reads (`52;c;?`) which are a paste-theft vector — forward writes, refuse reads.
 
-### P4 · CONFIRMED (measured end to end) · High — the terminal-query black hole
+### P4 · FIXED (this branch) · High — the terminal-query black hole
+*Fixed per Appendix B: `src/infra/queries.rs` (kitty.rs generalized) answers
+DA1/DA2/DSR 5·6/DECRQM/XTVERSION/XTWINOPS 18t (14/16t only with real pixel
+geometry, now plumbed host→pane through spawn/resize into PTY winsize);
+replies post-parse, stream-order. roost's own startup no longer blocks on
+the enhancement probe (259 ms vs 2011 ms first frame in the harness gate;
+e2e: `tests/pane_queries.rs`).*
 roost answers exactly one query (kitty `CSI ?u`) and swallows DA1, DSR-CPR
 `6n`, DECRQM, XTVERSION, XTWINOPS 14/16/18t, XTGETTCAP — worse than answering
 nothing: crossterm-0.28's `supports_keyboard_enhancement()` gets its kitty

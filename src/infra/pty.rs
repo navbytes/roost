@@ -15,7 +15,7 @@ use crate::core::event::AppEvent;
 use crate::core::status::{AgentStatus, StatusTracker};
 use crate::core::workspace::PaneId;
 use crate::infra::inspect;
-use crate::infra::kitty::KittyKeyboard;
+use crate::infra::queries::QueryResponder;
 use crate::ports::{MouseProto, Observation, PaneBackend};
 
 const SCROLLBACK_LINES: usize = 5000;
@@ -65,9 +65,14 @@ pub struct PtyPane {
     scroll: usize,
     /// The pane's child pid, for OS observation (live cwd / running agent).
     pid: Option<u32>,
-    /// Tracks the kitty keyboard flags this pane negotiated, so roost can
+    /// Answers the pane's terminal queries (DA1, DSR, DECRQM, XTWINOPS, …)
+    /// and tracks the kitty keyboard flags it negotiated, so roost can
     /// forward modified keys (Shift/Ctrl+Enter) in the encoding it asked for.
-    kitty: KittyKeyboard,
+    queries: QueryResponder,
+    /// The pane's pixel geometry (width, height), derived by the core from
+    /// the host window's proportionally; (0, 0) = unknown. Fed to the PTY's
+    /// winsize and to the XTWINOPS 14/16t replies.
+    pixels: (u16, u16),
     /// Per-spawn liveness flag shared with the reader thread. `kill()` clears
     /// it so the (now-doomed) reader stops emitting Output/Exit for this pane
     /// id. Without this, a pane id that is reused (close→new) or respawned
@@ -85,11 +90,12 @@ impl PaneBackend for PtyPane {
         spec: &CommandSpec,
         rows: u16,
         cols: u16,
+        pixels: (u16, u16),
         tx: SyncSender<AppEvent>,
     ) -> Result<Self> {
         let pty = native_pty_system();
         let pair = pty
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize { rows, cols, pixel_width: pixels.0, pixel_height: pixels.1 })
             .context("openpty")?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
@@ -154,18 +160,13 @@ impl PaneBackend for PtyPane {
             status: StatusTracker::new(),
             scroll: 0,
             pid,
-            kitty: KittyKeyboard::new(),
+            queries: QueryResponder::new(),
+            pixels,
             alive,
         })
     }
 
     fn process_output(&mut self, bytes: &[u8]) {
-        // Answer the pane's kitty-keyboard queries and track the flags it
-        // pushes, so modified keys reach it in the encoding it negotiated.
-        let reply = self.kitty.feed(bytes);
-        if !reply.is_empty() {
-            self.write_input_raw(&reply);
-        }
         // vt100 counts *parsed* bells, so a 0x07 consumed as an OSC string
         // terminator (ESC ] … BEL) doesn't count — only a real bell does.
         let bells_before = self.parser.screen().audible_bell_count();
@@ -173,11 +174,20 @@ impl PaneBackend for PtyPane {
         if self.parser.screen().audible_bell_count() != bells_before {
             self.status.on_bell();
         }
+        // Answer the pane's terminal queries (and track its kitty keyboard
+        // flags) — AFTER the chunk is parsed, so stateful replies (DSR 6
+        // cursor position, DECRQM mode values) reflect the state the app
+        // just finished establishing in this very chunk, not the state one
+        // chunk ago. Replies land in stream-encounter order.
+        let reply = self.queries.feed(bytes, self.parser.screen(), self.pixels);
+        if !reply.is_empty() {
+            self.write_input_raw(&reply);
+        }
         self.status.on_output();
     }
 
     fn kitty_disambiguate(&self) -> bool {
-        self.kitty.disambiguate()
+        self.queries.disambiguate()
     }
 
     fn app_cursor_keys(&self) -> bool {
@@ -208,11 +218,17 @@ impl PaneBackend for PtyPane {
         ok
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
+    fn resize(&mut self, rows: u16, cols: u16, pixels: (u16, u16)) {
         if rows == 0 || cols == 0 {
             return;
         }
-        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        self.pixels = pixels;
+        let _ = self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: pixels.0,
+            pixel_height: pixels.1,
+        });
         self.parser.set_size(rows, cols);
     }
 

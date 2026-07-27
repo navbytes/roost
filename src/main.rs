@@ -72,22 +72,54 @@ fn main() -> Result<()> {
     // Negotiate the enhanced (kitty) keyboard protocol so Shift+Enter and
     // Ctrl+Enter arrive as distinct key events — a bare terminal collapses
     // both to a plain CR, making "newline vs submit" impossible to tell apart.
-    // Only push the flag if the terminal actually supports it, and remember
-    // that so we can pop it on the way out (and in the panic hook).
-    let kbd_enhanced = matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
-    if kbd_enhanced {
-        let _ = execute!(
-            std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-    }
-    let result = run(&mut terminal);
-    if kbd_enhanced {
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
+    // Only push the flag if the terminal actually supports it.
+    //
+    // P4 (client side): the probe must never block first paint. crossterm's
+    // supports_keyboard_enhancement() writes `CSI ?u`+`CSI c` and waits up
+    // to a hard-coded 2 s for an answer — under a terminal that answers
+    // neither (a bare PTY, a pre-W2 roost) that 2 s used to land between
+    // launch and the first frame (measured: 2014 ms vs 23 ms). Run the probe
+    // on a helper thread with a short budget: real terminals answer in a few
+    // milliseconds, so the enhanced path is unchanged; past the budget we
+    // paint immediately without enhancement and let the main loop adopt a
+    // late "supported" answer if one ever arrives (`run` polls the channel).
+    let (kbd_tx, kbd_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = kbd_tx
+            .send(matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)));
+    });
+    let kbd_pending = match kbd_rx.recv_timeout(KBD_PROBE_BUDGET) {
+        Ok(true) => {
+            push_kbd_enhancement();
+            None
+        }
+        Ok(false) => None,          // answered: no support — settled
+        Err(_) => Some(kbd_rx),     // still probing: run() watches for the answer
+    };
+    let result = run(&mut terminal, kbd_pending);
+    // Pop unconditionally: the probe may have resolved (and pushed) after
+    // the budget expired, so a simple "did we push" bool can't be trusted
+    // here — and popping with nothing pushed is a no-op terminals ignore
+    // (the panic hook already relies on exactly that).
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// How long `main` waits synchronously for the keyboard-enhancement probe
+/// before painting without it. Generous for a real terminal round-trip
+/// (locals answer in single-digit ms; this survives a slow SSH hop) while
+/// staying far under crossterm's internal 2 s give-up.
+const KBD_PROBE_BUDGET: Duration = Duration::from_millis(250);
+
+/// Push the kitty keyboard enhancement flags roost uses. Paired with the
+/// unconditional pop on exit (and in the panic hook).
+fn push_kbd_enhancement() {
+    let _ = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
 }
 
 /// Acquire an exclusive lock on `<state>/roost.lock`. Returns the held file
@@ -136,7 +168,10 @@ fn install_panic_hook() {
 /// block.
 const EVENT_CHANNEL_BOUND: usize = 1024;
 
-fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut kbd_pending: Option<mpsc::Receiver<bool>>,
+) -> Result<()> {
     let (tx, rx) = mpsc::sync_channel::<AppEvent>(EVENT_CHANNEL_BOUND);
 
     // Wire production adapters to the core's ports.
@@ -151,7 +186,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut notifier = TermNotifier;
     let size = terminal.size()?;
     let mut app: App<PtyPane> =
-        App::new(ws, agents::registry(), Box::new(store), tx, size, sock_path)?;
+        App::new(ws, agents::registry(), Box::new(store), tx, size, host_pixels(), sock_path)?;
     app.relayout();
 
     // Keep the pi status extension in sync with this build so it can't silently
@@ -170,6 +205,22 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
     let loop_result: Result<()> = (|| {
     loop {
+        // P4: adopt a keyboard-enhancement answer that arrived after the
+        // startup budget (the probe thread keeps waiting up to crossterm's
+        // own 2 s). One-shot: any answer (or a dead channel) settles it.
+        if let Some(rx) = &kbd_pending {
+            match rx.try_recv() {
+                Ok(supported) => {
+                    if supported {
+                        push_kbd_enhancement();
+                    }
+                    kbd_pending = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => kbd_pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
         terminal.draw(|f| ui::render::draw(f, &mut app))?;
 
         // Drain ALL pending terminal events this tick, not just one. During a
@@ -211,9 +262,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if resized {
             // Trust the terminal's current size, not a possibly-stale value
             // carried on an intermediate coalesced event, then hard-clear so
-            // no leftover cells from an in-between frame survive.
+            // no leftover cells from an in-between frame survive. Pixel
+            // geometry travels with it (P4) — same ioctl, re-read together.
             let sz = terminal.size()?;
-            app.on_resize(sz);
+            app.on_resize(sz, host_pixels());
             terminal.clear()?;
         }
 
@@ -275,6 +327,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     }
     let _ = std::fs::remove_file(&control_token_path);
     loop_result
+}
+
+/// The host window's pixel geometry (width, height) via the winsize ioctl —
+/// a cheap local read, no terminal round-trip. (0, 0) when the host doesn't
+/// report pixels; panes then keep the honest zero (P4).
+fn host_pixels() -> (u16, u16) {
+    crossterm::terminal::window_size().map(|ws| (ws.width, ws.height)).unwrap_or((0, 0))
 }
 
 /// Write the control token 0600, owner-only.
@@ -452,7 +511,7 @@ mod tests {
         let store = MemStore::default();
         let (tx, _rx) = std::sync::mpsc::sync_channel(64);
         let ws = Workspace::default_in(PathBuf::from("/tmp"));
-        App::<FakePane>::new(ws, agents::registry(), Box::new(store), tx, Size::new(100, 30), None).unwrap()
+        App::<FakePane>::new(ws, agents::registry(), Box::new(store), tx, Size::new(100, 30), (0, 0), None).unwrap()
     }
 
     fn alt(code: KeyCode) -> KeyEvent {

@@ -40,11 +40,16 @@ pub enum MouseProto {
 /// A running pane: process + terminal state machine. Implemented by
 /// `infra::pty::PtyPane` in production.
 pub trait PaneBackend: Sized {
+    /// `pixels` is the pane's (width, height) pixel geometry, derived by the
+    /// core from the host window's proportionally; (0, 0) = unknown — kept 0
+    /// so downstream consumers (PTY winsize, XTWINOPS pixel reports) stay
+    /// honest rather than inventing a geometry.
     fn spawn(
         id: PaneId,
         cmd: &CommandSpec,
         rows: u16,
         cols: u16,
+        pixels: (u16, u16),
         tx: SyncSender<AppEvent>,
     ) -> Result<Self>;
 
@@ -60,7 +65,9 @@ pub trait PaneBackend: Sized {
     /// events must not yank the view to the live tail). Same success
     /// semantics as `write_input`.
     fn write_input_raw(&mut self, bytes: &[u8]) -> bool;
-    fn resize(&mut self, rows: u16, cols: u16);
+    /// `pixels` as in `spawn` — the pane's derived pixel geometry, refreshed
+    /// on every host resize; (0, 0) = unknown, kept 0.
+    fn resize(&mut self, rows: u16, cols: u16, pixels: (u16, u16));
     /// Ask the child to exit cleanly (SIGHUP, as if its terminal closed) so it
     /// can flush a final turn. Best-effort; `kill()` is the guaranteed stop.
     /// Default no-op for backends without a real process.
@@ -184,6 +191,9 @@ pub mod fakes {
         /// Test knob: simulates the pane's app having enabled bracketed
         /// paste (mode 2004).
         pub bracketed: bool,
+        /// The pixel geometry most recently seen — at spawn, then updated by
+        /// every resize — so tests can assert the P4 pixel plumbing.
+        pub pixels: (u16, u16),
     }
 
     impl PaneBackend for FakePane {
@@ -192,6 +202,7 @@ pub mod fakes {
             cmd: &CommandSpec,
             _rows: u16,
             _cols: u16,
+            pixels: (u16, u16),
             _tx: SyncSender<AppEvent>,
         ) -> Result<Self> {
             if cmd.program == "spawn-fail" {
@@ -212,6 +223,7 @@ pub mod fakes {
                 fail_write: false,
                 app_cursor: false,
                 bracketed: false,
+                pixels,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -232,7 +244,9 @@ pub mod fakes {
             self.input.extend_from_slice(bytes);
             true
         }
-        fn resize(&mut self, _rows: u16, _cols: u16) {}
+        fn resize(&mut self, _rows: u16, _cols: u16, pixels: (u16, u16)) {
+            self.pixels = pixels;
+        }
         fn kill(&mut self) {
             self.exited = true;
         }
