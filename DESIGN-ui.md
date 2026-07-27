@@ -573,6 +573,12 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   advertised nowhere; `↵` is new (C20 amendment). `scroll` becomes `select`
   because with an actionable entry the arrows move a cursor, not a view —
   the hint has to name what the key now does.
+- **[Amended 2026-07-27, SPEC-ux U16/U20 — two mode lists grow]:** rename
+  becomes `type {pane,tab} name` · `←→ move` · `↵ save` · `Esc cancel`
+  (45 columns) now that there is a cursor to move (C13); the picker becomes
+  `↑↓ choose` · `↵ open` · `1..9 launch` · `type filter` · `←→ dir` ·
+  `Esc cancel` (71 columns, C14). Both stay inside the 100-col floor beside
+  the right segment, and neither touches the Normal-mode seven.
 - **[Amended 2026-07-27, SPEC-parity P21 — scrollback search]:** the bar
   gains a mode and grows one token.
   - **Mode word list** gains `SEARCH`, on the same terms as the rest: a real
@@ -721,6 +727,23 @@ modals; derived from its rules):**
 **Target:** C12 frame; input text fg `FG`; cursor stays the `▏` suffix
 (`:167`), fg `FG`. Size and behavior unchanged.
 
+**[Amended 2026-07-27, SPEC-ux U16 — the `▏` becomes a real caret]:** "cursor
+stays the `▏` suffix" is superseded. The dialog now carries an insertion
+point, so the glyph renders **at** it (`rename_field`), not always at the
+end — same token, same `FG`, no new styling. It was already spelled like a
+caret; it just never moved, which is the tell that made a text field nobody
+tried to edit in place. Everything else is unchanged: 44×3, C12 frame, and
+the U8 rule that an outside click does not dismiss unsaved work.
+
+- **Char-indexed, not byte-indexed.** The point counts what the user sees.
+  A byte index would render the caret in the wrong column for any accented
+  or emoji name, and slicing one mid-character panics — so the field
+  clamps and converts (`byte_at`) at every edit.
+- **Motion is clamped, never wrapping.** `←` at the start and `→` at the
+  end do nothing. A one-line field that teleported the caret between its
+  ends on an overshoot would make every held arrow key a hazard.
+- **Hint bar** gains `←→ move` (45 columns, C9).
+
 ### C14 — Picker (quick-launch)
 
 **Current:** `render.rs:169–193` — Double/Cyan; selected row Black on Yellow.
@@ -752,6 +775,49 @@ so an out-of-range press is self-evidently one and needs no flash. The
 accelerator is also on the hint bar (`1..9 launch`) — an accelerator
 nothing advertises is one nobody presses, which is what "unhinted `j/k`"
 already cost this dialog.
+
+**[Amended 2026-07-27, SPEC-ux U20 — type-ahead and the §7 cwd column]** The
+picker becomes two columns and grows a filter. "Size and behavior unchanged"
+is fully superseded.
+
+- **Layout.** A fixed 16-column adapter column (the numbered rows, exactly
+  as above) then, separated by a gap, a **recent working directory** column
+  — DESIGN.md §7's long-promised "choose adapter + recent cwd". Rows are
+  `max(adapters, cwds)` tall; the dialog's width is
+  `16 + 2 + widest-cwd-label + 2`, floored at the pre-U20 **32** so a
+  column of short labels can never make the picker *shrink* relative to the
+  one it replaced (`picker_dialog_width`, shared by the drawn dialog and
+  the mouse hitbox so §4/§5's lockstep holds).
+- **Directory labels** are the last two path components (`src/roost`), not
+  full paths: a fleet's directories are usually siblings, so the tail is
+  what distinguishes them and the head is what would eat the dialog.
+- **Marking, three states** (`row_marks`): the column holding the keyboard
+  marks its selection with `❯` `ACCENT` + `FG` text — C14's existing idiom,
+  untouched; the *other* column's selection keeps `FG` **without** the
+  marker; everything else is `MUTED`. Two markers would claim two
+  selections; dropping the inactive one entirely would hide which
+  directory a launch is about to use. No bg highlight anywhere, as before.
+- **Keys.** `↑`/`↓` steer the focused column, `←`/`→` (and Tab) hand the
+  keyboard between them. Every other printable filters the adapter list by
+  ASCII-case-insensitive **substring**, `Backspace` widens it back, and the
+  live query replaces the title's tail (`new pane — clau▏`) so a narrowed
+  list always says why it is narrow — a one-row picker with a normal title
+  reads as a picker that lost its adapters.
+- **Digits stay accelerators, never filter text.** No adapter id or path
+  label needs a digit typed to reach it, and `1..9` is the fastest thing in
+  the dialog; giving it up to type-ahead would trade the best key for the
+  rarest. `1..9`, the click and Enter all index the **filtered** rows, so
+  the mouse and the keyboard can never disagree about what row 2 is.
+- **`j`/`k` stop being motions.** A list you filter by typing cannot
+  reserve letters. Nothing advertised is lost — their being unhinted is
+  the complaint U20 opened with — and the arrows the hint bar *does*
+  advertise are untouched.
+- **Hint bar** becomes `↑↓ choose` · `↵ open` · `1..9 launch` ·
+  `type filter` · `←→ dir` · `Esc cancel` (71 columns, C9).
+- **State ownership:** the recent-cwd list is session-only, on `App`, not in
+  `workspace.json` — see SPEC-ux U20 for why (it reconstructs itself from
+  the persisted pane cwds at startup, so persisting it would buy a schema
+  migration almost nothing).
 
 ### C15 — Help overlay
 
@@ -809,6 +875,15 @@ explain-itself surface, and it explained only the chords. It now ends with
   80-col floor — or `centered_near` clamps and clips a description mid-word,
   the exact failure the 2026-07-22 width amendment exists to prevent.
   Pinned by `help_dialog_fits_the_eighty_column_floor`.
+
+**[Amended 2026-07-27, SPEC-ux U16/U20 — two descriptions retuned, no rows
+added]:** `Alt+Enter`'s row becomes
+`picker: 1..9 launch · type filters · ←→ recent cwd` (71 columns with its
+key prefix) — the picker grew two ways of driving it and the overlay is the
+only surface that says so. The rename row is unchanged: `←→`/`Home`/`End`
+inside a text field is what a text field *is*, and spending overlay width to
+say "the arrow keys move the cursor" would teach nothing. Row count stays
+**20**.
 
 **[Amended 2026-07-27, SPEC-parity P21 — search adds no row]:** the
 `Alt+c / Alt+PgUp` row's description tightens from
@@ -1702,6 +1777,18 @@ unimplemented chord may never leave its letter in a name (live QA committed
 the title `abcwu`). These are mode-local, not entries in this table, and
 they do not consume the chords anywhere else. Cursor motion inside the
 buffer remains unimplemented.]
+
+[Amended 2026-07-27, SPEC-ux U16/U20 — the two dialogs' mode-local keys,
+listed here for the same reason as the blocks below: none is an Alt chord.
+Rename (C13): `←`/`→`/`Home`/`End` move an insertion point, `Delete` joins
+`Backspace` as its forward twin, and `Ctrl+U`/`Ctrl+W` now cut relative to
+the point (kill-to-start and word-behind-point, readline's real
+definitions) — the "cursor motion inside the buffer remains unimplemented"
+note above is superseded. Picker (C14): any printable filters the adapter
+list and `Backspace` widens it, `←`/`→` (or Tab) move between the adapter
+and recent-cwd columns, `↑`/`↓` steer whichever has the keyboard, and
+`1`..`9` still launch — addressing the filtered rows. `j`/`k` are no longer
+picker motions; they are filter text like every other letter.]
 
 [Amended 2026-07-27, SPEC-parity P21 — scrollback search. Three more
 mode-local keys, and for the same reason as the block below they join no row

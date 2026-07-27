@@ -55,8 +55,17 @@ pub enum RenameTarget {
 /// UI mode: non-Normal modes capture all keys (see handle_mode_key).
 pub enum Mode {
     Normal,
-    Rename { buffer: String, target: RenameTarget },
-    Picker { selection: usize },
+    /// U16: a one-line text field. `cursor` is the insertion point as a
+    /// **char** index into `buffer` (0 = before the first char,
+    /// `buffer.chars().count()` = at the end) — chars, not bytes, because
+    /// every motion, edit and the `▏` caret's position are all counted in
+    /// what the user sees, and a byte index would split a multi-byte name.
+    Rename { buffer: String, cursor: usize, target: RenameTarget },
+    /// U20: the quick-launch picker. `selection` indexes the **filtered**
+    /// adapter list (`filter` is the type-ahead query, empty = everything);
+    /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
+    /// two columns `↑`/`↓` are steering.
+    Picker { selection: usize, filter: String, cwd: usize, on_cwd: bool },
     Scroll { offset: usize },
     /// Text selection — mouse drag, or the C24 keyboard cursor. `cursor` is
     /// (row, col) in the focused pane's inner cell space; both input
@@ -197,6 +206,12 @@ const MAX_WAITS: usize = 16;
 /// C20: activity-feed ring buffer capacity — oldest evicted first.
 const FEED_CAP: usize = 200;
 
+/// U20: how many recent working directories the picker's second column
+/// keeps. Nine, so every one of them is reachable by the `1..9` row
+/// accelerators' worth of glancing — and so the dialog stays a thing you
+/// read in one look rather than scroll.
+const MAX_RECENT_CWDS: usize = 9;
+
 /// A closed pane or tab, kept on the undo stack so `Alt+u` can reopen it —
 /// crucially with its session id intact, so the agent resumes where it was.
 #[derive(Debug, Clone)]
@@ -324,6 +339,19 @@ pub struct App<B: PaneBackend> {
     /// `Mode::Search` prompt on purpose — `n`/`N` keep walking the hits back
     /// in Scroll/Copy mode, and the renderer keeps highlighting them.
     pub search: Option<Search>,
+    /// U20 / DESIGN.md §7: recent working directories, most recent first —
+    /// the picker's second column, so launching into a project doesn't need
+    /// a shell round-trip (`Alt+n`, `cd`, then the agent).
+    ///
+    /// **Session-only, deliberately.** Persisting it would mean a
+    /// `workspace.json` schema field, i.e. a migration, for a list that is
+    /// fully reconstructible: it is seeded at startup from the workspace's
+    /// own pane cwds (which *are* persisted) and grows as panes are
+    /// launched and `observe_panes` notices a pane `cd` somewhere new. A
+    /// restart therefore comes back with every directory the workspace
+    /// actually lives in — just not the ones a since-closed pane visited,
+    /// which is a fair price for not touching the precious state's schema.
+    recent_cwds: Vec<PathBuf>,
     /// Transient status message shown in the hint bar (e.g. "copied"), with
     /// the window it stays visible for: `FLASH_WINDOW` for ordinary notices,
     /// `CONFIRM_WINDOW` for confirm-arm prompts (U22 — prompt and arm live
@@ -459,6 +487,7 @@ impl<B: PaneBackend> App<B> {
             keys_seen: false,
             selection: None,
             search: None,
+            recent_cwds: Vec::new(),
             flash: None,
             undo: Vec::new(),
             confirm_close: None,
@@ -486,6 +515,19 @@ impl<B: PaneBackend> App<B> {
         // chance to send `?1004h` yet.
         let first = app.pane_order().first().copied().unwrap_or(0);
         app.set_focus(first);
+        // U20: seed the picker's recent-cwd column from the workspace that
+        // was just loaded — the directories this fleet already lives in.
+        // Reverse order so the *first* pane's cwd ends up most-recent,
+        // matching where focus just landed.
+        let seed: Vec<PathBuf> = app
+            .ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.values().map(|s| s.cwd.clone()))
+            .collect();
+        for cwd in seed.into_iter().rev() {
+            app.note_cwd(cwd);
+        }
         Ok(app)
     }
 
@@ -876,11 +918,18 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
+        // U20: directories a pane has *moved into* since we last looked —
+        // the user typing `cd ~/project` is the clearest possible statement
+        // that it is a directory they are working in, which is exactly what
+        // the picker's recent-cwd column offers back. Collected here and
+        // recorded after the loop, since `find_spec_mut` holds `self`.
+        let mut visited: Vec<PathBuf> = Vec::new();
         for (id, o) in observations {
             let Some(spec) = self.find_spec_mut(id) else { continue };
             if let Some(cwd) = o.cwd {
                 if spec.cwd != cwd {
-                    spec.cwd = cwd;
+                    spec.cwd = cwd.clone();
+                    visited.push(cwd);
                     dirty = true;
                 }
             }
@@ -907,6 +956,9 @@ impl<B: PaneBackend> App<B> {
         // cross-wiring against other panes.
         for id in promoted {
             self.pending_detect.entry(id).or_insert(SystemTime::UNIX_EPOCH);
+        }
+        for cwd in visited {
+            self.note_cwd(cwd);
         }
         if dirty {
             self.save();
@@ -1840,8 +1892,16 @@ impl<B: PaneBackend> App<B> {
     /// to the pane *under* the dialog — live QA typed `PSTX` into a hidden
     /// shell while the dialog's own buffer ignored it.
     pub fn handle_paste(&mut self, text: &str) {
-        if let Mode::Rename { buffer, .. } = &mut self.mode {
-            buffer.extend(text.chars().filter(|c| !c.is_control()));
+        if let Mode::Rename { buffer, cursor, .. } = &mut self.mode {
+            // U16: a paste lands at the point, like typing does, and leaves
+            // the point after what it inserted — a paste that always
+            // appended would be the one edit in the dialog that ignored the
+            // cursor.
+            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+            let at = (*cursor).min(buffer.chars().count());
+            let byte = byte_at(buffer, at);
+            buffer.insert_str(byte, &clean);
+            *cursor = at + clean.chars().count();
             return;
         }
         if self.modal_active() {
@@ -2142,7 +2202,10 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         if matches!(self.mode, Mode::Picker { .. }) {
-            let rows = picker_items().len();
+            // U20: hit-test against the FILTERED list — the rows that are
+            // actually drawn. A click on row 2 must launch what row 2 says,
+            // whatever the type-ahead has narrowed away.
+            let rows = self.picker_filtered().len();
             match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, rows, me.column, me.row)) {
                 Some(i) => self.picker_launch(i),
                 None if !inside => self.mode = Mode::Normal,
@@ -2427,13 +2490,22 @@ impl<B: PaneBackend> App<B> {
                     .find_spec(self.focused)
                     .and_then(|s| s.title.clone())
                     .unwrap_or_default();
-                self.mode = Mode::Rename { buffer: current, target: RenameTarget::Pane };
+                let cursor = current.chars().count();
+                self.mode = Mode::Rename { buffer: current, cursor, target: RenameTarget::Pane };
             }
             Action::RenameTab => {
                 let current = self.ws.active_tab().name.clone();
-                self.mode = Mode::Rename { buffer: current, target: RenameTarget::Tab };
+                let cursor = current.chars().count();
+                self.mode = Mode::Rename { buffer: current, cursor, target: RenameTarget::Tab };
             }
-            Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
+            Action::QuickLaunch => {
+                // U20: a fresh picker every time — no sticky filter from a
+                // previous visit, and the cwd column parked on its most
+                // recent entry (which is the pane you are splitting off, so
+                // the zero-keystroke launch matches the pre-U20 behavior).
+                self.mode =
+                    Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false };
+            }
             Action::ScrollMode => {
                 // U9: seed from the pane's CURRENT view offset — entering
                 // Scroll mode after wheeling continues from the wheeled
@@ -2980,16 +3052,67 @@ impl<B: PaneBackend> App<B> {
     /// Shared by the keyboard's Enter and U8's click-a-row path so the two
     /// can't drift.
     fn picker_launch(&mut self, index: usize) {
-        let items = picker_items();
-        let Some(adapter) = items.get(index.min(items.len().saturating_sub(1))).copied() else {
-            return;
-        };
+        // U20: `index` addresses the rows the user can actually see — the
+        // *filtered* list — so the accelerators, the click and Enter all
+        // agree with what is drawn even mid-type-ahead. An out-of-range
+        // index (a digit past the end of a narrowed list) launches nothing
+        // and leaves the picker up: the rows carry their own numbers, so it
+        // is self-evidently out of range.
+        let items = self.picker_filtered();
+        let Some(adapter) = items.get(index).cloned() else { return };
+        let cwd = self.picker_cwd();
         self.mode = Mode::Normal;
         self.exit_zoom(); // C21: "picker launch" is a structural action
         self.hide_float(); // C22 rule 3: ditto
-        self.new_pane_with(adapter);
+        self.spawn_child(&adapter, cwd.clone(), None);
+        // Launching into a directory is the strongest evidence it is one you
+        // are working in — float it to the top of the column for next time.
+        if let Some(cwd) = cwd {
+            self.note_cwd(cwd);
+        }
         self.relayout();
         self.save();
+    }
+
+    /// U20: the adapter rows the picker is currently showing — every adapter
+    /// whose id contains the type-ahead query, in registry order. An empty
+    /// query shows everything, so the pre-U20 picker is the zero-keystroke
+    /// case of this one. Matching is ASCII-case-insensitive substring, not
+    /// prefix: `laud` should find `claude`, because a picker that only
+    /// honors prefixes makes you know the list you came to read.
+    pub fn picker_filtered(&self) -> Vec<String> {
+        let filter = match &self.mode {
+            Mode::Picker { filter, .. } => filter.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        picker_items()
+            .into_iter()
+            .filter(|id| filter.is_empty() || id.to_ascii_lowercase().contains(&filter))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// U20 / DESIGN.md §7: the recent-directory column, most recent first.
+    pub fn picker_cwds(&self) -> &[PathBuf] {
+        &self.recent_cwds
+    }
+
+    /// The directory the picker would launch into right now — the selected
+    /// row of the cwd column, or `None` (inherit the focused pane's, the
+    /// pre-U20 behavior) when there is nothing to select.
+    fn picker_cwd(&self) -> Option<PathBuf> {
+        let Mode::Picker { cwd, .. } = &self.mode else { return None };
+        self.recent_cwds.get(*cwd).cloned()
+    }
+
+    /// U20: record `cwd` as the most recently used directory — move-to-front,
+    /// deduplicated, capped. The cap is `MAX_RECENT_CWDS` because the column
+    /// is a *list you read at a glance* inside a modal, not an archive; past
+    /// that a directory is faster to reach by typing it in a shell.
+    fn note_cwd(&mut self, cwd: PathBuf) {
+        self.recent_cwds.retain(|c| c != &cwd);
+        self.recent_cwds.insert(0, cwd);
+        self.recent_cwds.truncate(MAX_RECENT_CWDS);
     }
 
     // -- float (C22) ---------------------------------------------------------
@@ -3209,7 +3332,7 @@ impl<B: PaneBackend> App<B> {
         }
         match &mut self.mode {
             Mode::Normal => false,
-            Mode::Rename { buffer, target } => {
+            Mode::Rename { buffer, cursor, target } => {
                 let target = *target;
                 // U16: the dialog used to `push` every `Char` whatever its
                 // modifiers, so Ctrl+W/Ctrl+U literally typed `w`/`u` into
@@ -3218,12 +3341,31 @@ impl<B: PaneBackend> App<B> {
                 // editor on the platform binds — and every *other* modified
                 // char is discarded: a chord roost doesn't implement must
                 // never leave its letter behind in a name.
+                //
+                // [Amended, U16 second half] There is now a **point**. Every
+                // edit below is relative to it, which is what finally makes
+                // Ctrl+W's readline name honest: "word behind point" used to
+                // be "word at the end", because there was no point.
                 let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let len = buffer.chars().count();
+                *cursor = (*cursor).min(len);
                 match key.code {
-                    // Ctrl+U — readline's unix-line-discard.
-                    KeyCode::Char('u') if ctrl => buffer.clear(),
-                    // Ctrl+W — readline's unix-word-rubout.
-                    KeyCode::Char('w') if ctrl => *buffer = erase_word(buffer),
+                    // Ctrl+U — readline's unix-line-discard: kill from the
+                    // point back to the start, keeping the tail. (It cleared
+                    // the whole buffer before, which was the same thing when
+                    // the point was always the end.)
+                    KeyCode::Char('u') if ctrl => {
+                        *buffer = buffer[byte_at(buffer, *cursor)..].to_string();
+                        *cursor = 0;
+                    }
+                    // Ctrl+W — readline's unix-word-rubout, over the text
+                    // behind the point only; whatever follows it survives.
+                    KeyCode::Char('w') if ctrl => {
+                        let at = byte_at(buffer, *cursor);
+                        let head = erase_word(&buffer[..at]);
+                        *cursor = head.chars().count();
+                        *buffer = head + &buffer[at..];
+                    }
                     // Shift is how an uppercase letter arrives (kitty CSI-u
                     // spells `A` as Shift+`a`), so it is the one modifier a
                     // plain insert may carry.
@@ -3233,12 +3375,28 @@ impl<B: PaneBackend> App<B> {
                             .difference(crossterm::event::KeyModifiers::SHIFT)
                             .is_empty() =>
                     {
-                        buffer.push(c)
+                        buffer.insert(byte_at(buffer, *cursor), c);
+                        *cursor += 1;
                     }
                     KeyCode::Char(_) => {} // any other chord: swallowed, not typed
+                    // Backspace eats the char *behind* the point, Delete the
+                    // one under it — the split every text field makes, and
+                    // impossible to offer before there was a point.
                     KeyCode::Backspace => {
-                        buffer.pop();
+                        if *cursor > 0 {
+                            *cursor -= 1;
+                            buffer.remove(byte_at(buffer, *cursor));
+                        }
                     }
+                    KeyCode::Delete => {
+                        if *cursor < len {
+                            buffer.remove(byte_at(buffer, *cursor));
+                        }
+                    }
+                    KeyCode::Left => *cursor = cursor.saturating_sub(1),
+                    KeyCode::Right => *cursor = (*cursor + 1).min(len),
+                    KeyCode::Home => *cursor = 0,
+                    KeyCode::End => *cursor = len,
                     KeyCode::Enter => {
                         let text = buffer.trim().to_string();
                         match target {
@@ -3264,30 +3422,73 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
-            Mode::Picker { selection } => {
-                let items = picker_items();
+            Mode::Picker { .. } => {
+                // U20: both column lengths, read before the mode is borrowed
+                // mutably below — the adapter list depends on the live
+                // type-ahead filter, so it can't be a constant.
+                let rows = self.picker_filtered().len();
+                let cwds = self.recent_cwds.len();
+                let Mode::Picker { selection, filter, cwd, on_cwd } = &mut self.mode else {
+                    return true;
+                };
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selection = selection.checked_sub(1).unwrap_or(items.len() - 1)
+                    // U20: digits are always accelerators, never filter
+                    // text. No adapter id or path column ever needs a digit
+                    // typed to reach it, and the accelerator is the fastest
+                    // thing in the dialog — giving it up to type-ahead
+                    // would trade the picker's best key for its rarest.
+                    // Out of range is ignored and the picker stays up: the
+                    // rows carry their own numbers (C14).
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let i = c as usize - '1' as usize;
+                        if i < rows {
+                            self.picker_launch(i);
+                        }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *selection = (*selection + 1) % items.len()
+                    // U20 type-ahead: every other printable narrows the
+                    // adapter list. This is why `j`/`k` are no longer
+                    // motions — a list you filter by typing cannot reserve
+                    // letters, and those two were never advertised anywhere
+                    // (the unhinted-`j/k` complaint U20 opened with). The
+                    // arrows, which the hint bar does advertise, are
+                    // untouched.
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        filter.push(c);
+                        *selection = 0; // the old row may not exist now
+                    }
+                    KeyCode::Char(_) => {} // any other chord: swallowed
+                    KeyCode::Backspace => {
+                        filter.pop();
+                        *selection = 0;
+                    }
+                    // ← / → move between the two columns; ↑ / ↓ move within
+                    // whichever one has them. Wrapping is per column, as
+                    // before.
+                    KeyCode::Left => *on_cwd = false,
+                    KeyCode::Right => *on_cwd = cwds > 0,
+                    KeyCode::Tab => *on_cwd = !*on_cwd && cwds > 0,
+                    KeyCode::Up => {
+                        let (sel, len) =
+                            if *on_cwd { (&mut *cwd, cwds) } else { (&mut *selection, rows) };
+                        if len > 0 {
+                            *sel = sel.checked_sub(1).unwrap_or(len - 1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        let (sel, len) =
+                            if *on_cwd { (&mut *cwd, cwds) } else { (&mut *selection, rows) };
+                        if len > 0 {
+                            *sel = (*sel + 1) % len;
+                        }
                     }
                     KeyCode::Enter => {
                         let choice = *selection;
                         self.picker_launch(choice);
-                    }
-                    // U20: number accelerators — the picker was arrows-and-
-                    // Enter only, which is two or three keystrokes for a
-                    // list you can already see in full. A digit past the end
-                    // of the list is simply ignored: the rows carry their
-                    // own numbers (C14), so an out-of-range press is
-                    // self-evidently one, and the picker stays up.
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let i = c as usize - '1' as usize;
-                        if i < items.len() {
-                            self.picker_launch(i);
-                        }
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
@@ -3756,6 +3957,14 @@ pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// U16: byte offset of char index `at` in `s` (clamped to the end) — the
+/// bridge between the rename cursor's char-space arithmetic and Rust's
+/// byte-indexed slicing. A name can hold multi-byte chars (an emoji, an
+/// accented word), and slicing one down the middle panics.
+fn byte_at(s: &str, at: usize) -> usize {
+    s.char_indices().nth(at).map_or(s.len(), |(b, _)| b)
 }
 
 /// U17 word motions, shared shape: is cell `i` of `line` whitespace? Past the
@@ -5744,6 +5953,118 @@ mod tests {
         }
     }
 
+    // -- U16: rename cursor motion (the deferred half) ----------------------
+
+    /// The rename buffer and its cursor, for the motion tests below.
+    fn rename_state(app: &App<FakePane>) -> (String, usize) {
+        match &app.mode {
+            Mode::Rename { buffer, cursor, .. } => (buffer.clone(), *cursor),
+            _ => panic!("still renaming"),
+        }
+    }
+
+    fn rename_typing(text: &str) -> App<FakePane> {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::RenamePane);
+        for c in text.chars() {
+            app.handle_mode_key(key(c));
+        }
+        app
+    }
+
+    /// U16: Left/Right/Home/End move a real insertion point, and typing
+    /// happens *at* it — the dialog was append-only, so a typo in a long
+    /// name meant deleting back to it.
+    #[test]
+    fn rename_cursor_moves_and_insertion_happens_at_the_point() {
+        use crossterm::event::KeyCode;
+        let mut app = rename_typing("abcd");
+        assert_eq!(rename_state(&app), ("abcd".into(), 4), "the point starts at the end");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(rename_state(&app), ("abcd".into(), 2));
+        app.handle_mode_key(key('X'));
+        assert_eq!(rename_state(&app), ("abXcd".into(), 3), "inserted at the point");
+        press(&mut app, KeyCode::Home);
+        app.handle_mode_key(key('_'));
+        assert_eq!(rename_state(&app), ("_abXcd".into(), 1));
+        press(&mut app, KeyCode::End);
+        app.handle_mode_key(key('!'));
+        assert_eq!(rename_state(&app), ("_abXcd!".into(), 7));
+        // Motion clamps at both ends rather than wrapping.
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(rename_state(&app).1, 0);
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(rename_state(&app).1, 7);
+    }
+
+    /// U16: Backspace eats the char behind the point and Delete the one
+    /// under it — the split every text field makes, and one that could not
+    /// exist before there was a point.
+    #[test]
+    fn rename_backspace_and_delete_are_relative_to_the_point() {
+        use crossterm::event::KeyCode;
+        let mut app = rename_typing("abcd");
+        press(&mut app, KeyCode::Left); // between c and d
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(rename_state(&app), ("abd".into(), 2), "Backspace takes the char behind");
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(rename_state(&app), ("ab".into(), 2), "Delete takes the char under");
+        // Both are no-ops at their respective ends.
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(rename_state(&app), ("ab".into(), 2));
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(rename_state(&app), ("ab".into(), 0));
+    }
+
+    /// U16: with a point, "word behind point" finally means something —
+    /// Ctrl+W rubs out the word before the cursor and leaves the tail
+    /// alone, and Ctrl+U kills back to the start rather than the whole
+    /// buffer. Both are readline's actual definitions.
+    #[test]
+    fn rename_ctrl_w_and_ctrl_u_respect_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = rename_typing("alpha beta gamma");
+        // Park the point right after `beta`.
+        for _ in 0.." gamma".len() {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(rename_state(&app), ("alpha beta gamma".into(), 10));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            rename_state(&app),
+            ("alpha  gamma".into(), 6),
+            "the word behind the point goes; the tail stays"
+        );
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(
+            rename_state(&app),
+            (" gamma".into(), 0),
+            "Ctrl+U kills back to the start, keeping what follows the point"
+        );
+    }
+
+    /// U16: a paste lands at the point too — it would be the one edit in
+    /// the dialog that ignored the cursor otherwise. Multi-byte text keeps
+    /// the char/byte bookkeeping honest.
+    #[test]
+    fn rename_paste_inserts_at_the_point_including_multibyte() {
+        use crossterm::event::KeyCode;
+        let mut app = rename_typing("héllo");
+        press(&mut app, KeyCode::Left);
+        app.handle_paste("~ê~");
+        assert_eq!(rename_state(&app), ("héll~ê~o".into(), 7));
+        // And typing after a multi-byte insert still slices on a char
+        // boundary rather than panicking.
+        app.handle_mode_key(key('z'));
+        assert_eq!(rename_state(&app), ("héll~ê~zo".into(), 8));
+    }
+
     /// U16: everything else modified is swallowed, and Shift — how an
     /// uppercase letter arrives under kitty's CSI-u encoding — still types.
     #[test]
@@ -6147,6 +6468,143 @@ mod tests {
             app.find_spec(app.focused).map(|s| s.adapter.clone()),
             Some(items[items.len() - 1].to_string()),
         );
+    }
+
+    // -- U20: picker type-ahead + the recent-cwd column ---------------------
+
+    /// U20: typing filters the adapter list, Backspace widens it back. The
+    /// picker was a fixed list you could only walk; with three adapters that
+    /// is already two keystrokes more than naming one.
+    #[test]
+    fn picker_type_ahead_filters_the_adapter_list_and_backspace_widens_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::QuickLaunch);
+        assert_eq!(app.picker_filtered().len(), picker_items().len(), "no filter shows all");
+        app.handle_mode_key(key('l'));
+        // Substring, not prefix: `l` finds both `claude` and `shell`.
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+        app.handle_mode_key(key('a'));
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        app.handle_mode_key(key('z'));
+        assert!(app.picker_filtered().is_empty(), "a query matching nothing shows nothing");
+        assert!(matches!(app.mode, Mode::Picker { .. }), "and the picker stays up");
+        press(&mut app, crossterm::event::KeyCode::Backspace);
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        press(&mut app, crossterm::event::KeyCode::Backspace);
+        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+    }
+
+    /// U20: the `1..9` accelerators keep working *through* a filter — they
+    /// address the rows on screen, not the unfiltered registry, so a digit
+    /// always launches what the row it labels says.
+    #[test]
+    fn picker_accelerators_address_the_filtered_rows() {
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.runtimes.len();
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(key('l')); // → [claude, shell]
+        app.handle_mode_key(key('2')); // row 2 of the *filtered* list
+        assert!(matches!(app.mode, Mode::Normal), "launching closes the picker");
+        assert_eq!(app.runtimes.len(), before + 1);
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.adapter.clone()),
+            Some("shell".to_string()),
+        );
+
+        // A digit past the end of the *narrowed* list is ignored, and the
+        // picker stays up — the rows carry their own numbers.
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.runtimes.len();
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(key('l'));
+        app.handle_mode_key(key('3'));
+        assert!(matches!(app.mode, Mode::Picker { .. }));
+        assert_eq!(app.runtimes.len(), before);
+    }
+
+    /// U20: a click still launches the row it landed on after a filter —
+    /// the hit-test addresses the drawn rows, so keyboard and mouse can't
+    /// disagree about what row 1 is.
+    #[test]
+    fn picker_click_still_lands_on_the_right_row_after_filtering() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::QuickLaunch);
+        app.handle_mode_key(key('l')); // → [claude, shell]
+        let rect = crate::ui::render::modal_rect(&app).expect("the picker draws a dialog");
+        app.handle_modal_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y + 1, // first filtered row
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            Some(rect),
+        );
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.adapter.clone()),
+            Some("claude".to_string()),
+        );
+    }
+
+    /// U20 / DESIGN.md §7: the recent-cwd column is seeded from the
+    /// workspace, grows when a pane `cd`s somewhere new, and is what the
+    /// picker launches into — so opening an agent in another project costs
+    /// no shell round-trip.
+    #[test]
+    fn picker_launches_into_the_selected_recent_directory() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        assert_eq!(app.picker_cwds(), [PathBuf::from("/tmp")], "seeded from the workspace");
+
+        // A pane cd's into a project; the next observation records it.
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().observation =
+            Some(Observation { cwd: Some(PathBuf::from("/work/proj")), agent: None });
+        app.last_detect = Instant::now() - Duration::from_secs(60);
+        app.tick();
+        assert_eq!(
+            app.picker_cwds(),
+            [PathBuf::from("/work/proj"), PathBuf::from("/tmp")],
+            "most recent first, deduplicated"
+        );
+
+        // The picker opens on the most recent, and `→` + `↓` walks to the
+        // older one; Enter launches there.
+        app.apply(Action::QuickLaunch);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.find_spec(app.focused).map(|s| s.cwd.clone()),
+            Some(PathBuf::from("/tmp")),
+            "the launch uses the cwd column's selection"
+        );
+        // ...and using a directory floats it back to the top.
+        assert_eq!(app.picker_cwds()[0], PathBuf::from("/tmp"));
+    }
+
+    /// U20: `↑`/`↓` steer whichever column has the keyboard, and `←`/`→`
+    /// hand it over. Without this the second column would be unreachable.
+    #[test]
+    fn picker_arrows_steer_the_focused_column_only() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        app.note_cwd(PathBuf::from("/a"));
+        app.note_cwd(PathBuf::from("/b")); // → [/b, /a, /tmp]
+        app.apply(Action::QuickLaunch);
+        press(&mut app, KeyCode::Down);
+        let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
+        assert_eq!((*selection, *cwd, *on_cwd), (1, 0, false), "↓ moves the adapter column");
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
+        assert_eq!((*selection, *cwd, *on_cwd), (1, 2, true), "→ hands ↑↓ to the cwd column");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Up);
+        let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
+        assert_eq!((*selection, *cwd, *on_cwd), (0, 2, false), "← hands them back");
     }
 
     #[test]
