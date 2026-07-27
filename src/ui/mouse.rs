@@ -285,11 +285,23 @@ pub fn route_mouse(proto: MouseProto, pane: &PaneRect, me: &MouseEvent) -> Mouse
 }
 
 /// Translate screen coords to 1-based coords inside the pane's inner area
-/// (borders excluded), clamped to at least 1.
+/// (borders excluded), clamped to the grid at **both** ends.
+///
+/// P20: the left/top clamp came free from `saturating_sub`; the right and
+/// bottom didn't, so an event past the pane forwarded a column or row
+/// outside the grid the inner app believes it has — a `CSI <0;140;40M` to a
+/// program that asked for 80×24. Harmless-looking until gestures latch
+/// (below), which makes "the pointer is outside this pane" the normal case
+/// for a drag rather than an impossible one.
 fn cell_in_pane(rect: Rect, col: u16, row: u16) -> (u16, u16) {
+    let inner_w = rect.width.saturating_sub(2).max(1);
+    let inner_h = rect.height.saturating_sub(2).max(1);
     let inner_x = rect.x.saturating_add(1);
     let inner_y = rect.y.saturating_add(1);
-    (col.saturating_sub(inner_x).saturating_add(1), row.saturating_sub(inner_y).saturating_add(1))
+    (
+        col.saturating_sub(inner_x).min(inner_w - 1).saturating_add(1),
+        row.saturating_sub(inner_y).min(inner_h - 1).saturating_add(1),
+    )
 }
 
 fn button_code(b: MouseButton) -> u16 {
@@ -418,6 +430,44 @@ mod tests {
         // pane at (0,0): inner origin (1,1), so screen (5,5) → inner cell (5,5)
         match route_mouse(MouseProto::Sgr, &pane, &e) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<18;5;5M"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// P20: coordinates are clamped to the pane's inner grid at all four
+    /// edges. A latched gesture (main.rs) routinely reports positions
+    /// outside its own pane; the inner app must still only ever be told
+    /// about cells it believes it has.
+    #[test]
+    fn forwarded_coords_clamp_to_the_panes_inner_grid_on_every_edge() {
+        // Pane at (10, 5), 40×20 ⇒ inner origin (11, 6), inner 38×18, so
+        // the SGR range is 1..=38 by 1..=18.
+        let pane = pr(1, 10, 5, 40, 20, false);
+        let fwd = |col, row| match route_mouse(
+            MouseProto::Sgr,
+            &pane,
+            &ev(MouseEventKind::Drag(MouseButton::Left), col, row),
+        ) {
+            MouseAction::Forward(b) => String::from_utf8(b).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(fwd(48, 23), "\x1b[<32;38;18M", "the last inner cell");
+        // Past the right/bottom edge: clamped, not reported out of range
+        // (this is what used to send `;41;25` to an app with 38×18).
+        assert_eq!(fwd(60, 40), "\x1b[<32;38;18M");
+        assert_eq!(fwd(u16::MAX, u16::MAX), "\x1b[<32;38;18M");
+        // Past the left/top edge, and onto the borders: clamped to (1, 1).
+        assert_eq!(fwd(0, 0), "\x1b[<32;1;1M");
+        assert_eq!(fwd(10, 5), "\x1b[<32;1;1M");
+    }
+
+    /// The clamp must not divide by zero or wrap on a pane too small to
+    /// have an inside — a 1×1 rect is all border.
+    #[test]
+    fn a_pane_with_no_inner_area_still_clamps_to_cell_one() {
+        let pane = pr(1, 0, 0, 1, 1, false);
+        match route_mouse(MouseProto::Sgr, &pane, &ev(MouseEventKind::ScrollUp, 9, 9)) {
+            MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<64;1;1M"),
             other => panic!("{other:?}"),
         }
     }

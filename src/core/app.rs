@@ -89,6 +89,13 @@ pub struct FeedEntry {
     pub at: SystemTime,
     pub text: String,
     pub needs_input: bool,
+    /// U25: the pane this line is *about*, when there is one — what Enter
+    /// on the entry focuses. `None` for lines about no single live pane: a
+    /// closed pane or tab (gone; `Alt+u` is that line's recovery path, not
+    /// a jump) and control-plane calls (about a request, not a pane). The
+    /// id is a jump target, not a guarantee: pane ids are recycled, so
+    /// Enter re-checks the pane still exists before moving focus.
+    pub pane: Option<PaneId>,
 }
 
 /// How long the "copied" flash stays in the hint bar.
@@ -292,6 +299,12 @@ pub struct App<B: PaneBackend> {
     /// split as `pending_yank` above (the Alt+click path opens directly in
     /// `main.rs`, because it already runs there).
     pending_open: Option<String>,
+    /// P20: the pane a mouse gesture latched onto at button-down, held
+    /// until the matching release. Every event used to be re-hit-tested, so
+    /// a drag that crossed a pane border switched target mid-gesture: the
+    /// origin app never saw its release (left stuck mid-selection) and the
+    /// neighbour got orphan drag/up events for a press it never received.
+    mouse_latch: Option<PaneId>,
     /// W3: bytes roost owes its OWN terminal — pane OSC 9 notifications
     /// (P2) and OSC 52 clipboard writes (P3) forwarded on a pane's behalf.
     /// Queued rather than written because core does no I/O (module doc) and
@@ -368,6 +381,7 @@ impl<B: PaneBackend> App<B> {
             tab_focus: HashSet::new(),
             pending_yank: None,
             pending_open: None,
+            mouse_latch: None,
             host_out: Vec::new(),
             host_title: String::new(),
             last_host_title: None,
@@ -410,8 +424,8 @@ impl<B: PaneBackend> App<B> {
     /// C20: append one preformatted line to the activity feed, evicting the
     /// oldest entry once the ring is at capacity. The single entry point
     /// every hook (spawn/close/exit/status-diff/ctl) pushes through.
-    fn push_feed(&mut self, text: String, needs_input: bool) {
-        self.feed.push_back(FeedEntry { at: SystemTime::now(), text, needs_input });
+    fn push_feed(&mut self, text: String, needs_input: bool, pane: Option<PaneId>) {
+        self.feed.push_back(FeedEntry { at: SystemTime::now(), text, needs_input, pane });
         if self.feed.len() > FEED_CAP {
             self.feed.pop_front();
         }
@@ -571,6 +585,16 @@ impl<B: PaneBackend> App<B> {
         self.pending_open.take()
     }
 
+    /// P20: the pane a gesture in progress is latched to, if any.
+    pub fn mouse_latch(&self) -> Option<PaneId> {
+        self.mouse_latch
+    }
+
+    /// P20: latch a gesture to `id` (button-down), or clear it (release).
+    pub fn set_mouse_latch(&mut self, id: Option<PaneId>) {
+        self.mouse_latch = id;
+    }
+
     pub fn pane_order(&self) -> Vec<PaneId> {
         let mut v = Vec::new();
         layout::pane_order(&self.ws.active_tab().layout, &mut v);
@@ -651,7 +675,7 @@ impl<B: PaneBackend> App<B> {
                     Some(_) => format!("spawned {label} ({})", spec.adapter),
                     None => format!("spawned {label}"),
                 };
-                self.push_feed(line, false);
+                self.push_feed(line, false, Some(id));
             }
             Err(e) => {
                 self.dead.insert(id, e.to_string());
@@ -724,7 +748,7 @@ impl<B: PaneBackend> App<B> {
                         state_word(old),
                         state_word(status)
                     );
-                    self.push_feed(text, status == AgentStatus::NeedsInput);
+                    self.push_feed(text, status == AgentStatus::NeedsInput, Some(id));
                 }
             }
         }
@@ -1101,7 +1125,7 @@ impl<B: PaneBackend> App<B> {
             None => "?".to_string(),
         };
         let outcome = if ok { "ok" } else { "err" };
-        self.push_feed(format!("ctl {principal}: {} → {outcome}", sanitize(summary)), false);
+        self.push_feed(format!("ctl {principal}: {} → {outcome}", sanitize(summary)), false, None);
 
         let Some(dir) = self.sock_path.as_ref().and_then(|p| p.parent()) else { return };
         let ts = std::time::SystemTime::now()
@@ -1524,7 +1548,7 @@ impl<B: PaneBackend> App<B> {
             }
             // C20: one line per close_pane_id call — a tab removal doesn't
             // also get a pane-level "closed" line for the pane that emptied it.
-            self.push_feed(format!("closed tab {}", tab_snapshot.name), false);
+            self.push_feed(format!("closed tab {}", tab_snapshot.name), false, None);
             self.remember_closed(Closed::Tab { index: ti, tab: tab_snapshot });
             self.spawn_active_tab();
         } else if !empty {
@@ -1532,7 +1556,7 @@ impl<B: PaneBackend> App<B> {
                 // U2: the spec is already out of the tree, so the label is
                 // built from the captured spec (same `{id} {name}` shape as
                 // `feed_label`).
-                self.push_feed(format!("closed {id} {}", display_name_of(&spec)), false);
+                self.push_feed(format!("closed {id} {}", display_name_of(&spec)), false, None);
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
@@ -1650,7 +1674,7 @@ impl<B: PaneBackend> App<B> {
         // notification below, which only nudges for an *unfocused* pane (a
         // focused one's recovery hint is already on screen). U2: the feed
         // line carries the pane id; the notification the display name.
-        self.push_feed(format!("{} exited", self.feed_label(id)), false);
+        self.push_feed(format!("{} exited", self.feed_label(id)), false, Some(id));
         if id == self.focused {
             return None;
         }
@@ -2237,7 +2261,7 @@ impl<B: PaneBackend> App<B> {
                 self.ws.active_tab = i;
                 self.spawn_active_tab();
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
-                self.push_feed(format!("reopened tab {name}"), false);
+                self.push_feed(format!("reopened tab {name}"), false, None);
                 // U2: flashes name what they acted on.
                 self.set_flash(format!("reopened tab {name}"));
             }
@@ -2251,7 +2275,7 @@ impl<B: PaneBackend> App<B> {
                 // U2: `restore_pane` allocated the pane's NEW id and left it
                 // focused — label with that id, not the closed one's.
                 let restored = self.focused;
-                self.push_feed(format!("reopened {}", self.feed_label(restored)), false);
+                self.push_feed(format!("reopened {}", self.feed_label(restored)), false, Some(restored));
                 self.set_flash(format!("reopened {}", self.display_name(restored)));
             }
         }
@@ -3095,6 +3119,24 @@ impl<B: PaneBackend> App<B> {
                     KeyCode::Down | KeyCode::Char('j') => *offset = offset.saturating_sub(1),
                     KeyCode::PageUp => *offset = (*offset + feed_page).min(cap),
                     KeyCode::PageDown => *offset = offset.saturating_sub(feed_page),
+                    // U25: the feed listed what happened and left you to go
+                    // find it by hand. Enter jumps to the selected entry's
+                    // pane, through the same helper Alt+a's ring uses — so a
+                    // jump out of the feed switches tabs, expands stacks and
+                    // shows the float exactly like every other jump.
+                    KeyCode::Enter => {
+                        let target = feed_selected(&self.feed, *offset).and_then(|e| e.pane);
+                        match target {
+                            // Ids are recycled, and a line can outlive its
+                            // pane: re-check before moving anywhere.
+                            Some(id) if self.find_spec(id).is_some() => {
+                                self.mode = Mode::Normal;
+                                self.focus_attention_target(id);
+                            }
+                            Some(_) => self.set_flash("that pane is gone"),
+                            None => self.set_flash("no pane on that line"),
+                        }
+                    }
                     KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
                     _ => {}
                 }
@@ -3235,6 +3277,15 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// U25: the feed entry the overlay's cursor is on — `offset` counts back
+/// from the newest, and the renderer draws that entry on the window's last
+/// row (`render::feed_window`'s `end - 1`), so "selected" here and the
+/// marked row on screen are the same line by construction.
+pub fn feed_selected(feed: &VecDeque<FeedEntry>, offset: usize) -> Option<&FeedEntry> {
+    let last = feed.len().checked_sub(1)?;
+    feed.get(last - offset.min(last))
 }
 
 /// U19: stitch one wrapped run of grid rows back into the single logical
@@ -6277,7 +6328,7 @@ mod tests {
     fn feed_ring_evicts_the_oldest_entry_past_200() {
         let (mut app, _) = mk_app(shell_ws());
         for i in 0..(FEED_CAP + 5) {
-            app.push_feed(format!("entry {i}"), false);
+            app.push_feed(format!("entry {i}"), false, None);
         }
         assert_eq!(app.feed().len(), FEED_CAP);
         assert_eq!(app.feed().front().unwrap().text, "entry 5"); // oldest 5 evicted
@@ -6685,6 +6736,90 @@ mod tests {
         }
     }
 
+    /// U25: Enter on a feed entry focuses the pane it is about — the feed
+    /// listed what happened and then left you to go find it by hand. The
+    /// jump goes through the same helper Alt+a's ring uses, so it crosses
+    /// tabs and expands stacks like every other jump.
+    #[test]
+    fn feed_enter_focuses_the_selected_entrys_pane() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws()); // tab0: pane 1
+        app.apply(Action::NewTab); // tab1: pane 2, focused, active_tab=1
+        let far = app.focused;
+        assert_ne!(far, 1);
+        app.go_to_tab(0);
+        app.focused = 1;
+
+        // The newest entry is tab1's spawn; Enter on it crosses the tab.
+        app.apply(Action::ToggleFeed);
+        assert_eq!(feed_selected(app.feed(), 0).and_then(|e| e.pane), Some(far));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal), "the jump closes the feed");
+        assert_eq!(app.focused, far);
+        assert_eq!(app.ws.active_tab, 1, "the jump switched tabs, like Alt+a's");
+    }
+
+    /// U25: scrolling back selects an older entry, and Enter follows *that*
+    /// line — the marker the renderer draws and the entry Enter acts on are
+    /// the same row by construction.
+    #[test]
+    fn feed_enter_follows_the_scrolled_back_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let first = app.focused;
+        app.apply(Action::NewPane);
+        let second = app.focused;
+        app.apply(Action::ToggleFeed);
+        // Newest first: pane 2's spawn, then pane 1's below it.
+        assert_eq!(feed_selected(app.feed(), 0).and_then(|e| e.pane), Some(second));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(feed_selected(app.feed(), 1).and_then(|e| e.pane), Some(first));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.focused, first);
+    }
+
+    /// U25: lines that are about no live pane say so instead of jumping
+    /// somewhere arbitrary. A closed pane carries no id at all (`Alt+u` is
+    /// that line's recovery path, not a jump), and ids are recycled, so an
+    /// id that no longer resolves is re-checked before focus moves.
+    #[test]
+    fn feed_enter_on_a_line_with_no_live_pane_flashes_instead_of_jumping() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ClosePane); // newest line: "closed 2 …", pane None
+        let here = app.focused;
+        app.apply(Action::ToggleFeed);
+        assert_eq!(feed_selected(app.feed(), 0).and_then(|e| e.pane), None);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.flash(), Some("no pane on that line"));
+        assert_eq!(app.focused, here, "a dead line moves nothing");
+        assert!(matches!(app.mode, Mode::Feed { .. }), "and leaves the feed open");
+
+        // An id that no longer resolves to a pane is caught by the re-check.
+        let (mut app, _) = mk_app(shell_ws());
+        app.push_feed("ghost".into(), false, Some(999));
+        app.apply(Action::ToggleFeed);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.flash(), Some("that pane is gone"));
+        assert!(matches!(app.mode, Mode::Feed { .. }));
+    }
+
+    /// U25: an empty ring has nothing selected — Enter must not index into
+    /// it. (`feed_selected` is the only reader; this pins its degenerate
+    /// cases alongside the clamp `Up`/`PageUp` already rely on.)
+    #[test]
+    fn feed_selected_handles_an_empty_ring_and_clamps_past_the_oldest() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.feed.clear();
+        assert!(feed_selected(app.feed(), 0).is_none());
+        app.push_feed("a".into(), false, None);
+        app.push_feed("b".into(), false, None);
+        assert_eq!(feed_selected(app.feed(), 0).map(|e| e.text.clone()), Some("b".into()));
+        assert_eq!(feed_selected(app.feed(), 1).map(|e| e.text.clone()), Some("a".into()));
+        assert_eq!(feed_selected(app.feed(), 999).map(|e| e.text.clone()), Some("a".into()));
+    }
+
     #[test]
     fn other_alt_chords_close_the_feed_and_still_apply_globally() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -6702,7 +6837,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent};
         let (mut app, _) = mk_app(shell_ws());
         for i in 0..3 {
-            app.push_feed(format!("entry {i}"), false);
+            app.push_feed(format!("entry {i}"), false, None);
         }
         app.apply(Action::ToggleFeed);
         assert!(matches!(app.mode, Mode::Feed { offset: 0 }));

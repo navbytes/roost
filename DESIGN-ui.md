@@ -563,6 +563,16 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   since C24 while appearing in no hint and no help row, which is the same
   as not existing. Labels are deliberately terse (`ends`, `mark`) to buy
   the columns: the full wording lives one keystroke away under `Alt+?`.
+  **[Re-amended 2026-07-27, SPEC-ux U19]** `o open` joins the list after
+  `y/↵ yank` (92 columns with it — still inside the floor).
+- **[Amended 2026-07-27, SPEC-ux U20 — picker]:** the picker's list becomes
+  `↑↓ choose` · `↵ open` · `1..9 launch` · `Esc cancel` (48 columns).
+- **[Amended 2026-07-27, SPEC-ux U25 — feed]:** the feed's two-pair list
+  becomes `↑↓ select` · `PgUp/Dn page` · `↵ go to pane` · `q/Esc close`
+  (56 columns). `PgUp`/`PgDn` and `q` were **already implemented** and
+  advertised nowhere; `↵` is new (C20 amendment). `scroll` becomes `select`
+  because with an actionable entry the arrows move a cursor, not a view —
+  the hint has to name what the key now does.
 
 ### C10 — Flash message
 
@@ -917,6 +927,32 @@ extension events (`app.rs:1081`) or is polled from `StatusTracker`
 - Unit tests: ring cap eviction at 200; taxonomy hooks fire (status diff on
   tick, ctl entry on an audited control call, exit-suppression rule); the
   NeedsInput-line styling rule; offset clamping.
+
+**[Amended 2026-07-27, SPEC-ux U25 — entries are actionable]:** the feed
+told you what happened and then left you to go find it by hand, which for a
+fleet surface is half a feature.
+- **`FeedEntry` carries `pane: Option<PaneId>`** — the pane the line is
+  *about*. `Some` for `spawn`, `status` and `exit` (a dead pane is exactly
+  where you want to land); **`None`** for `close`/`reopened tab`/`ctl`: a
+  closed pane is gone and `Alt+u` is that line's recovery path, and a `ctl`
+  line is about a request, not a pane. The id is a jump target, not a
+  guarantee — ids are recycled (`next_pane_id` is a max+1), so Enter
+  re-checks the pane exists before moving.
+- **`Enter` focuses that pane** through `focus_attention_target` — the same
+  helper C19's ring uses — so a jump out of the feed switches tabs, expands
+  collapsed stacks and shows the float exactly like `Alt+a` does, and the
+  feed closes behind it. A line with no pane flashes `no pane on that
+  line`; a stale id flashes `that pane is gone`. Neither moves focus and
+  neither closes the overlay: a no-op you can see beats a silent one.
+- **The selected entry is the window's last row** — `offset` already means
+  "how many entries back from the newest", and `feed_window` ends at
+  `len − 1 − offset`, so the cursor the arrows move *is* the bottom visible
+  line. It is now marked: the row's leading column carries `❯` fg `ACCENT`
+  instead of a space (the C14 picker idiom, reused). Zero columns spent —
+  the leading space was already in the row rule — so `" HH:MM:SS  {text}"`
+  is otherwise untouched, `◆ ` prefix included.
+- Hint pairs per the C9 amendment; the arrows' label becomes `select`,
+  since with an actionable entry they move a cursor rather than a view.
 
 ### C21 — Pane zoom (Alt+z) — [Added 2026-07-22, fleet features]
 
@@ -1563,6 +1599,15 @@ unimplemented chord may never leave its letter in a name (live QA committed
 the title `abcwu`). These are mode-local, not entries in this table, and
 they do not consume the chords anywhere else. Cursor motion inside the
 buffer remains unimplemented.]
+
+[Amended 2026-07-27, SPEC-ux U17/U19/U20/U25 — mode-local keys. None of
+these are Alt chords, so none join the table above; they are listed here so
+the canonical page still knows they exist. Copy mode (C24): `w`/`b`/`e`
+word motions, `V` line select, `o` open the URL under the cursor, alongside
+the pre-existing `0`/`$`. Picker (C14): `1`..`9` launch that row. Feed
+(C20): `Enter` focuses the selected entry's pane, and the long-implemented
+`PgUp`/`PgDn`/`q` are now advertised. Every one of them is reachable from
+the C15 overlay's rows.]
 
 Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
 raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes

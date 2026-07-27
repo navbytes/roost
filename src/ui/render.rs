@@ -120,7 +120,15 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
         Mode::Scroll { .. } => {
             vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "exit")]
         }
-        Mode::Feed { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
+        // [Amended, U25] The feed's own working keys were missing from its
+        // own hint: PgUp/PgDn paged and `q` closed, both unadvertised, and
+        // Enter is new. A mode whose hint omits its keys has no keys.
+        Mode::Feed { .. } => vec![
+            ("↑↓", "select"),
+            ("PgUp/Dn", "page"),
+            ("↵", "go to pane"),
+            ("q/Esc", "close"),
+        ],
         Mode::Normal if focused_dead => {
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
         }
@@ -554,11 +562,23 @@ fn draw_feed_entries(f: &mut Frame, feed: &VecDeque<FeedEntry>, offset: usize, i
         return;
     }
     let range = feed_window(feed.len(), offset, inner.height as usize);
+    // U25: the window's last row IS the selected entry (`feed_window` ends
+    // at `len - 1 - offset`), so the marker can't drift from what Enter acts
+    // on — both read the same number.
+    let selected = range.end.saturating_sub(1);
     let lines: Vec<Line> = feed
         .iter()
+        .enumerate()
         .skip(range.start)
         .take(range.len())
-        .map(|e| Line::from(feed_entry_spans(&local_hh_mm_ss(e.at), &e.text, e.needs_input)))
+        .map(|(i, e)| {
+            Line::from(feed_entry_spans(
+                &local_hh_mm_ss(e.at),
+                &e.text,
+                e.needs_input,
+                i == selected,
+            ))
+        })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -581,8 +601,21 @@ fn feed_window(len: usize, offset: usize, rows: usize) -> std::ops::Range<usize>
 /// except a status line landing on NeedsInput, which gets the `◆ ` ACCENT
 /// prefix and FG text (the one red in the feed, same meaning as everywhere,
 /// C5). Pure so the exception is unit-tested without a `Frame`.
-fn feed_entry_spans(hhmmss: &str, text: &str, needs_input: bool) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(format!(" {hhmmss}  "), Style::default().fg(theme::DIM))];
+/// [Amended, U25] The row's leading column is now a selection marker: `❯`
+/// ACCENT on the entry Enter would act on, a space on every other row. Same
+/// `❯` idiom as the picker (C14), and it costs no columns — the leading
+/// space was already there.
+fn feed_entry_spans(
+    hhmmss: &str,
+    text: &str,
+    needs_input: bool,
+    selected: bool,
+) -> Vec<Span<'static>> {
+    let marker = if selected { theme::PICKER_SELECTED } else { ' ' };
+    let mut spans = vec![
+        Span::styled(marker.to_string(), Style::default().fg(theme::ACCENT)),
+        Span::styled(format!("{hhmmss}  "), Style::default().fg(theme::DIM)),
+    ];
     if needs_input {
         spans.push(Span::styled(
             format!("{} ", theme::GLYPH_NEEDS_INPUT),
@@ -1821,11 +1854,20 @@ mod tests {
         assert_ne!(dead, hint_pairs(&Mode::Normal, false, false));
     }
 
+    /// C20's list as amended by U25: every key the feed actually answers to.
+    /// PgUp/PgDn and `q` worked all along while appearing nowhere, and Enter
+    /// is new — the whole point of making entries actionable is that people
+    /// can tell they are.
     #[test]
-    fn hint_pairs_feed_mode_is_scroll_and_close() {
+    fn hint_pairs_feed_mode_lists_every_key_the_feed_answers_to() {
         assert_eq!(
             hint_pairs(&Mode::Feed { offset: 0 }, false, false),
-            vec![("↑↓", "scroll"), ("Esc", "close")]
+            vec![
+                ("↑↓", "select"),
+                ("PgUp/Dn", "page"),
+                ("↵", "go to pane"),
+                ("q/Esc", "close"),
+            ],
         );
     }
 
@@ -1930,24 +1972,40 @@ mod tests {
 
     #[test]
     fn feed_entry_spans_default_styling_is_dim_timestamp_muted_text() {
-        let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false);
+        let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false, false);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, " 12:34:56  spawned shell (shell)");
-        assert_eq!(spans[0].style.fg, Some(theme::DIM));
-        assert_eq!(spans[1].style.fg, Some(theme::MUTED));
+        assert_eq!(spans[1].style.fg, Some(theme::DIM));
+        assert_eq!(spans[2].style.fg, Some(theme::MUTED));
+    }
+
+    /// U25: the selected entry — the one Enter acts on — is marked, in the
+    /// leading column the unselected rows spend on a space, so the row's
+    /// width and every column after it are unchanged.
+    #[test]
+    fn feed_entry_spans_mark_the_selected_row_without_shifting_a_column() {
+        let plain = feed_entry_spans("12:34:56", "spawned shell", false, false);
+        let picked = feed_entry_spans("12:34:56", "spawned shell", false, true);
+        let text = |v: &[super::Span]| -> String { v.iter().map(|s| s.content.as_ref()).collect() };
+        assert_eq!(text(&picked), format!("{}12:34:56  spawned shell", theme::PICKER_SELECTED));
+        assert_eq!(text(&plain).chars().count(), text(&picked).chars().count());
+        assert_eq!(picked[0].style.fg, Some(theme::ACCENT));
+        // Everything past the marker is styled identically either way.
+        assert_eq!(picked[1].style, plain[1].style);
+        assert_eq!(picked[2].style, plain[2].style);
     }
 
     #[test]
     fn feed_entry_spans_needs_input_line_gets_the_accent_diamond_and_fg_text() {
-        let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true);
+        let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true, false);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             text,
             format!(" 12:34:56  {} pi: waiting → needs you", theme::GLYPH_NEEDS_INPUT)
         );
-        assert_eq!(spans[0].style.fg, Some(theme::DIM));
-        assert_eq!(spans[1].style.fg, Some(theme::ACCENT));
-        assert_eq!(spans[2].style.fg, Some(theme::FG));
+        assert_eq!(spans[1].style.fg, Some(theme::DIM));
+        assert_eq!(spans[2].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[3].style.fg, Some(theme::FG));
     }
 
     #[test]

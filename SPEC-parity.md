@@ -382,13 +382,25 @@ combining or VS16 sequence repeats only its base.*
 htop-class TUIs. **Contract:** implement the `b` arm (repeat last graphic
 char), part of the W6 vendored-parser batch.
 
-### P20 · CONFIRMED (inspection) · Low — mouse gestures don't latch to a pane
+### P20 · FIXED (this branch) · Low — mouse gestures don't latch to a pane
 Every mouse event is re-hit-tested, so a drag that crosses a border switches
 target mid-gesture (origin app never sees Up; neighbor gets orphan events);
 SGR coords also aren't clamped to the pane's right/bottom edge. Copy mode
 already latches — the pattern exists.
 **Contract:** latch button-down's pane until release (copy-mode style);
 clamp forwarded coords to the pane's inner grid.
+**Fixed:** `App::mouse_latch` holds the pane a button-down landed in;
+`handle_mouse` routes every subsequent Drag/Up to that pane wherever the
+pointer has wandered, and clears the latch on release. A Drag/Up with no
+latch behind it (the press landed on the tab bar, inside a modal, or off the
+body) is delivered to nobody rather than hit-tested into whatever sits under
+the pointer — that orphan delivery was the other half of the bug. Wheel and
+bare motion still hit-test, since neither is part of a button gesture; copy
+mode's own latch (`selection.pane`) is unchanged, this is the same rule for
+the forwarding path. `mouse::cell_in_pane` now clamps right and bottom as
+well as left and top, so a latched drag past its pane's edge reports the
+pane's last cell instead of a coordinate outside the grid the inner app
+believes it has.
 
 ### P21 · GAP · Low — no scrollback search, no dump-to-editor
 Every peer ships search; roost's only history export is `roost read --full`.

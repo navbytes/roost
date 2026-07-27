@@ -405,11 +405,25 @@ without the guard the clipped glyph is emitted). Golden frame added —
 a pane and asserts the host's grid carries each one intact, one wide cell plus
 an empty continuation apiece. (Amends DESIGN-ui C18, 2026-07-27.)
 
-### U25 · Low · OPEN — the feed can't act
+### U25 · Low · FIXED (this branch) — the feed can't act
 Feed entries aren't actionable (no jump-to-pane) and its hint omits its own
 working keys (PgUp/PgDn/q).
 **Proposed contract:** entries carry `PaneId`; Enter focuses that pane; hint
 lists the real keys.
+**Fixed:** `FeedEntry` carries `pane: Option<PaneId>` — `Some` for
+spawn/status/exit lines (a dead pane is exactly where you want to land),
+`None` for closes and `ctl` lines (a closed pane is gone, and `Alt+u`, not a
+jump, is that line's recovery path). Enter focuses it through
+`focus_attention_target`, the same helper Alt+a's ring uses, so the jump
+crosses tabs, expands stacks and shows the float like every other jump; ids
+are recycled, so it re-checks the pane exists first and otherwise flashes
+`that pane is gone` / `no pane on that line` without moving or closing.
+The selected entry is the window's last row by construction (`offset`
+already meant "entries back from the newest"), now marked with the picker's
+`❯` in the leading column the row rule already spent on a space — zero
+columns. The hint is the feed's real key set:
+`↑↓ select · PgUp/Dn page · ↵ go to pane · q/Esc close` (C20/C9 amended
+2026-07-27).
 
 ## New findings from the live session (not predicted by either review)
 
