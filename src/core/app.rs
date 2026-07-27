@@ -83,7 +83,10 @@ pub struct FeedEntry {
 const FLASH_WINDOW: Duration = Duration::from_secs(2);
 
 /// How long an armed destructive-close confirmation stays live: press the same
-/// key again within this window to actually close/quit.
+/// key again within this window to actually close/quit. A confirm's *flash*
+/// carries this same window (U22): the prompt must be visible for exactly as
+/// long as the second press would fire — the old FLASH_WINDOW-sized prompt
+/// left a silent final second where Alt+w/Alt+q still confirmed.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 /// How many closed panes/tabs the undo stack keeps.
@@ -198,13 +201,21 @@ pub struct App<B: PaneBackend> {
     alt_seen: bool,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
-    /// Transient status message shown in the hint bar (e.g. "copied").
-    flash: Option<(String, Instant)>,
+    /// Transient status message shown in the hint bar (e.g. "copied"), with
+    /// the window it stays visible for: `FLASH_WINDOW` for ordinary notices,
+    /// `CONFIRM_WINDOW` for confirm-arm prompts (U22 — prompt and arm live
+    /// exactly as long as each other; the window doubles as the marker that
+    /// tells a confirm prompt apart, see `clear_confirm_flash`).
+    flash: Option<(String, Instant, Duration)>,
     /// Recently closed panes/tabs, for `Alt+u` undo (most-recent last).
     undo: Vec<Closed>,
     /// When a destructive close (busy pane / last pane) has been armed and is
     /// awaiting a confirming second keypress.
     confirm_close: Option<Instant>,
+    /// When a busy-fleet quit (U1) has been armed and is awaiting a
+    /// confirming second Alt+q. Separate from `confirm_close` so an armed
+    /// close can never confirm a quit (or vice versa).
+    confirm_quit: Option<Instant>,
     /// Per-spawn secret handed to each pane's child via `ROOST_TOKEN`. A
     /// socket message is only honored if its token matches the one issued to
     /// the pane it claims to be — so a process in one pane can't spoof another
@@ -290,6 +301,7 @@ impl<B: PaneBackend> App<B> {
             flash: None,
             undo: Vec::new(),
             confirm_close: None,
+            confirm_quit: None,
             tokens: HashMap::new(),
             control_token,
             waiters: Vec::new(),
@@ -1571,22 +1583,43 @@ impl<B: PaneBackend> App<B> {
         if text.is_empty() {
             return None;
         }
-        self.flash =
-            Some((format!("copied {} chars", text.chars().count()), Instant::now()));
+        self.set_flash(format!("copied {} chars", text.chars().count()));
         Some(text)
     }
 
     /// Set a transient hint-bar message (e.g. a startup notice).
     pub fn set_flash(&mut self, msg: impl Into<String>) {
-        self.flash = Some((msg.into(), Instant::now()));
+        self.flash = Some((msg.into(), Instant::now(), FLASH_WINDOW));
+    }
+
+    /// Set a confirm-arm prompt ("… again to close/quit"). Carries
+    /// `CONFIRM_WINDOW`, not `FLASH_WINDOW`: the prompt must stay visible for
+    /// exactly as long as the second press would still fire (U22 — the old
+    /// 2s flash under a 3s arm left a silent final second that accepted a
+    /// destructive confirm with no visible prompt).
+    fn set_confirm_flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), Instant::now(), CONFIRM_WINDOW));
+    }
+
+    /// Drop a confirm-arm prompt from the bar, if that's what's showing.
+    /// U22's contract read in both directions: when the arm dies early (a
+    /// confirmed second press, or any other action disarming it), its prompt
+    /// must die with it — a visible "again to close" with nothing armed is
+    /// the mismatch lie inverted. Only `set_confirm_flash` produces
+    /// `CONFIRM_WINDOW`-sized flashes, so the window is the marker; an
+    /// ordinary flash some action just set is left alone.
+    fn clear_confirm_flash(&mut self) {
+        if self.flash.as_ref().is_some_and(|(_, _, w)| *w == CONFIRM_WINDOW) {
+            self.flash = None;
+        }
     }
 
     /// Current transient hint-bar message, if still within its window.
     pub fn flash(&self) -> Option<&str> {
         self.flash
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < FLASH_WINDOW)
-            .map(|(m, _)| m.as_str())
+            .filter(|(_, at, window)| at.elapsed() < *window)
+            .map(|(m, _, _)| m.as_str())
     }
 
     /// The URL under inner cell (row, col) of pane `id`, if any (for
@@ -1667,6 +1700,23 @@ impl<B: PaneBackend> App<B> {
     // -- actions -----------------------------------------------------------
 
     pub fn apply(&mut self, action: Action) {
+        // Any action other than a repeated close/quit disarms that pending
+        // confirmation, so a stale "press again" can't leak onto a later
+        // key — and a disarmed confirm's prompt goes with it (U22: prompt
+        // and arm live and die together). Runs BEFORE the action: a confirm
+        // the action itself arms below sets a fresh prompt that must not be
+        // swept up with the stale one (Alt+w-armed then Alt+q must leave
+        // the quit's own prompt standing).
+        let mut disarmed = false;
+        if !matches!(action, Action::ClosePane) {
+            disarmed |= self.confirm_close.take().is_some();
+        }
+        if !matches!(action, Action::Quit) {
+            disarmed |= self.confirm_quit.take().is_some();
+        }
+        if disarmed {
+            self.clear_confirm_flash();
+        }
         // C21/C22: a structural layout action must not change the tab
         // invisibly behind a full-screen zoomed pane, nor target the float
         // (which lives outside the layout tree — leaving it focused here is
@@ -1691,7 +1741,7 @@ impl<B: PaneBackend> App<B> {
             self.hide_float();
         }
         match action {
-            Action::Quit => self.quit = true,
+            Action::Quit => self.quit_guarded(),
             Action::NewPane => self.new_pane_with("shell"),
             Action::ClosePane => self.close_pane(),
             Action::Focus(dir) => self.focus_dir(dir),
@@ -1741,7 +1791,7 @@ impl<B: PaneBackend> App<B> {
                 // floating full-focus surface) — refuse rather than hide it
                 // and zoom whatever's behind it.
                 if self.float_focused() {
-                    self.flash = Some(("can't zoom the float".into(), Instant::now()));
+                    self.set_flash("can't zoom the float");
                 } else {
                     self.toggle_zoom();
                 }
@@ -1750,11 +1800,6 @@ impl<B: PaneBackend> App<B> {
             Action::ToggleFeed => self.toggle_feed(),
             Action::ToggleFloat => self.toggle_float(),
             Action::ToggleRaw => self.toggle_raw(),
-        }
-        // Any action other than a repeated close disarms a pending close
-        // confirmation, so a stale "press again" can't leak onto a later key.
-        if !matches!(action, Action::ClosePane) {
-            self.confirm_close = None;
         }
         self.relayout();
         self.save();
@@ -1771,7 +1816,7 @@ impl<B: PaneBackend> App<B> {
     /// Reopen the most recently closed pane or tab, resuming its session.
     fn undo_close(&mut self) {
         let Some(closed) = self.undo.pop() else {
-            self.flash = Some(("nothing to reopen".into(), Instant::now()));
+            self.set_flash("nothing to reopen");
             return;
         };
         match closed {
@@ -1783,7 +1828,7 @@ impl<B: PaneBackend> App<B> {
                 self.spawn_active_tab();
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.push_feed(format!("reopened tab {name}"), false);
-                self.flash = Some(("reopened tab".into(), Instant::now()));
+                self.set_flash("reopened tab");
             }
             Closed::Pane { tab_index, spec } => {
                 // Restore into its original tab if it still exists, else the
@@ -1794,7 +1839,7 @@ impl<B: PaneBackend> App<B> {
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.restore_pane(spec);
                 self.push_feed(format!("reopened {name}"), false);
-                self.flash = Some(("reopened pane".into(), Instant::now()));
+                self.set_flash("reopened pane");
             }
         }
     }
@@ -1934,22 +1979,23 @@ impl<B: PaneBackend> App<B> {
         // turn, and closing the last pane quits roost outright (which undo
         // can't recover). In those cases, arm a confirmation and require a
         // second Alt+w within the window; a non-busy pane closes immediately
-        // (undo covers an accidental one).
-        let is_working =
-            self.runtimes.get(&id).map(|rt| rt.status() == AgentStatus::Working).unwrap_or(false);
+        // (undo covers an accidental one). Busy is `Working || NeedsInput`
+        // (U12): an agent blocked on your approval is mid-turn all the same.
+        let is_busy = self.runtimes.get(&id).map(|rt| is_busy(rt.status())).unwrap_or(false);
         let would_quit = self.ws.tabs.len() == 1 && self.ws.active_tab().panes.len() == 1;
         let armed = self.confirm_close.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
-        if (is_working || would_quit) && !armed {
+        if (is_busy || would_quit) && !armed {
             self.confirm_close = Some(Instant::now());
             let msg = if would_quit {
                 "last pane — Alt+w again to quit roost"
             } else {
                 "agent busy — Alt+w again to close"
             };
-            self.flash = Some((msg.into(), Instant::now()));
+            self.set_confirm_flash(msg);
             return;
         }
         self.confirm_close = None;
+        self.clear_confirm_flash(); // the arm was consumed; its prompt dies with it (U22)
 
         // The actual removal (kill the runtime, capture undo, fix up
         // tab/focus bookkeeping) is close_pane_id's job — shared with the
@@ -1960,6 +2006,24 @@ impl<B: PaneBackend> App<B> {
         if would_quit {
             self.quit = true;
         }
+    }
+
+    /// Alt+q. U1: quitting kills every pane's process at once, so it gets
+    /// the same second-press machinery as `close_pane`'s busy guard — while
+    /// any pane is busy (`Working || NeedsInput`, the shared U12 predicate),
+    /// the first press arms and prompts; the second within the window quits.
+    /// A quiet fleet still quits instantly: sessions resume on relaunch, so
+    /// there's nothing in flight to protect.
+    fn quit_guarded(&mut self) {
+        let busy = self.runtimes.values().filter(|rt| is_busy(rt.status())).count();
+        let armed = self.confirm_quit.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
+        if busy > 0 && !armed {
+            self.confirm_quit = Some(Instant::now());
+            let noun = if busy == 1 { "agent" } else { "agents" };
+            self.set_confirm_flash(format!("{busy} {noun} busy — Alt+q again to quit"));
+            return;
+        }
+        self.quit = true;
     }
 
     fn new_tab(&mut self) {
@@ -2044,7 +2108,7 @@ impl<B: PaneBackend> App<B> {
         }
         let ring = self.attention_ring();
         if ring.is_empty() {
-            self.flash = Some(("nothing needs you".into(), Instant::now()));
+            self.set_flash("nothing needs you");
             return;
         }
         let next = match ring.iter().position(|&id| id == self.focused) {
@@ -2053,7 +2117,7 @@ impl<B: PaneBackend> App<B> {
         };
         if next == self.focused {
             // The only ring member is the pane we're already on.
-            self.flash = Some(("nothing else needs you".into(), Instant::now()));
+            self.set_flash("nothing else needs you");
             return;
         }
         self.focus_attention_target(next);
@@ -2089,7 +2153,7 @@ impl<B: PaneBackend> App<B> {
     fn cycle_layout(&mut self) {
         let order = self.pane_order();
         if order.len() < 2 {
-            self.flash = Some(("one pane — nothing to arrange".into(), Instant::now()));
+            self.set_flash("one pane — nothing to arrange");
             return;
         }
         let focused = self.focused;
@@ -2103,7 +2167,7 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
         }
-        self.flash = Some(("no room to rearrange".into(), Instant::now()));
+        self.set_flash("no room to rearrange");
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -2133,7 +2197,7 @@ impl<B: PaneBackend> App<B> {
         }
         let body = self.body_area();
         if !Self::float_fits(body) {
-            self.flash = Some(("no room for float".into(), Instant::now()));
+            self.set_flash("no room for float");
             return;
         }
         match &mut self.float {
@@ -2207,7 +2271,7 @@ impl<B: PaneBackend> App<B> {
         } else {
             self.pane_order().first().copied().unwrap_or(0)
         };
-        self.flash = Some(("scratch closed".into(), Instant::now()));
+        self.set_flash("scratch closed");
     }
 
     // -- raw pass-through (C23) -----------------------------------------------
@@ -2397,7 +2461,7 @@ impl<B: PaneBackend> App<B> {
                             // of `self.mode` has already ended.
                             self.pending_yank = self.finish_selection();
                         } else {
-                            self.flash = Some(("nothing selected".into(), Instant::now()));
+                            self.set_flash("nothing selected");
                         }
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
@@ -2535,6 +2599,14 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
+}
+
+/// U12's busy predicate, shared by the Alt+w and Alt+q destructive guards so
+/// the two can never disagree about what "busy" means: an agent mid-turn is
+/// one actively producing (`Working`) *or* blocked on your approval
+/// (`NeedsInput`) — closing either loses the in-flight turn.
+fn is_busy(status: AgentStatus) -> bool {
+    matches!(status, AgentStatus::Working | AgentStatus::NeedsInput)
 }
 
 /// C20: the feed overlay's `(width, height)` at the given body area —
@@ -2684,6 +2756,109 @@ mod tests {
         assert_eq!(app.runtimes.len(), 2);
         app.apply(Action::ClosePane); // confirmed ⇒ closed
         assert_eq!(app.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn closing_a_needs_input_pane_needs_a_confirming_second_press() {
+        // U12: an agent blocked on your approval (◆) is mid-turn all the
+        // same — the close guard's busy predicate is Working || NeedsInput,
+        // not Working alone.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ClosePane); // armed, not closed
+        assert_eq!(app.runtimes.len(), 2);
+        app.apply(Action::ClosePane); // confirmed ⇒ closed
+        assert_eq!(app.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn quit_with_a_quiet_fleet_is_instant() {
+        // U1: the guard protects in-flight turns; a quiet fleet has none —
+        // sessions resume on relaunch, so Alt+q stays a single press.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_with_a_busy_pane_arms_then_a_second_press_quits() {
+        // U1: closing one busy pane double-confirms, so killing the whole
+        // fleet must too — first press arms + prompts, second quits.
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_pty_output(1, b"x"); // Working
+        app.apply(Action::Quit);
+        assert!(!app.quit);
+        assert_eq!(app.flash(), Some("1 agent busy — Alt+q again to quit"));
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_guard_counts_needs_input_panes_and_pluralizes() {
+        // U1 counts with U12's predicate: a ◆ pane is as mid-turn as a
+        // working one, and the prompt reports how much is at stake.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.on_pty_output(1, b"x"); // Working
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::Quit);
+        assert!(!app.quit);
+        assert_eq!(app.flash(), Some("2 agents busy — Alt+q again to quit"));
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn another_action_disarms_the_quit_confirm_and_drops_its_prompt() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_pty_output(1, b"x"); // Working
+        app.apply(Action::Quit); // armed
+        assert!(app.flash().is_some());
+        app.apply(Action::ToggleHints); // any other action disarms...
+        assert_eq!(app.flash(), None, "the confirm prompt dies with its arm (U22)");
+        app.apply(Action::Quit); // ...so the next Alt+q re-arms, not quits
+        assert!(!app.quit);
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn an_armed_close_never_confirms_a_quit_nor_vice_versa() {
+        // The two confirms are separate state: Alt+w-then-Alt+q must not
+        // treat the close arm as the quit's first press (or the other way
+        // around) — each destructive path earns its own second press.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // Working
+        app.apply(Action::ClosePane); // close armed
+        app.apply(Action::Quit); // must ARM the quit, not confirm-quit
+        assert!(!app.quit);
+        // ...and the quit press disarmed the close: the next Alt+w re-arms
+        // instead of closing.
+        app.apply(Action::ClosePane);
+        assert_eq!(app.runtimes.len(), 2);
+    }
+
+    #[test]
+    fn confirm_flash_lives_exactly_as_long_as_its_confirm_window() {
+        // U22: FLASH_WINDOW (2s) < CONFIRM_WINDOW (3s) used to leave a
+        // silent final second where the second press still fired. A confirm
+        // prompt now carries the confirm window itself; ordinary flashes
+        // keep FLASH_WINDOW; a consumed arm takes its prompt down with it.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // Working
+        app.apply(Action::ClosePane); // armed
+        assert_eq!(app.flash.as_ref().unwrap().2, CONFIRM_WINDOW);
+        app.apply(Action::ClosePane); // confirmed ⇒ closed, prompt gone
+        assert_eq!(app.flash(), None);
+        app.set_flash("copied 3 chars");
+        assert_eq!(app.flash.as_ref().unwrap().2, FLASH_WINDOW);
     }
 
     #[test]

@@ -584,13 +584,43 @@ fn ux_navigation_session() {
     settle(&mut h);
     qa.check(pane_count(&sd) == n, "Alt+u restored the closed pane");
 
-    // quit: with a pane actively producing output, Alt+q must be instant
+    // quit guard (U1): with a pane actively producing output, an Alt+q must
+    // ARM a second-press confirm — roost stays up and the prompt is on the
+    // bar — and the second press within the window quits. (Before the
+    // guard, one press killed the fleet in ~318 ms.) Delivery hardening,
+    // not behavior fudging: the chord's ESC+'q' form can straddle reads
+    // under full-tilt firehose load and degrade to Esc + a literal q (the
+    // same split N3 documents for ESC+'P'), so the arming press retries
+    // until the prompt is visibly up — bailing out the moment roost dies,
+    // which is exactly the U1 bug. The prompt poll sits well inside the
+    // confirm window, which now equals the flash window (U22).
+    h.write_bytes(&[0x15]); // clear any stray chars off the shell line
     h.write_bytes(b"seq 1 100000\r");
     std::thread::sleep(Duration::from_millis(300));
+    let mut armed = false;
+    for _ in 0..3 {
+        h.write_bytes(&alt(b'q'));
+        if h
+            .wait_for(Duration::from_millis(1200), |s| s.contents().contains("again to quit"))
+            .is_some()
+        {
+            armed = true;
+            break;
+        }
+        if !harness::is_alive(h.pid()) {
+            break; // quit on a lone press: the U1 regression itself
+        }
+    }
+    qa.check(
+        harness::is_alive(h.pid()),
+        "Alt+q mid-firehose arms a confirm instead of quitting (U1)",
+    );
+    qa.check(armed, "the armed quit shows its second-press prompt on the bar (U1/U22)");
     let quit = h.quit_and_wait(Duration::from_secs(5));
-    qa.obs(&format!(
-        "Alt+q mid-firehose (agent 'working'): quit with NO confirmation in {quit:?}"
-    ));
+    qa.check(
+        quit.is_some(),
+        &format!("second Alt+q within the window quits cleanly ({quit:?})"),
+    );
 
     println!("\n==== QA SUMMARY: {} bug(s) ====", qa.bugs.len());
     for b in &qa.bugs {

@@ -24,13 +24,18 @@ Severity is impact for roost's target user: someone running a fleet of AI agents
 
 ## P0 — both review lenses agreed independently
 
-### U1 · High · VERIFIED — Alt+q kills the fleet unguarded
+### U1 · High · FIXED (this branch) — Alt+q kills the fleet unguarded
 Closing one busy pane double-confirms (`app.rs` `confirm_close`), but Alt+q
 quits instantly — live QA quit in ~318 ms while a pane was mid-firehose. ESC+`q`
 fusion can synthesize the chord (documented in `tests/live_qa.rs`).
 **Proposed contract:** when any pane is `Working` (or `NeedsInput`, see U12),
 arm the existing second-press confirm: flash `N agents working — Alt+q again to
 quit`. Instant quit stays when the fleet is quiet.
+**Fixed:** `App::quit_guarded` arms a separate `confirm_quit` with the same
+machinery as busy-close whenever any pane is busy (U12's `Working ||
+NeedsInput` predicate, shared `is_busy`), flashing `N agent(s) busy — Alt+q
+again to quit` ("busy", matching the Alt+w flash family, since the guard
+covers ◆ too); a quiet fleet still quits on one press.
 
 ### U2 · High · VERIFIED — panes have no identity on fleet surfaces
 Live feed frame: `spawned shell (shell)` ×2 and `shell: working → your turn` ×4,
@@ -124,10 +129,12 @@ the first pane, so those halves are pinned by code, not frames.
 **Proposed contract:** same-tab digit is a no-op; each tab remembers
 `last_focused` (session-only) and returns to it.
 
-### U12 · Med · OPEN — `◆ NeedsInput` panes close without the busy guard
+### U12 · Med · FIXED (this branch) — `◆ NeedsInput` panes close without the busy guard
 The Alt+w confirm checks only `Working`; an agent blocked on your approval is
 mid-turn all the same.
 **Proposed contract:** the guard predicate is `Working || NeedsInput`.
+**Fixed:** `close_pane`'s guard now uses the shared `is_busy` predicate
+(`Working || NeedsInput`), the same one Alt+q's U1 guard counts with.
 
 ### U13 · Med · OPEN — tab summary has no Exited state
 A background tab full of dead agents shows a blank glyph (SPEC-GAP-2,
@@ -182,13 +189,17 @@ No border drag-resize, no middle-click close, no drag-reorder.
 **Proposed contract:** drag a shared border to resize; middle-click closes a
 tab through the same confirm guard.
 
-### U22 · Low · OPEN — busy-close confirm fires on heuristic Working; window mismatch
+### U22 · Low · OPEN (window mismatch FIXED, this branch) — busy-close confirm fires on heuristic Working; window mismatch
 Any PTY output in the last ~2 s counts as Working, so closing a shell right
 after your own `ls` double-prompts (the live QA script codes around this); the
 confirm stays armed 3 s but its flash dies at 2 s — a final second accepts the
 second press with no visible prompt.
 **Proposed contract:** confirm only on extension-confirmed Working (or exempt
 `shell`); flash window == confirm window for confirm flashes.
+**Fixed (window half only):** flashes now carry their own window — confirm
+prompts live exactly `CONFIRM_WINDOW`, and a confirm that dies early (consumed
+second press, or disarmed by another action) takes its prompt down with it.
+The heuristic-Working half stays OPEN.
 
 ### U23 · Low · VERIFIED — help overlay teaches chords, nothing else
 Live QA: the overlay contains no status-glyph legend (`●◆○·✕` — the product's
