@@ -40,8 +40,13 @@ version = "1.0.5"
 [dependencies.log]
 version = "0.4.17"
 
+# roost (SPEC-parity P17): pinned to the *workspace's* unicode-width, not
+# upstream's 0.1.10. roost and ratatui measure cells with 0.2; a parser on
+# 0.1.x disagrees per glyph (VS16 emoji-presentation sequences changed width
+# between the two tables), which desyncs grid bookkeeping, the blit, and mouse
+# hitboxes. One table for the whole process is the contract.
 [dependencies.unicode-width]
-version = "0.1.10"
+version = "0.2"
 
 [dependencies.vte]
 version = "0.11.0"

@@ -1,6 +1,10 @@
 use unicode_width::UnicodeWidthChar as _;
+use unicode_width::UnicodeWidthStr;
 
 const CODEPOINTS_IN_CELL: usize = 6;
+
+/// Enough room for every codepoint a cell can hold, UTF-8 encoded.
+const CELL_UTF8_CAP: usize = CODEPOINTS_IN_CELL * 4;
 
 /// Represents a single terminal cell.
 #[derive(Clone, Debug, Default, Eq)]
@@ -40,10 +44,40 @@ impl Cell {
         self.attrs = a;
     }
 
-    pub(crate) fn append(&mut self, c: char) {
+    /// roost (SPEC-parity P17): measure the cell the way the *embedder* does
+    /// — `UnicodeWidthStr` over the whole cell, not `UnicodeWidthChar` over
+    /// the base char. unicode-width 0.2 scores an emoji-presentation sequence
+    /// (base char + VS16) as two columns, a fact only visible once the whole
+    /// cell is measured as a string. Renderers (roost's blit, ratatui) measure
+    /// exactly this string, so this is the one measurement that cannot
+    /// disagree with them. Allocation-free: a cell holds at most
+    /// `CODEPOINTS_IN_CELL` codepoints.
+    fn contents_width(&self) -> usize {
+        let mut buf = [0u8; CELL_UTF8_CAP];
+        let mut len = 0;
+        for c in self.contents.iter().take(self.len()) {
+            // `contents` holds at most CODEPOINTS_IN_CELL chars and each
+            // encodes to at most 4 bytes, so `buf` always has room.
+            len += c.encode_utf8(&mut buf[len..]).len();
+        }
+        // every byte was written by `char::encode_utf8`, so this is UTF-8
+        std::str::from_utf8(&buf[..len]).map_or(0, UnicodeWidthStr::width)
+    }
+
+    /// Appends a zero-width codepoint (combining mark, variation selector).
+    ///
+    /// roost (SPEC-parity P17): returns `true` when the append pushed a cell
+    /// that is still flagged narrow past one column — an emoji-presentation
+    /// sequence completing. The flag is deliberately **not** set here: only
+    /// the caller owns the grid, and a cell may not be marked wide unless the
+    /// cell to its right can be claimed as the continuation (a wide flag with
+    /// no continuation cell is an invariant break the grid would later
+    /// dereference). See `Screen::widen_cell`.
+    #[must_use]
+    pub(crate) fn append(&mut self, c: char) -> bool {
         let len = self.len();
         if len >= CODEPOINTS_IN_CELL {
-            return;
+            return false;
         }
         if len == 0 {
             // 0 is always less than 6
@@ -55,6 +89,15 @@ impl Cell {
         // we already checked that len < CODEPOINTS_IN_CELL
         self.contents[len] = c;
         self.len += 1;
+
+        !self.is_wide() && self.contents_width() > 1
+    }
+
+    /// roost (SPEC-parity P17): mark a cell wide after the fact, once the
+    /// caller has claimed its continuation cell. Only ever widens — a cell
+    /// never narrows, so the grid's continuation bookkeeping stays consistent.
+    pub(crate) fn promote_wide(&mut self) {
+        self.set_wide(true);
     }
 
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {

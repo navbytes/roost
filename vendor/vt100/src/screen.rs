@@ -1014,6 +1014,10 @@ impl Screen {
 
         if width == 0 {
             if pos.col > 0 {
+                // roost (SPEC-parity P17): track which column the appended
+                // codepoint actually landed in — a completed emoji-
+                // presentation sequence has to widen *that* cell.
+                let mut base_col = pos.col - 1;
                 let mut prev_cell = self
                     .grid_mut()
                     .drawing_cell_mut(crate::grid::Pos {
@@ -1026,6 +1030,7 @@ impl Screen {
                     // checked for pos.col > 0.
                     .unwrap();
                 if prev_cell.is_wide_continuation() {
+                    base_col = pos.col - 2;
                     prev_cell = self
                         .grid_mut()
                         .drawing_cell_mut(crate::grid::Pos {
@@ -1040,7 +1045,13 @@ impl Screen {
                         // the first half of the wide character before it.
                         .unwrap();
                 }
-                prev_cell.append(c);
+                let wants_wide = prev_cell.append(c);
+                // roost (SPEC-parity P17): the sequence just became two
+                // columns wide. Claim the continuation and step the cursor
+                // past it, exactly as a natively-wide char does.
+                if wants_wide && self.widen_cell(pos.row, base_col) {
+                    self.grid_mut().col_inc(1);
+                }
             } else if pos.row > 0 {
                 let prev_row = self
                     .grid()
@@ -1080,7 +1091,13 @@ impl Screen {
                             // character before it.
                             .unwrap();
                     }
-                    prev_cell.append(c);
+                    // roost (SPEC-parity P17): a promotion is refused here by
+                    // construction — the base cell is the previous row's last
+                    // column, so there is no cell to its right to claim. The
+                    // sequence stays one column, which is the pre-P17
+                    // behavior and the same pragmatism upstream applies to
+                    // wide chars that don't fit at a row's end.
+                    let _ = prev_cell.append(c);
                 }
             }
         } else {
@@ -1206,6 +1223,58 @@ impl Screen {
                 self.grid_mut().col_inc(1);
             }
         }
+    }
+
+    /// roost (SPEC-parity P17): promote an already-drawn cell from one column
+    /// to two, claiming the cell to its right as the wide continuation.
+    ///
+    /// Emoji-presentation sequences (base char + VS16) measure two columns
+    /// under unicode-width 0.2 — the table roost and ratatui use — but reach
+    /// the parser as a printable char followed by a zero-width one, so the
+    /// grid only learns the true width when the VS16 lands. Returns whether
+    /// the promotion happened: it is refused when the row has no cell to the
+    /// right to give up, leaving the sequence one column wide (the pre-P17
+    /// behavior). Refusing rather than half-promoting is load-bearing — a
+    /// wide flag without a continuation cell is an invariant the grid later
+    /// dereferences unconditionally.
+    fn widen_cell(&mut self, row: u16, col: u16) -> bool {
+        let size = self.grid().size();
+        if col + 1 >= size.cols {
+            return false;
+        }
+        let next_pos = crate::grid::Pos { row, col: col + 1 };
+
+        // A wide char may already straddle the cell we are claiming; its own
+        // continuation would be orphaned, so clear it first (the same repair
+        // `text` performs when a narrow char lands on a wide one).
+        let next_was_wide = self
+            .grid()
+            .drawing_cell(next_pos)
+            .is_some_and(crate::cell::Cell::is_wide);
+        if next_was_wide {
+            let orphan_pos = crate::grid::Pos { row, col: col + 2 };
+            if let Some(orphan) = self.grid_mut().drawing_cell_mut(orphan_pos)
+            {
+                orphan.clear(crate::attrs::Attrs::default());
+                orphan.set_wide_continuation(false);
+            }
+        }
+
+        if let Some(next) = self.grid_mut().drawing_cell_mut(next_pos) {
+            next.clear(crate::attrs::Attrs::default());
+            next.set_wide_continuation(true);
+        }
+        if let Some(base) =
+            self.grid_mut().drawing_cell_mut(crate::grid::Pos { row, col })
+        {
+            base.promote_wide();
+        }
+        if next_pos.col == size.cols - 1 {
+            if let Some(r) = self.grid_mut().drawing_row_mut(row) {
+                r.wrap(false);
+            }
+        }
+        true
     }
 
     // control codes
@@ -2356,5 +2425,92 @@ mod roost_tests {
         p.process(b"\x1b]9;hi\x07");
         assert_eq!(p.screen().audible_bell_count(), before);
         assert_eq!(p.take_effects().len(), 1);
+    }
+
+    // -- one width table for the process (SPEC-parity P17) ----------------
+
+    /// How many columns the grid actually gave a string: the cursor's advance
+    /// from a known-empty row.
+    fn grid_cols(bytes: &[u8]) -> u16 {
+        let mut p = parser();
+        p.process(bytes);
+        p.screen().cursor_position().1
+    }
+
+    /// The embedder's measurement — literally the crate roost and ratatui
+    /// call. If this and `grid_cols` ever disagree, the blit and the mouse
+    /// hitboxes disagree with the grid, which is P17.
+    fn embedder_cols(s: &str) -> u16 {
+        u16::try_from(unicode_width::UnicodeWidthStr::width(s)).unwrap()
+    }
+
+    #[test]
+    fn grid_and_embedder_measure_the_same_columns() {
+        // VS16 emoji-presentation sequences are the pair that changed between
+        // unicode-width 0.1.14 (grid, pre-P17) and 0.2 (renderer): measured
+        // before the fix, "❤\u{fe0f}" was 2 cols to the renderer and 1 to the
+        // grid, so the next glyph landed at col 1 and every hitbox after it
+        // was off by one.
+        for s in [
+            "\u{2764}\u{fe0f}", // VS16 heart
+            "\u{26a0}\u{fe0f}", // VS16 warning sign
+            "\u{2714}\u{fe0f}", // VS16 check mark
+            "\u{65e5}",         // CJK
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}",  // natively-wide emoji
+            "\u{2764}",   // bare heart: still one column
+            "a\u{0301}",  // combining acute: still one column
+            "ascii",      //
+            "\u{2764}\u{fe0e}", // VS15 text presentation: one column
+        ] {
+            assert_eq!(
+                grid_cols(s.as_bytes()),
+                embedder_cols(s),
+                "column disagreement for {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vs16_sequence_occupies_a_real_wide_cell() {
+        let mut p = parser();
+        p.process("\u{2764}\u{fe0f}X".as_bytes());
+        let s = p.screen();
+        let base = s.cell(0, 0).unwrap();
+        assert_eq!(base.contents(), "\u{2764}\u{fe0f}");
+        assert!(base.is_wide(), "the sequence must own two cells");
+        assert!(s.cell(0, 1).unwrap().is_wide_continuation());
+        assert!(s.cell(0, 1).unwrap().contents().is_empty());
+        // the following glyph starts after the continuation, not on top of it
+        assert_eq!(s.cell(0, 2).unwrap().contents(), "X");
+        // and the row reads back with no injected filler
+        assert_eq!(s.contents().lines().next().unwrap(), "\u{2764}\u{fe0f}X");
+    }
+
+    #[test]
+    fn widening_a_vs16_sequence_repairs_the_wide_char_it_displaces() {
+        // The cell claimed as the continuation may already hold a wide char
+        // from an earlier draw; leaving its own continuation behind would
+        // orphan a cell the grid later dereferences.
+        let mut p = parser();
+        p.process("\u{65e5}\u{672c}\x1b[H\u{2764}\u{fe0f}".as_bytes());
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().is_wide());
+        assert!(s.cell(0, 1).unwrap().is_wide_continuation());
+        assert!(!s.cell(0, 2).unwrap().is_wide_continuation());
+    }
+
+    #[test]
+    fn a_vs16_sequence_with_no_room_stays_one_column() {
+        // Last column: there is no cell to claim, so the sequence stays
+        // narrow rather than leaving a wide flag with no continuation.
+        let mut p = crate::Parser::new(2, 3, 0);
+        p.process("ab\u{2764}\u{fe0f}".as_bytes());
+        let s = p.screen();
+        assert!(!s.cell(0, 2).unwrap().is_wide());
+        assert_eq!(s.cell(0, 2).unwrap().contents(), "\u{2764}\u{fe0f}");
+        // and printing over it afterwards must not panic
+        p.process(b"\x1b[Hz");
+        assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "z");
     }
 }

@@ -317,7 +317,15 @@ leans on dim for secondary text — panes flatten into equal-weight walls.
 **Contract:** add dim/strikethrough to the vendored `Attrs` + SGR arms and map
 to ratatui `Modifier::DIM`/`CROSSED_OUT`.
 
-### P17 · CONFIRMED · Low-Med — unicode-width table skew (0.1.14 vs 0.2.0)
+### P17 · FIXED (this branch) · Low-Med — unicode-width table skew (0.1.14 vs 0.2.0)
+*Fixed: the vendored parser is pinned to the workspace's unicode-width 0.2, and
+cells are now measured as *strings* (`Cell::contents_width`) rather than by the
+base char alone — the only way an emoji-presentation sequence (base + VS16)
+scores the 2 columns the renderer already gives it. `Screen::widen_cell`
+promotes such a cell once the VS16 lands, claiming its continuation (and
+refusing at a row's end, where there is nothing to claim, rather than leaving a
+wide flag with no continuation). Measured after: `"❤️"` is 2 cols to both, and
+the next glyph lands at col 2, not col 1.*
 The vendored vt100 measures with unicode-width 0.1.14 while roost/ratatui use
 0.2.0 — VS16 emoji widths changed between them. Measured: `"❤️"` is 2 cols
 to the renderer, 1 col to the grid (following char landed at col 1) — grid
