@@ -113,6 +113,9 @@ pub struct Attrs {
     italic: Option<bool>,
     underline: Option<bool>,
     inverse: Option<bool>,
+    // roost (SPEC-parity P16)
+    dim: Option<bool>,
+    strikethrough: Option<bool>,
 }
 
 impl Attrs {
@@ -145,6 +148,16 @@ impl Attrs {
         self.inverse = Some(inverse);
         self
     }
+
+    pub fn dim(mut self, dim: bool) -> Self {
+        self.dim = Some(dim);
+        self
+    }
+
+    pub fn strikethrough(mut self, strikethrough: bool) -> Self {
+        self.strikethrough = Some(strikethrough);
+        self
+    }
 }
 
 impl BufWrite for Attrs {
@@ -157,6 +170,8 @@ impl BufWrite for Attrs {
             && self.italic.is_none()
             && self.underline.is_none()
             && self.inverse.is_none()
+            && self.dim.is_none()
+            && self.strikethrough.is_none()
         {
             return;
         }
@@ -227,11 +242,19 @@ impl BufWrite for Attrs {
             }
         }
 
-        if let Some(bold) = self.bold {
-            if bold {
-                write_param!(1);
-            } else {
+        // roost (SPEC-parity P16): bold and dim are one intensity. SGR 22
+        // ("normal intensity") clears both and nothing clears just one, so
+        // the pair is emitted as a unit — clear once, then re-assert whichever
+        // half is set — instead of as two independent toggles.
+        if self.bold.is_some() || self.dim.is_some() {
+            if self.bold == Some(false) || self.dim == Some(false) {
                 write_param!(22);
+            }
+            if self.bold == Some(true) {
+                write_param!(1);
+            }
+            if self.dim == Some(true) {
+                write_param!(2);
             }
         }
 
@@ -256,6 +279,14 @@ impl BufWrite for Attrs {
                 write_param!(7);
             } else {
                 write_param!(27);
+            }
+        }
+
+        if let Some(strikethrough) = self.strikethrough {
+            if strikethrough {
+                write_param!(9);
+            } else {
+                write_param!(29);
             }
         }
 

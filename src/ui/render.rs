@@ -1161,18 +1161,38 @@ fn should_place_cursor(
 }
 
 /// Copy the vt100 grid into the ratatui buffer.
-/// NOTE: wide-char (CJK/emoji) handling is approximate in the scaffold.
+///
+/// U24: wide-char (CJK/emoji) cells are blitted the way ratatui itself lays
+/// out a wide grapheme — the glyph goes in its own cell and the continuation
+/// cell to its right is `reset()`, never written to. Previously the
+/// continuation was stamped with `" "`, which drew a space *over* the right
+/// half of every CJK/emoji glyph the pane emitted. Since P17 the grid measures
+/// widths with the same unicode-width the terminal backend uses, so a cell
+/// marked wide here is a cell ratatui's diff will skip when flushing — the two
+/// halves can no longer disagree about which columns the glyph owns.
 fn blit_screen(f: &mut Frame, screen: &vt100::Screen, inner: Rect) {
     let (rows, cols) = screen.size();
+    let visible_cols = inner.width.min(cols);
     let buf = f.buffer_mut();
     for row in 0..inner.height.min(rows) {
-        for col in 0..inner.width.min(cols) {
+        for col in 0..visible_cols {
             let Some(cell) = screen.cell(row, col) else { continue };
             let x = inner.x + col;
             let y = inner.y + row;
             let Some(out) = buf.cell_mut((x, y)) else { continue };
+            if cell.is_wide_continuation() {
+                // Owned by the glyph on its left. Left at the buffer's reset
+                // default — exactly what ratatui's own wide-grapheme layout
+                // does — so nothing in roost ever writes a symbol into a cell
+                // another glyph already spans.
+                out.reset();
+                continue;
+            }
             let contents = cell.contents();
-            if contents.is_empty() {
+            // A wide glyph whose second half falls outside the drawn area
+            // would overflow into the pane's border, so it degrades to a
+            // space rather than corrupting the chrome.
+            if contents.is_empty() || (cell.is_wide() && col + 1 >= visible_cols) {
                 out.set_symbol(" ");
             } else {
                 out.set_symbol(&contents);
@@ -1210,6 +1230,16 @@ fn cell_style(cell: &vt100::Cell) -> Style {
     if cell.inverse() {
         style = style.add_modifier(Modifier::REVERSED);
     }
+    // P16: dim (SGR 2) and strikethrough (SGR 9) were dropped end to end, so
+    // a pane's secondary text rendered at the same weight as its primary —
+    // roost asserting emphasis the program never asked for. Claude Code leans
+    // on dim heavily; without it a pane is one flat wall of text.
+    if cell.dim() {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if cell.strikethrough() {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
     style
 }
 
@@ -1217,10 +1247,10 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 mod tests {
     use crate::App;
     use super::{
-        badge_text, cell_in_selection, centered_near, collapsed_name_color, collapsed_row_spans,
-        corner_badge, dialog_border_style, feed_entry_spans, feed_window, help_dialog_width,
-        hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans, should_place_cursor,
-        stack_header_text, state_word, HELP_KEYS,
+        badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_color,
+        collapsed_row_spans, corner_badge, dialog_border_style, feed_entry_spans, feed_window,
+        help_dialog_width, hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans,
+        should_place_cursor, stack_header_text, state_word, HELP_KEYS,
     };
     use crate::core::app::{Mode, RenameTarget};
     use crate::core::status::AgentStatus;
@@ -2067,5 +2097,91 @@ mod tests {
         let backend = TestBackend::new(36, 10);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| super::draw(f, &mut app)).unwrap();
+    }
+
+    /// Blit a parsed screen into a buffer of the same size and read the row
+    /// back as `(symbol, style)` pairs. `blit_screen` is the only writer, so
+    /// anything not written shows the buffer's reset default.
+    fn blit_row(bytes: &[u8], cols: u16, inner_cols: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut parser = vt100::Parser::new(2, cols, 0);
+        parser.process(bytes);
+        let mut term = Terminal::new(TestBackend::new(cols, 2)).unwrap();
+        term.draw(|f| {
+            blit_screen(f, parser.screen(), Rect::new(0, 0, inner_cols, 2));
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..cols)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect()
+    }
+
+    /// U24: a wide glyph occupies its own cell exactly once, and the cell to
+    /// its right is left blank for the terminal to paint the glyph's second
+    /// half into. Before, the continuation was stamped with `" "`, drawing a
+    /// space over the right half of every CJK/emoji glyph.
+    #[test]
+    fn wide_glyphs_blit_once_with_an_untouched_continuation_cell() {
+        // `日本語x`: cols 0/2/4 carry a glyph, 1/3/5 are continuations, and
+        // the narrow `x` lands at col 6 — not col 3, which is where a grid
+        // measuring widths with the pre-P17 table would have put it.
+        assert_eq!(
+            blit_row("日本語x".as_bytes(), 10, 10),
+            vec!["日", " ", "本", " ", "語", " ", "x", " ", " ", " "],
+        );
+        // Emoji, including a VS16 presentation sequence (P17): one cell each.
+        assert_eq!(
+            blit_row("\u{1f600}\u{2764}\u{fe0f}y".as_bytes(), 8, 8),
+            vec!["\u{1f600}", " ", "\u{2764}\u{fe0f}", " ", "y", " ", " ", " "],
+        );
+    }
+
+    /// P16: `cell_style` mapped only bold/italic/underline/inverse, so dimmed
+    /// and struck text was attribute-identical to plain text — verified end to
+    /// end before the fix. Claude Code leans on dim for secondary text, so a
+    /// pane flattened into one equal-weight wall.
+    #[test]
+    fn dim_and_strikethrough_reach_ratatui_modifiers() {
+        use super::cell_style;
+
+        let mut p = vt100::Parser::new(2, 20, 0);
+        p.process(b"\x1b[2mF\x1b[22;9mS\x1b[0mP\x1b[1;2;9mA");
+        let s = p.screen();
+        let faint = cell_style(s.cell(0, 0).unwrap());
+        assert!(faint.add_modifier.contains(Modifier::DIM));
+        assert!(!faint.add_modifier.contains(Modifier::CROSSED_OUT));
+
+        let struck = cell_style(s.cell(0, 1).unwrap());
+        assert!(struck.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(!struck.add_modifier.contains(Modifier::DIM));
+
+        // The regression this item started from: plain text must stay plain.
+        let plain = cell_style(s.cell(0, 2).unwrap());
+        assert!(!plain.add_modifier.contains(Modifier::DIM));
+        assert!(!plain.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert_ne!(plain, faint, "dim must be distinguishable from unstyled");
+        assert_ne!(plain, struck, "strikethrough must be distinguishable");
+
+        // Stacking with the attributes that already worked.
+        let all = cell_style(s.cell(0, 3).unwrap());
+        for m in [Modifier::BOLD, Modifier::DIM, Modifier::CROSSED_OUT] {
+            assert!(all.add_modifier.contains(m), "missing {m:?}");
+        }
+    }
+
+    /// U24 guard: a wide glyph whose second half would land outside the drawn
+    /// area degrades to a space instead of bleeding a two-column symbol into
+    /// the pane border ratatui draws in the next column.
+    #[test]
+    fn a_wide_glyph_clipped_by_the_pane_edge_degrades_to_a_space() {
+        // Grid is 10 wide but only 5 columns are drawn: 語 starts at col 4,
+        // so its right half is outside and it must not be emitted.
+        assert_eq!(
+            blit_row("日本語x".as_bytes(), 10, 5),
+            vec!["日", " ", "本", " ", " ", " ", " ", " ", " ", " "],
+        );
     }
 }

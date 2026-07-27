@@ -40,8 +40,9 @@ bug). Severity is impact for a user supervising AI-agent panes.
   U9), P7's scrolled-cursor facet (belongs with U3/N1).
 - **W6 · Width & styling fidelity** — P15, P16, P17, P19 (+ SPEC-ux U24 as one
   bundle: unify unicode-width, fix continuation cells in blit *and*
-  extraction, add missing SGR/REP arms).
-- **W7 · Mouse & shell polish** — P18, P20, P21.
+  extraction, add missing SGR/REP arms). **Shipped** — all five FIXED; amends
+  DESIGN-ui C18 (2026-07-27).
+- **W7 · Mouse & shell polish** — P18, P20, P21. P18 shipped; P20/P21 open.
 
 ---
 
@@ -303,21 +304,46 @@ only at ring-buffer capacity — inherent, accept.)
 
 ## P2 — rendering & extraction fidelity
 
-### P15 · CONFIRMED · Med-Low — yanked CJK/emoji text corrupted
+### P15 · FIXED (this branch) · Med-Low — yanked CJK/emoji text corrupted
+*Fixed: `extract_selection` skips wide-continuation cells instead of spacing
+them, and a selection that *starts* on a glyph's right half snaps back to its
+left half so the glyph the user pointed at is yanked whole rather than lost
+with the skipped cell. Measured before/after on the same grid: `日本語` yanked
+`"日 本 語"`, now `"日本語"`; `ok ❤️ 😀 done` yanked `"ok ❤️  😀  done"`, now
+verbatim. A unit pins the stated contract directly — a full-screen
+`extract_selection` and `grab_all_text` now return identical lines.*
 `extract_selection` pushes a space for every empty cell — wide-char
 continuation cells included: selecting `日本語` yanks `"日 本 語"`. Pasting
 yanked paths/code back into an agent breaks them.
 **Contract:** skip wide-continuation cells during extraction (the
 `grab_all_text` path already gets this right — the two must agree).
 
-### P16 · CONFIRMED · Low-Med — SGR 2 (dim) and 9 (strikethrough) dropped
+### P16 · FIXED (this branch) · Low-Med — SGR 2 (dim) and 9 (strikethrough) dropped
+*Fixed: the vendored `Attrs` carries both, the SGR arms handle 2/9 and their
+resets, and `cell_style` maps them to `Modifier::DIM`/`CROSSED_OUT`. One
+wrinkle worth the note: ECMA-48 has no "faint off" — SGR 22 is *normal
+intensity* and ends bold and dim together, so 22 clears both and the
+escape-code diff writes the intensity pair as a unit (clear once, re-assert
+whichever half survives) instead of as two independent toggles; without that,
+dropping bold silently took a still-set dim with it (unit-proven via a
+`contents_formatted` round trip). Dimmed and struck cells are now distinct
+from unstyled ones, which they demonstrably were not. Amends DESIGN-ui C18
+(2026-07-27).*
 Verified attribute-identical to unstyled text end to end (vt100 `Attrs` has
 no field; renderer maps only bold/italic/underline/inverse). Claude Code
 leans on dim for secondary text — panes flatten into equal-weight walls.
 **Contract:** add dim/strikethrough to the vendored `Attrs` + SGR arms and map
 to ratatui `Modifier::DIM`/`CROSSED_OUT`.
 
-### P17 · CONFIRMED · Low-Med — unicode-width table skew (0.1.14 vs 0.2.0)
+### P17 · FIXED (this branch) · Low-Med — unicode-width table skew (0.1.14 vs 0.2.0)
+*Fixed: the vendored parser is pinned to the workspace's unicode-width 0.2, and
+cells are now measured as *strings* (`Cell::contents_width`) rather than by the
+base char alone — the only way an emoji-presentation sequence (base + VS16)
+scores the 2 columns the renderer already gives it. `Screen::widen_cell`
+promotes such a cell once the VS16 lands, claiming its continuation (and
+refusing at a row's end, where there is nothing to claim, rather than leaving a
+wide flag with no continuation). Measured after: `"❤️"` is 2 cols to both, and
+the next glyph lands at col 2, not col 1.*
 The vendored vt100 measures with unicode-width 0.1.14 while roost/ratatui use
 0.2.0 — VS16 emoji widths changed between them. Measured: `"❤️"` is 2 cols
 to the renderer, 1 col to the grid (following char landed at col 1) — grid
@@ -325,14 +351,32 @@ bookkeeping, blit, and hitboxes disagree per glyph.
 **Contract:** bump the vendored parser to the workspace's unicode-width in
 the same change as P15/U24 so grid and renderer can never disagree again.
 
-### P18 · CONFIRMED · Low-Med — shell panes are non-login shells
+### P18 · FIXED (this branch) · Low-Med — shell panes are non-login shells
+*Fixed: `ShellAdapter::launch` adds `-l`. **Why `-l` and not the dash-argv0
+tmux and the emulators use:** roost spawns through portable-pty, whose
+`CommandBuilder` derives both the executable to resolve and argv[0] from the
+same `args[0]`, so `-zsh` would be looked up on `PATH` and fail — there is no
+seam for an argv0 that differs from the program. The two spellings mean the
+same thing to every shell involved. Guarded by a basename allowlist (sh, bash,
+zsh, fish, dash, ash, ksh/mksh/pdksh, csh/tcsh); an unrecognized `$SHELL`
+spawns bare, because a shell rejecting the flag would kill every pane at birth
+— a much worse failure than the missing profile. Agent adapters unchanged.
+e2e `tests/pane_env.rs`: the pane gets a private `$HOME` whose `.profile`
+exports a marker; before, the pane's env had no marker, now it does.*
 `$SHELL` is spawned bare (no `-l`, no dash-argv0). On macOS, `~/.zprofile`
 (Homebrew PATH — where `claude`/`pi` often live) never runs; the classic
 "works in a terminal tab, `command not found` in the mux" (tmux #1623).
 **Contract:** spawn shell-adapter panes as login shells (dash-prefixed argv0
 or `-l`), matching every terminal emulator's default.
 
-### P19 · CONFIRMED · Low — REP (`CSI Ps b`) unimplemented while TERM advertises it
+### P19 · FIXED (this branch) · Low — REP (`CSI Ps b`) unimplemented while TERM advertises it
+*Fixed: the `b` arm replays the last graphic character through `text`, so the
+repeat inherits the live attrs and obeys wrapping, scroll regions and wide-char
+placement instead of duplicating those rules. `"ab" + CSI 5 b` now renders
+`"abbbbbb"`. No-op before anything is printed, `0` means 1 per ECMA-48, and the
+count is bounded to `u16` by vte's parameter type. Known limitation, shared
+with xterm: the unit repeated is the last base char, not the last cell, so a
+combining or VS16 sequence repeats only its base.*
 `TERM=xterm-256color` promises `rep`; ncurses 6 uses it; roost renders
 `"ab" + CSI 5 b` as `"ab"` (expected `"abbbbbb"`) — dropped glyph runs in
 htop-class TUIs. **Contract:** implement the `b` arm (repeat last graphic

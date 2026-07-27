@@ -308,11 +308,28 @@ core language) and no mouse documentation.
 **Proposed contract:** one legend row and one mouse row; scroll the overlay on
 short terminals instead of capping content.
 
-### U24 · Low · OPEN — wide-char blit is approximate
+### U24 · Low · FIXED (this branch) — wide-char blit is approximate
 `render.rs` self-documents approximate CJK/emoji handling (continuation cells
 overwritten with spaces); agent TUIs are emoji-heavy.
 **Proposed contract:** skip continuation cells after wide symbols; add a
 CJK/emoji golden frame to the harness.
+**Fixed:** `blit_screen` leaves a continuation cell at the buffer's reset
+default — what ratatui's own wide-grapheme layout does — instead of stamping
+`" "` and a style over it, so nothing in roost writes a symbol into a cell
+another glyph already spans. Two honest notes on the payoff. The stamped space
+was *accidentally* invisible: ratatui's `Buffer::diff` skips the cell after a
+two-column symbol, so it never flushed. What was actually broken was the
+agreement about *which* columns a glyph owns — P17's width-table skew put the
+next glyph in a column the backend already treated as an emoji's right half,
+and the diff then dropped that glyph from the host stream outright. With P17
+landed and the continuation left alone, that class is closed by construction.
+The one newly-guarded case is real: a wide glyph whose second half falls
+outside the drawn area now degrades to a space instead of emitting a
+two-column symbol that would suppress the pane border's own cell (unit-proven:
+without the guard the clipped glyph is emitted). Golden frame added —
+`tests/pane_wide_glyphs.rs` prints CJK, a VS16 sequence and a wide emoji from
+a pane and asserts the host's grid carries each one intact, one wide cell plus
+an empty continuation apiece. (Amends DESIGN-ui C18, 2026-07-27.)
 
 ### U25 · Low · OPEN — the feed can't act
 Feed entries aren't actionable (no jump-to-pane) and its hint omits its own

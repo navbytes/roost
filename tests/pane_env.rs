@@ -5,6 +5,10 @@
 //! environment to a file. The pane must see roost's identity
 //! (`TERM_PROGRAM=roost` + version), none of the host's, and the unchanged
 //! TERM / ROOST_* contract.
+//!
+//! P18 shares this binary because it asks the same question of the same
+//! surface — what environment does a pane's shell actually come up with — and
+//! reuses the env-dump seam below.
 
 // The shared harness is compiled per test binary; helpers other tenants use
 // are dead code from this binary's view — not real rot.
@@ -109,6 +113,74 @@ fn pane_children_see_roost_identity_not_the_hosts() {
     // TERM / ROOST_* behavior unchanged.
     assert_eq!(env_val(&dump, "TERM"), Some("xterm-256color"));
     assert_eq!(env_val(&dump, "ROOST_PANE"), Some("1"));
+
+    let _ = h.quit_and_wait(Duration::from_secs(5));
+}
+
+/// P18 end to end: a pane's shell must be a *login* shell.
+///
+/// The probe is deliberately behavioral rather than a flag check. What P18 is
+/// actually about is the user's login profile running — `~/.zprofile` putting
+/// Homebrew on PATH so `claude`/`pi` resolve — so the gate gives the pane a
+/// private `$HOME` holding a `.profile` that exports a marker, and then asks
+/// the pane's own environment whether it ran. A non-login shell never sources
+/// it, which is exactly the "works in a terminal tab, `command not found` in
+/// the mux" failure (tmux #1623). The harness pins `SHELL=/bin/sh`, and both
+/// dash and bash read `~/.profile` as a login shell when no `.bash_profile`
+/// exists, so one fixture file covers whichever `/bin/sh` is.
+#[test]
+fn a_pane_shell_runs_its_login_profile() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let home =
+        std::env::temp_dir().join(format!("roost-p18-home-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("create fixture HOME");
+    std::fs::write(
+        home.join(".profile"),
+        "ROOST_LOGIN_PROBE=profile-ran\nexport ROOST_LOGIN_PROBE\n",
+    )
+    .expect("write fixture .profile");
+
+    let home_str = home.to_str().expect("fixture HOME is valid utf8").to_string();
+    let mut h = match Harness::try_spawn_with_env(
+        &fixture_workspace(cwd),
+        &[("HOME", home_str.as_str())],
+    ) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP login-shell gate: {reason}");
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
+    };
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+
+    let env_path = h.state_dir().join("login.env");
+    let done_path = h.state_dir().join("login.env.done");
+    h.write_bytes(
+        format!("env > {} && printf ok > {}\r", env_path.display(), done_path.display())
+            .as_bytes(),
+    );
+    let dumped = wait_for_file(&done_path, Duration::from_secs(5)).is_some();
+    let dump = dumped
+        .then(|| std::fs::read_to_string(&env_path).ok())
+        .flatten()
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(dumped, "pane shell never dumped its env");
+
+    assert_eq!(
+        env_val(&dump, "ROOST_LOGIN_PROBE"),
+        Some("profile-ran"),
+        "the pane's shell never sourced ~/.profile, so it is not a login shell; dump:\n{dump}"
+    );
+    // The fixture HOME really was the one in force — otherwise the assertion
+    // above could only ever have failed, proving nothing.
+    assert_eq!(env_val(&dump, "HOME"), Some(home_str.as_str()), "dump:\n{dump}");
 
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }

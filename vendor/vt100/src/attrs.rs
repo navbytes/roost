@@ -23,6 +23,11 @@ const TEXT_MODE_BOLD: u8 = 0b0000_0001;
 const TEXT_MODE_ITALIC: u8 = 0b0000_0010;
 const TEXT_MODE_UNDERLINE: u8 = 0b0000_0100;
 const TEXT_MODE_INVERSE: u8 = 0b0000_1000;
+// roost (SPEC-parity P16): dim (SGR 2) and strikethrough (SGR 9) were dropped
+// end to end. Agent CLIs lean on dim for secondary text, so every pane
+// rendered as an equal-weight wall.
+const TEXT_MODE_DIM: u8 = 0b0001_0000;
+const TEXT_MODE_STRIKETHROUGH: u8 = 0b0010_0000;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Attrs {
@@ -80,6 +85,30 @@ impl Attrs {
         }
     }
 
+    pub fn dim(&self) -> bool {
+        self.mode & TEXT_MODE_DIM != 0
+    }
+
+    pub fn set_dim(&mut self, dim: bool) {
+        if dim {
+            self.mode |= TEXT_MODE_DIM;
+        } else {
+            self.mode &= !TEXT_MODE_DIM;
+        }
+    }
+
+    pub fn strikethrough(&self) -> bool {
+        self.mode & TEXT_MODE_STRIKETHROUGH != 0
+    }
+
+    pub fn set_strikethrough(&mut self, strikethrough: bool) {
+        if strikethrough {
+            self.mode |= TEXT_MODE_STRIKETHROUGH;
+        } else {
+            self.mode &= !TEXT_MODE_STRIKETHROUGH;
+        }
+    }
+
     pub fn write_escape_code_diff(
         &self,
         contents: &mut Vec<u8>,
@@ -102,10 +131,16 @@ impl Attrs {
         } else {
             attrs.bgcolor(self.bgcolor)
         };
-        let attrs = if self.bold() == other.bold() {
+        // roost (SPEC-parity P16): bold and dim are one *intensity* in
+        // ECMA-48 — SGR 22 is "normal intensity" and clears both, and there
+        // is no code that clears only one. So the pair is diffed as a unit:
+        // if either half changed, both are re-asserted, or turning bold off
+        // would silently take a still-set dim with it.
+        let attrs = if self.bold() == other.bold() && self.dim() == other.dim()
+        {
             attrs
         } else {
-            attrs.bold(self.bold())
+            attrs.bold(self.bold()).dim(self.dim())
         };
         let attrs = if self.italic() == other.italic() {
             attrs
@@ -121,6 +156,11 @@ impl Attrs {
             attrs
         } else {
             attrs.inverse(self.inverse())
+        };
+        let attrs = if self.strikethrough() == other.strikethrough() {
+            attrs
+        } else {
+            attrs.strikethrough(self.strikethrough())
         };
 
         attrs.write_buf(contents);

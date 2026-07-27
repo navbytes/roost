@@ -130,6 +130,10 @@ pub struct Screen {
     // `Screen::snapshot`), and the copy's own `sync_snapshot`/`effects` are
     // always empty — no recursion, no double-delivered effects.
     sync_snapshot: Option<Box<Screen>>,
+    // roost: the last graphic character actually printed, for REP
+    // (`CSI Ps b`) — SPEC-parity P19. `None` until something is printed, and
+    // a REP in that state is a no-op, as the spec requires.
+    last_graphic: Option<char>,
 }
 
 impl Screen {
@@ -160,6 +164,7 @@ impl Screen {
 
             effects: Vec::new(),
             sync_snapshot: None,
+            last_graphic: None,
         }
     }
 
@@ -195,6 +200,7 @@ impl Screen {
             // source: effects belong to the live screen alone.
             effects: Vec::new(),
             sync_snapshot: None,
+            last_graphic: self.last_graphic,
         }
     }
 
@@ -1014,6 +1020,10 @@ impl Screen {
 
         if width == 0 {
             if pos.col > 0 {
+                // roost (SPEC-parity P17): track which column the appended
+                // codepoint actually landed in — a completed emoji-
+                // presentation sequence has to widen *that* cell.
+                let mut base_col = pos.col - 1;
                 let mut prev_cell = self
                     .grid_mut()
                     .drawing_cell_mut(crate::grid::Pos {
@@ -1026,6 +1036,7 @@ impl Screen {
                     // checked for pos.col > 0.
                     .unwrap();
                 if prev_cell.is_wide_continuation() {
+                    base_col = pos.col - 2;
                     prev_cell = self
                         .grid_mut()
                         .drawing_cell_mut(crate::grid::Pos {
@@ -1040,7 +1051,13 @@ impl Screen {
                         // the first half of the wide character before it.
                         .unwrap();
                 }
-                prev_cell.append(c);
+                let wants_wide = prev_cell.append(c);
+                // roost (SPEC-parity P17): the sequence just became two
+                // columns wide. Claim the continuation and step the cursor
+                // past it, exactly as a natively-wide char does.
+                if wants_wide && self.widen_cell(pos.row, base_col) {
+                    self.grid_mut().col_inc(1);
+                }
             } else if pos.row > 0 {
                 let prev_row = self
                     .grid()
@@ -1080,10 +1097,20 @@ impl Screen {
                             // character before it.
                             .unwrap();
                     }
-                    prev_cell.append(c);
+                    // roost (SPEC-parity P17): a promotion is refused here by
+                    // construction — the base cell is the previous row's last
+                    // column, so there is no cell to its right to claim. The
+                    // sequence stays one column, which is the pre-P17
+                    // behavior and the same pragmatism upstream applies to
+                    // wide chars that don't fit at a row's end.
+                    let _ = prev_cell.append(c);
                 }
             }
         } else {
+            // roost (SPEC-parity P19): REP repeats the last *graphic*
+            // character, so it is recorded here — on the path that actually
+            // occupies a cell — and not for the zero-width branch above.
+            self.last_graphic = Some(c);
             if self
                 .grid()
                 .drawing_cell(pos)
@@ -1206,6 +1233,85 @@ impl Screen {
                 self.grid_mut().col_inc(1);
             }
         }
+    }
+
+    /// REP — repeat the preceding graphic character (`CSI Ps b`).
+    ///
+    /// roost (SPEC-parity P19): `TERM=xterm-256color` advertises `rep` and
+    /// ncurses 6 emits it, so having no `b` arm silently swallowed whole runs
+    /// of repeated glyphs — `"ab"` + `CSI 5 b` rendered `"ab"` where every
+    /// other terminal shows `"abbbbbb"`.
+    ///
+    /// Deliberately implemented by replaying the character through `text`
+    /// rather than by writing cells directly: that is what makes the repeat
+    /// inherit the *current* attributes and obey wrapping, scroll regions,
+    /// insert mode and wide-char placement for free, instead of duplicating
+    /// (and eventually diverging from) those rules here. A REP before anything
+    /// has been printed is a no-op, as the spec requires. The count is a `u16`
+    /// by construction — vte's parameters are `u16` — which bounds the work a
+    /// single sequence can ask for.
+    ///
+    /// Known limitation, shared with xterm: the repeated unit is the last base
+    /// character, not the last *cell*, so repeating a combining sequence
+    /// (`e` + U+0301) or an emoji-presentation sequence repeats only the base
+    /// char. Applications that use REP emit it for runs of plain glyphs.
+    fn rep(&mut self, count: u16) {
+        let Some(c) = self.last_graphic else { return };
+        for _ in 0..count {
+            self.text(c);
+        }
+    }
+
+    /// roost (SPEC-parity P17): promote an already-drawn cell from one column
+    /// to two, claiming the cell to its right as the wide continuation.
+    ///
+    /// Emoji-presentation sequences (base char + VS16) measure two columns
+    /// under unicode-width 0.2 — the table roost and ratatui use — but reach
+    /// the parser as a printable char followed by a zero-width one, so the
+    /// grid only learns the true width when the VS16 lands. Returns whether
+    /// the promotion happened: it is refused when the row has no cell to the
+    /// right to give up, leaving the sequence one column wide (the pre-P17
+    /// behavior). Refusing rather than half-promoting is load-bearing — a
+    /// wide flag without a continuation cell is an invariant the grid later
+    /// dereferences unconditionally.
+    fn widen_cell(&mut self, row: u16, col: u16) -> bool {
+        let size = self.grid().size();
+        if col + 1 >= size.cols {
+            return false;
+        }
+        let next_pos = crate::grid::Pos { row, col: col + 1 };
+
+        // A wide char may already straddle the cell we are claiming; its own
+        // continuation would be orphaned, so clear it first (the same repair
+        // `text` performs when a narrow char lands on a wide one).
+        let next_was_wide = self
+            .grid()
+            .drawing_cell(next_pos)
+            .is_some_and(crate::cell::Cell::is_wide);
+        if next_was_wide {
+            let orphan_pos = crate::grid::Pos { row, col: col + 2 };
+            if let Some(orphan) = self.grid_mut().drawing_cell_mut(orphan_pos)
+            {
+                orphan.clear(crate::attrs::Attrs::default());
+                orphan.set_wide_continuation(false);
+            }
+        }
+
+        if let Some(next) = self.grid_mut().drawing_cell_mut(next_pos) {
+            next.clear(crate::attrs::Attrs::default());
+            next.set_wide_continuation(true);
+        }
+        if let Some(base) =
+            self.grid_mut().drawing_cell_mut(crate::grid::Pos { row, col })
+        {
+            base.promote_wide();
+        }
+        if next_pos.col == size.cols - 1 {
+            if let Some(r) = self.grid_mut().drawing_row_mut(row) {
+                r.wrap(false);
+            }
+        }
+        true
     }
 
     // control codes
@@ -1595,13 +1701,23 @@ impl Screen {
             match next_param!() {
                 &[0] => self.attrs = crate::attrs::Attrs::default(),
                 &[1] => self.attrs.set_bold(true),
+                // roost (SPEC-parity P16): faint/dim and strikethrough.
+                &[2] => self.attrs.set_dim(true),
                 &[3] => self.attrs.set_italic(true),
                 &[4] => self.attrs.set_underline(true),
                 &[7] => self.attrs.set_inverse(true),
-                &[22] => self.attrs.set_bold(false),
+                &[9] => self.attrs.set_strikethrough(true),
+                // SGR 22 is "normal intensity" in ECMA-48: it ends *both*
+                // bold and faint, which is why there is no separate reset for
+                // dim alone. Matching the existing 23/24/27 shape otherwise.
+                &[22] => {
+                    self.attrs.set_bold(false);
+                    self.attrs.set_dim(false);
+                }
                 &[23] => self.attrs.set_italic(false),
                 &[24] => self.attrs.set_underline(false),
                 &[27] => self.attrs.set_inverse(false),
+                &[29] => self.attrs.set_strikethrough(false),
                 &[n] if (30..=37).contains(&n) => {
                     self.attrs.fgcolor =
                         crate::attrs::Color::Idx(to_u8!(n) - 30);
@@ -1817,6 +1933,8 @@ impl vte::Perform for Screen {
                 'S' => self.su(canonicalize_params_1(params, 1)),
                 'T' => self.sd(canonicalize_params_1(params, 1)),
                 'X' => self.ech(canonicalize_params_1(params, 1)),
+                // roost (SPEC-parity P19): REP
+                'b' => self.rep(canonicalize_params_1(params, 1)),
                 'd' => self.vpa(canonicalize_params_1(params, 1)),
                 'h' => self.sm(params),
                 'l' => self.rm(params),
@@ -2356,5 +2474,263 @@ mod roost_tests {
         p.process(b"\x1b]9;hi\x07");
         assert_eq!(p.screen().audible_bell_count(), before);
         assert_eq!(p.take_effects().len(), 1);
+    }
+
+    // -- REP, `CSI Ps b` (SPEC-parity P19) --------------------------------
+
+    fn row0(p: &crate::Parser) -> String {
+        p.screen().contents().lines().next().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn rep_repeats_the_last_graphic_character() {
+        // The measured case: before the `b` arm existed this rendered "ab".
+        let mut p = parser();
+        p.process(b"ab\x1b[5b");
+        assert_eq!(row0(&p), "abbbbbb");
+    }
+
+    #[test]
+    fn rep_defaults_to_one_and_treats_zero_as_one() {
+        // ECMA-48: Pn defaults to 1, and an explicit 0 means the default.
+        let mut p = parser();
+        p.process(b"x\x1b[b");
+        assert_eq!(row0(&p), "xx");
+        let mut p = parser();
+        p.process(b"x\x1b[0b");
+        assert_eq!(row0(&p), "xx");
+    }
+
+    #[test]
+    fn rep_with_no_preceding_graphic_character_is_a_no_op() {
+        let mut p = parser();
+        p.process(b"\x1b[5b");
+        assert_eq!(row0(&p), "");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+        // Still a no-op after a control sequence has run but nothing printed.
+        let mut p = parser();
+        p.process(b"\x1b[2J\x1b[3;3H\x1b[4b");
+        assert_eq!(p.screen().contents(), "");
+        assert_eq!(p.screen().cursor_position(), (2, 2));
+    }
+
+    #[test]
+    fn rep_uses_the_attributes_in_force_at_the_repeat() {
+        // The repeat is new output, so it takes the *current* SGR state --
+        // not whatever was in force when the original character was printed.
+        let mut p = parser();
+        p.process(b"P\x1b[31;2m\x1b[3b");
+        let s = p.screen();
+        assert_eq!(s.cell(0, 0).unwrap().fgcolor(), crate::attrs::Color::Default);
+        assert!(!s.cell(0, 0).unwrap().dim());
+        for col in 1..=3 {
+            let cell = s.cell(0, col).unwrap();
+            assert_eq!(cell.contents(), "P");
+            assert_eq!(cell.fgcolor(), crate::attrs::Color::Idx(1));
+            assert!(cell.dim(), "the repeat carries the live attrs");
+        }
+    }
+
+    #[test]
+    fn rep_wraps_at_the_row_edge_like_ordinary_output() {
+        // 20 columns: `z` plus 24 repeats fills row 0 and continues on row 1.
+        let mut p = parser();
+        p.process(b"z\x1b[24b");
+        let s = p.screen();
+        for col in 0..20 {
+            assert_eq!(s.cell(0, col).unwrap().contents(), "z", "row 0 col {col}");
+        }
+        for col in 0..5 {
+            assert_eq!(s.cell(1, col).unwrap().contents(), "z", "row 1 col {col}");
+        }
+        assert!(s.cell(1, 5).unwrap().contents().is_empty());
+        assert_eq!(s.cursor_position(), (1, 5));
+        // A real grid wrap, so `contents()` reflows it back into one logical
+        // line exactly as it would for a typed run of the same length.
+        assert_eq!(s.contents(), "z".repeat(25));
+    }
+
+    #[test]
+    fn rep_repeats_the_last_character_printed_not_the_last_one_on_screen() {
+        // Moving the cursor does not change what REP repeats, and a repeat
+        // lands wherever the cursor now is.
+        let mut p = parser();
+        p.process(b"abc\x1b[H\x1b[2b");
+        assert_eq!(row0(&p), "ccc");
+    }
+
+    #[test]
+    fn rep_repeats_a_wide_character_as_a_wide_character() {
+        let mut p = parser();
+        p.process("\u{65e5}\x1b[2b".as_bytes());
+        let s = p.screen();
+        assert_eq!(row0(&p), "\u{65e5}".repeat(3));
+        assert!(s.cell(0, 4).unwrap().is_wide());
+        assert!(s.cell(0, 5).unwrap().is_wide_continuation());
+        assert_eq!(s.cursor_position(), (0, 6));
+    }
+
+    // -- one width table for the process (SPEC-parity P17) ----------------
+
+    /// How many columns the grid actually gave a string: the cursor's advance
+    /// from a known-empty row.
+    fn grid_cols(bytes: &[u8]) -> u16 {
+        let mut p = parser();
+        p.process(bytes);
+        p.screen().cursor_position().1
+    }
+
+    /// The embedder's measurement — literally the crate roost and ratatui
+    /// call. If this and `grid_cols` ever disagree, the blit and the mouse
+    /// hitboxes disagree with the grid, which is P17.
+    fn embedder_cols(s: &str) -> u16 {
+        u16::try_from(unicode_width::UnicodeWidthStr::width(s)).unwrap()
+    }
+
+    #[test]
+    fn grid_and_embedder_measure_the_same_columns() {
+        // VS16 emoji-presentation sequences are the pair that changed between
+        // unicode-width 0.1.14 (grid, pre-P17) and 0.2 (renderer): measured
+        // before the fix, "❤\u{fe0f}" was 2 cols to the renderer and 1 to the
+        // grid, so the next glyph landed at col 1 and every hitbox after it
+        // was off by one.
+        for s in [
+            "\u{2764}\u{fe0f}", // VS16 heart
+            "\u{26a0}\u{fe0f}", // VS16 warning sign
+            "\u{2714}\u{fe0f}", // VS16 check mark
+            "\u{65e5}",         // CJK
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}",  // natively-wide emoji
+            "\u{2764}",   // bare heart: still one column
+            "a\u{0301}",  // combining acute: still one column
+            "ascii",      //
+            "\u{2764}\u{fe0e}", // VS15 text presentation: one column
+        ] {
+            assert_eq!(
+                grid_cols(s.as_bytes()),
+                embedder_cols(s),
+                "column disagreement for {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vs16_sequence_occupies_a_real_wide_cell() {
+        let mut p = parser();
+        p.process("\u{2764}\u{fe0f}X".as_bytes());
+        let s = p.screen();
+        let base = s.cell(0, 0).unwrap();
+        assert_eq!(base.contents(), "\u{2764}\u{fe0f}");
+        assert!(base.is_wide(), "the sequence must own two cells");
+        assert!(s.cell(0, 1).unwrap().is_wide_continuation());
+        assert!(s.cell(0, 1).unwrap().contents().is_empty());
+        // the following glyph starts after the continuation, not on top of it
+        assert_eq!(s.cell(0, 2).unwrap().contents(), "X");
+        // and the row reads back with no injected filler
+        assert_eq!(s.contents().lines().next().unwrap(), "\u{2764}\u{fe0f}X");
+    }
+
+    #[test]
+    fn widening_a_vs16_sequence_repairs_the_wide_char_it_displaces() {
+        // The cell claimed as the continuation may already hold a wide char
+        // from an earlier draw; leaving its own continuation behind would
+        // orphan a cell the grid later dereferences.
+        let mut p = parser();
+        p.process("\u{65e5}\u{672c}\x1b[H\u{2764}\u{fe0f}".as_bytes());
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().is_wide());
+        assert!(s.cell(0, 1).unwrap().is_wide_continuation());
+        assert!(!s.cell(0, 2).unwrap().is_wide_continuation());
+    }
+
+    // -- dim and strikethrough, SGR 2 / 9 (SPEC-parity P16) ---------------
+
+    #[test]
+    fn sgr_2_sets_dim_and_sgr_22_clears_it() {
+        let mut p = parser();
+        p.process(b"\x1b[2mfaint\x1b[22mplain");
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().dim());
+        assert!(!s.cell(0, 5).unwrap().dim());
+        // SGR 0 is the other reset.
+        let mut p = parser();
+        p.process(b"\x1b[2mfaint\x1b[0mplain");
+        assert!(!p.screen().cell(0, 5).unwrap().dim());
+    }
+
+    #[test]
+    fn sgr_9_sets_strikethrough_and_sgr_29_clears_it() {
+        let mut p = parser();
+        p.process(b"\x1b[9mgone\x1b[29mhere");
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().strikethrough());
+        assert!(!s.cell(0, 4).unwrap().strikethrough());
+        let mut p = parser();
+        p.process(b"\x1b[9mgone\x1b[0mhere");
+        assert!(!p.screen().cell(0, 4).unwrap().strikethrough());
+    }
+
+    #[test]
+    fn dim_and_strikethrough_are_independent_of_the_other_attributes() {
+        // A realistic agent-CLI run: everything on at once, then the two new
+        // attributes cleared while bold/italic/underline/inverse stay.
+        let mut p = parser();
+        p.process(b"\x1b[1;2;3;4;7;9mall\x1b[29mno-strike");
+        let s = p.screen();
+        let all = s.cell(0, 0).unwrap();
+        assert!(all.bold() && all.italic() && all.underline() && all.inverse());
+        assert!(all.dim() && all.strikethrough());
+        let rest = s.cell(0, 3).unwrap();
+        assert!(rest.bold() && rest.italic() && rest.underline() && rest.inverse());
+        assert!(rest.dim(), "SGR 29 must not touch intensity");
+        assert!(!rest.strikethrough());
+    }
+
+    #[test]
+    fn sgr_22_ends_both_halves_of_intensity() {
+        // ECMA-48: 22 is "normal intensity", not "bold off". A pane that
+        // dims, bolds, then sends 22 expects plain text on both counts.
+        let mut p = parser();
+        p.process(b"\x1b[1;2mboth\x1b[22mneither");
+        let s = p.screen();
+        assert!(s.cell(0, 0).unwrap().bold() && s.cell(0, 0).unwrap().dim());
+        assert!(!s.cell(0, 4).unwrap().bold() && !s.cell(0, 4).unwrap().dim());
+    }
+
+    #[test]
+    fn the_intensity_pair_round_trips_through_the_escape_code_diff() {
+        // `contents_formatted` re-emits attribute changes. Since SGR 22
+        // clears both halves, dropping bold while dim stays set has to
+        // re-assert the dim, or the replayed stream loses it.
+        let mut p = parser();
+        p.process(b"\x1b[1;2mA\x1b[22;2mB\x1b[9mC");
+        let formatted = p.screen().contents_formatted();
+        let mut replay = parser();
+        replay.process(&formatted);
+        let s = replay.screen();
+        for (col, (bold, dim, strike)) in
+            [(true, true, false), (false, true, false), (false, true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let cell = s.cell(0, u16::try_from(col).unwrap()).unwrap();
+            assert_eq!(cell.bold(), bold, "bold at col {col}");
+            assert_eq!(cell.dim(), dim, "dim at col {col}");
+            assert_eq!(cell.strikethrough(), strike, "strike at col {col}");
+        }
+    }
+
+    #[test]
+    fn a_vs16_sequence_with_no_room_stays_one_column() {
+        // Last column: there is no cell to claim, so the sequence stays
+        // narrow rather than leaving a wide flag with no continuation.
+        let mut p = crate::Parser::new(2, 3, 0);
+        p.process("ab\u{2764}\u{fe0f}".as_bytes());
+        let s = p.screen();
+        assert!(!s.cell(0, 2).unwrap().is_wide());
+        assert_eq!(s.cell(0, 2).unwrap().contents(), "\u{2764}\u{fe0f}");
+        // and printing over it afterwards must not panic
+        p.process(b"\x1b[Hz");
+        assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "z");
     }
 }
