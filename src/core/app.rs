@@ -83,7 +83,10 @@ pub struct FeedEntry {
 const FLASH_WINDOW: Duration = Duration::from_secs(2);
 
 /// How long an armed destructive-close confirmation stays live: press the same
-/// key again within this window to actually close/quit.
+/// key again within this window to actually close/quit. A confirm's *flash*
+/// carries this same window (U22): the prompt must be visible for exactly as
+/// long as the second press would fire — the old FLASH_WINDOW-sized prompt
+/// left a silent final second where Alt+w/Alt+q still confirmed.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 /// How many closed panes/tabs the undo stack keeps.
@@ -198,13 +201,21 @@ pub struct App<B: PaneBackend> {
     alt_seen: bool,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
-    /// Transient status message shown in the hint bar (e.g. "copied").
-    flash: Option<(String, Instant)>,
+    /// Transient status message shown in the hint bar (e.g. "copied"), with
+    /// the window it stays visible for: `FLASH_WINDOW` for ordinary notices,
+    /// `CONFIRM_WINDOW` for confirm-arm prompts (U22 — prompt and arm live
+    /// exactly as long as each other; the window doubles as the marker that
+    /// tells a confirm prompt apart, see `clear_confirm_flash`).
+    flash: Option<(String, Instant, Duration)>,
     /// Recently closed panes/tabs, for `Alt+u` undo (most-recent last).
     undo: Vec<Closed>,
     /// When a destructive close (busy pane / last pane) has been armed and is
     /// awaiting a confirming second keypress.
     confirm_close: Option<Instant>,
+    /// When a busy-fleet quit (U1) has been armed and is awaiting a
+    /// confirming second Alt+q. Separate from `confirm_close` so an armed
+    /// close can never confirm a quit (or vice versa).
+    confirm_quit: Option<Instant>,
     /// Per-spawn secret handed to each pane's child via `ROOST_TOKEN`. A
     /// socket message is only honored if its token matches the one issued to
     /// the pane it claims to be — so a process in one pane can't spoof another
@@ -290,6 +301,7 @@ impl<B: PaneBackend> App<B> {
             flash: None,
             undo: Vec::new(),
             confirm_close: None,
+            confirm_quit: None,
             tokens: HashMap::new(),
             control_token,
             waiters: Vec::new(),
@@ -549,8 +561,15 @@ impl<B: PaneBackend> App<B> {
                 }
                 // C20: spawn owns the pane's "birth" line — diff_statuses
                 // deliberately stays silent on a pane's first observation.
-                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
-                self.push_feed(format!("spawned {name} ({})", spec.adapter), false);
+                // U2: led by the pane id; the `({adapter})` suffix only for
+                // titled panes (an untitled display name already ends in the
+                // adapter/cwd tag — C4's no-dup rule).
+                let label = format!("{id} {}", display_name_of(spec));
+                let line = match &spec.title {
+                    Some(_) => format!("spawned {label} ({})", spec.adapter),
+                    None => format!("spawned {label}"),
+                };
+                self.push_feed(line, false);
             }
             Err(e) => {
                 self.dead.insert(id, e.to_string());
@@ -615,12 +634,14 @@ impl<B: PaneBackend> App<B> {
                 None => {} // first observation: spawn owns birth, no line
                 Some(old) if old == status || status == AgentStatus::Exited => {}
                 Some(old) => {
-                    let name = self
-                        .find_spec(id)
-                        .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
-                        .unwrap_or_else(|| format!("pane {id}"));
-                    let text =
-                        format!("{name}: {} → {}", state_word(old), state_word(status));
+                    // U2: `{id} {display_name}`, so four identical shells'
+                    // transitions stop being indistinguishable in the feed.
+                    let text = format!(
+                        "{}: {} → {}",
+                        self.feed_label(id),
+                        state_word(old),
+                        state_word(status)
+                    );
                     self.push_feed(text, status == AgentStatus::NeedsInput);
                 }
             }
@@ -696,6 +717,25 @@ impl<B: PaneBackend> App<B> {
             .flat_map(|t| t.panes.values())
             .filter_map(|s| s.session.clone())
             .collect()
+    }
+
+    /// U2: the one display name for pane `id`, used by every fleet surface
+    /// (corner badge, collapsed rows, feed lines, notifications, flashes) —
+    /// `display_name_of` on its spec, else `pane {id}` for a pane that no
+    /// longer has one (already closed by the time an event lands).
+    pub fn display_name(&self, id: PaneId) -> String {
+        self.find_spec(id).map(display_name_of).unwrap_or_else(|| format!("pane {id}"))
+    }
+
+    /// U2: a feed entry's pane label — the pane id (the join key for
+    /// `roost send <id>`) ahead of the display name, e.g. `3 shell · roost`.
+    /// Falls back to `pane {id}` when the spec is already gone (no bare
+    /// doubled `{id} pane {id}`).
+    fn feed_label(&self, id: PaneId) -> String {
+        match self.find_spec(id) {
+            Some(spec) => format!("{id} {}", display_name_of(spec)),
+            None => format!("pane {id}"),
+        }
     }
 
     /// C22: learns the float — `send`/`read`/badges/rename/respawn by id
@@ -1368,8 +1408,10 @@ impl<B: PaneBackend> App<B> {
             self.spawn_active_tab();
         } else if !empty {
             if let Some(spec) = spec {
-                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
-                self.push_feed(format!("closed {name}"), false);
+                // U2: the spec is already out of the tree, so the label is
+                // built from the captured spec (same `{id} {name}` shape as
+                // `feed_label`).
+                self.push_feed(format!("closed {id} {}", display_name_of(&spec)), false);
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
@@ -1419,16 +1461,16 @@ impl<B: PaneBackend> App<B> {
         // workspace by the time its process EOFs — that Exit is expected, so
         // there's no name to report: nothing to log (the close hook already
         // did) or notify about.
-        let spec = self.find_spec(id)?;
-        let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
+        self.find_spec(id)?;
         // C20: the feed logs every exit, focused pane included — unlike the
         // notification below, which only nudges for an *unfocused* pane (a
-        // focused one's recovery hint is already on screen).
-        self.push_feed(format!("{name} exited"), false);
+        // focused one's recovery hint is already on screen). U2: the feed
+        // line carries the pane id; the notification the display name.
+        self.push_feed(format!("{} exited", self.feed_label(id)), false);
         if id == self.focused {
             return None;
         }
-        Some(format!("{name} exited"))
+        Some(format!("{} exited", self.display_name(id)))
     }
 
     /// Session id reported exactly by an agent-side extension.
@@ -1452,11 +1494,9 @@ impl<B: PaneBackend> App<B> {
             _ => false,
         };
         if became_needy && id != self.focused {
-            let name = self
-                .find_spec(id)
-                .map(|s| s.title.clone().unwrap_or_else(|| s.adapter.clone()))
-                .unwrap_or_else(|| format!("pane {id}"));
-            Some(format!("{name} is waiting for you"))
+            // U2: the shared display name — "shell · roost is waiting for
+            // you", not an anonymous "shell is waiting for you".
+            Some(format!("{} is waiting for you", self.display_name(id)))
         } else {
             None
         }
@@ -1571,22 +1611,43 @@ impl<B: PaneBackend> App<B> {
         if text.is_empty() {
             return None;
         }
-        self.flash =
-            Some((format!("copied {} chars", text.chars().count()), Instant::now()));
+        self.set_flash(format!("copied {} chars", text.chars().count()));
         Some(text)
     }
 
     /// Set a transient hint-bar message (e.g. a startup notice).
     pub fn set_flash(&mut self, msg: impl Into<String>) {
-        self.flash = Some((msg.into(), Instant::now()));
+        self.flash = Some((msg.into(), Instant::now(), FLASH_WINDOW));
+    }
+
+    /// Set a confirm-arm prompt ("… again to close/quit"). Carries
+    /// `CONFIRM_WINDOW`, not `FLASH_WINDOW`: the prompt must stay visible for
+    /// exactly as long as the second press would still fire (U22 — the old
+    /// 2s flash under a 3s arm left a silent final second that accepted a
+    /// destructive confirm with no visible prompt).
+    fn set_confirm_flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), Instant::now(), CONFIRM_WINDOW));
+    }
+
+    /// Drop a confirm-arm prompt from the bar, if that's what's showing.
+    /// U22's contract read in both directions: when the arm dies early (a
+    /// confirmed second press, or any other action disarming it), its prompt
+    /// must die with it — a visible "again to close" with nothing armed is
+    /// the mismatch lie inverted. Only `set_confirm_flash` produces
+    /// `CONFIRM_WINDOW`-sized flashes, so the window is the marker; an
+    /// ordinary flash some action just set is left alone.
+    fn clear_confirm_flash(&mut self) {
+        if self.flash.as_ref().is_some_and(|(_, _, w)| *w == CONFIRM_WINDOW) {
+            self.flash = None;
+        }
     }
 
     /// Current transient hint-bar message, if still within its window.
     pub fn flash(&self) -> Option<&str> {
         self.flash
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < FLASH_WINDOW)
-            .map(|(m, _)| m.as_str())
+            .filter(|(_, at, window)| at.elapsed() < *window)
+            .map(|(m, _, _)| m.as_str())
     }
 
     /// The URL under inner cell (row, col) of pane `id`, if any (for
@@ -1630,6 +1691,25 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// U3: pane `id`'s grid-clamped view offset — > 0 means its on-screen
+    /// grid is frozen history, which the corner badge must mark (`↑N`) and
+    /// the Working pulse must stop asserting liveness over (N1). 0 for a
+    /// pane with no runtime.
+    pub fn scroll_offset(&self, id: PaneId) -> usize {
+        self.runtimes.get(&id).map(|rt| rt.scroll_offset()).unwrap_or(0)
+    }
+
+    /// U3: the focused pane's `(view offset, banked history rows)` — the
+    /// scroll-mode hint's `↑N/M`. Read from the backend (the view's truth),
+    /// not from `Mode::Scroll`'s own counter, so the hint can never report
+    /// a phantom position the grid refused (U9's overshoot).
+    pub fn scroll_position(&self) -> (usize, usize) {
+        self.runtimes
+            .get(&self.focused)
+            .map(|rt| (rt.scroll_offset(), rt.scroll_total()))
+            .unwrap_or((0, 0))
+    }
+
     // -- dead panes --------------------------------------------------------
 
     /// True when the focused pane has no live process (spawn failed or the
@@ -1667,6 +1747,23 @@ impl<B: PaneBackend> App<B> {
     // -- actions -----------------------------------------------------------
 
     pub fn apply(&mut self, action: Action) {
+        // Any action other than a repeated close/quit disarms that pending
+        // confirmation, so a stale "press again" can't leak onto a later
+        // key — and a disarmed confirm's prompt goes with it (U22: prompt
+        // and arm live and die together). Runs BEFORE the action: a confirm
+        // the action itself arms below sets a fresh prompt that must not be
+        // swept up with the stale one (Alt+w-armed then Alt+q must leave
+        // the quit's own prompt standing).
+        let mut disarmed = false;
+        if !matches!(action, Action::ClosePane) {
+            disarmed |= self.confirm_close.take().is_some();
+        }
+        if !matches!(action, Action::Quit) {
+            disarmed |= self.confirm_quit.take().is_some();
+        }
+        if disarmed {
+            self.clear_confirm_flash();
+        }
         // C21/C22: a structural layout action must not change the tab
         // invisibly behind a full-screen zoomed pane, nor target the float
         // (which lives outside the layout tree — leaving it focused here is
@@ -1691,7 +1788,7 @@ impl<B: PaneBackend> App<B> {
             self.hide_float();
         }
         match action {
-            Action::Quit => self.quit = true,
+            Action::Quit => self.quit_guarded(),
             Action::NewPane => self.new_pane_with("shell"),
             Action::ClosePane => self.close_pane(),
             Action::Focus(dir) => self.focus_dir(dir),
@@ -1723,7 +1820,14 @@ impl<B: PaneBackend> App<B> {
                 self.mode = Mode::Rename { buffer: current, target: RenameTarget::Tab };
             }
             Action::QuickLaunch => self.mode = Mode::Picker { selection: 0 },
-            Action::ScrollMode => self.mode = Mode::Scroll { offset: 0 },
+            Action::ScrollMode => {
+                // U9: seed from the pane's CURRENT view offset — entering
+                // Scroll mode after wheeling continues from the wheeled
+                // position; a zero seed made the first keypress snap the
+                // view from there back toward the live tail.
+                let offset = self.scroll_offset(self.focused);
+                self.mode = Mode::Scroll { offset };
+            }
             Action::CopyMode => {
                 // C24: cursor starts bottom-left of the focused pane's inner
                 // grid (C22 rule 1: targets the float like any pane when
@@ -1741,7 +1845,7 @@ impl<B: PaneBackend> App<B> {
                 // floating full-focus surface) — refuse rather than hide it
                 // and zoom whatever's behind it.
                 if self.float_focused() {
-                    self.flash = Some(("can't zoom the float".into(), Instant::now()));
+                    self.set_flash("can't zoom the float");
                 } else {
                     self.toggle_zoom();
                 }
@@ -1750,11 +1854,6 @@ impl<B: PaneBackend> App<B> {
             Action::ToggleFeed => self.toggle_feed(),
             Action::ToggleFloat => self.toggle_float(),
             Action::ToggleRaw => self.toggle_raw(),
-        }
-        // Any action other than a repeated close disarms a pending close
-        // confirmation, so a stale "press again" can't leak onto a later key.
-        if !matches!(action, Action::ClosePane) {
-            self.confirm_close = None;
         }
         self.relayout();
         self.save();
@@ -1771,7 +1870,7 @@ impl<B: PaneBackend> App<B> {
     /// Reopen the most recently closed pane or tab, resuming its session.
     fn undo_close(&mut self) {
         let Some(closed) = self.undo.pop() else {
-            self.flash = Some(("nothing to reopen".into(), Instant::now()));
+            self.set_flash("nothing to reopen");
             return;
         };
         match closed {
@@ -1783,18 +1882,21 @@ impl<B: PaneBackend> App<B> {
                 self.spawn_active_tab();
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.push_feed(format!("reopened tab {name}"), false);
-                self.flash = Some(("reopened tab".into(), Instant::now()));
+                // U2: flashes name what they acted on.
+                self.set_flash(format!("reopened tab {name}"));
             }
             Closed::Pane { tab_index, spec } => {
                 // Restore into its original tab if it still exists, else the
                 // active one; split the focused pane and reuse the saved spec
                 // (session id preserved ⇒ the agent resumes).
-                let name = spec.title.clone().unwrap_or_else(|| spec.adapter.clone());
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
                 self.focused = self.pane_order().first().copied().unwrap_or(0);
                 self.restore_pane(spec);
-                self.push_feed(format!("reopened {name}"), false);
-                self.flash = Some(("reopened pane".into(), Instant::now()));
+                // U2: `restore_pane` allocated the pane's NEW id and left it
+                // focused — label with that id, not the closed one's.
+                let restored = self.focused;
+                self.push_feed(format!("reopened {}", self.feed_label(restored)), false);
+                self.set_flash(format!("reopened {}", self.display_name(restored)));
             }
         }
     }
@@ -1934,22 +2036,24 @@ impl<B: PaneBackend> App<B> {
         // turn, and closing the last pane quits roost outright (which undo
         // can't recover). In those cases, arm a confirmation and require a
         // second Alt+w within the window; a non-busy pane closes immediately
-        // (undo covers an accidental one).
-        let is_working =
-            self.runtimes.get(&id).map(|rt| rt.status() == AgentStatus::Working).unwrap_or(false);
+        // (undo covers an accidental one). Busy is `Working || NeedsInput`
+        // (U12): an agent blocked on your approval is mid-turn all the same.
+        let is_busy = self.runtimes.get(&id).map(|rt| is_busy(rt.status())).unwrap_or(false);
         let would_quit = self.ws.tabs.len() == 1 && self.ws.active_tab().panes.len() == 1;
         let armed = self.confirm_close.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
-        if (is_working || would_quit) && !armed {
+        if (is_busy || would_quit) && !armed {
             self.confirm_close = Some(Instant::now());
             let msg = if would_quit {
-                "last pane — Alt+w again to quit roost"
+                "last pane — Alt+w again to quit roost".to_string()
             } else {
-                "agent busy — Alt+w again to close"
+                // U2: name which agent the close would interrupt.
+                format!("{} busy — Alt+w again to close", self.display_name(id))
             };
-            self.flash = Some((msg.into(), Instant::now()));
+            self.set_confirm_flash(msg);
             return;
         }
         self.confirm_close = None;
+        self.clear_confirm_flash(); // the arm was consumed; its prompt dies with it (U22)
 
         // The actual removal (kill the runtime, capture undo, fix up
         // tab/focus bookkeeping) is close_pane_id's job — shared with the
@@ -1960,6 +2064,24 @@ impl<B: PaneBackend> App<B> {
         if would_quit {
             self.quit = true;
         }
+    }
+
+    /// Alt+q. U1: quitting kills every pane's process at once, so it gets
+    /// the same second-press machinery as `close_pane`'s busy guard — while
+    /// any pane is busy (`Working || NeedsInput`, the shared U12 predicate),
+    /// the first press arms and prompts; the second within the window quits.
+    /// A quiet fleet still quits instantly: sessions resume on relaunch, so
+    /// there's nothing in flight to protect.
+    fn quit_guarded(&mut self) {
+        let busy = self.runtimes.values().filter(|rt| is_busy(rt.status())).count();
+        let armed = self.confirm_quit.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
+        if busy > 0 && !armed {
+            self.confirm_quit = Some(Instant::now());
+            let noun = if busy == 1 { "agent" } else { "agents" };
+            self.set_confirm_flash(format!("{busy} {noun} busy — Alt+q again to quit"));
+            return;
+        }
+        self.quit = true;
     }
 
     fn new_tab(&mut self) {
@@ -2044,7 +2166,7 @@ impl<B: PaneBackend> App<B> {
         }
         let ring = self.attention_ring();
         if ring.is_empty() {
-            self.flash = Some(("nothing needs you".into(), Instant::now()));
+            self.set_flash("nothing needs you");
             return;
         }
         let next = match ring.iter().position(|&id| id == self.focused) {
@@ -2053,7 +2175,7 @@ impl<B: PaneBackend> App<B> {
         };
         if next == self.focused {
             // The only ring member is the pane we're already on.
-            self.flash = Some(("nothing else needs you".into(), Instant::now()));
+            self.set_flash("nothing else needs you");
             return;
         }
         self.focus_attention_target(next);
@@ -2089,7 +2211,7 @@ impl<B: PaneBackend> App<B> {
     fn cycle_layout(&mut self) {
         let order = self.pane_order();
         if order.len() < 2 {
-            self.flash = Some(("one pane — nothing to arrange".into(), Instant::now()));
+            self.set_flash("one pane — nothing to arrange");
             return;
         }
         let focused = self.focused;
@@ -2103,7 +2225,7 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
         }
-        self.flash = Some(("no room to rearrange".into(), Instant::now()));
+        self.set_flash("no room to rearrange");
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -2133,7 +2255,7 @@ impl<B: PaneBackend> App<B> {
         }
         let body = self.body_area();
         if !Self::float_fits(body) {
-            self.flash = Some(("no room for float".into(), Instant::now()));
+            self.set_flash("no room for float");
             return;
         }
         match &mut self.float {
@@ -2207,7 +2329,7 @@ impl<B: PaneBackend> App<B> {
         } else {
             self.pane_order().first().copied().unwrap_or(0)
         };
-        self.flash = Some(("scratch closed".into(), Instant::now()));
+        self.set_flash("scratch closed");
     }
 
     // -- raw pass-through (C23) -----------------------------------------------
@@ -2244,7 +2366,16 @@ impl<B: PaneBackend> App<B> {
                 self.mode = Mode::Normal;
                 return true;
             }
-            if matches!(self.mode, Mode::Scroll { .. }) {
+            // U9: Alt+c is exempt from the snap below — Scroll→Copy hands
+            // the frozen view over intact, because scroll→select→yank is
+            // THE keyboard path for copying history (the wheel→Alt+c route
+            // already preserved the view; the keyboard route snapped to the
+            // live tail at the handoff, so history could never be yanked by
+            // keyboard). Same special-case shape as Alt+e above; the chord
+            // still falls through to the global binding, which enters Copy.
+            let scroll_to_copy =
+                matches!(self.mode, Mode::Scroll { .. }) && key.code == KeyCode::Char('c');
+            if matches!(self.mode, Mode::Scroll { .. }) && !scroll_to_copy {
                 let focused = self.focused;
                 if let Some(rt) = self.runtimes.get_mut(&focused) {
                     rt.set_scrollback(0);
@@ -2320,20 +2451,32 @@ impl<B: PaneBackend> App<B> {
             }
             Mode::Scroll { offset } => {
                 let page = (self.term_size.height / 2).max(1) as usize;
+                let focused = self.focused;
+                // U9: base the arithmetic on the view's CURRENT offset (the
+                // grid auto-advances it as new lines bank while scrolled),
+                // and after every write read the grid-clamped value back —
+                // the mode offset is a mirror of the view, never an
+                // independent counter free to overshoot into a phantom
+                // (~240 banked Down presses before the screen moved).
+                let cur = self
+                    .runtimes
+                    .get(&focused)
+                    .map(|rt| rt.scroll_offset())
+                    .unwrap_or(*offset);
                 let new_offset = match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => Some(*offset + 1),
-                    KeyCode::Down | KeyCode::Char('j') => Some(offset.saturating_sub(1)),
-                    KeyCode::PageUp => Some(*offset + page),
-                    KeyCode::PageDown => Some(offset.saturating_sub(page)),
+                    KeyCode::Up | KeyCode::Char('k') => Some(cur + 1),
+                    KeyCode::Down | KeyCode::Char('j') => Some(cur.saturating_sub(1)),
+                    KeyCode::PageUp => Some(cur + page),
+                    KeyCode::PageDown => Some(cur.saturating_sub(page)),
                     KeyCode::Esc | KeyCode::Char('q') => None,
                     _ => return true,
                 };
-                let focused = self.focused;
                 match new_offset {
                     Some(n) => {
                         *offset = n;
                         if let Some(rt) = self.runtimes.get_mut(&focused) {
                             rt.set_scrollback(n);
+                            *offset = rt.scroll_offset();
                         }
                     }
                     None => {
@@ -2397,7 +2540,24 @@ impl<B: PaneBackend> App<B> {
                             // of `self.mode` has already ended.
                             self.pending_yank = self.finish_selection();
                         } else {
-                            self.flash = Some(("nothing selected".into(), Instant::now()));
+                            self.set_flash("nothing selected");
+                        }
+                    }
+                    // U9: page the VIEW by the pane's inner height (grid-
+                    // clamped) — history is now reachable while selecting.
+                    // The cursor and selection stay in visible-grid cell
+                    // space and extraction still reads the visible grid
+                    // (C24's what-you-see-is-what-yanks limit stands).
+                    KeyCode::PageUp | KeyCode::PageDown => {
+                        let focused = self.focused;
+                        let view_page = copy_h.max(1) as usize;
+                        if let Some(rt) = self.runtimes.get_mut(&focused) {
+                            let cur = rt.scroll_offset();
+                            let want = match key.code {
+                                KeyCode::PageUp => cur + view_page,
+                                _ => cur.saturating_sub(view_page),
+                            };
+                            rt.set_scrollback(want);
                         }
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
@@ -2535,6 +2695,33 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
+}
+
+/// U2: a pane's display name from its spec — the custom title when set, else
+/// `{adapter} · {cwd-tag}` (the cwd's last path component), so a bank of
+/// untitled shells on the same adapter stays tellable apart. This was the
+/// corner badge's render-local fallback; it's shared here so the badge, the
+/// collapsed rows, the feed, notifications, and flashes can never drift
+/// apart on what a pane is called (C4's amendment points at this fn).
+pub fn display_name_of(spec: &PaneSpec) -> String {
+    if let Some(title) = &spec.title {
+        return title.clone();
+    }
+    let cwd_tag = spec
+        .cwd
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| format!(" · {f}"))
+        .unwrap_or_default();
+    format!("{}{cwd_tag}", spec.adapter)
+}
+
+/// U12's busy predicate, shared by the Alt+w and Alt+q destructive guards so
+/// the two can never disagree about what "busy" means: an agent mid-turn is
+/// one actively producing (`Working`) *or* blocked on your approval
+/// (`NeedsInput`) — closing either loses the in-flight turn.
+fn is_busy(status: AgentStatus) -> bool {
+    matches!(status, AgentStatus::Working | AgentStatus::NeedsInput)
 }
 
 /// C20: the feed overlay's `(width, height)` at the given body area —
@@ -2684,6 +2871,194 @@ mod tests {
         assert_eq!(app.runtimes.len(), 2);
         app.apply(Action::ClosePane); // confirmed ⇒ closed
         assert_eq!(app.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn closing_a_needs_input_pane_needs_a_confirming_second_press() {
+        // U12: an agent blocked on your approval (◆) is mid-turn all the
+        // same — the close guard's busy predicate is Working || NeedsInput,
+        // not Working alone.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ClosePane); // armed, not closed
+        assert_eq!(app.runtimes.len(), 2);
+        app.apply(Action::ClosePane); // confirmed ⇒ closed
+        assert_eq!(app.runtimes.len(), 1);
+    }
+
+    #[test]
+    fn quit_with_a_quiet_fleet_is_instant() {
+        // U1: the guard protects in-flight turns; a quiet fleet has none —
+        // sessions resume on relaunch, so Alt+q stays a single press.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_with_a_busy_pane_arms_then_a_second_press_quits() {
+        // U1: closing one busy pane double-confirms, so killing the whole
+        // fleet must too — first press arms + prompts, second quits.
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_pty_output(1, b"x"); // Working
+        app.apply(Action::Quit);
+        assert!(!app.quit);
+        assert_eq!(app.flash(), Some("1 agent busy — Alt+q again to quit"));
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_guard_counts_needs_input_panes_and_pluralizes() {
+        // U1 counts with U12's predicate: a ◆ pane is as mid-turn as a
+        // working one, and the prompt reports how much is at stake.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.on_pty_output(1, b"x"); // Working
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::Quit);
+        assert!(!app.quit);
+        assert_eq!(app.flash(), Some("2 agents busy — Alt+q again to quit"));
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn another_action_disarms_the_quit_confirm_and_drops_its_prompt() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_pty_output(1, b"x"); // Working
+        app.apply(Action::Quit); // armed
+        assert!(app.flash().is_some());
+        app.apply(Action::ToggleHints); // any other action disarms...
+        assert_eq!(app.flash(), None, "the confirm prompt dies with its arm (U22)");
+        app.apply(Action::Quit); // ...so the next Alt+q re-arms, not quits
+        assert!(!app.quit);
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn an_armed_close_never_confirms_a_quit_nor_vice_versa() {
+        // The two confirms are separate state: Alt+w-then-Alt+q must not
+        // treat the close arm as the quit's first press (or the other way
+        // around) — each destructive path earns its own second press.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // Working
+        app.apply(Action::ClosePane); // close armed
+        app.apply(Action::Quit); // must ARM the quit, not confirm-quit
+        assert!(!app.quit);
+        // ...and the quit press disarmed the close: the next Alt+w re-arms
+        // instead of closing.
+        app.apply(Action::ClosePane);
+        assert_eq!(app.runtimes.len(), 2);
+    }
+
+    #[test]
+    fn confirm_flash_lives_exactly_as_long_as_its_confirm_window() {
+        // U22: FLASH_WINDOW (2s) < CONFIRM_WINDOW (3s) used to leave a
+        // silent final second where the second press still fired. A confirm
+        // prompt now carries the confirm window itself; ordinary flashes
+        // keep FLASH_WINDOW; a consumed arm takes its prompt down with it.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // Working
+        app.apply(Action::ClosePane); // armed
+        assert_eq!(app.flash.as_ref().unwrap().2, CONFIRM_WINDOW);
+        app.apply(Action::ClosePane); // confirmed ⇒ closed, prompt gone
+        assert_eq!(app.flash(), None);
+        app.set_flash("copied 3 chars");
+        assert_eq!(app.flash.as_ref().unwrap().2, FLASH_WINDOW);
+    }
+
+    #[test]
+    fn scroll_mode_offset_clamps_to_banked_history_no_overshoot() {
+        // U9 (overshoot): paging past the top of history must clamp BOTH
+        // the view and the mode's mirrored offset — one Down after that
+        // moves the view immediately, instead of burning ~240 presses
+        // against a phantom counter.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().scroll_total = 10;
+        app.apply(Action::ScrollMode);
+        // term height 30 ⇒ page 15; two PageUps ask for 30, history has 10.
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 10);
+        let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
+        assert_eq!(offset, 10, "mode offset mirrors the clamp, not the ask");
+        // One Down moves the view immediately.
+        app.handle_mode_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 9);
+        let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
+        assert_eq!(offset, 9);
+    }
+
+    #[test]
+    fn entering_scroll_mode_seeds_from_the_wheeled_offset() {
+        // U9 (wheel/keys desync): Scroll mode continues from the wheeled
+        // position — the first Up goes one line FURTHER back, instead of
+        // snapping the view from the wheeled offset to 1.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.wheel_scroll(id, 24);
+        app.apply(Action::ScrollMode);
+        let Mode::Scroll { offset } = app.mode else { panic!("scroll mode") };
+        assert_eq!(offset, 24, "seeded from the pane's current view offset");
+        app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 25);
+    }
+
+    #[test]
+    fn alt_c_from_scroll_mode_preserves_the_scrolled_view() {
+        // U9 (scroll→copy snap): the Alt-chord snap exempts the copy
+        // transition, so scroll→select→yank works on history — the view a
+        // wheel→Alt+c handoff always kept now survives the keyboard route
+        // too. (Any other Alt chord still snaps: pinned by
+        // `scrolling_then_a_global_chord_snaps_the_pane_back_to_live`.)
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.wheel_scroll(id, 5);
+        app.apply(Action::ScrollMode);
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert!(!consumed, "Alt+c falls through to the global CopyMode binding");
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 5, "no snap at the handoff");
+        app.apply(Action::CopyMode); // what the fallthrough dispatches
+        assert!(matches!(app.mode, Mode::Copy { .. }));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 5, "copy opens on the frozen view");
+    }
+
+    #[test]
+    fn copy_mode_pages_the_view_by_pane_height_and_clamps() {
+        // U9: PgUp/PgDn in copy mode walk the view through history by the
+        // pane's inner height, clamped to what's banked; motions/selection
+        // stay in visible-grid cell space (C24).
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let (rows, _) = inner_dims(app.rects()[0].rect);
+        let page = rows as usize;
+        app.runtimes.get_mut(&id).unwrap().scroll_total = page + 5;
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback as usize, page);
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(
+            app.runtimes.get(&id).unwrap().scrollback as usize,
+            page + 5,
+            "second page clamps to the banked history"
+        );
+        app.handle_mode_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.runtimes.get(&id).unwrap().scrollback as usize, 5);
+        assert!(matches!(app.mode, Mode::Copy { .. }), "paging never leaves copy mode");
     }
 
     #[test]
@@ -3192,13 +3567,15 @@ mod tests {
 
         let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
         assert_eq!(transitions.len(), 2, "{:?}", app.feed());
-        let alpha = transitions.iter().find(|e| e.text.starts_with("alpha:")).expect("alpha's own line");
-        assert_eq!(alpha.text, "alpha: idle → working");
+        // U2: transition lines lead with the pane id, then the display name.
+        let alpha = transitions.iter().find(|e| e.text.contains("alpha:")).expect("alpha's own line");
+        assert_eq!(alpha.text, format!("{a} alpha: idle → working"));
         assert!(!alpha.needs_input);
-        let charlie = transitions.iter().find(|e| e.text.starts_with("charlie:")).expect("charlie's own line");
-        assert_eq!(charlie.text, "charlie: idle → needs you");
+        let charlie =
+            transitions.iter().find(|e| e.text.contains("charlie:")).expect("charlie's own line");
+        assert_eq!(charlie.text, format!("{c} charlie: idle → needs you"));
         assert!(charlie.needs_input);
-        assert!(!transitions.iter().any(|e| e.text.starts_with("bravo:")), "unchanged pane must stay silent");
+        assert!(!transitions.iter().any(|e| e.text.contains("bravo:")), "unchanged pane must stay silent");
 
         // The broadcast's one ctl line must still be exactly one — untouched by the tick.
         assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
@@ -4409,12 +4786,102 @@ mod tests {
     }
 
     #[test]
-    fn spawn_pushes_a_feed_line_naming_the_adapter() {
+    fn scroll_offset_and_position_report_the_grid_clamped_view() {
+        // U3: honesty surfaces (badge ↑N, hint ↑N/M) read the VIEW's truth —
+        // a stored offset beyond the banked history reports as the clamp,
+        // never the caller's phantom (U9's overshoot).
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let rt = app.runtimes.get_mut(&id).unwrap();
+        rt.scroll_total = 300;
+        rt.set_scrollback(5000); // caller overshoots
+        assert_eq!(app.scroll_offset(id), 300);
+        assert_eq!(app.scroll_position(), (300, 300));
+        // Back at the tail: no offset, no token.
+        app.runtimes.get_mut(&id).unwrap().set_scrollback(0);
+        assert_eq!(app.scroll_offset(id), 0);
+    }
+
+    // -- U2 pane identity ---------------------------------------------------
+
+    #[test]
+    fn display_name_of_is_title_else_adapter_cwd_tag() {
+        let mut spec = PaneSpec {
+            adapter: "pi".into(),
+            cwd: PathBuf::from("/home/user/rqa-work"),
+            session: None,
+            title: None,
+            spawned_by: None,
+        };
+        assert_eq!(display_name_of(&spec), "pi · rqa-work");
+        spec.title = Some("worker1".into());
+        assert_eq!(display_name_of(&spec), "worker1");
+        // A cwd with no final component (e.g. `/`) degrades to the bare
+        // adapter, no dangling separator.
+        spec.title = None;
+        spec.cwd = PathBuf::from("/");
+        assert_eq!(display_name_of(&spec), "pi");
+    }
+
+    #[test]
+    fn display_name_and_feed_label_fall_back_for_a_specless_pane() {
+        let (app, _) = mk_app(shell_ws());
+        assert_eq!(app.display_name(99), "pane 99");
+        assert_eq!(app.feed_label(99), "pane 99"); // not "99 pane 99"
+        assert_eq!(app.feed_label(1), "1 shell · tmp");
+    }
+
+    #[test]
+    fn notifications_carry_the_display_name() {
+        // U2: "shell · tmp is waiting for you", not an anonymous "shell is
+        // waiting for you" — same helper as every other fleet surface.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2, so pane 1 is unfocused
+        let msg = app.on_status(1, AgentStatus::NeedsInput);
+        assert_eq!(msg.as_deref(), Some("shell · tmp is waiting for you"));
+    }
+
+    #[test]
+    fn exit_feed_line_has_the_id_and_the_exit_notification_the_name() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2
+        let msg = app.on_pty_exit(1); // unfocused pane exits ⇒ notification
+        assert_eq!(msg.as_deref(), Some("shell · tmp exited"));
+        assert_eq!(app.feed().back().unwrap().text, "1 shell · tmp exited");
+    }
+
+    #[test]
+    fn reopened_flash_and_feed_line_name_the_restored_pane() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
+        app.apply(Action::ClosePane); // quiet pane closes instantly
+        app.apply(Action::Undo);
+        let restored = app.focused;
+        assert_eq!(app.flash(), Some("reopened shell · tmp"));
+        assert_eq!(app.feed().back().unwrap().text, format!("reopened {restored} shell · tmp"));
+    }
+
+    #[test]
+    fn busy_close_confirm_flash_names_the_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // Working
+        app.apply(Action::ClosePane); // armed
+        assert_eq!(app.flash(), Some("shell · tmp busy — Alt+w again to close"));
+    }
+
+    #[test]
+    fn spawn_pushes_a_feed_line_with_id_and_display_name() {
+        // U2: `spawned {id} {display_name}` — the untitled display name
+        // (`shell · tmp`) already ends in the adapter/cwd tag, so no
+        // `(shell)` suffix (C4's no-dup rule); titled spawns keep it (see
+        // the float's `spawned N scratch (shell)` test).
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
         let last = app.feed().back().expect("spawn should push a feed line");
-        assert!(last.text.starts_with("spawned "), "{}", last.text);
-        assert!(last.text.contains("(shell)"), "{}", last.text);
+        assert_eq!(last.text, format!("spawned {id} shell · tmp"));
         assert!(!last.needs_input);
     }
 
@@ -4593,8 +5060,8 @@ mod tests {
         assert_eq!(spec.title.as_deref(), Some("scratch"));
         assert!(app.runtimes.contains_key(&float_id), "must actually spawn");
         // Free correctness via the shared spawn_pane hook (no float-specific
-        // feed code needed).
-        assert!(app.feed().back().unwrap().text.starts_with("spawned scratch (shell)"));
+        // feed code needed). U2: titled spawn = `spawned {id} {title} ({adapter})`.
+        assert_eq!(app.feed().back().unwrap().text, format!("spawned {float_id} scratch (shell)"));
     }
 
     #[test]

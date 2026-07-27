@@ -1,0 +1,311 @@
+# SPEC-parity — lessons from peer terminals: verified defects & contracts
+
+**Status: OPEN.** A living spec of defects and gaps that peer tools (tmux,
+zellij, wezterm, kitty, alacritty, ghostty, Claude Code's own issue tracker)
+spent years discovering, verified present in roost. Companion to SPEC-ux.md
+(which catalogues gaps found by direct UX review); items here came from mining
+peer issue trackers and were **individually verified against the real binary**
+before being written down.
+
+**Method.** Stage 1: research over peer projects' open+closed issues (public
+web), calibrated against SPEC-ux.md and shipped fixes so only new failure
+modes surface; each candidate carried a runnable verification recipe. Stage 2:
+every recipe executed against roost — unit probes against `translate`/vt100/
+`extract_selection`, PTY-harness sessions with raw host-byte capture, and the
+control CLI as ground truth. Stage 3 (this doc): only verified items, with
+corrected mechanisms where the research guess was wrong. A separate deep-dive
+diagnosed the startup-stall cluster (P4) end to end with measurements.
+
+**Verdicts:** `CONFIRMED` (reproduced, evidence in Appendix A) ·
+`PARTIAL` (symptom real, mechanism corrected) · `GAP` (missing feature, not a
+bug). Severity is impact for a user supervising AI-agent panes.
+
+---
+
+## Workstreams (fix-surface grouping — implement in this order)
+
+- **W1 · Pane env hygiene** — P11. Small; shrinks the blast radius of W2/W3
+  (apps stop sniffing iTerm/kitty/tmux identity and negotiating protocols
+  roost can't back). Sequence first.
+- **W2 · Query responder** — P4 (+ the DECRQM half of P1). Implementation-
+  ready; full byte-precise design in Appendix B. Kills the yazi/atuin startup
+  stalls and the crossterm infinite hang.
+- **W3 · Pane escape-traffic channel** — P1, P2, P3, P6, P7. One missing piece
+  of plumbing unlocks all five: vt100's `Perform` impl has no way to surface
+  events (or re-emit sequences to the host). Includes the vendored-parser arms
+  (2026, 1004, OSC 9/52/777, DECSCUSR, SGR 2/9, REP) shared with W6.
+- **W4 · Input gating** — P12, P13. Two guards in `translate`; P13's fix is
+  the same change as SPEC-ux U5 (meta-ESC fallthrough via `encode_raw`).
+- **W5 · Scroll/zoom state truth** — P5, P9, P14 (folds into/amends SPEC-ux
+  U9), P7's scrolled-cursor facet (belongs with U3/N1).
+- **W6 · Width & styling fidelity** — P15, P16, P17, P19 (+ SPEC-ux U24 as one
+  bundle: unify unicode-width, fix continuation cells in blit *and*
+  extraction, add missing SGR/REP arms).
+- **W7 · Mouse & shell polish** — P18, P20, P21.
+
+---
+
+## P0 — breaks the agent-supervision loop
+
+### P1 · CONFIRMED · High — synchronized output (mode 2026) neither honored nor forwarded
+Apps wrap redraws in `CSI ?2026h … ?2026l` expecting atomic presentation —
+the mechanism behind a year of "Claude Code flickers/tears in tmux" reports
+(claude-code #37283; tmux PR #4744; zellij #4693). roost's vt100 has no 2026
+arm and the render loop blits whatever the parser holds every ~33 ms tick.
+**Measured:** 31 of 50 server-side `roost read` samples caught the pane's
+grid mid-bracket (cleared/partial); 42 of 80 host frames torn; `?2026` never
+reaches the host.
+**Contract:** track mode 2026 in the vendored parser; while a pane's bracket
+is open, the renderer presents that pane's *last pre-bracket* grid (with a
+staleness cap so a stuck bracket can't freeze the pane); answer DECRQM 2026
+honestly per what ships (see W2).
+
+### P2 · CONFIRMED · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
+Claude Code emits desktop notifications via OSC 9 and progress via OSC 9;4
+(claude-code #19976, #57366). roost drops them at `osc_dispatch` (only OSC
+0/1/2 handled) — and because the OSC-terminating BEL is deliberately not
+counted as a bell, the NeedsInput heuristic never fires either.
+**Measured:** after a pane emitted `OSC 9 ; NEEDS-YOU BEL` + 3.3 s quiet,
+status stayed `waiting`; the control probe (a real BEL) flipped it to
+`needs_input`; no `ESC ]9;` ever reached the host stream.
+**Contract:** an OSC 9/777 notification from a pane (a) maps to the same
+attention path as a bell (badge ◆ + notifier), and (b) is optionally
+re-emitted to the host terminal so native desktop notifications fire.
+OSC 9;4 progress may be surfaced later (badge percentage) — out of scope here.
+
+### P3 · CONFIRMED · High — inner-app OSC 52 clipboard writes are discarded
+An app inside a pane (Claude Code copy action — claude-code #63054/#63061,
+nvim+osc52, anything over SSH) sets the clipboard via `OSC 52`; roost eats it;
+the app reports "copied" over an unchanged clipboard — the same lie SPEC-ux
+U14 documents for roost's own copy path, now for inner apps.
+**Measured:** pane emitted `OSC 52;c;aGk=`; the bytes `ESC ]52` never
+appeared anywhere in the captured host stream.
+**Contract:** forward pane OSC 52 writes to the host terminal (roost's own
+copy mode already proves the host path works); optionally cap size and gate
+reads (`52;c;?`) which are a paste-theft vector — forward writes, refuse reads.
+
+### P4 · CONFIRMED (measured end to end) · High — the terminal-query black hole
+roost answers exactly one query (kitty `CSI ?u`) and swallows DA1, DSR-CPR
+`6n`, DECRQM, XTVERSION, XTWINOPS 14/16/18t, XTGETTCAP — worse than answering
+nothing: crossterm-0.28's `supports_keyboard_enhancement()` gets its kitty
+half answered and then **blocks forever** waiting for DA1 (measured: hung at
+10 s; on a bare PTY it times out at 2.002 s). atuin's default inline viewport
+**aborts at ~2.045 s** waiting for a cursor-position report (50 ms once
+answered). yazi burns two 500 ms DA1-terminated probe rounds and its 400 ms
+watchdog prints the red *"Terminal response timeout"* flash users see. roost
+itself pays the same 2 s as a client at startup (first frame 2014 ms vs 23 ms
+under an answering terminal), and roost-inside-roost hard-hangs. PTYs are also
+opened with `pixel_width/height: 0` (degrades image-capable apps silently).
+**Contract:** the full responder design — queries, byte-precise replies,
+stream-order requirement, what to deliberately NOT answer, pixel-geometry
+plumbing, and the client-side startup fix — is in **Appendix B**. This is
+implementation-ready.
+
+### P5 · CONFIRMED · High (destructive) — no reflow; a zoom round-trip truncates the grid
+`Grid::set_size` hard-truncates rows in place and clears wrap flags; zoom
+deliberately resizes the pane's PTY to full-body and back.
+**Measured:** a 110-char line printed *while zoomed* (118 cols) lost its tail
+(`Q7TAIL`, cols 95–100) permanently on unzoom to 58 cols — still gone after
+re-zooming; pre-zoom wrapped lines never rejoin. Nuance: scrollback rows keep
+their old width, so history becomes mixed-width after a round-trip.
+**Contract:** a zoom round-trip must be lossless. Either (a) implement reflow
+(rewrap on width change, live grid + defined scrollback semantics), or (b)
+stop resizing the zoomed pane's PTY (letterbox at tiled size). Pick
+deliberately; (b) is honest and cheap, (a) is what users of alacritty/wezterm
+expect. Interim: document the loss. Also fixes SPEC-ux U19's dependency on
+`row_wrapped` surviving resizes.
+
+## P1 — status, identity, input correctness
+
+### P6 · CONFIRMED · Med-High — pane OSC 0/2 titles invisible
+Claude Code continuously publishes `spinner + task` via OSC 0/2 (claude-code
+#17887/#52258) — the cheapest live fleet-status text there is. vt100 already
+parses and stores it; **zero** call sites read `screen().title()`; nothing
+re-emits it to the host (outer tab title goes stale the moment roost starts).
+**Contract:** untitled panes' `display_name` (SPEC-ux U2) prefers the live
+OSC title over `adapter · cwd-tag`; an explicit Alt+r title still wins; roost
+sets the *host* terminal title to `roost · <active pane's display_name>`.
+
+### P7 · CONFIRMED · Med — cursor fidelity: hidden/shape/scroll all wrong
+Three facets, all verified: (a) the renderer places the host cursor whenever
+the pane is focused, never consulting `screen.hide_cursor()` — a ghost cursor
+blinks over TUIs that hid theirs; (b) DECSCUSR (`CSI 5 q` etc.) dies in the
+vendored parser's unhandled arm and is never mirrored to the host — insert-bar
+cursors render as blocks; (c) the cursor position comes from the live grid
+even while the view is scrolled back — it floats over history.
+**Contract:** honor `hide_cursor()`; park the cursor while scrollback offset
+> 0 (same surface as U3/N1); parse DECSCUSR per pane and mirror the focused
+pane's shape to the host (restoring roost's own on focus change/exit).
+
+### P8 · CONFIRMED · Med — kitty keyboard protocol: roost affirms flags it doesn't implement
+After a pane pushes flags 7, roost's query reply echoes `?7u` — contractually
+promising disambiguated Esc (`CSI 27u`), CSI-u modifier combos, and release
+events — while only modified-Enter is actually CSI-u-encoded; Esc goes out as
+bare `0x1b`; Release events are filtered before translate ever sees them.
+Apps that trust the ACK (fish 4, helix, kakoune) misparse. Note: a unit test
+currently pins the flag-echoing reply as intended, and release events require
+host-side kitty flags — an architecture decision, not a patch.
+**Contract:** reply with the flags roost *implements* (mask to the honest
+subset), and grow the subset deliberately: next increments are CSI-u Esc
+(`\x1b[27u`) and Ctrl/Alt letter combos under disambiguate.
+
+### P9 · CONFIRMED · Med — wheel is dead over alternate-screen apps
+`man`/`less` without mouse mode: wheel events route to roost-side scrollback,
+but the alternate grid has scrollback capacity 0 — the view never moves and
+the app receives nothing (measured byte-level: zero bytes from six wheel
+events; `less` screen byte-identical). tmux #1333 → #4952 is this exact saga.
+**Contract:** when `alternate_screen() && MouseProto::None`, translate wheel
+to 3× arrow keys per tick (the DECSET 1007 convention). All needed state is
+already exposed on the backend.
+
+### P10 · CONFIRMED · Med — focus reporting (?1004) absent at all three layers
+roost never enables host focus events, has no FocusGained/Lost arms, doesn't
+parse `?1004h` from panes, and synthesizes nothing on pane switches —
+verified end to end (a `?1004h` pane saw no `CSI I`/`CSI O` across a focus
+round-trip). Supersedes the SPEC-ux "deliberately-scoped" note with evidence.
+**Contract:** track `?1004` per pane; deliver `CSI I`/`CSI O` on roost pane
+focus changes to panes that asked; enable host focus events and forward them
+to the focused pane; vim autoread / TUI dim-on-blur start working.
+
+### P11 · CONFIRMED · Med — host identity env leaks into panes
+`TERM_PROGRAM=iTerm.app`, `KITTY_WINDOW_ID`, `ITERM_SESSION_ID`, `TMUX` all
+arrive verbatim inside panes (only `TERM` is overridden). Apps then negotiate
+proprietary protocols (iTerm2 images, kitty graphics, tmux DCS passthrough)
+that roost swallows — enlarging P1/P2/P3/P8's blast radius.
+**Contract:** scrub the known identity vars at spawn; set
+`TERM_PROGRAM=roost` (+ version var) so apps can adapt deliberately.
+Sequence this first — it's small and de-risks everything in W2/W3.
+
+### P12 · CONFIRMED · Med — Ctrl+`-` forwards a bare Enter (accidental submit)
+`encode_key`'s blanket `& 0x1f` maps Ctrl+`-` → `0x0D` (CR — submits the
+half-written prompt in any agent CLI) and Ctrl+`/` → `0x0F` (readline
+operate-and-get-next). The same mask is *coincidentally correct* for
+`[ ] \ ^ _` — the fix is a collision gate (letters + those five), not removal.
+**Contract:** Ctrl+`-` and Ctrl+`/` encode `0x1F` (xterm/kitty legacy);
+Ctrl+digits and other non-C0-mappable punctuation forward nothing rather than
+a wrong control byte.
+
+### P13 · CONFIRMED · Med (raised) — Ctrl+Alt+key triggers Alt actions
+The chord table matches on ALT alone: `C-M-f` toggles the float, **`C-M-w`
+closes a pane** — destructive collision with emacs/readline muscle memory.
+**Contract:** chords match only when CONTROL is absent; Ctrl+Alt+printables
+forward as ESC+ctrl-byte. This is the same change as SPEC-ux U5's meta-ESC
+fallthrough (`encode_raw` already computes exactly these bytes) — implement
+them together.
+
+### P14 · PARTIAL · Med-Low — scrolled view jumps on interaction (mechanism corrected)
+The research claimed passive drift; **measurement disproved it** — the
+vendored grid auto-compensates the offset as lines scroll out (view stayed
+anchored through new output). The real defect: roost keeps two shadow copies
+of the offset (`PtyPane::scroll`, `Mode::Scroll { offset }`) that are never
+reconciled with the grid's compensated value — the *next* wheel tick or
+scroll-mode key teleports the view toward the tail (measured: one Up moved
+the view 4 lines tailward). This amends SPEC-ux U9: reading back the clamped
+value once is insufficient — **every scroll step must seed from the grid's
+current `scrollback()` value**, not from a cached copy. (True drift remains
+only at ring-buffer capacity — inherent, accept.)
+
+## P2 — rendering & extraction fidelity
+
+### P15 · CONFIRMED · Med-Low — yanked CJK/emoji text corrupted
+`extract_selection` pushes a space for every empty cell — wide-char
+continuation cells included: selecting `日本語` yanks `"日 本 語"`. Pasting
+yanked paths/code back into an agent breaks them.
+**Contract:** skip wide-continuation cells during extraction (the
+`grab_all_text` path already gets this right — the two must agree).
+
+### P16 · CONFIRMED · Low-Med — SGR 2 (dim) and 9 (strikethrough) dropped
+Verified attribute-identical to unstyled text end to end (vt100 `Attrs` has
+no field; renderer maps only bold/italic/underline/inverse). Claude Code
+leans on dim for secondary text — panes flatten into equal-weight walls.
+**Contract:** add dim/strikethrough to the vendored `Attrs` + SGR arms and map
+to ratatui `Modifier::DIM`/`CROSSED_OUT`.
+
+### P17 · CONFIRMED · Low-Med — unicode-width table skew (0.1.14 vs 0.2.0)
+The vendored vt100 measures with unicode-width 0.1.14 while roost/ratatui use
+0.2.0 — VS16 emoji widths changed between them. Measured: `"❤️"` is 2 cols
+to the renderer, 1 col to the grid (following char landed at col 1) — grid
+bookkeeping, blit, and hitboxes disagree per glyph.
+**Contract:** bump the vendored parser to the workspace's unicode-width in
+the same change as P15/U24 so grid and renderer can never disagree again.
+
+### P18 · CONFIRMED · Low-Med — shell panes are non-login shells
+`$SHELL` is spawned bare (no `-l`, no dash-argv0). On macOS, `~/.zprofile`
+(Homebrew PATH — where `claude`/`pi` often live) never runs; the classic
+"works in a terminal tab, `command not found` in the mux" (tmux #1623).
+**Contract:** spawn shell-adapter panes as login shells (dash-prefixed argv0
+or `-l`), matching every terminal emulator's default.
+
+### P19 · CONFIRMED · Low — REP (`CSI Ps b`) unimplemented while TERM advertises it
+`TERM=xterm-256color` promises `rep`; ncurses 6 uses it; roost renders
+`"ab" + CSI 5 b` as `"ab"` (expected `"abbbbbb"`) — dropped glyph runs in
+htop-class TUIs. **Contract:** implement the `b` arm (repeat last graphic
+char), part of the W6 vendored-parser batch.
+
+### P20 · CONFIRMED (inspection) · Low — mouse gestures don't latch to a pane
+Every mouse event is re-hit-tested, so a drag that crosses a border switches
+target mid-gesture (origin app never sees Up; neighbor gets orphan events);
+SGR coords also aren't clamped to the pane's right/bottom edge. Copy mode
+already latches — the pattern exists.
+**Contract:** latch button-down's pane until release (copy-mode style);
+clamp forwarded coords to the pane's inner grid.
+
+### P21 · GAP · Low — no scrollback search, no dump-to-editor
+Every peer ships search; roost's only history export is `roost read --full`.
+**Contract (sketch):** `/` in Scroll/Copy mode = incremental search over
+`grab_all_text`, jumps setting the (P14-vetted) offset; a dump-to-editor verb
+can start as a thin affordance over the existing control-plane read.
+
+## Not applicable — peer failure classes roost's architecture rules out
+Daemon/attach crashes (no daemon by design) · session-resurrection duplicates
+(single-instance lock + claimed-session set) · scrollback-serialization
+corruption (scrollback never persisted) · post-crash wrecked terminals (panic
+hook restores) · config-file breakage (zero-config) · output-flood starvation
+(bounded channel + per-tick cap, firehose-gated) · heuristic-status wrongness
+(documented tradeoff; sharpest edge tracked as U22).
+
+---
+
+## Appendix A — verification evidence (abridged)
+Full receipts live in the verification run's output; per-item highlights:
+P1 31/50 torn server-side samples · P2 status `waiting` after OSC 9 vs
+`needs_input` after control BEL · P3/P6 target bytes absent from whole-session
+host capture · P5 `Q7TAIL` destroyed across zoom round-trip · P7 host cursor
+visible during pane `?25l` · P8 `\x1b[?7u` echo + bare-`0x1b` Esc ·
+P9 zero bytes from six wheel events · P10 no `CSI I/O` across focus
+round-trip · P11 four identity vars leaked verbatim · P12 `Ctrl+'-' →
+[0x0D]` · P13 `Ctrl+Alt+w → Action(ClosePane)` · P14 anchored view, then
+4-line jump on first keypress · P15 `"日 本 語"` · P16 attrs identical to
+unstyled · P17 `X` at col 1 after a 2-col heart · P18 non-login probe ·
+P19 `"ab"` unchanged · P4 measured in the startup-stall diagnosis (atuin
+abort at 2045 ms; yazi watchdog message verbatim; crossterm hang > 10 s;
+roost first frame 2014 ms vs 23 ms).
+
+## Appendix B — W2 query responder: implementation-ready design (from the P4 deep dive)
+Generalize `src/infra/kitty.rs` into a pane-side query responder fed from
+`PtyPane::process_output`, with replies written via `write_input_raw`.
+Load-bearing details: run `parser.process` *before* the responder so DSR/
+DECRQM answers reflect post-chunk state, and emit replies in stream-encounter
+order (crossterm's `?u`+DA1 burst requires kitty-reply-then-DA1 or it
+misparses). Answers (modeled on tmux 3.5a `input.c`):
+DA1 `CSI c` → `\x1b[?1;2c` (the single highest-value reply: unstalls
+crossterm, both yazi rounds, atuin) · DA2 → `\x1b[>84;0;0c` or a roost
+identity · DSR 5 → `\x1b[0n` · DSR 6 → `\x1b[{row+1};{col+1}R` from
+`screen.cursor_position()` · DECRQM `?Pd$p` → honest values from tracked
+state (2004/25/1 known; report 0 for untracked modes; claim 2026 only once
+W3 ships it) · XTVERSION → `\x1bP>|roost {version}\x1b\\` · XTWINOPS
+14/16/18t from plumbed pixel geometry (suppress 14/16 when unknown).
+Deliberately silent: kitty-graphics probe (roost can't composite — with DA1
+answered, yazi picks its fallback instantly and honestly), XTGETTCAP,
+DECRQSS, and OSC 10/11 unless roost learns real host colors. Pixel plumbing:
+read host winsize at startup/resize, derive per-pane pixels proportionally,
+pass through `PaneBackend::spawn/resize`. Separately: roost's own startup
+must not block on `supports_keyboard_enhancement()` under a non-answering
+terminal (run concurrently with init); a first-frame-latency regression guard
+belongs in the harness once fixed.
+
+## Cross-references
+U2 ← P6 (display_name prefers OSC title) · U3/N1 ← P7c (park cursor while
+scrolled) · U5 = P13 (one change) · U9 ← P14 (amended contract: seed every
+step from the grid) · U14 ↔ P3 (both halves of clipboard honesty) · U19 ← P5
+(wrap flags survive only with reflow) · U24 = P15+P16+P17+P19 bundle (W6).

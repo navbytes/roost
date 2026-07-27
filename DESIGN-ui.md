@@ -107,6 +107,11 @@ indications (`ZOOM`/`RAW`, C9) plus a plain-text `raw` badge token (C23); the
 float (C22) is chrome-identical to a pane; the copy cursor (C24) is
 modifier-based. Any new glyph appearing under `src/ui/` is a DEVIATED.
 
+**[Amended 2026-07-27, SPEC-ux U3]:** one glyph added since: `↑` U+2191
+(`theme::SCROLLED`, single-width) — the scrollback marker leading the badge's
+`↑N` token (C4) and the scroll hint's `↑N/M` position (C9). It appears only
+while a pane's view is frozen in history; no other new glyph is sanctioned.
+
 ---
 
 ## 3. Component contracts
@@ -211,17 +216,35 @@ with tests `:530–555`.
 - Drawn on **every** non-collapsed pane, focused included (suppression branch
   at `:376` removed; occlusion of the inner app's top-right cells is accepted
   by design).
-- Content: `"{name} · {adapter} {glyph}"` — where `name` is the existing
-  display name (`title`, else the adapter/cwd fallback built at `:304–312`).
-  When the pane has no custom title the fallback already contains the adapter,
-  so the ` · {adapter}` segment is skipped (no `"pi · repo · pi"` dup):
-  untitled badge = `"{name} {glyph}"`.
+- Content: `"{id} {name} · {adapter} {glyph}"` — where `name` is the display
+  name (`title`, else the adapter/cwd fallback). When the pane has no custom
+  title the fallback already contains the adapter, so the ` · {adapter}`
+  segment is skipped (no `"pi · repo · pi"` dup): untitled badge =
+  `"{id} {name} {glyph}"`.
+  **[Amended 2026-07-27, SPEC-ux U2]:** the badge leads with the pane id —
+  the join key for `roost send <id>`, which previously appeared nowhere in
+  the TUI — and the display-name fallback is no longer render-local: it is
+  the shared `core::app::display_name_of` (title, else
+  `{adapter} · {cwd-tag}`), the one helper every fleet surface (badge,
+  collapsed rows, feed, notifications, flashes) derives pane identity from.
 - Style: text fg `MUTED`; glyph fg per C5 status colors, pulsing when Working.
 - Geometry: top row of the pane's inner area, right-aligned, one column of
   right breathing room — `corner_badge()` clipping behavior and its tests
   stay (helper may evolve to return spans for the two-tone styling).
 - [Amended 2026-07-22, fleet features] A raw pane's badge additionally carries
   the `raw` token per C23.
+- **[Amended 2026-07-27, SPEC-ux U3/N1]** Whenever the pane's grid-clamped
+  scrollback offset is > 0 the badge carries a dim `↑N` token — fg
+  `ACCENT_DIM`, same family as the `raw` token, placed glyph-adjacent (after
+  `raw` when both): `"{id} {name} · ↑N {glyph}"`, raw
+  `"{id} {name} · raw · ↑N {glyph}"`. N is the *view's* offset read back from
+  the grid (`PaneBackend::scroll_offset`), never a caller's unclamped
+  counter. While the token shows, the Working glyph's C5 pulse is suppressed
+  (steady base color): pulsing red means "alive right now", which a frozen
+  view must not assert (N1) — the glyph itself keeps reporting the true
+  status, and any path that resets the offset removes the token and resumes
+  the pulse. Collapsed rows and the tab bar keep pulsing — they show no
+  grid, so there is no frozen view to lie about.
 
 ### C5 — Status glyph system + pulse
 
@@ -252,6 +275,11 @@ extra redraw scheduling. Only Working `●` pulses — never `◆` (steady red =
 "waiting on you", pulsing red = "alive"). Pure function
 (`theme::pulse_phase(elapsed) -> Color` or equivalent) with unit tests at the
 boundaries: 0 → ACCENT, 549 → ACCENT, 550 → ACCENT_DIM, 1100 → ACCENT.
+
+[Amended 2026-07-27: one sanctioned exception to "pulse: yes" — a scrolled
+pane's corner badge shows Working steady (no pulse) while its view is frozen
+in history, per C4's N1 carve-out. The table above describes live views; C4
+owns the frozen-view composition.]
 
 ### C6 — Stack header row
 
@@ -299,11 +327,13 @@ nothing announces "this region is a stack".
 focused = Black on status-color bg, unfocused = status-color fg.
 
 **Target:**
-- Row format: `marker(1) + glyph(1) + " " + name + fill + "{adapter} · {word}" + " "`
+- Row format: `marker(1) + glyph(1) + " " + id + " " + name + fill + "{adapter} · {word}" + " "`
   with the right segment right-aligned.
+  **[Amended 2026-07-27, SPEC-ux U2]:** the pane id rides ahead of the name
+  (same placement as the C4 badge), styled with the name.
   - marker: `▎` fg `ACCENT` when the row is the focused pane, else `" "`.
   - glyph: per C5 (color + Working pulse).
-  - name fg by state: Working/NeedsInput → `FG`; Waiting/Idle → `MUTED`;
+  - id + name fg by state: Working/NeedsInput → `FG`; Waiting/Idle → `MUTED`;
     Exited → `DIM`.
   - right segment fg `DIM`; adapter = `PaneSpec.adapter`.
   - No-dup rule (mirrors C4): when the pane is untitled and its fallback name
@@ -380,6 +410,14 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   `RAW` when the focused pane is raw (C23), `ZOOM` when zoomed (C21).
   Precedence: a real non-Normal mode word always wins; else `RAW` beats
   `ZOOM` beats `NORMAL` (input safety trumps view state).
+- **[Amended 2026-07-27, SPEC-ux U3]:** while the mode is Scroll, the right
+  segment additionally carries the position `↑N/M` fg `DIM` immediately
+  ahead of the mode word (`… needs-you segment  ↑N/M SCROLL `) — N = the
+  focused pane's grid-clamped view offset, M = its banked history rows,
+  both read from the backend (never `Mode::Scroll`'s own counter, which can
+  hold a phantom the grid refused — U9). The position rides *inside* the
+  right segment, so the existing fit/yield machinery covers it: pairs drop
+  whole before any of the segment clips.
 - **New / amended pair lists** (all obey the same styling formula):
   - Feed mode (C20): `↑↓ scroll` · `Esc close`.
   - Focused-raw Normal (C23): exactly **one** pair — `Alt+Shift+p exit raw`.
@@ -397,6 +435,13 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
 generic notices — "copied", extension updates — so it gets the neutral
 elevated treatment, not a reserved color; ok-green is banned from chrome.)
 Timing/precedence unchanged.
+
+**[Amended 2026-07-27, SPEC-ux U22]:** "timing unchanged" is superseded for
+confirm-arm prompts only: a flash that arms a destructive second-press
+confirm lives exactly `CONFIRM_WINDOW` (3 s) instead of `FLASH_WINDOW`
+(2 s), and dies early with its arm — prompt and armed window may never
+disagree in either direction. Ordinary flashes keep `FLASH_WINDOW`; styling
+and precedence are untouched.
 
 ### C11 — Alt-key warning
 
@@ -567,11 +612,19 @@ extension events (`app.rs:1081`) or is polled from `StatusTracker`
 
   | kind | hook (single source each — no double reporting) | line text |
   |---|---|---|
-  | `status` | the 2 s housekeeping tick (`app.rs:367–401`): App keeps a last-known-status map for spawned panes and diffs it *before* the `pending_detect` early-return. One source for all transitions — extension-pushed and heuristic alike — at ≤ 2 s granularity (documented; a sub-2 s flicker may be missed, accepted). Transitions **to Exited are suppressed** here (the `exit` hook owns that). First observation of a pane logs nothing (`spawn` owns birth). | `{name}: {old} → {new}` using the C8 state words |
-  | `spawn` | `spawn_pane` success (`app.rs:349–358`) — covers Alt+n, picker, control spawn/fork, undo restore, respawn | `spawned {name} ({adapter})` |
-  | `close` | `close_pane_id` (`app.rs:980–1028`) and `undo_close` (`app.rs:1309–1333`) | `closed {name}` / `closed tab {name}` / `reopened {name}` / `reopened tab {name}` |
-  | `exit` | `on_pty_exit` (`app.rs:1058–1072`), including the focused pane (unlike the notifier) | `{name} exited` |
+  | `status` | the 2 s housekeeping tick (`app.rs:367–401`): App keeps a last-known-status map for spawned panes and diffs it *before* the `pending_detect` early-return. One source for all transitions — extension-pushed and heuristic alike — at ≤ 2 s granularity (documented; a sub-2 s flicker may be missed, accepted). Transitions **to Exited are suppressed** here (the `exit` hook owns that). First observation of a pane logs nothing (`spawn` owns birth). | `{id} {name}: {old} → {new}` using the C8 state words |
+  | `spawn` | `spawn_pane` success (`app.rs:349–358`) — covers Alt+n, picker, control spawn/fork, undo restore, respawn | `spawned {id} {name} ({adapter})`, the suffix for titled panes only |
+  | `close` | `close_pane_id` (`app.rs:980–1028`) and `undo_close` (`app.rs:1309–1333`) | `closed {id} {name}` / `closed tab {name}` / `reopened {id} {name}` / `reopened tab {name}` |
+  | `exit` | `on_pty_exit` (`app.rs:1058–1072`), including the focused pane (unlike the notifier) | `{id} {name} exited` |
   | `ctl` | `audit()` (`app.rs:675–695`, becomes `&mut self`; feed push happens even when there is no socket dir) — the same sanitized `method_summary` as `control.log`, so broadcast and every other control verb land here with zero extra code | `ctl {principal}: {summary} → {ok\|err}` |
+
+  **[Amended 2026-07-27, SPEC-ux U2]:** pane-referencing lines lead with the
+  pane id (`{id} {name}` via `App::feed_label`; `name` is the shared
+  `display_name_of`) — live QA showed four identical `shell: working → your
+  turn` lines with no way to tell the panes apart. Tab lines keep the tab
+  name; a pane whose spec is already gone degrades to `pane {id}`. The
+  spawn line's `({adapter})` suffix is titled-only (C4's no-dup rule — an
+  untitled display name already ends in the adapter/cwd tag).
 
   Session-detection events are deliberately excluded (noise, not action).
 - **Geometry:** centered on `body_area()`;
@@ -751,9 +804,10 @@ can never see them.
   trap the user).
 - **Indication (must be visible on the pane even when unfocused):**
   - Corner badge (C4): the badge text gains a `raw` token —
-    titled: `"{name} · {adapter} · raw {glyph}"`, untitled:
-    `"{name} · raw {glyph}"` — the `raw` token fg `ACCENT_DIM` (the
-    "roost stepped back" color family, C11/C16).
+    titled: `"{id} {name} · {adapter} · raw {glyph}"`, untitled:
+    `"{id} {name} · raw {glyph}"` — the `raw` token fg `ACCENT_DIM` (the
+    "roost stepped back" color family, C11/C16). [Id prefix per C4's U2
+    amendment, 2026-07-27.]
   - Collapsed stack row (C8): right segment gains the prefix →
     `"raw · {word}"`.
   - Hint bar while a raw pane is focused and mode is Normal: mode word
@@ -799,6 +853,14 @@ reading order).
   limit, shared with the mouse path and documented: the **visible grid
   only** — no scrollback paging inside copy mode (deliberately left out;
   Scroll mode remains a separate concern).
+  **[Amended 2026-07-27, SPEC-ux U9]:** "no scrollback paging" is
+  superseded — `PgUp`/`PgDn` in copy mode page the **view** by the pane's
+  inner height (grid-clamped), and Alt+c from Scroll mode hands the frozen
+  view over intact (the Alt-chord snap exempts exactly the copy
+  transition), so history can be yanked by keyboard. The visible-grid
+  extraction limit itself **stands**: cursor and selection live in visible
+  cell space, and yanking grabs what is on screen at yank time — paging
+  moves the paper under them, what you see is what yanks.
 - **Mouse drag still works in copy mode** and simply replaces the keyboard
   selection (both write `app.selection`); a drag also moves the cursor to
   the drag point, so the two methods interleave without surprises.
@@ -1040,9 +1102,15 @@ not a benchmark suite.
   2. **No draw starvation:** pane A's on-screen region differs between
      consecutive 500 ms samples for the whole run (the firehose visibly
      keeps flowing — bounded, not frozen).
-  3. **Clean exit under load:** send Alt+q (`0x1b q` — meta-ESC) mid-spew;
-     the roost process exits within **2 s** and no child of it survives
+  3. **Clean exit under load:** quit mid-spew; the roost process exits
+     within **2 s** of the first keypress and no child of it survives
      (the historical quit-freeze regression, ROADMAP "Alt+q freeze fix").
+     Mid-spew the fleet is busy, so per U1 (SPEC-ux) the first Alt+q arms
+     the second-press confirm — the harness's `quit_and_wait` answers it
+     like a user would (second Alt+q after a short grace window); a quiet
+     fleet still exits on the single press. [Amended 2026-07-27: U1's
+     busy-quit guard made a lone mid-spew Alt+q deliberately insufficient;
+     the 2 s budget is unchanged and now covers both presses.]
 - Skipped on runners without a functional PTY (compile-time cfg or runtime
   skip with a printed reason) — same stance as the golden-frame assessment.
 
@@ -1073,8 +1141,9 @@ not a benchmark suite.
   persistence / feed filtering / feed search (200-entry ring is the whole
   product, C20) · sub-2 s status-transition granularity in the feed (single
   tick-diff source beats double-reporting, C20) · per-tab zoom flags (one
-  app-level bool, C21) · copy-mode scrollback paging (visible grid only,
-  same as the mouse path, C24) · layout-cycle undo (C25) · a close-whole-tab
+  app-level bool, C21) · ~~copy-mode scrollback paging~~ [superseded
+  2026-07-27 by SPEC-ux U9 — PgUp/PgDn view paging shipped, C24 amendment;
+  the visible-grid *extraction* limit stands] · layout-cycle undo (C25) · a close-whole-tab
   gesture (C26 — tabs die by last-pane close only) · a TUI broadcast key
   (fat-finger safety — CLI only, per brief; grammar lives in PLAN F2) ·
   configurable keys for any of the above (zero-config stands).

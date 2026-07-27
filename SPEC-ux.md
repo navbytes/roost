@@ -24,15 +24,20 @@ Severity is impact for roost's target user: someone running a fleet of AI agents
 
 ## P0 — both review lenses agreed independently
 
-### U1 · High · VERIFIED — Alt+q kills the fleet unguarded
+### U1 · High · FIXED (this branch) — Alt+q kills the fleet unguarded
 Closing one busy pane double-confirms (`app.rs` `confirm_close`), but Alt+q
 quits instantly — live QA quit in ~318 ms while a pane was mid-firehose. ESC+`q`
 fusion can synthesize the chord (documented in `tests/live_qa.rs`).
 **Proposed contract:** when any pane is `Working` (or `NeedsInput`, see U12),
 arm the existing second-press confirm: flash `N agents working — Alt+q again to
 quit`. Instant quit stays when the fleet is quiet.
+**Fixed:** `App::quit_guarded` arms a separate `confirm_quit` with the same
+machinery as busy-close whenever any pane is busy (U12's `Working ||
+NeedsInput` predicate, shared `is_busy`), flashing `N agent(s) busy — Alt+q
+again to quit` ("busy", matching the Alt+w flash family, since the guard
+covers ◆ too); a quiet fleet still quits on one press.
 
-### U2 · High · VERIFIED — panes have no identity on fleet surfaces
+### U2 · High · FIXED (this branch) — panes have no identity on fleet surfaces
 Live feed frame: `spawned shell (shell)` ×2 and `shell: working → your turn` ×4,
 indistinguishable; notifications say "shell is waiting for you"; the pane id —
 the join key for `roost send <id>` — appears nowhere in the TUI. The corner
@@ -41,8 +46,13 @@ notifications, and flashes don't use it.
 **Proposed contract:** one `display_name(id)` helper (title, else
 `adapter · cwd-tag`), used by feed lines, notifications, and flashes; pane id
 shown in the badge, collapsed rows, and feed entries.
+**Fixed:** the badge's fallback moved to a shared `core::app::display_name_of`
+(+ `App::display_name`/`feed_label`); feed lines lead with `{id} {name}`,
+notifications and pane-referencing flashes carry the display name, and the
+corner badge and collapsed rows lead with the pane id (C4/C8/C20 amended
+2026-07-27).
 
-### U3 · High · VERIFIED — a scrolled pane looks live (and still pulses ●)
+### U3 · High · FIXED (this branch) — a scrolled pane looks live (and still pulses ●)
 Live frame E1: a wheel-scrolled pane frozen at old output shows no indicator
 anywhere — and its badge keeps the pulsing `●` working glyph, actively asserting
 liveness while the view is stale. Wheel scrolling never enters Scroll mode, so
@@ -50,6 +60,11 @@ the `SCROLL` mode word never covers it; Scroll mode itself shows no position.
 **Proposed contract:** whenever a pane's scrollback offset > 0, its badge gains
 a dim `↑N` token (same family as the `raw` token); Scroll mode's hint shows
 `line N/M`. Any path that resets the offset removes the token.
+**Fixed:** the badge carries `↑N` (ACCENT_DIM, glyph-adjacent) whenever the
+grid-clamped offset is > 0, and Scroll mode's right segment shows `↑N/M` —
+both read via the new `PaneBackend::scroll_offset`/`scroll_total` accessors,
+so they reflect the view, never a phantom counter (C4/C9/§2 amended
+2026-07-27; N1's pulse rule rides along).
 
 ### U4 · High · OPEN — the macOS Alt trap is only caught on Apple Terminal
 `wants_alt_hint` fires solely on `TERM_PROGRAM == "Apple_Terminal"`; default
@@ -94,7 +109,7 @@ scrolls the pane under the overlay (no feed gate in `handle_mouse`).
 overlay, clicks hit overlay rows or dismiss, never mutate focus/tabs beneath;
 paste: routes to the text field if one exists, else is swallowed.
 
-### U9 · Med · VERIFIED — scrollback is keyboard-hostile
+### U9 · Med · FIXED (this branch) — scrollback is keyboard-hostile
 Three connected live confirmations:
 - **Overshoot:** Scroll-mode offset is unclamped while the view clamps — after
   paging past the top, ~240 Down presses were burned before the view moved.
@@ -107,6 +122,13 @@ Three connected live confirmations:
 value back into both the runtime and the mode offset; Scroll-mode entry seeds
 `offset` from the pane's current offset; Scroll→Copy preserves the view; copy
 mode gains PgUp/PgDn view paging (and the wheel while selecting).
+**Fixed:** every `set_scrollback`/`scroll_by` reads the grid clamp back (and
+bases arithmetic on the view's current offset); Scroll-mode entry seeds from
+the pane's offset and every keypress mirrors the clamp into the mode offset;
+Alt+c is exempted from the Alt-chord snap so Scroll→Copy keeps the frozen
+view; copy mode pages the view with PgUp/PgDn by pane height (C24 amended
+2026-07-27). The wheel-while-selecting half of the proposal is not in this
+wave (mouse-path routing in copy mode is untouched).
 
 ### U10 · Med · VERIFIED — dead-pane `f` destroys the session, bare
 Live QA: `f` on a dead pane respawned fresh instantly — a single unshifted key,
@@ -124,10 +146,12 @@ the first pane, so those halves are pinned by code, not frames.
 **Proposed contract:** same-tab digit is a no-op; each tab remembers
 `last_focused` (session-only) and returns to it.
 
-### U12 · Med · OPEN — `◆ NeedsInput` panes close without the busy guard
+### U12 · Med · FIXED (this branch) — `◆ NeedsInput` panes close without the busy guard
 The Alt+w confirm checks only `Working`; an agent blocked on your approval is
 mid-turn all the same.
 **Proposed contract:** the guard predicate is `Working || NeedsInput`.
+**Fixed:** `close_pane`'s guard now uses the shared `is_busy` predicate
+(`Working || NeedsInput`), the same one Alt+q's U1 guard counts with.
 
 ### U13 · Med · OPEN — tab summary has no Exited state
 A background tab full of dead agents shows a blank glyph (SPEC-GAP-2,
@@ -182,13 +206,17 @@ No border drag-resize, no middle-click close, no drag-reorder.
 **Proposed contract:** drag a shared border to resize; middle-click closes a
 tab through the same confirm guard.
 
-### U22 · Low · OPEN — busy-close confirm fires on heuristic Working; window mismatch
+### U22 · Low · OPEN (window mismatch FIXED, this branch) — busy-close confirm fires on heuristic Working; window mismatch
 Any PTY output in the last ~2 s counts as Working, so closing a shell right
 after your own `ls` double-prompts (the live QA script codes around this); the
 confirm stays armed 3 s but its flash dies at 2 s — a final second accepts the
 second press with no visible prompt.
 **Proposed contract:** confirm only on extension-confirmed Working (or exempt
 `shell`); flash window == confirm window for confirm flashes.
+**Fixed (window half only):** flashes now carry their own window — confirm
+prompts live exactly `CONFIRM_WINDOW`, and a confirm that dies early (consumed
+second press, or disarmed by another action) takes its prompt down with it.
+The heuristic-Working half stays OPEN.
 
 ### U23 · Low · VERIFIED — help overlay teaches chords, nothing else
 Live QA: the overlay contains no status-glyph legend (`●◆○·✕` — the product's
@@ -210,10 +238,14 @@ lists the real keys.
 
 ## New findings from the live session (not predicted by either review)
 
-### N1 · Med · NEW — the frozen-scroll badge still pulses ●
+### N1 · Med · FIXED (this branch) — the frozen-scroll badge still pulses ●
 Compounds U3: frame E1 shows the wheel-scrolled (frozen) pane's badge pulsing
 `●` working — the UI actively asserts liveness for a stale view. The U3 `↑N`
 token must also suppress or co-locate honestly with the status glyph.
+**Fixed:** while `↑N` shows, the badge's Working glyph holds its steady base
+color instead of pulsing — status stays truthful (the agent IS working), but
+the "alive right now" animation never plays over a frozen view; resetting the
+offset resumes it (C4 amendment 2026-07-27, `badge_glyph_color`).
 
 ### N2 · Low · NEW — Alt+o silently no-ops outside a split
 With the focused pane in a stack, Alt+o changed nothing and said nothing (the

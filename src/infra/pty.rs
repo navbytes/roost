@@ -254,14 +254,35 @@ impl PaneBackend for PtyPane {
     }
 
     fn set_scrollback(&mut self, lines: usize) {
-        self.scroll = lines;
         self.parser.set_scrollback(lines);
+        // U9: mirror the grid-clamped value back, never the caller's ask —
+        // a stored offset past the banked history is a phantom the view
+        // ignores, which is exactly what burned ~240 keypresses of
+        // overshoot before the screen moved.
+        self.scroll = self.parser.screen().scrollback();
     }
 
     fn scroll_by(&mut self, delta: i32) {
-        self.scroll =
-            (self.scroll as i64 + delta as i64).clamp(0, SCROLLBACK_LINES as i64) as usize;
-        self.parser.set_scrollback(self.scroll);
+        // U9: base the arithmetic on the grid's CURRENT offset, not the
+        // last value we stored — while scrolled, the grid auto-advances
+        // the offset as new lines bank (the view stays pinned on content),
+        // so a stale base would yank the view toward the tail on the next
+        // wheel click. Then read the clamp back, same as set_scrollback.
+        let cur = self.parser.screen().scrollback() as i64;
+        let want = (cur + i64::from(delta)).max(0) as usize;
+        self.parser.set_scrollback(want);
+        self.scroll = self.parser.screen().scrollback();
+    }
+
+    /// The grid-clamped offset, NOT `self.scroll`: the roost-side counter
+    /// can exceed what the grid actually banked (U9's overshoot), and U3's
+    /// honesty surfaces must reflect the view, never the phantom intent.
+    fn scroll_offset(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    fn scroll_total(&self) -> usize {
+        self.parser.screen().scrollback_rows()
     }
 
     /// Forward mouse events only when the inner app speaks SGR encoding —
@@ -349,6 +370,24 @@ mod tests {
     fn normalizes_reversed_coords() {
         let p = screen_with("hello", 2, 10);
         assert_eq!(extract_selection(p.screen(), (0, 4), (0, 0)), "hello");
+    }
+
+    #[test]
+    fn parser_scrollback_offset_reads_back_grid_clamped() {
+        // U3/U9: the vendored grid clamps `set_scrollback` to the banked
+        // history; `screen().scrollback()` (PtyPane::scroll_offset's source)
+        // reads that clamp back, and `scrollback_rows()` is its exact upper
+        // bound — the pair the ↑N badge token and ↑N/M hint are built on.
+        let mut p = vt100::Parser::new(5, 10, 100);
+        for i in 0..20 {
+            p.process(format!("line{i}\r\n").as_bytes());
+        }
+        let banked = p.screen().scrollback_rows();
+        assert!(banked > 0 && banked <= 100);
+        p.set_scrollback(5000); // overshoot far past the banked history
+        assert_eq!(p.screen().scrollback(), banked);
+        p.set_scrollback(0);
+        assert_eq!(p.screen().scrollback(), 0);
     }
 
     #[test]
