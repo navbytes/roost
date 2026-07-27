@@ -135,9 +135,10 @@ fn ux_navigation_session() {
     let sd = h.state_dir().to_path_buf();
     let mut qa = Qa { bugs: Vec::new() };
     // Readiness gate: wait for the first REAL frame (hint bar drawn) before
-    // sending any input — crossterm's startup keyboard-enhancement probe
-    // reads stdin while waiting for the terminal's reply, so keys sent
-    // before the event loop is live get consumed and discarded.
+    // sending any input. Since the P4 client-side fix this frame arrives in
+    // ~250 ms — long before crossterm's keyboard-enhancement probe (which
+    // this harness never answers) releases the shared event reader at its
+    // internal ~2 s give-up, so a frame alone no longer proves keys flow.
     h.wait_for(Duration::from_secs(15), |s| s.contents().contains("NORMAL"))
         .expect("roost never drew its first frame");
     // ...and until the control socket answers, so cli probes are trustworthy.
@@ -146,6 +147,12 @@ fn ux_navigation_session() {
         assert!(std::time::Instant::now() < cli_deadline, "control CLI never came up");
         std::thread::sleep(Duration::from_millis(100));
     }
+    // ...and until pane input actually round-trips — chords sent while the
+    // probe still owns the reader would be delivered late, in one burst,
+    // and desync the whole script.
+    h.write_bytes(b"echo dr''ive-up\r");
+    h.wait_for(Duration::from_secs(10), |s| s.contents().contains("drive-up"))
+        .expect("pane input never went live");
     let settle = |h: &mut Harness| {
         h.settle(Duration::from_secs(2));
     };
@@ -307,7 +314,7 @@ fn ux_navigation_session() {
     settle(&mut h);
     h.write_bytes(&alt(b'0'));
     settle(&mut h);
-    qa.obs("Alt+9 (no such tab) and Alt+0 (unbound) both no-op silently — no next/prev-tab chord exists");
+    qa.obs("Alt+9 (no such tab) no-ops silently; Alt+0 is unbound so U5 now forwards it to the pane — still no next/prev-tab chord, tabs ≥ 10 keyboard-unreachable (U7)");
 
     // ---- D. rename, picker, modal ownership ---------------------------
     // rename swallows modifiers: Ctrl+W / Ctrl+U insert literal w / u
@@ -547,22 +554,31 @@ fn ux_navigation_session() {
     h.write_bytes(&alt(b'b'));
     settle(&mut h);
     let s = h.screen().contents();
-    qa.obs(&format!("cooked pane: Alt+b reached the pane as ^[b: {}", s.contains("^[b")));
+    // U5 FIXED: an unbound Alt+printable belongs to the pane — cooked
+    // routing must deliver Alt+b as meta-ESC (`^[b` under cat's tty echo).
+    qa.check(s.contains("^[b"), "U5: cooked pane forwards unbound Alt+b as ^[b");
     // Raw-mode probe is an OBS, not a check: the uppercase-delivery form
     // ESC+'P' is byte-identical to the DCS introducer, so on a terminal
     // without kitty disambiguation (this harness included) the toggle is
-    // inherently racy — SPEC-ux N3. Both outcomes are recorded.
+    // inherently racy — SPEC-ux N3. Both outcomes are recorded. (Since U5,
+    // Alt+b forwards in cooked and raw alike, so forwarding can no longer
+    // discriminate — the badge's ` · raw ` token is the probe now: unlike
+    // the hint-bar RAW mode word, a live flash can't hide it.)
+    let raw_on = |h: &mut Harness| h.screen().contents().contains("· raw");
     h.write_bytes(&alt(b'P'));
     settle(&mut h);
-    h.write_bytes(&alt(b'b'));
-    settle(&mut h);
-    let raw_worked = h.screen().contents().contains("^[b");
-    qa.obs(&format!(
-        "raw toggle via ESC+'P' (DCS-ambiguous, N3): engaged={raw_worked}; Alt+b forwarded: {raw_worked}"
-    ));
-    if raw_worked {
+    let raw_engaged = raw_on(&mut h);
+    qa.obs(&format!("raw toggle via ESC+'P' (DCS-ambiguous, N3): engaged={raw_engaged}"));
+    if raw_engaged {
         h.write_bytes(&alt(b'P'));
         settle(&mut h);
+        if raw_on(&mut h) {
+            // The exit chord is the same DCS-ambiguous byte pair — retry
+            // once so a swallowed toggle can't leave the rest of the drive
+            // (Alt+w close, Alt+q quit) forwarding into a raw pane.
+            h.write_bytes(&alt(b'P'));
+            settle(&mut h);
+        }
     }
     h.write_bytes(&[0x03]); // Ctrl+C ends cat
     settle(&mut h);

@@ -117,6 +117,15 @@ fn live_qa_evidence() {
         h.wait_for(Duration::from_secs(8), |s| s.contents().contains("Alt+n")).is_some(),
         "roost must draw its chrome within 8s of spawn"
     );
+    // ...and wait until pane input round-trips: since the P4 client-side fix
+    // the frame arrives well before crossterm's keyboard-enhancement probe
+    // (never answered by this harness) releases the shared event reader at
+    // its ~2 s give-up; keys sent before then land late, in one burst.
+    type_line(&mut h, "echo dr''ive-up");
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("drive-up")).is_some(),
+        "pane input never went live"
+    );
 
     frame(&mut h, "S0 · fresh launch (1 shell pane)");
 

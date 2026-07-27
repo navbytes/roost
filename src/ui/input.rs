@@ -58,6 +58,19 @@ pub fn translate(key: KeyEvent) -> InputResult {
     }
 
     if key.modifiers.contains(KeyModifiers::ALT) {
+        // P13: the chord table matches only when CONTROL is absent —
+        // Ctrl+Alt+key is emacs/readline vocabulary (C-M-f forward-word,
+        // C-M-w append-kill …), not a roost chord; matching on ALT alone
+        // made C-M-w close a pane. Forward as meta-ESC + ctrl byte instead,
+        // exactly what `encode_raw` computes (it strips ALT, keeps CTRL).
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let bytes = encode_raw(key);
+            return if bytes.is_empty() {
+                InputResult::Ignore
+            } else {
+                InputResult::Forward(bytes)
+            };
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let action = match key.code {
             // Alt+Shift+arrows: resize
@@ -100,7 +113,24 @@ pub fn translate(key: KeyEvent) -> InputResult {
         };
         return match action {
             Some(a) => InputResult::Action(a),
-            None => InputResult::Ignore,
+            // U5 (SPEC-ux) / P13: an unbound Alt+printable is the pane's
+            // vocabulary, not roost's — forward it as the meta-ESC bytes a
+            // real terminal sends (readline M-b/M-d/M-. et al.) instead of
+            // swallowing it. Bound chords stay roost's (matched above); raw
+            // mode remains the escape hatch for those. Non-printables that
+            // miss the table keep the old swallow — U5's contract is
+            // printables, deliberately.
+            None => match key.code {
+                KeyCode::Char(_) => {
+                    let bytes = encode_raw(key);
+                    if bytes.is_empty() {
+                        InputResult::Ignore
+                    } else {
+                        InputResult::Forward(bytes)
+                    }
+                }
+                _ => InputResult::Ignore,
+            },
         };
     }
 
@@ -183,10 +213,13 @@ fn encode_key(key: KeyEvent) -> InputResult {
         }
     };
     let bytes: Vec<u8> = match key.code {
-        KeyCode::Char(c) if ctrl => {
-            let b = (c.to_ascii_lowercase() as u8) & 0x1f;
-            vec![b]
-        }
+        KeyCode::Char(c) if ctrl => match ctrl_byte(c) {
+            Some(b) => vec![b],
+            // P12: no real C0 mapping — forward nothing rather than a wrong
+            // control byte (the blanket `& 0x1f` used to turn Ctrl+`-` into
+            // CR, submitting half-written prompts).
+            None => return InputResult::Ignore,
+        },
         KeyCode::Char(c) => c.to_string().into_bytes(),
         // Shift+Enter / Ctrl+Enter → ESC+CR ("meta-enter") as the *fallback*
         // for panes that never negotiated the kitty keyboard protocol: pi's
@@ -234,6 +267,23 @@ fn encode_key(key: KeyEvent) -> InputResult {
         _ => return InputResult::Ignore,
     };
     InputResult::Forward(bytes)
+}
+
+/// P12: the byte Ctrl+`c` transmits — only where the C0 mapping is real.
+/// The classic `& 0x1f` mask is correct for the ASCII letters and for
+/// `@ [ \ ] ^ _` (and space ≡ `@` → NUL); `?` is DEL by the same xterm
+/// convention; and terminals map Ctrl+`-` and Ctrl+`/` to 0x1F (US, the
+/// readline undo / help bindings). Everything else — digits, the remaining
+/// punctuation — has no C0 identity: `None`, forward nothing, because the
+/// masked byte would be a *different* control character (Ctrl+`-` used to
+/// come out as CR and submit the prompt).
+fn ctrl_byte(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        c @ ('a'..='z' | '@' | '[' | '\\' | ']' | '^' | '_' | ' ') => Some((c as u8) & 0x1f),
+        '?' => Some(0x7f),
+        '-' | '/' => Some(0x1f),
+        _ => None,
+    }
 }
 
 /// C23: encode a key event the way a raw-focused pane sees it — the
@@ -335,9 +385,14 @@ mod tests {
             translate(alt(KeyCode::Char('P'))),
             InputResult::Action(Action::ToggleRaw)
         ));
-        // lowercase Alt+p (no shift) is deliberately unbound — it stays free
-        // for raw-mode pass-through (C23).
-        assert!(matches!(translate(alt(KeyCode::Char('p'))), InputResult::Ignore));
+        // lowercase Alt+p (no shift) is deliberately unbound — and per U5 an
+        // unbound Alt+printable now belongs to the pane: it forwards as
+        // meta-ESC instead of being swallowed (C23's "stays free" honored by
+        // forwarding, the stronger form of free).
+        match translate(alt(KeyCode::Char('p'))) {
+            InputResult::Forward(b) => assert_eq!(b, vec![0x1b, b'p']),
+            _ => panic!("unbound Alt+p must forward as meta-ESC (U5)"),
+        }
     }
 
     #[test]
@@ -580,6 +635,149 @@ mod tests {
         // The uppercase-delivery variant (Alt+'R', no shift bit) forwards
         // the uppercase byte.
         assert_eq!(encode_raw(alt(KeyCode::Char('R'))), vec![0x1b, b'R']);
+    }
+
+    // -- P12: Ctrl+char encodes only real C0 mappings ---------------------
+
+    #[test]
+    fn ctrl_chars_encode_only_real_c0_mappings() {
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        // The mappings every terminal agrees on.
+        let cases: &[(char, u8)] = &[
+            ('a', 0x01),
+            ('c', 0x03),
+            ('z', 0x1a),
+            ('A', 0x01), // shift/uppercase delivery still lands on the letter's C0
+            ('@', 0x00),
+            (' ', 0x00), // Ctrl+Space ≡ Ctrl+@ → NUL (emacs set-mark)
+            ('[', 0x1b), // Ctrl+[ IS ESC — must survive the gate
+            ('\\', 0x1c),
+            (']', 0x1d),
+            ('^', 0x1e),
+            ('_', 0x1f),
+            ('?', 0x7f), // Ctrl+? → DEL, xterm convention
+            ('-', 0x1f), // P12: was 0x0D (CR — accidental submit!)
+            ('/', 0x1f), // P12: was 0x0F (readline operate-and-get-next)
+        ];
+        for (c, want) in cases {
+            match translate(ctrl(*c)) {
+                InputResult::Forward(b) => assert_eq!(b, vec![*want], "Ctrl+{c:?}"),
+                _ => panic!("Ctrl+{c:?} must forward"),
+            }
+        }
+        // No C0 identity → nothing, never a wrong control byte.
+        for c in ['1', '2', '9', '0', '.', ',', ';', '\'', '=', '`', '~', '!'] {
+            assert!(
+                matches!(translate(ctrl(c)), InputResult::Ignore),
+                "Ctrl+{c:?} must forward nothing"
+            );
+        }
+    }
+
+    // -- P13: Ctrl+Alt is never a chord -----------------------------------
+
+    #[test]
+    fn ctrl_alt_forwards_meta_esc_ctrl_bytes_instead_of_chord_actions() {
+        let ctrl_alt =
+            |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::ALT);
+        // The destructive collision from the spec: C-M-w must never close a
+        // pane; C-M-f (emacs forward-word) must never toggle the float.
+        let cases: &[(KeyCode, &[u8])] = &[
+            (KeyCode::Char('w'), &[0x1b, 0x17]),
+            (KeyCode::Char('f'), &[0x1b, 0x06]),
+            (KeyCode::Char('q'), &[0x1b, 0x11]), // and never quit
+            (KeyCode::Char('-'), &[0x1b, 0x1f]), // composes with the P12 gate
+            (KeyCode::Right, b"\x1b\x1b[1;5C"),  // meta-ESC + ctrl CSI form
+        ];
+        for (code, want) in cases {
+            match translate(ctrl_alt(*code)) {
+                InputResult::Forward(b) => assert_eq!(&b, want, "{code:?}"),
+                InputResult::Action(a) => {
+                    panic!("Ctrl+Alt+{code:?} matched chord action {a:?}")
+                }
+                InputResult::Ignore => panic!("Ctrl+Alt+{code:?} swallowed"),
+            }
+        }
+        // A Ctrl+Alt combo with no base encoding forwards nothing — but
+        // still never an action.
+        assert!(matches!(translate(ctrl_alt(KeyCode::Char('9'))), InputResult::Ignore));
+    }
+
+    // -- U5 (SPEC-ux): unbound plain-Alt printables forward ---------------
+
+    #[test]
+    fn unbound_alt_printables_forward_as_meta_esc() {
+        // The documented "left free for readline" chords, plus a symbol.
+        let cases: &[(char, &[u8])] = &[
+            ('b', &[0x1b, b'b']), // readline backward-word — the live-QA probe
+            ('d', &[0x1b, b'd']), // readline kill-word
+            ('.', &[0x1b, b'.']), // readline yank-last-arg
+            ('p', &[0x1b, b'p']),
+            ('x', &[0x1b, b'x']),
+            ('0', &[0x1b, b'0']), // Alt+0: no tab 0 chord exists (U7) — pane's
+        ];
+        for (c, want) in cases {
+            match translate(alt(KeyCode::Char(*c))) {
+                InputResult::Forward(b) => assert_eq!(&b, want, "Alt+{c:?}"),
+                _ => panic!("Alt+{c:?} must forward as meta-ESC, not be swallowed"),
+            }
+        }
+        // Unmatched Alt+non-printables keep the old swallow — U5's contract
+        // is printables.
+        assert!(matches!(translate(alt(KeyCode::Backspace)), InputResult::Ignore));
+        assert!(matches!(translate(alt(KeyCode::F(5))), InputResult::Ignore));
+    }
+
+    /// P13/U5 must not disturb a single bound chord: every entry in the
+    /// action table still maps to its action with plain ALT (and its
+    /// shifted variants where those are part of the binding).
+    #[test]
+    fn every_bound_chord_still_maps_to_its_action() {
+        let bound: &[(KeyEvent, Action)] = &[
+            (alt(KeyCode::Char('q')), Action::Quit),
+            (alt(KeyCode::Char('n')), Action::NewPane),
+            (alt(KeyCode::Char('w')), Action::ClosePane),
+            (alt(KeyCode::Char('t')), Action::NewTab),
+            (alt(KeyCode::Char('s')), Action::ToggleStack),
+            (alt(KeyCode::Char('o')), Action::FlipSplit),
+            (alt(KeyCode::Char('r')), Action::RenamePane),
+            (alt_shift(KeyCode::Char('r')), Action::RenameTab),
+            (alt(KeyCode::Char('R')), Action::RenameTab),
+            (alt_shift(KeyCode::Char('p')), Action::ToggleRaw),
+            (alt(KeyCode::Char('P')), Action::ToggleRaw),
+            (alt(KeyCode::Enter), Action::QuickLaunch),
+            (alt(KeyCode::Char('/')), Action::ToggleHints),
+            (alt(KeyCode::Char('c')), Action::CopyMode),
+            (alt(KeyCode::Char('u')), Action::Undo),
+            (alt(KeyCode::Char('?')), Action::Help),
+            (alt(KeyCode::Char('a')), Action::JumpAttention),
+            (alt(KeyCode::Char('z')), Action::ToggleZoom),
+            (alt(KeyCode::Char('g')), Action::CycleLayout),
+            (alt(KeyCode::Char('e')), Action::ToggleFeed),
+            (alt(KeyCode::Char('f')), Action::ToggleFloat),
+            (alt(KeyCode::PageUp), Action::ScrollMode),
+            (alt(KeyCode::Char('3')), Action::GoToTab(2)),
+            (alt(KeyCode::Right), Action::Focus(Dir::Right)),
+            (alt(KeyCode::Char('h')), Action::Focus(Dir::Left)),
+            (alt(KeyCode::Char('j')), Action::Focus(Dir::Down)),
+            (alt(KeyCode::Char('k')), Action::Focus(Dir::Up)),
+            (alt_shift(KeyCode::Right), Action::Resize { horizontal: true, grow: true }),
+            (alt_shift(KeyCode::Up), Action::Resize { horizontal: false, grow: false }),
+        ];
+        for (key, want) in bound {
+            match translate(*key) {
+                InputResult::Action(a) => assert_eq!(a, *want, "{key:?}"),
+                _ => panic!("bound chord {key:?} no longer maps to {want:?}"),
+            }
+            // ...and adding CONTROL takes every one of them out of the
+            // chord table (P13), without exception.
+            let mut with_ctrl = *key;
+            with_ctrl.modifiers |= KeyModifiers::CONTROL;
+            assert!(
+                !matches!(translate(with_ctrl), InputResult::Action(_)),
+                "{key:?} + CONTROL must not chord"
+            );
+        }
     }
 
     #[test]

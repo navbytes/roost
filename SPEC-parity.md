@@ -187,7 +187,10 @@ that roost swallows — enlarging P1/P2/P3/P8's blast radius.
 `TERM_PROGRAM=roost` (+ version var) so apps can adapt deliberately.
 Sequence this first — it's small and de-risks everything in W2/W3.
 
-### P12 · CONFIRMED · Med — Ctrl+`-` forwards a bare Enter (accidental submit)
+### P12 · FIXED (this branch) · Med — Ctrl+`-` forwards a bare Enter (accidental submit)
+*Fixed: `encode_key`'s Ctrl arm now runs through a C0 collision gate
+(`ctrl_byte`) — letters/`@ [ \ ] ^ _`/space keep the mask, `?` → DEL,
+`-`/`/` → 0x1F, everything else forwards nothing.*
 `encode_key`'s blanket `& 0x1f` maps Ctrl+`-` → `0x0D` (CR — submits the
 half-written prompt in any agent CLI) and Ctrl+`/` → `0x0F` (readline
 operate-and-get-next). The same mask is *coincidentally correct* for
@@ -196,7 +199,10 @@ operate-and-get-next). The same mask is *coincidentally correct* for
 Ctrl+digits and other non-C0-mappable punctuation forward nothing rather than
 a wrong control byte.
 
-### P13 · CONFIRMED · Med (raised) — Ctrl+Alt+key triggers Alt actions
+### P13 · FIXED (this branch) · Med (raised) — Ctrl+Alt+key triggers Alt actions
+*Fixed with SPEC-ux U5 (one change): the chord table now requires CONTROL
+absent — Ctrl+Alt forwards as meta-ESC + ctrl byte, and unmatched plain-Alt
+printables forward as meta-ESC, both via `encode_raw`.*
 The chord table matches on ALT alone: `C-M-f` toggles the float, **`C-M-w`
 closes a pane** — destructive collision with emacs/readline muscle memory.
 **Contract:** chords match only when CONTROL is absent; Ctrl+Alt+printables
