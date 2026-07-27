@@ -357,7 +357,14 @@ the same change as P15/U24 so grid and renderer can never disagree again.
 **Contract:** spawn shell-adapter panes as login shells (dash-prefixed argv0
 or `-l`), matching every terminal emulator's default.
 
-### P19 · CONFIRMED · Low — REP (`CSI Ps b`) unimplemented while TERM advertises it
+### P19 · FIXED (this branch) · Low — REP (`CSI Ps b`) unimplemented while TERM advertises it
+*Fixed: the `b` arm replays the last graphic character through `text`, so the
+repeat inherits the live attrs and obeys wrapping, scroll regions and wide-char
+placement instead of duplicating those rules. `"ab" + CSI 5 b` now renders
+`"abbbbbb"`. No-op before anything is printed, `0` means 1 per ECMA-48, and the
+count is bounded to `u16` by vte's parameter type. Known limitation, shared
+with xterm: the unit repeated is the last base char, not the last cell, so a
+combining or VS16 sequence repeats only its base.*
 `TERM=xterm-256color` promises `rep`; ncurses 6 uses it; roost renders
 `"ab" + CSI 5 b` as `"ab"` (expected `"abbbbbb"`) — dropped glyph runs in
 htop-class TUIs. **Contract:** implement the `b` arm (repeat last graphic

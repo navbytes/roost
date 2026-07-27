@@ -130,6 +130,10 @@ pub struct Screen {
     // `Screen::snapshot`), and the copy's own `sync_snapshot`/`effects` are
     // always empty — no recursion, no double-delivered effects.
     sync_snapshot: Option<Box<Screen>>,
+    // roost: the last graphic character actually printed, for REP
+    // (`CSI Ps b`) — SPEC-parity P19. `None` until something is printed, and
+    // a REP in that state is a no-op, as the spec requires.
+    last_graphic: Option<char>,
 }
 
 impl Screen {
@@ -160,6 +164,7 @@ impl Screen {
 
             effects: Vec::new(),
             sync_snapshot: None,
+            last_graphic: None,
         }
     }
 
@@ -195,6 +200,7 @@ impl Screen {
             // source: effects belong to the live screen alone.
             effects: Vec::new(),
             sync_snapshot: None,
+            last_graphic: self.last_graphic,
         }
     }
 
@@ -1101,6 +1107,10 @@ impl Screen {
                 }
             }
         } else {
+            // roost (SPEC-parity P19): REP repeats the last *graphic*
+            // character, so it is recorded here — on the path that actually
+            // occupies a cell — and not for the zero-width branch above.
+            self.last_graphic = Some(c);
             if self
                 .grid()
                 .drawing_cell(pos)
@@ -1222,6 +1232,33 @@ impl Screen {
                 next_cell.set_wide_continuation(true);
                 self.grid_mut().col_inc(1);
             }
+        }
+    }
+
+    /// REP — repeat the preceding graphic character (`CSI Ps b`).
+    ///
+    /// roost (SPEC-parity P19): `TERM=xterm-256color` advertises `rep` and
+    /// ncurses 6 emits it, so having no `b` arm silently swallowed whole runs
+    /// of repeated glyphs — `"ab"` + `CSI 5 b` rendered `"ab"` where every
+    /// other terminal shows `"abbbbbb"`.
+    ///
+    /// Deliberately implemented by replaying the character through `text`
+    /// rather than by writing cells directly: that is what makes the repeat
+    /// inherit the *current* attributes and obey wrapping, scroll regions,
+    /// insert mode and wide-char placement for free, instead of duplicating
+    /// (and eventually diverging from) those rules here. A REP before anything
+    /// has been printed is a no-op, as the spec requires. The count is a `u16`
+    /// by construction — vte's parameters are `u16` — which bounds the work a
+    /// single sequence can ask for.
+    ///
+    /// Known limitation, shared with xterm: the repeated unit is the last base
+    /// character, not the last *cell*, so repeating a combining sequence
+    /// (`e` + U+0301) or an emoji-presentation sequence repeats only the base
+    /// char. Applications that use REP emit it for runs of plain glyphs.
+    fn rep(&mut self, count: u16) {
+        let Some(c) = self.last_graphic else { return };
+        for _ in 0..count {
+            self.text(c);
         }
     }
 
@@ -1896,6 +1933,8 @@ impl vte::Perform for Screen {
                 'S' => self.su(canonicalize_params_1(params, 1)),
                 'T' => self.sd(canonicalize_params_1(params, 1)),
                 'X' => self.ech(canonicalize_params_1(params, 1)),
+                // roost (SPEC-parity P19): REP
+                'b' => self.rep(canonicalize_params_1(params, 1)),
                 'd' => self.vpa(canonicalize_params_1(params, 1)),
                 'h' => self.sm(params),
                 'l' => self.rm(params),
@@ -2435,6 +2474,100 @@ mod roost_tests {
         p.process(b"\x1b]9;hi\x07");
         assert_eq!(p.screen().audible_bell_count(), before);
         assert_eq!(p.take_effects().len(), 1);
+    }
+
+    // -- REP, `CSI Ps b` (SPEC-parity P19) --------------------------------
+
+    fn row0(p: &crate::Parser) -> String {
+        p.screen().contents().lines().next().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn rep_repeats_the_last_graphic_character() {
+        // The measured case: before the `b` arm existed this rendered "ab".
+        let mut p = parser();
+        p.process(b"ab\x1b[5b");
+        assert_eq!(row0(&p), "abbbbbb");
+    }
+
+    #[test]
+    fn rep_defaults_to_one_and_treats_zero_as_one() {
+        // ECMA-48: Pn defaults to 1, and an explicit 0 means the default.
+        let mut p = parser();
+        p.process(b"x\x1b[b");
+        assert_eq!(row0(&p), "xx");
+        let mut p = parser();
+        p.process(b"x\x1b[0b");
+        assert_eq!(row0(&p), "xx");
+    }
+
+    #[test]
+    fn rep_with_no_preceding_graphic_character_is_a_no_op() {
+        let mut p = parser();
+        p.process(b"\x1b[5b");
+        assert_eq!(row0(&p), "");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+        // Still a no-op after a control sequence has run but nothing printed.
+        let mut p = parser();
+        p.process(b"\x1b[2J\x1b[3;3H\x1b[4b");
+        assert_eq!(p.screen().contents(), "");
+        assert_eq!(p.screen().cursor_position(), (2, 2));
+    }
+
+    #[test]
+    fn rep_uses_the_attributes_in_force_at_the_repeat() {
+        // The repeat is new output, so it takes the *current* SGR state --
+        // not whatever was in force when the original character was printed.
+        let mut p = parser();
+        p.process(b"P\x1b[31;2m\x1b[3b");
+        let s = p.screen();
+        assert_eq!(s.cell(0, 0).unwrap().fgcolor(), crate::attrs::Color::Default);
+        assert!(!s.cell(0, 0).unwrap().dim());
+        for col in 1..=3 {
+            let cell = s.cell(0, col).unwrap();
+            assert_eq!(cell.contents(), "P");
+            assert_eq!(cell.fgcolor(), crate::attrs::Color::Idx(1));
+            assert!(cell.dim(), "the repeat carries the live attrs");
+        }
+    }
+
+    #[test]
+    fn rep_wraps_at_the_row_edge_like_ordinary_output() {
+        // 20 columns: `z` plus 24 repeats fills row 0 and continues on row 1.
+        let mut p = parser();
+        p.process(b"z\x1b[24b");
+        let s = p.screen();
+        for col in 0..20 {
+            assert_eq!(s.cell(0, col).unwrap().contents(), "z", "row 0 col {col}");
+        }
+        for col in 0..5 {
+            assert_eq!(s.cell(1, col).unwrap().contents(), "z", "row 1 col {col}");
+        }
+        assert!(s.cell(1, 5).unwrap().contents().is_empty());
+        assert_eq!(s.cursor_position(), (1, 5));
+        // A real grid wrap, so `contents()` reflows it back into one logical
+        // line exactly as it would for a typed run of the same length.
+        assert_eq!(s.contents(), "z".repeat(25));
+    }
+
+    #[test]
+    fn rep_repeats_the_last_character_printed_not_the_last_one_on_screen() {
+        // Moving the cursor does not change what REP repeats, and a repeat
+        // lands wherever the cursor now is.
+        let mut p = parser();
+        p.process(b"abc\x1b[H\x1b[2b");
+        assert_eq!(row0(&p), "ccc");
+    }
+
+    #[test]
+    fn rep_repeats_a_wide_character_as_a_wide_character() {
+        let mut p = parser();
+        p.process("\u{65e5}\x1b[2b".as_bytes());
+        let s = p.screen();
+        assert_eq!(row0(&p), "\u{65e5}".repeat(3));
+        assert!(s.cell(0, 4).unwrap().is_wide());
+        assert!(s.cell(0, 5).unwrap().is_wide_continuation());
+        assert_eq!(s.cursor_position(), (0, 6));
     }
 
     // -- one width table for the process (SPEC-parity P17) ----------------
