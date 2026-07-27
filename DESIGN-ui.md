@@ -16,6 +16,13 @@ Their line anchors were verified against the working tree on 2026-07-22.
 C1–C18 are unchanged and must **still** audit ALIGNED after the fleet build —
 in particular the C1 grep gates and the C18 zero-diff rule.
 
+**Amendment 2026-07-27 (SPEC-parity W6):** **C18 is the one exception to the
+line above** — its zero-diff rule now carries a dated amendment covering
+`blit_screen`'s wide-char continuation handling (SPEC-ux U24) and `cell_style`'s
+dim/strikethrough mapping (SPEC-parity P16). Read C18's own amendment before
+auditing it; the restated predicate is *"does the blit add anything the program
+did not emit?"*. `conv_color` and the C1 grep gates are untouched.
+
 ---
 
 ## 1. Design thesis

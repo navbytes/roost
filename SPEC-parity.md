@@ -40,8 +40,9 @@ bug). Severity is impact for a user supervising AI-agent panes.
   U9), P7's scrolled-cursor facet (belongs with U3/N1).
 - **W6 · Width & styling fidelity** — P15, P16, P17, P19 (+ SPEC-ux U24 as one
   bundle: unify unicode-width, fix continuation cells in blit *and*
-  extraction, add missing SGR/REP arms).
-- **W7 · Mouse & shell polish** — P18, P20, P21.
+  extraction, add missing SGR/REP arms). **Shipped** — all five FIXED; amends
+  DESIGN-ui C18 (2026-07-27).
+- **W7 · Mouse & shell polish** — P18, P20, P21. P18 shipped; P20/P21 open.
 
 ---
 
