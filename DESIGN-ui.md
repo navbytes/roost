@@ -727,6 +727,29 @@ change here is an automatic DEVIATED. [Re-affirmed 2026-07-22 for the fleet
 build: the feed, float, zoom, raw, and copy-cursor features all draw *around*
 the blit, never inside it.]
 
+**Amended 2026-07-27 (SPEC-ux U24, SPEC-parity P16) — the rule is restated,
+not relaxed.** The zero-diff rule existed to stop a *restyle* from reaching
+into the blit: the chrome may not theme program output. That intent is
+unchanged and still binding. What the rule cannot forbid is fixing the blit's
+own fidelity to the program, which is the opposite failure — output the
+program emitted and roost did not reproduce. Two such changes land here:
+
+- `blit_screen` leaves a wide glyph's continuation cell at the buffer's reset
+  default rather than stamping `" "` plus a style over it (U24). Nothing in
+  roost may write a symbol into a cell another glyph already spans; a wide
+  glyph clipped by the drawn area's edge degrades to a space rather than
+  emitting a two-column symbol that would suppress the border's own cell.
+- `cell_style` maps SGR 2 and 9 to `Modifier::DIM` and `CROSSED_OUT` (P16).
+  These were dropped end to end, so dimmed secondary text rendered at full
+  weight — the pane asserting emphasis the program never asked for.
+
+`conv_color` is **unchanged**, and the colour rule is untouched: no palette
+token, no theme lookup, no default-bg substitution may appear in any of the
+three. The revised predicate for an audit is *"does the blit add anything the
+program did not emit?"* — the answer must stay no. Adding a modifier the
+program **did** emit is fidelity; C1's theme gate and the no-BOLD rule
+continue to apply to chrome only and are unaffected by either change.
+
 ---
 
 ### C19 — Jump-to-attention (Alt+a) — [Added 2026-07-22, fleet features]

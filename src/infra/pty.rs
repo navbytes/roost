@@ -623,6 +623,14 @@ impl PaneBackend for PtyPane {
 /// screen, in reading order: from `start` to end-of-line, whole middle lines,
 /// and start-of-line to `end`. Trailing spaces are trimmed per line and lines
 /// joined with '\n'. `start`/`end` are normalized (either order accepted).
+///
+/// P15: wide-character continuation cells are skipped, not spaced. The right
+/// half of a CJK/emoji glyph holds no contents of its own — the whole glyph
+/// was already emitted with its left half — so filling it with a space is what
+/// turned a selection of `日本語` into `"日 本 語"`, corrupting every yanked
+/// path, identifier, and code fragment containing wide text. The whole-history
+/// path (`grab_all_text` → vt100's `write_contents`) has always skipped them;
+/// these two now agree.
 pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -> String {
     let (rows, cols) = screen.size();
     if rows == 0 || cols == 0 {
@@ -632,11 +640,22 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
     let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
     let mut lines: Vec<String> = Vec::new();
     for row in start.0..=end.0.min(rows - 1) {
-        let first = if row == start.0 { start.1 } else { 0 };
+        let mut first = if row == start.0 { start.1 } else { 0 };
+        // P15 boundary: a selection that begins on a wide glyph's right half
+        // snaps back to its left half, so the glyph the user pointed at is
+        // yanked whole instead of vanishing with the skipped continuation.
+        if first > 0
+            && screen
+                .cell(row, first)
+                .is_some_and(|c| c.is_wide_continuation())
+        {
+            first -= 1;
+        }
         let last = if row == end.0 { end.1 } else { cols - 1 };
         let mut line = String::new();
         for col in first..=last.min(cols - 1) {
             match screen.cell(row, col) {
+                Some(c) if c.is_wide_continuation() => {}
                 Some(c) if !c.contents().is_empty() => line.push_str(&c.contents()),
                 _ => line.push(' '),
             }
@@ -901,5 +920,53 @@ mod tests {
         // (0,0) = `0` on row 0; (1,9) = `$` (last column) on row 1 — exactly
         // what pressing 0 then j then $ drives.
         assert_eq!(extract_selection(p.screen(), (0, 0), (1, 9)), "hi\nbye");
+    }
+
+    /// P15: `日本語` occupies six columns, three of them continuations.
+    /// Before, each continuation contributed a space and the yank came back
+    /// `"日 本 語"` — unusable pasted into an agent.
+    #[test]
+    fn wide_cjk_yanks_without_injected_spaces() {
+        let p = screen_with("日本語", 3, 20);
+        assert_eq!(extract_selection(p.screen(), (0, 0), (0, 5)), "日本語");
+        // Selecting past the text must still trim, not pad from the middle.
+        assert_eq!(extract_selection(p.screen(), (0, 0), (0, 19)), "日本語");
+    }
+
+    /// P15/P17: an emoji-presentation sequence is two columns as of P17, so
+    /// it has a continuation cell to skip like any other wide glyph — and
+    /// mixed narrow/wide text keeps every column of its narrow half.
+    #[test]
+    fn wide_emoji_and_mixed_text_yank_verbatim() {
+        let p = screen_with("ok \u{2764}\u{fe0f} \u{1f600} done", 3, 30);
+        assert_eq!(
+            extract_selection(p.screen(), (0, 0), (0, 29)),
+            "ok \u{2764}\u{fe0f} \u{1f600} done"
+        );
+    }
+
+    /// P15 boundary: pointing at a wide glyph's right half selects the glyph,
+    /// not nothing. Without the snap the skipped continuation would silently
+    /// drop the first character of the selection.
+    #[test]
+    fn selection_starting_on_a_continuation_cell_keeps_its_glyph() {
+        let p = screen_with("日本語", 3, 20);
+        // (0,1) is 日's right half; (0,3) is 本's.
+        assert_eq!(extract_selection(p.screen(), (0, 1), (0, 5)), "日本語");
+        assert_eq!(extract_selection(p.screen(), (0, 3), (0, 5)), "本語");
+    }
+
+    /// P15's stated contract: the copy path and the whole-history path must
+    /// agree. `grab_all_text` goes through vt100's `write_contents`, which has
+    /// always skipped continuations; a full-screen `extract_selection` now
+    /// produces the same text.
+    #[test]
+    fn selection_and_history_extraction_agree_on_wide_text() {
+        let p = screen_with("日本語 abc\r\n\u{1f600}x", 3, 20);
+        let selected = extract_selection(p.screen(), (0, 0), (1, 19));
+        let all = p.screen().all_contents();
+        let history: Vec<&str> = all.lines().take(2).collect();
+        assert_eq!(selected.lines().collect::<Vec<_>>(), history);
+        assert_eq!(selected, "日本語 abc\n\u{1f600}x");
     }
 }

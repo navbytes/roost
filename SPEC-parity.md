@@ -303,7 +303,14 @@ only at ring-buffer capacity — inherent, accept.)
 
 ## P2 — rendering & extraction fidelity
 
-### P15 · CONFIRMED · Med-Low — yanked CJK/emoji text corrupted
+### P15 · FIXED (this branch) · Med-Low — yanked CJK/emoji text corrupted
+*Fixed: `extract_selection` skips wide-continuation cells instead of spacing
+them, and a selection that *starts* on a glyph's right half snaps back to its
+left half so the glyph the user pointed at is yanked whole rather than lost
+with the skipped cell. Measured before/after on the same grid: `日本語` yanked
+`"日 本 語"`, now `"日本語"`; `ok ❤️ 😀 done` yanked `"ok ❤️  😀  done"`, now
+verbatim. A unit pins the stated contract directly — a full-screen
+`extract_selection` and `grab_all_text` now return identical lines.*
 `extract_selection` pushes a space for every empty cell — wide-char
 continuation cells included: selecting `日本語` yanks `"日 本 語"`. Pasting
 yanked paths/code back into an agent breaks them.
