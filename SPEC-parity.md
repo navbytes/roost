@@ -350,7 +350,18 @@ bookkeeping, blit, and hitboxes disagree per glyph.
 **Contract:** bump the vendored parser to the workspace's unicode-width in
 the same change as P15/U24 so grid and renderer can never disagree again.
 
-### P18 · CONFIRMED · Low-Med — shell panes are non-login shells
+### P18 · FIXED (this branch) · Low-Med — shell panes are non-login shells
+*Fixed: `ShellAdapter::launch` adds `-l`. **Why `-l` and not the dash-argv0
+tmux and the emulators use:** roost spawns through portable-pty, whose
+`CommandBuilder` derives both the executable to resolve and argv[0] from the
+same `args[0]`, so `-zsh` would be looked up on `PATH` and fail — there is no
+seam for an argv0 that differs from the program. The two spellings mean the
+same thing to every shell involved. Guarded by a basename allowlist (sh, bash,
+zsh, fish, dash, ash, ksh/mksh/pdksh, csh/tcsh); an unrecognized `$SHELL`
+spawns bare, because a shell rejecting the flag would kill every pane at birth
+— a much worse failure than the missing profile. Agent adapters unchanged.
+e2e `tests/pane_env.rs`: the pane gets a private `$HOME` whose `.profile`
+exports a marker; before, the pane's env had no marker, now it does.*
 `$SHELL` is spawned bare (no `-l`, no dash-argv0). On macOS, `~/.zprofile`
 (Homebrew PATH — where `claude`/`pi` often live) never runs; the classic
 "works in a terminal tab, `command not found` in the mux" (tmux #1623).
