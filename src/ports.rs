@@ -142,6 +142,15 @@ pub trait PaneBackend: Sized {
         false
     }
 
+    /// P9: is the pane's app drawing on the *alternate* screen (`?1049h` /
+    /// `?47h` — `less`, `man`, vim, every full-screen TUI)? That grid has no
+    /// scrollback at all, so a wheel event roost handles itself can only be a
+    /// no-op there; the wheel has to reach the application instead. See
+    /// `ui::mouse::route_mouse`. Default false.
+    fn alternate_screen(&self) -> bool {
+        false
+    }
+
     /// W3: drain what the pane's escape traffic asked roost to do since the
     /// last call — see `PaneEffects`. Called right after `process_output`;
     /// nothing accumulates between calls. Default empty for backends with no
@@ -262,6 +271,9 @@ pub mod fakes {
         /// Test knob: simulates the pane's app having enabled bracketed
         /// paste (mode 2004).
         pub bracketed: bool,
+        /// Test knob (P9): simulates the pane's app drawing on the alternate
+        /// screen (`?1049h`).
+        pub alternate_screen: bool,
         /// The pixel geometry most recently seen — at spawn, then updated by
         /// every resize — so tests can assert the P4 pixel plumbing.
         pub pixels: (u16, u16),
@@ -302,6 +314,7 @@ pub mod fakes {
                 fail_write: false,
                 app_cursor: false,
                 bracketed: false,
+                alternate_screen: false,
                 pixels,
                 effects: PaneEffects::default(),
                 cursor_shape: None,
@@ -353,6 +366,9 @@ pub mod fakes {
         }
         fn bracketed_paste(&self) -> bool {
             self.bracketed
+        }
+        fn alternate_screen(&self) -> bool {
+            self.alternate_screen
         }
         fn take_effects(&mut self) -> PaneEffects {
             std::mem::take(&mut self.effects)

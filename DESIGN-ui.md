@@ -1003,6 +1003,31 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
   trigger clears the flag; focus-move-under-zoom retargets the display list;
   PTY resize targets.
 
+**[Amended 2026-07-27, SPEC-parity P5 — the round trip is lossless]** Zoom
+resizing the pane's PTY both ways is only safe because the resize itself now
+preserves the grid: the vendored parser **reflows the live grid** on a size
+change, rebuilding the logical lines from the rows' wrap flags and laying
+them out again at the new width (narrowing wraps, widening rejoins,
+attributes and wide glyphs carried whole). Before, unzooming hard-truncated
+every column past the tiled width — a 110-column line printed at 118 lost its
+tail permanently, and pre-zoom wrapped lines never rejoined. Two limits are
+deliberate and contracted:
+- **Scrollback keeps its historical width.** Only the live grid rewraps;
+  rows already banked stay as they were banked, and rows a narrowing pushes
+  off the top are banked at the new width (so history can be mixed-width
+  after a round-trip). Same veneer-vs-second-state split C4's P1 snapshot
+  draws — it buys the lossless round-trip without a full history rewrap. A
+  narrowing spends the screen's own blank rows first, so the common case
+  (a shell with room below the prompt) banks nothing at all.
+- **The alternate screen is never reflowed**, nor is a grid with a scroll
+  region set: those applications own their canvas and repaint on SIGWINCH, so
+  a rewrap would only fight the redraw already on its way.
+"No reflow churn while reading" above is unchanged and means what it always
+did — hidden panes are not resized at all while zoomed, so nothing rewraps
+behind the zoomed view. C4's `↑N` token and C9's `↑N/M` stay honest across a
+resize: the offset is re-read from the grid's own clamp afterwards, never
+carried over.
+
 ### C22 — Floating scratch pane (Alt+f) — [Added 2026-07-22, fleet features]
 
 **Current:** no floating anything. All panes live in a tab's layout tree;
@@ -1384,6 +1409,25 @@ Every px-only construct in the mockup, and its cell-level fate:
   zoom-follows-focus work. Raw mode (C23) alters the **key path only** —
   mouse routing, mouse capture, paste, and the vt100 blit are untouched by
   it.
+- **[Amended 2026-07-27, SPEC-parity P9 — where a wheel tick goes]** Wheel
+  routing has three answers, not two, and `mouse::route_mouse` decides all of
+  them from one `PaneMouseState` (mouse protocol · alternate screen · DECCKM)
+  so the decision stays in one pure, tested place:
+  1. the pane's app speaks SGR mouse reporting → forward the encoded event,
+     unchanged (asking for the wheel means wanting the wheel);
+  2. no protocol, **alternate screen** (`?1049h`/`?47h` — `man`, `less`,
+     vim) → forward `ALT_SCROLL_KEYS` = 3 Up/Down presses, encoded by the
+     keyboard path's own `encode_raw` + `app_cursor_upgrade` (so a pager
+     driven through `smkx` gets `ESC O A/B`). That grid has scrollback
+     capacity 0, so roost-side scrolling there could only ever be a no-op —
+     measured as zero bytes reaching the pane from six wheel events. This is
+     the DECSET 1007 / `alternate-scroll` convention every peer settled on;
+  3. otherwise → scroll roost's own scrollback by `WHEEL_LINES` = 3, exactly
+     as before. The two 3s are deliberately the same number: one notch moves
+     a pager by what it moves history by.
+  The C15 help row (`wheel scrolls · click focuses · drag selects`) is
+  unchanged and now true in more places. Clicks over a protocol-less pane
+  remain roost's, alternate screen or not.
 
 ---
 

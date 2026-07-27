@@ -435,6 +435,14 @@ impl PaneBackend for PtyPane {
         self.parser.screen().bracketed_paste()
     }
 
+    /// P9: vt100 already tracks modes 1049/47, so this is a read, not new
+    /// state. Answered from the LIVE screen rather than the presented frame,
+    /// like every other input-routing accessor here: a ≤150 ms presentation
+    /// veneer (P1) must never decide where a keystroke or a wheel tick goes.
+    fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> bool {
         // Typing means "I'm back" — snap to the live tail.
         if self.scroll != 0 {
@@ -465,6 +473,13 @@ impl PaneBackend for PtyPane {
             pixel_height: pixels.1,
         });
         self.parser.set_size(rows, cols);
+        // U3/U9 × P5: a resize reflows the live grid, which can bank rows the
+        // rewrap pushed off the top — so the view's offset moves with them.
+        // Read the grid's clamp back rather than keeping the pre-resize
+        // number, exactly as `set_scrollback`/`scroll_by` do: the `↑N` badge
+        // and the scroll-mode hint are built on this value and must describe
+        // the view, never a stale one.
+        self.scroll = self.parser.screen().scrollback();
     }
 
     fn hangup(&mut self) {
