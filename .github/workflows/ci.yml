@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Both, deliberately: the PTY integration tests under tests/ drive the real
+    # binary through a real pty, and several have only ever been run on one
+    # developer's Mac. Two OSes is what tells a product bug apart from a host
+    # quirk — which is the whole reason this workflow exists.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action and no cache: GitHub runners ship rustup + a
+      # current stable, and a cold build of this tree is well under a minute.
+      - run: cargo build --tests --verbose
+      # --no-fail-fast so one red integration test doesn't hide the others;
+      # the point of a first CI run is the full picture, not the first failure.
+      - run: cargo test --no-fail-fast --verbose
