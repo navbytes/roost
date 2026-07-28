@@ -175,6 +175,59 @@ fn scrub_host_identity(cmd: &mut CommandBuilder) {
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 }
 
+/// Every live pid in session `sid`, **excluding the leader itself** (that one
+/// is already covered by the process-group kill).
+///
+/// A pane is spawned through `setsid`, so its pid *is* its session id, and
+/// everything it goes on to spawn inherits that session — job control moves a
+/// process between *groups*, never out of the session. That makes "same
+/// session" the one net wide enough to catch a backgrounded job, which is in
+/// neither the pane's process group nor the terminal's foreground group.
+///
+/// Linux reads `/proc` directly: no subprocess in a teardown path, and no
+/// dependency on a `pgrep` binary being installed. Elsewhere (macOS has no
+/// `/proc`) it shells out to `pgrep -s`, which BSD and Linux both support.
+/// Either way a failure yields an empty list — the group kill above still
+/// happened, and a sweep that cannot enumerate must not block the quit.
+fn session_members(sid: u32) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+            if pid == sid {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+            // Fields are space-separated, but field 2 is the executable name
+            // in parentheses and may itself contain spaces *and* ')' — so the
+            // only safe split point is the LAST ')'. After it: state(3),
+            // ppid(4), pgrp(5), session(6).
+            let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else { continue };
+            let mut fields = rest.split_whitespace();
+            let session = fields.nth(3).and_then(|s| s.parse::<u32>().ok());
+            if session == Some(sid) {
+                out.push(pid);
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Ok(out) = std::process::Command::new("pgrep").arg("-s").arg(sid.to_string()).output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .filter(|p| *p != sid)
+            .collect()
+    }
+}
+
 pub struct PtyPane {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -514,6 +567,29 @@ impl PaneBackend for PtyPane {
         if let Some(pid) = self.pid {
             unsafe {
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+            // ...and then sweep the whole **session**, because the group kill
+            // above provably does not cover it. An interactive shell with job
+            // control puts every job in a *new* process group, so a
+            // backgrounded one (`sleep 600 &`) is in neither the pane's group
+            // nor — being background — the foreground group the PTY's hangup
+            // would reach. Measured before this sweep existed: the `sleep`
+            // outlived roost's quit, reparented to init and still running.
+            //
+            // The session is the right net: `setsid` makes the pane its own
+            // session leader (so its sid == this pid), a job-control fork
+            // changes only the group, and nothing a pane spawns can leave the
+            // session without asking for it. roost's own process is in the
+            // terminal's session, never a pane's, so this cannot reach it —
+            // and the `!= pid` guard keeps the leader on the group path above.
+            //
+            // Pid reuse between the scan and the signal is theoretically
+            // possible; the window is microseconds and the group kill carries
+            // the identical hazard, so it is accepted rather than papered over.
+            for member in session_members(pid) {
+                unsafe {
+                    libc::kill(member as libc::pid_t, libc::SIGKILL);
+                }
             }
         }
         // Reap WITHOUT blocking the UI thread indefinitely. A bare

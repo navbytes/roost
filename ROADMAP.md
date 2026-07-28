@@ -114,9 +114,25 @@ wait`, ownership-scoped, audit-logged, CSPRNG control token). Left:
   vs permanent failure. Rare now that pi/claude ids are reliable.
 - **[choice] Closing a tab's last pane deletes the tab.** Deliberate (mirrors
   "close last pane quits"); may become a configurable choice.
-- **[perf] Orphan-child cleanup.** The freeze fix reaps non-blocking and SIGKILLs
-  the process group; in the pathological case where a child won't die within the
-  ~100ms poll it's left to the OS. Fine, but worth revisiting if leaks appear.
+- ~~**[perf] Orphan-child cleanup.**~~ **DONE 2026-07-28 — and it was not a
+  pathological case.** The entry guessed the risk was "a child that won't die
+  within the ~100ms poll"; the actual leak was structural and reproducible on
+  the first try. An interactive shell with job control puts every job in a
+  *new* process group, so `sleep 600 &` sat in neither the pane's group (the
+  one roost SIGKILLs) nor the session's foreground group (the one the PTY's
+  hangup reaches). It outlived every quit, reparented to init, still running.
+  `PtyPane::kill` now sweeps the whole **session** after the group kill —
+  `setsid` makes the pane its own session leader and a job-control fork
+  changes only the group, so nothing a pane spawns can leave that net without
+  asking to. Pinned by `tests/orphan_cleanup.rs`, which backgrounds a real
+  job and fails without the sweep.
+  *Separately:* `tests/firehose.rs`'s no-orphans gate had been failing on this
+  host for an unrelated reason — `harness::is_alive` used `kill -0`, which
+  succeeds for a **zombie**. A zombie is a process that has already died and
+  holds nothing; counting one as a survivor made the gate fail on any host
+  whose PID 1 reaps lazily (here it is a container shim). `is_alive` now
+  checks the state too. The two fixes are independent, and each was verified
+  against the other disabled.
 
 ## Internal quality — refactors
 
