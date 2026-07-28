@@ -4,7 +4,7 @@ Canonical design reference: `docs/tui-design.html` (tokens at `:root` ~line 584,
 terminal markup ~614–696, token legend ~698). This document translates that
 mockup into testable contracts for a ratatui 0.29 cell-grid TUI. The
 `design-supervisor` agent audits implementation against the numbered contracts
-below (C1–C26) and issues a per-contract verdict: **ALIGNED** or **DEVIATED**
+below (C1–C27) and issues a per-contract verdict: **ALIGNED** or **DEVIATED**
 (with file:line evidence). Line anchors below were verified against the working
 tree on 2026-07-21 and may drift a line or two; the code element named is the
 anchor, not the number.
@@ -41,6 +41,14 @@ hues. Consequences that touch every contract with a colour in it:
   auditable predicates are the §2 legibility principle and the four mechanical
   gates it names — they replace the old "hex values match exactly or they
   don't" rule for chrome colour, which now has nothing to compare against.
+
+**Amendment 2026-07-28 (vertical-tabs tribunal):** **C27** (the fleet roster,
+`Alt+Shift+a`) is new, and **C2** carries a dated amendment adding a count
+cell beside the tab summary glyph. Both come from a tribunal that *rejected* a
+herdr.dev-style vertical sidebar on the 80-column arithmetic and closed the one
+gap it did find; the reasoning lives in C27's provenance paragraph. They add no
+glyph (§2's inventory is unchanged — the count cell is ASCII text, see C2) and
+no colour.
 
 ---
 
@@ -794,6 +802,18 @@ query `ink()` — it is text being typed right now, and the quiet rung is not
 for input you must proofread. Precedence, pair lists, fit/yield order and
 every width number are untouched.
 
+**[Amended 2026-07-28, C27 — the roster's mode and list]** The mode-word list
+gains `ROSTER`, on the same terms as `FEED` and `SEARCH` (a real mode always
+beats the Normal-slot pseudo-words), and the roster's own pair list is
+`↑↓ select` · `PgUp/Dn page` · `↵ go to pane` · `type filter` · `Esc close`
+(**68 columns** — inside the 100-col floor beside the right segment). It is
+the feed's list with `type filter` in place of `q/Esc close`'s `q`: the
+roster filters as you type, so a letter cannot also be a command (U20), and
+the hint has to advertise the key set that actually exists. The **Normal-mode
+seven gain nothing** — the 100-column argument in this contract's 2026-07-22
+amendment is unchanged, and `Alt+Shift+a` is discoverable through `Alt+?`
+(C15) beside the `Alt+a` it pairs with.
+
 ### C10 — Flash message
 
 **Current:** `render.rs:56–64` — Black on Green BOLD.
@@ -924,6 +944,14 @@ The interior's "`Clear` then default bg, no explicit paper fill" line is now
 the rule everywhere rather than a modal-only carve-out (§2 background policy).
 Backdrop, anchoring, stacking order and the U8 input-ownership rules are
 untouched.
+
+**[Amended 2026-07-28, C27]** The fleet roster is a **fifth** C12 modal
+("four" above, and "the other three" in the paste rule, predate it). It takes
+the frame, the backdrop, the anchoring and every U8 rule unchanged; its two
+mode-specific answers are contracted in C27 — the wheel moves its cursor (it
+has one; the feed's `offset` *is* its cursor, so both are "the wheel drives
+the selection"), and a click on a row jumps while a click outside dismisses,
+the picker's shape. Paste is swallowed, like every non-Rename modal.
 
 ### C13 — Rename dialog
 
@@ -1109,6 +1137,15 @@ precisely the state P21 catalogued.
 **[Amended 2026-07-27, theme inheritance]** Key column `accent()`,
 description column `quiet()` — the same key/label system as the hint bar, as
 before. Content, width rule and the ≤20-row cap are untouched.
+
+**[Amended 2026-07-28, C27 — the roster costs no row]:** `Alt+Shift+a` joins
+C19's own row rather than taking a 21st: `Alt+a / Alt+Shift+a` →
+`jump to next pane that needs you / list every pane` (70 columns with its key
+prefix, inside the ≤80 floor). This is the merge idiom the cap has always
+demanded of a new chord — and here it is also the honest presentation, since
+the two chords are one deliberate pair (C27's binding rationale). Row count
+stays **20**; `help_keys_match_the_c8_key_table_verbatim_and_in_order` and
+`help_dialog_fits_the_eighty_column_floor` pin both halves.
 
 ### C16 — Dead-pane overlay
 
@@ -1725,6 +1762,166 @@ whole tabs" is therefore a **scope statement + pinning**, not a build.
   and the tab name) + the README wording above. Zero behavior change; any
   behavior diff in this area is a DEVIATED.
 
+### C27 — Fleet roster (Alt+Shift+a) — [Added 2026-07-28, vertical-tabs tribunal]
+
+**Provenance.** A three-member tribunal evaluated adopting a herdr.dev-style
+left vertical sidebar and **rejected** it: at roost's 80×24 floor a 20-column
+rail leaves 30-column panes, below `MIN_SPLIT_COLS = 36`, so side-by-side
+agents become illegal by roost's own predicate — and herdr's two sections are
+Workspaces + Agents, a tier roost's singleton `Workspace` does not have. The
+tribunal did find one gap, unanimously, and this contract closes it: **roost
+has no surface showing named, per-pane identity for panes in *other* tabs, at
+rest.** `Alt+a` (C19) reaches them without listing them; `Alt+e` (C20) is a
+time-ordered log, not current state; a tab with three needy agents renders as
+one `◆`, identical to a tab with one (the C2 amendment of the same date
+addresses that last one from the tab bar's side).
+
+**Current:** none of the above surfaces answers "what is my fleet, right
+now". `App::attention_ring` (`app.rs`) already enumerates the workspace in
+the right order but only over `NeedsInput` panes and only to move focus.
+
+**Target — a read-only navigator that makes the fleet legible without moving
+you.**
+
+- **Binding: `Alt+Shift+a`** (`Action::ToggleRoster`), also accepted as
+  `Alt+'A'` — the uppercase-delivery tolerance `Alt+Shift+r` and
+  `Alt+Shift+p` already carry, and the same in-repo precedent for choosing a
+  *shifted sibling* at all. Deliberate pairing with C19: **`Alt+a` takes you
+  to the next one; `Alt+Shift+a` shows you all of them and lets you choose.**
+  The unshifted Alt pool cannot supply this chord — `b`/`d` are live readline
+  word-ops since U5, `i`/`m` went to U7's tab navigation, and `p` is reserved
+  by C23 so the raw toggle has no near-miss.
+  (Delivery note: unlike C23's `ESC`+`P`, `ESC`+`A` is not an escape
+  introducer, so it carries none of N3's DCS ambiguity.)
+- **Surface: a C12 modal** (`Mode::Roster`), drawn through the existing frame
+  + `draw_mode_overlay` path — the same machinery the feed, picker and help
+  use, so the backdrop, border, anchoring and U8 mouse rules all apply
+  unchanged. It is the **fifth** C12 modal (C12's U8 amendment lists four).
+- **Geometry:** `roster_overlay_size` **is** `feed_overlay_size` —
+  `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`, anchored by
+  `centered_near` like every other modal. Deliberately one function, not a
+  copy: the two overlays answer the fleet's two questions and must not
+  resize under a user toggling between them, and the 80×24 floor is then
+  proven once for both.
+- **Content:** every pane in the workspace, **grouped by tab**, tabs in
+  order, panes in that tab's `pane_order()`, the float (C22) last under its
+  own group when shown — i.e. exactly C19's ring enumeration, so the roster
+  and `Alt+a` can never disagree about what order the fleet is in.
+  - **Group header rows** use C6's idiom: an uppercase label
+    (`" 1 MAIN · 4 PANES"` — the tab's own bar label, then how many of its
+    panes are being shown), `quiet()`, `Modifier::UNDERLINED` across every
+    cell of the row (the label is padded to the row width so the rule runs
+    edge to edge, exactly as `stack_header_text` does it). A header is a
+    label, never a destination.
+  - **Pane rows reuse C8's collapsed-row format verbatim** — marker + glyph +
+    id + name + `{adapter} · {state word}` — by calling the very same
+    `collapsed_row_spans`, one column narrower. `display_name_of` /
+    `App::display_name`, `state_word`, `collapsed_name_style` and the C5
+    glyph table are all shared, so a pane reads identically here, in a
+    collapsed stack row, and on its badge. **No new glyphs**: §2's inventory
+    holds.
+  - **Two marks, two meanings.** The row's leading column is the *cursor*
+    (`❯`, `accent()` — the C14/C20 idiom), and C8's own `▎` still marks the
+    *focused* pane inside the row. "What will Enter act on" and "where am I
+    right now" are different questions and get different marks rather than
+    one overloaded one.
+- **Opening cursor lands on the pane `Alt+a` would pick** — the same
+  worst-first ring order, through the shared `App::attention_next` that
+  `jump_attention` itself now calls. This is load-bearing: it makes
+  `Alt+Shift+a` `Enter` *exactly equivalent* to `Alt+a`, so the roster is a
+  superset of the chord users already know rather than a competing command
+  (pinned by `roster_enter_lands_exactly_where_alt_a_would_have`). With
+  nothing needing attention it opens on the focused pane.
+- **Keys.** `↑`/`↓` move by pane (headers are skipped by construction —
+  the cursor is a `PaneId`, and a header has none), clamped at both ends
+  rather than wrapping; `PgUp`/`PgDn` page by half the overlay's height (C20's
+  `feed_page` rule, one source for both keys); `Enter` jumps; `Esc` dismisses;
+  `Alt+Shift+a` toggles closed (U18: a mode's entry chord exits it, derived
+  through `translate` like every other mode's).
+- **Type-ahead filters the list**, U20's picker idiom: every printable
+  character narrows it by ASCII-case-insensitive substring over **id, display
+  name and adapter** (the three things a row shows — the id because it is the
+  `roost send <id>` join key), `Backspace` widens, and the live query replaces
+  the frame title's tail (`fleet — clau▏`) so a narrowed list always says why
+  it is narrow. A group whose panes all filter out loses its header too — an
+  empty group is a row that says nothing. `Enter` acts on the filtered
+  selection, and the cursor follows the filter when the pane under it is
+  narrowed away.
+  - **Deviation from the brief, recorded:** the brief asked for `j`/`k` as
+    motions *and* type-ahead, and asked for `q` to dismiss. Those cannot both
+    hold — U20 settled this exact conflict for the picker: *"a list you filter
+    by typing cannot reserve letters"*, and it is why `j`/`k` stopped being
+    picker motions. The arrows and the paging keys are the motions here; `j`,
+    `k` and `q` are filter text like every other letter, and `Esc` (plus the
+    entry chord) is the way out. The hint bar advertises exactly that set, so
+    nothing advertised is lost.
+- **Jump goes through `focus_attention_target`** — the helper C19's ring and
+  C20's `Enter` already share — so tab-switching (`go_to_tab` semantics, lazy
+  spawn, C21's zoom rule), collapsed-stack expansion and float-reveal all come
+  free and behave identically to every other jump in roost. The roster closes
+  behind the jump. Ids are recycled (`next_pane_id` is a max+1), so a pane
+  that closed while the roster was open flashes `that pane is gone` without
+  moving focus and without closing the overlay: a no-op you can see beats a
+  silent one (C20's own rule).
+- **Live.** The rows are recomputed every frame from the workspace, so
+  statuses change and exited/closed panes leave the list while it is open. It
+  is a monitoring surface; stale state is worse than none. The cursor is a
+  **`PaneId`, not a row index**, precisely so the list can churn underneath it
+  without the cursor silently re-pointing at a different pane. The scrolled
+  window (`top`) is the one piece of view state, clamped by the pure
+  `roster_top_clamped` that the renderer and the mouse hit-test both call
+  (§4/§5 lockstep); it scrolls the least it can to keep the cursor visible,
+  and takes the cursor's group header with it when revealing upward (a row
+  whose tab you cannot see is a pane you cannot place).
+- **Mouse (U8's modal rules, no exceptions):** a click on a pane row jumps in
+  **one** press (C14's "the picker is a launcher" reasoning — "select, then
+  confirm" would be a second click for nothing), hit-tested by the existing
+  `mouse::picker_row_at` against the dialog's *drawn* rect; a click on a
+  header does nothing; a click outside dismisses; the wheel moves the roster's
+  **cursor** (one row per notch, the arrows' own step) and never reaches the
+  pane beneath. The wheel deliberately moves the cursor rather than a detached
+  view: `Enter` acts on the cursor, so a wheel that scrolled the list out from
+  under it would leave the overlay pointing at a row nobody can see. Paste is
+  swallowed like every other non-Rename modal — a pasted blob is not a filter
+  anybody meant to type.
+- **Chrome:** mode word `ROSTER` (C9's list); hint pairs
+  `↑↓ select` · `PgUp/Dn page` · `↵ go to pane` · `type filter` · `Esc close`
+  (**68 columns**, inside the 100-col floor beside the right segment). The
+  C15 overlay teaches the chord on C19's own row, merged:
+  `Alt+a / Alt+Shift+a` → `jump to next pane that needs you / list every
+  pane` — the merge idiom the ≤20-row cap has always demanded, and here also
+  the honest presentation of a deliberate pair.
+
+**The C20 distinction (contracted, so the two never drift):**
+> **`Alt+e` answers "what happened"** — a time-ordered history of transitions,
+> spawns, exits and control calls, newest last, with entries that outlive the
+> panes they name.
+> **`Alt+Shift+a` answers "what is"** — the current state of every pane that
+> exists right now, grouped by where it lives, with no history at all.
+>
+> A change that gives the roster a timeline, or the feed a grouped
+> current-state view, is a merge of two contracts and must be argued as one.
+
+**Scope: jump is the only action in v1.** No close, no send, no broadcast,
+no rename. Rationale, recorded so a later change is a deliberate decision
+rather than a drift: those would turn a navigator into a control panel,
+duplicate keys the panes already answer to, and `roost send <id>` (with the
+id the roster puts in front of you) already covers scripted dispatch —
+the CLI is also where the fat-finger-unsafe verbs deliberately live (§7's
+"no TUI broadcast key"). Adding an action here means re-arguing that split.
+
+**Unit tests (the executable form of this contract):** ring-order opening
+cursor and the `Alt+a` equivalence · row grouping incl. the float's own group
+· header skipping and end clamping · type-ahead over id/name/adapter with
+Backspace widening and header collapse · `Enter` through the shared helper
+across tabs · stale-cursor flash · entry-chord and `Esc` toggling closed ·
+window follow/clamp · mouse row-click jump, header-click no-op, outside-click
+dismiss, wheel-moves-cursor · the drawn overlay (headers underlined, C8 rows,
+both marks, live query). Plus the PTY e2e `tests/roster_overlay.rs`: the
+roster lists a **non-active** tab's panes and jumps across to one, with
+`roost list` as ground truth — that cross-tab case is the whole point of the
+feature, so it gets a real terminal.
+
 ---
 
 ## 4. Pixel-idea translations (explicit)
@@ -1817,7 +2014,8 @@ the violated bullet). Mechanics per contract class:
 - **Structural predicates** (C2 cell layout + width formula, C6 geometry
   threshold, C5 phase boundaries; fleet additions: C19 ring order, C20 ring
   cap/taxonomy, C21 display list, C22 geometry/id guard, C23 routing
-  predicate, C24 motion/anchor, C25 builders/fit): verify against the unit
+  predicate, C24 motion/anchor, C25 builders/fit; C27 row model, ring-order
+  opening cursor, filter and window clamp): verify against the unit
   tests this plan requires — tests are the executable form of the contract.
 - **Visual predicates** (colors in place, marker glyphs, right-alignment,
   feed styling, raw badge token): verify by reading the span-construction
@@ -1973,6 +2171,7 @@ only the C9-curated subsets.
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
 | 9 | `Alt+f` | **floating scratch shell (toggle)** | C22 |
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
+| 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one** | C27 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
 | 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
@@ -2061,6 +2260,21 @@ the pre-existing `0`/`$`. Picker (C14): `1`..`9` launch that row. Feed
 (C20): `Enter` focuses the selected entry's pane, and the long-implemented
 `PgUp`/`PgDn`/`q` are now advertised. Every one of them is reachable from
 the C15 overlay's rows.]
+
+[Amended 2026-07-28, C27 — the roster's own keys, and why it takes a shifted
+chord. `Alt+Shift+a` is row 10b above; it is deliberately the shifted sibling
+of row 10, because the unshifted pool cannot supply a mnemonic one: `b`/`d`
+are live readline word-ops since U5 (taking them now would be a regression,
+not a theory), `i`/`m` went to U7's tab navigation, and `p` stays free by
+C23's own rule so the raw toggle has no near-miss. `Alt+Shift+r` and
+`Alt+Shift+p` are the in-repo precedent for a shifted sibling, and the same
+uppercase-delivery tolerance (`Alt+'A'`) rides along.
+Mode-local, not Alt chords, so they join no row: `↑`/`↓` move the cursor by
+pane, `PgUp`/`PgDn` page, `Enter` goes to the cursor's pane, `Esc` closes, and
+**every printable character is filter text** — `j`, `k` and `q` included,
+because a list you filter by typing cannot reserve letters (U20's rule, paid
+for by the picker). All of them are advertised on the roster's own hint list
+(C9) and the chord itself on C15's merged `Alt+a / Alt+Shift+a` row.]
 
 Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
 raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes

@@ -12,6 +12,12 @@ QA session against the real binary in a real PTY (`tests/ux_nav_qa.rs`, an
 `#[ignore]`d evidence drive: multiple panes, stacks, layout cycling, zoom, tabs,
 every mode, mouse events). Appendix A records what the session confirmed.
 
+**Later additions.** U26 and U27 (2026-07-28) come from a different origin: a
+three-member **vertical-tabs tribunal** that evaluated a herdr.dev-style left
+sidebar, rejected it on the 80-column arithmetic, and catalogued the one gap it
+would have closed by accident. Both are FIXED on this branch; their provenance
+is recorded in each item and in DESIGN-ui C27's own opening paragraph.
+
 **Item status legend.**
 - `VERIFIED` — reproduced in the live QA session (or directly visible in its frames).
 - `CODE-VERIFIED` — pinned to the exact code path; live probe not applicable or inconclusive.
@@ -463,6 +469,60 @@ already meant "entries back from the newest"), now marked with the picker's
 columns. The hint is the feed's real key set:
 `↑↓ select · PgUp/Dn page · ↵ go to pane · q/Esc close` (C20/C9 amended
 2026-07-27).
+
+### U26 · Med · FIXED (this branch) — no surface names the panes in other tabs
+**Found by the vertical-tabs tribunal (2026-07-28).** A three-member tribunal
+evaluated adopting a herdr.dev-style left vertical sidebar and **rejected** it
+on the 80-column arithmetic — at roost's floor a 20-column rail leaves
+30-column panes, under `MIN_SPLIT_COLS = 36`, so side-by-side agents become
+illegal by roost's own predicate, and herdr's two sections (Workspaces +
+Agents) assume a tier roost's singleton `Workspace` does not have. What the
+tribunal did find, unanimously, is the gap the sidebar would have closed by
+accident: **roost has no surface showing named, per-pane identity for panes in
+*other* tabs, at rest.** `Alt+a` reaches them without listing them; `Alt+e` is
+a time-ordered log rather than current state; a tab holding three needy agents
+renders as one `◆`, identical to a tab holding one.
+**Proposed contract:** a modal roster of every pane, grouped by tab, opening
+on the pane `Alt+a` would pick, whose only action is going to one.
+**Fixed:** new **C27** — `Alt+Shift+a` (plus the `Alt+'A'` uppercase-delivery
+tolerance `Alt+Shift+r`/`Alt+Shift+p` already carry) opens `Mode::Roster`, a
+C12 modal on C20's own geometry. It lists every pane grouped by tab in C19's
+ring order (the float last), tab headers in C6's underlined-label idiom and
+pane rows in **C8's collapsed-row format verbatim** — the same
+`collapsed_row_spans`, `display_name`, `state_word` and C5 glyph table every
+other fleet surface uses, so no new glyph and no new vocabulary. The opening
+cursor is the pane `Alt+a` would jump to (both read one `attention_next`), so
+`Alt+Shift+a` `Enter` **is** `Alt+a` — the roster is a superset of the chord
+users know, not a competitor. Arrows/PgUp/PgDn move (headers are skipped;
+letters filter on id/name/adapter, U20's picker idiom, with the live query in
+the frame title), `Enter` jumps through `focus_attention_target` so tab
+switches, stack expansion and float reveal come free, `Esc` and the entry
+chord (U18) close it, and U8's modal rules cover the mouse — click a row to
+go there, click a header for nothing, click outside to dismiss, wheel to move
+the cursor and never the pane beneath. **Jump is the only action in v1** and
+C27 says so, alongside the contracted split from C20: *`Alt+e` answers "what
+happened", `Alt+Shift+a` answers "what is"*. The sibling half of the finding —
+one `◆` for a tab of three — is closed by the same date's C2 amendment (U27).
+
+### U27 · Low · FIXED (this branch) — a tab of three needy agents reads as one
+**Found by the vertical-tabs tribunal (2026-07-28); the sidebar was rejected
+on the 80-column arithmetic and this is the other half of what closed the gap
+it identified.** `App::tab_summary` reduces a whole tab to one glyph, so `◆`
+means "at least one pane here needs you" and nothing more: a tab with three
+blocked agents is pixel-identical to a tab with one, and the only way to learn
+the difference was to visit the tab.
+**Proposed contract:** render the count beside the summary glyph.
+**Fixed:** C2 amended — the tab bar's glyph cell gains a **count cell** when
+the tab holds ≥ 2 panes in the summarized state (`◆3`, `●2`), carrying the
+glyph's own style (pulse included, so the pair flips as one token). The cell
+is **always reserved** — a space below 2, the digit for 2–9, `+` for 10 or
+more — so tab widths never jitter as agent statuses flip, which is worth more
+than the column it costs; `mouse::tab_width` grows to `label + 8` and the
+renderer, `tab_at_x` and their tests moved in the same commit (§4/§5's hard
+lockstep rule). Measured cost, documented in the amendment: one fewer visible
+tab at 80 and 120 columns, none at 100 or 160, and per U7 the strip scrolls,
+so the effect is fewer tabs visible before the `…`, never a tab you cannot
+reach.
 
 ## New findings from the live session (not predicted by either review)
 

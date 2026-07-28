@@ -10,8 +10,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
-    feed_overlay_size, App, FeedEntry, Mode, RenameTarget,
-    Search, Selection, TabSummary,
+    feed_overlay_size, roster_overlay_size, App, FeedEntry, Mode, RenameTarget,
+    RosterRow, Search, Selection, TabSummary,
 };
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, PaneRect};
@@ -72,7 +72,7 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // Anchor floating dialogs near the focused pane rather than dead-center
     // of the whole screen, so it's visually obvious which pane they affect.
     let anchor = rects.iter().find(|pr| pr.id == app.focused).map(|pr| pr.rect).unwrap_or(body);
-    draw_mode_overlay(f, app, body, anchor);
+    draw_mode_overlay(f, app, body, anchor, pulse);
 }
 
 /// C9: Normal-mode hint pairs — exactly these seven; bindings the old
@@ -157,6 +157,17 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
             ("↵", "go to pane"),
             ("q/Esc", "close"),
         ],
+        // [Added, C27] The roster's own key set — 68 columns, inside the
+        // 100-col floor beside the right segment. `q` is deliberately absent
+        // where the feed has it: this list filters as you type, so a letter
+        // is filter text (U20's rule), and `Esc` is the way out.
+        Mode::Roster { .. } => vec![
+            ("↑↓", "select"),
+            ("PgUp/Dn", "page"),
+            ("↵", "go to pane"),
+            ("type", "filter"),
+            ("Esc", "close"),
+        ],
         Mode::Normal if focused_dead => {
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
         }
@@ -192,6 +203,7 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Copy { .. } => "COPY",
         Mode::Help => "HELP",
         Mode::Feed { .. } => "FEED",
+        Mode::Roster { .. } => "ROSTER",
         Mode::Search { .. } => "SEARCH",
     }
 }
@@ -512,7 +524,11 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
     ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
     ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
-    ("Alt+a", "jump to next pane that needs you"),
+    // C27: the deliberate pair rides one row — the merge idiom the ≤20
+    // cap has always demanded of a new chord, and here it is also the
+    // honest presentation: Alt+a takes you to the next one,
+    // Alt+Shift+a shows you all of them and lets you choose.
+    ("Alt+a / Alt+Shift+a", "jump to next pane that needs you / list every pane"),
     ("Alt+e", "activity feed (status / spawns / exits / control)"),
     ("Alt+r / Alt+Shift+r", "rename pane / tab"),
     ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
@@ -594,10 +610,26 @@ fn dialog_rect(
             let (w, h) = feed_overlay_size(body);
             Some(centered_near(anchor, body, w, h))
         }
+        // C27: deliberately the feed's own geometry — the two overlays
+        // answer the fleet's two questions and should not resize under a
+        // user toggling between them.
+        Mode::Roster { .. } => {
+            let (w, h) = roster_overlay_size(body);
+            Some(centered_near(anchor, body, w, h))
+        }
     }
 }
 
-fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, anchor: Rect) {
+/// `pulse` is the frame's one shared C5 phase read (see `draw`) — the roster
+/// draws status glyphs, and a second `app.elapsed()` sample here could split a
+/// frame across both phases.
+fn draw_mode_overlay<B: PaneBackend>(
+    f: &mut Frame,
+    app: &App<B>,
+    body: Rect,
+    anchor: Rect,
+    pulse: Style,
+) {
     let Some(rect) =
         dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
     else {
@@ -711,6 +743,119 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             draw_feed_entries(f, app.feed(), *offset, inner);
+        }
+        Mode::Roster { cursor, filter, .. } => {
+            dim_backdrop(f, body, rect);
+            f.render_widget(Clear, rect);
+            // The live query rides in the title, exactly as the picker's
+            // does (U20): a list narrowed to two rows with an ordinary title
+            // reads as a fleet that lost its panes.
+            let heading = if filter.is_empty() {
+                " fleet ".to_string()
+            } else {
+                format!(" fleet — {filter}{} ", theme::RENAME_CURSOR)
+            };
+            let block = Block::bordered()
+                .title(Line::from(Span::styled(heading, theme::ink())))
+                .border_type(BorderType::Plain)
+                .border_style(dialog_border_style());
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            draw_roster_rows(f, app, *cursor, inner, pulse);
+        }
+    }
+}
+
+/// C27: the roster's visible rows inside the modal's inner area — tab group
+/// headers in C6's underlined-label idiom, pane rows in C8's collapsed-row
+/// format verbatim (through the very same `collapsed_row_spans`), each behind
+/// the one leading column that carries the cursor marker.
+fn draw_roster_rows<B: PaneBackend>(
+    f: &mut Frame,
+    app: &App<B>,
+    cursor: layout::PaneId,
+    inner: Rect,
+    pulse: Style,
+) {
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let (rows, top) = app.roster_view();
+    if rows.is_empty() {
+        // Only reachable through the type-ahead: the workspace always has at
+        // least one pane. Same shape as the feed's empty state.
+        let text = "no pane matches";
+        let pad = inner.width.saturating_sub(text.chars().count() as u16) / 2;
+        let y = inner.y + inner.height / 2;
+        f.render_widget(
+            Paragraph::new(format!("{}{text}", " ".repeat(pad as usize))).style(theme::quiet()),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        return;
+    }
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(top)
+        .take(inner.height as usize)
+        .map(|row| Line::from(roster_row_spans(app, row, inner.width, cursor, pulse)))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// C27: one roster row's spans.
+///
+/// A group header is C6's idiom — an uppercase label, `quiet()`, every cell
+/// of the row underlined (the text is padded to the full width so the rule
+/// runs edge to edge, exactly as `stack_header_text` does it).
+///
+/// A pane row is `marker + C8's collapsed row`. The leading column is the
+/// cursor (`❯`, the picker/feed idiom) and the C8 row keeps its own `▎` for
+/// the *focused* pane, so the roster answers "which row will Enter act on"
+/// and "where am I right now" with two different marks instead of
+/// overloading one.
+fn roster_row_spans<B: PaneBackend>(
+    app: &App<B>,
+    row: &RosterRow,
+    width: u16,
+    cursor: layout::PaneId,
+    pulse: Style,
+) -> Vec<Span<'static>> {
+    match row {
+        RosterRow::Group { label } => {
+            let pad = (width as usize).saturating_sub(mouse::display_width(label) as usize);
+            vec![Span::styled(
+                format!("{label}{}", " ".repeat(pad)),
+                theme::quiet().add_modifier(Modifier::UNDERLINED),
+            )]
+        }
+        RosterRow::Pane { id } => {
+            let id = *id;
+            let spec = app.find_spec(id);
+            let status =
+                app.runtimes.get(&id).map(|rt| rt.status()).unwrap_or(AgentStatus::Exited);
+            let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
+            let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
+            let name = if spec.is_some() { app.display_name(id) } else { "?".into() };
+            let (_, base, pulses) = theme::status_style(status);
+            let glyph_style = if pulses { pulse } else { base };
+            let marker = if id == cursor {
+                Span::styled(theme::PICKER_SELECTED.to_string(), theme::accent())
+            } else {
+                Span::raw(" ")
+            };
+            let mut spans = vec![marker];
+            spans.extend(collapsed_row_spans(
+                width.saturating_sub(1),
+                app.focused == id,
+                status,
+                id,
+                &name,
+                &adapter,
+                has_title,
+                app.is_raw(id),
+                glyph_style,
+            ));
+            spans
         }
     }
 }
@@ -1554,7 +1699,7 @@ mod tests {
         help_dialog_width, hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans,
         should_place_cursor, stack_header_text, state_word, HELP_KEYS,
     };
-    use crate::core::app::{Mode, RenameTarget};
+    use crate::core::app::{Mode, RenameTarget, RosterRow};
     use crate::core::status::AgentStatus;
     use crate::ui::mouse;
     use crate::ui::theme;
@@ -2362,7 +2507,7 @@ mod tests {
                 ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
                 ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
                 ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
-                ("Alt+a", "jump to next pane that needs you"),
+                ("Alt+a / Alt+Shift+a", "jump to next pane that needs you / list every pane"),
                 ("Alt+e", "activity feed (status / spawns / exits / control)"),
                 ("Alt+r / Alt+Shift+r", "rename pane / tab"),
                 ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
@@ -2645,6 +2790,7 @@ mod tests {
             ("help overlay", Action::Help),
             ("picker", Action::QuickLaunch),
             ("activity feed", Action::ToggleFeed),
+            ("fleet roster", Action::ToggleRoster),
             ("rename dialog", Action::RenamePane),
             ("scroll mode", Action::ScrollMode),
             ("copy mode", Action::CopyMode),
@@ -2909,6 +3055,122 @@ mod tests {
         assert!(!drawn.contains("claude"), "and drops the rest:\n{drawn}");
         assert!(!drawn.contains(" 2 "), "no second row survives the filter:\n{drawn}");
         assert!(matches!(app.mode, Mode::Picker { .. }));
+    }
+
+    /// C27, end to end through the real `draw()`: the roster groups panes
+    /// under underlined tab headers, spells each pane row in C8's collapsed
+    /// format (id + name + `{adapter} · {state word}`), marks the cursor with
+    /// the picker's `❯`, lists a pane from a tab that is **not** active, and
+    /// puts the live type-ahead query in the frame title.
+    #[test]
+    fn the_roster_draws_grouped_rows_a_cursor_and_the_live_filter() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane); // tab0: two panes
+        app.apply(Action::NewTab); // tab1 ("tab2"): one pane, now active
+        let drawn = |app: &mut App<crate::ports::fakes::FakePane>| -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        app.apply(Action::ToggleRoster);
+        let frame = drawn(&mut app);
+        assert!(frame.contains(" fleet "), "the frame's title:\n{frame}");
+        assert!(frame.contains("1 MAIN · 2 PANES"), "tab 1's group header:\n{frame}");
+        assert!(frame.contains("2 TAB2 · 1 PANE"), "tab 2's group header:\n{frame}");
+        // C8's row format, for a pane in the *inactive* tab — the whole point
+        // of the feature. `shell · /tmp` untitled ⇒ the state word alone.
+        assert!(frame.contains("1 shell · tmp"), "an inactive tab's pane row:\n{frame}");
+        assert!(frame.contains("idle") || frame.contains("your turn"), "a state word:\n{frame}");
+        assert!(frame.contains(theme::PICKER_SELECTED), "the cursor marker:\n{frame}");
+        assert!(frame.contains("ROSTER"), "the C9 mode word:\n{frame}");
+
+        // Type-ahead: the title carries the query, and a group with no
+        // surviving pane loses its header too.
+        for c in "3".chars() {
+            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                crossterm::event::KeyCode::Char(c),
+            ));
+        }
+        let frame = drawn(&mut app);
+        assert!(frame.contains(&format!("fleet — 3{}", theme::RENAME_CURSOR)), "query:\n{frame}");
+        assert!(frame.contains("2 TAB2 · 1 PANE"), "pane 3 lives in tab 2:\n{frame}");
+        assert!(!frame.contains("1 MAIN · 2 PANES"), "tab 1 filtered away whole:\n{frame}");
+    }
+
+    /// C27 borrows C6's header idiom: the group row is underlined edge to
+    /// edge (text *and* the fill after it), so it reads as a rule rather than
+    /// as another pane.
+    #[test]
+    fn roster_group_headers_are_underlined_across_the_whole_row() {
+        let row = RosterRow::Group { label: " 1 MAIN · 2 PANES".to_string() };
+        let mut app = mk_app(ratatui::layout::Size::new(100, 30));
+        app.apply(crate::ui::input::Action::ToggleRoster);
+        let spans = super::roster_row_spans(&app, &row, 40, 1, theme::accent());
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(mouse::display_width(&text), 40, "the label is padded to the row width");
+        for s in &spans {
+            assert!(
+                s.style.add_modifier.contains(Modifier::UNDERLINED),
+                "every cell of the header carries the rule: {s:?}"
+            );
+        }
+    }
+
+    /// C27's two marks mean two different things: `❯` is the cursor (what
+    /// Enter acts on), `▎` is the focused pane (where you are). A row that is
+    /// both carries both, and the pane row behind the cursor column is C8's
+    /// own `collapsed_row_spans` output verbatim.
+    #[test]
+    fn roster_pane_rows_carry_the_cursor_and_focus_marks_separately() {
+        let mut app = mk_app(ratatui::layout::Size::new(100, 30));
+        app.apply(crate::ui::input::Action::NewPane);
+        app.apply(crate::ui::input::Action::ToggleRoster);
+        let focused = app.focused;
+        let other = app.pane_order().into_iter().find(|id| *id != focused).expect("two panes");
+
+        let render = |app: &App<crate::ports::fakes::FakePane>, id, cursor| -> String {
+            super::roster_row_spans(app, &RosterRow::Pane { id }, 50, cursor, theme::accent())
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        let cursor_on_focused = render(&app, focused, focused);
+        assert!(cursor_on_focused.starts_with(theme::PICKER_SELECTED), "{cursor_on_focused:?}");
+        assert!(cursor_on_focused.contains(theme::MARKER_ACTIVE), "{cursor_on_focused:?}");
+
+        let neither = render(&app, other, focused);
+        assert!(!neither.starts_with(theme::PICKER_SELECTED), "{neither:?}");
+        assert!(!neither.contains(theme::MARKER_ACTIVE), "{neither:?}");
+        // The row's body is C8's, one column narrower than the roster row.
+        let c8: String = collapsed_row_spans(
+            49,
+            false,
+            AgentStatus::Idle,
+            other,
+            &app.display_name(other),
+            "shell",
+            false,
+            false,
+            theme::quiet(),
+        )
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+        assert_eq!(neither, format!(" {c8}"));
     }
 
     #[test]

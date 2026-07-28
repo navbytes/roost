@@ -76,6 +76,15 @@ pub enum Mode {
     /// C20 activity-feed overlay; `offset` counts entries back from the
     /// newest (0 = live tail).
     Feed { offset: usize },
+    /// C27: the fleet roster — every pane in the workspace, grouped by tab.
+    ///
+    /// The cursor is a **`PaneId`, not a row index**: the roster is a live
+    /// monitoring surface (panes spawn and exit while it is open), and an
+    /// index would silently re-point at a different pane the moment the list
+    /// under it changed. `filter` is the type-ahead query (empty = every
+    /// pane); `top` is the first visible row of the scrolled window, the one
+    /// piece of view state the renderer and the mouse hit-test share.
+    Roster { cursor: PaneId, filter: String, top: usize },
     /// P21: the incremental scrollback-search prompt, opened with `/` from
     /// Scroll or Copy mode. The search itself lives on `App::search` (it
     /// outlives the prompt — `n`/`N` keep working after Enter); this only
@@ -1905,7 +1914,11 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         if self.modal_active() {
-            return; // Picker / Help / Feed: nothing to type into
+            // Picker / Help / Feed / Roster: nothing to type into. The
+            // roster's type-ahead is deliberately keystroke-only — a pasted
+            // blob is not a filter anybody meant to type, and it must never
+            // reach the pane hidden underneath (U8).
+            return;
         }
         self.forward_paste(text);
     }
@@ -2144,15 +2157,21 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    /// U8: is a modal overlay up? These four modes own the whole
+    /// U8: is a modal overlay up? These five modes own the whole
     /// non-keyboard input surface — mouse and paste alike — while they are
     /// active. Scroll/Copy are deliberately excluded: they draw no dialog,
     /// nothing is hidden underneath them, and their mouse behavior (wheel
     /// scrolls, drag selects) is the point.
+    /// [Amended, C27] the roster is the fifth: it is a C12 modal, so U8's
+    /// rules cover it unchanged.
     pub fn modal_active(&self) -> bool {
         matches!(
             self.mode,
-            Mode::Rename { .. } | Mode::Picker { .. } | Mode::Help | Mode::Feed { .. }
+            Mode::Rename { .. }
+                | Mode::Picker { .. }
+                | Mode::Help
+                | Mode::Feed { .. }
+                | Mode::Roster { .. }
         )
     }
 
@@ -2181,6 +2200,17 @@ impl<B: PaneBackend> App<B> {
             match me.kind {
                 MouseEventKind::ScrollUp => *offset = (*offset + page).min(cap),
                 MouseEventKind::ScrollDown => *offset = offset.saturating_sub(page),
+                _ => {}
+            }
+        }
+        // C27: the roster's wheel moves its CURSOR, not a detached view —
+        // Enter acts on the cursor, so a wheel that scrolled the list out
+        // from under it would leave the overlay pointing at a row nobody can
+        // see. One row per notch, the arrow keys' own step.
+        if matches!(self.mode, Mode::Roster { .. }) {
+            match me.kind {
+                MouseEventKind::ScrollUp => self.roster_move(-1),
+                MouseEventKind::ScrollDown => self.roster_move(1),
                 _ => {}
             }
         }
@@ -2215,6 +2245,27 @@ impl<B: PaneBackend> App<B> {
         }
         if matches!(self.mode, Mode::Help) {
             self.mode = Mode::Normal;
+            return;
+        }
+        // C27: a click on a pane row goes to that pane (one press — the
+        // roster is a navigator, and "select, then confirm" would be a second
+        // click for nothing, the same call C14's picker made); a click on a
+        // group header does nothing, because a header is a label; a click
+        // outside dismisses, like the feed.
+        if matches!(self.mode, Mode::Roster { .. }) {
+            let (rows, top) = self.roster_view();
+            let visible = rows.len().saturating_sub(top).min(self.roster_view_rows());
+            match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, visible, me.column, me.row))
+            {
+                Some(i) => {
+                    if let Some(RosterRow::Pane { id }) = rows.get(top + i) {
+                        let id = *id;
+                        self.roster_jump(id);
+                    }
+                }
+                None if !inside => self.mode = Mode::Normal,
+                None => {}
+            }
             return;
         }
         if matches!(self.mode, Mode::Feed { .. }) && !inside {
@@ -2526,6 +2577,7 @@ impl<B: PaneBackend> App<B> {
             Action::Undo => self.undo_close(),
             Action::Help => self.mode = Mode::Help,
             Action::JumpAttention => self.jump_attention(),
+            Action::ToggleRoster => self.toggle_roster(),
             Action::ToggleZoom => {
                 // C21: zooming the float makes no sense (it's already a
                 // floating full-focus surface) — refuse rather than hide it
@@ -2954,6 +3006,25 @@ impl<B: PaneBackend> App<B> {
         ring
     }
 
+    /// C19: the ring member `Alt+a` would move to from where focus is now —
+    /// the first one strictly after the focused pane, wrapping past the end
+    /// back to `R[0]`; a focused pane that isn't in the ring gets `R[0]`
+    /// itself. `None` only when nothing needs attention.
+    ///
+    /// Split out of `jump_attention` for C27: the roster's opening cursor is
+    /// *defined* as "the pane Alt+a would pick", so both must read one
+    /// function or the two chords would eventually disagree about it.
+    fn attention_next(&self) -> Option<PaneId> {
+        let ring = self.attention_ring();
+        if ring.is_empty() {
+            return None;
+        }
+        Some(match ring.iter().position(|&id| id == self.focused) {
+            Some(k) => ring[(k + 1) % ring.len()],
+            None => ring[0],
+        })
+    }
+
     /// Alt+a: cycle-focus to the next ring member after the focused pane,
     /// wrapping past the end back to the first; a focused pane that isn't in
     /// the ring jumps straight to the first member.
@@ -2965,14 +3036,9 @@ impl<B: PaneBackend> App<B> {
             self.hide_float();
             return;
         }
-        let ring = self.attention_ring();
-        if ring.is_empty() {
+        let Some(next) = self.attention_next() else {
             self.set_flash("nothing needs you");
             return;
-        }
-        let next = match ring.iter().position(|&id| id == self.focused) {
-            Some(k) => ring[(k + 1) % ring.len()],
-            None => ring[0],
         };
         if next == self.focused {
             // The only ring member is the pane we're already on.
@@ -3045,6 +3111,198 @@ impl<B: PaneBackend> App<B> {
     /// (`handle_mode_key`) and, since U8, one wheel notch over the overlay.
     fn feed_page(&self) -> usize {
         (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize
+    }
+
+    // ---- C27: the fleet roster ------------------------------------------
+
+    /// C27: open the roster on the pane `Alt+a` would jump to, or close it if
+    /// it is already up (U18's rule: a mode's entry chord exits it — the
+    /// generic path in `handle_mode_key` handles the close, this stays
+    /// honest either way).
+    ///
+    /// The opening cursor is load-bearing: landing it on `attention_next`
+    /// makes `Alt+Shift+a` `Enter` *exactly* `Alt+a`, so the roster is a
+    /// superset of the chord users already know rather than a competing
+    /// command. With nothing needing attention it lands on the focused pane
+    /// — the roster then opens where you already are.
+    fn toggle_roster(&mut self) {
+        if matches!(self.mode, Mode::Roster { .. }) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        let cursor = self.attention_next().unwrap_or(self.focused);
+        self.mode = Mode::Roster { cursor, filter: String::new(), top: 0 };
+        self.roster_reveal();
+    }
+
+    /// C27: every row the roster shows right now — each tab's header
+    /// followed by that tab's panes in `pane_order()`, tabs in order, the
+    /// float last when shown. Exactly C19's ring enumeration, so the roster
+    /// and `Alt+a` can never disagree about what order the fleet is in.
+    ///
+    /// The type-ahead filter applies to panes only; a group whose panes all
+    /// filter out drops its header too (an empty group is a row that says
+    /// nothing).
+    pub fn roster_rows(&self) -> Vec<RosterRow> {
+        let filter = match &self.mode {
+            Mode::Roster { filter, .. } => filter.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let mut rows = Vec::new();
+        for (i, tab) in self.ws.tabs.iter().enumerate() {
+            let mut order = Vec::new();
+            layout::pane_order(&tab.layout, &mut order);
+            let panes: Vec<PaneId> =
+                order.into_iter().filter(|&id| self.roster_matches(id, &filter)).collect();
+            if panes.is_empty() {
+                continue;
+            }
+            rows.push(RosterRow::Group { label: roster_group_label(i, &tab.name, panes.len()) });
+            rows.extend(panes.into_iter().map(|id| RosterRow::Pane { id }));
+        }
+        if let Some(f) = &self.float {
+            if f.shown && self.roster_matches(f.id, &filter) {
+                rows.push(RosterRow::Group { label: roster_float_label() });
+                rows.push(RosterRow::Pane { id: f.id });
+            }
+        }
+        rows
+    }
+
+    /// C27: does pane `id` match the (already lowercased) type-ahead query?
+    /// Matched against the three things a row shows — the pane id, its
+    /// display name and its adapter — as an ASCII-case-insensitive
+    /// substring, the same matching rule U20 gave the picker. An empty query
+    /// matches everything, so the un-filtered roster is the zero-keystroke
+    /// case of this one.
+    fn roster_matches(&self, id: PaneId, filter: &str) -> bool {
+        if filter.is_empty() {
+            return true;
+        }
+        let adapter = self.find_spec(id).map(|s| s.adapter.clone()).unwrap_or_default();
+        let hay = format!("{id} {} {adapter}", self.display_name(id)).to_ascii_lowercase();
+        hay.contains(filter)
+    }
+
+    /// C27: the roster overlay's visible row window — `top` clamped against
+    /// the rows there actually are and the height there actually is. The one
+    /// computation the renderer and the mouse hit-test share, so a click can
+    /// never land on a different row than the one under the pointer
+    /// (§4/§5 lockstep).
+    pub fn roster_view(&self) -> (Vec<RosterRow>, usize) {
+        let rows = self.roster_rows();
+        let top = match &self.mode {
+            Mode::Roster { top, .. } => *top,
+            _ => 0,
+        };
+        let top = roster_top_clamped(top, rows.len(), self.roster_view_rows());
+        (rows, top)
+    }
+
+    /// How many rows the overlay can show at once (its inner height).
+    fn roster_view_rows(&self) -> usize {
+        roster_overlay_size(self.body_area()).1.saturating_sub(2) as usize
+    }
+
+    /// C27: the roster's paging step — half the overlay's height, at least
+    /// one row. Same rule (and same reason) as C20's `feed_page`: one source
+    /// for PgUp/PgDn so the keys can't drift from each other.
+    fn roster_page(&self) -> usize {
+        (roster_overlay_size(self.body_area()).1 / 2).max(1) as usize
+    }
+
+    /// The cursor's index among the rows currently shown, if it is still one
+    /// of them (a pane can exit, close, or be filtered away underneath it).
+    fn roster_cursor_index(&self, rows: &[RosterRow]) -> Option<usize> {
+        let Mode::Roster { cursor, .. } = &self.mode else { return None };
+        rows.iter().position(|r| matches!(r, RosterRow::Pane { id } if id == cursor))
+    }
+
+    /// Move the cursor `delta` pane rows (negative = up), skipping group
+    /// headers — they are labels, not destinations. Clamped at both ends
+    /// rather than wrapping: the roster is a map of the fleet, and a cursor
+    /// that teleported from the last pane to the first on an overshoot would
+    /// make a held key a hazard (same rule C13's caret follows).
+    fn roster_move(&mut self, delta: isize) {
+        let rows = self.roster_rows();
+        let panes: Vec<PaneId> = rows
+            .iter()
+            .filter_map(|r| match r {
+                RosterRow::Pane { id } => Some(*id),
+                RosterRow::Group { .. } => None,
+            })
+            .collect();
+        if panes.is_empty() {
+            return;
+        }
+        let Mode::Roster { cursor, .. } = &self.mode else { return };
+        let at = panes.iter().position(|id| id == cursor).unwrap_or(0) as isize;
+        let next = (at + delta).clamp(0, panes.len() as isize - 1) as usize;
+        let id = panes[next];
+        if let Mode::Roster { cursor, .. } = &mut self.mode {
+            *cursor = id;
+        }
+        self.roster_reveal();
+    }
+
+    /// Scroll the window the least it can to keep the cursor on screen (and
+    /// clamp it against a list that shrank while the roster was open).
+    fn roster_reveal(&mut self) {
+        let rows = self.roster_rows();
+        let height = self.roster_view_rows();
+        let len = rows.len();
+        let at = self.roster_cursor_index(&rows);
+        // Scrolling up onto the first pane of a group takes that group's
+        // header with it: a row whose tab you cannot see is a pane you cannot
+        // place, and the header costs one row exactly when there is one to
+        // spare (the cursor is at the top of the window either way).
+        let reveal = match at {
+            Some(at) if at > 0 && matches!(rows[at - 1], RosterRow::Group { .. }) => Some(at - 1),
+            other => other,
+        };
+        if let Mode::Roster { top, .. } = &mut self.mode {
+            let mut t = roster_top_clamped(*top, len, height);
+            if let (Some(at), Some(reveal)) = (at, reveal) {
+                if reveal < t {
+                    t = reveal;
+                } else if height > 0 && at >= t + height {
+                    t = at + 1 - height;
+                }
+            }
+            *top = t;
+        }
+    }
+
+    /// Put the cursor back on a real row after the filter changed under it —
+    /// the first pane still shown. A filter that narrowed the list to
+    /// nothing leaves the cursor alone (there is nothing to point at, and
+    /// widening the query brings it back).
+    fn roster_clamp_cursor(&mut self) {
+        let rows = self.roster_rows();
+        if self.roster_cursor_index(&rows).is_none() {
+            let first = rows.iter().find_map(|r| match r {
+                RosterRow::Pane { id } => Some(*id),
+                RosterRow::Group { .. } => None,
+            });
+            if let (Some(id), Mode::Roster { cursor, .. }) = (first, &mut self.mode) {
+                *cursor = id;
+            }
+        }
+        self.roster_reveal();
+    }
+
+    /// C27's only action: go to a pane. Through `focus_attention_target` —
+    /// the helper C19's ring and C20's Enter already share — so a roster jump
+    /// switches tabs, expands collapsed stacks and shows the float exactly
+    /// like every other jump in roost. Ids are recycled, so a pane that
+    /// closed while the roster was open flashes instead of moving focus.
+    fn roster_jump(&mut self, id: PaneId) {
+        if self.find_spec(id).is_none() {
+            self.set_flash("that pane is gone");
+            return;
+        }
+        self.mode = Mode::Normal;
+        self.focus_attention_target(id);
     }
 
     /// C14: launch the picker's item `index` — leave the modal, then spawn
@@ -3683,6 +3941,50 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
+            // C27: the fleet roster. A list you filter by typing cannot
+            // reserve letters (U20's finding, paid for by the picker), so the
+            // motions here are the arrows and the paging keys; every
+            // printable — `j`, `k` and `q` included — is filter text, and
+            // `Esc` (with Alt+Shift+a) is the way out.
+            Mode::Roster { .. } => {
+                let page = self.roster_page() as isize;
+                match key.code {
+                    KeyCode::Up => self.roster_move(-1),
+                    KeyCode::Down => self.roster_move(1),
+                    KeyCode::PageUp => self.roster_move(-page),
+                    KeyCode::PageDown => self.roster_move(page),
+                    KeyCode::Enter => {
+                        if let Mode::Roster { cursor, .. } = &self.mode {
+                            let target = *cursor;
+                            self.roster_jump(target);
+                        }
+                    }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    // Shift is how an uppercase letter arrives under the
+                    // kitty encoding, so it is the one modifier a filter
+                    // keystroke may carry — same rule the rename field (U16)
+                    // and the search prompt (P21) follow.
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        if let Mode::Roster { filter, .. } = &mut self.mode {
+                            filter.push(c);
+                        }
+                        self.roster_clamp_cursor();
+                    }
+                    KeyCode::Backspace => {
+                        if let Mode::Roster { filter, .. } = &mut self.mode {
+                            filter.pop();
+                        }
+                        self.roster_clamp_cursor();
+                    }
+                    _ => {}
+                }
+                true
+            }
             // P21: the incremental search prompt. Every printable key is
             // query text — including `n`, `N` and `/`, which only mean
             // "step" once the prompt is closed; a prompt that stole letters
@@ -3919,6 +4221,7 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
         Mode::Copy { .. } => Some(Action::CopyMode),
         Mode::Help => Some(Action::Help),
         Mode::Feed { .. } => Some(Action::ToggleFeed),
+        Mode::Roster { .. } => Some(Action::ToggleRoster),
         // P21: the search prompt is entered with `/`, not an Alt chord, so
         // there is no chord for it to toggle off. Alt+PgUp while searching
         // therefore falls through to the global binding, exactly as it
@@ -4110,6 +4413,53 @@ pub fn feed_overlay_size(body: Rect) -> (u16, u16) {
     let w = body.width.saturating_sub(4).min(72);
     let h = body.height.saturating_sub(4).min(16);
     (w, h)
+}
+
+/// C27: the roster overlay's `(width, height)` — deliberately C20's formula,
+/// not a second one. The two overlays answer the fleet's two questions
+/// ("what happened" / "what is") and a user toggling between them should not
+/// watch the frame resize; sharing one function also means the 80×24 floor
+/// is proven once.
+pub fn roster_overlay_size(body: Rect) -> (u16, u16) {
+    feed_overlay_size(body)
+}
+
+/// C27: one row of the fleet roster — a tab's group header, or a pane.
+/// Headers are labels, never destinations: the cursor skips them, and a
+/// click on one does nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosterRow {
+    Group { label: String },
+    Pane { id: PaneId },
+}
+
+/// C27: a tab group's header text, in C6's uppercase-label idiom
+/// (`" STACK · 3 PANES"`) — the tab's own bar label, then how many of its
+/// panes the roster is showing.
+fn roster_group_label(index: usize, name: &str, panes: usize) -> String {
+    format!(" {} {} · {}", index + 1, name.to_uppercase(), roster_pane_count(panes))
+}
+
+/// C22's float is not a tab, so it gets its own group rather than being
+/// smuggled into the last one.
+fn roster_float_label() -> String {
+    format!(" FLOAT · {}", roster_pane_count(1))
+}
+
+fn roster_pane_count(n: usize) -> String {
+    if n == 1 {
+        "1 PANE".to_string()
+    } else {
+        format!("{n} PANES")
+    }
+}
+
+/// C27: the roster window's first visible row — `top` clamped so the window
+/// never runs off the end of a list that shrank while the overlay was open.
+/// Pure so the renderer, the mouse hit-test and the cursor-reveal all clamp
+/// identically.
+pub fn roster_top_clamped(top: usize, len: usize, height: usize) -> usize {
+    top.min(len.saturating_sub(height))
 }
 
 /// C25: the arrangement at cycle index `idx` (0=grid, 1=main+stack,
@@ -7102,6 +7452,301 @@ mod tests {
         let expected = vec![tab0_order[0], tab0_order[2], tab1_order[0], tab1_order[1]];
         assert_eq!(app.attention_ring(), expected);
         assert_eq!(app.needs_input_count(), expected.len());
+    }
+
+    // -- C27 fleet roster -----------------------------------------------------
+
+    /// A two-tab fixture with a needy pane parked in the *second* tab — the
+    /// case the roster exists for (a pane you cannot see from where you are).
+    /// Returns (app, tab0 order, tab1 order).
+    fn roster_fixture() -> (App<FakePane>, Vec<PaneId>, Vec<PaneId>) {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab0: two panes
+        let tab0 = app.pane_order();
+        app.apply(Action::NewTab);
+        app.apply(Action::NewPane); // tab1: two panes
+        let tab1 = app.pane_order();
+        app.go_to_tab(0);
+        (app, tab0, tab1)
+    }
+
+    fn roster_panes<B: PaneBackend>(app: &App<B>) -> Vec<PaneId> {
+        app.roster_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                RosterRow::Pane { id } => Some(id),
+                RosterRow::Group { .. } => None,
+            })
+            .collect()
+    }
+
+    fn roster_cursor<B: PaneBackend>(app: &App<B>) -> PaneId {
+        match &app.mode {
+            Mode::Roster { cursor, .. } => *cursor,
+            _ => panic!("the roster is not open"),
+        }
+    }
+
+    /// C27: the roster lists **every** pane in the workspace grouped by tab,
+    /// in exactly C19's ring enumeration — tabs ascending, `pane_order()`
+    /// within each, one header ahead of each group.
+    #[test]
+    fn roster_rows_group_every_pane_by_tab_in_ring_order() {
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.apply(Action::ToggleRoster);
+        let rows = app.roster_rows();
+        assert!(matches!(&rows[0], RosterRow::Group { label } if label.contains("MAIN")));
+        assert_eq!(rows[1], RosterRow::Pane { id: tab0[0] });
+        assert_eq!(rows[2], RosterRow::Pane { id: tab0[1] });
+        assert!(matches!(&rows[3], RosterRow::Group { label } if label.contains("TAB2")));
+        assert_eq!(rows[4], RosterRow::Pane { id: tab1[0] });
+        assert_eq!(rows[5], RosterRow::Pane { id: tab1[1] });
+        assert_eq!(rows.len(), 6);
+        // The pane sequence is the ring's own order, with nothing dropped:
+        // make every pane needy and the two lists must coincide.
+        for id in tab0.iter().chain(tab1.iter()) {
+            app.runtimes.get_mut(id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        }
+        assert_eq!(roster_panes(&app), app.attention_ring());
+    }
+
+    /// C22's float is not a tab, so it rides last under its own header —
+    /// same placement it has in the C19 ring.
+    #[test]
+    fn roster_lists_the_float_last_under_its_own_group() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleRoster);
+        let rows = app.roster_rows();
+        assert_eq!(rows.last(), Some(&RosterRow::Pane { id: float_id }));
+        assert!(matches!(&rows[rows.len() - 2], RosterRow::Group { label } if label.contains("FLOAT")));
+    }
+
+    /// The load-bearing one: the opening cursor is the pane `Alt+a` would
+    /// pick, so `Alt+Shift+a` `Enter` is exactly `Alt+a`. Pinned against
+    /// `attention_ring` itself rather than a hand-written id.
+    #[test]
+    fn roster_opens_on_the_pane_alt_a_would_jump_to() {
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.runtimes.get_mut(&tab1[1]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&tab0[1]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.focused = tab0[1]; // sitting ON a ring member: Alt+a goes to the next
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_cursor(&app), tab1[1]);
+        assert_eq!(roster_cursor(&app), app.attention_ring()[1]);
+    }
+
+    /// ...and with nothing needing attention it opens where you already are.
+    #[test]
+    fn roster_opens_on_the_focused_pane_when_nothing_needs_attention() {
+        let (mut app, tab0, _) = roster_fixture();
+        app.focused = tab0[1];
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_cursor(&app), tab0[1]);
+    }
+
+    /// C27: `Alt+Shift+a` `Enter` and `Alt+a` land on the same pane, from the
+    /// same starting state — the equivalence the opening cursor exists for.
+    #[test]
+    fn roster_enter_lands_exactly_where_alt_a_would_have() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let needy = |app: &mut App<FakePane>, ids: &[PaneId]| {
+            for id in ids {
+                app.runtimes.get_mut(id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+            }
+        };
+
+        let (mut jump, tab0, tab1) = roster_fixture();
+        needy(&mut jump, &[tab0[1], tab1[0]]);
+        jump.apply(Action::JumpAttention);
+
+        let (mut roster, ..) = roster_fixture();
+        needy(&mut roster, &[tab0[1], tab1[0]]);
+        roster.apply(Action::ToggleRoster);
+        roster.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(roster.focused, jump.focused);
+        assert_eq!(roster.ws.active_tab, jump.ws.active_tab);
+        assert!(matches!(roster.mode, Mode::Normal), "the jump closes the roster behind it");
+    }
+
+    /// C27: Enter goes through `focus_attention_target`, so a jump into
+    /// another tab switches tabs exactly like `Alt+a` and the feed do.
+    #[test]
+    fn roster_enter_jumps_across_tabs_through_the_shared_helper() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _, tab1) = roster_fixture();
+        assert_eq!(app.ws.active_tab, 0);
+        app.apply(Action::ToggleRoster);
+        // Walk the cursor onto the second tab's last pane: 3 pane rows down
+        // from tab0's first pane, headers skipped by construction.
+        app.focused = app.pane_order()[0];
+        if let Mode::Roster { cursor, .. } = &mut app.mode {
+            *cursor = app.ws.tabs[0].panes.keys().copied().min().unwrap();
+        }
+        for _ in 0..3 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        }
+        assert_eq!(roster_cursor(&app), tab1[1]);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.focused, tab1[1]);
+        assert_eq!(app.ws.active_tab, 1, "the jump switched tabs");
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    /// C27: `↑`/`↓` move by *pane*, never landing on a group header, and
+    /// clamp at both ends instead of wrapping.
+    #[test]
+    fn roster_cursor_skips_group_headers_and_clamps_at_both_ends() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.focused = tab0[0];
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_cursor(&app), tab0[0]);
+
+        let mut seen = vec![roster_cursor(&app)];
+        for _ in 0..5 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+            seen.push(roster_cursor(&app));
+        }
+        // Four panes, walked in order, then clamped on the last one — never a
+        // header (a header is not a `PaneId` at all) and never wrapped.
+        assert_eq!(seen, vec![tab0[0], tab0[1], tab1[0], tab1[1], tab1[1], tab1[1]]);
+
+        for _ in 0..9 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Up));
+        }
+        assert_eq!(roster_cursor(&app), tab0[0], "clamps at the top too");
+    }
+
+    /// C27: type-ahead, U20's idiom — printables filter on id / name /
+    /// adapter, Backspace widens, and a group whose panes all filter out
+    /// takes its header with it.
+    #[test]
+    fn roster_type_ahead_filters_on_id_name_and_adapter() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.find_spec_mut(tab1[0]).unwrap().title = Some("backend".into());
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_panes(&app).len(), 4);
+
+        for c in "backend".chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(roster_panes(&app), vec![tab1[0]], "filtered to the renamed pane");
+        assert_eq!(app.roster_rows().len(), 2, "only its own group's header survives");
+        assert_eq!(roster_cursor(&app), tab1[0], "the cursor follows the filter");
+
+        for _ in 0..7 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        assert_eq!(roster_panes(&app).len(), 4, "Backspace widens it back");
+
+        // The id is matchable on its own — it is the `roost send <id>` key.
+        for c in tab0[1].to_string().chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert!(roster_panes(&app).contains(&tab0[1]));
+        // ...and so is the adapter every pane in the fixture shares.
+        for _ in 0..4 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        for c in "shell".chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(roster_panes(&app).len(), 4);
+    }
+
+    /// U18: a mode's entry chord exits it — `Alt+Shift+a` closes the roster,
+    /// leaving exactly what `Esc` leaves.
+    #[test]
+    fn roster_entry_chord_and_esc_both_close_it() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let chord =
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+
+        let (mut app, ..) = roster_fixture();
+        app.apply(Action::ToggleRoster);
+        assert!(app.handle_mode_key(chord), "the toggle is consumed, never re-dispatched");
+        assert!(matches!(app.mode, Mode::Normal));
+
+        let (mut app, ..) = roster_fixture();
+        app.apply(Action::ToggleRoster);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    /// C27: the roster is a C12 modal, so U8's rules cover it — and Enter on
+    /// a pane that closed while it was open flashes instead of moving focus.
+    #[test]
+    fn roster_is_a_modal_and_a_stale_cursor_flashes_instead_of_jumping() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, tab0, _) = roster_fixture();
+        app.apply(Action::ToggleRoster);
+        assert!(app.modal_active(), "the roster owns the mouse and paste surface (U8)");
+        if let Mode::Roster { cursor, .. } = &mut app.mode {
+            *cursor = 999; // an id no pane has
+        }
+        let focused = app.focused;
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.focused, focused, "no focus move");
+        assert!(matches!(app.mode, Mode::Roster { .. }), "and the roster stays up");
+        assert_eq!(app.flash(), Some("that pane is gone"));
+        assert!(tab0.contains(&focused));
+    }
+
+    /// C27 "live": the list reflects the workspace while it is open. Close a
+    /// pane under the roster and its row goes with it.
+    #[test]
+    fn roster_rows_follow_the_workspace_while_it_is_open() {
+        let (mut app, tab0, _) = roster_fixture();
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_panes(&app).len(), 4);
+        app.close_pane_id(tab0[1]);
+        let panes = roster_panes(&app);
+        assert_eq!(panes.len(), 3);
+        assert!(!panes.contains(&tab0[1]));
+    }
+
+    /// C27: the window scrolls to keep the cursor visible, and clamps rather
+    /// than running off the end of a list that shrank underneath it.
+    #[test]
+    fn roster_window_follows_the_cursor_and_clamps() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..7 {
+            app.apply(Action::NewPane);
+        }
+        // A short terminal: the overlay shows fewer rows than the fleet has.
+        app.on_resize(Size::new(100, 12), (0, 0));
+        app.apply(Action::ToggleRoster);
+        let height = app.roster_view_rows();
+        let visible = |app: &App<FakePane>| {
+            let (rows, top) = app.roster_view();
+            let at = rows
+                .iter()
+                .position(|r| matches!(r, RosterRow::Pane { id } if *id == roster_cursor(app)))
+                .expect("the cursor is on a row");
+            assert!(at >= top && at < top + height, "the cursor is inside the window");
+            assert!(top + height <= rows.len(), "and the window never runs past the end");
+            top
+        };
+        let (rows, _) = app.roster_view();
+        assert!(rows.len() > height, "fixture must overflow the window");
+        // It opens scrolled to wherever the cursor landed — here the focused
+        // pane, which is the last one spawned, i.e. off the first screenful.
+        let opened_at = visible(&app);
+        assert!(opened_at > 0, "the window scrolled to reveal the opening cursor");
+
+        for _ in 0..8 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Up));
+        }
+        assert_eq!(visible(&app), 0, "walking back up scrolls the window home");
+        for _ in 0..8 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        }
+        visible(&app);
     }
 
     // -- C21 zoom -------------------------------------------------------------
