@@ -309,14 +309,44 @@ pub fn descendant_pids(pid: u32) -> Vec<u32> {
     all
 }
 
-/// Whether `pid` still names a live process (`kill -0`). Uses `output()`
-/// rather than `status()` so a "No such process" (the expected, common case)
-/// doesn't spam the test's own stderr.
+/// Whether `pid` still names a **running** process.
+///
+/// `kill -0` alone is not that question: it succeeds for a zombie, which is
+/// a process that has already died and is only waiting for its parent to
+/// collect the exit status. A zombie holds no PTY, no memory and no CPU —
+/// calling one a survivor makes the orphan gates fail on any host whose PID 1
+/// reaps lazily, regardless of what roost did. (Measured here: PID 1 is a
+/// container shim, and a killed grandchild sat in state `Z` well past the
+/// gate's 800ms grace.) So the state is checked too, and only a genuinely
+/// live process counts.
+///
+/// `output()` rather than `status()` so a "No such process" — the expected,
+/// common case — doesn't spam the test's own stderr.
 pub fn is_alive(pid: u32) -> bool {
-    Command::new("kill")
+    let exists = Command::new("kill")
         .args(["-0", &pid.to_string()])
         .output()
         .map(|o| o.status.success())
+        .unwrap_or(false);
+    exists && !is_zombie(pid)
+}
+
+/// Is `pid` a corpse awaiting reaping? Linux answers from `/proc` (state is
+/// the field right after the last `)`, since the executable name in field 2
+/// can contain spaces and parens); elsewhere, from `ps`. An unreadable
+/// answer means "not a zombie", which keeps `is_alive` conservative — a gate
+/// should fail loudly on a real survivor rather than quietly excuse one.
+fn is_zombie(pid: u32) -> bool {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state == "Z");
+    }
+    Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with('Z'))
         .unwrap_or(false)
 }
 

@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthStr;
 
-use crate::core::layout::PaneRect;
+use crate::core::layout::{PaneId, PaneRect};
 use crate::ports::MouseProto;
 use crate::ui::{input, theme};
 
@@ -51,6 +51,62 @@ pub fn hit_test(rects: &[PaneRect], col: u16, row: u16) -> Option<PaneRect> {
                 && row < pr.rect.y + pr.rect.height
         })
         .copied()
+}
+
+/// U21: the seam between two adjacent panes — the thing a drag resizes.
+///
+/// `a` is the pane on the low side of the split (left, or above) and `b` the
+/// one on the high side, which is what lets the drag handler say "the border
+/// is at `a`'s far edge" without re-deriving the orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seam {
+    pub a: PaneId,
+    pub b: PaneId,
+    /// A *vertical* split: the panes sit side by side and the seam is dragged
+    /// horizontally. `false` = stacked, dragged vertically.
+    pub vertical: bool,
+}
+
+/// U21: is (col, row) on the border between two panes?
+///
+/// Every pane draws its own border (C3), so two neighbours are separated by a
+/// **two-cell seam** — `a`'s far edge and `b`'s near edge, which are adjacent
+/// columns/rows. Both count: a user aiming at "the line between the panes"
+/// cannot be expected to distinguish them, and one-cell targets are unkind
+/// with a mouse.
+///
+/// Collapsed stack members are excluded. Their "borders" are the stack's own
+/// internal rows (C6/C8 draw them as single bars, not framed panes), and a
+/// stack's proportions are not a split ratio anything could resize.
+pub fn seam_at(rects: &[PaneRect], col: u16, row: u16) -> Option<Seam> {
+    let live: Vec<&PaneRect> = rects.iter().filter(|p| !p.collapsed).collect();
+    for a in &live {
+        for b in &live {
+            if a.id == b.id {
+                continue;
+            }
+            let (ar, br) = (a.rect, b.rect);
+            // Side by side: b starts exactly where a ends.
+            if br.x == ar.x + ar.width {
+                let lo = ar.y.max(br.y);
+                let hi = (ar.y + ar.height).min(br.y + br.height);
+                let on_seam = col + 1 == br.x || col == br.x;
+                if on_seam && row >= lo && row < hi {
+                    return Some(Seam { a: a.id, b: b.id, vertical: true });
+                }
+            }
+            // Stacked: b starts exactly where a ends.
+            if br.y == ar.y + ar.height {
+                let lo = ar.x.max(br.x);
+                let hi = (ar.x + ar.width).min(br.x + br.width);
+                let on_seam = row + 1 == br.y || row == br.y;
+                if on_seam && col >= lo && col < hi {
+                    return Some(Seam { a: a.id, b: b.id, vertical: false });
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The body of a tab's label: `N name` (no separator, no status glyph).

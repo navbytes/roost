@@ -493,6 +493,37 @@ sanctioned home of the theme-variant slot: a theme that renders ANSI 8 faint
 costs a hairline here and nothing else. Everything else in this contract —
 `BorderType::Plain`, no BOLD, no border title — is unchanged.
 
+**[Amended 2026-07-28, SPEC-ux U21 — a shared border is a handle.]** The
+border between two panes can be dragged to move that split. Nothing about
+how a border is *drawn* changes; this contracts what it *is*.
+
+- **The seam is two cells.** Every pane draws its own border, so neighbours
+  are separated by `a`'s far edge and `b`'s near edge — adjacent
+  columns/rows. Both are the handle. A user aiming at "the line between the
+  panes" cannot be expected to distinguish them, and a one-cell mouse target
+  is unkind. `mouse::seam_at` is the single hit-test, and it is only ever a
+  *shared* border: a pane's outer edge, against the body, focuses like any
+  other cell of that pane.
+- **The drag is a closed loop on the drawn geometry.** `layout::resize_pane`
+  works in ratios of a split whose extent the mouse layer cannot see — the
+  pair may be nested two splits deep — so an open-loop cell→ratio conversion
+  drifts and never recovers. Every event instead measures where the border
+  is *now* and asks for the change that would put it under the cursor, so an
+  imperfect estimate is corrected a cell later. Pinned by a test requiring
+  the border to land within one column of the pointer, which the open-loop
+  form fails.
+- **A seam drag does not move focus.** Grabbing a border is an act on the
+  layout, not a choice of which pane to type into.
+- **No seam while zoomed** (C21: one pane fills the body), and none on a
+  collapsed stack member — those rows are C6/C8's own chrome, not a split
+  ratio anything could move. The gesture latches at button-down like P20's
+  pane latch, and for the same reason: the pointer leaves the two-cell
+  border almost immediately.
+- **Middle-click-closes-a-tab is rejected**, not deferred — see U21's own
+  entry. It contradicts C26 (tabs die by last-pane close only) and the
+  "deliberately left out" list's *close-whole-tab gesture*; a tab can hold
+  several agents, and middle-click is the button that pastes on X11.
+
 ### C4 — Corner badge
 
 **Current:** `render.rs:376–383` — fg DarkGray, top-right, text = pane name

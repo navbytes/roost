@@ -89,6 +89,27 @@ impl StatusTracker {
         self.last_output.is_some_and(|t| t.elapsed() < ACTIVE_WINDOW)
     }
 
+    /// [U22] Is the status `current()` reports one an extension/hook actually
+    /// *reported*, or one roost inferred from PTY traffic?
+    ///
+    /// `current()` folds the two together on purpose — a badge should read
+    /// the same however roost learned it — but the destructive-close guard
+    /// cannot afford that: a hook saying "working" means a turn is in
+    /// flight, while `recent_output()` means bytes arrived, which is equally
+    /// true of `ls`. A decayed report counts as *not* reported: once the
+    /// hook has gone quiet past `STUCK_WORKING`, `current()` has stopped
+    /// believing it, and so does this.
+    pub fn reported(&self) -> bool {
+        let live = self.ext_at.is_some_and(|t| t.elapsed() <= STUCK_WORKING);
+        match self.extension_status {
+            Some(AgentStatus::Working | AgentStatus::NeedsInput) => live,
+            // A resting report that `current()` promoted to Working/NeedsInput
+            // was promoted by a heuristic (fresh output, or a bell), not by
+            // the report itself.
+            _ => false,
+        }
+    }
+
     /// A bell that arrived *after* the extension's last status report, and
     /// recently enough to still matter. This is the signal the extension can't
     /// give us: pi exposes no event for its built-in permission/approval prompt,

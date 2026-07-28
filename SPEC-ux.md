@@ -392,22 +392,90 @@ are new state, not a missing binding (C14 amended 2026-07-27).
   reconstructs itself from the precious state on every start. C14/C9/§8
   amended 2026-07-27.
 
-### U21 · Low · OPEN — mouse can't resize; tabs are click-to-switch only
+### U21 · Low · FIXED (resize) / REJECTED (middle-click close) — mouse can't resize; tabs are click-to-switch only
 No border drag-resize, no middle-click close, no drag-reorder.
 **Proposed contract:** drag a shared border to resize; middle-click closes a
 tab through the same confirm guard.
 
-### U22 · Low · OPEN (window mismatch FIXED, this branch) — busy-close confirm fires on heuristic Working; window mismatch
+**Fixed (resize):** a left press on the border *between two panes* drags that
+split; `mouse::seam_at` finds the seam and `App::drag_seam` moves it.
+
+Two details are load-bearing:
+- **The seam is two cells wide.** Every pane draws its own border (C3), so
+  neighbours are separated by `a`'s far edge and `b`'s near edge. Both count
+  — a user aiming at "the line between the panes" cannot be expected to
+  distinguish them, and one-cell mouse targets are unkind. A pane's *outer*
+  border, shared with nothing, is not a seam and still focuses.
+- **The drag is a closed loop on the drawn geometry**, not an accumulated
+  offset. `layout::resize_pane` works in ratios of a split whose extent the
+  mouse layer cannot see (the pair may be nested two splits deep), so any
+  open-loop cell→ratio conversion drifts: it under-moves on a nested split
+  and never catches up. Each event instead measures where the border *is*
+  and asks for the change that would put it under the cursor, so an
+  imperfect estimate is corrected a cell later. The test pins the border
+  landing within one column of the pointer, which an open-loop version
+  fails.
+
+A seam drag deliberately **does not move focus**: grabbing a border is an act
+on the layout, not a choice of which pane to type into. Zoom has no seam
+(C21: one pane fills the body), and collapsed stack members are excluded —
+their "borders" are C6/C8's own rows, not a split ratio.
+
+**Rejected (middle-click close), and recorded rather than quietly dropped:**
+this half contradicts a standing decision. **C26** contracts that *tabs die
+by last-pane close only*, and DESIGN-ui's "deliberately left out" list names
+"a close-whole-tab gesture" explicitly. The reasoning holds up: a tab can
+hold several agents, so closing one is the most destructive thing in the
+TUI short of `Alt+q` — and middle-click is the *worst* button to spend on
+it, being the one that pastes on X11 and is easy to hit by accident on a
+tilt-wheel. It would also be the only destructive verb in roost reachable
+without a confirm-able keystroke, which is the same fat-finger argument
+that keeps broadcast CLI-only (§7). Re-opening this means re-arguing C26,
+not just implementing a click.
+
+**Not done, not argued:** drag-to-reorder tabs. It is neither contradicted
+nor contracted; it is simply not built.
+
+### U22 · Low · FIXED (both halves) — busy-close confirm fires on heuristic Working; window mismatch
 Any PTY output in the last ~2 s counts as Working, so closing a shell right
 after your own `ls` double-prompts (the live QA script codes around this); the
 confirm stays armed 3 s but its flash dies at 2 s — a final second accepts the
 second press with no visible prompt.
 **Proposed contract:** confirm only on extension-confirmed Working (or exempt
 `shell`); flash window == confirm window for confirm flashes.
-**Fixed (window half only):** flashes now carry their own window — confirm
+**Fixed (window half):** flashes now carry their own window — confirm
 prompts live exactly `CONFIRM_WINDOW`, and a confirm that dies early (consumed
 second press, or disarmed by another action) takes its prompt down with it.
-The heuristic-Working half stays OPEN.
+
+**Fixed (heuristic half, 2026-07-28):** the close guard now asks
+`App::mid_turn` rather than `is_busy(status())`, and that predicate reads
+*how roost learned the status*. `PaneBackend::status_reported` splits the two
+sources the badge deliberately merges: an extension/hook saying "working"
+means a turn is in flight and always arms; `ACTIVE_WINDOW`'s two seconds of
+PTY bytes arms only for a **non-`shell`** adapter. Both halves of the
+proposed contract are in there and neither alone would have been right —
+"extension-confirmed only" would have dropped the guard for a pi/claude pane
+with no hook installed, which has a real turn to lose and for which output
+*is* the best available evidence; "exempt shell" alone would have ignored a
+hook that did report.
+
+*Recorded trade-off:* a shell running something long (`cargo build`) now
+closes on the first `Alt+w`. roost cannot tell that from `ls` — both are
+"recent output" — so the choice was between a guard that fires on every
+close and one that fires on none, and a guard that fires on ordinary use is
+one people learn to double-tap through. `Alt+u` reopens the pane.
+
+*Deliberately asymmetric:* the exemption stops at `Alt+w`. `Alt+q` still
+arms on any busy pane, shells included, because it kills the whole fleet
+with no undo, including panes you are not looking at — and U1's "sessions
+resume on relaunch" is an *agent* argument that a half-finished build does
+not get. One spurious keypress against the session's live work is not a
+close call.
+
+The QA drive used to code around this finding — a fallback second press
+labelled "heuristic Working from recent shell output". That workaround is
+now a check: `Alt+w` closes a shell on the first press *right after it
+printed*.
 
 ### U23 · Low · FIXED (this branch) — help overlay teaches chords, nothing else
 Live QA: the overlay contains no status-glyph legend (`●◆○·✕` — the product's

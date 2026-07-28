@@ -115,6 +115,17 @@ pub trait PaneBackend: Sized {
     fn kill(&mut self);
 
     fn status(&self) -> AgentStatus;
+    /// [U22] Did an extension/hook *report* this pane's status, or did roost
+    /// infer it from PTY traffic? `status()` deliberately hides the
+    /// difference — the badge should read the same either way — but the
+    /// destructive-close guard must not, because the two carry very different
+    /// weight. A hook saying "working" means a turn is in flight; two seconds
+    /// of bytes means something printed, which is equally true of `ls`.
+    /// Default false: a backend with no notion of extensions has only
+    /// heuristics.
+    fn status_reported(&self) -> bool {
+        false
+    }
     fn set_extension_status(&mut self, s: AgentStatus);
     fn on_exit(&mut self);
 
@@ -367,6 +378,9 @@ pub mod fakes {
         /// Mirrors `StatusTracker`'s contract: an extension-reported `Exited`
         /// is demoted to `Waiting` — only `on_exit` (the PTY EOF) marks a
         /// pane dead.
+        fn status_reported(&self) -> bool {
+            matches!(self.ext, Some(AgentStatus::Working | AgentStatus::NeedsInput))
+        }
         fn set_extension_status(&mut self, s: AgentStatus) {
             let s = if s == AgentStatus::Exited { AgentStatus::Waiting } else { s };
             self.ext = Some(s);
