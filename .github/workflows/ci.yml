@@ -33,6 +33,12 @@ jobs:
       # test prints its p50/max every run, so creep stays visible. Anywhere
       # the variable is unset — Linux CI, any developer's machine — the
       # shipped 250 ms applies.
-      - run: cargo test --no-fail-fast --verbose
+      #
+      # `--show-output` because libtest captures a passing test's output, and
+      # the numbers worth keeping — firehose's echo-latency p50/max, its exit
+      # time — are produced on the runs that pass. Without it they were only
+      # ever visible on the way to a panic, which is the one run where they
+      # add nothing.
+      - run: cargo test --no-fail-fast --verbose -- --show-output
         env:
           ROOST_TEST_ECHO_BUDGET_MS: ${{ matrix.os == 'macos-latest' && '1000' || '' }}
