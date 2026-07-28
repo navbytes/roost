@@ -37,6 +37,10 @@ pub enum Action {
     /// Focus the next pane that needs input, worst-first, wrapping across
     /// tabs (C19).
     JumpAttention,
+    /// Toggle the C27 fleet roster overlay — every pane in the workspace,
+    /// grouped by tab, opening on the pane `Alt+a` would jump to
+    /// (Alt+Shift+a).
+    ToggleRoster,
     /// Toggle a full-screen, focus-following view of the focused pane — a
     /// pure view transform, no layout change (C21).
     ToggleZoom,
@@ -104,7 +108,14 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('c') => Some(Action::CopyMode),
             KeyCode::Char('u') => Some(Action::Undo),
             KeyCode::Char('?') => Some(Action::Help),
-            KeyCode::Char('a') => Some(Action::JumpAttention),
+            // C19/C27, the deliberate pair: Alt+a takes you to the next pane
+            // that needs you; Alt+Shift+a shows you all of them and lets you
+            // choose. Alt+'A' is the same uppercase-delivery tolerance
+            // Alt+Shift+r / Alt+Shift+p already carry.
+            KeyCode::Char('a') => {
+                Some(if shift { Action::ToggleRoster } else { Action::JumpAttention })
+            }
+            KeyCode::Char('A') => Some(Action::ToggleRoster),
             KeyCode::Char('z') => Some(Action::ToggleZoom),
             KeyCode::Char('g') => Some(Action::CycleLayout),
             KeyCode::Char('e') => Some(Action::ToggleFeed),
@@ -408,6 +419,27 @@ mod tests {
             InputResult::Forward(b) => assert_eq!(b, vec![0x1b, b'p']),
             _ => panic!("unbound Alt+p must forward as meta-ESC (U5)"),
         }
+    }
+
+    /// C27: the shifted sibling of C19's jump. Alt+a stays the jump, the
+    /// shifted form opens the roster, and the uppercase-delivery form
+    /// (`Alt+'A'`, no SHIFT bit) reaches it too — the same tolerance
+    /// Alt+Shift+r / Alt+Shift+p carry.
+    #[test]
+    fn alt_shift_a_opens_the_roster_with_uppercase_delivery_tolerance() {
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('a'))),
+            InputResult::Action(Action::ToggleRoster)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('A'))),
+            InputResult::Action(Action::ToggleRoster)
+        ));
+        // ...and the unshifted chord is untouched: it is still the jump.
+        assert!(matches!(
+            translate(alt(KeyCode::Char('a'))),
+            InputResult::Action(Action::JumpAttention)
+        ));
     }
 
     #[test]

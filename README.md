@@ -73,6 +73,7 @@ you're in.
 | `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |
 | `Alt+f` | toggle the floating scratch shell (readline forward-word collision — already swallowed; raw mode below gets it back) |
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
+| `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |
 | `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
 | `Alt+r` | rename pane |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
@@ -136,7 +137,7 @@ selection still works too, if you prefer it.)
 
 ## Fleet features
 
-Eight keyboard-first additions for running more agents at once, plus one
+Nine keyboard-first additions for running more agents at once, plus one
 CLI-only escape hatch — all Alt-only, same layer as everything above.
 
 - **Jump to attention (`Alt+a`).** Jumps to the next pane whose status is
@@ -144,6 +145,19 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   the next one. Nothing needs you? A flash says so and nothing else
   changes — the hint bar's `◆ N needs you · Alt+a` segment always matches
   the count it will actually cycle through.
+- **Fleet roster (`Alt+Shift+a`).** The shifted sibling of the chord above:
+  `Alt+a` takes you to the next pane that needs you, `Alt+Shift+a` shows you
+  all of them and lets you choose. A modal list of every pane in the
+  workspace, grouped by tab — id, name, adapter and current state per row,
+  the same way collapsed stack rows read — so the panes sitting in tabs you
+  aren't looking at finally have a resting surface with names on it. It opens
+  with its cursor already on the pane `Alt+a` would have jumped to, so
+  `Alt+Shift+a` then `Enter` is exactly `Alt+a`. Arrows and `PgUp`/`PgDn`
+  move, typing filters by id / name / adapter, `Enter` goes there (across
+  tabs, expanding stacks, revealing the float, like every other jump),
+  `Esc` or the same chord closes it. Clicking a row goes there too. Honest
+  scope: going to a pane is the *only* thing it does — it's a navigator, not
+  a control panel; `roost send <id>` is where scripted dispatch lives.
 - **Activity feed (`Alt+e`).** A modal overlay, not a persistent pane —
   there's no spare row at an 80×24 terminal — streaming the most recent 200
   events: status changes, spawns, closes/reopens, exits, and control-plane
@@ -206,6 +220,12 @@ Status lives in the glyph, not the border — the focused pane's border is
 always accent-red, everything else stays quiet. When a non-focused pane
 starts waiting for you, roost rings the terminal bell (and posts a native
 notification on macOS).
+
+A tab's glyph summarizes its panes (worst first), and carries a **count**
+when more than one pane is in that state — `◆3` is three agents waiting on
+you in that tab, `●2` two working. Ten or more shows `+`. The count cell is
+always reserved (blank below two), so tab widths never shift as statuses
+change. For the names behind the number, `Alt+Shift+a` lists every pane.
 
 Status arrives two ways:
 

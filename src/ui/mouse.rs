@@ -71,11 +71,19 @@ pub fn display_width(s: &str) -> u16 {
 }
 
 /// Total columns one tab occupies in the bar (C2): a 1-col marker, a space,
-/// the label body, a space, a 1-col status glyph, a space, the separator, and
-/// a trailing gutter space (amended 2026-07-23) — seven fixed columns plus the
-/// label. The gutter gives every divider symmetric 1-cell padding (`│ ▎`).
+/// the label body, a space, a 1-col status glyph, a 1-col **count cell**, a
+/// space, the separator, and a trailing gutter space — eight fixed columns
+/// plus the label. The gutter gives every divider symmetric 1-cell padding
+/// (`│ ▎`, amended 2026-07-23).
+///
+/// [Amended 2026-07-28] The count cell (`◆3`) is **always reserved**, blank
+/// below 2, so a tab's width never changes as its agents' statuses flip —
+/// stability is worth more than the column, because a bar that reflows under
+/// a background status change moves every hitbox on it (§4/§5 lockstep) for
+/// a signal the user did not act on. `render::tab_count_cell` decides what
+/// goes in it; this function only knows it is exactly one column, always.
 pub fn tab_width(index: usize, name: &str) -> u16 {
-    display_width(&tab_label(index, name)) + 7
+    display_width(&tab_label(index, name)) + 8
 }
 
 /// Sum of `tab_width` over every tab.
@@ -604,74 +612,90 @@ mod tests {
 
     #[test]
     fn tab_hit_testing_matches_the_c2_worked_example() {
-        // C2 worked example (amended 2026-07-23, +7 gutter): ["main", "api"]
-        // → tab 0 spans cols 0..13 ("1 main" is 6 chars + 7 fixed cols), tab 1
-        // spans cols 13..25 ("2 api" is 5 chars + 7). Generous bar width, no
-        // status area, so this pins the base hit-math with nothing else in play.
+        // C2 worked example (amended 2026-07-28, +8 with the count cell):
+        // ["main", "api"] → tab 0 spans cols 0..14 ("1 main" is 6 chars + 8
+        // fixed cols), tab 1 spans cols 14..27 ("2 api" is 5 chars + 8).
+        // Generous bar width, no status area, so this pins the base hit-math
+        // with nothing else in play.
         let names = vec!["main".to_string(), "api".to_string()];
         assert_eq!(tab_at_x(&names, 100, 0, 0, 0), Some(0)); // start of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0)); // last col of tab 0 (its gutter)
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(1)); // first col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 24), Some(1)); // last col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 25), None); // past the end
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(0)); // last col of tab 0 (its gutter)
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 14), Some(1)); // first col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 26), Some(1)); // last col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 27), None); // past the end
         assert_eq!(tab_at_x(&names, 100, 0, 0, 200), None);
+    }
+
+    /// C2's geometry rule (amended 2026-07-28): the count cell is **always**
+    /// reserved, so a tab's width does not move when its count appears or
+    /// disappears. Width is a pure function of the label — nothing about a
+    /// tab's agents can shift the hitboxes beside it mid-session.
+    #[test]
+    fn tab_width_is_a_function_of_the_label_alone_so_a_count_cannot_move_it() {
+        assert_eq!(tab_width(0, "main"), 14); // 6-col label + 8 fixed
+        assert_eq!(tab_width(1, "api"), 13); // 5-col label + 8 fixed
+        // The renderer's own cell is one column for every count it can show,
+        // which is what makes the line above independent of status (the
+        // boundaries themselves are pinned in `render`).
+        for n in [0usize, 1, 2, 9, 10, 99] {
+            assert_eq!(crate::ui::render::tab_count_cell_cols(n), 1, "count {n}");
+        }
     }
 
     #[test]
     fn wide_glyph_tab_name_uses_display_width_not_char_count() {
         // "日本" is 2 chars but 4 display columns (CJK glyphs are
         // double-width in a terminal): label "1 日本" is 1 + 1 + 2 + 2 = 6
-        // display columns, so tab_width is 6 + 7 = 13 — not the char-count
-        // answer of 11. D1: a renamed tab with wide glyphs must not
+        // display columns, so tab_width is 6 + 8 = 14 — not the char-count
+        // answer of 12. D1: a renamed tab with wide glyphs must not
         // misindex clicks past the glyph's real width.
         let names = vec!["日本".to_string()];
-        assert_eq!(tab_width(0, "日本"), 13);
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0)); // last col of the tab
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), None); // just past it
+        assert_eq!(tab_width(0, "日本"), 14);
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(0)); // last col of the tab
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 14), None); // just past it
     }
 
     #[test]
     fn tab_at_x_after_a_wide_glyph_tab_uses_its_real_width() {
         // tab 0's label "1 🦀x" is 1 + 1 + 2 + 1 = 5 display columns (the
-        // crab emoji is double-width, 'x' is single) + 7 fixed cols = 12;
-        // tab 1 must start at col 12, not the char-count answer of 11.
+        // crab emoji is double-width, 'x' is single) + 8 fixed cols = 13;
+        // tab 1 must start at col 13, not the char-count answer of 12.
         let names = vec!["🦀x".to_string(), "b".to_string()];
-        assert_eq!(tab_width(0, "🦀x"), 12);
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 11), Some(0)); // last col of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(1)); // first col of tab 1
+        assert_eq!(tab_width(0, "🦀x"), 13);
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0)); // last col of tab 0
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(1)); // first col of tab 1
     }
 
     #[test]
     fn status_area_click_switches_nothing() {
-        // +7 gutter (2026-07-23): two tabs are 25 cols (13 + 12); a 10-col
-        // status area then occupies cols 25..35.
+        // +8 with the count cell (2026-07-28): two tabs are 27 cols
+        // (14 + 13); a 10-col status area then occupies cols 27..37.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 35, 10, 0, 24), Some(1)); // last tab col
-        assert_eq!(tab_at_x(&names, 35, 10, 0, 25), None); // status area starts here
-        assert_eq!(tab_at_x(&names, 35, 10, 0, 34), None); // status area, last col
+        assert_eq!(tab_at_x(&names, 37, 10, 0, 26), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, 37, 10, 0, 27), None); // status area starts here
+        assert_eq!(tab_at_x(&names, 37, 10, 0, 36), None); // status area, last col
     }
 
     #[test]
     fn status_area_is_dropped_before_tabs_clip() {
-        // Tabs alone (25 cols) fit a 25-col bar, but not alongside a 10-col
-        // status area (25+10=35 > 25) — C2 says the status area drops first,
-        // so tab 1 (cols 13..25) stays fully clickable and nothing clips.
+        // Tabs alone (27 cols) fit a 27-col bar, but not alongside a 10-col
+        // status area (27+10=37 > 27) — C2 says the status area drops first,
+        // so tab 1 (cols 14..27) stays fully clickable and nothing clips.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 25, 10, 0, 24), Some(1));
-        assert_eq!(tab_at_x(&names, 25, 10, 0, 25), None); // past both tabs, no status shown
+        assert_eq!(tab_at_x(&names, 27, 10, 0, 26), Some(1));
+        assert_eq!(tab_at_x(&names, 27, 10, 0, 27), None); // past both tabs, no status shown
     }
 
     #[test]
     fn overflow_clips_and_the_clip_point_switches_nothing() {
-        // Ten single-letter tabs: labels "1 a".."10 j", each 10 cols except
-        // the last (11), after the +7 gutter. A 45-col bar with no status area
-        // fits exactly four tabs (40 cols) before the fifth would overflow,
-        // leaving spare columns for the `…` clip marker at col 40.
+        // Ten single-letter tabs: labels "1 a".."10 j", each 11 cols except
+        // the last (12), after the +8 count cell. A 45-col bar with no status
+        // area fits exactly four tabs (44 cols) before the fifth would
+        // overflow, leaving one spare column for the `…` clip marker at 44.
         let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
-        assert_eq!(tab_strip(&names, 45, 0, 0).width, 40);
-        assert_eq!(tab_at_x(&names, 45, 0, 0, 39), Some(3)); // last col of tab 3 (0-based)
-        assert_eq!(tab_at_x(&names, 45, 0, 0, 40), None); // the `…` clip marker
-        assert_eq!(tab_at_x(&names, 45, 0, 0, 44), None); // past the visible tabs too
+        assert_eq!(tab_strip(&names, 45, 0, 0).width, 44);
+        assert_eq!(tab_at_x(&names, 45, 0, 0, 43), Some(3)); // last col of tab 3 (0-based)
+        assert_eq!(tab_at_x(&names, 45, 0, 0, 44), None); // the `…` clip marker
     }
 
     #[test]
@@ -704,18 +728,20 @@ mod tests {
     #[test]
     fn the_strip_scrolls_the_least_it_can_to_keep_the_active_tab_visible() {
         let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
-        // Tab 0 active: nothing scrolls, four tabs fit (40 of 45 cols).
+        // Tab 0 active: nothing scrolls, four tabs fit (44 of 45 cols).
         let strip = tab_strip(&names, 45, 0, 0);
         assert_eq!((strip.start, strip.end, strip.x0), (0, 4, 0));
         assert!(!strip.left_marker && strip.right_marker);
         // Tab 3 is the last that fits unscrolled — still no scroll.
         assert_eq!(tab_strip(&names, 45, 0, 3).start, 0);
         // Tab 4 forces it: start=1 (the left `…` costs a column, so tabs
-        // 1..4 = 40 + 1 = 41 <= 45), and both ends now hide tabs.
+        // 1..4 = 44 + 1 = 45 <= 45). The window now fills the bar exactly, so
+        // the *trailing* marker yields — it is opportunistic by contract and
+        // may never displace a tab (C2, U7 amendment).
         let strip = tab_strip(&names, 45, 0, 4);
         assert_eq!((strip.start, strip.end, strip.x0), (1, 5, 1));
-        assert!(strip.left_marker && strip.right_marker);
-        // The last tab (index 9, an 11-col label) is reachable and drawn.
+        assert!(strip.left_marker && !strip.right_marker);
+        // The last tab (index 9, a 12-col label) is reachable and drawn.
         let strip = tab_strip(&names, 45, 0, 9);
         assert!(strip.end == names.len(), "the active tab must be inside the window");
         assert!(strip.start > 0 && strip.left_marker);
@@ -755,10 +781,10 @@ mod tests {
         assert_eq!((strip.start, strip.x0), (1, 1));
         assert_eq!(tab_at_x(&names, 45, 0, 4, 0), None, "the left `…` is not a tab");
         assert_eq!(tab_at_x(&names, 45, 0, 4, 1), Some(1), "first drawn tab, at its real index");
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 10), Some(1), "...through its last column");
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 11), Some(2));
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 40), Some(4), "the active tab is clickable");
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 41), None, "past the window: the right `…`");
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 11), Some(1), "...through its last column");
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 12), Some(2));
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 34), Some(4), "the active tab is clickable");
+        assert_eq!(tab_at_x(&names, 45, 0, 4, 44), Some(4), "...to its last column");
         // Exhaustive agreement with the drawn strip: every column either
         // maps to a tab inside the window, or to nothing.
         for x in 0..45u16 {
@@ -805,19 +831,21 @@ mod tests {
     /// (tabs still win outright).
     #[test]
     fn the_status_area_yields_its_cwd_before_its_mode_word() {
-        let names = vec!["main".to_string(), "api".to_string()]; // 25 cols of tabs
+        let names = vec!["main".to_string(), "api".to_string()]; // 27 cols of tabs
+        let tabs = total_tabs_width(&names);
+        assert_eq!(tabs, 27);
         let full = status_width(Some("ZOOM"), Some("~/work"), true); // 24
         let no_cwd = status_width(Some("ZOOM"), None, true); // 15
 
-        let fit = status_fit(Some("ZOOM"), Some("~/work"), true, &names, 25 + full).unwrap();
+        let fit = status_fit(Some("ZOOM"), Some("~/work"), true, &names, tabs + full).unwrap();
         assert_eq!((fit.mode, fit.cwd, fit.width), (Some("ZOOM"), Some("~/work"), full));
 
         // One column short of the full form: the cwd goes, the word stays.
-        let fit = status_fit(Some("ZOOM"), Some("~/work"), true, &names, 25 + full - 1).unwrap();
+        let fit = status_fit(Some("ZOOM"), Some("~/work"), true, &names, tabs + full - 1).unwrap();
         assert_eq!((fit.mode, fit.cwd, fit.width), (Some("ZOOM"), None, no_cwd));
 
         // Not even the word fits beside the tabs: no status area at all.
-        assert_eq!(status_fit(Some("ZOOM"), Some("~/work"), true, &names, 25 + no_cwd - 1), None);
+        assert_eq!(status_fit(Some("ZOOM"), Some("~/work"), true, &names, tabs + no_cwd - 1), None);
     }
 
     /// The fitted width is what bounds tab clicks — a wider status area
@@ -825,23 +853,23 @@ mod tests {
     /// exactly as it takes them away from the drawn tabs.
     #[test]
     fn a_mode_word_in_the_status_area_shrinks_the_clickable_tab_span() {
-        let names = vec!["main".to_string(), "api".to_string()]; // tabs: 0..25
-        let bar = 25 + status_width(Some("ZOOM"), None, true);
+        let names = vec!["main".to_string(), "api".to_string()]; // tabs: 0..27
+        let bar = total_tabs_width(&names) + status_width(Some("ZOOM"), None, true);
         let fit = status_fit(Some("ZOOM"), None, true, &names, bar).unwrap();
-        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 24), Some(1)); // last tab col
-        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 25), None); // status area
+        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 26), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 27), None); // status area
     }
 
     #[test]
     fn single_tab_bar_hit_testing() {
-        // One tab, no separators to get confused by: "1 solo" is 6 chars + 7
-        // fixed cols = 13, occupying the whole visible width.
+        // One tab, no separators to get confused by: "1 solo" is 6 chars + 8
+        // fixed cols = 14, occupying the whole visible width.
         let names = vec!["solo".to_string()];
-        assert_eq!(tab_width(0, "solo"), 13);
-        assert_eq!(tab_strip(&names, 100, 0, 0).width, 13);
+        assert_eq!(tab_width(0, "solo"), 14);
+        assert_eq!(tab_strip(&names, 100, 0, 0).width, 14);
         assert_eq!(tab_at_x(&names, 100, 0, 0, 0), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), None); // just past the only tab
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, 0, 14), None); // just past the only tab
     }
 
     #[test]

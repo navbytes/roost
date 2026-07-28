@@ -554,6 +554,38 @@ fn ux_navigation_session() {
         focused_pane(&sd) == bell_pane,
         &format!("Alt+a jumps to the bell pane ({bell_pane})"),
     );
+    // C27: the shifted sibling. Same setup — a bell in a pane we then focus
+    // away from — but this time the fleet is *listed* and the jump is chosen:
+    // the roster must open with its cursor already on the pane Alt+a would
+    // have picked, so Alt+Shift+a + Enter == Alt+a.
+    let roster_pane = focused_pane(&sd);
+    h.write_bytes(b"sh -c 'sleep 2; printf \"\\a\"'\r");
+    h.write_bytes(&alt_arrow(b'D'));
+    settle(&mut h); // focus away again
+    std::thread::sleep(Duration::from_secs(4));
+    h.write_bytes(&alt(b'A')); // Alt+Shift+a, uppercase-delivery form
+    let s = frame(&mut h, "F1b: fleet roster");
+    qa.check(s.contains("fleet"), "Alt+Shift+a opens the fleet roster");
+    qa.check(
+        s.lines().any(|l| l.contains("PANE")),
+        "the roster groups the fleet under per-tab headers",
+    );
+    qa.check(s.contains("ROSTER"), "the roster names itself in the mode-word slot");
+    h.write_bytes(b"\r"); // Enter on the opening cursor
+    settle(&mut h);
+    qa.check(
+        focused_pane(&sd) == roster_pane,
+        &format!("roster Enter lands where Alt+a would have ({roster_pane})"),
+    );
+    h.write_bytes(&alt(b'A'));
+    settle(&mut h);
+    let reopened = h.screen().contents().contains("ROSTER");
+    h.write_bytes(&alt(b'A'));
+    settle(&mut h);
+    qa.check(
+        reopened && !h.screen().contents().contains("ROSTER"),
+        "Alt+Shift+a toggles the roster closed again (U18)",
+    );
     // feed overlay + wheel-under test
     h.write_bytes(&alt(b'e'));
     let s = frame(&mut h, "F2: activity feed");

@@ -900,6 +900,56 @@ mod tests {
         assert_eq!(app.runtimes.get(&pane).unwrap().scrollback, 0, "the pane must stay live");
     }
 
+    /// C27/U8: the roster owns the wheel too — it moves the roster's own
+    /// cursor and the pane underneath stays at its live tail.
+    #[test]
+    fn the_wheel_moves_the_roster_cursor_and_never_the_pane_under_it() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        app.apply(Action::ToggleRoster);
+        let opened_on = match app.mode {
+            Mode::Roster { cursor, .. } => cursor,
+            _ => panic!("the roster must be open"),
+        };
+        handle_mouse(&mut app, wheel_up(5, 5)); // over a pane, roster open
+
+        match app.mode {
+            Mode::Roster { cursor, .. } => {
+                assert_ne!(cursor, opened_on, "the wheel moves the roster's cursor")
+            }
+            _ => panic!("the roster must stay open"),
+        }
+        for id in [1u64, 2] {
+            assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 0, "pane {id} stays live");
+        }
+    }
+
+    /// C27: a click on a pane row goes there in one press; a click on a group
+    /// header does nothing (it is a label); a click outside dismisses.
+    #[test]
+    fn a_roster_row_click_jumps_and_a_header_click_does_nothing() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // panes 1|2 in tab 0
+        app.apply(Action::NewTab); // tab 1, pane 3, active
+        app.apply(Action::ToggleRoster);
+        let rect = ui::render::modal_rect(&app).expect("the roster draws a dialog");
+
+        // Row 0 of the list is tab 0's group header.
+        handle_mouse(&mut app, click(rect.x + 2, rect.y + 1));
+        assert!(matches!(app.mode, Mode::Roster { .. }), "a header click does nothing");
+
+        // Row 1 is tab 0's first pane — a pane in a tab that is NOT active.
+        handle_mouse(&mut app, click(rect.x + 2, rect.y + 2));
+        assert!(matches!(app.mode, Mode::Normal), "the jump closes the roster");
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.ws.active_tab, 0, "and switched tabs to get there");
+
+        app.apply(Action::ToggleRoster);
+        let below = app.body_area().bottom() - 1;
+        handle_mouse(&mut app, click(0, below));
+        assert!(matches!(app.mode, Mode::Normal), "a click outside closes the roster");
+    }
+
     /// Every other modal swallows the wheel outright.
     #[test]
     fn the_wheel_is_swallowed_by_the_other_modals() {
