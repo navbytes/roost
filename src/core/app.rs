@@ -66,7 +66,15 @@ pub enum Mode {
     /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
     /// two columns `↑`/`↓` are steering.
     Picker { selection: usize, filter: String, cwd: usize, on_cwd: bool },
-    Scroll { offset: usize },
+    /// [P14] Scroll mode carries **no offset of its own.** It used to hold a
+    /// mirror of the view's position, which is a second answer to a question
+    /// with exactly one: the vt100 grid auto-advances its offset as new rows
+    /// bank while the view is scrolled, so a cached copy drifts, and the next
+    /// key seeded from it teleported the view toward the tail (measured at 4
+    /// lines per press). Every reader and every step now asks
+    /// `PaneBackend::scroll_offset` — the grid — so the drift has nowhere to
+    /// live.
+    Scroll,
     /// Text selection — mouse drag, or the C24 keyboard cursor. `cursor` is
     /// (row, col) in the focused pane's inner cell space; both input
     /// methods write the same `App::selection`.
@@ -2428,17 +2436,14 @@ impl<B: PaneBackend> App<B> {
         self.jump_to_match(next % n);
     }
 
-    /// The one place a search moves a view: write the offset, then mirror
-    /// the grid's clamped answer into `Mode::Scroll`'s counter if that is
-    /// the mode we're in (or heading back to). Never a cached number — the
-    /// backend is the only thing that knows how far back the history goes.
+    /// The one place a search moves a view: write the offset and let the
+    /// grid clamp it. [P14] There is nothing to mirror afterwards — Scroll
+    /// mode keeps no counter, and every surface that reports the position
+    /// asks the backend — so a jump past the banked history can no longer
+    /// leave a phantom number behind the honest one.
     fn scroll_view_to(&mut self, pane: PaneId, offset: usize) {
         let Some(rt) = self.runtimes.get_mut(&pane) else { return };
         rt.set_scrollback(offset);
-        let clamped = rt.scroll_offset();
-        if let Mode::Scroll { offset } = &mut self.mode {
-            *offset = clamped;
-        }
     }
 
     /// P21 × P5 (reflow): re-capture a running search's haystack against the
@@ -2471,13 +2476,13 @@ impl<B: PaneBackend> App<B> {
         self.scroll_view_to(s.pane, s.origin);
     }
 
-    /// P21: the mode the search prompt hands back to. Scroll mode's counter
-    /// is re-seeded from the grid rather than from anything the search
-    /// remembered — the view moved, and `Mode::Scroll` mirrors the view.
+    /// P21: the mode the search prompt hands back to. [P14] Scroll mode
+    /// carries nothing to re-seed: the view is wherever the search left it,
+    /// and that is read from the grid by whoever asks.
     fn mode_after_search(&self, copy_cursor: Option<(u16, u16)>) -> Mode {
         match copy_cursor {
             Some(cursor) => Mode::Copy { cursor },
-            None => Mode::Scroll { offset: self.scroll_offset(self.focused) },
+            None => Mode::Scroll,
         }
     }
 
@@ -2607,12 +2612,13 @@ impl<B: PaneBackend> App<B> {
                     Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false };
             }
             Action::ScrollMode => {
-                // U9: seed from the pane's CURRENT view offset — entering
-                // Scroll mode after wheeling continues from the wheeled
-                // position; a zero seed made the first keypress snap the
-                // view from there back toward the live tail.
-                let offset = self.scroll_offset(self.focused);
-                self.mode = Mode::Scroll { offset };
+                // U9: entering Scroll mode after wheeling continues from the
+                // wheeled position — a zero seed made the first keypress snap
+                // the view back toward the live tail. [P14] It continues from
+                // there by *not carrying a seed at all*: the view is already
+                // where the wheel left it, and the first key reads it from
+                // the grid.
+                self.mode = Mode::Scroll;
             }
             Action::CopyMode => {
                 // C24: cursor starts bottom-left of the focused pane's inner
@@ -3724,7 +3730,7 @@ impl<B: PaneBackend> App<B> {
             // you are about to select, so throwing the hits away at the
             // handoff would break the flow the search exists to serve.
             let looking_back =
-                matches!(self.mode, Mode::Scroll { .. } | Mode::Search { .. });
+                matches!(self.mode, Mode::Scroll | Mode::Search { .. });
             let scroll_to_copy = looking_back && key.code == KeyCode::Char('c');
             if looking_back && !scroll_to_copy {
                 let focused = self.focused;
@@ -3764,7 +3770,7 @@ impl<B: PaneBackend> App<B> {
         // Scroll mode passes None. Neither `n`, `N` nor `/` was bound in
         // either mode before, so nothing is displaced.
         let look_back = match self.mode {
-            Mode::Scroll { .. } => Some(None),
+            Mode::Scroll => Some(None),
             Mode::Copy { cursor } => Some(Some(cursor)),
             _ => None,
         };
@@ -3950,21 +3956,22 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
-            Mode::Scroll { offset } => {
+            Mode::Scroll => {
                 let page = (self.term_size.height / 2).max(1) as usize;
                 let focused = self.focused;
-                // U9: base the arithmetic on the view's CURRENT offset (the
-                // grid auto-advances it as new lines bank while scrolled),
-                // and after every write read the grid-clamped value back —
-                // the mode offset is a mirror of the view, never an
-                // independent counter free to overshoot into a phantom
-                // (~240 banked Down presses before the screen moved).
-                let cur = self
-                    .runtimes
-                    .get(&focused)
-                    .map(|rt| rt.scroll_offset())
-                    .unwrap_or(*offset);
-                let new_offset = match key.code {
+                // U9/P14: every step reads the view's CURRENT offset off the
+                // grid and writes the result straight back to it. The grid
+                // auto-advances that offset as new rows bank while scrolled,
+                // so anything cached between two presses is stale by the
+                // second one — which is what walked the view 4 lines toward
+                // the tail on the next key, and what let ~240 banked Down
+                // presses pile up before the screen moved. There is now no
+                // "between": a pane with no runtime has no view to scroll,
+                // and this does nothing rather than counting into the void.
+                let Some(cur) = self.runtimes.get(&focused).map(|rt| rt.scroll_offset()) else {
+                    return true;
+                };
+                let want = match key.code {
                     KeyCode::Up | KeyCode::Char('k') => Some(cur + 1),
                     KeyCode::Down | KeyCode::Char('j') => Some(cur.saturating_sub(1)),
                     KeyCode::PageUp => Some(cur + page),
@@ -3972,12 +3979,10 @@ impl<B: PaneBackend> App<B> {
                     KeyCode::Esc | KeyCode::Char('q') => None,
                     _ => return true,
                 };
-                match new_offset {
+                match want {
                     Some(n) => {
-                        *offset = n;
                         if let Some(rt) = self.runtimes.get_mut(&focused) {
                             rt.set_scrollback(n);
-                            *offset = rt.scroll_offset();
                         }
                     }
                     None => self.exit_mode(), // U18: one definition of leaving
@@ -4264,7 +4269,7 @@ impl<B: PaneBackend> App<B> {
     fn exit_mode(&mut self) {
         match self.mode {
             // Snap the view back to the live tail, same as Esc/q.
-            Mode::Scroll { .. } => {
+            Mode::Scroll => {
                 let focused = self.focused;
                 if let Some(rt) = self.runtimes.get_mut(&focused) {
                     rt.set_scrollback(0);
@@ -4440,7 +4445,7 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
         Mode::Rename { target: RenameTarget::Pane, .. } => Some(Action::RenamePane),
         Mode::Rename { target: RenameTarget::Tab, .. } => Some(Action::RenameTab),
         Mode::Picker { .. } => Some(Action::QuickLaunch),
-        Mode::Scroll { .. } => Some(Action::ScrollMode),
+        Mode::Scroll => Some(Action::ScrollMode),
         Mode::Copy { .. } => Some(Action::CopyMode),
         Mode::Help { .. } => Some(Action::Help),
         Mode::Feed { .. } => Some(Action::ToggleFeed),
@@ -5176,13 +5181,15 @@ mod tests {
         app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         app.handle_mode_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 10);
-        let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
-        assert_eq!(offset, 10, "mode offset mirrors the clamp, not the ask");
+        assert!(matches!(app.mode, Mode::Scroll), "still in scroll mode");
+        // [P14] The view itself is the assertion now — scroll mode holds no
+        // mirror to check, which is the point: the ask (30) never became
+        // state anywhere, so the next key cannot resume from it.
+        assert_eq!(app.scroll_offset(id), 10, "the grid's clamp, not the ask");
         // One Down moves the view immediately.
         app.handle_mode_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 9);
-        let Mode::Scroll { offset } = app.mode else { panic!("still in scroll mode") };
-        assert_eq!(offset, 9);
+        assert_eq!(app.scroll_offset(id), 9);
     }
 
     // -- P21: scrollback search ---------------------------------------------
@@ -5293,8 +5300,8 @@ mod tests {
         assert_eq!(app.scroll_offset(id), 10, "the grid's clamp wins over the arithmetic");
         assert_eq!(app.scroll_position(), (10, 10), "and the ↑N/M hint reports the clamp");
         press(&mut app, crossterm::event::KeyCode::Enter);
-        let Mode::Scroll { offset } = app.mode else { panic!("Enter hands back to scroll mode") };
-        assert_eq!(offset, 10, "scroll mode's mirror is re-seeded from the grid");
+        assert!(matches!(app.mode, Mode::Scroll), "Enter hands back to scroll mode");
+        assert_eq!(app.scroll_offset(id), 10, "…on the view the search left behind");
     }
 
     /// P21: Esc restores the view the search opened on and leaves nothing
@@ -5312,7 +5319,7 @@ mod tests {
         press(&mut app, crossterm::event::KeyCode::Esc);
         assert_eq!(app.scroll_offset(id), 5, "Esc puts the view back");
         assert!(app.search.is_none(), "a cancelled search leaves no trace");
-        assert!(matches!(app.mode, Mode::Scroll { .. }), "and hands scroll mode back");
+        assert!(matches!(app.mode, Mode::Scroll), "and hands scroll mode back");
 
         // Enter, by contrast, keeps both.
         app.handle_mode_key(key('/'));
@@ -5441,10 +5448,47 @@ mod tests {
         let id = app.focused;
         app.wheel_scroll(id, 24);
         app.apply(Action::ScrollMode);
-        let Mode::Scroll { offset } = app.mode else { panic!("scroll mode") };
-        assert_eq!(offset, 24, "seeded from the pane's current view offset");
+        assert!(matches!(app.mode, Mode::Scroll), "scroll mode");
+        assert_eq!(app.scroll_offset(id), 24, "entering the mode moved nothing");
         app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 25);
+    }
+
+    /// P14, the invariant made structural: **every scroll step reads the
+    /// view's current offset off the grid, never a number roost stashed
+    /// between two keypresses.**
+    ///
+    /// The grid auto-compensates its own offset as new rows bank while the
+    /// view is scrolled — that is what keeps the view pinned to the content
+    /// you were reading instead of letting it slide. Anything roost cached
+    /// before that happened is stale the moment it does, and a step seeded
+    /// from the stale copy walks the view toward the tail (measured at 4
+    /// lines on one Up). Scroll mode used to hold such a mirror; it holds
+    /// nothing now, and this pins the behaviour that fact guarantees.
+    #[test]
+    fn a_scroll_step_reads_the_grid_after_it_auto_advanced_under_new_output() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.wheel_scroll(id, 5);
+        app.apply(Action::ScrollMode);
+        assert_eq!(app.scroll_offset(id), 5);
+
+        // The pane emits; the grid banks 7 rows and carries the view with
+        // them, exactly as the vendored parser does. (`FakePane` has no real
+        // grid, so the compensation is applied directly — it is the
+        // *backend's* behaviour being modelled, not roost's.)
+        app.runtimes.get_mut(&id).unwrap().scrollback = 12;
+
+        app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.scroll_offset(id),
+            13,
+            "one row further back than where the view actually is (12), not than \
+             where it was when the mode opened (5)",
+        );
+        app.handle_mode_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.scroll_offset(id), 12, "and back down from the same truth");
     }
 
     #[test]
@@ -5725,7 +5769,7 @@ mod tests {
         let id = app.focused;
         app.apply(Action::ScrollMode);
         app.handle_mode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)); // scroll back 1
-        assert!(matches!(app.mode, Mode::Scroll { .. }));
+        assert!(matches!(app.mode, Mode::Scroll));
         assert_eq!(app.runtimes.get(&id).unwrap().scrollback, 1);
         // A global Alt chord (e.g. focus move) exits scroll mode AND resets the
         // pane's scrollback, so it isn't left frozen mid-history.

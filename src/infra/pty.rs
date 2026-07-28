@@ -181,8 +181,6 @@ pub struct PtyPane {
     writer: Box<dyn Write + Send>,
     parser: vt100::Parser,
     status: StatusTracker,
-    /// Roost-side scrollback offset (wheel / scroll mode).
-    scroll: usize,
     /// The pane's child pid, for OS observation (live cwd / running agent).
     pid: Option<u32>,
     /// Answers the pane's terminal queries (DA1, DSR, DECRQM, XTWINOPS, …)
@@ -373,7 +371,6 @@ impl PaneBackend for PtyPane {
             writer,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
             status: StatusTracker::new(),
-            scroll: 0,
             pid,
             queries: QueryResponder::new(),
             pixels,
@@ -452,9 +449,11 @@ impl PaneBackend for PtyPane {
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> bool {
-        // Typing means "I'm back" — snap to the live tail.
-        if self.scroll != 0 {
-            self.scroll = 0;
+        // Typing means "I'm back" — snap to the live tail. [P14] Asked of
+        // the grid, not of a roost-side counter: the grid auto-advances the
+        // offset as new rows bank while the view is scrolled, so any cached
+        // copy is a second answer to a question that has exactly one.
+        if self.parser.screen().scrollback() != 0 {
             self.parser.set_scrollback(0);
         }
         self.write_input_raw(bytes)
@@ -480,14 +479,11 @@ impl PaneBackend for PtyPane {
             pixel_width: pixels.0,
             pixel_height: pixels.1,
         });
-        self.parser.set_size(rows, cols);
         // U3/U9 × P5: a resize reflows the live grid, which can bank rows the
         // rewrap pushed off the top — so the view's offset moves with them.
-        // Read the grid's clamp back rather than keeping the pre-resize
-        // number, exactly as `set_scrollback`/`scroll_by` do: the `↑N` badge
-        // and the scroll-mode hint are built on this value and must describe
-        // the view, never a stale one.
-        self.scroll = self.parser.screen().scrollback();
+        // [P14] Nothing to re-read: every reader of the offset asks the grid,
+        // so the reflowed value is already the answer they get.
+        self.parser.set_size(rows, cols);
     }
 
     fn hangup(&mut self) {
@@ -577,12 +573,12 @@ impl PaneBackend for PtyPane {
     }
 
     fn set_scrollback(&mut self, lines: usize) {
+        // [P14] Nothing to mirror: `scroll_offset` reads the grid, so the
+        // caller's ask never becomes state of its own. U9's overshoot — a
+        // stored offset past the banked history that the view ignores, and
+        // that burned ~240 keypresses before the screen moved — is not
+        // representable now that there is nowhere to store it.
         self.parser.set_scrollback(lines);
-        // U9: mirror the grid-clamped value back, never the caller's ask —
-        // a stored offset past the banked history is a phantom the view
-        // ignores, which is exactly what burned ~240 keypresses of
-        // overshoot before the screen moved.
-        self.scroll = self.parser.screen().scrollback();
     }
 
     fn scroll_by(&mut self, delta: i32) {
@@ -594,12 +590,13 @@ impl PaneBackend for PtyPane {
         let cur = self.parser.screen().scrollback() as i64;
         let want = (cur + i64::from(delta)).max(0) as usize;
         self.parser.set_scrollback(want);
-        self.scroll = self.parser.screen().scrollback();
     }
 
-    /// The grid-clamped offset, NOT `self.scroll`: the roost-side counter
-    /// can exceed what the grid actually banked (U9's overshoot), and U3's
-    /// honesty surfaces must reflect the view, never the phantom intent.
+    /// [P14] The grid, and only the grid. This used to sit beside a
+    /// roost-side `scroll` counter that could exceed what the grid actually
+    /// banked (U9's overshoot) and drifted whenever the grid auto-advanced
+    /// under new output; that field is gone, so U3's honesty surfaces cannot
+    /// report anything but the view.
     fn scroll_offset(&self) -> usize {
         self.parser.screen().scrollback()
     }

@@ -368,7 +368,33 @@ forward as ESC+ctrl-byte. This is the same change as SPEC-ux U5's meta-ESC
 fallthrough (`encode_raw` already computes exactly these bytes) — implement
 them together.
 
-### P14 · PARTIAL · Med-Low — scrolled view jumps on interaction (mechanism corrected)
+### P14 · FIXED (this branch) · Med-Low — scrolled view jumps on interaction (mechanism corrected)
+*Closed in two passes, and the second one is structural rather than
+behavioural — stated plainly so nobody reads a refactor as a bug fix.*
+***Pass 1 (SPEC-ux U9, already shipped):** every scroll step was re-pointed at
+the grid — `PtyPane::scroll_by`, Scroll mode's keys, copy-mode paging and the
+search's `scroll_view_to` all read `screen().scrollback()` immediately before
+acting and let the grid clamp the result. That is what actually stopped the
+4-line teleport this finding measured.*
+***Pass 2 (this branch):** the two caches themselves are **deleted**, so the
+defect stops being "currently handled" and becomes unrepresentable.
+`PtyPane::scroll` is gone — its last reader was `write_input`'s snap-to-tail
+guard, which now asks the grid — and `Mode::Scroll` no longer carries an
+`offset` at all. Nothing observable changes: every path that could have read a
+stale copy had already been re-seeded in pass 1, and the one fallback that
+still consulted the cache (`unwrap_or(*offset)`, reached only when the pane has
+no runtime) now does nothing instead of counting into a view that does not
+exist. What changes is that a future scroll step **cannot** be written against
+a cached offset, because there is no longer one to cache into.*
+*The invariant is pinned by
+`a_scroll_step_reads_the_grid_after_it_auto_advanced_under_new_output`: the
+backend's offset is advanced under the mode (modelling the grid carrying the
+view along as rows bank), and the next `↑` must land one row past **where the
+view is**, not one past where the mode opened. Being a regression guard for an
+invariant that already held, it passes before and after — it exists so the
+next person cannot quietly reintroduce the mirror.*
+
+### P14 (original finding) — mechanism, for the record
 The research claimed passive drift; **measurement disproved it** — the
 vendored grid auto-compensates the offset as lines scroll out (view stayed
 anchored through new output). The real defect: roost keeps two shadow copies
