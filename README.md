@@ -21,7 +21,7 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, shell)
 - **Session-native, not process-native.** Agent CLIs persist their own conversation state and resume by id, so roost never needs a daemon — it just remembers the layout tree plus each pane's `(adapter, cwd, session-id)`.
 - **Fleet at a glance.** The tab bar, corner badges, and collapsed stack rows show every agent's state — working, needs input, waiting, idle, exited — and roost rings the bell the moment one needs you.
 - **A control CLI for orchestrators.** `roost spawn / send / read / status / wait / close` — an LLM (or you) can drive a fleet of agent panes and watch the whole thing live.
-- **~1.2 MB, no daemon.** One binary, zero config, nothing to keep alive in the background.
+- **~1.4 MB, no daemon.** One binary, zero config, nothing to keep alive in the background.
 
 Full design rationale: [DESIGN.md](DESIGN.md).
 
@@ -42,8 +42,10 @@ Only one roost runs per workspace at a time — a second instance on the same
 state dir refuses to start (they'd race and corrupt `workspace.json`). Run an
 isolated one with `ROOST_STATE=/some/dir roost`.
 
-State lives in `~/.local/state/roost/workspace.json` (auto-saved on every
-change, atomic writes). Delete it to start clean.
+State lives in `~/.local/state/roost/workspace.json` on Linux and
+`~/Library/Application Support/roost/workspace.json` on macOS (auto-saved on
+every change, atomic writes) — alongside the control socket, token and audit
+log. Delete it to start clean.
 
 ### macOS: make Option send Alt
 
@@ -77,7 +79,9 @@ you're in.
 | `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
 | `Alt+r` | rename pane |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
-| `Alt+t`, `Alt+1..9` | new tab / go to tab |
+| `Alt+t`, `Alt+1..9`, `Alt+0` | new tab / go to tab / go to the last tab |
+| `Alt+i` / `Alt+m` | previous / next tab (wraps — the route to tabs past the ninth) |
+| `Alt+Shift+i` / `Alt+Shift+m` | carry the focused pane to the previous / next tab |
 | `Alt+w` | close pane (press twice to confirm when the agent is busy or it's the last pane) |
 | `Alt+u` | undo — reopen the last closed pane or tab, sessions resumed (exact scope below) |
 | `Alt+c` | copy mode — `hjkl`/arrows + `v` mark + `y`/`Enter` yank, or drag with the mouse (`Esc`/`q` exits) |
@@ -373,9 +377,9 @@ deep-history scrolling render correctly.
 M0 render core ✓ · M1 splits/tabs ✓ · M2 persistence + session detection ✓ ·
 M3 status socket + badges ✓ · M4 stacks + resize ✓ · M5 picker, rename,
 scroll, notifications ✓ · fleet features (jump, feed, zoom, float, raw mode,
-keyboard copy, layouts, broadcast) ✓. Deferred: mouse support, opencode
-adapter, config file (roost is deliberately zero-config for now). Full
-detail: [ROADMAP.md](ROADMAP.md).
+keyboard copy, layouts, broadcast) ✓ · mouse, wheel routing and link-opening ✓.
+Deferred: opencode adapter, config file (roost is deliberately zero-config for
+now). Full detail: [ROADMAP.md](ROADMAP.md).
 
 ---
 

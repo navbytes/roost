@@ -1,7 +1,7 @@
 # roost roadmap
 
 Everything known to be outstanding, as of the current `main`. The core product
-is complete and green (306 unit tests); nothing here is a known-broken defect —
+is complete and green (553 unit tests); nothing here is a known-broken defect —
 it's deferred scope, deliberate choices, and one thing only a human can do.
 
 Legend: **[you]** needs a real terminal / human judgment · **[gap]** promised
@@ -168,6 +168,15 @@ wait`, ownership-scoped, audit-logged, CSPRNG control token). Left:
   vs permanent failure. Rare now that pi/claude ids are reliable.
 - **[choice] Closing a tab's last pane deletes the tab.** Deliberate (mirrors
   "close last pane quits"); may become a configurable choice.
+  *Amended 2026-07-28:* the **last** tab is the exception — there is no tab to
+  delete, so `close_pane_id` left it with an emptied `Stack` root and saved
+  that. Next launch loaded zero panes: chrome around a blank body, dead-pane
+  hints (pane 0 has no runtime), and no key that makes a pane. Repaired at the
+  load boundary rather than at the one write that produces it —
+  `Workspace::validate_and_repair` now drops paneless tabs and starts over if
+  none survive, so a hand-edited file or a crash mid-close lands in the same
+  net. Pinned by `tests/empty_tab_recovery.rs`, which boots the real binary
+  against the exact broken `workspace.json`.
 - ~~**[perf] Orphan-child cleanup.**~~ **DONE 2026-07-28 — and it was not a
   pathological case.** The entry guessed the risk was "a child that won't die
   within the ~100ms poll"; the actual leak was structural and reproducible on

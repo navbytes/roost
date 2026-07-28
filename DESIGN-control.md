@@ -5,6 +5,15 @@ manage/control roost. Synthesized from a five-member design tribunal
 (CLI-champion, socket-RPC-champion, MCP-champion, security/architecture
 adversary, product/use-case lens).*
 
+> **Status: shipped.** This is the design record, written before the build and
+> kept in its original future tense — §2's "what already exists" and the
+> phase plan describe the codebase as it was, not as it is. Phases 1 and 2 are
+> done: `list/status/spawn/fork/send/read/close/wait`, ownership-scoped
+> capabilities, a CSPRNG fleet token, and the audit log all shipped. Phase 3
+> stayed unbuilt on purpose. For the verbs as they behave today see
+> [README.md](README.md#controlling-roost-cli--llm) and `roost --help`; for
+> what is left, [ROADMAP.md](ROADMAP.md).
+
 ---
 
 ## 1. The reframing

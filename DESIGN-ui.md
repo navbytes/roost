@@ -1,8 +1,10 @@
 # DESIGN-ui.md — roost TUI chrome restyle
 
 Canonical design reference: `docs/tui-design.html` (tokens at `:root` ~line 584,
-terminal markup ~614–696, token legend ~698). This document translates that
-mockup into testable contracts for a ratatui 0.29 cell-grid TUI. The
+terminal markup ~614–696, token legend ~698) — **for layout, glyphs and
+relationships, not for its hex values**, which §2's theme-inheritance amendment
+demoted when roost stopped shipping fixed hues. This document translates that
+mockup into testable contracts for a ratatui 0.30 cell-grid TUI. The
 `design-supervisor` agent audits implementation against the numbered contracts
 below (C1–C28) and issues a per-contract verdict: **ALIGNED** or **DEVIATED**
 (with file:line evidence). Line anchors below were verified against the working
