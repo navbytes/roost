@@ -206,16 +206,36 @@ fn borders_are_structure_and_the_badge_is_quiet_ink() {
     assert_eq!(attrs(screen, 1, corners[1]).0, STRUCTURE, "the unfocused pane's border");
 
     // C4's corner badge rides the focused pane's first inner row, hard right
-    // against its inner edge. Its text is the quiet rung — readable as a
-    // watermark in any theme, because it is the user's own ink dimmed.
+    // against its inner edge. It is **two-tone**: the text is the quiet rung
+    // — readable as a watermark in any theme, because it is the user's own
+    // ink dimmed — and the status glyph rightmost of it carries its own C5
+    // style, which is only sometimes dim (`·` idle, `✕` exited; `○` waiting
+    // is full-strength `ink()` per §2, and `●`/`◆` are the accent). So the
+    // scan has to step over the glyph by *position* before it starts reading
+    // weight, or a waiting pane breaks the walk on its own badge.
     let badge_row = 2;
     let inner_right = corners[1] - 2; // last inner column of the focused pane
+    let cell = |c: u16| screen.cell(badge_row, c).expect("cell inside the grid").contents();
+
+    // Rightmost non-blank cell on the row: the breathing-room column comes
+    // after the glyph, so this is the glyph itself.
+    let glyph_col = (0..=inner_right)
+        .rev()
+        .find(|c| !cell(*c).trim().is_empty())
+        .expect("the badge's status glyph");
+    assert!(
+        "●◆○·✕".contains(&cell(glyph_col)),
+        "badge col {glyph_col} should be a C5 status glyph, found {:?}",
+        cell(glyph_col),
+    );
+
+    // Everything left of the glyph is the quiet run, up to the point the walk
+    // leaves the badge and lands in the pane's own content.
     let mut quiet_cells = 0;
-    for c in (0..=inner_right).rev() {
+    for c in (0..glyph_col).rev() {
         let (fg, dim, ..) = attrs(screen, badge_row, c);
-        let symbol = screen.cell(badge_row, c).expect("cell inside the grid").contents();
-        if symbol.trim().is_empty() && quiet_cells == 0 {
-            continue; // the badge's trailing breathing-room column
+        if cell(c).trim().is_empty() && quiet_cells == 0 {
+            continue; // the space separating the glyph from the text
         }
         if !dim {
             break; // ran off the front of the badge into pane content
