@@ -205,6 +205,15 @@ modifier-based. Any new glyph appearing under `src/ui/` is a DEVIATED.
 `↑N` token (C4) and the scroll hint's `↑N/M` position (C9). It appears only
 while a pane's view is frozen in history; no other new glyph is sanctioned.
 
+**[Amended 2026-07-28, vertical-tabs tribunal]: the roster and the tab count
+add NO new glyph.** The roster (C27) draws the `❯` selection marker, the `▎`
+focused-row marker and the C5 status glyphs, all of them already here and all
+with their existing meanings. The tab bar's count cell (C2) holds a **digit or
+`+`** — ASCII text in the glyph's own style, the same class of thing as the
+`raw` badge token, not a symbol. This inventory governs symbols; text tokens
+are governed by their own contracts. Any new *glyph* under `src/ui/` is still
+a DEVIATED.
+
 ---
 
 ## 3. Component contracts
@@ -285,6 +294,8 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
   Worked example (audit fixture): tabs `["main", "api"]` → tab 0 occupies
   cols 0..13, tab 1 cols 13..25; `tab_at_x(_, 12) == Some(0)`,
   `tab_at_x(_, 13) == Some(1)`, `tab_at_x(_, 25) == None`.
+  **[Superseded 2026-07-28 — the formula is `+ 8` and the worked example moves
+  with it; see this contract's count-cell amendment below.]**
 - Right-aligned status area, fg `DIM` on `TAB_STRIP`, content
   `"{cwd} · {save}"` + one trailing space:
   - `cwd` = focused pane's `PaneSpec.cwd` with a `$HOME` prefix abbreviated to
@@ -385,6 +396,71 @@ in. `TAB_STRIP` is deleted:
   now `ink()` over `quiet()`. The saved word is `quiet()`, "save failed"
   `accent()`. There is no `TAB_STRIP` beneath any of it. Width math, overflow
   markers and every hitbox are untouched.
+
+**[Amended 2026-07-28, vertical-tabs tribunal (SPEC-ux U27) — the glyph gains
+a count]** The summary reduces a whole tab to one glyph, so `◆` has always
+meant "at least one pane here needs you" and nothing more: **a tab with three
+blocked agents was pixel-identical to a tab with one**, and the only way to
+learn the difference was to go and look. This is the sibling half of the gap
+C27 closes from the other side (the tribunal's provenance is recorded there).
+
+- **Content.** Each tab's parts become **nine**, the count cell riding
+  immediately after the glyph with no space between them:
+  `marker(1) + " " + label + " " + glyph(1) + count(1) + " " + "│"(1) + " "(1)`.
+  The count is how many of that tab's panes are in the **summarized** state.
+  `App::tab_summary` returns it alongside the summary — one call, so the
+  ranking (U13's, verbatim) and the number can never disagree about which
+  state won. It is never a pane total: the glyph says what the tab is
+  reporting and the count says how much of it there is. `◆3`, `●2`, `✕2`.
+- **Style.** The count carries the **glyph's own style**, pulse included, so
+  `●3` flips as one token rather than as a dot with a number attached — the
+  count is part of the signal, not a remark about it.
+- **Geometry rule — stability over saving a column.** The cell is **always
+  reserved**: a space below 2, the digit for `2`–`9`, `+` for 10 or more —
+  always exactly one column (`render::tab_count_cell`). Tab widths therefore
+  do **not** jitter as agent statuses flip. That is worth the column: a strip
+  that reflowed whenever a background pane changed state would move every
+  hitbox on the bar (and every tab's drawn position) for a signal the user did
+  not act on, and §4/§5's lockstep rule exists precisely because those two
+  must never disagree. `+` past nine because two digits would break the
+  one-column invariant the hit math rests on, and because past nine the exact
+  number stops being actionable — "more than you can eyeball" is the honest
+  reading.
+- **Lockstep.** `mouse::tab_width` becomes `display_width(label) + 8`, and the
+  renderer's cell layout, `mouse::tab_width`/`tab_at_x` and their tests all
+  move in the **same commit** (§4/§5, hard rule).
+  Worked example, superseding the one above: tabs `["main", "api"]` → tab 0
+  occupies cols 0..14, tab 1 cols 14..27; `tab_at_x(_, 13) == Some(0)`,
+  `tab_at_x(_, 14) == Some(1)`, `tab_at_x(_, 27) == None`.
+- **Measured cost (+1 column per tab), as promised rather than assumed.** How
+  many tabs the strip shows before the `…`, at the default names
+  (`main`, `tab2`, `tab3`, …), status area dropped as C2's ladder already
+  drops it once tabs overflow:
+
+  | bar width | before | after |
+  |---|---|---|
+  | 80 | 6 tabs | **5** |
+  | 100 | 7 tabs | 7 |
+  | 120 | 9 tabs | **8** |
+  | 160 | 11 tabs | 11 |
+
+  With one-character tab names (the cheapest labels there are, so the fixed
+  columns dominate) it is 8→7, 9→9, 11→10, 15→14 at the same four widths.
+  So: **one fewer visible tab at two of the four widths, none at the other
+  two** — the +1 only costs a tab when it crosses a multiple of the tab width.
+  Per U7 the strip *scrolls*, so the effect is fewer tabs visible before the
+  `…` marker, never a tab you cannot reach: every tab stays reachable by
+  `Alt+1..9`/`Alt+0`/`Alt+i`/`Alt+m`, and the active one is always drawn. That
+  is the cost this amendment is worth paying — an unreadable count is worse
+  than a shorter strip, and C27's roster now answers "which panes, exactly"
+  for anything the bar cannot say.
+- One consequence worth recording, visible in the tests: at a width where the
+  scrolled window now fills the bar exactly, the **trailing** `…` yields —
+  it is opportunistic by contract and may never displace a tab (U7's
+  amendment). The leading marker, which is paid for out of the tab budget, is
+  unaffected.
+- No new glyph: the cell holds ASCII text (a digit or `+`) in the glyph's own
+  style, so §2's inventory — which governs *symbols* — is unchanged.
 
 ### C3 — Pane borders
 
@@ -1869,8 +1945,10 @@ you.**
   **`PaneId`, not a row index**, precisely so the list can churn underneath it
   without the cursor silently re-pointing at a different pane. The scrolled
   window (`top`) is the one piece of view state, clamped by the pure
-  `roster_top_clamped` that the renderer and the mouse hit-test both call
-  (§4/§5 lockstep); it scrolls the least it can to keep the cursor visible,
+  `roster_top_clamped`, which the renderer and the mouse hit-test both reach
+  through the single `App::roster_view` accessor — one rows-and-offset answer
+  per frame, so a click can never land on a different row than the one under
+  the pointer (§4/§5 lockstep); it scrolls the least it can to keep the cursor visible,
   and takes the cursor's group header with it when revealing upward (a row
   whose tab you cannot see is a pane you cannot place).
 - **Mouse (U8's modal rules, no exceptions):** a click on a pane row jumps in
@@ -1953,6 +2031,12 @@ Every px-only construct in the mockup, and its cell-level fate:
   the same commit. The prefix-width test dies with the prefix; a new test pins
   the `label + 6` formula and the worked example in C2. Click routing stays at
   `main.rs:306–309`; it gains the status-area/overflow clamp (C2).
+  **[Amended 2026-07-28]** The formula is now `label + 8` (the C2 count-cell
+  amendment); the rule itself is unchanged and was exercised by that change —
+  renderer, width formula, `tab_at_x` and every offset test moved together,
+  and the count cell's "always exactly one column" invariant is asserted from
+  the mouse side against the renderer's own `tab_count_cell` rather than a
+  hard-coded 1, so the two cannot drift apart later either.
 - **Dialog anchoring stays.** `centered_near()` (`render.rs:114–122`) and its
   tests are untouched; dialogs keep anchoring to the focused pane, not screen
   center.

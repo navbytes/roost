@@ -221,6 +221,12 @@ always accent-red, everything else stays quiet. When a non-focused pane
 starts waiting for you, roost rings the terminal bell (and posts a native
 notification on macOS).
 
+A tab's glyph summarizes its panes (worst first), and carries a **count**
+when more than one pane is in that state — `◆3` is three agents waiting on
+you in that tab, `●2` two working. Ten or more shows `+`. The count cell is
+always reserved (blank below two), so tab widths never shift as statuses
+change. For the names behind the number, `Alt+Shift+a` lists every pane.
+
 Status arrives two ways:
 
 1. **Exact** — agent-side integrations report over roost's unix socket

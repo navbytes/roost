@@ -1056,39 +1056,49 @@ impl<B: PaneBackend> App<B> {
     /// and no known status — we report `Unknown` for those rather than letting
     /// the tab look idle/quiet, which would be a lie. A pane that's neither
     /// running nor a recorded spawn-failure is "not spawned yet".
-    pub fn tab_summary(&self, tab_index: usize) -> TabSummary {
-        let Some(tab) = self.ws.tabs.get(tab_index) else { return TabSummary::Quiet };
-        let mut any_unknown = false;
-        let (mut needs, mut working, mut waiting, mut exited) = (false, false, false, false);
+    /// [Amended 2026-07-28, C2] It now returns the summary **and how many of
+    /// the tab's panes are in that summarized state** — the number the tab bar
+    /// renders beside the glyph (`◆3`), so a tab holding three blocked agents
+    /// stops reading exactly like a tab holding one.
+    ///
+    /// The count is of the *summarized* state only, never a pane total: the
+    /// glyph says what the tab is reporting, and the count says how much of it
+    /// there is. `Quiet` counts 0 — it reports nothing by construction. The
+    /// ranking is unchanged (U13's order, verbatim), which is why the count
+    /// rides along here rather than in a second function that could disagree
+    /// with it about which state won.
+    pub fn tab_summary(&self, tab_index: usize) -> (TabSummary, usize) {
+        let Some(tab) = self.ws.tabs.get(tab_index) else { return (TabSummary::Quiet, 0) };
+        let (mut unknown, mut needs, mut working, mut waiting, mut exited) = (0, 0, 0, 0, 0);
         for id in tab.panes.keys() {
             match self.runtimes.get(id) {
                 Some(rt) => match rt.status() {
-                    AgentStatus::NeedsInput => needs = true,
-                    AgentStatus::Working => working = true,
-                    AgentStatus::Waiting => waiting = true,
-                    AgentStatus::Exited => exited = true, // U13
+                    AgentStatus::NeedsInput => needs += 1,
+                    AgentStatus::Working => working += 1,
+                    AgentStatus::Waiting => waiting += 1,
+                    AgentStatus::Exited => exited += 1, // U13
                     AgentStatus::Idle => {}
                 },
                 // No runtime and not a known spawn-failure ⇒ not spawned yet.
-                None if !self.dead.contains_key(id) => any_unknown = true,
+                None if !self.dead.contains_key(id) => unknown += 1,
                 // A recorded spawn failure is a dead pane too (U13).
-                None => exited = true,
+                None => exited += 1,
             }
         }
-        if needs {
-            TabSummary::NeedsInput // a real, actionable signal wins outright
-        } else if any_unknown {
-            TabSummary::Unknown // honest: we haven't run these panes
-        } else if working {
-            TabSummary::Working
-        } else if waiting {
-            TabSummary::Waiting
-        } else if exited {
+        if needs > 0 {
+            (TabSummary::NeedsInput, needs) // a real, actionable signal wins outright
+        } else if unknown > 0 {
+            (TabSummary::Unknown, unknown) // honest: we haven't run these panes
+        } else if working > 0 {
+            (TabSummary::Working, working)
+        } else if waiting > 0 {
+            (TabSummary::Waiting, waiting)
+        } else if exited > 0 {
             // U13: ranked below Waiting (a live agent outranks a corpse) and
             // above Quiet (a dead pane is news; an idle one isn't).
-            TabSummary::Exited
+            (TabSummary::Exited, exited)
         } else {
-            TabSummary::Quiet
+            (TabSummary::Quiet, 0)
         }
     }
 
@@ -4672,13 +4682,53 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         let id = app.pane_order()[0];
         // Freshly spawned shell, nothing happening → Quiet (not Unknown).
-        assert_eq!(app.tab_summary(0), TabSummary::Quiet);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Quiet);
         // A pane needing input dominates the summary.
         app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
-        assert_eq!(app.tab_summary(0), TabSummary::NeedsInput);
+        assert_eq!(app.tab_summary(0).0, TabSummary::NeedsInput);
         // Not spawned (no runtime, no recorded failure) → Unknown, never idle.
         app.runtimes.remove(&id);
-        assert_eq!(app.tab_summary(0), TabSummary::Unknown);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Unknown);
+    }
+
+    /// C2 (amended 2026-07-28): the summary now carries **how many** panes
+    /// are in the state it reports — the tribunal's finding was that a tab of
+    /// three needy agents drew the same single `◆` as a tab of one. The count
+    /// is of the summarized state alone, never a pane total, and it rides on
+    /// the same call as the ranking so the two can never disagree about which
+    /// state won.
+    #[test]
+    fn tab_summary_counts_the_panes_in_the_state_it_reports() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // one tab, three panes
+
+        assert_eq!(app.tab_summary(0), (TabSummary::Quiet, 0), "Quiet reports nothing");
+
+        for id in [1u64, 2, 3] {
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
+        }
+        assert_eq!(app.tab_summary(0), (TabSummary::Working, 3));
+
+        // The count follows the *summarized* state, not the pane total: one
+        // needy pane outranks two working ones, and counts as one.
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.tab_summary(0), (TabSummary::NeedsInput, 1));
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.tab_summary(0), (TabSummary::NeedsInput, 2));
+
+        // Unknown counts the unspawned panes; Exited counts the corpses.
+        app.runtimes.remove(&3);
+        assert_eq!(app.tab_summary(0), (TabSummary::NeedsInput, 2), "needs-you still wins");
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Idle);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Idle);
+        assert_eq!(app.tab_summary(0), (TabSummary::Unknown, 1));
+        app.dead.insert(3, "boom".into()); // a recorded spawn failure is a corpse (U13)
+        app.runtimes.get_mut(&1).unwrap().kill();
+        assert_eq!(app.tab_summary(0), (TabSummary::Exited, 2));
+
+        // A tab index that doesn't exist reports the blank, counting nothing.
+        assert_eq!(app.tab_summary(9), (TabSummary::Quiet, 0));
     }
 
     /// U13 (closes SPEC-GAP-2): a tab whose agents are dead says so instead
@@ -4688,25 +4738,25 @@ mod tests {
     fn tab_summary_reports_exited_and_ranks_it_between_waiting_and_quiet() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1 | 2 in one tab
-        assert_eq!(app.tab_summary(0), TabSummary::Quiet);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Quiet);
 
         app.runtimes.get_mut(&1).unwrap().kill(); // pane 1 dies
-        assert_eq!(app.tab_summary(0), TabSummary::Exited, "a dead pane is news");
+        assert_eq!(app.tab_summary(0).0, TabSummary::Exited, "a dead pane is news");
 
         // A live pane with something to say outranks a corpse...
         app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
-        assert_eq!(app.tab_summary(0), TabSummary::Waiting);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Waiting);
         app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Working);
-        assert_eq!(app.tab_summary(0), TabSummary::Working);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Working);
         app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::NeedsInput);
-        assert_eq!(app.tab_summary(0), TabSummary::NeedsInput);
+        assert_eq!(app.tab_summary(0).0, TabSummary::NeedsInput);
         // ...and an idle one does not: Idle is "nothing to report", the
         // corpse is the only news on the tab.
         app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Idle);
-        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Exited);
         // Every pane dead is still Exited, never Quiet.
         app.runtimes.get_mut(&2).unwrap().kill();
-        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Exited);
     }
 
     /// A pane whose *spawn* failed has no runtime at all — it is dead, not
@@ -4717,7 +4767,7 @@ mod tests {
         let id = app.pane_order()[0];
         app.runtimes.remove(&id);
         app.dead.insert(id, "spawn-fail requested".into());
-        assert_eq!(app.tab_summary(0), TabSummary::Exited);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Exited);
     }
 
     /// U14: the flash says what actually happened. A native helper that

@@ -996,14 +996,16 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
         spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), theme::quiet()));
         used += strip.x0;
     }
-    // Left to right, one 8-part span group per tab (marker/label/glyph/
+    // Left to right, one 9-part span group per tab (marker/label/glyph/count/
     // separator/gutter), stopping exactly where `tab_strip` says to.
     for (i, tab) in app.ws.tabs.iter().enumerate().take(strip.end).skip(strip.start) {
         let active = i == app.ws.active_tab;
-        let summary = app.tab_summary(i);
+        // [Amended 2026-07-28] ...and how many panes are in that state, so a
+        // tab of three needy agents stops reading like a tab of one.
+        let (summary, count) = app.tab_summary(i);
         let (glyph, base_style) = tab_summary_badge(summary);
         let glyph_style = if summary == TabSummary::Working { pulse } else { base_style };
-        push_tab_spans(&mut spans, i, &tab.name, active, glyph, glyph_style);
+        push_tab_spans(&mut spans, i, &tab.name, active, glyph, glyph_style, count);
         used += mouse::tab_width(i, &tab.name);
     }
 
@@ -1042,9 +1044,15 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// One tab's 8-part span sequence (C2): marker, label, status glyph, the
-/// separator, and a trailing gutter space — column count matches
-/// `mouse::tab_width` (`display_width(label) + 7`) exactly.
+/// One tab's 9-part span sequence (C2): marker, label, status glyph, the
+/// **count cell**, the separator, and a trailing gutter space — column count
+/// matches `mouse::tab_width` (`display_width(label) + 8`) exactly.
+///
+/// [Amended 2026-07-28] `count` is how many of the tab's panes are in the
+/// summarized state (`App::tab_summary_counted`). It renders in the glyph's
+/// own style — pulse included, so `●3` flips as one token rather than as a
+/// dot with a number stuck to it: the count is part of the signal, not a
+/// separate remark about it.
 fn push_tab_spans(
     spans: &mut Vec<Span<'static>>,
     index: usize,
@@ -1052,6 +1060,7 @@ fn push_tab_spans(
     active: bool,
     glyph: char,
     glyph_style: Style,
+    count: usize,
 ) {
     if active {
         spans.push(Span::styled(theme::MARKER_ACTIVE.to_string(), theme::accent()));
@@ -1067,13 +1076,48 @@ fn push_tab_spans(
     spans.push(Span::raw(" "));
 
     spans.push(Span::styled(glyph.to_string(), glyph_style));
+    // C2 (amended 2026-07-28): the count cell, glyph-adjacent and in the
+    // glyph's own style. Always exactly one column — blank below 2 — so tab
+    // widths never jitter as statuses flip.
+    spans.push(Span::styled(tab_count_cell(count).to_string(), glyph_style));
     spans.push(Span::raw(" "));
 
     spans.push(Span::styled(theme::TAB_SEPARATOR.to_string(), theme::rule()));
     // C2 (amended 2026-07-23): trailing gutter — one space after the separator
     // gives every divider symmetric 1-cell padding, so adjacent tabs read
-    // `│ ▎` not `│▎`. Counts as this tab's own column (mouse::tab_width +7).
+    // `│ ▎` not `│▎`. Counts as this tab's own column (mouse::tab_width +8).
     spans.push(Span::raw(" "));
+}
+
+/// C2 (amended 2026-07-28): what goes in a tab's count cell for `n` panes in
+/// the summarized state. **Exactly one column, always** — that invariant is
+/// the contract's geometry rule, and `mouse::tab_width` depends on it:
+/// - `0`/`1` → a space. One is what a glyph already means; drawing `◆1`
+///   would spend a column to say nothing, and *omitting* the cell instead
+///   would make every tab's width follow its agents' statuses.
+/// - `2..=9` → the digit.
+/// - `10+` → `+`. Past nine the exact number stops being actionable ("more
+///   than you can eyeball") and two digits would break the one-column rule,
+///   which the whole strip's hit math is built on.
+///
+/// Pure so the boundaries are unit-tested; ASCII text in the glyph's own
+/// style, so §2's glyph inventory is unchanged (no new symbol).
+fn tab_count_cell(n: usize) -> char {
+    match n {
+        0 | 1 => ' ',
+        2..=9 => char::from_digit(n as u32, 10).unwrap_or('+'),
+        _ => '+',
+    }
+}
+
+/// The count cell's rendered width, for whatever `n` — **always 1**. This is
+/// the number `mouse::tab_width`'s `+8` is built on, so it lives here, beside
+/// the cell it measures, and the mouse side asserts against it rather than
+/// against a hard-coded 1 (§4/§5 lockstep: the width formula and the drawn
+/// cells have to move together or not at all).
+#[cfg(test)]
+pub fn tab_count_cell_cols(n: usize) -> u16 {
+    mouse::display_width(&tab_count_cell(n).to_string())
 }
 
 /// Map a tab's aggregate summary to a tab-bar glyph + style (theme::C5).
@@ -2325,6 +2369,38 @@ mod tests {
         );
     }
 
+    /// C27/C9: the roster's own list, and the 68-column number the contract
+    /// quotes — it has to fit beside the right segment at the 100-col floor,
+    /// which is the only reason the number is in the contract at all. Note
+    /// what is *not* here: the feed's `q`, because in a list you filter by
+    /// typing, `q` is filter text (U20's rule).
+    #[test]
+    fn hint_pairs_roster_mode_is_the_c27_list_and_fits_the_floor() {
+        let pairs = hint_pairs(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, false, false);
+        assert_eq!(
+            pairs,
+            vec![
+                ("↑↓", "select"),
+                ("PgUp/Dn", "page"),
+                ("↵", "go to pane"),
+                ("type", "filter"),
+                ("Esc", "close"),
+            ],
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        assert_eq!(cols, 68, "C27 quotes 68 columns");
+        assert!(cols < 100, "and it must fit beside the right segment at the floor");
+        assert!(!pairs.iter().any(|(k, _)| k.contains('q')), "`q` filters, it does not close");
+    }
+
+    #[test]
+    fn mode_word_roster_wins_regardless_of_zoom() {
+        assert_eq!(
+            mode_word(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, true, false),
+            "ROSTER"
+        );
+    }
+
     #[test]
     fn mode_word_feed_wins_regardless_of_zoom() {
         assert_eq!(mode_word(&Mode::Feed { offset: 0 }, false, false), "FEED");
@@ -2347,8 +2423,8 @@ mod tests {
         // (fuses with the terminal's own bg), glyph in its own style,
         // separator `rule`.
         let mut spans = Vec::new();
-        push_tab_spans(&mut spans, 0, "main", true, theme::GLYPH_WORKING, theme::accent());
-        assert_eq!(spans.len(), 8); // 7 parts + trailing gutter (C2, amended 2026-07-23)
+        push_tab_spans(&mut spans, 0, "main", true, theme::GLYPH_WORKING, theme::accent(), 3);
+        assert_eq!(spans.len(), 9); // 8 parts + the count cell (C2, amended 2026-07-28)
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style, theme::accent());
         assert_eq!(spans[2].content.as_ref(), "1 main");
@@ -2356,9 +2432,12 @@ mod tests {
         assert_eq!(spans[2].style.bg, Some(theme::ACTIVE_TAB_BG));
         assert_eq!(spans[4].content.as_ref(), theme::GLYPH_WORKING.to_string());
         assert_eq!(spans[4].style, theme::accent());
-        assert_eq!(spans[6].content.as_ref(), theme::TAB_SEPARATOR.to_string());
-        assert_eq!(spans[6].style, theme::rule());
-        assert_eq!(spans[7].content.as_ref(), " "); // trailing gutter
+        // ...then the count, in the glyph's own style so `●3` is one token.
+        assert_eq!(spans[5].content.as_ref(), "3");
+        assert_eq!(spans[5].style, theme::accent());
+        assert_eq!(spans[7].content.as_ref(), theme::TAB_SEPARATOR.to_string());
+        assert_eq!(spans[7].style, theme::rule());
+        assert_eq!(spans[8].content.as_ref(), " "); // trailing gutter
     }
 
     #[test]
@@ -2367,8 +2446,8 @@ mod tests {
         // `quiet`, and no bg override: since 2026-07-27 there is no strip
         // fill underneath it either (§2 background policy).
         let mut spans = Vec::new();
-        push_tab_spans(&mut spans, 1, "api", false, theme::GLYPH_IDLE, theme::quiet());
-        assert_eq!(spans.len(), 8); // 7 parts + trailing gutter (C2, amended 2026-07-23)
+        push_tab_spans(&mut spans, 1, "api", false, theme::GLYPH_IDLE, theme::quiet(), 1);
+        assert_eq!(spans.len(), 9); // 8 parts + the count cell (C2, amended 2026-07-28)
         assert_eq!(spans[0].content.as_ref(), " ");
         assert_eq!(spans[0].style.fg, None);
         assert_eq!(spans[2].content.as_ref(), "2 api");
@@ -2376,6 +2455,86 @@ mod tests {
         assert_eq!(spans[2].style.bg, None);
         assert_eq!(spans[4].content.as_ref(), theme::GLYPH_IDLE.to_string());
         assert_eq!(spans[4].style, theme::quiet());
+        // A count below 2 still spends its column — blank, so the width is
+        // the same as the `3` above (C2's stability rule).
+        assert_eq!(spans[5].content.as_ref(), " ");
+    }
+
+    /// C2 (amended 2026-07-28): the count cell's whole vocabulary — blank
+    /// below 2, the digit through 9, `+` past that — and the invariant the
+    /// tab-width formula rests on: exactly one column, every time.
+    #[test]
+    fn tab_count_cell_is_blank_below_two_a_digit_to_nine_then_plus() {
+        assert_eq!(super::tab_count_cell(0), ' ');
+        assert_eq!(super::tab_count_cell(1), ' ', "one is what a glyph already means");
+        assert_eq!(super::tab_count_cell(2), '2');
+        assert_eq!(super::tab_count_cell(9), '9');
+        // Past nine the exact number stops being actionable and two digits
+        // would break the one-column rule the hit math is built on.
+        assert_eq!(super::tab_count_cell(10), '+');
+        assert_eq!(super::tab_count_cell(37), '+');
+        for n in [0usize, 1, 2, 5, 9, 10, 11, 100, 1000] {
+            assert_eq!(super::tab_count_cell_cols(n), 1, "count {n} must be one column");
+        }
+    }
+
+    /// The geometry rule the count exists under: a tab's drawn width is the
+    /// same before and after its count appears, so nothing on the bar moves
+    /// when a background agent's status flips. Measured through the real span
+    /// builder, not the formula — that is the half a formula can't prove.
+    #[test]
+    fn a_tabs_drawn_width_does_not_move_when_its_count_appears() {
+        let drawn = |count: usize| -> u16 {
+            let mut spans = Vec::new();
+            push_tab_spans(&mut spans, 0, "main", true, theme::GLYPH_NEEDS_INPUT, theme::accent(), count);
+            spans.iter().map(|s| mouse::display_width(&s.content)).sum()
+        };
+        let expected = mouse::tab_width(0, "main");
+        for count in [0usize, 1, 2, 9, 10, 42] {
+            assert_eq!(drawn(count), expected, "count {count} changed the tab's width");
+        }
+    }
+
+    /// C2 end to end through `draw()`: a tab holding three needy panes draws
+    /// `◆3`, and one holding a single needy pane draws `◆` with a blank cell
+    /// — the exact confusion the tribunal found (one diamond for any number
+    /// of blocked agents), and the fix, in the same frame.
+    #[test]
+    fn the_tab_bar_counts_panes_in_the_summarized_state() {
+        use crate::core::status::AgentStatus;
+        use crate::ports::PaneBackend;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // tab 0: three panes
+        app.apply(Action::NewTab); // tab 1: one pane
+        let bar = |app: &mut App<crate::ports::fakes::FakePane>| -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..100).filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol().to_string())).collect()
+        };
+
+        for id in [1u64, 2, 3] {
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        }
+        let row = bar(&mut app);
+        assert!(row.contains("◆3"), "three needy panes count on the tab bar:\n{row}");
+
+        // Knock two of them back down: the same tab, the same glyph, no count.
+        for id in [2u64, 3] {
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Idle);
+        }
+        let quiet_row = bar(&mut app);
+        assert!(!quiet_row.contains("◆3"), "the count follows the fleet:\n{quiet_row}");
+        assert!(quiet_row.contains('◆'), "...but the glyph still reports it:\n{quiet_row}");
+        // And the bar is the same length either way — the stability rule,
+        // observed on the drawn row rather than derived from the formula.
+        assert_eq!(row.trim_end().len(), quiet_row.trim_end().len());
     }
 
     #[test]
@@ -3194,6 +3353,32 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| super::draw(f, &mut app)).unwrap();
+    }
+
+    /// C27 shares C20's geometry, so it inherits the 80×24 proof — but the
+    /// roster also draws *rows built from other rows* (a group header padded
+    /// to the inner width, a C8 row one column narrower), which is where a
+    /// width underflow would land. Driven through the real `draw()` at the
+    /// spec's floor and at the 36×10 minimum, with a fleet big enough to
+    /// overflow the window.
+    #[test]
+    fn the_roster_draws_at_the_floor_and_below_it_without_panicking() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        for size in [Size::new(80, 24), Size::new(36, 10)] {
+            let mut app = mk_app(size);
+            for _ in 0..4 {
+                app.apply(Action::NewPane);
+            }
+            app.apply(Action::NewTab);
+            app.apply(Action::ToggleRoster);
+            let mut term =
+                Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+            term.draw(|f| super::draw(f, &mut app)).unwrap();
+        }
     }
 
     #[test]
