@@ -1,6 +1,8 @@
 # SPEC-parity — lessons from peer terminals: verified defects & contracts
 
-**Status: OPEN.** A living spec of defects and gaps that peer tools (tmux,
+**Status: CLOSED — P1–P21 are all fixed or shipped.** One sub-item is
+deliberately left undone and says so in place: P21's dump-to-editor half. A
+spec of defects and gaps that peer tools (tmux,
 zellij, wezterm, kitty, alacritty, ghostty, Claude Code's own issue tracker)
 spent years discovering, verified present in roost. Companion to SPEC-ux.md
 (which catalogues gaps found by direct UX review); items here came from mining
@@ -22,7 +24,7 @@ bug). Severity is impact for a user supervising AI-agent panes.
 
 ---
 
-## Workstreams (fix-surface grouping — implement in this order)
+## Workstreams (fix-surface grouping — the order they were implemented in)
 
 - **W1 · Pane env hygiene** — P11. Small; shrinks the blast radius of W2/W3
   (apps stop sniffing iTerm/kitty/tmux identity and negotiating protocols
@@ -41,7 +43,8 @@ bug). Severity is impact for a user supervising AI-agent panes.
   the live grid reflows on resize (scrollback keeps its historical width, the
   alternate screen never reflows), and the wheel over a protocol-less
   alternate-screen app becomes arrow keys; amends DESIGN-ui C21 and §5
-  (2026-07-27). P14 remains open.
+  (2026-07-27). P14 closed later, in two passes — the second deleted the two
+  shadow scroll-offset caches outright, so the defect became unrepresentable.
 - **W6 · Width & styling fidelity** — P15, P16, P17, P19 (+ SPEC-ux U24 as one
   bundle: unify unicode-width, fix continuation cells in blit *and*
   extraction, add missing SGR/REP arms). **Shipped** — all five FIXED; amends

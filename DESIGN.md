@@ -1,6 +1,10 @@
 # Roost — a session-native multiplexer for AI agent CLIs
 
-*Design doc v0.1 — July 2026. Working name "roost": your agents come home to roost after every reboot. Alternatives at the end.*
+*Design doc v0.1 — July 2026. The founding document: thesis, architecture, and the decisions roost was built from. It is kept as written except where a
+claim would now mislead; the specs of record for shipped behavior are
+[DESIGN-ui.md](DESIGN-ui.md) (chrome and keys, contracts C1–C28),
+[DESIGN-control.md](DESIGN-control.md) (control interface), and
+[README.md](README.md) (what the tool does today).*
 
 ## 1. Thesis
 
@@ -85,7 +89,7 @@ enum LayoutNode {
 - **Tabs**: one per project/repo typically. Tab bar on top, `Alt+1..9` to jump.
 - **Splits**: n-ary with ratios (simpler resize math than strict binary trees, matches zellij behavior).
 - **Stacked panes**: the star primitive for agents. Collapsed panes render as one-line title bars — *name + status badge* — so eight agents fit in the space of one. `Alt+↑/↓` moves through the stack; the expanded pane gets the room. A stack of collapsed agent title bars is effectively a live fleet dashboard for free.
-- **Floating panes**: deferred (the quick-launch picker will eventually want one).
+- **Floating panes**: shipped as one app-wide floating scratch shell (`Alt+f`, DESIGN-ui C22) — session-only, never persisted. The quick-launch picker stayed a modal rather than taking the float.
 
 ## 5. Lifecycle & persistence
 
@@ -93,7 +97,7 @@ enum LayoutNode {
 
 **The workspace file** is the whole product, morally:
 
-`~/.local/state/roost/workspace.json` (state, not config — config lives in `~/.config/roost/config.toml`)
+`~/.local/state/roost/workspace.json` on Linux; `~/Library/Application Support/roost/workspace.json` on macOS, which has no XDG state dir (state, not config — the planned `~/.config/roost/config.toml` is still unbuilt; roost is zero-config)
 
 ```jsonc
 {
@@ -204,13 +208,18 @@ One flat modifier layer, zellij-flavored but simpler (no modal locking in v1). A
 | `Alt+w` | close pane (confirm if status = Working) |
 | `Alt+r` | rename pane |
 | `Alt+q` | quit roost (saves workspace; agents die, sessions live) |
-| `Alt+Enter` | quick-launch picker: choose adapter + recent cwd (v1.2, floating pane) |
+| `Alt+Enter` | quick-launch picker: choose adapter + recent cwd |
 
 Everything else passes through to the pane raw — agents see a normal terminal.
 
+The layer grew well past this v1 table — zoom, float, roster, feed, copy mode,
+canned layouts, raw pass-through, tab stepping. The current keymap is
+[DESIGN-ui.md §8](DESIGN-ui.md) (the in-app `Alt+?` overlay is generated from
+the same table), and README lists it for users.
+
 ## 8. Rendering
 
-Per pane: `vt100::Parser` fed by the PTY reader thread maintains the grid; on redraw, roost blits the visible grid region into the pane's ratatui rect, plus a 1-row title bar (name, adapter icon, status badge). Scrollback: vt100's built-in buffer, `Alt+PgUp` enters scroll mode. Mouse support and full OSC passthrough (hyperlinks, clipboard) deferred; get keys and colors right first.
+Per pane: `vt100::Parser` fed by the PTY reader thread maintains the grid; on redraw, roost blits the visible grid region into the pane's ratatui rect, plus a 1-row title bar (name, adapter icon, status badge). Scrollback: vt100's built-in buffer, `Alt+PgUp` enters scroll mode. Mouse support and OSC passthrough both shipped after this was written: the wheel routes to the inner app or roost's own scrollback, clicks and drags forward to mouse-aware apps, `Alt`+click opens links, and OSC 9/52 are re-emitted to the host (SPEC-parity W3).
 
 Resize: on layout change, recompute rects → `pty.resize(rows, cols)` per pane → agents reflow themselves (they all handle SIGWINCH fine).
 
@@ -223,17 +232,9 @@ Each milestone is independently usable; stop anywhere and still have a tool.
 - **M2 ✓ — persistence + resume**: workspace.json, atomic debounced saves, restore-on-launch with the pi adapter (`--session`). Session detection via session-dir diffing (works before the extension exists). **← daily-driver threshold for the reboot story**
 - **M3 ✓ — status**: heuristic detector + the roost pi extension over the unix socket; border colors, badges, bell on NeedsInput. **← the v1 bar from the interview**
 - **M4 ✓ — stacked panes**: stack node, collapsed title bars, stack navigation. Fleet-at-a-glance.
-- **M5 ✓ — polish (partial: claude adapter, picker, notifications; floating panes + config deferred)**: claude adapter, quick-launch picker, macOS notifications, config file, generic TOML adapter.
+- **M5 ✓ — polish**: claude adapter, quick-launch picker, macOS notifications. Floating panes landed later as the `Alt+f` scratch shell; the config file and the generic TOML adapter are still unbuilt — roost is deliberately zero-config (see [ROADMAP.md](ROADMAP.md)).
 
 Risk notes: vt100 fidelity is the main unknown (agents use rich TUIs — pi and Claude Code both redraw aggressively). Mitigation: M0 exists precisely to stress this early; if `vt100` falls short, wezterm's `termwiz` is the upgrade path. Second risk: `NeedsInput` semantics differ per tool ("turn ended" vs "explicit question") — the adapter owns that interpretation, so wrongness stays local.
-
-## 10. Name candidates
-
-- **roost** — agents come home to roost after every reboot; short, brandable, `roost` free on crates.io-style naming vibes. *(used in this doc)*
-- **coop** — a coop full of agents; doubles as "co-op".
-- **perch** — where your agents sit; nice verb ("perch a new pane").
-- **aviary** — a place that houses many birds; more literal, longer.
-- **remux** — resume + mux; descriptive, less charming.
 
 ---
 

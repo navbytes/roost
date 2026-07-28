@@ -1,8 +1,11 @@
 # SPEC-ux — roost UX gaps: an open spec
 
-**Status: OPEN.** A living spec of user-facing gaps and the contracts proposed to
-close them. Nothing here is implemented yet; each item carries a verification
-status so implementation PRs can cite `U<n>` and flip the item to FIXED.
+**Status: one item open (U10); U1–U9 and U11–U27 are FIXED.** A spec of
+user-facing gaps and the contracts that closed them. Each item carries a
+verification status; implementation PRs cite `U<n>` and flip the item to FIXED,
+and the `U<n>` numbers are the vocabulary `src/` comments use for the *why*
+behind a behavior — which is what keeps this doc load-bearing after the fixes
+shipped.
 
 **Origin.** Two independent expert reviews (a Warp-trained lens: discoverability,
 affordances, mouse parity, recovery flows; a lazygit-trained lens: keyboard
