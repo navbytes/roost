@@ -101,14 +101,23 @@ wait`, ownership-scoped, audit-logged, CSPRNG control token). Left:
   sibling in the same adapter+cwd. A true fork (branch the agent's conversation)
   needs the pi extension to become bidirectional — pi branches its session and
   reports the new id, roost opens the pane on it.
-- **[perf] Audit-log rotation.** `<state>/control.log` is append-only and
-  unbounded; add size-based rotation.
+- ~~**[perf] Audit-log rotation.**~~ **DONE 2026-07-28.** `control.log`
+  rotates to `control.log.1` past 4 MiB (~100k control calls), keeping one
+  generation — so the trail is bounded at twice the cap and the part kept is
+  always the most recent. Rename rather than truncate-in-place: it is atomic,
+  so a reader tailing the log never sees a half-empty file. Best-effort and
+  silent, the same stance the append itself already took — an audit line that
+  cannot be written must not take a control call down with it.
 
 ## UX & robustness — deferred
 
-- **[choice] Tab-bar overflow past 9 tabs.** Beyond 9, tabs clip and only 1–9
-  are keyboard-reachable (`Alt+1..9`). Add horizontal scroll keeping the active
-  tab visible, or a tab-picker. Low priority (target is a few tabs).
+- ~~**[choice] Tab-bar overflow past 9 tabs.**~~ **ALREADY DONE — entry was
+  stale.** Both halves shipped without this being ticked off: U7 (2026-07-27)
+  added `Alt+0` for the last tab and `Alt+i`/`Alt+m` to step the strip with
+  wrap, so tabs past the ninth are keyboard-reachable; and C2's
+  `mouse::tab_scroll_start` scrolls the strip so the **active tab is always
+  visible**, with a `…` marking each end that hides tabs. C27's roster
+  (`Alt+Shift+a`) is the tab-picker this entry offered as the alternative.
 - **[choice] Dead-pane `Enter` retry.** Relaunching a dead pane re-runs the same
   resume command even if it just failed permanently; could distinguish transient
   vs permanent failure. Rare now that pi/claude ids are reliable.

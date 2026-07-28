@@ -444,6 +444,10 @@ pub struct App<B: PaneBackend> {
     /// origin app never saw its release (left stuck mid-selection) and the
     /// neighbour got orphan drag/up events for a press it never received.
     mouse_latch: Option<PaneId>,
+    /// U21: the pane seam a left-drag is currently resizing, latched at
+    /// button-down like `mouse_latch` and for the same reason — the pointer
+    /// leaves the two-cell border almost immediately once the drag starts.
+    resize_drag: Option<crate::ui::mouse::Seam>,
     /// W3: bytes roost owes its OWN terminal — pane OSC 9 notifications
     /// (P2) and OSC 52 clipboard writes (P3) forwarded on a pane's behalf.
     /// Queued rather than written because core does no I/O (module doc) and
@@ -524,6 +528,7 @@ impl<B: PaneBackend> App<B> {
             pending_yank: None,
             pending_open: None,
             mouse_latch: None,
+            resize_drag: None,
             host_out: Vec::new(),
             host_title: String::new(),
             last_host_title: None,
@@ -753,6 +758,77 @@ impl<B: PaneBackend> App<B> {
     /// P20: latch a gesture to `id` (button-down), or clear it (release).
     pub fn set_mouse_latch(&mut self, id: Option<PaneId>) {
         self.mouse_latch = id;
+    }
+
+    /// U21: a left press landed on the seam between two panes — start a
+    /// resize gesture instead of the usual focus-and-forward. Returns
+    /// whether one started, so the caller can stop routing this press.
+    ///
+    /// Deliberately does **not** move focus. Grabbing a border is an act on
+    /// the layout, not a choice of which pane to type into, and stealing
+    /// focus from the pane you were working in to the one you happened to
+    /// drag past would be a side effect nobody asked for.
+    pub fn begin_seam_drag(&mut self, col: u16, row: u16) -> bool {
+        // C21: a zoomed pane fills the body and has no seam; C22's float
+        // lives outside the layout tree, so its edges resize nothing.
+        if self.zoomed {
+            return false;
+        }
+        let rects = self.display_rects();
+        let seam = crate::ui::mouse::seam_at(&rects, col, row);
+        let started = seam.is_some();
+        self.resize_drag = seam;
+        started
+    }
+
+    /// U21: the pointer moved during a seam drag — move the border to it.
+    ///
+    /// A **closed loop on the drawn geometry**, not an accumulated offset:
+    /// every event measures where the border actually is now and asks for
+    /// the ratio change that would put it under the cursor. `resize_pane`
+    /// works in ratios of a split whose extent this layer cannot see (the
+    /// pair may be nested two splits deep), so any open-loop conversion
+    /// would drift — under-move on nested splits, over-move on wide ones,
+    /// and never recover. Measuring each time means an imperfect estimate
+    /// is corrected by the next event a cell later, which is what makes the
+    /// border track the pointer instead of lagging it.
+    pub fn drag_seam(&mut self, col: u16, row: u16) {
+        let Some(seam) = self.resize_drag else { return };
+        let rects = self.display_rects();
+        let (Some(a), Some(b)) = (
+            rects.iter().find(|p| p.id == seam.a).map(|p| p.rect),
+            rects.iter().find(|p| p.id == seam.b).map(|p| p.rect),
+        ) else {
+            self.resize_drag = None; // a pane went away mid-drag
+            return;
+        };
+        let (border, want, extent, axis) = if seam.vertical {
+            (b.x as i32, col as i32, (a.width + b.width).max(1), SplitDir::Vertical)
+        } else {
+            (b.y as i32, row as i32, (a.height + b.height).max(1), SplitDir::Horizontal)
+        };
+        let moved = want - border;
+        if moved == 0 {
+            return;
+        }
+        let delta = moved as f32 / extent as f32;
+        let target = seam.a;
+        layout::resize_pane(&mut self.ws.active_tab_mut().layout, target, axis, delta);
+        self.relayout();
+    }
+
+    /// U21: the drag ended. Saving here rather than on every drag event —
+    /// a resize writes the workspace, and a drag emits one event per cell.
+    pub fn end_seam_drag(&mut self) {
+        if self.resize_drag.take().is_some() {
+            self.save();
+        }
+    }
+
+    /// U21: is a seam drag in progress? The mouse path checks this to keep
+    /// routing drag/release to the resize rather than to a pane.
+    pub fn seam_dragging(&self) -> bool {
+        self.resize_drag.is_some()
     }
 
     pub fn pane_order(&self) -> Vec<PaneId> {
@@ -1331,9 +1407,9 @@ impl<B: PaneBackend> App<B> {
         let line =
             format!("{ts} {principal} {} -> {outcome} {}\n", sanitize(summary), sanitize(detail));
         use std::io::Write;
-        if let Ok(mut f) =
-            std::fs::OpenOptions::new().create(true).append(true).open(dir.join("control.log"))
-        {
+        let path = dir.join("control.log");
+        rotate_audit_log(&path, AUDIT_LOG_MAX);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = f.write_all(line.as_bytes());
         }
     }
@@ -4682,6 +4758,31 @@ fn is_busy(status: AgentStatus) -> bool {
     matches!(status, AgentStatus::Working | AgentStatus::NeedsInput)
 }
 
+/// Rotate `<state>/control.log` past this size. One generation is kept, so
+/// the audit trail costs at most `2 × AUDIT_LOG_MAX` on disk.
+///
+/// 4 MiB is roughly a hundred thousand control calls — far more than any
+/// session produces, so an interactive user never sees a rotation, while a
+/// scripted orchestrator hammering `send`/`read` in a loop can no longer
+/// grow the file without bound (the ROADMAP's `[perf] Audit-log rotation`).
+const AUDIT_LOG_MAX: u64 = 4 * 1024 * 1024;
+
+/// Size-based rotation for the audit log: `control.log` → `control.log.1`,
+/// replacing any previous `.1`, once the live file passes `max`.
+///
+/// Rename rather than truncate-in-place: a rename is atomic, so a reader
+/// tailing the log never observes a half-empty file, and the most recent
+/// generation survives for exactly as long as it takes the next one to fill.
+/// Deliberately best-effort and silent — an audit line that cannot be
+/// written must never take a control call down with it, which is the same
+/// stance the append below already takes.
+fn rotate_audit_log(path: &std::path::Path, max: u64) {
+    let too_big = std::fs::metadata(path).map(|m| m.len() >= max).unwrap_or(false);
+    if too_big {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+}
+
 /// C20: the feed overlay's `(width, height)` at the given body area —
 /// `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`. Shared by
 /// the renderer (geometry) and `handle_mode_key` (PgUp/PgDn page size) so
@@ -6279,6 +6380,40 @@ mod tests {
         assert!(lines[0].contains(" err "), "denied wait must audit as err: {}", lines[0]);
         assert!(!lines[0].contains("parked"), "denied wait must not claim it parked: {}", lines[0]);
         assert!(lines[1].contains("FORGED"), "content preserved, just de-lined: {}", lines[1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The audit log was append-only and unbounded — fine for a human, but a
+    /// scripted orchestrator looping `send`/`read` grows it forever.
+    /// Rotation keeps one generation, so the trail costs at most twice the
+    /// cap on disk and the *most recent* history is always the part kept.
+    #[test]
+    fn the_audit_log_rotates_once_it_passes_its_cap_and_keeps_one_generation() {
+        let dir = std::env::temp_dir().join(format!("roost-audit-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("control.log");
+        let old = dir.join("control.log.1");
+
+        // Under the cap: nothing moves, however many times it is checked.
+        std::fs::write(&log, b"a line\n").unwrap();
+        super::rotate_audit_log(&log, 64);
+        assert!(log.exists() && !old.exists(), "a small log is left alone");
+
+        // Past it: the live file becomes the kept generation and the next
+        // write starts a fresh one.
+        std::fs::write(&log, vec![b'x'; 64]).unwrap();
+        super::rotate_audit_log(&log, 64);
+        assert!(!log.exists(), "the live file was rotated away");
+        assert_eq!(std::fs::metadata(&old).unwrap().len(), 64, "…into .1, intact");
+
+        // Rotating again replaces the previous generation rather than
+        // accumulating .2, .3, … — the bound is two files, not a series.
+        std::fs::write(&log, vec![b'y'; 64]).unwrap();
+        super::rotate_audit_log(&log, 64);
+        assert_eq!(std::fs::read(&old).unwrap(), vec![b'y'; 64], ".1 is the newer generation");
+        assert!(!dir.join("control.log.2").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

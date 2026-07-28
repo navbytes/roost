@@ -555,6 +555,27 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
+    // U21: a left press on the seam between two panes drags that border
+    // instead of focusing. Checked ahead of the pane paths below because a
+    // pane's rect *includes* its border (C3), so hit-testing would happily
+    // claim the seam for one of the two panes and forward the drag into it.
+    // Only a *shared* border is a seam — a pane's outer edge, against the
+    // body, still focuses like any other cell of it.
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) if app.begin_seam_drag(me.column, me.row) => {
+            return;
+        }
+        MouseEventKind::Drag(_) if app.seam_dragging() => {
+            app.drag_seam(me.column, me.row);
+            return;
+        }
+        MouseEventKind::Up(_) if app.seam_dragging() => {
+            app.end_seam_drag();
+            return;
+        }
+        _ => {}
+    }
+
     // C21/§5: zoom-aware — while zoomed, the display list is just the
     // zoomed pane, so body clicks/wheel can only ever hit it.
     let rects = app.display_rects();
@@ -997,6 +1018,112 @@ mod tests {
         assert_eq!(app.rects().len(), 2, "the clicked row spawned a pane");
         let spawned = app.focused;
         assert_eq!(app.find_spec(spawned).map(|s| s.adapter.clone()), Some(items[items.len() - 1].into()));
+    }
+
+    // ---- U21: drag a shared border to resize -----------------------------
+
+    fn drag_to(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    fn release_at(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// U21: press the seam between two side-by-side panes, drag right, and
+    /// the border follows the pointer — the split really moves, and the
+    /// pane that grew is the one on the left of the seam.
+    #[test]
+    fn dragging_a_shared_border_resizes_the_split() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // two panes, side by side at 100 cols
+        let order = app.pane_order();
+        let (left, right) = (order[0], order[1]);
+        let rects = app.display_rects();
+        let lr = rects.iter().find(|p| p.id == left).unwrap().rect;
+        let rr = rects.iter().find(|p| p.id == right).unwrap().rect;
+        assert_eq!(rr.x, lr.x + lr.width, "the fixture really is a vertical split");
+        let seam = rr.x;
+        let before = lr.width;
+
+        handle_mouse(&mut app, click(seam, lr.y + 2));
+        assert!(app.seam_dragging(), "the press on the seam started a drag");
+        handle_mouse(&mut app, drag_to(seam + 10, lr.y + 2));
+        handle_mouse(&mut app, release_at(seam + 10, lr.y + 2));
+        assert!(!app.seam_dragging(), "the release ended it");
+
+        let after = app.display_rects().iter().find(|p| p.id == left).unwrap().rect.width;
+        assert!(after > before, "the left pane grew: {before} → {after}");
+        // Closed loop on the drawn geometry: the border should land on the
+        // pointer, not somewhere proportionally short of it.
+        let landed = app.display_rects().iter().find(|p| p.id == right).unwrap().rect.x;
+        assert!(
+            landed.abs_diff(seam + 10) <= 1,
+            "the border tracked the pointer: wanted {}, got {landed}",
+            seam + 10,
+        );
+    }
+
+    /// …and it does not steal focus. Grabbing a border is an act on the
+    /// layout, not a choice of which pane to type into.
+    #[test]
+    fn a_seam_drag_leaves_focus_where_it_was() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane);
+        let order = app.pane_order();
+        let focused = app.focused;
+        let other = order.iter().copied().find(|id| *id != focused).unwrap();
+        let rects = app.display_rects();
+        let seam = rects.iter().find(|p| p.id == other).unwrap().rect;
+        let lr = rects.iter().find(|p| p.id == focused).unwrap().rect;
+        // Whichever side the unfocused pane is on, its inner edge is a seam.
+        let (col, row) = if seam.x > lr.x { (seam.x, seam.y + 2) } else { (lr.x, lr.y + 2) };
+        handle_mouse(&mut app, click(col, row));
+        handle_mouse(&mut app, drag_to(col + 3, row));
+        handle_mouse(&mut app, release_at(col + 3, row));
+        assert_eq!(app.focused, focused, "the drag moved the border, not the focus");
+    }
+
+    /// A pane's *outer* border — the one against the body edge, shared with
+    /// nothing — is not a seam, so clicking it still focuses that pane like
+    /// any other cell of it.
+    #[test]
+    fn an_outer_border_is_not_a_seam_and_still_focuses() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane);
+        let order = app.pane_order();
+        let first = order[0];
+        assert_ne!(app.focused, first, "NewPane focuses the pane it created");
+        let body = app.body_area();
+        let r = app.display_rects().iter().find(|p| p.id == first).unwrap().rect;
+        // The far-left column of the leftmost pane touches the body edge.
+        assert_eq!(r.x, body.x);
+        handle_mouse(&mut app, click(r.x, r.y + 2));
+        assert!(!app.seam_dragging(), "no drag started on an outer border");
+        assert_eq!(app.focused, first, "the click focused the pane");
+    }
+
+    /// C21: a zoomed pane fills the body and has no seam to grab — the
+    /// click must fall through to the ordinary pane path rather than
+    /// latching a drag onto geometry that isn't there.
+    #[test]
+    fn a_zoomed_pane_has_no_seam() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        let r = app.display_rects()[0].rect;
+        handle_mouse(&mut app, click(r.x + r.width - 1, r.y + 2));
+        assert!(!app.seam_dragging());
     }
 
     /// Help closes on any click (C15's "any key closes it", in mouse form);

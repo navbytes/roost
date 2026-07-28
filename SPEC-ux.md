@@ -392,10 +392,49 @@ are new state, not a missing binding (C14 amended 2026-07-27).
   reconstructs itself from the precious state on every start. C14/C9/§8
   amended 2026-07-27.
 
-### U21 · Low · OPEN — mouse can't resize; tabs are click-to-switch only
+### U21 · Low · FIXED (resize) / REJECTED (middle-click close) — mouse can't resize; tabs are click-to-switch only
 No border drag-resize, no middle-click close, no drag-reorder.
 **Proposed contract:** drag a shared border to resize; middle-click closes a
 tab through the same confirm guard.
+
+**Fixed (resize):** a left press on the border *between two panes* drags that
+split; `mouse::seam_at` finds the seam and `App::drag_seam` moves it.
+
+Two details are load-bearing:
+- **The seam is two cells wide.** Every pane draws its own border (C3), so
+  neighbours are separated by `a`'s far edge and `b`'s near edge. Both count
+  — a user aiming at "the line between the panes" cannot be expected to
+  distinguish them, and one-cell mouse targets are unkind. A pane's *outer*
+  border, shared with nothing, is not a seam and still focuses.
+- **The drag is a closed loop on the drawn geometry**, not an accumulated
+  offset. `layout::resize_pane` works in ratios of a split whose extent the
+  mouse layer cannot see (the pair may be nested two splits deep), so any
+  open-loop cell→ratio conversion drifts: it under-moves on a nested split
+  and never catches up. Each event instead measures where the border *is*
+  and asks for the change that would put it under the cursor, so an
+  imperfect estimate is corrected a cell later. The test pins the border
+  landing within one column of the pointer, which an open-loop version
+  fails.
+
+A seam drag deliberately **does not move focus**: grabbing a border is an act
+on the layout, not a choice of which pane to type into. Zoom has no seam
+(C21: one pane fills the body), and collapsed stack members are excluded —
+their "borders" are C6/C8's own rows, not a split ratio.
+
+**Rejected (middle-click close), and recorded rather than quietly dropped:**
+this half contradicts a standing decision. **C26** contracts that *tabs die
+by last-pane close only*, and DESIGN-ui's "deliberately left out" list names
+"a close-whole-tab gesture" explicitly. The reasoning holds up: a tab can
+hold several agents, so closing one is the most destructive thing in the
+TUI short of `Alt+q` — and middle-click is the *worst* button to spend on
+it, being the one that pastes on X11 and is easy to hit by accident on a
+tilt-wheel. It would also be the only destructive verb in roost reachable
+without a confirm-able keystroke, which is the same fat-finger argument
+that keeps broadcast CLI-only (§7). Re-opening this means re-arguing C26,
+not just implementing a click.
+
+**Not done, not argued:** drag-to-reorder tabs. It is neither contradicted
+nor contracted; it is simply not built.
 
 ### U22 · Low · FIXED (both halves) — busy-close confirm fires on heuristic Working; window mismatch
 Any PTY output in the last ~2 s counts as Working, so closing a shell right
