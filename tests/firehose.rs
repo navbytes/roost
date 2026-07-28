@@ -177,9 +177,11 @@ fn firehose_latency_starvation_and_clean_exit() {
     latencies.sort();
     let p50 = latencies[latencies.len() / 2];
     let max = *latencies.last().unwrap();
-    // Always printed, budget or no budget: the distribution is the thing
+    // Always emitted, budget or no budget: the distribution is the thing
     // worth reading over time, and on a runner with a loosened bound it is
     // the only way to notice latency creeping up while the gate stays green.
+    // libtest captures this for a *passing* test — which is exactly the run
+    // whose numbers matter — so CI passes `--show-output` to get it back.
     eprintln!(
         "firehose echo latency: p50={p50:?} max={max:?} (n={}, bound={budget:?})",
         latencies.len()
