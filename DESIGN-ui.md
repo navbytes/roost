@@ -23,81 +23,155 @@ dim/strikethrough mapping (SPEC-parity P16). Read C18's own amendment before
 auditing it; the restated predicate is *"does the blit add anything the program
 did not emit?"*. `conv_color` and the C1 grep gates are untouched.
 
+**Amendment 2026-07-27 (theme inheritance) — read §2 before auditing any
+contract below.** A user on a light-theme terminal reported the tab bar and
+hint bar rendering as near-black bands and the **active tab's label being
+invisible** (near-white ink on `Color::Reset` = their white background).
+roost's chrome now inherits the terminal's palette instead of shipping fixed
+hues. Consequences that touch every contract with a colour in it:
+- The token names changed and two of them merged — see §2's rename map. Any
+  `FG`/`MUTED`/`DIM`/`RULE`/`ACCENT`/`ACCENT_DIM` still spelled below is the
+  pre-amendment wording; read it through the map.
+- `BG`, `TAB_STRIP` and `BAR` are **deleted**. **No chrome surface has a
+  background fill any more** — where a contract below says "bg `X`", the
+  current rule is either `attention()` (`REVERSED`, for the three surfaces
+  that must shout) or no fill at all. The per-contract amendments say which.
+- Exact-hue auditing is retired: there are no hexes left to match. The
+  auditable predicates are the §2 legibility principle and the four mechanical
+  gates it names — they replace the old "hex values match exactly or they
+  don't" rule for chrome colour, which now has nothing to compare against.
+
 ---
 
 ## 1. Design thesis
 
-> **Chrome is ink · paper · one red; program output keeps its own colors.**
+> **Chrome is the user's own ink on the user's own paper, plus their one red;
+> program output keeps its own colors.**
 
 Everything roost draws itself (tab bar, borders, badges, stack chrome, hint
-bar, modals) uses exactly one accent hue plus a warm gray ramp. Everything a
-program draws inside a pane passes through the vt100 blit byte-faithfully and
-keeps its own palette. Red is never decoration: it means either *focus* or
-*roost wants your attention* (live keys, needs-input, working pulse, failure).
+bar, modals) is built from the terminal's own palette — one accent hue plus
+the ink the user's shell prompt already uses. Everything a program draws
+inside a pane passes through the vt100 blit byte-faithfully and keeps its own
+palette. Red is never decoration: it means either *focus* or *roost wants your
+attention* (live keys, needs-input, working pulse, failure).
+
+**[Amended 2026-07-27 — the thesis line used to read "ink · paper · one red"
+with fixed hues.]** See §2.
 
 ---
 
 ## 2. Token table
 
-| Token | Hex | ratatui expression | Where used in chrome |
-|---|---|---|---|
-| `BG` | `#15120f` | `Color::Rgb(21, 18, 15)` | "paper". Active tab cell bg is `Color::Reset` (see stance below); `BG` itself is referenced only if a surface ever needs an explicit paper fill. |
-| `FG` | `#eae5df` | `Color::Rgb(234, 229, 223)` | primary ink: active tab label, waiting glyph ○, modal titles/body, dead-pane bar text, flash text, working/needs-input collapsed row names |
-| `MUTED` | `#8f8983` | `Color::Rgb(143, 137, 131)` | secondary ink: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, waiting/idle collapsed row names |
-| `DIM` | `#57524b` | `Color::Rgb(87, 82, 75)` | tertiary ink: idle glyph ·, tab-bar right status, stack header, collapsed-row right text, exited row names, hint-bar mode word |
-| `RULE` | `#332f2a` | `Color::Rgb(51, 47, 42)` | structure: unfocused pane borders, tab separators `│`, focused collapsed-row bg, flash bg |
-| `ACCENT` | `#ff563c` | `Color::Rgb(255, 86, 60)` | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, ● working (pulse phase A), modal borders, "◆ N needs you", "save failed" |
-| `ACCENT_DIM` | `#a83a28` | `Color::Rgb(168, 58, 40)` | ✕ exited glyph, expanded-stack edge `▌`, ● working pulse phase B, dead-pane action bar bg, alt-warning bg, `raw` badge token (C23) |
-| `TAB_STRIP` | `#1b1713` | `Color::Rgb(27, 23, 19)` | tab bar row bg (inactive cells + fill + right status area) |
-| `BAR` | `#211d19` | `Color::Rgb(33, 29, 25)` | hint bar row bg |
-| `ok` | `#7fae7f` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
-| `warn` | `#d8a657` | — not defined in theme | **no chrome role.** Same rule. (Alt-warning uses `ACCENT_DIM`, not warn.) |
-| `info` | `#8fb2c9` | — not defined in theme | **no chrome role.** Same rule. |
+**[Amended 2026-07-27 — chrome inherits the terminal's theme.]** Every token
+below used to be a fixed `Rgb(..)` triple from the mockup. A user on a light
+terminal reported the tab bar and hint bar rendering as near-black bands and
+the **active tab's label being invisible**: it was drawn in the near-white
+`#eae5df` on `Color::Reset`, i.e. white text on the user's white background.
+That was not an oversight — it was this section's own stance, logged as
+SPEC-GAP-4. The stance is now reversed, and the tokens are styles rather than
+colours. Names below are the accessors in `src/ui/theme.rs`; the old
+`SCREAMING_CASE` names are gone. Rename map for reading older text in this
+document: `FG`→`ink`, `MUTED`/`DIM`→`quiet` (they collapse), `RULE`→`rule`,
+`ACCENT`→`accent`, `ACCENT_DIM`→`accent_quiet`, pulse phase A→`pulse_bright`,
+pulse phase B→`accent`; `BG`, `TAB_STRIP` and `BAR` are **deleted**.
 
-All nine chrome tokens live as `pub const` in a new `src/ui/theme.rs` (C1).
-The ok/warn/info trio is deliberately **not** defined there — defining unused
-consts invites casual reuse and dilutes the one-red rule.
+| Token | ratatui expression | Where used in chrome |
+|---|---|---|
+| `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text |
+| `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…` |
+| `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders, tab separators `│`. Never text (see the legibility principle). |
+| `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, ● working (pulse phase B), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
+| `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, `raw` badge token (C23), `↑N` badge token (U3) |
+| `pulse_bright()` | `Color::LightRed` (ANSI 9) | ● working, pulse phase A — and nothing else |
+| `attention()` | `Modifier::REVERSED`, no colour | the three attention surfaces: flash (C10), alt-warning bar (C11), dead-pane action bar (C16) |
+| `ACTIVE_TAB_BG` | `Color::Reset` | the only `bg` chrome sets anywhere, and it sets it to *nothing* (C2) |
+| `ok` / `warn` / `info` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
 
-### Truecolor stance
+All chrome styling lives in `src/ui/theme.rs` (C1) — accessors now rather than
+consts, because a token is a whole `Style` (colour *and* modifier) and
+`Style`'s builders are not `const fn`. The ok/warn/info trio is deliberately
+**not** defined there — defining unused tokens invites casual reuse and
+dilutes the one-red rule.
 
-**Truecolor required; modern-terminal target; no fallback palette.**
+### The legibility principle
 
-- All chrome colors are `Color::Rgb(..)`. No named-ANSI variants, no palette
-  detection, no config (zero-config stands).
-- Justification: the design's identity is exact hue discipline (three grays
-  seven RGB points apart carry the whole hierarchy). A named-ANSI fallback
-  would re-import the user-theme variance this redesign exists to remove, and
-  roost's audience (people multiplexing AI-agent CLIs) runs modern emulators
-  (iTerm2, kitty, WezTerm, Alacritty, Ghostty, Windows Terminal — all
-  truecolor).
-- Degradation position: on non-truecolor terminals (notably stock macOS
-  Terminal.app, which quantizes RGB SGR to the 256 palette) colors approximate;
-  near-neighbors `BG`/`TAB_STRIP`/`BAR` may collapse to one shade. Acceptable:
-  the fg ramp (FG/MUTED/DIM) and the accent survive quantization, and nothing
-  breaks functionally. Document "best on a truecolor terminal with a
-  `#15120f`-family background" in the README; ship no code path for it.
+Theme variance is concentrated in the ANSI 8 slot. Variance is therefore
+allowed **only where degradation is graceful**:
 
-### Background policy (paper stance)
+- **Text always derives from `Color::Reset`** — the terminal's own foreground
+  on its own background: the one contrast pair the user has already validated,
+  because it is what every line of their shell output uses. Legible by
+  construction, in light, dark and tinted themes alike.
+- **The quieter text rung is `Reset` + `Modifier::DIM`.** Worst case a
+  terminal ignores DIM and it renders as primary ink; it can never become
+  invisible. This is why there are **two** text rungs and not three: a third
+  spelled out of ANSI 8 would put words in the one colour a theme is free to
+  swallow.
+- **ANSI 8 (`rule()`) is structure only** — borders, separators, rules. If a
+  theme makes it faint you lose a hairline, not a word.
+- **Attention surfaces use `Modifier::REVERSED`, never a colour fill.**
+  Reversing the terminal's own fg/bg is guaranteed contrasty in any theme.
+- **The one red is the user's red**: ANSI 1, with ANSI 9 for the bright half
+  of the pulse. The pulse may **not** lean on DIM — a terminal that ignores
+  the modifier would kill the animation outright — so its two phases are two
+  guaranteed-visible reds (C5).
 
-roost does **not** repaint the terminal background. The `#15120f` paper is
-assumed to be (approximately) the user's terminal background; program cells
-with default bg continue to show terminal-default through the blit. Chrome
-sets an explicit bg **only** on: the tab bar row (`TAB_STRIP`), the hint bar
-row (`BAR`), the flash (`RULE`), the alt-warning and dead-pane action bars
-(`ACCENT_DIM`), and the focused collapsed row (`RULE`). The active tab cell bg
-is `Color::Reset` so it visually fuses with the body, whatever the terminal bg
-is — the mockup's "active tab shares the body background" effect without
-assuming we own the background. (SPEC-GAP-4 below.)
+### Theme-inherited stance
+
+**Inherit the terminal's palette; no curated palettes, no light/dark
+detection, no config (zero-config stands).**
+
+- Chrome names only `Color::Reset`, `Color::DarkGray`, `Color::Red`,
+  `Color::LightRed` and modifiers. **No `Color::Rgb` and no `Color::Indexed`
+  anywhere under `src/`** — the sole exemption is the vt100 blit's
+  `conv_color`/`cell_style`, which carry *program* output and must keep the
+  full palette (C18). Mechanically gated by
+  `theme::tests::no_truecolor_or_indexed_colour_is_constructed_in_src`, a
+  source scan honouring a `chrome-gate-exempt` marker.
+- Justification: roost is chrome *around* other programs' output, so it should
+  recede into the theme the user already chose. Inheriting is correct for
+  **all** themes rather than a light/dark binary, survives a live theme switch
+  with no restart, and needs no detection machinery at all.
+- What is preserved from the old stance is the *discipline*, not the hues: one
+  accent, quiet structure, glyphs that carry meaning by shape (§ glyph
+  inventory), no decoration. What is dropped is the exact-hue requirement —
+  and with it the mockup's authority over specific values. Where
+  `docs/tui-design.html` shows a hex, it now documents the *relationship*
+  (ink ≫ quiet ≫ structure, one red apart from all of them), not the colour;
+  that is not a spec/mockup conflict to flag.
+
+### Background policy
+
+**Chrome paints no background fill at all.** roost does not repaint the
+terminal background, and it no longer paints bands on top of it either: the
+tab bar row, the hint bar row, the flash, the alt-warning bar, the dead-pane
+action bar and the focused collapsed row have all lost their fills. The three
+that needed to *shout* became `attention()` (`REVERSED`); the two bars and the
+focused collapsed row carry no surface of their own and are distinguished by
+ink weight and markers instead. The active tab cell's bg is `Color::Reset` —
+the single `bg` chrome sets, and it sets it to nothing, so the label fuses
+with whatever the terminal's own background is.
+
+Mechanically gated twice: `theme::tests::no_chrome_call_site_sets_a_background_fill`
+(source scan under `src/ui/`) and `render::tests::chrome_paints_no_background_fill`
+(every cell of every drawn chrome state). A companion gate,
+`render::tests::structure_colour_never_carries_text`, enforces that `rule()`
+appears on no text-bearing cell. (SPEC-GAP-4, closed by this amendment.)
 
 ### Bold policy
 
 Chrome uses **no `Modifier::BOLD` anywhere** (the mockup's TUI region is
-regular weight throughout; color carries hierarchy). Current BOLD uses (brand
-block, active tab, glyphs, dialog borders, help keys, hint keys, flash,
-focused border) are all removed. Modifiers still permitted: `DIM` (modal
-backdrop mechanism, C12), `REVERSED` (copy selection C17 + copy cursor C24),
-`UNDERLINED` (stack header rule C6 + copy cursor-in-selection C24). Program
-output keeps whatever attributes it sent.
+regular weight throughout; hierarchy is carried by ink weight and the one
+red). Modifiers permitted, and what each is load-bearing for:
+- `DIM` — the quiet text rung and the quiet red (§2 table), plus the modal
+  backdrop mechanism (C12). **[Amended 2026-07-27]** it is a token component
+  now, not only a mechanism.
+- `REVERSED` — the three attention surfaces (C10/C11/C16), copy selection
+  (C17), copy cursor (C24), search hits (C17 amendment).
+- `UNDERLINED` — the stack header rule (C6), the copy cursor inside a
+  selection and the current search hit (C24/C17).
+
+Program output keeps whatever attributes it sent.
 
 ### Glyph inventory (chrome)
 
@@ -133,13 +207,33 @@ is ALIGNED iff all its bullets hold in the rendered output / code.
 :379, :392–397`).
 
 **Target:**
-- `src/ui/theme.rs` exists, exporting: the nine chrome color consts from the
-  token table; the status-glyph mapping (C5); the pulse phase function (C5);
-  and the chrome glyph consts listed above.
+- `src/ui/theme.rs` exists, exporting: the chrome style tokens from the §2
+  table; the status-glyph mapping (C5); the pulse phase function (C5); and the
+  chrome glyph consts listed above.
 - `grep -n 'Color::' src/ui/render.rs` matches only inside the vt100 blit
-  section (`conv_color` / `cell_style`, currently `:470–499`) — all chrome
-  styles are built from `theme::` items.
+  section (`conv_color` / `cell_style`) — all chrome styles are built from
+  `theme::` items.
 - No `Color::` literal for ok/warn/info hues exists anywhere under `src/ui/`.
+
+**[Amended 2026-07-27, theme inheritance]** The token table is now styles, not
+colours, so the exports are **accessor fns** (`ink`, `quiet`, `rule`,
+`accent`, `accent_quiet`, `pulse_bright`, `attention`) plus the
+`ACTIVE_TAB_BG` sentinel const — a token carries a modifier as well as a
+colour and `Style`'s builders are not `const fn`. theme.rs remains the single
+source of chrome styling, which is what this contract has always been about;
+the "tokens only from theme.rs" gate is unchanged in force. Three new
+mechanical gates ride with it, and their failure is a C1 DEVIATED:
+- `theme::tests::no_truecolor_or_indexed_colour_is_constructed_in_src` —
+  chrome inherits or it doesn't ship (§2 stance), with the marked
+  program-output exemption in `conv_color`/`cell_style`.
+- `theme::tests::no_chrome_call_site_sets_a_background_fill` and
+  `render::tests::chrome_paints_no_background_fill` — §2 background policy,
+  scanned in source and measured on drawn frames.
+- `render::tests::structure_colour_never_carries_text` — `rule()` (ANSI 8) is
+  structure only; a `DarkGray` cell must hold a box-drawing glyph or a blank.
+Two further tests pin the principle itself:
+`theme::tests::both_text_rungs_derive_from_reset` and
+`render::tests::every_chrome_word_is_drawn_in_ink_the_user_already_reads`.
 
 ### C2 — Tab bar
 
@@ -259,6 +353,27 @@ another closes):
   shift on close/reorder/undo, so a tab's entry is the one remembered id that
   tab still owns — a vanished tab can never hand its memory to another.
 
+**[Amended 2026-07-27, theme inheritance — the bar loses its strip and the
+active tab loses its highlight]** This is the contract the reported bug lived
+in. `TAB_STRIP` is deleted:
+- **Row 0 has no fill.** The bar is ink on the terminal's own paper; the gap
+  before the status area and the row past the last tab show the user's
+  background, not a band roost painted over it. (A near-black strip on a light
+  terminal was half of what the user saw.)
+- **Active vs inactive is ink weight plus the `▎` marker**, never a
+  background: active label = `ink()` with the `ACTIVE_TAB_BG` (`Color::Reset`)
+  sentinel, inactive label = `quiet()`. The old rule — near-white `FG` on
+  `Color::Reset` — spelled *white text on the user's white background*, which
+  is precisely why the active tab was invisible. There is no "inactive bg =
+  `TAB_STRIP`" any more; inactive cells set no bg at all.
+- Glyph table per C5 as amended; separator `│` stays `rule()` — structure,
+  where a faint theme costs a hairline rather than a word.
+- The **status area** (U15) keeps its relative rule, respelled for a two-rung
+  ramp: the mode word reads a step brighter than the cwd beside it, which is
+  now `ink()` over `quiet()`. The saved word is `quiet()`, "save failed"
+  `accent()`. There is no `TAB_STRIP` beneath any of it. Width math, overflow
+  markers and every hitbox are untouched.
+
 ### C3 — Pane borders
 
 **Current:** `render.rs:344–351` — focused = status-colored + BOLD, unfocused
@@ -273,6 +388,12 @@ another closes):
 - The border-embedded title line is **removed** (no `.title(...)` on pane
   blocks). Pane identity moves entirely to the corner badge (C4); the
   `[scroll]` tag is dropped — the hint bar's mode word `SCROLL` (C9) covers it.
+
+**[Amended 2026-07-27, theme inheritance]** Focused border fg = `accent()`
+(the user's ANSI 1); unfocused border fg = `rule()` (ANSI 8). Borders are the
+sanctioned home of the theme-variant slot: a theme that renders ANSI 8 faint
+costs a hairline here and nothing else. Everything else in this contract —
+`BorderType::Plain`, no BOLD, no border title — is unchanged.
 
 ### C4 — Corner badge
 
@@ -335,6 +456,12 @@ with tests `:530–555`.
   the pulse. Collapsed rows and the tab bar keep pulsing — they show no
   grid, so there is no frozen view to lie about.
 
+**[Amended 2026-07-27, theme inheritance]** Badge text `quiet()`; glyph per
+C5 as amended (pulsing when Working and the view is live); the `raw` and `↑N`
+tokens both `accent_quiet()`, still their own spans and never folded into the
+text. No bg — the badge is a watermark over the pane's own last output, and
+`quiet()` is exactly the right shape for that: the user's ink, one rung back.
+
 ### C5 — Status glyph system + pulse
 
 **Current:** glyphs from `status.rs:34–42`; colors `render.rs:282–290`
@@ -395,6 +522,21 @@ is mirrored to the host terminal on change, so an editor's insert bar looks
 like a bar; a pane that asks for no shape — including the pane focus moves
 *to* — restores the terminal's default, as do exit and the panic hook.
 
+**[Amended 2026-07-27, theme inheritance — the table and the pulse]** Read
+the table above through §2's rename map: Working/NeedsInput `accent()`,
+Waiting `ink()`, Idle `quiet()`, Exited `accent_quiet()`; TabSummary Unknown
+`quiet()`, Exited `accent_quiet()`, Quiet a blank.
+
+The **pulse phases change substance, not timing**: period 1100 ms and 50% duty
+are untouched, but the phases are now `[0, 550) → pulse_bright()` (ANSI 9) and
+`[550, 1100) → accent()` (ANSI 1) — two guaranteed-visible reds. The old phase
+B was a dimmer hue; expressing it as `accent()` + `DIM` would have let a
+terminal that ignores DIM flatten the pulse into a steady dot, so the pulse is
+the one place chrome spends a second colour rather than a modifier. Unit
+boundaries restated: 0 → `pulse_bright`, 549 → `pulse_bright`, 550 →
+`accent`, 1100 → `pulse_bright`. Every other rule here (one shared clock, only
+Working pulses, the frozen-view carve-out, `should_place_cursor`) stands.
+
 ### C6 — Stack header row
 
 **Current:** none — stack members are laid out directly (`layout.rs:302–322`);
@@ -418,6 +560,11 @@ nothing announces "this region is a stack".
   bottom rule.
 - `layout.rs` unit tests updated for the new stack geometry in the same change.
 
+**[Amended 2026-07-27, theme inheritance]** Header text is `quiet()`; the
+`Modifier::UNDERLINED` rule that stands in for the mockup's 1px bottom border
+is unchanged, and is the right shape for the new stance — a rule expressed as
+an attribute rather than a colour cannot be swallowed by a theme. Still no bg.
+
 ### C7 — Expanded-member edge marker
 
 **Current:** the expanded stack member renders as an ordinary bordered pane
@@ -434,6 +581,10 @@ nothing announces "this region is a stack".
   ACCENT_DIM edge) would smear the one-red discipline.
 - Applies only to expanded members of a `Stack` node; ordinary split panes
   never get the marker.
+
+**[Amended 2026-07-27, theme inheritance]** The `▌` edge is `accent_quiet()`
+and the focused member's full border is `accent()`; the reasoning (don't stack
+a quiet red inside a red frame) is unchanged.
 
 ### C8 — Collapsed stack rows
 
@@ -471,6 +622,20 @@ focused = Black on status-color bg, unfocused = status-color fg.
 - Click-to-expand behavior unchanged.
 - [Amended 2026-07-22, fleet features] A raw pane's right segment carries the
   `raw · ` prefix per C23.
+
+**[Amended 2026-07-27, theme inheritance — the focused row loses its fill]**
+- **No row fill in either state.** "Focused row additionally paints bg `RULE`
+  across the full row width" is withdrawn: chrome paints no fills (§2). Focus
+  is carried the way the tab bar carries it — the `▎` `accent()` marker plus
+  **full-strength ink on the row's id+name, whatever its status**
+  (`render::collapsed_name_style(status, focused)`).
+- The unfocused name ramp collapses with the token table: Working/NeedsInput
+  `ink()`; Waiting/Idle/**Exited** `quiet()`. Exited used to have its own
+  third rung; §2 sanctions only two text rungs, and a dead pane already says
+  so twice on the same row — the `✕` `accent_quiet()` glyph and the `exited`
+  state word.
+- Right segment `quiet()`. Width-shedding order, the no-dup rule, the state
+  words and the C23 `raw · ` prefix are all untouched.
 
 ### C9 — Hint bar
 
@@ -616,6 +781,15 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
     (C17/C24), and it is why the prompt had to fit in the bar's existing
     fit/yield machinery rather than get a surface of its own.
 
+**[Amended 2026-07-27, theme inheritance — the bar loses its fill]** `BAR` is
+deleted: **row bg is dropped entirely**, so the hint bar is ink on the user's
+own paper (a near-black band on a light terminal was the other half of the
+reported bug). Keys `accent()`, labels `quiet()`, the right segment's
+aggregate `accent()`, mode word and position `quiet()`, and the P21 search
+query `ink()` — it is text being typed right now, and the quiet rung is not
+for input you must proofread. Precedence, pair lists, fit/yield order and
+every width number are untouched.
+
 ### C10 — Flash message
 
 **Current:** `render.rs:56–64` — Black on Green BOLD.
@@ -643,6 +817,12 @@ confirm lives exactly `CONFIRM_WINDOW` (3 s) instead of `FLASH_WINDOW`
 disagree in either direction. Ordinary flashes keep `FLASH_WINDOW`; styling
 and precedence are untouched.
 
+**[Amended 2026-07-27, theme inheritance]** `" {msg} "` is now `attention()`
+— `Modifier::REVERSED`, no colours — instead of `FG` on a `RULE` fill. Same
+intent (neutral elevated treatment, no reserved hue), expressed as a reversal
+of the terminal's own pair, which is guaranteed contrasty in any theme. Timing
+and precedence remain untouched.
+
 ### C11 — Alt-key warning
 
 **Current:** `render.rs:45–54` — Black on Yellow.
@@ -668,6 +848,12 @@ unchanged; what fires the bar, and what it says, are now contracted:
   Profiles > Keyboard, "Use Option as Meta Key"; `iTerm.app` → iTerm2 >
   Settings > Profiles > Keys, Left Option = `Esc+`. Anything else gets a
   terminal-agnostic line — never a menu path that terminal doesn't have.
+
+**[Amended 2026-07-27, theme inheritance]** The bar is `attention()`
+(`REVERSED`), not `FG` on an `ACCENT_DIM` fill. The "roost-level problem bars
+share one treatment" rule survives verbatim — this and the dead-pane bar
+(C16) are both `attention()` — and the mockup's `warn` yellow stays banned.
+Trigger and wording are untouched.
 
 ### C12 — Modal system (shared)
 
@@ -719,6 +905,12 @@ modals; derived from its rules):**
     rename and no control byte may reach a title), swallowed by the other
     three, forwarded to the focused pane in every non-modal mode (Scroll and
     Copy included: they draw no dialog and hide nothing).
+
+**[Amended 2026-07-27, theme inheritance]** Border `accent()`, title `ink()`.
+The interior's "`Clear` then default bg, no explicit paper fill" line is now
+the rule everywhere rather than a modal-only carve-out (§2 background policy).
+Backdrop, anchoring, stacking order and the U8 input-ownership rules are
+untouched.
 
 ### C13 — Rename dialog
 
@@ -819,6 +1011,11 @@ is fully superseded.
   the persisted pane cwds at startup, so persisting it would buy a schema
   migration almost nothing).
 
+**[Amended 2026-07-27, theme inheritance]** `❯` `accent()`, selected item
+`ink()`, unselected `quiet()`, title `ink()`, border `accent()`. C14's "**no
+bg highlight**" was already the right instinct and is now the house rule (§2);
+the two-column selection idiom is untouched.
+
 ### C15 — Help overlay
 
 **Current:** `render.rs:194–237` — Double/Cyan; keys Yellow BOLD, desc Gray.
@@ -896,6 +1093,10 @@ not §8 table rows, but the overlay is the one surface that has to know they
 exist — a search nothing advertises is a search nobody finds, which is
 precisely the state P21 catalogued.
 
+**[Amended 2026-07-27, theme inheritance]** Key column `accent()`,
+description column `quiet()` — the same key/label system as the hint bar, as
+before. Content, width rule and the ≤20-row cap are untouched.
+
 ### C16 — Dead-pane overlay
 
 **Current:** `render.rs:387–403` — error line Red fg; action bar Black on Red.
@@ -906,6 +1107,14 @@ precisely the state P21 catalogued.
   (`" ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close "`),
   fg `FG` on bg `ACCENT_DIM`.
 - Placement (bottom rows over preserved last screen) unchanged.
+
+**[Amended 2026-07-27, theme inheritance]** The spawn-error line stays
+`accent()` on no bg. The action bar becomes `attention()` (`REVERSED`) instead
+of `FG` on an `ACCENT_DIM` fill — same pairing with C11 as before, same
+placement over the preserved last screen. C17's neighbouring rule is worth
+naming here: this bar is chrome painted *over* program output, and `REVERSED`
+composes with whatever the dead pane last drew rather than assuming a
+background.
 
 ### C17 — Copy-mode selection
 
@@ -1087,6 +1296,12 @@ fleet surface is half a feature.
   is otherwise untouched, `◆ ` prefix included.
 - Hint pairs per the C9 amendment; the arrows' label becomes `select`,
   since with an actionable entry they move a cursor rather than a view.
+
+**[Amended 2026-07-27, theme inheritance]** Feed styling in current tokens:
+frame `accent()` border with an `ink()` title over a `DIM` backdrop;
+timestamps and ordinary text `quiet()`; a NeedsInput line's text `ink()` with
+an `accent()` `◆ ` prefix; the U25 selection marker `❯` `accent()`; the empty
+state `quiet()`. No fills anywhere in it.
 
 ### C21 — Pane zoom (Alt+z) — [Added 2026-07-22, fleet features]
 
@@ -1290,6 +1505,11 @@ can never see them.
   `0x1b 'q'`, `Alt+b` as `0x1b 'b'`, Alt+Shift+p toggles off; cooked pane
   unchanged); dead-pane override; badge/row tokens; only-intercepted-chord
   property (table-driven over the whole current action list).
+
+**[Amended 2026-07-27, theme inheritance]** The badge's `raw` token is
+`accent_quiet()` and the collapsed row's `raw · ` prefix rides the row's
+`quiet()` right segment, as before. Raw mode adds no surface of its own, so
+this contract is a rename only.
 
 ### C24 — Keyboard copy mode — [Added 2026-07-22, fleet features]
 
@@ -1497,16 +1717,16 @@ Every px-only construct in the mockup, and its cell-level fate:
 
 | Mockup construct | Translation |
 |---|---|
-| 2px `--color-accent` top edge on active tab (`:628`) | `▎` U+258E fg `ACCENT` as the active tab's first column (C2). A 1-row bar has no vertical edge to give; a left quarter-block preserves "one red edge marks the active tab" and survives 256-color quantization. |
-| 2px `--tui-red-dim` left edge on expanded stack member (`:662`) | left border column overpainted `▌` U+258C fg `ACCENT_DIM` (C7); half-block ≈ "thicker than 1px". |
+| 2px `--color-accent` top edge on active tab (`:628`) | `▎` U+258E fg `accent()` as the active tab's first column (C2). A 1-row bar has no vertical edge to give; a left quarter-block preserves "one red edge marks the active tab". [Amended 2026-07-27] it now carries *more* weight than the mockup gave it: with the active tab's highlight fill gone, the marker plus full-strength ink is the whole signal. |
+| 2px `--tui-red-dim` left edge on expanded stack member (`:662`) | left border column overpainted `▌` U+258C fg `accent_quiet()` (C7); half-block ≈ "thicker than 1px". |
 | 1px borders throughout | `BorderType::Plain` single-line glyphs (C3, C12). |
 | 6px pane gap + 12–14px pane padding (`:636, :639`) | **dropped** — border cells already separate panes; spending whole cell columns on gaps wastes terminal real estate. |
 | ~9px vertical padding on every bar (tab/hint/stack-header/collapsed-row) → each renders ~2 text-lines tall in the browser | **height dropped — every bar stays exactly 1 row.** A terminal row is indivisible and scarce; reproducing the padding means adding blank rows, burning ~3 of ~44 rows for pure air. No serious TUI (tmux/zellij/lazygit) uses multi-row bars. The mockup's tall bars are a CSS-padding rendering artifact, not a directive. Only *horizontal* padding translates (space cells, C2 gutter); vertical does not. |
 | ~18px horizontal tab padding (`:628`) | ~1 gutter cell per separator (C2, amended 2026-07-23) — the translatable half of the mockup's tab padding. |
 | letterspacing (0.02–0.11em) | **dropped** — no letterspacing in a cell grid; spacing out characters by hand is a gimmick that breaks widths. |
-| tab strip `border-bottom` / hint bar `border-top` (1px rules) | **dropped** — no spare rows; the `TAB_STRIP`/`BAR` bg steps carry the separation. |
+| tab strip `border-bottom` / hint bar `border-top` (1px rules) | **dropped** — no spare rows. [Amended 2026-07-27] the `TAB_STRIP`/`BAR` bg steps that used to carry the separation are gone too (§2 background policy): the bars are set off by the ink weight of what is on them, and the panes' own top/bottom borders are the rules that survive. |
 | stack header `border-bottom` (`:659`) | `Modifier::UNDERLINED` across the header row (C6) — the one place a rule translates to an attribute instead of a row. |
-| `tui-pulse` opacity animation (1 → 0.28) | two-phase color flip `ACCENT ↔ ACCENT_DIM`, 1100 ms period (C5) — nearest cell-model equivalent of an opacity dip against `BG`. |
+| `tui-pulse` opacity animation (1 → 0.28) | two-phase colour flip, 1100 ms period (C5). [Amended 2026-07-27] the phases are ANSI 9 ↔ ANSI 1 — two real reds rather than one red at two opacities, because an opacity dip has no theme-safe cell equivalent: spelling the quiet phase with `DIM` would let a terminal that ignores the modifier kill the animation. |
 | `tui-blink` block cursor (`:673`) | out of scope — the real cursor belongs to the inner program; roost already positions the hardware cursor (`render.rs:355–362`). |
 | emulator chrome row (traffic lights, `:617–624`) | out of scope — OS terminal window chrome. |
 | JetBrains Mono font | out of scope — user's terminal font. |
@@ -1604,7 +1824,8 @@ position.
 quiet shells are deterministically `Idle`→`Waiting`; `Working` needs scripted
 output (`while sleep …; do echo; done`); `NeedsInput` is hard to script
 without the socket — keep it out of golden frames. (2) Pulse phase is
-wall-clock — assert pulsing cells ∈ {ACCENT, ACCENT_DIM}, never an exact
+wall-clock — assert pulsing cells ∈ {`pulse_bright`, `accent`} (ANSI 9/1
+  since 2026-07-27), never an exact
 phase. (3) Needs a PTY-capable CI runner (fine on macOS/Linux). (4) Frame
 settling — poll-parse until stable rather than sleep.
 
@@ -1683,11 +1904,24 @@ not a benchmark suite.
 - **SPEC-GAP-3 — collapsed-row task detail.** Mockup's `running build` is
   task-level detail roost doesn't have; the state-word table (C8) is the
   honest substitute.
-- **SPEC-GAP-4 — paper assumption.** roost does not repaint the terminal bg;
-  the exact mockup look requires a terminal background near `#15120f`.
-  Documented stance, no code (see §2).
-- **Deliberately left out:** config/theme file (zero-config stands, tokens are
-  consts) · named-ANSI fallback palette · tab-overflow scrolling (ROADMAP item;
+- **SPEC-GAP-4 — paper assumption.** ~~roost does not repaint the terminal
+  bg; the exact mockup look requires a terminal background near `#15120f`.
+  Documented stance, no code (see §2).~~ **CLOSED 2026-07-27** by the
+  theme-inheritance amendment. It stopped being a documented stance and became
+  a bug the day a user on a light terminal found the active tab's label
+  invisible — near-white ink on `Color::Reset` is white-on-white when
+  `Color::Reset` is white. Replaced by: chrome derives all of its text from
+  `Color::Reset` (the terminal's own validated fg/bg pair), spends ANSI 8 on
+  structure only, reverses for attention rather than filling, and takes its
+  one red from ANSI 1/9. roost no longer assumes *any* background, rather than
+  assuming a dark one — and the assumption cannot creep back in, because the
+  four mechanical gates named in C1 fail if it does.
+- **Deliberately left out:** config/theme file (zero-config stands — and
+  since 2026-07-27 there is nothing to configure: the theme *is* the
+  terminal's) · curated light/dark palettes and any background-colour
+  detection (`OSC 11` probing, `COLORFGBG` sniffing — inheriting is right for
+  every theme, not just a light/dark binary, and survives a live theme switch
+  with no machinery at all) · tab-overflow scrolling (ROADMAP item;
   C2 clips honestly) · any restyle of program output · golden-frame *color
   scenarios* in this build (§6 — the harness foundation itself now ships with
   the firehose gate) · letterspacing/gap/padding emulation (§4).

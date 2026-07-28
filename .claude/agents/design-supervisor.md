@@ -29,8 +29,10 @@ Implementation surface: `src/ui/render.rs` (all chrome drawing), `src/ui/mouse.r
 2. For each contract, locate the implementing code and verdict it:
    - **ALIGNED** — implementation matches the contract. Cite file:line.
    - **DEVIATED** — differs. Cite file:line, quote the spec requirement, state the
-     observed value (e.g., "C4 wants Rgb(255,86,60) focused border; render.rs:345
-     uses Color::Yellow"). Hex values match exactly or they don't — no "close enough".
+     observed value (e.g., "C3 wants `theme::accent()` on the focused border;
+     render.rs:1072 uses Color::Yellow"). A contract names a **theme token**, not a
+     hue: the token matches or it doesn't — no "close enough", and no substituting
+     a literal colour for a token.
    - **NOT-BUILT** — contract not yet implemented. If `.claude/company/*/PLAN.md`
      exists, note which package owns it; during a staged rollout this is expected,
      not a defect.
@@ -39,6 +41,22 @@ Implementation surface: `src/ui/render.rs` (all chrome drawing), `src/ui/mouse.r
 3. Cross-cutting checks, every run:
    - **Token discipline**: after a theme module exists, `grep -n "Color::" src/ui/ src/core/status.rs`
      — any chrome color constructed outside the theme module is a deviation.
+   - **Theme inheritance** (§2, amended 2026-07-27) — the chrome inherits the
+     user's terminal palette, so these four are the colour audit and they replace
+     the retired exact-hue check. Each has a mechanical gate; run
+     `cargo test --bin roost theme:: render::tests::chrome render::tests::structure render::tests::every_chrome`
+     and treat a failure as DEVIATED with the test output as evidence:
+     * no `Color::Rgb` / `Color::Indexed` anywhere under `src/` except the marked
+       program-output lines in `conv_color`/`cell_style`;
+     * **no chrome background fill at all** — the only `bg` permitted is the
+       `ACTIVE_TAB_BG` (`Color::Reset`) sentinel; a surface that needs to shout
+       uses `theme::attention()` (`REVERSED`);
+     * **structure-only discipline** — `theme::rule()` (ANSI 8) may appear on
+       borders, separators and rules and on **no text-bearing span**;
+     * **no element pairs two theme-variant colours** (which the no-fill rule
+       makes structurally impossible — flag any new construction that would).
+     Text is `Color::Reset` (± `DIM`); the one red is ANSI 1, ANSI 9 for the
+     pulse's bright phase. A chrome word drawn in anything else is a DEVIATED.
    - **Hitbox lockstep**: if the tab bar changed, verify `src/ui/mouse.rs` width
      constants/functions and their unit tests changed with it.
    - **Passthrough integrity**: the vt100 grid blit in render.rs must stay
@@ -72,5 +90,6 @@ Severity: **high** = wrong color/glyph/structure visible in normal use ·
   spec, not improved upon.
 - Chrome only: tabs, borders, badges, stack rows, hint bar, modals, overlays,
   selection, backdrop. Program output inside panes is out of scope by design
-  ("chrome is ink · paper · one red; program output keeps its own colors").
+  ("chrome is the user's own ink on the user's own paper, plus their one red;
+  program output keeps its own colors" — §1, amended 2026-07-27).
 - Every claim carries file:line. No file dumps in the report.

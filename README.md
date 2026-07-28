@@ -232,16 +232,23 @@ than see-through; the inner app's content still draws underneath it.
 
 ## Appearance
 
-> Chrome is ink · paper · one red; program output keeps its own colors.
+> roost's chrome inherits your terminal's theme; its text is exactly as
+> legible as your shell prompt.
 
-roost's own chrome — tabs, borders, badges, hint bar — uses three warm grays
-for hierarchy and one accent (`#ff563c`) for focus, badges, and live keys.
-Program output inside panes keeps its own colors and attributes untouched.
-Colors are truecolor RGB: best on a truecolor terminal (iTerm2, Ghostty,
-kitty, WezTerm) with a dark background in the `#15120f` family — roost never
-repaints your terminal's background. On non-truecolor terminals (macOS
-Terminal.app) the palette quantizes; legibility survives, exact hues don't.
-Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
+roost's own chrome — tabs, borders, badges, hint bar — is drawn in *your*
+colors. Every word it puts on screen uses your terminal's own foreground on
+your own background, the one contrast pair you have already proved readable,
+optionally one step quieter. The one accent is your ANSI red. Borders and
+separators are the only thing spending ANSI 8, so a theme that renders it
+faint costs you a hairline, not a word. Surfaces that need to shout (the
+flash, the dead-pane bar, the Alt-key warning) reverse your fg/bg rather than
+painting a color, and roost paints no background fill anywhere at all.
+
+That means light themes, dark themes, tinted themes and solarized-anything all
+work, there is nothing to configure, and switching your terminal's theme while
+roost is running just works — nothing is detected, cached, or assumed. Program
+output inside panes is untouched: it keeps its own colors and attributes,
+truecolor included. Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 
 ## Session resume
 
