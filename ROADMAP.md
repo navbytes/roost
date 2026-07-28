@@ -118,6 +118,51 @@ wait`, ownership-scoped, audit-logged, CSPRNG control token). Left:
   `mouse::tab_scroll_start` scrolls the strip so the **active tab is always
   visible**, with a `…` marking each end that hides tabs. C27's roster
   (`Alt+Shift+a`) is the tab-picker this entry offered as the alternative.
+- **[choice] A persistent fleet rail — projects → agents.** Parked 2026-07-28
+  after a design pass; **not** the sidebar the vertical-tabs tribunal rejected,
+  and worth keeping distinct from it.
+
+  The tribunal gave two reasons. The arithmetic one holds (with a correction
+  recorded at C27's provenance: it forbids *side-by-side* panes rather than
+  splitting outright, and it was only ever run at herdr's 20-column width —
+  a rail of ≤ 8 columns clears the 80-column floor). The other reason,
+  "a tier roost's singleton `Workspace` does not have", **is wrong**: the
+  missing tier is the **directory**, which every `PaneSpec` already carries
+  and C14's picker already surfaces as a recent-cwd column.
+
+  That changes what the surface would be. Grouped by *tab* it rotates the
+  axis C2's strip already draws — the duplication that made the first pass
+  feel redundant. Grouped by **project → agent** it adds an axis roost has
+  never shown: which repository, which agents inside it, what each is doing.
+  Two orthogonal reads of one fleet, the way `Alt+e` (what happened) and
+  `Alt+Shift+a` (what is) are already contracted apart.
+
+  The shape, if it is ever picked up:
+  - **Two levels.** A project row (directory name, worst-first aggregate
+    glyph + count exactly as C2 computes it, git branch from `.git/HEAD` on
+    a second line), then one row per agent (status glyph, pane id, adapter).
+    Agents indent to the branch column; a blank row separates projects but
+    never splits one. The rail reserves a trailing gutter column.
+  - **Responsive tiers.** ~20 columns labelled on wide terminals, ~6 columns
+    (marker · glyph · id) between 80 and 120, nothing below — the collapse
+    is what keeps the floor legal, and it is what Chrome's vertical tabs
+    collapse to.
+  - **Grouped by `PaneSpec.cwd`**, not the live observed cwd: stable beats
+    truthful here, or rows jump between folders as you `cd` in a shell pane.
+
+  Honest costs, so a later pass doesn't have to rediscover them: it argues
+  against §1 (every column is one not showing agent output) and would be the
+  largest permanent chrome expenditure roost has made; it needs a contracted
+  split against C27's roster or the two drift; and it is **not** the free
+  reuse of `roster_rows()` an earlier sketch claimed — cwd grouping is a new
+  row model with its own aggregate. The free Alt pool is also down to
+  `b d p v x y PgDn`, and `b`/`d` are protected readline ops, so the toggle
+  chord is an open problem rather than a detail.
+
+  Mockup (cell-accurate at 80/100/120/160 columns, with the split-floor
+  arithmetic computed live):
+  https://claude.ai/code/artifact/b048130b-8f0a-4b47-a3c6-afca00888491
+
 - **[choice] Dead-pane `Enter` retry.** Relaunching a dead pane re-runs the same
   resume command even if it just failed permanently; could distinguish transient
   vs permanent failure. Rare now that pi/claude ids are reliable.
