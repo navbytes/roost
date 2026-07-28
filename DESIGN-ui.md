@@ -34,8 +34,9 @@ hues. Consequences that touch every contract with a colour in it:
   pre-amendment wording; read it through the map.
 - `BG`, `TAB_STRIP` and `BAR` are **deleted**. **No chrome surface has a
   background fill any more** — where a contract below says "bg `X`", the
-  current rule is either `attention()` (`REVERSED`, for the three surfaces
-  that must shout) or no fill at all. The per-contract amendments say which.
+  current rule is either `attention()` / `attention_problem()` (`REVERSED`,
+  plain or red-tinted, for the three surfaces that must shout) or no fill at
+  all. The per-contract amendments say which.
 - Exact-hue auditing is retired: there are no hexes left to match. The
   auditable predicates are the §2 legibility principle and the four mechanical
   gates it names — they replace the old "hex values match exactly or they
@@ -83,7 +84,8 @@ pulse phase B→`accent`; `BG`, `TAB_STRIP` and `BAR` are **deleted**.
 | `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, ● working (pulse phase B), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
 | `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, `raw` badge token (C23), `↑N` badge token (U3) |
 | `pulse_bright()` | `Color::LightRed` (ANSI 9) | ● working, pulse phase A — and nothing else |
-| `attention()` | `Modifier::REVERSED`, no colour | the three attention surfaces: flash (C10), alt-warning bar (C11), dead-pane action bar (C16) |
+| `attention()` | `Modifier::REVERSED`, no colour | the **neutral** attention surface: the transient flash (C10) |
+| `attention_problem()` | `Color::Red` + `Modifier::REVERSED` | the **problem** bars: alt-warning (C11), dead-pane action bar (C16) |
 | `ACTIVE_TAB_BG` | `Color::Reset` | the only `bg` chrome sets anywhere, and it sets it to *nothing* (C2) |
 | `ok` / `warn` / `info` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
 
@@ -146,9 +148,11 @@ detection, no config (zero-config stands).**
 terminal background, and it no longer paints bands on top of it either: the
 tab bar row, the hint bar row, the flash, the alt-warning bar, the dead-pane
 action bar and the focused collapsed row have all lost their fills. The three
-that needed to *shout* became `attention()` (`REVERSED`); the two bars and the
-focused collapsed row carry no surface of their own and are distinguished by
-ink weight and markers instead. The active tab cell's bg is `Color::Reset` —
+that needed to *shout* reverse the terminal's own pair instead — plain
+(`attention()`) for the neutral flash, red-tinted (`attention_problem()`) for
+the two problem bars; the two chrome bars and the focused collapsed row carry
+no surface of their own and are distinguished by ink weight and markers
+instead. The active tab cell's bg is `Color::Reset` —
 the single `bg` chrome sets, and it sets it to nothing, so the label fuses
 with whatever the terminal's own background is.
 
@@ -817,7 +821,8 @@ confirm lives exactly `CONFIRM_WINDOW` (3 s) instead of `FLASH_WINDOW`
 disagree in either direction. Ordinary flashes keep `FLASH_WINDOW`; styling
 and precedence are untouched.
 
-**[Amended 2026-07-27, theme inheritance]** `" {msg} "` is now `attention()`
+**[Amended 2026-07-27, theme inheritance; revised same day after the design
+supervisor's SG-1]** `" {msg} "` is now `attention()`
 — `Modifier::REVERSED`, no colours — instead of `FG` on a `RULE` fill. Same
 intent (neutral elevated treatment, no reserved hue), expressed as a reversal
 of the terminal's own pair, which is guaranteed contrasty in any theme. Timing
@@ -849,10 +854,18 @@ unchanged; what fires the bar, and what it says, are now contracted:
   Settings > Profiles > Keys, Left Option = `Esc+`. Anything else gets a
   terminal-agnostic line — never a menu path that terminal doesn't have.
 
-**[Amended 2026-07-27, theme inheritance]** The bar is `attention()`
+**[Amended 2026-07-27, theme inheritance; revised same day after the design
+supervisor's SG-1]** The bar is `attention_problem()`
 (`REVERSED`), not `FG` on an `ACCENT_DIM` fill. The "roost-level problem bars
 share one treatment" rule survives verbatim — this and the dead-pane bar
-(C16) are both `attention()` — and the mockup's `warn` yellow stays banned.
+(C16) are both `attention_problem()` — and the mockup's `warn` yellow stays
+banned. The first amendment made all three bars `attention()`, which silently
+dropped a distinction the pre-theme design carried in colour (`RULE` fill for
+the neutral flash, `ACCENT_DIM` for problems): `copied 12 chars` and "Alt keys
+aren't reaching roost" rendered identically. The distinction is restored from
+primitives that survive any palette — reversing `accent()` paints the row in
+the user's red with their background as the ink, so a problem still reads as a
+problem, while the flash keeps the plain reversal.
 Trigger and wording are untouched.
 
 ### C12 — Modal system (shared)
@@ -1109,10 +1122,13 @@ before. Content, width rule and the ≤20-row cap are untouched.
 - Placement (bottom rows over preserved last screen) unchanged.
 
 **[Amended 2026-07-27, theme inheritance]** The spawn-error line stays
-`accent()` on no bg. The action bar becomes `attention()` (`REVERSED`) instead
+`accent()` on no bg. The action bar becomes `attention_problem()` instead
 of `FG` on an `ACCENT_DIM` fill — same pairing with C11 as before, same
-placement over the preserved last screen. C17's neighbouring rule is worth
-naming here: this bar is chrome painted *over* program output, and `REVERSED`
+placement over the preserved last screen. The style rides on the **widget**,
+so the reversal covers the bar's whole inner width: styling the span alone
+reversed only the columns the message occupied and left the dead program's
+last output at normal video across the rest of the row (the supervisor's D1).
+C17's neighbouring rule is worth naming here: this bar is chrome painted *over* program output, and `REVERSED`
 composes with whatever the dead pane last drew rather than assuming a
 background.
 

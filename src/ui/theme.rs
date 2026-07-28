@@ -83,11 +83,23 @@ pub fn pulse_bright() -> Style {
     Style::default().fg(Color::LightRed)
 }
 
-/// Attention surfaces (flash, dead-pane action bar, Alt-trap warning bar):
-/// reverse the terminal's own fg/bg. No colour fill anywhere in chrome —
-/// a fill assumes a background roost does not own (§2 background policy).
+/// A neutral attention surface (the transient flash): reverse the terminal's
+/// own fg/bg. No colour fill anywhere in chrome — a fill assumes a background
+/// roost does not own (§2 background policy) — and reversing the user's own
+/// pair is the one treatment guaranteed to be contrasty in any theme.
 pub fn attention() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
+}
+
+/// A *problem* attention surface (dead-pane action bar, Alt-trap warning):
+/// the same reversal, tinted by the one red. Reversing `accent()` paints the
+/// row in the user's red with their background colour as the ink, so a
+/// problem still reads as a problem — the distinction C10/C11 carried with
+/// `RULE` vs `ACCENT_DIM` fills before chrome inherited the theme, rebuilt
+/// from primitives that survive any palette. Red is a mid-tone in every
+/// sane theme, so the reversed ink stays legible on light and dark alike.
+pub fn attention_problem() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED)
 }
 
 /// Active tab's label cell background — a deliberate sentinel (§2 background

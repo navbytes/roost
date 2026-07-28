@@ -278,9 +278,10 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     if app.show_alt_hint() {
         // C11/U4: same bar, per-terminal wording — the app knows the host's
-        // TERM_PROGRAM and picks the real menu path where there is one.
+        // TERM_PROGRAM and picks the real menu path where there is one. A
+        // problem bar, so the red-tinted reversal, not the neutral one.
         f.render_widget(
-            Paragraph::new(app.alt_hint_line()).style(theme::attention()),
+            Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()),
             area,
         );
         return;
@@ -1144,17 +1145,19 @@ fn draw_pane<B: PaneBackend>(
         if let Some(err) = app.dead.get(&pr.id) {
             lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
         }
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {} exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close ",
-                theme::GLYPH_EXITED
-            ),
-            theme::attention(),
-        )));
+        lines.push(Line::from(Span::raw(format!(
+            " {} exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close ",
+            theme::GLYPH_EXITED
+        ))));
         let n = lines.len() as u16;
         let y = inner.y + inner.height.saturating_sub(n);
         let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
-        f.render_widget(Paragraph::new(lines), overlay);
+        // C16: the style rides on the *widget*, not the span, so the whole
+        // inner width reverses. Styling the span alone would reverse only the
+        // ~76 text columns and leave the dead program's last output showing
+        // through the rest of the row at normal video — the bar has to read as
+        // one bar, exactly as C10/C11's rows do.
+        f.render_widget(Paragraph::new(lines).style(theme::attention_problem()), overlay);
     }
 }
 
@@ -2659,7 +2662,70 @@ mod tests {
         app.apply(Action::ToggleHints); // the tab bar picks up the mode word
         out.push(("zoom with the hint bar hidden", snap(&mut app)));
 
+        // C16: a dead pane's action bar. The fixture omitted every
+        // pane-overlay state, which is exactly how a span-styled (rather than
+        // widget-styled) bar hid from these gates — it reversed its ~76 text
+        // columns and left the dead program's last output showing through the
+        // rest of the row. Both shapes are drawn: with and without a spawn
+        // error, since the error adds a second row to the same bar.
+        let mut app = three_panes();
+        let focused = app.focused;
+        app.on_pty_exit(focused);
+        out.push(("dead pane action bar", snap(&mut app)));
+
+        let mut app = three_panes();
+        let focused = app.focused;
+        app.on_pty_exit(focused);
+        app.dead.insert(focused, "no such file or directory".into());
+        out.push(("dead pane with a spawn error", snap(&mut app)));
+
         out
+    }
+
+    /// C16 regression: the dead-pane action bar reverses its **whole inner
+    /// width**, not just the columns its text happens to occupy. Styling the
+    /// span instead of the widget left the dead program's last output visible
+    /// at normal video across the rest of the row — three bars (C10 flash,
+    /// C11 alt warning, C16 dead pane) meant to read as one treatment, one of
+    /// them ragged. Caught by the design supervisor; the gate fixture now
+    /// draws the state that hid it.
+    #[test]
+    fn the_dead_pane_bar_reverses_its_whole_row() {
+        for (name, buf) in chrome_buffers() {
+            if !name.starts_with("dead pane") {
+                continue;
+            }
+            let area = *buf.area();
+            // The bar is the bottom row of the dead pane's inner area. Find
+            // it by its text, then assert the reversal runs across the row
+            // rather than stopping where the message does.
+            let row = (0..area.height)
+                .find(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains("exited — Enter")
+                })
+                .unwrap_or_else(|| panic!("{name}: no dead-pane bar drawn"));
+            let reversed: Vec<u16> = (0..area.width)
+                .filter(|x| buf[(*x, row)].style().add_modifier.contains(Modifier::REVERSED))
+                .collect();
+            assert!(!reversed.is_empty(), "{name}: the bar is not reversed at all");
+            let (first, last) = (reversed[0], *reversed.last().unwrap());
+            assert_eq!(
+                reversed.len() as u16,
+                last - first + 1,
+                "{name}: the bar's reversal is not contiguous across its row"
+            );
+            // Wider than the message itself — what the span-styled version
+            // could not be.
+            let text_cols =
+                (0..area.width).filter(|x| buf[(*x, row)].symbol() != " ").count();
+            assert!(
+                (last - first + 1) as usize > text_cols,
+                "{name}: the bar covers only its own glyphs, not the row"
+            );
+        }
     }
 
     /// §2 gate: **structure-only discipline.** `theme::rule()` (ANSI 8) is
