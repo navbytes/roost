@@ -84,7 +84,19 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 /// checked ahead of `focused_dead` would be, but a dead pane can't be raw-
 /// routed either way (`raw_routing_active` requires it alive), so the dead
 /// branch stays first and wins when both happen to be true.
-fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'static str, &'static str)> {
+///
+/// [Amended 2026-07-28, C15] `help_scrolled` says whether the keymap is
+/// taller than its overlay right now. Only Help reads it, and it is the
+/// difference between two *true* hint rows: on a terminal showing the whole
+/// table every key really does close it; on a shorter one the arrows read on
+/// instead, and a bar still promising "any key close" would be advertising a
+/// dismissal the arrows no longer perform.
+fn hint_pairs(
+    mode: &Mode,
+    focused_dead: bool,
+    focused_raw: bool,
+    help_scrolled: bool,
+) -> Vec<(&'static str, &'static str)> {
     match mode {
         // C24: keyboard cursor + mouse drag, replacing the old two-pair list.
         // [Amended, U17] The mode's whole vocabulary is now on the bar: the
@@ -103,7 +115,10 @@ fn hint_pairs(mode: &Mode, focused_dead: bool, focused_raw: bool) -> Vec<(&'stat
             ("drag", "select"),
             ("Esc", "exit"),
         ],
-        Mode::Help => vec![("Alt+?", "all keys"), ("any key", "close")],
+        Mode::Help { .. } if help_scrolled => {
+            vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]
+        }
+        Mode::Help { .. } => vec![("Alt+?", "all keys"), ("any key", "close")],
         // [Amended, U16] `←→` joins the list once there is a cursor to move:
         // a text field whose caret is stuck at the end is one nobody tries
         // to move, and the motion was the half of U16 left unimplemented.
@@ -201,7 +216,7 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Picker { .. } => "PICKER",
         Mode::Scroll { .. } => "SCROLL",
         Mode::Copy { .. } => "COPY",
-        Mode::Help => "HELP",
+        Mode::Help { .. } => "HELP",
         Mode::Feed { .. } => "FEED",
         Mode::Roster { .. } => "ROSTER",
         Mode::Search { .. } => "SEARCH",
@@ -314,7 +329,9 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // and "◆ N needs you" the fleet's primary signal — trailing pairs drop
     // whole until the segment fits.
     let focused_raw = app.is_raw(app.focused);
-    let hints = hint_pairs(&app.mode, app.focused_dead(), focused_raw);
+    let (help_visible, help_total) = help_scroll_extent(app.body_area());
+    let hints =
+        hint_pairs(&app.mode, app.focused_dead(), focused_raw, help_visible < help_total);
     // U3: Scroll mode's right segment shows where in history the view sits
     // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
     // can never report a phantom row the grid refused (U9's overshoot).
@@ -490,57 +507,243 @@ fn help_key_prefix(key: &str) -> String {
     format!(" {key:<18}")
 }
 
-/// C15 (amended): the help overlay's width — the widest content line (key
-/// column + its description), plus the 2 border columns. `centered_near`
-/// still clamps this to the screen. The old fixed 52-col width predated this
-/// key list and clipped long descriptions mid-word ("…(pi / claud"). Pure so
-/// the sizing has a unit-test seam.
-fn help_dialog_width(keys: &[(&str, &str)]) -> u16 {
-    let content = keys
+/// C15 (amended 2026-07-28): the keymap's content width — the widest row
+/// (key column + description). One *column* of it; the overlay may draw two
+/// side by side, which `help_layout` decides. Pure so the sizing has a
+/// unit-test seam.
+fn help_content_width() -> u16 {
+    HELP_GROUPS
         .iter()
+        .flat_map(|g| g.rows.iter())
         .map(|(k, d)| mouse::display_width(&help_key_prefix(k)) + mouse::display_width(d))
         .max()
-        .unwrap_or(0);
-    content + 2
+        .unwrap_or(0)
 }
 
-/// C15/§8: the help overlay's row list — the canonical key table, verbatim
-/// and in this order (merged rows stay merged), then U23's three reference
-/// rows: the status-glyph legend and the two mouse rows. Hard cap: ≤ 20 rows
-/// (§8; pinned by `help_keys_fit_the_cap`). The single source
+/// C15: one line of the drawn keymap — a group heading or a chord row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HelpLine {
+    Head(&'static str),
+    Row(&'static str, &'static str),
+}
+
+/// C15: the keymap flattened into drawable lines, in group order — each
+/// heading followed by its rows, with no blank between groups. The
+/// underlined heading is the separator (C6's idiom, exactly as C27's roster
+/// stacks its groups), and a blank row per group would cost six rows of a
+/// table that already has to scroll on a short terminal.
+fn help_lines() -> Vec<HelpLine> {
+    let mut out = Vec::new();
+    for g in HELP_GROUPS {
+        out.push(HelpLine::Head(g.title));
+        out.extend(g.rows.iter().map(|(k, d)| HelpLine::Row(k, d)));
+    }
+    out
+}
+
+/// C15: how the keymap lays out in `body` — how many columns, how the lines
+/// divide between them, and the dialog those choices need.
+struct HelpLayout {
+    /// One `Vec<HelpLine>` per column, left to right.
+    columns: Vec<Vec<HelpLine>>,
+    /// Rows of content each column shows at once (the shorter of "what it
+    /// holds" and "what fits"); the scroll step and the `top` clamp use it.
+    height: u16,
+    /// The dialog rect's size, borders included.
+    size: (u16, u16),
+}
+
+/// C15 (amended 2026-07-28): lay the keymap out for `body`, taking **the
+/// fewest columns that fit**.
+///
+/// One column is the calm form and stays the answer whenever the list fits
+/// in the body's height. A second column is taken only when one column
+/// would overflow *and* the terminal is wide enough to hold two — never to
+/// fill space for its own sake. When neither fits, the overlay scrolls
+/// (C15's amended key rules); nothing is dropped and nothing is merged away
+/// to fit a cap, which is the whole point of this shape.
+///
+/// The split point is a group boundary, chosen to balance the two columns,
+/// so a group is never sawn in half across the gutter.
+fn help_layout(body: Rect) -> HelpLayout {
+    let lines = help_lines();
+    let content = help_content_width();
+    let avail_h = body.height.saturating_sub(2); // the dialog's borders
+    let one_fits = lines.len() as u16 <= avail_h;
+    let two_wide_enough = content * 2 + HELP_GUTTER + 2 <= body.width;
+    let columns = if one_fits || !two_wide_enough {
+        vec![lines]
+    } else {
+        let at = help_split_point(&lines);
+        let (a, b) = lines.split_at(at);
+        vec![a.to_vec(), b.to_vec()]
+    };
+    let tallest = columns.iter().map(|c| c.len()).max().unwrap_or(0) as u16;
+    let height = tallest.min(avail_h);
+    // +1 so a row that spends the full content width still has a column of
+    // air before the right border (the key column already opens with one).
+    let w = content * columns.len() as u16 + HELP_GUTTER * (columns.len() as u16 - 1) + 3;
+    HelpLayout { columns, height, size: (w.min(body.width), height + 2) }
+}
+
+/// Columns are separated by this many blank cells.
+const HELP_GUTTER: u16 = 2;
+
+/// C15: draw the laid-out keymap into the dialog's inner area, every column
+/// scrolled to the same `top` (they scroll as one sheet — two columns
+/// sliding independently would be two lists, not one table).
+///
+/// A heading borrows C6's idiom, the same one the roster's group rows use:
+/// uppercase, `quiet()`, underlined across its own column so it reads as a
+/// rule rather than as another chord.
+fn draw_help_columns(f: &mut Frame, layout: &HelpLayout, top: usize, inner: Rect) {
+    let content = help_content_width();
+    for (i, column) in layout.columns.iter().enumerate() {
+        let x = inner.x + i as u16 * (content + HELP_GUTTER);
+        if x >= inner.x + inner.width {
+            break;
+        }
+        let width = content.min(inner.x + inner.width - x);
+        let lines: Vec<Line> = column
+            .iter()
+            .skip(top)
+            .take(layout.height as usize)
+            .map(|line| match line {
+                HelpLine::Head(title) => {
+                    let pad = (width as usize).saturating_sub(mouse::display_width(title) as usize + 1);
+                    Line::from(Span::styled(
+                        format!(" {title}{}", " ".repeat(pad)),
+                        theme::quiet().add_modifier(Modifier::UNDERLINED),
+                    ))
+                }
+                HelpLine::Row(k, d) => Line::from(vec![
+                    Span::styled(help_key_prefix(k), theme::accent()),
+                    Span::styled(d.to_string(), theme::quiet()),
+                ]),
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines),
+            Rect::new(x, inner.y, width, inner.height),
+        );
+    }
+}
+
+/// C15: `(rows shown at once, rows the tallest column holds)` for `body` —
+/// the one place `App`'s scroll clamp and this renderer agree about how far
+/// the keymap can move. Equal values mean the whole table is on screen and
+/// the scroll keys have nothing to do (`Mode::Help`'s "any key closes it"
+/// then holds unamended).
+pub fn help_scroll_extent(body: Rect) -> (usize, usize) {
+    let l = help_layout(body);
+    (l.height as usize, l.columns.iter().map(|c| c.len()).max().unwrap_or(0))
+}
+
+/// C15: the group boundary that divides `lines` most evenly between two
+/// columns — i.e. the heading nearest the halfway mark. Headings only:
+/// splitting inside a group would put a heading in one column and half its
+/// chords in the other, which reads as two unrelated tables.
+fn help_split_point(lines: &[HelpLine]) -> usize {
+    let half = lines.len() / 2;
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| *i > 0 && matches!(l, HelpLine::Head(_)))
+        .min_by_key(|(i, _)| i.abs_diff(half))
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len())
+}
+
+/// C15: one titled block of the keymap.
+struct HelpGroup {
+    title: &'static str,
+    rows: &'static [(&'static str, &'static str)],
+}
+
+/// C15/§8 (amended 2026-07-28): the canonical key table, **grouped by what
+/// the chord acts on**, plus U23's reference block. The single source
 /// `draw_mode_overlay` reads for `Mode::Help`.
 ///
-/// U23 (2026-07-27): the overlay taught chords and nothing else — neither
-/// `●◆○·✕`, the product's core language, nor a word about the mouse, so the
-/// one surface that exists to explain roost explained only half of it. Paid
-/// for by merging three natural chord pairs (split/flip, zoom/float,
-/// close/undo) rather than by scrolling the overlay, so C15's "any key
-/// closes it" and the ≤20 cap both survive untouched.
-const HELP_KEYS: &[(&str, &str)] = &[
-    ("Alt+n", "new shell pane (auto split)"),
-    ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
-    ("Alt+←↓↑→ / hjkl", "move focus"),
-    ("Alt+Shift+←↓↑→", "resize along that axis"),
-    ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
-    ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-    ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
-    // C27: the deliberate pair rides one row — the merge idiom the ≤20
-    // cap has always demanded of a new chord, and here it is also the
-    // honest presentation: Alt+a takes you to the next one,
-    // Alt+Shift+a shows you all of them and lets you choose.
-    ("Alt+a / Alt+Shift+a", "jump to next pane that needs you / list every pane"),
-    ("Alt+e", "activity feed (status / spawns / exits / control)"),
-    ("Alt+r / Alt+Shift+r", "rename pane / tab"),
-    ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
-    ("Alt+i / Alt+m", "previous / next tab (wraps)"),
-    ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-    ("Alt+c / Alt+PgUp", "copy (hjkl wbe 0$ vV y o) / scroll — / search, n/N"),
-    ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
-    ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
-    ("Alt+q", "quit (workspace saved; sessions live)"),
-    ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
-    ("mouse", "wheel scrolls · click focuses · drag selects"),
-    ("Alt+click / o", "open the URL under the pointer / copy cursor"),
+/// History, because the shape is the point. U23 (2026-07-27) added the
+/// glyph legend and the mouse rows and paid for them by *merging three
+/// natural chord pairs* — the only currency available under a ≤20-row hard
+/// cap. C28 then wanted two more chords, and merging again would have put
+/// four chords on one row. The cap is gone instead: the overlay takes a
+/// second column when the terminal is wide enough and scrolls when it is
+/// not (`help_layout`), so the keymap can grow with roost rather than
+/// rationing itself. Unmerged rows are also plainly easier to read —
+/// "Alt+z / Alt+f → zoom pane (view only) / floating scratch shell" made
+/// the reader pair the halves up themselves.
+///
+/// Group order is "how often you reach for it": panes, then their layout,
+/// then tabs, then the fleet surfaces, then reading, then the session.
+const HELP_GROUPS: &[HelpGroup] = &[
+    HelpGroup {
+        title: "PANES",
+        rows: &[
+            ("Alt+n", "new shell pane (auto split)"),
+            ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
+            ("Alt+←↓↑→ / hjkl", "move focus"),
+            ("Alt+r", "rename this pane"),
+            ("Alt+w", "close pane (confirm if busy)"),
+            ("Alt+u", "reopen the last pane or tab you closed"),
+            ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
+        ],
+    },
+    HelpGroup {
+        title: "LAYOUT",
+        rows: &[
+            ("Alt+Shift+←↓↑→", "resize along that axis"),
+            ("Alt+s", "toggle split ⇄ stack"),
+            ("Alt+o", "flip this split's orientation"),
+            ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
+            ("Alt+z", "zoom the focused pane (view only)"),
+            ("Alt+f", "floating scratch shell"),
+        ],
+    },
+    HelpGroup {
+        title: "TABS",
+        rows: &[
+            ("Alt+t", "new tab"),
+            ("Alt+1..9 / Alt+0", "go to that tab / the last one"),
+            ("Alt+i / Alt+m", "previous / next tab (wraps)"),
+            // C28: the shifted siblings sit directly under the chords they
+            // are the shifted form of — the pairing *is* the explanation.
+            ("Alt+Shift+i / +m", "move this pane to the previous / next tab"),
+            ("Alt+Shift+r", "rename this tab"),
+        ],
+    },
+    HelpGroup {
+        title: "FLEET",
+        rows: &[
+            ("Alt+a", "jump to the next pane that needs you"),
+            ("Alt+Shift+a", "roster: every pane, grouped by tab"),
+            ("Alt+e", "activity feed (status / spawns / exits / control)"),
+        ],
+    },
+    HelpGroup {
+        title: "READING",
+        rows: &[
+            ("Alt+PgUp", "scroll back — `/` searches, n/N step the hits"),
+            ("Alt+c", "copy mode: hjkl wbe 0$ · v/V select · y yank · o URL"),
+        ],
+    },
+    HelpGroup {
+        title: "SESSION",
+        rows: &[
+            ("Alt+/", "toggle the hint bar"),
+            ("Alt+?", "this keymap"),
+            ("Alt+q", "quit (workspace saved; sessions live)"),
+        ],
+    },
+    HelpGroup {
+        title: "READING THE SCREEN",
+        rows: &[
+            ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
+            ("mouse", "wheel scrolls · click focuses · drag selects"),
+            ("Alt+click / o", "open the URL under the pointer / copy cursor"),
+        ],
+    },
 ];
 
 /// U23: the legend row's text, rebuilt from the `theme` glyph constants —
@@ -602,9 +805,9 @@ fn dialog_rect(
             let h = rows.max(cwds.len()).max(1) as u16 + 2;
             Some(centered_near(anchor, body, picker_dialog_width(cwds), h))
         }
-        Mode::Help => {
-            let h = HELP_KEYS.len() as u16 + 2;
-            Some(centered_near(anchor, body, help_dialog_width(HELP_KEYS), h.min(body.height)))
+        Mode::Help { .. } => {
+            let (w, h) = help_layout(body).size;
+            Some(centered_near(anchor, body, w, h))
         }
         Mode::Feed { .. } => {
             let (w, h) = feed_overlay_size(body);
@@ -708,30 +911,32 @@ fn draw_mode_overlay<B: PaneBackend>(
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
         }
-        Mode::Help => {
-            // Full keymap — the §8 key table, verbatim and in order (C15
-            // amended). `HELP_KEYS` is the single source; `help_keys_fit_the_cap`
-            // pins the ≤ 20-row hard cap this relies on (80×24 body = 22
-            // rows = 20 content + 2 border, zero slack).
-            let keys = HELP_KEYS;
+        Mode::Help { top } => {
+            // C15 (amended): the §8 key table, grouped, in as few columns as
+            // fit and scrolled when even those don't. `HELP_GROUPS` is the
+            // single source and `help_layout` the single geometry — the same
+            // call `dialog_rect` above made for this rect.
+            let layout = help_layout(body);
+            let (visible, total) = (layout.height as usize, layout.columns.iter().map(|c| c.len()).max().unwrap_or(0));
+            let top = (*top).min(total.saturating_sub(visible));
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
+            // The title says how to leave — and, only when the table doesn't
+            // fit, that there is more of it and which keys reach it. A
+            // terminal showing everything says nothing about scrolling,
+            // because there is nothing to scroll.
+            let heading = if total > visible {
+                format!(" keys — {}/{} · ↑↓ more · any key closes ", (top + visible).min(total), total)
+            } else {
+                " keys — any key to close ".to_string()
+            };
             let block = Block::bordered()
-                .title(dialog_title(" keys — any key to close "))
+                .title(Line::from(heading).style(theme::ink()))
                 .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            let lines: Vec<Line> = keys
-                .iter()
-                .map(|(k, d)| {
-                    Line::from(vec![
-                        Span::styled(help_key_prefix(k), theme::accent()),
-                        Span::styled(d.to_string(), theme::quiet()),
-                    ])
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines), inner);
+            draw_help_columns(f, &layout, top, inner);
         }
         Mode::Feed { offset } => {
             dim_backdrop(f, body, rect);
@@ -1785,8 +1990,8 @@ mod tests {
     use super::{
         badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_style,
         collapsed_row_spans, corner_badge, dialog_border_style, feed_entry_spans, feed_window,
-        help_dialog_width, hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans,
-        should_place_cursor, stack_header_text, state_word, HELP_KEYS,
+        help_content_width, help_layout, help_lines, hint_bar_right_spans, hint_pairs, mode_word,
+        push_tab_spans, should_place_cursor, stack_header_text, state_word, HelpLine, HELP_GROUPS,
     };
     use crate::core::app::{Mode, RenameTarget, RosterRow};
     use crate::core::status::AgentStatus;
@@ -2185,7 +2390,7 @@ mod tests {
         // U6 order (C9 amended 2026-07-27): `Alt+? keys` first so it yields
         // last, `Alt+r rename` last so it drops first.
         assert_eq!(
-            hint_pairs(&Mode::Normal, false, false),
+            hint_pairs(&Mode::Normal, false, false, false),
             vec![
                 ("Alt+?", "keys"),
                 ("Alt+n", "new"),
@@ -2206,7 +2411,7 @@ mod tests {
     /// one still standing is `Alt+? keys`.
     #[test]
     fn the_help_pair_is_the_last_hint_to_yield_and_rename_the_first() {
-        let pairs = hint_pairs(&Mode::Normal, false, false);
+        let pairs = hint_pairs(&Mode::Normal, false, false, false);
         let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
         let right_w = " ◆ 1 needs you · Alt+a  NORMAL ".chars().count() as u16 - 1;
 
@@ -2227,7 +2432,7 @@ mod tests {
     /// a hint bar that clips its own mode's keys is the U17 bug restated.
     #[test]
     fn hint_pairs_copy_mode_is_the_c24_list_amended_by_u17() {
-        let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false);
+        let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false, false);
         assert_eq!(
             pairs,
             vec![
@@ -2255,7 +2460,7 @@ mod tests {
     #[test]
     fn hint_pairs_focused_raw_normal_is_exactly_one_pair() {
         // C23: every other hint would be a lie — nothing else is intercepted.
-        assert_eq!(hint_pairs(&Mode::Normal, false, true), vec![("Alt+Shift+p", "exit raw")]);
+        assert_eq!(hint_pairs(&Mode::Normal, false, true, false), vec![("Alt+Shift+p", "exit raw")]);
     }
 
     #[test]
@@ -2265,7 +2470,7 @@ mod tests {
         // hint bar must show what's actually actionable (dead-pane keys),
         // not a raw-exit hint nothing would honor.
         assert_eq!(
-            hint_pairs(&Mode::Normal, true, true),
+            hint_pairs(&Mode::Normal, true, true, false),
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")],
         );
     }
@@ -2293,30 +2498,36 @@ mod tests {
         assert_eq!(dialog_border_style(), theme::accent());
     }
 
+    /// C15 amended: one column is sized to the widest key-column-plus-
+    /// description line, not a fixed 52 that clips long descriptions
+    /// mid-word. Every key pads to the same column, so the longest
+    /// description decides it.
     #[test]
-    fn help_dialog_width_fits_the_widest_content_line() {
-        // C15 amended: width must be sized to the widest key-column-plus-
-        // description line, not a fixed 52 that clips long descriptions
-        // mid-word. Both keys pad to the same column, so the longer
-        // description ("bb"'s) must be the one that decides the width.
-        let keys: &[(&str, &str)] = &[("a", "short"), ("bb", "a much longer description here")];
-        let w = help_dialog_width(keys);
-        let expected =
-            super::help_key_prefix("bb").chars().count() as u16 + "a much longer description here".len() as u16 + 2;
-        assert_eq!(w, expected);
+    fn help_content_width_fits_the_widest_row() {
+        let widest = HELP_GROUPS
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .max_by_key(|(k, d)| {
+                mouse::display_width(&super::help_key_prefix(k)) + mouse::display_width(d)
+            })
+            .expect("the keymap has rows");
+        assert_eq!(
+            help_content_width(),
+            mouse::display_width(&super::help_key_prefix(widest.0))
+                + mouse::display_width(widest.1),
+        );
     }
 
     #[test]
-    fn help_dialog_width_clamps_to_the_screen_via_centered_near() {
-        // help_dialog_width itself doesn't clamp — centered_near does, same
-        // as every other modal (C15's anchoring is unchanged).
-        let keys: &[(&str, &str)] = &[("k", "a description so long it would exceed a narrow body")];
+    fn help_dialog_clamps_to_the_screen_via_centered_near() {
+        // `help_layout` clamps its own width to the body, and
+        // `centered_near` clamps the placement — same as every other modal
+        // (C15's anchoring is unchanged).
         let body = Rect::new(0, 1, 30, 20);
-        let anchor = Rect::new(0, 1, 30, 20);
-        let w = help_dialog_width(keys);
-        assert!(w > body.width); // the ideal width doesn't fit
-        let rect = centered_near(anchor, body, w, 3);
-        assert!(rect.width <= body.width); // but the placed dialog does
+        let (w, h) = help_layout(body).size;
+        assert!(w <= body.width);
+        let rect = centered_near(body, body, w, h);
+        assert!(rect.width <= body.width && rect.height <= body.height);
     }
 
     #[test]
@@ -2329,7 +2540,7 @@ mod tests {
         assert_eq!(mode_word(&Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false }, false, false), "PICKER");
         assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, false, false), "SCROLL");
         assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false), "COPY");
-        assert_eq!(mode_word(&Mode::Help, false, false), "HELP");
+        assert_eq!(mode_word(&Mode::Help { top: 0 }, false, false), "HELP");
     }
 
     #[test]
@@ -2339,7 +2550,7 @@ mod tests {
         assert_eq!(mode_word(&Mode::Normal, true, false), "ZOOM");
         assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
         assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, true, false), "SCROLL");
-        assert_eq!(mode_word(&Mode::Help, true, false), "HELP");
+        assert_eq!(mode_word(&Mode::Help { top: 0 }, true, false), "HELP");
     }
 
     #[test]
@@ -2357,7 +2568,7 @@ mod tests {
         // right before the aggregate/mode-word segment ever yields. Measure
         // via the SAME `hint_pair_cols` the draw path uses — a +3/+4 drift
         // here once let the whole segment drop at widths 111-116 (D2).
-        let pairs = hint_pairs(&Mode::Normal, false, false);
+        let pairs = hint_pairs(&Mode::Normal, false, false, false);
         let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
         let all_w: u16 = pairs.iter().map(&pw).sum();
 
@@ -2387,7 +2598,7 @@ mod tests {
 
     #[test]
     fn hint_pairs_dead_focused_normal_offers_relaunch_not_new_pane() {
-        let dead = hint_pairs(&Mode::Normal, true, false);
+        let dead = hint_pairs(&Mode::Normal, true, false, false);
         assert_eq!(
             dead,
             vec![
@@ -2398,7 +2609,7 @@ mod tests {
             ],
         );
         // A live pane never offers "relaunch"; a dead one never offers "new".
-        assert_ne!(dead, hint_pairs(&Mode::Normal, false, false));
+        assert_ne!(dead, hint_pairs(&Mode::Normal, false, false, false));
     }
 
     /// C20's list as amended by U25: every key the feed actually answers to.
@@ -2408,7 +2619,7 @@ mod tests {
     #[test]
     fn hint_pairs_feed_mode_lists_every_key_the_feed_answers_to() {
         assert_eq!(
-            hint_pairs(&Mode::Feed { offset: 0 }, false, false),
+            hint_pairs(&Mode::Feed { offset: 0 }, false, false, false),
             vec![
                 ("↑↓", "select"),
                 ("PgUp/Dn", "page"),
@@ -2425,7 +2636,7 @@ mod tests {
     /// typing, `q` is filter text (U20's rule).
     #[test]
     fn hint_pairs_roster_mode_is_the_c27_list_and_fits_the_floor() {
-        let pairs = hint_pairs(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, false, false);
+        let pairs = hint_pairs(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, false, false, false);
         assert_eq!(
             pairs,
             vec![
@@ -2440,6 +2651,20 @@ mod tests {
         assert_eq!(cols, 68, "C27 quotes 68 columns");
         assert!(cols < 100, "and it must fit beside the right segment at the floor");
         assert!(!pairs.iter().any(|(k, _)| k.contains('q')), "`q` filters, it does not close");
+    }
+
+    /// C15 (amended): the hint bar tells the truth in both cases. A keymap
+    /// that fits is closed by any key and says so; a scrolled one advertises
+    /// the reading keys and narrows the claim to "any *other* key", because
+    /// the arrows have stopped closing it.
+    #[test]
+    fn the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls() {
+        let whole = hint_pairs(&Mode::Help { top: 0 }, false, false, false);
+        assert_eq!(whole, vec![("Alt+?", "all keys"), ("any key", "close")]);
+        let scrolled = hint_pairs(&Mode::Help { top: 0 }, false, false, true);
+        assert_eq!(scrolled, vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]);
+        let cols: u16 = scrolled.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        assert!(cols < 100, "the scrolled row still fits beside the right segment: {cols}");
     }
 
     #[test]
@@ -2459,9 +2684,9 @@ mod tests {
     #[test]
     fn hint_pairs_rename_word_differs_pane_vs_tab() {
         let pane =
-            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false);
+            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false, false);
         let tab =
-            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false);
+            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false, false);
         assert_eq!(pane[0], ("type", "pane name"));
         assert_eq!(tab[0], ("type", "tab name"));
     }
@@ -2685,52 +2910,43 @@ mod tests {
 
     // -- C15/§8 help overlay ---------------------------------------------------
 
+    /// §8's table and the drawn keymap are the same table: **every chord
+    /// roost binds appears in the overlay**. This is the check the old ≤20
+    /// cap made impossible to state — under a cap, a new chord's options
+    /// were "merge a row" or "go undocumented", and the second is exactly
+    /// what a keymap must never do.
     #[test]
-    fn help_keys_fit_the_cap() {
-        // §8: hard cap, ≤ 20 content rows (the 80×24 floor's body is exactly
-        // 22 rows = 20 content + 2 border, zero slack).
-        assert!(HELP_KEYS.len() <= 20, "help overlay must never exceed the 20-row cap, got {}", HELP_KEYS.len());
+    fn every_bound_chord_is_documented_in_the_keymap() {
+        let text = HELP_GROUPS
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .map(|(k, d)| format!("{k} {d}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for chord in [
+            "Alt+n", "Alt+Enter", "Alt+r", "Alt+w", "Alt+u", "Alt+Shift+p", "Alt+Shift+←↓↑→",
+            "Alt+s", "Alt+o", "Alt+g", "Alt+z", "Alt+f", "Alt+t", "Alt+1..9", "Alt+0", "Alt+i",
+            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a", "Alt+e", "Alt+PgUp",
+            "Alt+c", "Alt+/", "Alt+?", "Alt+q",
+        ] {
+            assert!(text.contains(chord), "the keymap must document {chord:?}");
+        }
     }
 
+    /// C28's pair is documented as a pair, directly under the chords it is
+    /// the shifted form of — the adjacency *is* the explanation ("shift
+    /// makes the tab chord take the pane with you").
     #[test]
-    fn help_keys_match_the_c8_key_table_verbatim_and_in_order() {
-        // The exact §8 table — six fleet rows (a/e/z/f/Shift+p/g) folded
-        // into the prior 14-row list at their §8 positions, then U7's tab
-        // reach chords (2026-07-27): the tab row gained Alt+0 and a
-        // previous/next row joined it, paid for by merging Alt+/ and Alt+?
-        // into one row so the ≤20 cap still holds. Wording matches §8.
-        // U23 (2026-07-27): three more merges (s/o, z/f, w/u) buy the three
-        // reference rows that close the table — the status legend and the
-        // two mouse rows. P21 (2026-07-27): scrollback search adds no row —
-        // its `/` and `n/N` are tightened into the copy/scroll row's own
-        // description, which is what the ≤20 cap has always demanded of a
-        // new mode-local key.
-        assert_eq!(
-            HELP_KEYS,
-            &[
-                ("Alt+n", "new shell pane (auto split)"),
-                ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
-                ("Alt+←↓↑→ / hjkl", "move focus"),
-                ("Alt+Shift+←↓↑→", "resize along that axis"),
-                ("Alt+s / Alt+o", "toggle split ⇄ stack / flip orientation"),
-                ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-                ("Alt+z / Alt+f", "zoom pane (view only) / floating scratch shell"),
-                ("Alt+a / Alt+Shift+a", "jump to next pane that needs you / list every pane"),
-                ("Alt+e", "activity feed (status / spawns / exits / control)"),
-                ("Alt+r / Alt+Shift+r", "rename pane / tab"),
-                ("Alt+t / Alt+1..9 / Alt+0", "new tab / go to tab / last tab"),
-                ("Alt+i / Alt+m", "previous / next tab (wraps)"),
-                ("Alt+w / Alt+u", "close pane (confirm if busy) / undo close"),
-                ("Alt+c / Alt+PgUp", "copy (hjkl wbe 0$ vV y o) / scroll — / search, n/N"),
-                ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
-                ("Alt+/ / Alt+?", "toggle hint bar / this keymap"),
-                ("Alt+q", "quit (workspace saved; sessions live)"),
-                ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
-                ("mouse", "wheel scrolls · click focuses · drag selects"),
-                ("Alt+click / o", "open the URL under the pointer / copy cursor"),
-            ],
-        );
-        assert_eq!(HELP_KEYS.len(), 20);
+    fn the_tabs_group_teaches_the_move_pane_chords_under_their_unshifted_siblings() {
+        let tabs = HELP_GROUPS.iter().find(|g| g.title == "TABS").expect("a TABS group");
+        let step = tabs.rows.iter().position(|(k, _)| *k == "Alt+i / Alt+m").expect("the step row");
+        let move_row = tabs
+            .rows
+            .iter()
+            .position(|(k, _)| k.starts_with("Alt+Shift+i"))
+            .expect("the move row");
+        assert_eq!(move_row, step + 1, "the shifted pair sits directly under the unshifted one");
+        assert!(tabs.rows[move_row].1.contains("move this pane"));
     }
 
     /// U23: the legend is the C5 glyph table, not a hand-copied lookalike —
@@ -2738,15 +2954,84 @@ mod tests {
     /// teaching a symbol roost no longer draws.
     #[test]
     fn help_legend_row_matches_the_theme_glyph_table() {
-        let (key, desc) = HELP_KEYS
+        let (key, desc) = HELP_GROUPS
             .iter()
+            .flat_map(|g| g.rows.iter())
             .find(|(k, _)| *k == "status")
             .copied()
             .expect("the overlay carries a status-glyph legend row");
         assert_eq!(key, "status");
         assert_eq!(desc, super::status_legend_text());
         // The two glyphs the live-QA drive greps the frame for.
-        assert!(desc.contains(theme::GLYPH_WORKING) && desc.contains(theme::GLYPH_EXITED));
+        assert!(
+            desc.contains(theme::GLYPH_WORKING) && desc.contains(theme::GLYPH_EXITED),
+            "{desc}",
+        );
+    }
+
+    /// C15 (amended): one column while the table fits, a second only when
+    /// it does not *and* the terminal is wide enough for two — the fewest
+    /// columns that fit, never columns for their own sake.
+    #[test]
+    fn help_takes_the_fewest_columns_that_fit() {
+        let lines = help_lines().len() as u16;
+        let content = help_content_width();
+
+        // Tall enough for the whole table: one column, however wide the
+        // terminal is.
+        let tall = Rect::new(0, 1, content * 4, lines + 2);
+        assert_eq!(help_layout(tall).columns.len(), 1, "a body that fits stays one column");
+
+        // Too short, and wide enough for two: two columns.
+        let wide = Rect::new(0, 1, content * 2 + super::HELP_GUTTER + 2, lines / 2 + 2);
+        let two = help_layout(wide);
+        assert_eq!(two.columns.len(), 2, "a short, wide body splits");
+        assert_eq!(
+            two.columns.iter().map(|c| c.len()).sum::<usize>(),
+            lines as usize,
+            "…and every single line survives the split",
+        );
+
+        // Too short and too narrow: one column, and it scrolls (see
+        // `help_scroll_extent`).
+        let narrow = Rect::new(0, 1, content + 2, 12);
+        let one = help_layout(narrow);
+        assert_eq!(one.columns.len(), 1);
+        let (visible, total) = super::help_scroll_extent(narrow);
+        assert!(visible < total, "a narrow, short body scrolls rather than dropping rows");
+    }
+
+    /// A column break never lands inside a group: a heading in one column
+    /// with half its chords in the other is worse than either arrangement.
+    #[test]
+    fn a_second_column_always_starts_on_a_group_heading() {
+        let content = help_content_width();
+        let wide = Rect::new(0, 1, content * 2 + super::HELP_GUTTER + 2, 14);
+        let layout = help_layout(wide);
+        assert_eq!(layout.columns.len(), 2);
+        assert!(
+            matches!(layout.columns[1].first(), Some(HelpLine::Head(_))),
+            "the right column opens on a heading: {:?}",
+            layout.columns[1].first(),
+        );
+        assert!(
+            matches!(layout.columns[0].first(), Some(HelpLine::Head(_))),
+            "…as does the left",
+        );
+    }
+
+    /// The keymap must be drawable at roost's own 80×24 floor — the case
+    /// that used to force the ≤20-row cap. It scrolls there now, but every
+    /// row is reachable and nothing is clipped horizontally.
+    #[test]
+    fn help_fits_the_eighty_column_floor_and_reaches_every_row() {
+        let body = Rect::new(0, 1, 80, 22); // 80×24 minus the two bars
+        let layout = help_layout(body);
+        assert!(layout.size.0 <= 80, "the keymap is {} cols wide", layout.size.0);
+        assert!(layout.size.1 <= body.height);
+        let (visible, total) = super::help_scroll_extent(body);
+        assert_eq!(total, help_lines().len(), "one column at the floor holds the whole table");
+        assert!(visible >= 1);
     }
 
     /// U20: the picker's accelerator has to be visible to be pressed, and
@@ -2836,6 +3121,7 @@ mod tests {
             &Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
             false,
             false,
+            false,
         );
         assert_eq!(
             pairs,
@@ -2857,20 +3143,25 @@ mod tests {
     /// source until now.
     #[test]
     fn help_rows_document_every_mouse_verb() {
-        let text = HELP_KEYS.iter().map(|(k, d)| format!("{k} {d}")).collect::<Vec<_>>().join("\n");
+        let text = HELP_GROUPS
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .map(|(k, d)| format!("{k} {d}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         for token in ["mouse", "wheel", "click", "drag", "Alt+click", "URL"] {
             assert!(text.contains(token), "the help overlay must mention {token:?}");
         }
     }
 
-    /// C15 (amended U23): the overlay may never be wider than the 80-col
+    /// C15 (amended U23): one column may never be wider than the 80-col
     /// floor — `centered_near` would clamp it to the screen and clip a
     /// description mid-word, the exact failure the width rule exists to
-    /// stop. The three reference rows are long; this is their guard rail.
+    /// stop. The reference rows are long; this is their guard rail.
     #[test]
-    fn help_dialog_fits_the_eighty_column_floor() {
-        let w = help_dialog_width(HELP_KEYS);
-        assert!(w <= 80, "help overlay is {w} cols wide; the 80-col floor would clip it");
+    fn one_help_column_fits_the_eighty_column_floor() {
+        let w = help_layout(Rect::new(0, 1, 200, 200)).size.0;
+        assert!(w <= 80, "the keymap is {w} cols wide; the 80-col floor would clip it");
     }
 
     // -- C24 keyboard copy cursor ----------------------------------------------
@@ -3319,6 +3610,59 @@ mod tests {
         assert!(!frame.contains("1 MAIN · 2 PANES"), "tab 1 filtered away whole:\n{frame}");
     }
 
+    /// C15 (amended), end to end through the real `draw()`: the keymap
+    /// draws its groups as underlined headings, spells each chord in the
+    /// key column, and — on a body too short for the whole table — says so
+    /// in its own title rather than silently ending mid-list.
+    #[test]
+    fn the_keymap_draws_grouped_rows_and_admits_when_it_is_scrolled() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::Help);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let frame: String = (0..30)
+            .map(|y| {
+                (0..100)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(frame.contains("PANES"), "a group heading:\n{frame}");
+        assert!(frame.contains("Alt+n"), "a chord from it:\n{frame}");
+        assert!(frame.contains("any key closes"), "the way out is in the title:\n{frame}");
+
+        // The heading wears C6's rule across its own column, exactly as the
+        // roster's group rows do — not just uppercase text.
+        let (hy, hx) = (0..30)
+            .flat_map(|y| (0..100).map(move |x| (y, x)))
+            .find(|&(y, x)| {
+                buf.cell((x, y)).is_some_and(|c| c.symbol() == "P")
+                    && (0..5).all(|i| {
+                        buf.cell((x + i, y)).is_some_and(|c| c.symbol() == &"PANES"[i as usize..][..1])
+                    })
+            })
+            .expect("the PANES heading is on screen");
+        assert!(
+            buf.cell((hx, hy)).unwrap().modifier.contains(Modifier::UNDERLINED),
+            "the heading is underlined (C6's idiom)",
+        );
+
+        // A 30-row terminal cannot hold the whole table, so the title has to
+        // own up to it — the alternative is a list that just stops.
+        let (visible, total) = super::help_scroll_extent(app.body_area());
+        assert!(visible < total, "the fixture is genuinely scrolled");
+        assert!(frame.contains(&format!("/{total}")), "the title counts the rows:\n{frame}");
+        assert!(frame.contains("↑↓ more"), "…and names the keys that reach them:\n{frame}");
+    }
+
     /// C27 + C5, the headline restore case: a workspace reloaded from disk
     /// has runtimes for the active tab only (`spawn_active_tab`), so the
     /// first `Alt+Shift+a` of a session lists panes that have never been
@@ -3507,6 +3851,30 @@ mod tests {
             app.apply(Action::ToggleRoster);
             let mut term =
                 Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+            term.draw(|f| super::draw(f, &mut app)).unwrap();
+        }
+    }
+
+    /// C15 (amended): the keymap draws at the 80×24 floor, at the 36×10
+    /// split floor beneath it, and on a body so short the overlay has room
+    /// for no content rows at all — the arithmetic the column/scroll layout
+    /// added is exactly where an off-by-one would panic, and the one modal
+    /// you open when lost must never be the one that crashes.
+    #[test]
+    fn the_keymap_draws_at_the_floor_and_below_it_without_panicking() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        for size in [Size::new(80, 24), Size::new(200, 26), Size::new(36, 10), Size::new(20, 4)] {
+            let mut app = mk_app(size);
+            app.apply(Action::Help);
+            let mut term = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+            term.draw(|f| super::draw(f, &mut app)).unwrap();
+            // …and scrolled to its end, where `top` is at its largest.
+            let (visible, total) = super::help_scroll_extent(app.body_area());
+            app.mode = Mode::Help { top: total.saturating_sub(visible) };
             term.draw(|f| super::draw(f, &mut app)).unwrap();
         }
     }

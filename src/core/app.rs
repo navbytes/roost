@@ -71,8 +71,11 @@ pub enum Mode {
     /// (row, col) in the focused pane's inner cell space; both input
     /// methods write the same `App::selection`.
     Copy { cursor: (u16, u16) },
-    /// Full-keymap overlay (Alt+?); any key dismisses it.
-    Help,
+    /// C15: the full-keymap overlay (Alt+?). `top` is the first visible
+    /// content row — 0 whenever the keymap fits, which is the common case;
+    /// the scroll keys only do anything on a terminal too short to show the
+    /// whole table at once. Every key that is not a scroll key dismisses it.
+    Help { top: usize },
     /// C20 activity-feed overlay; `offset` counts entries back from the
     /// newest (0 = live tail).
     Feed { offset: usize },
@@ -2195,7 +2198,7 @@ impl<B: PaneBackend> App<B> {
             self.mode,
             Mode::Rename { .. }
                 | Mode::Picker { .. }
-                | Mode::Help
+                | Mode::Help { .. }
                 | Mode::Feed { .. }
                 | Mode::Roster { .. }
         )
@@ -2240,6 +2243,27 @@ impl<B: PaneBackend> App<B> {
                 _ => {}
             }
         }
+        // C15: the wheel reads the keymap on when there is more of it than
+        // fits (its own PgUp/PgDn step, like the feed's), and any *click*
+        // dismisses it — "any key closes it" in mouse form. Handled here,
+        // above the left-click-only gate below, or the one gesture that
+        // means "show me more" would fall through to the dismissal. Over a
+        // keymap that fits entirely on screen the wheel is simply inert,
+        // exactly as the arrow keys are.
+        if matches!(self.mode, Mode::Help { .. }) {
+            let page = self.help_page();
+            match me.kind {
+                MouseEventKind::ScrollUp => {
+                    self.help_scroll(-page);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll(page);
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.mode = Mode::Normal,
+                _ => {}
+            }
+            return;
+        }
         let inside = dialog.is_some_and(|r| {
             me.column >= r.x
                 && me.column < r.x.saturating_add(r.width)
@@ -2267,10 +2291,6 @@ impl<B: PaneBackend> App<B> {
                 None if !inside => self.mode = Mode::Normal,
                 None => {}
             }
-            return;
-        }
-        if matches!(self.mode, Mode::Help) {
-            self.mode = Mode::Normal;
             return;
         }
         // C27: a click on a pane row goes to that pane (one press — the
@@ -2548,6 +2568,9 @@ impl<B: PaneBackend> App<B> {
             Action::NextTab => self.step_tab(1),
             Action::PrevTab => self.step_tab(-1),
             Action::LastTab => self.go_to_tab(self.ws.tabs.len().saturating_sub(1)),
+            Action::MovePaneToTab { forward } => {
+                self.move_pane_to_tab(if forward { 1 } else { -1 })
+            }
             Action::ToggleStack => {
                 let focused = self.focused;
                 layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
@@ -2601,7 +2624,7 @@ impl<B: PaneBackend> App<B> {
             }
             Action::ToggleHints => self.hints = !self.hints,
             Action::Undo => self.undo_close(),
-            Action::Help => self.mode = Mode::Help,
+            Action::Help => self.mode = Mode::Help { top: 0 },
             Action::JumpAttention => self.jump_attention(),
             Action::ToggleRoster => self.toggle_roster(),
             Action::ToggleZoom => {
@@ -2990,6 +3013,116 @@ impl<B: PaneBackend> App<B> {
         self.go_to_tab(next);
     }
 
+    /// C28: carry the focused pane `delta` tabs (wrapping), and go with it.
+    ///
+    /// The process is never touched — `runtimes` is keyed by `PaneId` across
+    /// the whole workspace, not per tab — so a running agent keeps its PTY,
+    /// its scrollback and its session through the move. Only the layout
+    /// trees and the spec change hands.
+    ///
+    /// Refusals, both flashed rather than silent (a no-op you can see beats
+    /// one you can't): the C22 float belongs to no tab, and a lone tab has
+    /// nowhere to send anything.
+    fn move_pane_to_tab(&mut self, delta: isize) {
+        if self.float_focused() {
+            self.set_flash("the scratch pane belongs to no tab");
+            return;
+        }
+        let n = self.ws.tabs.len();
+        if n < 2 {
+            self.set_flash("only one tab");
+            return;
+        }
+        let id = self.focused;
+        let si = self.ws.active_tab;
+        if !self.ws.tabs[si].panes.contains_key(&id) {
+            return; // focus is somewhere this action has no business moving
+        }
+        let mut di = (si as isize + delta).rem_euclid(n as isize) as usize;
+
+        // Where the pane lands, and whether it fits — decided *before*
+        // anything is removed, so a refusal leaves the workspace untouched
+        // rather than stranding the pane between two tabs. The destination
+        // is not the active tab, but `compute_rects` is pure and the body
+        // area is the same whichever tab is on screen, so this is the real
+        // geometry rather than a guess.
+        let body = self.body_area();
+        let mut drects = Vec::new();
+        layout::compute_rects(&self.ws.tabs[di].layout, body, &mut drects);
+        let host = self
+            .tab_focus_target(di)
+            .filter(|h| drects.iter().any(|pr| pr.id == *h))
+            .or_else(|| drects.first().map(|pr| pr.id));
+        let Some(host) = host else { return };
+        let host_rect = drects.iter().find(|pr| pr.id == host).map(|pr| pr.rect);
+        // Same split rule as `spawn_child`: cut the widest way, and refuse
+        // below the C25 floor rather than make a pane nothing can render in.
+        let dir = host_rect
+            .map(|r| {
+                if r.width >= r.height * 3 {
+                    SplitDir::Vertical
+                } else {
+                    SplitDir::Horizontal
+                }
+            })
+            .unwrap_or(SplitDir::Vertical);
+        if let Some(r) = host_rect {
+            let too_small = match dir {
+                SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
+                SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
+            };
+            if too_small {
+                self.set_flash(format!("{} has no room", self.ws.tabs[di].name));
+                return;
+            }
+        }
+
+        // C21/C22: this is a tab change, so it exits zoom and hides the
+        // float exactly like `go_to_tab` — done here rather than inherited,
+        // since the switch below is hand-rolled (the pane has to leave one
+        // tree and join another between the leave and the arrive).
+        self.exit_zoom();
+        self.hide_float();
+
+        let label = self.feed_label(id);
+        let Some(spec) = self.ws.tabs[si].panes.remove(&id) else { return };
+        // U11: the pane that is leaving cannot also be what this tab
+        // remembers — coming back falls through to the tab's first pane.
+        // (`remember_tab_focus` is deliberately *not* called for the source:
+        // there is nothing honest to store when the focused pane departs.)
+        self.tab_focus.remove(&id);
+        let source_emptied = layout::remove_pane(&mut self.ws.tabs[si].layout, id);
+        if source_emptied {
+            // Moving a tab's last pane away removes the tab — the same rule
+            // `close_pane_id` follows, and for the same reason: a tab with
+            // no panes is not a thing roost can draw. No undo record: the
+            // pane is alive in the destination, and resurrecting the tab
+            // around it would duplicate it.
+            let name = self.ws.tabs[si].name.clone();
+            self.ws.tabs.remove(si);
+            if si < di {
+                di -= 1; // every later tab shifted down one
+            }
+            self.push_feed(format!("closed tab {name}"), false, None);
+        }
+
+        let dest = &mut self.ws.tabs[di];
+        let dest_name = dest.name.clone();
+        dest.panes.insert(id, spec);
+        if !layout::split_pane(&mut dest.layout, host, id, dir) {
+            dest.layout = LayoutNode::Pane(id); // the empty-tab fallback `spawn_child` keeps
+        }
+        self.ws.active_tab = di;
+        // The destination may never have been visited (lazy spawn), so its
+        // *other* panes come alive here — the moved one already has its
+        // runtime and `spawn_active_tab` skips it.
+        self.spawn_active_tab();
+        self.set_focus(id);
+        self.push_feed(format!("moved {label} to {dest_name}"), false, None);
+        self.relayout();
+        self.save();
+    }
+
     /// C21: leave zoom (a pure view flag). Called by every documented exit
     /// trigger before applying whatever caused it, so the layout never
     /// changes invisibly behind a full-screen zoomed pane.
@@ -3239,6 +3372,33 @@ impl<B: PaneBackend> App<B> {
     /// How many rows the overlay can show at once (its inner height).
     fn roster_view_rows(&self) -> usize {
         roster_overlay_size(self.body_area()).1.saturating_sub(2) as usize
+    }
+
+    /// C15: the keymap's paging step — half its visible height, at least one
+    /// row. Same rule as C20's `feed_page` and C27's `roster_page`.
+    fn help_page(&self) -> isize {
+        (crate::ui::render::help_scroll_extent(self.body_area()).0 / 2).max(1) as isize
+    }
+
+    /// C15: move the keymap's window `delta` rows, clamped to the table.
+    /// `isize::MIN`/`MAX` mean Home/End.
+    ///
+    /// Returns **whether it moved** — that is the whole contract with
+    /// `handle_mode_key`: a scroll key that has nowhere to go is not a
+    /// scroll key, so it falls through to "any key closes it" and the
+    /// amendment stays invisible on any terminal that shows the whole table.
+    fn help_scroll(&mut self, delta: isize) -> bool {
+        let (visible, total) = crate::ui::render::help_scroll_extent(self.body_area());
+        let max = total.saturating_sub(visible) as isize;
+        let Mode::Help { top } = &mut self.mode else { return false };
+        let next = match delta {
+            isize::MIN => 0,
+            isize::MAX => max,
+            d => (*top as isize + d).clamp(0, max),
+        } as usize;
+        let moved = next != *top;
+        *top = next;
+        moved
     }
 
     /// C27: the roster's paging step — half the overlay's height, at least
@@ -3943,9 +4103,35 @@ impl<B: PaneBackend> App<B> {
                 }
                 true
             }
-            Mode::Help => {
-                // Any key dismisses the keymap overlay.
-                self.mode = Mode::Normal;
+            Mode::Help { .. } => {
+                // C15 (amended): any key dismisses the keymap — except the
+                // scroll keys, and only when there is something to scroll
+                // to. On a terminal that shows the whole table (the common
+                // case) `help_scroll` reports no movement, so ↓ closes the
+                // overlay exactly as it always did: the amendment costs
+                // nothing anywhere it isn't needed, and a reader on a short
+                // terminal is not dismissed for trying to read on.
+                let step = self.help_page();
+                let delta = match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => 1,
+                    KeyCode::Up | KeyCode::Char('k') => -1,
+                    // Space is deliberately NOT a page key. In a modal whose
+                    // contract is "any key closes it", Space is the key a
+                    // reader hits to make it go away — pressing it and
+                    // getting another screenful is the opposite of what they
+                    // asked for.
+                    KeyCode::PageDown => step,
+                    KeyCode::PageUp => -step,
+                    KeyCode::Home => isize::MIN,
+                    KeyCode::End => isize::MAX,
+                    _ => {
+                        self.mode = Mode::Normal;
+                        return true;
+                    }
+                };
+                if !self.help_scroll(delta) {
+                    self.mode = Mode::Normal;
+                }
                 true
             }
             Mode::Feed { offset } => {
@@ -4256,7 +4442,7 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
         Mode::Picker { .. } => Some(Action::QuickLaunch),
         Mode::Scroll { .. } => Some(Action::ScrollMode),
         Mode::Copy { .. } => Some(Action::CopyMode),
-        Mode::Help => Some(Action::Help),
+        Mode::Help { .. } => Some(Action::Help),
         Mode::Feed { .. } => Some(Action::ToggleFeed),
         Mode::Roster { .. } => Some(Action::ToggleRoster),
         // P21: the search prompt is entered with `/`, not an Alt chord, so
@@ -5474,7 +5660,62 @@ mod tests {
         assert!(!consumed);
         assert!(matches!(app.mode, Mode::Normal));
         app.apply(Action::Help);
-        assert!(matches!(app.mode, Mode::Help));
+        assert!(matches!(app.mode, Mode::Help { .. }));
+    }
+
+    // ---- C15 (amended): the keymap scrolls only when it must -------------
+
+    /// On a terminal too short for the whole table, the scroll keys read on
+    /// instead of dismissing — and every other key still closes it, so
+    /// C15's "any key closes it" is narrowed by exactly the keys that have
+    /// somewhere to go and by nothing else.
+    #[test]
+    fn the_keymap_scrolls_on_a_short_terminal_and_still_closes_on_any_other_key() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, _) = mk_app(shell_ws());
+        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area());
+        assert!(visible < total, "this fixture's body is too short for the whole keymap");
+
+        app.apply(Action::Help);
+        assert!(matches!(app.mode, Mode::Help { top: 0 }));
+        app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Help { top: 1 }), "↓ read on");
+        app.handle_mode_key(KeyEvent::from(KeyCode::PageDown));
+        let Mode::Help { top } = app.mode else { panic!("PgDn kept it open") };
+        assert!(top > 1, "PgDn paged further than ↓ did");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Home));
+        assert!(matches!(app.mode, Mode::Help { top: 0 }), "Home went back to the first row");
+        app.handle_mode_key(KeyEvent::from(KeyCode::End));
+        assert!(
+            matches!(app.mode, Mode::Help { top: t } if t == total - visible),
+            "End went to the last screenful",
+        );
+        // …and at the bottom, ↓ has nowhere to go, so it closes — the same
+        // key, dismissing exactly when it stops being a scroll key.
+        app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Normal), "↓ at the end closes");
+
+        app.apply(Action::Help);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(app.mode, Mode::Normal), "an ordinary key still closes it");
+    }
+
+    /// …and on a terminal that shows the whole table, the amendment is
+    /// invisible: every key closes it, arrows included, exactly as before.
+    #[test]
+    fn the_keymap_closes_on_every_key_when_the_whole_table_fits() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut ws = shell_ws();
+        ws.tabs[0].name = "main".into();
+        let (mut app, _) = mk_app(ws);
+        app.on_resize(Size::new(120, 60), (0, 0));
+        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area());
+        assert_eq!(visible, total, "a tall body shows the whole keymap at once");
+        for key in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Char('j')] {
+            app.apply(Action::Help);
+            app.handle_mode_key(KeyEvent::from(key));
+            assert!(matches!(app.mode, Mode::Normal), "{key:?} closes when nothing scrolls");
+        }
     }
 
     #[test]
@@ -7962,6 +8203,146 @@ mod tests {
         assert_eq!(app.ws.active_tab, 2);
     }
 
+    // ---- C28: move the focused pane between tabs -------------------------
+
+    /// The core of it: the pane changes tabs, focus follows it there, and
+    /// **the process is untouched** — same runtime object, so the agent keeps
+    /// its PTY, its scrollback and its session across the move. That is the
+    /// whole reason the chord exists rather than "close it and start another
+    /// one over there".
+    #[test]
+    fn move_pane_to_tab_carries_the_pane_and_the_focus_without_respawning() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 1: panes 1|2, focus 2
+        app.apply(Action::NewTab); // tab 2: pane 3, focus 3
+        app.apply(Action::GoToTab(0));
+        app.set_focus(2);
+        // Stamp the live runtime so "the same process" is provable rather
+        // than assumed: a respawn would hand back a fresh FakePane with an
+        // empty input log.
+        app.runtimes.get_mut(&2).expect("pane 2 is running").write_input(b"mid-turn");
+
+        app.apply(Action::MovePaneToTab { forward: true });
+
+        assert_eq!(app.ws.active_tab, 1, "focus followed the pane to tab 2");
+        assert_eq!(app.focused, 2);
+        assert!(!app.ws.tabs[0].panes.contains_key(&2), "gone from the source tab");
+        assert!(app.ws.tabs[1].panes.contains_key(&2), "and arrived in the destination");
+        assert!(app.pane_order().contains(&2), "…in its layout tree, not just its map");
+        assert_eq!(
+            app.runtimes.get(&2).map(|rt| rt.input.clone()),
+            Some(b"mid-turn".to_vec()),
+            "the same runtime object — a move must never respawn the agent",
+        );
+        assert!(app.ws.tabs[0].panes.contains_key(&1), "the source tab's other pane stayed");
+    }
+
+    /// It wraps at both ends, exactly like the `Alt+i`/`Alt+m` pair it is
+    /// the shifted sibling of.
+    #[test]
+    fn move_pane_to_tab_wraps_at_both_ends() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        for _ in 0..2 {
+            app.apply(Action::NewTab); // three tabs
+        }
+        app.apply(Action::GoToTab(0));
+        app.set_focus(2);
+        app.apply(Action::MovePaneToTab { forward: false });
+        assert_eq!(app.ws.active_tab, 2, "moving back from the first tab wraps to the last");
+        assert!(app.ws.tabs[2].panes.contains_key(&2));
+        app.apply(Action::MovePaneToTab { forward: true });
+        assert_eq!(app.ws.active_tab, 0, "…and forward from the last wraps to the first");
+        assert!(app.ws.tabs[0].panes.contains_key(&2));
+    }
+
+    /// Moving a tab's *last* pane away removes the tab — `close_pane_id`'s
+    /// rule, since a tab with no panes is not a thing roost can draw. The
+    /// destination index has to survive the tabs below it shifting down.
+    #[test]
+    fn moving_a_tabs_last_pane_away_removes_the_tab_and_still_lands_right() {
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..2 {
+            app.apply(Action::NewTab); // tabs: [1] [2] [3], one pane each
+        }
+        app.apply(Action::GoToTab(0)); // sitting on the first tab's only pane
+        let moved = app.focused;
+
+        app.apply(Action::MovePaneToTab { forward: true });
+
+        assert_eq!(app.ws.tabs.len(), 2, "the emptied source tab went with it");
+        assert_eq!(app.ws.active_tab, 0, "the destination shifted down into index 0");
+        assert_eq!(app.ws.tabs[0].name, "tab2", "…and it really is the tab we aimed at");
+        assert!(app.ws.tabs[0].panes.contains_key(&moved));
+        assert_eq!(app.focused, moved);
+        // No undo record: the pane is alive over here, and resurrecting the
+        // tab around it would duplicate it.
+        assert!(
+            !app.undo.iter().any(|c| matches!(c, Closed::Tab { .. })),
+            "a move is not a close",
+        );
+    }
+
+    /// Both refusals are flashed, not silent, and neither disturbs anything:
+    /// the C22 float belongs to no tab, and a lone tab has nowhere to send.
+    #[test]
+    fn move_pane_to_tab_refuses_visibly_on_the_float_and_on_a_lone_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::MovePaneToTab { forward: true });
+        assert_eq!(app.ws.tabs.len(), 1, "nothing happened");
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("one tab")), "{:?}", app.flash);
+
+        app.apply(Action::NewTab);
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::MovePaneToTab { forward: true });
+        assert_eq!(app.focused, float_id, "the float is still where it was");
+        assert!(app.is_float(float_id));
+        assert!(
+            app.flash.as_ref().is_some_and(|(m, ..)| m.contains("scratch")),
+            "{:?}",
+            app.flash
+        );
+    }
+
+    /// C21: a move is a tab change, so it exits zoom — the invariant that
+    /// keeps the layout from changing invisibly behind a full-screen pane.
+    #[test]
+    fn move_pane_to_tab_exits_zoom_like_any_other_tab_change() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewTab);
+        app.apply(Action::GoToTab(0));
+        app.set_focus(2);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::MovePaneToTab { forward: true });
+        assert!(!app.zoomed(), "the tab changed under the zoom");
+    }
+
+    /// A destination with no room refuses **before** anything moves: the
+    /// pane must never be stranded between two tabs by a split the
+    /// destination cannot legally take (C25's `MIN_SPLIT_*` floor).
+    #[test]
+    fn move_pane_to_tab_refuses_a_destination_with_no_room_without_moving_anything() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        // Fill tab 2 until one more split would break the floor.
+        while app.spawn_child("shell", None, None).is_some() {}
+        let packed: Vec<PaneId> = app.pane_order();
+        assert!(packed.len() > 1, "the destination is genuinely full: {packed:?}");
+        app.apply(Action::GoToTab(0));
+        let moved = app.focused;
+
+        app.apply(Action::MovePaneToTab { forward: true });
+
+        assert_eq!(app.ws.active_tab, 0, "we did not move");
+        assert!(app.ws.tabs[0].panes.contains_key(&moved), "…and neither did the pane");
+        assert_eq!(app.pane_order(), vec![moved]);
+        assert_eq!(app.ws.tabs[1].panes.len(), packed.len(), "the destination is unchanged");
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("no room")), "{:?}", app.flash);
+    }
+
     /// `Alt+0` is the digit row's "and the rest" slot: the last tab,
     /// whatever its number — including past the ninth.
     #[test]
@@ -9301,7 +9682,7 @@ mod tests {
         app.apply(Action::ToggleRaw);
         assert!(app.raw_routing_active());
 
-        app.mode = Mode::Help;
+        app.mode = Mode::Help { top: 0 };
         assert!(!app.raw_routing_active(), "only applies in Normal mode");
         app.mode = Mode::Normal;
         assert!(app.raw_routing_active());

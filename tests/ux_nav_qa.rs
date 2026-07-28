@@ -626,7 +626,25 @@ fn ux_navigation_session() {
         "help overlay includes a status-glyph legend",
     );
     qa.check(s.to_lowercase().contains("mouse") || s.contains("wheel"), "help overlay documents mouse behavior");
+    // C15 (amended): the keymap is grouped, and every chord gets its own row
+    // — including the two the old ≤20-row cap would have forced onto an
+    // already-merged one.
+    qa.check(
+        ["PANES", "TABS", "FLEET", "SESSION"].iter().all(|g| s.contains(g)),
+        "help overlay groups its chords under headings",
+    );
+    qa.check(
+        s.contains("Alt+Shift+i") && s.contains("move this pane"),
+        "C28: the move-pane chords are documented in the keymap",
+    );
+    // …and Space still dismisses it: "any key closes it" must survive the
+    // amendment that let the overlay scroll.
     h.write_bytes(b" ");
+    settle(&mut h);
+    qa.check(
+        !h.screen().contents().contains("PANES"),
+        "space still closes the keymap (C15's dismiss rule survives scrolling)",
+    );
     settle(&mut h);
     // hints hidden + zoom: any mode indication left?
     h.write_bytes(&alt(b'/'));

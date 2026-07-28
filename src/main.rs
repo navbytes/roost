@@ -844,6 +844,14 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }
     }
+    fn wheel_down(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -998,6 +1006,15 @@ mod tests {
         let mut app = mk_app();
         app.apply(Action::Help);
         let rect = ui::render::modal_rect(&app).expect("help draws a dialog");
+        // C15 (amended): the wheel reads on when the keymap is taller than
+        // the overlay — it must not be mistaken for a dismissal, or the one
+        // gesture for "show me more" would throw the list away.
+        let (visible, total) = ui::render::help_scroll_extent(app.body_area());
+        assert!(visible < total, "this fixture's keymap is scrolled");
+        handle_mouse(&mut app, wheel_down(rect.x + 1, rect.y + 1));
+        assert!(matches!(app.mode, Mode::Help { top } if top > 0), "the wheel scrolls the keymap");
+        handle_mouse(&mut app, wheel_up(rect.x + 1, rect.y + 1));
+        assert!(matches!(app.mode, Mode::Help { top: 0 }), "…and back up");
         handle_mouse(&mut app, click(rect.x + 1, rect.y + 1));
         assert!(matches!(app.mode, Mode::Normal), "any click dismisses help");
 

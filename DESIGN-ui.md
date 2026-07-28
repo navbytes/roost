@@ -4,7 +4,7 @@ Canonical design reference: `docs/tui-design.html` (tokens at `:root` ~line 584,
 terminal markup ~614–696, token legend ~698). This document translates that
 mockup into testable contracts for a ratatui 0.29 cell-grid TUI. The
 `design-supervisor` agent audits implementation against the numbered contracts
-below (C1–C27) and issues a per-contract verdict: **ALIGNED** or **DEVIATED**
+below (C1–C28) and issues a per-contract verdict: **ALIGNED** or **DEVIATED**
 (with file:line evidence). Line anchors below were verified against the working
 tree on 2026-07-21 and may drift a line or two; the code element named is the
 anchor, not the number.
@@ -49,6 +49,16 @@ herdr.dev-style vertical sidebar on the 80-column arithmetic and closed the one
 gap it did find; the reasoning lives in C27's provenance paragraph. They add no
 glyph (§2's inventory is unchanged — the count cell is ASCII text, see C2) and
 no colour.
+
+**Amendment 2026-07-28 (move-pane + keymap):** **C28** (move a pane between
+tabs, `Alt+Shift+i`/`Alt+Shift+m`) is new, and **C15 retires the help
+overlay's ≤20-row cap** — the keymap is now grouped, takes a second column
+when the terminal is wide enough, and scrolls only when it must. Read C15's
+last amendment before auditing it: six merges in eight days had turned "the
+merge idiom" into a budget that was shaping the artifact, and the cap's
+replacement is a stronger check, not a weaker one — *every chord roost binds
+appears in the overlay*, an assertion the cap made unsatisfiable. Neither
+adds a glyph or a colour.
 
 ---
 
@@ -1223,6 +1233,65 @@ the two chords are one deliberate pair (C27's binding rationale). Row count
 stays **20**; `help_keys_match_the_c8_key_table_verbatim_and_in_order` and
 `help_dialog_fits_the_eighty_column_floor` pin both halves.
 
+**[Amended 2026-07-28, C28 — the ≤20-row cap is retired; the keymap is
+grouped, columned and scrollable.]**
+
+Every amendment above this one paid for new content the same way: **merge two
+chords onto one row.** Read the trail — U7 merged `Alt+c`/`Alt+PgUp` and
+`Alt+/`/`Alt+?`; U23 merged `Alt+s`/`Alt+o`, `Alt+z`/`Alt+f` and
+`Alt+w`/`Alt+u`; C27 merged `Alt+a`/`Alt+Shift+a`. Six merges in eight days,
+each recorded as "the idiom the cap has always demanded". C28's two chords
+would have made it seven, on a row already holding two. That is not an idiom
+any more; it is a budget, and the budget was distorting the artifact — the
+one surface whose entire job is explaining roost had started explaining it
+in the fewest rows rather than the clearest.
+
+So the cap goes, and with it the merges:
+
+- **Grouped, not one flat list.** `HELP_GROUPS` — `PANES`, `LAYOUT`, `TABS`,
+  `FLEET`, `READING`, `SESSION`, `READING THE SCREEN` — in "how often you
+  reach for it" order, each heading in C6's idiom (uppercase, `quiet()`,
+  underlined across its column), exactly as C27's roster stacks its groups.
+  No blank row between groups: the underline *is* the separator, and six
+  blanks would be six rows of a table that already scrolls at the floor.
+  Grouping is also what makes an unmerged list readable — 26 undifferentiated
+  chord rows is a worse artifact than 20 merged ones; 26 in seven named
+  blocks is a better one than either.
+- **The fewest columns that fit** (`help_layout`). One column while the list
+  fits the body's height — the calm form, and the only form at the 80-col
+  floor. A second column only when one would overflow *and* the terminal is
+  wide enough for two, split at the group boundary nearest the halfway mark
+  so a heading is never sawn off from its chords. Never columns for their
+  own sake.
+- **Scrolling, when even that is not enough** — the option U23 explicitly
+  rejected, taken now because its stated cost has been paid down. U23's
+  objection was that carving arrows out of "any key closes it" makes the
+  modal you open when you are lost the one with a non-obvious way out. Two
+  things answer that. First, the carve-out is **conditional on there being
+  something to scroll to**: `help_scroll` returns whether it moved, and a key
+  that did not move the window falls straight through to the dismissal — so
+  on every terminal that shows the whole table (which two columns now make
+  the common case) `↓` closes the overlay exactly as it always did, and the
+  amendment is invisible. Second, when it *is* scrolled the overlay says so
+  in its own title (`keys — 26/36 · ↑↓ more · any key closes`) and the C9
+  hint bar switches to `↑↓ PgUp/Dn read on` · `any other key close`. The way
+  out is more visible while scrolled than it was before, not less.
+  `↑`/`↓`/`j`/`k` step, `PgUp`/`PgDn` page by half the visible height
+  (C20's `feed_page` rule), `Home`/`End` jump; the wheel pages, and any
+  **click** still dismisses (U8's mouse form of the same rule).
+  **`Space` is deliberately not a page key** — in a modal whose contract is
+  "any key closes it", `Space` is what a reader hits to make it go away, and
+  answering with another screenful is the opposite of the ask.
+- **Width rule, unchanged in substance:** one *column* must stay ≤ 80 or
+  `centered_near` clamps and clips a description mid-word. Pinned by
+  `one_help_column_fits_the_eighty_column_floor`.
+- **What replaces the cap as the binding check:**
+  `every_bound_chord_is_documented_in_the_keymap` — every chord roost binds
+  appears in the overlay. That assertion was *impossible* to write under the
+  cap, where a new chord's options were "merge a row" or "go undocumented".
+  It is the check that actually matters, and it only became available by
+  removing the constraint that made it unsatisfiable.
+
 ### C16 — Dead-pane overlay
 
 **Current:** `render.rs:387–403` — error line Red fg; action bar Black on Red.
@@ -2005,6 +2074,11 @@ you.**
   `Alt+a / Alt+Shift+a` → `jump to next pane that needs you / list every
   pane` — the merge idiom the ≤20-row cap has always demanded, and here also
   the honest presentation of a deliberate pair.
+  **[Superseded 2026-07-28, C15's cap retirement]** the merge is undone:
+  `Alt+a` and `Alt+Shift+a` are two rows of the overlay's `FLEET` group,
+  which is where the pairing is now legible without cramming. The chords,
+  their meanings and this contract are unchanged — only the row packing was,
+  and it was only ever a consequence of the cap.
 
 **The C20 distinction (contracted, so the two never drift):**
 > **`Alt+e` answers "what happened"** — a time-ordered history of transitions,
@@ -2038,6 +2112,75 @@ both marks, live query). Plus the PTY e2e `tests/roster_overlay.rs`: the
 roster lists a **non-active** tab's panes and jumps across to one, with
 `roost list` as ground truth — that cross-tab case is the whole point of the
 feature, so it gets a real terminal.
+
+### C28 — Move a pane between tabs (Alt+Shift+i / Alt+Shift+m) — [Added 2026-07-28]
+
+**Current:** a pane is born in a tab and dies in it. Every arrangement verb
+roost has (`Alt+s`, `Alt+o`, `Alt+g`, `Alt+Shift+arrows`) rearranges panes
+*within* one tab; the only way to get a running agent into a different tab is
+to close it and start another one over there, which throws away its PTY, its
+scrollback and its session. Tabs are how roost separates concerns, and
+concerns get reassigned — a pane started in `main` while exploring belongs in
+`api` once you know what it is.
+
+**Target — the pane changes tabs and you go with it.**
+
+- **Binding: `Alt+Shift+i` / `Alt+Shift+m`** (`Action::MovePaneToTab
+  { forward }`), also accepted as `Alt+I`/`Alt+M` (the uppercase-delivery
+  tolerance `Alt+Shift+r`/`a`/`p` already carry). The shifted siblings of
+  U7's `Alt+i`/`Alt+m`: **the unshifted chords move you between tabs, the
+  shifted ones move the focused pane there and follow it.** Costs the
+  unshifted Alt pool nothing (§8's amendment).
+  `Alt+[`/`Alt+]` — the brief's suggestion — are rejected: `ESC [` is the
+  CSI introducer, so `Alt+[` cannot be told apart from the start of an
+  escape sequence (§8's standing rejection, same hazard as C23's `ESC`+`P`).
+- **Wraps at both ends**, exactly like the pair it is the shifted form of.
+- **The process is never touched.** `runtimes` is keyed by `PaneId` across
+  the whole workspace, so a running agent keeps its PTY, its scrollback and
+  its resume session through the move; only the layout trees and the spec
+  change hands. This is the entire reason the chord exists rather than
+  "close it and start another one over there", and it is what
+  `move_pane_to_tab_carries_the_pane_and_the_focus_without_respawning`
+  proves by stamping the live runtime before the move and reading it after.
+- **Where it lands:** split off the destination tab's remembered focus pane
+  (U11's `tab_focus`, else that tab's first), cut the widest way — the same
+  rule `spawn_child` uses for `Alt+n`, so a moved pane arrives exactly where
+  a new one would.
+- **Refusals are checked *before* anything moves,** and all three are
+  flashed rather than silent (C11: a no-op you can see beats one you can't):
+  the C22 float belongs to no tab (`the scratch pane belongs to no tab`); a
+  lone tab has nowhere to send (`only one tab`); and a destination whose
+  split would break C25's `MIN_SPLIT_*` floor (`{tab} has no room`). The
+  destination's geometry is real, not guessed — `compute_rects` is pure and
+  the body area does not depend on which tab is active — so the check is the
+  same arithmetic the split itself will do. Ordering is the contract here: a
+  pane must never be stranded between two tabs by a split the destination
+  turns out not to be able to take.
+- **Moving a tab's last pane away removes the tab**, `close_pane_id`'s own
+  rule (a tab with no panes is not a thing roost can draw), with the same
+  index fix-up — and the destination index shifts down with it when the
+  source sat before it. **No undo record**: the pane is alive in the
+  destination, and resurrecting the tab around it would duplicate it. The
+  inverse chord is the way back.
+- **C21/C22:** a move is a tab change, so it exits zoom and hides the float,
+  exactly as `go_to_tab` does. U11: the departing pane is cleared from
+  `tab_focus` — a tab cannot remember a pane that left it, and coming back
+  falls through to its first pane.
+- **C20:** one feed line, `moved {id} {name} to {tab}` (plus `closed tab
+  {name}` when the source emptied — the same line a last-pane close emits,
+  because it is the same event).
+- **Chrome:** no new surface. The tab bar's C2 count cells and C27's roster
+  both re-read the workspace every frame, so they show the move the instant
+  it happens; C15's keymap teaches the pair directly under the unshifted
+  chords it is the shifted form of, because that adjacency *is* the
+  explanation.
+
+**Unit tests (the executable form of this contract):** the carry (pane,
+focus, and the same runtime object) · wrap at both ends · the emptied source
+tab removed with the destination index still landing right, and no undo
+record · both flat refusals, visible · the pre-flight geometry refusal
+leaving *both* tabs untouched · zoom exited · the chord table, with the
+unshifted pair proven unchanged.
 
 ---
 
@@ -2278,9 +2421,10 @@ not a benchmark suite.
 
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
-The one canonical list. The help overlay (C15) renders exactly these rows in
-this order (merged rows stay merged; ≤ 20 rows, hard cap). The hint bar shows
-only the C9-curated subsets.
+The one canonical list. The help overlay (C15) renders every chord here —
+**grouped**, unmerged, and with no row cap since 2026-07-28 (see C15's
+amendment; the ≤20-row cap and the merges it forced are gone). The hint bar
+shows only the C9-curated subsets.
 
 | # | Chord | Action | Contract |
 |---|---|---|---|
@@ -2299,6 +2443,7 @@ only the C9-curated subsets.
 | 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
 | 13b | `Alt+i / Alt+m` | **previous / next tab (wraps)** | C2 |
+| 13c | `Alt+Shift+i / Alt+Shift+m` | **move this pane to the previous / next tab (wraps)** | C28 |
 | 14 | `Alt+w` | close pane (confirm if busy / last) | — |
 | 15 | `Alt+u` | undo — reopen last closed pane/tab | C26 |
 | 16 | `Alt+c` | copy mode (hjkl+v+y, or drag) | C17/C24 |
@@ -2339,6 +2484,21 @@ legend, mouse verbs, `Alt+click`). Rows 5+6, 8+9 and 14+15 render merged
 (`Alt+s / Alt+o`, `Alt+z / Alt+f`, `Alt+w / Alt+u`) to pay for them within
 the ≤20 cap — the chords, their meanings and their contracts are unchanged;
 only the row packing is.]
+
+[Amended 2026-07-28, C15's cap retirement — **every merge recorded in the
+two amendments above is undone.** `Alt+c`/`Alt+PgUp`, `Alt+/`/`Alt+?`,
+`Alt+s`/`Alt+o`, `Alt+z`/`Alt+f`, `Alt+w`/`Alt+u` and `Alt+a`/`Alt+Shift+a`
+each get their own overlay row again, and the reference rows above become
+the overlay's own `READING THE SCREEN` group. The rows are also no longer
+rendered "verbatim and in order" from this table: they are grouped by what
+the chord acts on (C15's amendment names the groups). This table stays the
+canonical *list* — what is bound, and to what contract — and the check that
+the two agree is `every_bound_chord_is_documented_in_the_keymap`, which
+supersedes the retired `help_keys_fit_the_cap` /
+`help_keys_match_the_c8_key_table_verbatim_and_in_order` /
+`help_dialog_fits_the_eighty_column_floor` trio named in the older text
+(`one_help_column_fits_the_eighty_column_floor` carries the width rule
+forward).]
 
 [Amended 2026-07-27, SPEC-ux U16 — rename-dialog editing keys. The dialog
 is a text field, and inside it `Ctrl+U` (clear the line) and `Ctrl+W` (rub
@@ -2408,6 +2568,20 @@ Control-plane only, no key by design: `roost send --all TEXT [--enter]`
 
 Free Alt keys remaining after this engagement: `b d p v x y PgDn`
 (`i m 0` were taken by U7, 2026-07-27).
+[Amended 2026-07-28, C28] Row 13c costs the **unshifted** pool nothing: it
+spends `Alt+Shift+i`/`Alt+Shift+m`, the shifted siblings of row 13b, so the
+free list above is unchanged. That is the fourth use of the shifted-sibling
+idiom (`Alt+Shift+r` renames the tab its unshifted form's pane belongs to,
+`Alt+Shift+a` lists the fleet its unshifted form jumps through,
+`Alt+Shift+p` has no unshifted twin by C23's design) and the tightest
+reading of it yet: **shift makes the tab chord take the pane with you.**
+Each carries the same uppercase-delivery tolerance (`Alt+I`/`Alt+M`), since
+some terminals send a shifted Alt+letter as an uppercase char with no SHIFT
+bit.
+`Alt+[` / `Alt+]` were the brief's suggestion and are rejected: `ESC [` is
+the CSI introducer, so `Alt+[` is indistinguishable from the start of an
+escape sequence (the same N3 hazard that kept C23 off `ESC`+`P`; see the
+rejection recorded above).
 Collision flags (all already swallowed by roost today, `input.rs:72–77`;
 raw mode C23 is the remedy): `Alt+f` readline forward-word · `Alt+a` zsh
 accept-and-hold · `Alt+b/d` left deliberately free (readline word ops — the
