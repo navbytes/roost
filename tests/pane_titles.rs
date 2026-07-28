@@ -86,7 +86,16 @@ fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
     // argv, which is exactly what `observe_panes` matches on, so the pane is
     // promoted to the pi adapter — the real path for an agent launched by
     // hand inside a shell pane.
-    h.write_bytes(b"sh -c 'sleep 300' pi\r");
+    //
+    // The trailing `; :` is load-bearing. A shell handed a `-c` string
+    // holding exactly one command **exec-replaces itself** with it, and the
+    // `pi` that was going to be argv[0] dies with the shell: on macOS
+    // `ps -o command=` then reports a bare `sleep 300` and the promotion
+    // never fires. A second command forces the shell to stay alive and fork,
+    // so `pi` survives in its argv on every platform. (macOS's /bin/sh
+    // optimizes here where Linux's does not, which is why this test passed
+    // on one and failed on the other for as long as it existed.)
+    h.write_bytes(b"sh -c 'sleep 300; :' pi\r");
 
     // Inbound: once promoted, the corner badge adopts the title it had been
     // ignoring (C4's badge leads with the pane id, so `1 TASK-X` is the

@@ -93,6 +93,25 @@ fn firehose_latency_starvation_and_clean_exit() {
     // (`src/ui/input.rs`: Alt+l / Alt+Right both map to Focus(Dir::Right)).
     h.write_bytes(b"\x1bl");
 
+    // Give pane B a two-column prompt before measuring anything typed into
+    // it. This is not cosmetic: the echo assertion below accumulates 20
+    // characters on the pane's **first content row**, and C4's corner badge
+    // (`2 shell · T ○`, ~16 columns) is right-aligned on that very row and
+    // overwrites what runs under it — the fixture comment above already
+    // guards the badge's *width*, but not the prompt's. A login shell on
+    // macOS starts with `\h:\W \u\$ `, 30 columns of hostname and username,
+    // which leaves 12 before the collision and fails this test at keystroke
+    // ~12 on every Mac while passing on Linux's two-column `$ `. Setting it
+    // in-band is the only way: shell panes are login shells (P18) and
+    // macOS's /etc/bashrc assigns PS1 after any inherited value.
+    h.write_bytes(b"PS1='$ '\r");
+    // The new prompt is a row that *starts* with `$` — matching bare `$ `
+    // would also match the echo of the command that set it.
+    h.wait_for(Duration::from_secs(3), |s| {
+        half(s, true).lines().any(|l| l.trim_start_matches('│').starts_with('$'))
+    })
+    .expect("pane B never took the short prompt");
+
     // --- Assertion 2 (checked first so its ~3.5s duration overlaps the
     // sustained-spew window assertion 1 also needs, keeping total wall time
     // down): no draw starvation. Pane A's region must keep changing across
