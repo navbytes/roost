@@ -84,6 +84,20 @@ impl Harness {
         // confuse content-based screen assertions.
         cmd.env("SHELL", "/bin/sh");
         cmd.env("TERM", "xterm-256color");
+        // ...and a deterministic *character* environment, for the same
+        // reason. Inherited, this is whatever the developer's shell exports:
+        // under `LC_CTYPE=C` the pane's shell reads the wide-glyph payload in
+        // tests/pane_wide_glyphs.rs a byte at a time instead of a character
+        // at a time, and that test fails on that machine alone while passing
+        // on every CI runner — which is exactly the kind of "works on my
+        // box" the rest of this file exists to prevent. LC_ALL rather than
+        // LANG so a developer who exports LC_ALL doesn't silently win.
+        cmd.env("LC_ALL", "C.UTF-8");
+        // Note: a pane's *prompt* cannot be pinned from here. Shell panes are
+        // login shells (P18), and macOS's /etc/profile sources /etc/bashrc,
+        // which assigns PS1 unconditionally — an inherited one loses. A test
+        // that needs a short prompt has to set it in-band; tests/firehose.rs
+        // does, and says why.
         // Never let a test run mutate the developer's real ~/.pi extension.
         cmd.env("ROOST_NO_EXT_INSTALL", "1");
         // Scenario-specific extras last, so a scenario can override any of
