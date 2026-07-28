@@ -19,6 +19,10 @@ pub enum Action {
     PrevTab,
     /// U7: jump to the last tab (`Alt+0`), whatever its number.
     LastTab,
+    /// C28: carry the focused pane to the previous / next tab, wrapping —
+    /// `Alt+Shift+i` / `Alt+Shift+m`, the shifted siblings of the two chords
+    /// that move *you* between tabs. Focus follows the pane.
+    MovePaneToTab { forward: bool },
     ToggleStack,
     /// Flip the focused pane's split between vertical and horizontal.
     FlipSplit,
@@ -129,8 +133,21 @@ pub fn translate(key: KeyEvent) -> InputResult {
             // forward to the pane — now they're roost's, like every other
             // chord in this table. See §8's amendment for why these two.
             KeyCode::Char('0') => Some(Action::LastTab),
-            KeyCode::Char('i') => Some(Action::PrevTab),
-            KeyCode::Char('m') => Some(Action::NextTab),
+            // C28: the shifted siblings carry the *pane* the way the
+            // unshifted ones carry *you* — Alt+i/Alt+m move focus between
+            // tabs, Alt+Shift+i/Alt+Shift+m move the focused pane there and
+            // follow it. `Alt+I`/`Alt+M` are the same uppercase-delivery
+            // tolerance Alt+Shift+r / Alt+Shift+a / Alt+Shift+p carry.
+            // (Alt+[ / Alt+] were the brief's suggestion and are rejected in
+            // §8: `ESC [` is the CSI introducer.)
+            KeyCode::Char('i') => {
+                Some(if shift { Action::MovePaneToTab { forward: false } } else { Action::PrevTab })
+            }
+            KeyCode::Char('I') => Some(Action::MovePaneToTab { forward: false }),
+            KeyCode::Char('m') => {
+                Some(if shift { Action::MovePaneToTab { forward: true } } else { Action::NextTab })
+            }
+            KeyCode::Char('M') => Some(Action::MovePaneToTab { forward: true }),
             KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
             KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
             KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
@@ -439,6 +456,39 @@ mod tests {
         assert!(matches!(
             translate(alt(KeyCode::Char('a'))),
             InputResult::Action(Action::JumpAttention)
+        ));
+    }
+
+    /// C28: the shifted siblings of U7's tab steps carry the *pane*. The
+    /// unshifted pair must stay exactly what it was — the whole idiom is
+    /// "shift makes the chord take the pane with you", so a regression here
+    /// would silently move panes when the user meant to change tabs.
+    #[test]
+    fn alt_shift_i_and_m_move_the_pane_with_uppercase_delivery_tolerance() {
+        for (code, forward) in [('i', false), ('m', true)] {
+            assert!(
+                matches!(
+                    translate(alt_shift(KeyCode::Char(code))),
+                    InputResult::Action(Action::MovePaneToTab { forward: f }) if f == forward
+                ),
+                "Alt+Shift+{code}",
+            );
+            let upper = code.to_ascii_uppercase();
+            assert!(
+                matches!(
+                    translate(alt(KeyCode::Char(upper))),
+                    InputResult::Action(Action::MovePaneToTab { forward: f }) if f == forward
+                ),
+                "Alt+{upper} (uppercase delivery)",
+            );
+        }
+        assert!(matches!(
+            translate(alt(KeyCode::Char('i'))),
+            InputResult::Action(Action::PrevTab)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('m'))),
+            InputResult::Action(Action::NextTab)
         ));
     }
 
