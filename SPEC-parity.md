@@ -248,7 +248,37 @@ even while the view is scrolled back — it floats over history.
 > 0 (same surface as U3/N1); parse DECSCUSR per pane and mirror the focused
 pane's shape to the host (restoring roost's own on focus change/exit).
 
-### P8 · CONFIRMED · Med — kitty keyboard protocol: roost affirms flags it doesn't implement
+### P8 · FIXED (this branch) · Med — kitty keyboard protocol: roost affirms flags it doesn't implement
+*Fixed, both halves — the promise and the delivery.*
+***The promise:** a push is now masked to `queries::SUPPORTED` **before it is
+stored**, so the flag stack itself can only ever describe behaviour roost
+delivers. A push of 7 reports `?1u`; a push of only unimplemented bits
+reports `?0u` and leaves `disambiguate()` false, so the app keeps the legacy
+encodings roost does send correctly instead of waiting for CSI-u that never
+comes. Masking on the way *in* rather than on the reply is what keeps the
+three readers of that state — the ACK, `disambiguate()`, and
+`input::kitty_upgrade` — from ever disagreeing.*
+***The delivery:** the bit roost does claim is now true. `kitty_upgrade`
+grew from "modified Enter only" to the two increments this finding named:
+**Esc → `CSI 27 u`** (the headline — a bare `0x1b` is indistinguishable from
+the first byte of an escape sequence, which is the whole reason an app asks
+for this mode) and **`Ctrl`/`Alt` + printable → `CSI <code> ; <mods> u`**,
+where the legacy encodings collide (`Ctrl+I` ≡ Tab, `Ctrl+M` ≡ Enter,
+`Ctrl+[` ≡ Esc) or don't exist at all. That last case closes P12's hole for
+negotiated panes at no extra cost: `Ctrl+-` had no C0 identity and was
+dropped rather than mis-sent; CSI-u says it exactly (`45;5u`). The key code
+is the unshifted codepoint, with shift in the modifier, per the spec.*
+*Deliberately still legacy, because roost does not claim the bits that would
+cover them: unmodified printables, and modified navigation/function keys
+whose legacy forms (`CSI 1;5C`) are already unambiguous — sending everything
+as CSI-u is bit `0x8`. Release events (bit `0x2`) stay unclaimed: they are
+filtered before `translate` sees them and would need host-side kitty flags,
+which is an architecture decision rather than a patch.*
+*The unit test that used to pin the flag-echoing reply as intended now pins
+the mask instead. e2e `tests/pane_queries.rs`: a pane pushes 7 and queries
+through a real PTY — the reply is `?1u`, never `?7u` — and then Ctrl+B
+arrives as `98;5u` rather than `0x02`. Both halves were verified to fail
+against the code they replace.*
 After a pane pushes flags 7, roost's query reply echoes `?7u` — contractually
 promising disambiguated Esc (`CSI 27u`), CSI-u modifier combos, and release
 events — while only modified-Enter is actually CSI-u-encoded; Esc goes out as

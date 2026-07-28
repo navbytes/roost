@@ -209,20 +209,71 @@ pub fn app_cursor_upgrade(key: KeyEvent, bytes: Vec<u8>, app_cursor: bool) -> Ve
     }
 }
 
-/// Upgrade modified-Enter bytes to the kitty CSI-u encoding when the target
-/// pane negotiated the protocol (`kitty` = its disambiguate flag). Panes that
-/// never opted in keep the ESC+CR fallback from `encode_key`. Called from the
-/// forward path, where the focused pane's state is known.
+/// kitty's modifier parameter: `1 + shift(1) + alt(2) + ctrl(4)`. Same shape
+/// as xterm's (`encode_key`'s `xm`), and `1` means "no modifiers" — which the
+/// CSI-u form then omits entirely.
+fn kitty_mods(m: KeyModifiers) -> u8 {
+    1 + u8::from(m.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(m.contains(KeyModifiers::ALT))
+        + 4 * u8::from(m.contains(KeyModifiers::CONTROL))
+}
+
+/// One key in the kitty CSI-u encoding: `CSI <code> ; <mods> u`, with the
+/// `; <mods>` dropped when there are none. `code` is the key's **unshifted**
+/// Unicode codepoint — kitty carries the shift in the modifier, not in the
+/// code, so `Ctrl+Shift+A` is `97;6u` and never `65;…`.
+fn csi_u(code: u32, m: KeyModifiers) -> Vec<u8> {
+    match kitty_mods(m) {
+        1 => format!("\x1b[{code}u").into_bytes(),
+        xm => format!("\x1b[{code};{xm}u").into_bytes(),
+    }
+}
+
+/// Re-encode a key in the kitty CSI-u form when the target pane negotiated
+/// the **disambiguate** flag (`kitty`); panes that never opted in keep the
+/// legacy bytes `encode_key` produced. Called from the forward path (raw and
+/// cooked alike), where the focused pane's state is known.
+///
+/// [Amended, P8] This used to upgrade *only* modified Enter, while
+/// `queries.rs` echoed the app's whole pushed flag word back at it — so a
+/// pane that asked for disambiguation was told "yes" and then sent bare
+/// `0x1b` for Esc and legacy control bytes for `Ctrl+key`. The flag is now
+/// masked to what roost implements (`queries::SUPPORTED`), and this function
+/// is the other half of that bargain: **disambiguate now means what it
+/// says.**
+///
+/// What the flag actually promises, and what is delivered here:
+/// - **Esc → `CSI 27 u`.** The headline of the whole protocol: a bare `0x1b`
+///   is indistinguishable from the first byte of an escape sequence, which
+///   is why an app asks for this mode at all.
+/// - **`Ctrl`/`Alt` + a printable → `CSI <code> ; <mods> u`.** The legacy
+///   encodings collide (`Ctrl+I` ≡ Tab, `Ctrl+M` ≡ Enter, `Ctrl+[` ≡ Esc)
+///   and for much of the keyboard they don't exist at all — P12 has roost
+///   *dropping* `Ctrl+-` rather than sending a wrong control byte. CSI-u has
+///   an exact answer for every one of them, so under this flag the P12 hole
+///   closes on its own.
+/// - **Modified Enter → `CSI 13 ; <mods> u`**, as before, now through the
+///   same general encoder rather than two hand-written constants.
+///
+/// Deliberately still legacy: unmodified printables (the spec keeps those
+/// legacy under disambiguate alone), and the navigation/function keys, whose
+/// modified legacy forms (`CSI 1;5C`) are already unambiguous. Sending
+/// *everything* as CSI-u is bit `0x8`, which roost does not claim.
 pub fn kitty_upgrade(key: KeyEvent, bytes: Vec<u8>, kitty: bool) -> Vec<u8> {
-    if !kitty || key.code != KeyCode::Enter || key.modifiers.contains(KeyModifiers::ALT) {
+    if !kitty {
         return bytes;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
-        b"\x1b[13;2u".to_vec() // Shift+Enter, kitty CSI-u (mods 2 = shift)
-    } else if key.modifiers.contains(KeyModifiers::CONTROL) {
-        b"\x1b[13;5u".to_vec() // Ctrl+Enter, kitty CSI-u (mods 5 = ctrl)
-    } else {
-        bytes
+    let m = key.modifiers;
+    let ctrl_or_alt = m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Esc => csi_u(27, m),
+        KeyCode::Enter if m.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            csi_u(13, m)
+        }
+        // The unshifted codepoint: crossterm hands us the *shifted* char for
+        // `Ctrl+Shift+a` on some terminals, and kitty wants `97;6u`.
+        KeyCode::Char(c) if ctrl_or_alt => csi_u(c.to_ascii_lowercase() as u32, m),
+        _ => bytes,
     }
 }
 
@@ -680,6 +731,70 @@ mod tests {
         // A plain letter is never touched, kitty or not.
         let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert_eq!(kitty_upgrade(a, b"a".to_vec(), true), b"a");
+    }
+
+    /// P8: **the headline of the protocol.** An app asks for disambiguation
+    /// precisely because a bare `0x1b` cannot be told apart from the first
+    /// byte of an escape sequence — and roost was answering "yes" and then
+    /// sending the bare byte anyway.
+    #[test]
+    fn a_negotiated_pane_gets_esc_as_csi_27u() {
+        let esc = plain(KeyCode::Esc);
+        assert_eq!(kitty_upgrade(esc, vec![0x1b], false), vec![0x1b], "legacy pane: untouched");
+        assert_eq!(kitty_upgrade(esc, vec![0x1b], true), b"\x1b[27u");
+        // Modified Esc carries kitty's modifier parameter like any other key.
+        let ctrl_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL);
+        assert_eq!(kitty_upgrade(ctrl_esc, vec![0x1b], true), b"\x1b[27;5u");
+    }
+
+    /// P8: `Ctrl`/`Alt` + printable. The legacy encodings collide
+    /// (`Ctrl+I` ≡ Tab, `Ctrl+M` ≡ Enter, `Ctrl+[` ≡ Esc) and for much of the
+    /// keyboard don't exist at all — P12 has roost *dropping* `Ctrl+-`
+    /// rather than sending a wrong byte. CSI-u answers all of them.
+    #[test]
+    fn a_negotiated_pane_gets_ctrl_and_alt_printables_as_csi_u() {
+        let case = |code, mods| kitty_upgrade(KeyEvent::new(code, mods), b"legacy".to_vec(), true);
+        // 99 = 'c'. mods: 5 = ctrl, 3 = alt, 7 = both.
+        assert_eq!(case(KeyCode::Char('c'), KeyModifiers::CONTROL), b"\x1b[99;5u");
+        assert_eq!(case(KeyCode::Char('b'), KeyModifiers::ALT), b"\x1b[98;3u");
+        assert_eq!(
+            case(KeyCode::Char('w'), KeyModifiers::CONTROL | KeyModifiers::ALT),
+            b"\x1b[119;7u",
+        );
+        // The code is the *unshifted* codepoint — kitty carries shift in the
+        // modifier, so Ctrl+Shift+A is 97;6u and never 65;anything.
+        assert_eq!(
+            case(KeyCode::Char('A'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            b"\x1b[97;6u",
+        );
+        // The collisions the flag exists to resolve, each now distinct from
+        // the bare key it used to be indistinguishable from.
+        assert_eq!(case(KeyCode::Char('i'), KeyModifiers::CONTROL), b"\x1b[105;5u");
+        assert_eq!(case(KeyCode::Char('m'), KeyModifiers::CONTROL), b"\x1b[109;5u");
+        assert_eq!(case(KeyCode::Char('['), KeyModifiers::CONTROL), b"\x1b[91;5u");
+        // P12's hole closes on its own here: `Ctrl+-` has no C0 identity, so
+        // `encode_key` forwards nothing — but CSI-u can say it exactly.
+        assert_eq!(case(KeyCode::Char('-'), KeyModifiers::CONTROL), b"\x1b[45;5u");
+    }
+
+    /// …and the keys the flag does *not* cover keep their legacy bytes: an
+    /// unmodified printable, and a modified navigation key whose legacy form
+    /// (`CSI 1;5C`) is already unambiguous. Sending everything as CSI-u is
+    /// bit `0x8`, which roost does not claim — so it must not behave as if
+    /// it had.
+    #[test]
+    fn a_negotiated_pane_keeps_legacy_for_what_disambiguate_does_not_cover() {
+        let keep = |code, mods, bytes: &[u8]| {
+            assert_eq!(kitty_upgrade(KeyEvent::new(code, mods), bytes.to_vec(), true), bytes);
+        };
+        keep(KeyCode::Char('a'), KeyModifiers::NONE, b"a");
+        keep(KeyCode::Char('A'), KeyModifiers::SHIFT, b"A");
+        keep(KeyCode::Right, KeyModifiers::CONTROL, b"\x1b[1;5C");
+        keep(KeyCode::Up, KeyModifiers::NONE, b"\x1b[A");
+        keep(KeyCode::Tab, KeyModifiers::NONE, b"\t");
+        keep(KeyCode::Backspace, KeyModifiers::NONE, &[0x7f]);
+        keep(KeyCode::Enter, KeyModifiers::NONE, b"\r");
+        keep(KeyCode::F(5), KeyModifiers::NONE, b"\x1b[15~");
     }
 
     // -- C23 raw pass-through: encode_raw -------------------------------

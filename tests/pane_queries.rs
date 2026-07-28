@@ -98,6 +98,63 @@ fn pane_da1_and_cursor_position_queries_are_answered() {
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }
 
+/// P8, end to end: the kitty keyboard ACK is a **promise**, and roost has to
+/// keep it.
+///
+/// A pane pushes flags 7 — disambiguate | report-event-types | alternate-keys
+/// — and roost used to echo `?7u` straight back while implementing only part
+/// of the first bit. Apps that take the terminal at its word (fish 4, helix,
+/// kakoune) then misparse. Both halves are checked here through a real PTY:
+/// the reply carries only the bit roost implements, and the bit it does claim
+/// is actually delivered on the wire.
+#[test]
+fn the_kitty_ack_promises_only_what_roost_delivers_and_then_delivers_it() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP kitty ACK gate: {reason}");
+            return;
+        }
+    };
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+
+    // Push flags 7 and query, then park `cat` so the kernel's ECHOCTL makes
+    // roost's reply visible as `^[…` text. Same marker trick as above: the
+    // echo of the typed line itself can never satisfy the gate.
+    h.write_bytes(b"printf 'KB''D1'; printf '\\033[>7u\\033[?u'; cat\r");
+    h.wait_for(Duration::from_secs(5), |s| s.contents().contains("KBD1"))
+        .expect("pane never ran the push/query script");
+
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[[?1u")).is_none() {
+        panic!(
+            "the ACK must report only the flags roost implements (?1u), not the \
+             pushed word:\n{}",
+            h.screen().contents()
+        );
+    }
+    assert!(
+        !h.screen().contents().contains("^[[?7u"),
+        "roost echoed the app's whole flag word back at it:\n{}",
+        h.screen().contents()
+    );
+
+    // …and the bit it *did* claim is real: with disambiguate negotiated,
+    // Ctrl+B reaches the pane as CSI-u rather than the legacy 0x02 byte.
+    h.write_bytes(&[0x02]);
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[[98;5u")).is_none() {
+        panic!(
+            "a negotiated pane must receive Ctrl+B as CSI-u (98;5u), not 0x02:\n{}",
+            h.screen().contents()
+        );
+    }
+
+    h.write_bytes(b"\x03"); // Ctrl+C ends cat
+    h.settle(Duration::from_secs(2));
+    let _ = h.quit_and_wait(Duration::from_secs(5));
+}
+
 #[test]
 fn first_frame_is_not_blocked_by_the_enhancement_probe() {
     let cwd = std::env::temp_dir();
