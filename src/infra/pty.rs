@@ -117,7 +117,33 @@ fn host_clipboard_bytes(selection: &str, payload_base64: &str, cap: usize) -> Op
 /// stuck one — an app killed mid-redraw, a bug that never sends `?2026l` —
 /// must never freeze the pane, so past the cap the live grid is presented
 /// again. Torn beats frozen.
-const SYNC_STALE_CAP: Duration = Duration::from_millis(150);
+const SYNC_STALE_CAP_DEFAULT: Duration = Duration::from_millis(150);
+
+/// The cap actually in force, `$ROOST_SYNC_CAP_MS` overriding the default.
+///
+/// The override exists for `tests/pane_sync_output.rs`, which drives a real
+/// pane through real brackets and samples `roost read` from outside. That
+/// test can only hold a bracket open by sleeping inside it, and a loaded CI
+/// runner stretches a 60 ms shell `sleep` past 150 ms often enough to expire
+/// the cap — at which point roost correctly presents the torn frame and the
+/// gate reports a defect that isn't one (observed: two of three macOS runs).
+/// Raising the cap for that one process removes the race instead of making
+/// it rarer, and leaves the gate asserting what it means to assert: that an
+/// *unexpired* bracket is never read mid-redraw. Expiry itself stays pinned
+/// by the pure unit test below, which needs no clock at all.
+///
+/// Same shape as `ROOST_NO_EXT_INSTALL`: a knob the product does not
+/// advertise, read once, with the shipped behavior as its default.
+fn sync_stale_cap() -> Duration {
+    static CAP: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ROOST_SYNC_CAP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(SYNC_STALE_CAP_DEFAULT)
+    })
+}
 
 /// P1: which screen to *present* — the last complete frame while a
 /// synchronized-output bracket is open and fresh, else the live grid. Pure
@@ -287,7 +313,7 @@ impl PtyPane {
     /// surface P1 measured 31/50 torn samples on). History and state
     /// surfaces deliberately do not; see `sync_view`.
     fn presented(&self) -> &vt100::Screen {
-        sync_presented(self.parser.screen(), self.sync_view.as_ref(), SYNC_STALE_CAP)
+        sync_presented(self.parser.screen(), self.sync_view.as_ref(), sync_stale_cap())
     }
 
     /// W3: turn one parser effect into roost-side consequences — attention
@@ -780,7 +806,7 @@ mod tests {
     use super::{
         extract_selection, host_clipboard_bytes, host_notify_bytes, sanitize_for_host,
         scrub_host_identity, sync_presented, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP,
-        HOST_NOTIFY_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP,
+        HOST_NOTIFY_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -797,7 +823,7 @@ mod tests {
     #[test]
     fn sync_presents_the_live_grid_when_no_bracket_is_open() {
         let p = screen_with("live", 4, 20);
-        let presented = sync_presented(p.screen(), None, SYNC_STALE_CAP);
+        let presented = sync_presented(p.screen(), None, SYNC_STALE_CAP_DEFAULT);
         assert!(presented.contents().contains("live"));
     }
 
@@ -810,13 +836,13 @@ mod tests {
         p.process(b"\x1b[?2026h\x1b[2J\x1b[Htorn");
         let snap = p.take_sync_snapshot().expect("bracket open captures");
         let view = Some((snap, Instant::now()));
-        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP);
+        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP_DEFAULT);
         assert!(presented.contents().contains("complete"));
         assert!(!presented.contents().contains("torn"));
     }
 
     /// P1's safety valve: a bracket that never closes (an app killed
-    /// mid-redraw) must not freeze the pane forever. Past `SYNC_STALE_CAP`
+    /// mid-redraw) must not freeze the pane forever. Past `SYNC_STALE_CAP_DEFAULT`
     /// the live grid is presented again — torn beats frozen. Pure, so the
     /// expiry is proven without sleeping 150 ms.
     #[test]
@@ -827,15 +853,15 @@ mod tests {
         let snap = p.take_sync_snapshot().expect("bracket open captures");
 
         // One tick shy of the cap: still the captured frame.
-        let fresh = Some((snap.clone(), Instant::now() - SYNC_STALE_CAP + Duration::from_millis(1)));
-        assert!(sync_presented(p.screen(), fresh.as_ref(), SYNC_STALE_CAP)
+        let fresh = Some((snap.clone(), Instant::now() - SYNC_STALE_CAP_DEFAULT + Duration::from_millis(1)));
+        assert!(sync_presented(p.screen(), fresh.as_ref(), SYNC_STALE_CAP_DEFAULT)
             .contents()
             .contains("complete"));
 
         // Past it: the live grid, however torn — the pane keeps moving even
         // though the app never sent `?2026l`.
-        let stale = Some((snap, Instant::now() - SYNC_STALE_CAP - Duration::from_millis(1)));
-        let presented = sync_presented(p.screen(), stale.as_ref(), SYNC_STALE_CAP);
+        let stale = Some((snap, Instant::now() - SYNC_STALE_CAP_DEFAULT - Duration::from_millis(1)));
+        let presented = sync_presented(p.screen(), stale.as_ref(), SYNC_STALE_CAP_DEFAULT);
         assert!(presented.contents().contains("half-drawn"));
         assert!(!presented.contents().contains("complete"));
     }
@@ -853,13 +879,13 @@ mod tests {
         let snap = p.take_sync_snapshot().expect("bracket open captures");
         let view = Some((snap, Instant::now()));
         // Scrolled to the live tail: the snapshot presents as usual.
-        assert!(sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP)
+        assert!(sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP_DEFAULT)
             .contents()
             .contains("row19"));
         // Scrolled into history: the live grid's own scrolled view wins.
         p.set_scrollback(5);
         assert!(p.screen().scrollback() > 0);
-        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP);
+        let presented = sync_presented(p.screen(), view.as_ref(), SYNC_STALE_CAP_DEFAULT);
         assert_eq!(presented.contents(), p.screen().contents());
     }
 

@@ -59,7 +59,19 @@ fn cli_read(state_dir: &std::path::Path) -> String {
 fn a_pane_inside_a_2026_bracket_is_never_read_mid_redraw() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
+    // Hold the staleness cap far above anything this loop can produce. The
+    // pane can only keep a bracket open by sleeping inside it, and a loaded
+    // runner stretches the 60 ms `sleep` below past the shipped 150 ms cap
+    // often enough to matter (two of three macOS CI runs): once it expires
+    // roost *correctly* presents the torn frame, and this gate reports a
+    // defect that isn't one. With the cap out of reach, a torn sample can
+    // only mean the thing the gate is named for — a read that ignored an
+    // open bracket. Cap expiry is pinned separately, and without a clock, by
+    // `sync_presented`'s own unit tests in src/infra/pty.rs.
+    let mut h = match Harness::try_spawn_with_env(
+        &fixture_workspace(cwd),
+        &[("ROOST_SYNC_CAP_MS", "30000")],
+    ) {
         Ok(h) => h,
         Err(reason) => {
             eprintln!("SKIP sync-output gate: {reason}");
@@ -73,8 +85,9 @@ fn a_pane_inside_a_2026_bracket_is_never_read_mid_redraw() {
     // cleared grid) about half the time. Both markers are spelled split
     // (`SYNC''HEAD`) so the shell's echo of the command line can never
     // satisfy — or falsify — an assertion; only printf's real output can.
-    // 60 ms sits comfortably under the 150 ms staleness cap, so the honest
-    // path is "present the previous complete frame", not "cap expired".
+    // 60 ms is the intended bracket duration; the cap is raised above at
+    // spawn so that a runner stretching this sleep cannot turn the honest
+    // path ("present the previous complete frame") into "cap expired".
     h.write_bytes(
         b"while :; do printf '\\033[?2026h\\033[2J\\033[HSYNC''HEAD'; sleep 0.06; \
           printf 'SYNC''TAIL\\033[?2026l'; sleep 0.06; done\r",
