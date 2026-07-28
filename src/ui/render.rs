@@ -32,7 +32,7 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // requires every Working glyph to flip in unison; sampling `app.elapsed()`
     // separately per glyph left a real (if tiny) window for the clock to tick
     // past the 550ms edge mid-draw and split a frame across both phases.
-    let pulse = theme::pulse_phase(app.elapsed());
+    let pulse: Style = theme::pulse_phase(app.elapsed());
 
     draw_tab_bar(f, app, tab_bar, pulse);
 
@@ -205,10 +205,10 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
 /// unit-testable without a `Frame`.
 ///
 /// [P21] `query` is the live search prompt (`/foo`) and is the one token on
-/// this bar drawn in `FG`: it is text the user is typing right now, and DIM
-/// input is input you cannot proofread. `position` carries `↑N/M` in Scroll
-/// mode and the `i/n` hit counter while searching — both DIM, both the same
-/// "where am I" role.
+/// this bar drawn in `ink`: it is text the user is typing right now, and
+/// quiet input is input you cannot proofread. `position` carries `↑N/M` in
+/// Scroll mode and the `i/n` hit counter while searching — both `quiet`, both
+/// the same "where am I" role.
 fn hint_bar_right_spans(
     n: usize,
     query: Option<String>,
@@ -219,17 +219,17 @@ fn hint_bar_right_spans(
     if n > 0 {
         spans.push(Span::styled(
             format!("◆ {n} needs you · Alt+a"),
-            Style::default().fg(theme::ACCENT),
+            theme::accent(),
         ));
         spans.push(Span::raw("  "));
     }
     if let Some(q) = query {
-        spans.push(Span::styled(format!("{q} "), Style::default().fg(theme::FG)));
+        spans.push(Span::styled(format!("{q} "), theme::ink()));
     }
     if let Some(pos) = position {
-        spans.push(Span::styled(format!("{pos} "), Style::default().fg(theme::DIM)));
+        spans.push(Span::styled(format!("{pos} "), theme::quiet()));
     }
-    spans.push(Span::styled(word.to_string(), Style::default().fg(theme::DIM)));
+    spans.push(Span::styled(word.to_string(), theme::quiet()));
     spans.push(Span::raw(" "));
     spans
 }
@@ -278,10 +278,10 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     if app.show_alt_hint() {
         // C11/U4: same bar, per-terminal wording — the app knows the host's
-        // TERM_PROGRAM and picks the real menu path where there is one.
+        // TERM_PROGRAM and picks the real menu path where there is one. A
+        // problem bar, so the red-tinted reversal, not the neutral one.
         f.render_widget(
-            Paragraph::new(app.alt_hint_line())
-                .style(Style::default().fg(theme::FG).bg(theme::ACCENT_DIM)),
+            Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()),
             area,
         );
         return;
@@ -290,14 +290,14 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // A transient action result (e.g. "copied") takes over the bar briefly.
     if let Some(msg) = app.flash() {
         f.render_widget(
-            Paragraph::new(format!(" {msg} ")).style(Style::default().fg(theme::FG).bg(theme::RULE)),
+            Paragraph::new(format!(" {msg} ")).style(theme::attention()),
             area,
         );
         return;
     }
 
-    // (key, what it does) pairs for the current context: key ACCENT, label
-    // MUTED, no chip bg. The right segment (aggregate + mode word) WINS over
+    // (key, what it does) pairs for the current context: key `accent`, label
+    // `quiet`, no chip bg. The right segment (aggregate + mode word) WINS over
     // the pairs (C9 yield order): the mode word is a modal-safety affordance
     // and "◆ N needs you" the fleet's primary signal — trailing pairs drop
     // whole until the segment fits.
@@ -330,8 +330,8 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     let mut used = 0u16;
     for (key, label) in &hints[..shown] {
         used += hint_pair_cols(key, label); // same source as fit_hint_pairs
-        spans.push(Span::styled(format!(" {key} "), Style::default().fg(theme::ACCENT)));
-        spans.push(Span::styled(format!("{label}  "), Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(format!(" {key} "), theme::accent()));
+        spans.push(Span::styled(format!("{label}  "), theme::quiet()));
     }
     if used.saturating_add(right_w) <= area.width {
         let pad = area.width.saturating_sub(used).saturating_sub(right_w);
@@ -340,8 +340,10 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     }
 
     // Paragraph truncates (no wrap) so a narrow terminal just clips the
-    // tail; the bg fills the row edge-to-edge regardless of span coverage.
-    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::BAR)), area);
+    // tail. No row fill: the bar is ink on the terminal's own paper (§2
+    // background policy), so every cell no span touches keeps the user's
+    // background instead of a band roost painted.
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Floating rect of the given size, centered on `anchor` (the focused pane)
@@ -382,13 +384,13 @@ fn dim_backdrop(f: &mut Frame, body: Rect, dialog: Rect) {
 /// focus color; the dimmed backdrop (below) keeps it from being confused
 /// with the focused pane's own accent border. No BOLD (§2 bold policy).
 fn dialog_border_style() -> Style {
-    Style::default().fg(theme::ACCENT)
+    theme::accent()
 }
 
 /// C12's title style: regular weight, primary ink — shared by all three
 /// modals so there's exactly one place that sets it.
 fn dialog_title(text: &'static str) -> Line<'static> {
-    Line::from(text).style(Style::default().fg(theme::FG))
+    Line::from(text).style(theme::ink())
 }
 
 /// C14 (U20): a picker row's text after its 1-column marker — the `1..9`
@@ -418,18 +420,17 @@ fn rename_field(buffer: &str, cursor: usize) -> String {
 /// C14 (U20): one picker row's leading marker and text style, given whether
 /// it is its column's selection and whether that column has the keyboard.
 /// Three states, no fourth: the focused column's selection wears `❯` in
-/// `ACCENT` with `FG` text (C14's idiom, unchanged); the *other* column's
-/// selection keeps `FG` text without the marker — what a launch would use
-/// has to stay readable from either side — and everything else is `MUTED`.
+/// `accent` with `ink` text (C14's idiom, unchanged); the *other* column's
+/// selection keeps `ink` text without the marker — what a launch would use
+/// has to stay readable from either side — and everything else is `quiet`.
 /// Pure so the three states are pinned without a `Frame`.
 fn row_marks(selected: bool, column_focused: bool) -> (Span<'static>, Style) {
     match (selected, column_focused) {
-        (true, true) => (
-            Span::styled(theme::PICKER_SELECTED.to_string(), Style::default().fg(theme::ACCENT)),
-            Style::default().fg(theme::FG),
-        ),
-        (true, false) => (Span::raw(" "), Style::default().fg(theme::FG)),
-        _ => (Span::raw(" "), Style::default().fg(theme::MUTED)),
+        (true, true) => {
+            (Span::styled(theme::PICKER_SELECTED.to_string(), theme::accent()), theme::ink())
+        }
+        (true, false) => (Span::raw(" "), theme::ink()),
+        _ => (Span::raw(" "), theme::quiet()),
     }
 }
 
@@ -618,8 +619,7 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             f.render_widget(
-                Paragraph::new(rename_field(buffer, *cursor))
-                    .style(Style::default().fg(theme::FG)),
+                Paragraph::new(rename_field(buffer, *cursor)).style(theme::ink()),
                 inner,
             );
         }
@@ -638,18 +638,18 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                 format!(" new pane — {filter}{} ", theme::RENAME_CURSOR)
             };
             let block = Block::bordered()
-                .title(Line::from(Span::styled(heading, Style::default().fg(theme::FG))))
+                .title(Line::from(Span::styled(heading, theme::ink())))
                 .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            // C14: selected row is a `❯`-prefix + FG item text, no bg
-            // highlight; unselected rows are plain MUTED text. [Amended,
+            // C14: selected row is a `❯`-prefix + `ink` item text, no bg
+            // highlight; unselected rows are plain `quiet` text. [Amended,
             // U20] Each row leads with its `1..9` accelerator — an
             // accelerator nothing shows is one nobody presses — and a
             // second column lists the recent working directories. The
             // column with focus marks its selection with `❯`; the other
-            // shows its selection in FG without the marker, so what will
+            // shows its selection in `ink` without the marker, so what will
             // actually be launched is readable from either side.
             const ADAPTER_COL: usize = 16;
             let rows = items.len().max(cwds.len());
@@ -694,8 +694,8 @@ fn draw_mode_overlay<B: PaneBackend>(f: &mut Frame, app: &App<B>, body: Rect, an
                 .iter()
                 .map(|(k, d)| {
                     Line::from(vec![
-                        Span::styled(help_key_prefix(k), Style::default().fg(theme::ACCENT)),
-                        Span::styled(d.to_string(), Style::default().fg(theme::MUTED)),
+                        Span::styled(help_key_prefix(k), theme::accent()),
+                        Span::styled(d.to_string(), theme::quiet()),
                     ])
                 })
                 .collect();
@@ -727,8 +727,7 @@ fn draw_feed_entries(f: &mut Frame, feed: &VecDeque<FeedEntry>, offset: usize, i
         let pad = inner.width.saturating_sub(text.chars().count() as u16) / 2;
         let y = inner.y + inner.height / 2;
         f.render_widget(
-            Paragraph::new(format!("{}{text}", " ".repeat(pad as usize)))
-                .style(Style::default().fg(theme::DIM)),
+            Paragraph::new(format!("{}{text}", " ".repeat(pad as usize))).style(theme::quiet()),
             Rect::new(inner.x, y, inner.width, 1),
         );
         return;
@@ -769,12 +768,12 @@ fn feed_window(len: usize, offset: usize, rows: usize) -> std::ops::Range<usize>
     first..last + 1
 }
 
-/// C20's per-row rule: `" HH:MM:SS  {text}"`, timestamp DIM, text MUTED —
-/// except a status line landing on NeedsInput, which gets the `◆ ` ACCENT
-/// prefix and FG text (the one red in the feed, same meaning as everywhere,
-/// C5). Pure so the exception is unit-tested without a `Frame`.
+/// C20's per-row rule: `" HH:MM:SS  {text}"`, timestamp and text both
+/// `quiet` — except a status line landing on NeedsInput, which gets the `◆ `
+/// `accent` prefix and `ink` text (the one red in the feed, same meaning as
+/// everywhere, C5). Pure so the exception is unit-tested without a `Frame`.
 /// [Amended, U25] The row's leading column is now a selection marker: `❯`
-/// ACCENT on the entry Enter would act on, a space on every other row. Same
+/// `accent` on the entry Enter would act on, a space on every other row. Same
 /// `❯` idiom as the picker (C14), and it costs no columns — the leading
 /// space was already there.
 fn feed_entry_spans(
@@ -785,17 +784,14 @@ fn feed_entry_spans(
 ) -> Vec<Span<'static>> {
     let marker = if selected { theme::PICKER_SELECTED } else { ' ' };
     let mut spans = vec![
-        Span::styled(marker.to_string(), Style::default().fg(theme::ACCENT)),
-        Span::styled(format!("{hhmmss}  "), Style::default().fg(theme::DIM)),
+        Span::styled(marker.to_string(), theme::accent()),
+        Span::styled(format!("{hhmmss}  "), theme::quiet()),
     ];
     if needs_input {
-        spans.push(Span::styled(
-            format!("{} ", theme::GLYPH_NEEDS_INPUT),
-            Style::default().fg(theme::ACCENT),
-        ));
-        spans.push(Span::styled(text.to_string(), Style::default().fg(theme::FG)));
+        spans.push(Span::styled(format!("{} ", theme::GLYPH_NEEDS_INPUT), theme::accent()));
+        spans.push(Span::styled(text.to_string(), theme::ink()));
     } else {
-        spans.push(Span::styled(text.to_string(), Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(text.to_string(), theme::quiet()));
     }
     spans
 }
@@ -815,7 +811,7 @@ fn local_hh_mm_ss(t: std::time::SystemTime) -> String {
 }
 
 /// C2: numbered tabs (marker + label + status glyph + separator) filling
-/// the row edge-to-edge on `TAB_STRIP`, plus a right-aligned
+/// the row edge-to-edge on the terminal's own background, plus a right-aligned
 /// "{cwd} · {save}" status area. Column bookkeeping here is the renderer
 /// half of the mouse-hitbox lockstep rule (DESIGN-ui.md §4/§5) —
 /// `mouse::tab_width`/`tab_at_x` mirror this exactly and change together.
@@ -835,7 +831,7 @@ pub fn tab_status_word<B: PaneBackend>(app: &App<B>) -> Option<&'static str> {
     (word != "NORMAL").then_some(word)
 }
 
-fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: Color) {
+fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: Style) {
     let cwd = app.focused_cwd();
     let saved = app.last_save_ok();
     let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
@@ -852,7 +848,7 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
     // marker, now at whichever end is hiding tabs). It occupies column 0,
     // which is why `TabStrip::x0` exists.
     if strip.left_marker {
-        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), theme::quiet()));
         used += strip.x0;
     }
     // Left to right, one 8-part span group per tab (marker/label/glyph/
@@ -860,16 +856,16 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
     for (i, tab) in app.ws.tabs.iter().enumerate().take(strip.end).skip(strip.start) {
         let active = i == app.ws.active_tab;
         let summary = app.tab_summary(i);
-        let (glyph, base_color) = tab_summary_badge(summary);
-        let glyph_color = if summary == TabSummary::Working { pulse } else { base_color };
-        push_tab_spans(&mut spans, i, &tab.name, active, glyph, glyph_color);
+        let (glyph, base_style) = tab_summary_badge(summary);
+        let glyph_style = if summary == TabSummary::Working { pulse } else { base_style };
+        push_tab_spans(&mut spans, i, &tab.name, active, glyph, glyph_style);
         used += mouse::tab_width(i, &tab.name);
     }
 
     // ...and a trailing `…` when tabs remain past the right edge and a
     // spare column is left to show it in (overflow, C2).
     if strip.right_marker {
-        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), theme::quiet()));
         used += 1;
     }
 
@@ -880,26 +876,25 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
             spans.push(Span::raw(" ".repeat(pad as usize)));
         }
         // U15: the mode word reads a step brighter than the cwd beside it —
-        // it's state, not context — while staying inside the ink ramp (no
-        // new token, and never the accent: it isn't an alarm).
+        // it's state, not context — while staying inside the ink ramp (never
+        // the accent: it isn't an alarm). [Amended 2026-07-27, theme
+        // inheritance] The ramp is two rungs deep now, so "a step brighter"
+        // is spelled `ink` over `quiet` rather than the old MUTED over DIM —
+        // the *relationship* is what the rule was ever about.
         if !mode_word.is_empty() {
-            spans.push(Span::styled(mode_word, Style::default().fg(theme::MUTED)));
+            spans.push(Span::styled(mode_word, theme::ink()));
         }
         if !prefix.is_empty() {
-            spans.push(Span::styled(prefix, Style::default().fg(theme::DIM)));
+            spans.push(Span::styled(prefix, theme::quiet()));
         }
-        let save_color = if saved { theme::DIM } else { theme::ACCENT };
-        spans.push(Span::styled(format!("{save_word} "), Style::default().fg(save_color)));
+        let save_style = if saved { theme::quiet() } else { theme::accent() };
+        spans.push(Span::styled(format!("{save_word} "), save_style));
     }
 
-    // Base fill first (edge-to-edge TAB_STRIP, including any empty middle):
-    // Paragraph's own `.style()` fills the whole `area`, so cells no span
-    // touches (the gap before the status area, or the entire row past the
-    // last tab when there's no overflow) still get the strip background.
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::TAB_STRIP)),
-        area,
-    );
+    // No row fill: the tab bar carries no background of its own (§2), so the
+    // gap before the status area and the row past the last tab show the
+    // user's terminal background rather than a band roost painted over it.
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// One tab's 8-part span sequence (C2): marker, label, status glyph, the
@@ -911,38 +906,36 @@ fn push_tab_spans(
     name: &str,
     active: bool,
     glyph: char,
-    glyph_color: Color,
+    glyph_style: Style,
 ) {
     if active {
-        spans.push(Span::styled(theme::MARKER_ACTIVE.to_string(), Style::default().fg(theme::ACCENT)));
+        spans.push(Span::styled(theme::MARKER_ACTIVE.to_string(), theme::accent()));
     } else {
         spans.push(Span::raw(" "));
     }
     spans.push(Span::raw(" "));
 
-    let label_style = if active {
-        Style::default().fg(theme::FG).bg(theme::ACTIVE_TAB_BG)
-    } else {
-        Style::default().fg(theme::MUTED)
-    };
+    // Active vs inactive is ink weight plus the `▎` marker — no highlight
+    // fill to go invisible against a light theme (§2, 2026-07-27).
+    let label_style = if active { theme::active_tab_label() } else { theme::quiet() };
     spans.push(Span::styled(mouse::tab_label(index, name), label_style));
     spans.push(Span::raw(" "));
 
-    spans.push(Span::styled(glyph.to_string(), Style::default().fg(glyph_color)));
+    spans.push(Span::styled(glyph.to_string(), glyph_style));
     spans.push(Span::raw(" "));
 
-    spans.push(Span::styled(theme::TAB_SEPARATOR.to_string(), Style::default().fg(theme::RULE)));
+    spans.push(Span::styled(theme::TAB_SEPARATOR.to_string(), theme::rule()));
     // C2 (amended 2026-07-23): trailing gutter — one space after the separator
     // gives every divider symmetric 1-cell padding, so adjacent tabs read
     // `│ ▎` not `│▎`. Counts as this tab's own column (mouse::tab_width +7).
     spans.push(Span::raw(" "));
 }
 
-/// Map a tab's aggregate summary to a tab-bar glyph + colour (theme::C5).
+/// Map a tab's aggregate summary to a tab-bar glyph + style (theme::C5).
 /// `Quiet` renders as a blank (no clutter for tabs with nothing to report);
-/// `Unknown` is a faint dot so a not-yet-spawned background tab reads as
+/// `Unknown` is a quiet dot so a not-yet-spawned background tab reads as
 /// "unknown", not idle.
-fn tab_summary_badge(s: crate::core::app::TabSummary) -> (char, Color) {
+fn tab_summary_badge(s: crate::core::app::TabSummary) -> (char, Style) {
     theme::tab_summary_style(s)
 }
 
@@ -961,12 +954,21 @@ pub fn state_word(status: AgentStatus) -> &'static str {
     }
 }
 
-/// C8's collapsed-row name color, by status.
-fn collapsed_name_color(status: AgentStatus) -> Color {
+/// C8's collapsed-row name style, by status and focus.
+///
+/// [Amended 2026-07-27, theme inheritance] The focused row used to be a
+/// `RULE` fill across its whole width. Chrome paints no fills now (§2), so
+/// focus is carried the way the tab bar carries it: full-strength ink plus
+/// the `▎` marker. The status ramp still speaks on unfocused rows — and it
+/// is two rungs deep, not three, so Waiting/Idle/Exited share the quiet one
+/// (the `✕` glyph and the `exited` state word already say which is dead).
+fn collapsed_name_style(status: AgentStatus, focused: bool) -> Style {
+    if focused {
+        return theme::ink();
+    }
     match status {
-        AgentStatus::Working | AgentStatus::NeedsInput => theme::FG,
-        AgentStatus::Waiting | AgentStatus::Idle => theme::MUTED,
-        AgentStatus::Exited => theme::DIM,
+        AgentStatus::Working | AgentStatus::NeedsInput => theme::ink(),
+        AgentStatus::Waiting | AgentStatus::Idle | AgentStatus::Exited => theme::quiet(),
     }
 }
 
@@ -1033,7 +1035,7 @@ fn draw_pane<B: PaneBackend>(
     app: &mut App<B>,
     pr: PaneRect,
     stack_expanded: bool,
-    pulse: Color,
+    pulse: Style,
 ) {
     let focused = app.focused == pr.id;
     let raw = app.is_raw(pr.id);
@@ -1069,11 +1071,7 @@ fn draw_pane<B: PaneBackend>(
     // the glyph system (corner badge / collapsed row), not the border color,
     // and the border no longer carries a title (identity moved to the
     // corner badge, C4). No BOLD.
-    let border_style = if focused {
-        Style::default().fg(theme::ACCENT)
-    } else {
-        Style::default().fg(theme::RULE)
-    };
+    let border_style = if focused { theme::accent() } else { theme::rule() };
     let block = Block::bordered().border_style(border_style);
     let inner = block.inner(pr.rect);
     f.render_widget(block, pr.rect);
@@ -1081,7 +1079,7 @@ fn draw_pane<B: PaneBackend>(
     // C7: an unfocused expanded stack member gets its left border column
     // overpainted with the accent-dim edge marker. Suppressed when focused —
     // the full accent border is already the stronger signal, and stacking
-    // ACCENT_DIM inside an ACCENT frame would smear the one-red discipline.
+    // a quiet red inside a red frame would smear the one-red discipline.
     if stack_expanded && !focused {
         paint_stack_edge(f, pr.rect);
     }
@@ -1126,7 +1124,7 @@ fn draw_pane<B: PaneBackend>(
     }
 
     // C4: corner badge — the pane label, top-right. Drawn after the content
-    // so it stays visible (a cell TUI can't do true translucency; MUTED text
+    // so it stays visible (a cell TUI can't do true translucency; quiet text
     // reads as a watermark rather than content). Drawn on every pane,
     // focused included: occlusion of the inner app's own top-right cells is
     // accepted by design now that identity lives here, not a border title.
@@ -1134,9 +1132,9 @@ fn draw_pane<B: PaneBackend>(
     // glyph stops pulsing while the view is frozen (badge_glyph_color).
     let (glyph, glyph_base, pulses) = theme::status_style(status);
     let scrolled = app.scroll_offset(pr.id);
-    let glyph_color = badge_glyph_color(pulses, scrolled, pulse, glyph_base);
+    let glyph_style = badge_glyph_style(pulses, scrolled, pulse, glyph_base);
     let text = badge_text(pr.id, &name, &adapter, has_title);
-    if let Some((rect, spans)) = corner_badge(inner, &text, raw, scrolled, glyph, glyph_color) {
+    if let Some((rect, spans)) = corner_badge(inner, &text, raw, scrolled, glyph, glyph_style) {
         f.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
 
@@ -1145,22 +1143,21 @@ fn draw_pane<B: PaneBackend>(
     if status == AgentStatus::Exited && inner.height > 0 {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(err) = app.dead.get(&pr.id) {
-            lines.push(Line::from(Span::styled(
-                format!(" spawn failed: {err} "),
-                Style::default().fg(theme::ACCENT),
-            )));
+            lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
         }
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {} exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close ",
-                theme::GLYPH_EXITED
-            ),
-            Style::default().fg(theme::FG).bg(theme::ACCENT_DIM),
-        )));
+        lines.push(Line::from(Span::raw(format!(
+            " {} exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close ",
+            theme::GLYPH_EXITED
+        ))));
         let n = lines.len() as u16;
         let y = inner.y + inner.height.saturating_sub(n);
         let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
-        f.render_widget(Paragraph::new(lines), overlay);
+        // C16: the style rides on the *widget*, not the span, so the whole
+        // inner width reverses. Styling the span alone would reverse only the
+        // ~76 text columns and leave the dead program's last output showing
+        // through the rest of the row at normal video — the bar has to read as
+        // one bar, exactly as C10/C11's rows do.
+        f.render_widget(Paragraph::new(lines).style(theme::attention_problem()), overlay);
     }
 }
 
@@ -1172,7 +1169,7 @@ fn paint_stack_edge(f: &mut Frame, rect: Rect) {
     for y in rect.y..rect.y + rect.height {
         if let Some(cell) = buf.cell_mut((rect.x, y)) {
             cell.set_symbol(&theme::MARKER_EXPANDED_EDGE.to_string());
-            cell.set_style(Style::default().fg(theme::ACCENT_DIM));
+            cell.set_style(theme::accent_quiet());
         }
     }
 }
@@ -1204,18 +1201,18 @@ fn collapsed_row_spans(
     adapter: &str,
     has_title: bool,
     raw: bool,
-    glyph_color: Color,
+    glyph_style: Style,
 ) -> Vec<Span<'static>> {
     let (glyph, ..) = theme::status_style(status);
     let marker = if focused {
-        (theme::MARKER_ACTIVE.to_string(), Style::default().fg(theme::ACCENT))
+        (theme::MARKER_ACTIVE.to_string(), theme::accent())
     } else {
         (" ".to_string(), Style::default())
     };
     let left: Vec<(String, Style)> = vec![
         marker,
-        (glyph.to_string(), Style::default().fg(glyph_color)),
-        (format!(" {id} {name}"), Style::default().fg(collapsed_name_color(status))),
+        (glyph.to_string(), glyph_style),
+        (format!(" {id} {name}"), collapsed_name_style(status, focused)),
     ];
     let left_w: u16 = left.iter().map(|(t, _)| mouse::display_width(t)).sum();
     let right = if has_title {
@@ -1230,16 +1227,17 @@ fn collapsed_row_spans(
         let pad = width - left_w - right_w;
         let mut spans: Vec<Span> = left.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
         spans.push(Span::raw(" ".repeat(pad as usize)));
-        spans.push(Span::styled(right, Style::default().fg(theme::DIM)));
+        spans.push(Span::styled(right, theme::quiet()));
         spans
     } else {
         clip_spans(&left, width)
     }
 }
 
-/// C8: render one collapsed stack member's row. Focused rows additionally
-/// paint `RULE` across the full row width; unfocused rows have no bg
-/// (background policy, §2).
+/// C8: render one collapsed stack member's row. No row fill in either state
+/// (background policy, §2): focus is the `▎` marker plus full-strength ink
+/// (`collapsed_name_style`), so the row reads the same way the active tab
+/// does and can't go invisible on a light theme.
 #[allow(clippy::too_many_arguments)]
 fn draw_collapsed_row(
     f: &mut Frame,
@@ -1251,14 +1249,13 @@ fn draw_collapsed_row(
     adapter: &str,
     has_title: bool,
     raw: bool,
-    pulse: Color,
+    pulse: Style,
 ) {
     let (_, base, pulses) = theme::status_style(status);
-    let glyph_color = if pulses { pulse } else { base };
+    let glyph_style = if pulses { pulse } else { base };
     let spans =
-        collapsed_row_spans(rect.width, focused, status, id, name, adapter, has_title, raw, glyph_color);
-    let style = if focused { Style::default().bg(theme::RULE) } else { Style::default() };
-    f.render_widget(Paragraph::new(Line::from(spans)).style(style), rect);
+        collapsed_row_spans(rect.width, focused, status, id, name, adapter, has_title, raw, glyph_style);
+    f.render_widget(Paragraph::new(Line::from(spans)), rect);
 }
 
 /// C6's header text for the given row width: uppercase " STACK · N PANES"
@@ -1280,19 +1277,19 @@ fn stack_header_text(width: u16, n: usize) -> String {
 fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
     f.render_widget(
         Paragraph::new(stack_header_text(header.rect.width, header.n))
-            .style(Style::default().fg(theme::DIM).add_modifier(Modifier::UNDERLINED)),
+            .style(theme::quiet().add_modifier(Modifier::UNDERLINED)),
         header.rect,
     );
 }
 
 /// Top-right corner badge (C4): pane name (+ adapter, when titled) and the
 /// status glyph, right-aligned with one column of breathing room. Two-tone:
-/// the text is MUTED, the glyph carries its own C5 status color. [Amended,
+/// the text is `quiet`, the glyph carries its own C5 status style. [Amended,
 /// C23] a raw pane's badge gains a `raw` token between the text and the
-/// glyph, in its own `ACCENT_DIM` span (never folded into the MUTED text —
-/// it needs its own color). [Amended, U3] a scrolled pane's badge carries a
-/// dim `↑N` token — its grid-clamped view offset, 0 = live tail = no token
-/// — glyph-adjacent (after `raw`), same `ACCENT_DIM` family. Returns the
+/// glyph, in its own `accent_quiet` span (never folded into the quiet text —
+/// it needs its own colour). [Amended, U3] a scrolled pane's badge carries a
+/// quiet `↑N` token — its grid-clamped view offset, 0 = live tail = no token
+/// — glyph-adjacent (after `raw`), same `accent_quiet` family. Returns the
 /// 1-row rect and the clipped spans — or `None` if the pane is too small to
 /// be worth badging. Pure so it can be unit-tested.
 fn corner_badge(
@@ -1301,7 +1298,7 @@ fn corner_badge(
     raw: bool,
     scrolled: usize,
     glyph: char,
-    glyph_color: Color,
+    glyph_style: Style,
 ) -> Option<(Rect, Vec<Span<'static>>)> {
     if text.trim().is_empty() || inner.width < 3 || inner.height == 0 {
         return None;
@@ -1311,21 +1308,18 @@ fn corner_badge(
     // the glyph part).
     let mut parts: Vec<(String, Style)> = Vec::with_capacity(4);
     if raw || scrolled > 0 {
-        parts.push((format!(" {text} · "), Style::default().fg(theme::MUTED)));
+        parts.push((format!(" {text} · "), theme::quiet()));
     } else {
-        parts.push((format!(" {text} "), Style::default().fg(theme::MUTED)));
+        parts.push((format!(" {text} "), theme::quiet()));
     }
     if raw {
         let token = if scrolled > 0 { "raw · " } else { "raw " };
-        parts.push((token.to_string(), Style::default().fg(theme::ACCENT_DIM)));
+        parts.push((token.to_string(), theme::accent_quiet()));
     }
     if scrolled > 0 {
-        parts.push((
-            format!("{}{scrolled} ", theme::SCROLLED),
-            Style::default().fg(theme::ACCENT_DIM),
-        ));
+        parts.push((format!("{}{scrolled} ", theme::SCROLLED), theme::accent_quiet()));
     }
-    parts.push((format!("{glyph} "), Style::default().fg(glyph_color)));
+    parts.push((format!("{glyph} "), glyph_style));
     let total: u16 = parts.iter().map(|(t, _)| mouse::display_width(t)).sum();
     let w = total.min(max);
     let spans = clip_spans(&parts, w);
@@ -1333,14 +1327,14 @@ fn corner_badge(
     Some((Rect::new(x, inner.y, w, 1), spans))
 }
 
-/// N1: the badge glyph's color — the C5 pulse only while the pane's view is
+/// N1: the badge glyph's style — the C5 pulse only while the pane's view is
 /// at the live tail. A pulsing `●` asserts "alive right now", which a frozen
-/// (scrolled) view must not do; the glyph keeps its steady base color (the
+/// (scrolled) view must not do; the glyph keeps its steady base style (the
 /// status itself stays truthful — the agent IS working) while the C4 `↑N`
 /// token carries the frozen-view signal. Any path that resets the offset
 /// resumes the pulse. Collapsed rows and the tab bar keep pulsing: they
 /// show no grid, so there is no frozen view to lie about.
-fn badge_glyph_color(pulses: bool, scrolled: usize, pulse: Color, base: Color) -> Color {
+fn badge_glyph_style(pulses: bool, scrolled: usize, pulse: Style, base: Style) -> Style {
     if pulses && scrolled == 0 {
         pulse
     } else {
@@ -1505,11 +1499,16 @@ fn blit_screen(f: &mut Frame, screen: &vt100::Screen, inner: Rect) {
     }
 }
 
+/// Program output, not chrome (C18): a pane's own colours pass through
+/// byte-faithfully and keep the **full** palette — indexed and truecolor
+/// alike. §2's inherit-the-terminal rule governs what roost draws *around*
+/// panes, never what a program draws inside one, so these three lines carry
+/// the `chrome-gate-exempt` marker the theme module's source scan honours.
 fn conv_color(c: vt100::Color) -> Option<Color> {
     match c {
         vt100::Color::Default => None,
-        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
-        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+        vt100::Color::Idx(i) => Some(Color::Indexed(i)), // chrome-gate-exempt: program output
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)), // chrome-gate-exempt: program output
     }
 }
 
@@ -1519,7 +1518,7 @@ fn cell_style(cell: &vt100::Cell) -> Style {
         style = style.fg(fg);
     }
     if let Some(bg) = conv_color(cell.bgcolor()) {
-        style = style.bg(bg);
+        style = style.bg(bg); // chrome-gate-exempt: program output
     }
     if cell.bold() {
         style = style.add_modifier(Modifier::BOLD);
@@ -1550,7 +1549,7 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 mod tests {
     use crate::App;
     use super::{
-        badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_color,
+        badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_style,
         collapsed_row_spans, corner_badge, dialog_border_style, feed_entry_spans, feed_window,
         help_dialog_width, hint_bar_right_spans, hint_pairs, mode_word, push_tab_spans,
         should_place_cursor, stack_header_text, state_word, HELP_KEYS,
@@ -1560,7 +1559,7 @@ mod tests {
     use crate::ui::mouse;
     use crate::ui::theme;
     use ratatui::layout::Rect;
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::{Color, Modifier};
 
     #[test]
     fn dialog_centers_on_focused_pane_not_whole_screen() {
@@ -1598,7 +1597,7 @@ mod tests {
     fn badge_is_two_toned_and_right_aligned_on_top_row() {
         // inner content area at (1,1) sized 40x20 (borders excluded)
         let inner = Rect::new(1, 1, 40, 20);
-        let (rect, spans) = corner_badge(inner, "claude", false, 0, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+        let (rect, spans) = corner_badge(inner, "claude", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         assert_eq!(rect.y, inner.y); // top row of the content
         assert_eq!(rect.height, 1);
         // right edge: badge ends one col shy of the inner right edge is fine;
@@ -1606,16 +1605,16 @@ mod tests {
         assert_eq!(rect.x + rect.width, inner.x + inner.width);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content.as_ref(), " claude ");
-        assert_eq!(spans[0].style.fg, Some(theme::MUTED));
+        assert_eq!(spans[0].style, theme::quiet());
         assert_eq!(spans[1].content.as_ref(), format!("{} ", theme::GLYPH_WORKING));
-        assert_eq!(spans[1].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[1].style, theme::accent());
     }
 
     #[test]
     fn badge_clips_and_drops_the_glyph_first_when_pane_too_small() {
         let inner = Rect::new(0, 0, 6, 5);
         let (rect, spans) =
-            corner_badge(inner, "a-very-long-name", false, 0, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+            corner_badge(inner, "a-very-long-name", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         assert!(total <= 5); // width-1 breathing room
         assert!(rect.x >= inner.x && rect.x + rect.width <= inner.x + inner.width);
@@ -1630,7 +1629,7 @@ mod tests {
         // overflow the pane by several columns (D1). The fix must stop
         // clipping on a display-width boundary and never split a glyph.
         let inner = Rect::new(0, 0, 5, 5); // budget = inner.width - 1 = 4
-        let (rect, spans) = corner_badge(inner, "日本語", false, 0, theme::GLYPH_IDLE, theme::DIM).unwrap();
+        let (rect, spans) = corner_badge(inner, "日本語", false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let rendered_width: u16 = spans.iter().map(|s| mouse::display_width(&s.content)).sum();
         assert!(rendered_width <= 4, "clipped badge must fit its column budget, got {rendered_width}");
         assert!(rect.width <= 4);
@@ -1662,30 +1661,30 @@ mod tests {
 
     #[test]
     fn no_badge_for_tiny_or_empty() {
-        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", false, 0, theme::GLYPH_WORKING, theme::ACCENT).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", false, 0, theme::GLYPH_WORKING, theme::ACCENT).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", false, 0, theme::GLYPH_WORKING, theme::ACCENT).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
     }
 
     // -- C23 raw indication ---------------------------------------------------
 
     #[test]
-    fn badge_gains_a_raw_token_in_its_own_accent_dim_color() {
+    fn badge_gains_a_raw_token_in_its_own_quiet_red() {
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "scratch · shell", true, 0, theme::GLYPH_IDLE, theme::DIM).unwrap();
+            corner_badge(inner, "scratch · shell", true, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" scratch · shell · raw {} ", theme::GLYPH_IDLE));
         let raw_span = spans.iter().find(|s| s.content.as_ref() == "raw ").expect("raw token span");
-        assert_eq!(raw_span.style.fg, Some(theme::ACCENT_DIM));
+        assert_eq!(raw_span.style, theme::accent_quiet());
         // The raw token must be its own span, not folded into the muted text.
-        assert!(spans.iter().any(|s| s.style.fg == Some(theme::MUTED)));
+        assert!(spans.iter().any(|s| s.style == theme::quiet()));
     }
 
     #[test]
     fn badge_without_raw_has_no_raw_token() {
         let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) = corner_badge(inner, "pi", false, 0, theme::GLYPH_IDLE, theme::DIM).unwrap();
+        let (_, spans) = corner_badge(inner, "pi", false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("raw"));
     }
@@ -1693,16 +1692,16 @@ mod tests {
     // -- U3 scrollback indication ---------------------------------------------
 
     #[test]
-    fn badge_gains_a_scrolled_token_in_accent_dim() {
+    fn badge_gains_a_scrolled_token_in_quiet_red() {
         // U3: a frozen view must say so — `↑N` (grid-clamped offset), same
-        // ACCENT_DIM family as the raw token, glyph-adjacent.
+        // quiet-red family as the raw token, glyph-adjacent.
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", false, 42, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+            corner_badge(inner, "3 pi", false, 42, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · ↑42 {} ", theme::GLYPH_WORKING));
         let token = spans.iter().find(|s| s.content.as_ref() == "↑42 ").expect("↑N token span");
-        assert_eq!(token.style.fg, Some(theme::ACCENT_DIM));
+        assert_eq!(token.style, theme::accent_quiet());
     }
 
     #[test]
@@ -1710,7 +1709,7 @@ mod tests {
         // raw · ↑N — input state first, then view state, then the glyph.
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", true, 7, theme::GLYPH_IDLE, theme::DIM).unwrap();
+            corner_badge(inner, "3 pi", true, 7, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · raw · ↑7 {} ", theme::GLYPH_IDLE));
     }
@@ -1719,7 +1718,7 @@ mod tests {
     fn badge_at_live_tail_has_no_scrolled_token() {
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", false, 0, theme::GLYPH_WORKING, theme::ACCENT).unwrap();
+            corner_badge(inner, "3 pi", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains('↑'), "{text}");
     }
@@ -1728,31 +1727,32 @@ mod tests {
     fn badge_glyph_pulse_yields_while_the_view_is_frozen() {
         // N1: pulsing red means "alive right now" — a scrolled pane's glyph
         // holds the steady base color instead; the tail resumes the pulse.
-        let phase = theme::ACCENT_DIM; // pretend mid-pulse phase B
-        assert_eq!(super::badge_glyph_color(true, 0, phase, theme::ACCENT), phase);
-        assert_eq!(super::badge_glyph_color(true, 12, phase, theme::ACCENT), theme::ACCENT);
+        let phase = theme::pulse_bright(); // pretend mid-pulse phase A
+        assert_eq!(super::badge_glyph_style(true, 0, phase, theme::accent()), phase);
+        assert_eq!(super::badge_glyph_style(true, 12, phase, theme::accent()), theme::accent());
         // Non-pulsing statuses are steady either way.
-        assert_eq!(super::badge_glyph_color(false, 0, phase, theme::FG), theme::FG);
-        assert_eq!(super::badge_glyph_color(false, 12, phase, theme::FG), theme::FG);
+        assert_eq!(super::badge_glyph_style(false, 0, phase, theme::ink()), theme::ink());
+        assert_eq!(super::badge_glyph_style(false, 12, phase, theme::ink()), theme::ink());
     }
 
     #[test]
     fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
-        // U3: `↑N/M` rides inside the right segment (DIM), so C9's yield
+        // U3: `↑N/M` rides inside the right segment (quiet), so C9's yield
         // machinery covers it — and it only exists when a position is given.
         let spans = hint_bar_right_spans(0, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "↑12/300 SCROLL ");
-        assert_eq!(spans[0].style.fg, Some(theme::DIM));
+        assert_eq!(spans[0].style, theme::quiet());
 
         let spans = hint_bar_right_spans(2, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
     }
 
-    /// P21: the search prompt lives in C9's right segment — `/query▏` in FG
-    /// (it is live input; DIM input is input you cannot proofread) with the
-    /// DIM hit counter and the SEARCH mode word behind it. No dialog: the
+    /// P21: the search prompt lives in C9's right segment — `/query▏` in
+    /// `ink` (it is live input; quiet input is input you cannot proofread)
+    /// with the `quiet` hit counter and the SEARCH mode word behind it. The
+    /// prompt draws no dialog: the
     /// pane being searched must stay visible while the query narrows.
     #[test]
     fn hint_bar_right_carries_the_search_prompt_and_hit_counter() {
@@ -1763,8 +1763,8 @@ mod tests {
         let spans = hint_bar_right_spans(0, query, position, "SEARCH");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/beta{} 2/3 SEARCH ", theme::RENAME_CURSOR));
-        assert_eq!(spans[0].style.fg, Some(theme::FG), "the typed query is legible, not dim");
-        assert_eq!(spans[1].style.fg, Some(theme::DIM), "the counter is a position token");
+        assert_eq!(spans[0].style, theme::ink(), "the typed query is legible, not dim");
+        assert_eq!(spans[1].style, theme::quiet(), "the counter is a position token");
 
         // A query with no hits says so rather than hiding the counter — an
         // empty result is the answer, not the absence of one.
@@ -1837,19 +1837,34 @@ mod tests {
         assert_eq!(state_word(AgentStatus::Exited), "exited");
     }
 
+    /// C8's name ramp, as amended by the theme-inherited stance: two text
+    /// rungs, not three (Exited joins Waiting/Idle in the quiet one — its
+    /// `✕` glyph and `exited` word already say it is dead), and a focused
+    /// row is full-strength ink whatever its status, since the `RULE` fill
+    /// that used to carry focus is gone.
     #[test]
-    fn collapsed_name_color_by_state() {
-        assert_eq!(collapsed_name_color(AgentStatus::Working), theme::FG);
-        assert_eq!(collapsed_name_color(AgentStatus::NeedsInput), theme::FG);
-        assert_eq!(collapsed_name_color(AgentStatus::Waiting), theme::MUTED);
-        assert_eq!(collapsed_name_color(AgentStatus::Idle), theme::MUTED);
-        assert_eq!(collapsed_name_color(AgentStatus::Exited), theme::DIM);
+    fn collapsed_name_style_by_state_and_focus() {
+        assert_eq!(collapsed_name_style(AgentStatus::Working, false), theme::ink());
+        assert_eq!(collapsed_name_style(AgentStatus::NeedsInput, false), theme::ink());
+        assert_eq!(collapsed_name_style(AgentStatus::Waiting, false), theme::quiet());
+        assert_eq!(collapsed_name_style(AgentStatus::Idle, false), theme::quiet());
+        assert_eq!(collapsed_name_style(AgentStatus::Exited, false), theme::quiet());
+        // Focus overrides the ramp: the row you are on is never the quiet one.
+        for s in [
+            AgentStatus::Working,
+            AgentStatus::NeedsInput,
+            AgentStatus::Waiting,
+            AgentStatus::Idle,
+            AgentStatus::Exited,
+        ] {
+            assert_eq!(collapsed_name_style(s, true), theme::ink(), "{s:?} focused");
+        }
     }
 
     #[test]
     fn collapsed_row_shows_right_segment_when_it_fits() {
         let spans =
-            collapsed_row_spans(40, false, AgentStatus::Working, 2, "pi", "pi", true, false, theme::ACCENT);
+            collapsed_row_spans(40, false, AgentStatus::Working, 2, "pi", "pi", true, false, theme::accent());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("pi · working "));
     }
@@ -1861,7 +1876,7 @@ mod tests {
         // right segment is the bare state word — "your turn", not
         // "shell · your turn". [DESIGN-ui.md amended 2026-07-22, ux #3.]
         let spans =
-            collapsed_row_spans(40, false, AgentStatus::Waiting, 2, "shell", "shell", false, false, theme::FG);
+            collapsed_row_spans(40, false, AgentStatus::Waiting, 2, "shell", "shell", false, false, theme::ink());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("your turn "));
         assert!(!text.contains("shell ·"));
@@ -1874,7 +1889,7 @@ mod tests {
         // nothing more (U2: the id rides with the name on the left).
         let left_w = 5 + name.chars().count() as u16;
         let spans =
-            collapsed_row_spans(left_w, false, AgentStatus::Idle, 2, name, "shell", true, false, theme::DIM);
+            collapsed_row_spans(left_w, false, AgentStatus::Idle, 2, name, "shell", true, false, theme::quiet());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" · 2 {name}"));
         assert!(!text.contains("shell"));
@@ -1891,7 +1906,7 @@ mod tests {
             "shell",
             true,
             false,
-            theme::FG,
+            theme::ink(),
         );
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text.chars().count(), 4);
@@ -1901,19 +1916,19 @@ mod tests {
     #[test]
     fn collapsed_row_focused_marker_is_accent() {
         let spans =
-            collapsed_row_spans(40, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::ACCENT);
+            collapsed_row_spans(40, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::accent());
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
-        assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[0].style, theme::accent());
     }
 
     #[test]
     fn collapsed_row_raw_gains_the_prefix_ahead_of_the_usual_right_segment() {
-        let titled = collapsed_row_spans(60, false, AgentStatus::Working, 2, "pi", "pi", true, true, theme::ACCENT);
+        let titled = collapsed_row_spans(60, false, AgentStatus::Working, 2, "pi", "pi", true, true, theme::accent());
         let text: String = titled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · pi · working "), "{text}");
 
         let untitled =
-            collapsed_row_spans(60, false, AgentStatus::Waiting, 2, "shell", "shell", false, true, theme::FG);
+            collapsed_row_spans(60, false, AgentStatus::Waiting, 2, "shell", "shell", false, true, theme::ink());
         let text: String = untitled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · your turn "), "{text}");
     }
@@ -2030,14 +2045,14 @@ mod tests {
         let spans = hint_bar_right_spans(3, None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
-        assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[0].style, theme::accent());
     }
 
     #[test]
     fn dialog_border_style_is_accent_with_no_modifiers() {
         // Pins C12: the old bright-fg/double-border/bold dialog look is
         // gone — one plain accent style for all three modals.
-        assert_eq!(dialog_border_style(), Style::default().fg(theme::ACCENT));
+        assert_eq!(dialog_border_style(), theme::accent());
     }
 
     #[test]
@@ -2183,44 +2198,45 @@ mod tests {
 
     #[test]
     fn push_tab_spans_active_tab_uses_accent_marker_and_reset_bg() {
-        // C2: active tab — marker ▎ ACCENT, label FG on Color::Reset (fuses
-        // with the body bg), glyph in its own color, separator RULE.
+        // C2: active tab — marker ▎ `accent`, label `ink` on Color::Reset
+        // (fuses with the terminal's own bg), glyph in its own style,
+        // separator `rule`.
         let mut spans = Vec::new();
-        push_tab_spans(&mut spans, 0, "main", true, theme::GLYPH_WORKING, theme::ACCENT);
+        push_tab_spans(&mut spans, 0, "main", true, theme::GLYPH_WORKING, theme::accent());
         assert_eq!(spans.len(), 8); // 7 parts + trailing gutter (C2, amended 2026-07-23)
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
-        assert_eq!(spans[0].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[0].style, theme::accent());
         assert_eq!(spans[2].content.as_ref(), "1 main");
-        assert_eq!(spans[2].style.fg, Some(theme::FG));
+        assert_eq!(spans[2].style, theme::active_tab_label());
         assert_eq!(spans[2].style.bg, Some(theme::ACTIVE_TAB_BG));
         assert_eq!(spans[4].content.as_ref(), theme::GLYPH_WORKING.to_string());
-        assert_eq!(spans[4].style.fg, Some(theme::ACCENT));
+        assert_eq!(spans[4].style, theme::accent());
         assert_eq!(spans[6].content.as_ref(), theme::TAB_SEPARATOR.to_string());
-        assert_eq!(spans[6].style.fg, Some(theme::RULE));
+        assert_eq!(spans[6].style, theme::rule());
         assert_eq!(spans[7].content.as_ref(), " "); // trailing gutter
     }
 
     #[test]
-    fn push_tab_spans_inactive_tab_uses_blank_marker_and_muted_label() {
-        // C2: inactive tab — marker is a plain space (no ACCENT), label MUTED
-        // with no bg override (TAB_STRIP comes from the paragraph-level fill,
-        // not a per-span bg).
+    fn push_tab_spans_inactive_tab_uses_blank_marker_and_quiet_label() {
+        // C2: inactive tab — marker is a plain space (no accent), label
+        // `quiet`, and no bg override: since 2026-07-27 there is no strip
+        // fill underneath it either (§2 background policy).
         let mut spans = Vec::new();
-        push_tab_spans(&mut spans, 1, "api", false, theme::GLYPH_IDLE, theme::DIM);
+        push_tab_spans(&mut spans, 1, "api", false, theme::GLYPH_IDLE, theme::quiet());
         assert_eq!(spans.len(), 8); // 7 parts + trailing gutter (C2, amended 2026-07-23)
         assert_eq!(spans[0].content.as_ref(), " ");
         assert_eq!(spans[0].style.fg, None);
         assert_eq!(spans[2].content.as_ref(), "2 api");
-        assert_eq!(spans[2].style.fg, Some(theme::MUTED));
+        assert_eq!(spans[2].style, theme::quiet());
         assert_eq!(spans[2].style.bg, None);
         assert_eq!(spans[4].content.as_ref(), theme::GLYPH_IDLE.to_string());
-        assert_eq!(spans[4].style.fg, Some(theme::DIM));
+        assert_eq!(spans[4].style, theme::quiet());
     }
 
     #[test]
     fn collapsed_row_spans_at_zero_width_is_empty_not_panicking() {
         let spans =
-            collapsed_row_spans(0, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::ACCENT);
+            collapsed_row_spans(0, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::accent());
         assert!(spans.is_empty());
     }
 
@@ -2264,13 +2280,17 @@ mod tests {
         assert_eq!(feed_window(5, 0, 0), 0..0);
     }
 
+    /// C20's default row is the quiet rung throughout — timestamp and text
+    /// alike. They used to be two different greys (DIM and MUTED); §2's
+    /// two-rung ramp merged them, and nothing is lost: the timestamp is
+    /// column-aligned, which is what actually separates it from the text.
     #[test]
-    fn feed_entry_spans_default_styling_is_dim_timestamp_muted_text() {
+    fn feed_entry_spans_default_styling_is_quiet_throughout() {
         let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false, false);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, " 12:34:56  spawned shell (shell)");
-        assert_eq!(spans[1].style.fg, Some(theme::DIM));
-        assert_eq!(spans[2].style.fg, Some(theme::MUTED));
+        assert_eq!(spans[1].style, theme::quiet());
+        assert_eq!(spans[2].style, theme::quiet());
     }
 
     /// U25: the selected entry — the one Enter acts on — is marked, in the
@@ -2283,23 +2303,23 @@ mod tests {
         let text = |v: &[super::Span]| -> String { v.iter().map(|s| s.content.as_ref()).collect() };
         assert_eq!(text(&picked), format!("{}12:34:56  spawned shell", theme::PICKER_SELECTED));
         assert_eq!(text(&plain).chars().count(), text(&picked).chars().count());
-        assert_eq!(picked[0].style.fg, Some(theme::ACCENT));
+        assert_eq!(picked[0].style, theme::accent());
         // Everything past the marker is styled identically either way.
         assert_eq!(picked[1].style, plain[1].style);
         assert_eq!(picked[2].style, plain[2].style);
     }
 
     #[test]
-    fn feed_entry_spans_needs_input_line_gets_the_accent_diamond_and_fg_text() {
+    fn feed_entry_spans_needs_input_line_gets_the_accent_diamond_and_ink_text() {
         let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true, false);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             text,
             format!(" 12:34:56  {} pi: waiting → needs you", theme::GLYPH_NEEDS_INPUT)
         );
-        assert_eq!(spans[1].style.fg, Some(theme::DIM));
-        assert_eq!(spans[2].style.fg, Some(theme::ACCENT));
-        assert_eq!(spans[3].style.fg, Some(theme::FG));
+        assert_eq!(spans[1].style, theme::quiet());
+        assert_eq!(spans[2].style, theme::accent());
+        assert_eq!(spans[3].style, theme::ink());
     }
 
     #[test]
@@ -2421,22 +2441,22 @@ mod tests {
     }
 
     /// C14 (U20): the three row states — the focused column's selection
-    /// (marker + FG), the other column's selection (FG, no marker, so what
-    /// a launch would use stays readable), everything else MUTED.
+    /// (marker + `ink`), the other column's selection (`ink`, no marker, so
+    /// what a launch would use stays readable), everything else `quiet`.
     #[test]
     fn picker_rows_mark_only_the_focused_columns_selection() {
         let (marker, style) = super::row_marks(true, true);
         assert_eq!(marker.content.as_ref(), theme::PICKER_SELECTED.to_string());
-        assert_eq!(marker.style.fg, Some(theme::ACCENT));
-        assert_eq!(style.fg, Some(theme::FG));
+        assert_eq!(marker.style, theme::accent());
+        assert_eq!(style, theme::ink());
 
         let (marker, style) = super::row_marks(true, false);
         assert_eq!(marker.content.as_ref(), " ", "no marker in the column without focus");
-        assert_eq!(style.fg, Some(theme::FG), "but still readable as the selection");
+        assert_eq!(style, theme::ink(), "but still readable as the selection");
 
         let (marker, style) = super::row_marks(false, true);
         assert_eq!(marker.content.as_ref(), " ");
-        assert_eq!(style.fg, Some(theme::MUTED));
+        assert_eq!(style, theme::quiet());
     }
 
     /// C14 (U20): the dialog grows to fit the widest cwd label, and stays
@@ -2578,6 +2598,214 @@ mod tests {
         let ws = Workspace::default_in(PathBuf::from("/tmp"));
         App::<crate::ports::fakes::FakePane>::new(ws, agents::registry(), Box::new(store), tx, size, (0, 0), None)
             .unwrap()
+    }
+
+    /// Every chrome surface that has a drawn state, rendered through the
+    /// real `draw()` — the shared fixture for the §2 mechanical gates below.
+    /// `FakePane::screen()` is `None`, so nothing here is program output:
+    /// every cell in these buffers is chrome roost drew itself.
+    fn chrome_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        type Fixture = App<crate::ports::fakes::FakePane>;
+        fn snap(app: &mut Fixture) -> ratatui::buffer::Buffer {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            term.backend().buffer().clone()
+        }
+        fn three_panes() -> Fixture {
+            let mut app = mk_app(Size::new(100, 30));
+            app.apply(Action::NewPane);
+            app.apply(Action::NewPane);
+            app
+        }
+
+        let mut out: Vec<(&'static str, ratatui::buffer::Buffer)> = Vec::new();
+
+        let mut app = three_panes();
+        out.push(("normal, three tiled panes", snap(&mut app)));
+
+        let mut app = three_panes();
+        app.apply(Action::ToggleStack);
+        out.push(("collapsed stack rows", snap(&mut app)));
+
+        let mut app = three_panes();
+        app.set_flash("copied 12 chars");
+        out.push(("flash", snap(&mut app)));
+
+        let mut app = three_panes();
+        app.note_key_seen(); // U4's evidence: keys arriving, none with Alt
+        assert!(app.show_alt_hint());
+        out.push(("alt-trap warning bar", snap(&mut app)));
+
+        for (name, action) in [
+            ("help overlay", Action::Help),
+            ("picker", Action::QuickLaunch),
+            ("activity feed", Action::ToggleFeed),
+            ("rename dialog", Action::RenamePane),
+            ("scroll mode", Action::ScrollMode),
+            ("copy mode", Action::CopyMode),
+            ("raw pane", Action::ToggleRaw),
+            ("floating scratch pane", Action::ToggleFloat),
+            ("zoom", Action::ToggleZoom),
+        ] {
+            let mut app = three_panes();
+            app.apply(action);
+            out.push((name, snap(&mut app)));
+        }
+
+        let mut app = three_panes();
+        app.apply(Action::ToggleZoom);
+        app.apply(Action::ToggleHints); // the tab bar picks up the mode word
+        out.push(("zoom with the hint bar hidden", snap(&mut app)));
+
+        // C16: a dead pane's action bar. The fixture omitted every
+        // pane-overlay state, which is exactly how a span-styled (rather than
+        // widget-styled) bar hid from these gates — it reversed its ~76 text
+        // columns and left the dead program's last output showing through the
+        // rest of the row. Both shapes are drawn: with and without a spawn
+        // error, since the error adds a second row to the same bar.
+        let mut app = three_panes();
+        let focused = app.focused;
+        app.on_pty_exit(focused);
+        out.push(("dead pane action bar", snap(&mut app)));
+
+        let mut app = three_panes();
+        let focused = app.focused;
+        app.on_pty_exit(focused);
+        app.dead.insert(focused, "no such file or directory".into());
+        out.push(("dead pane with a spawn error", snap(&mut app)));
+
+        out
+    }
+
+    /// C16 regression: the dead-pane action bar reverses its **whole inner
+    /// width**, not just the columns its text happens to occupy. Styling the
+    /// span instead of the widget left the dead program's last output visible
+    /// at normal video across the rest of the row — three bars (C10 flash,
+    /// C11 alt warning, C16 dead pane) meant to read as one treatment, one of
+    /// them ragged. Caught by the design supervisor; the gate fixture now
+    /// draws the state that hid it.
+    #[test]
+    fn the_dead_pane_bar_reverses_its_whole_row() {
+        for (name, buf) in chrome_buffers() {
+            if !name.starts_with("dead pane") {
+                continue;
+            }
+            let area = *buf.area();
+            // The bar is the bottom row of the dead pane's inner area. Find
+            // it by its text, then assert the reversal runs across the row
+            // rather than stopping where the message does.
+            let row = (0..area.height)
+                .find(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains("exited — Enter")
+                })
+                .unwrap_or_else(|| panic!("{name}: no dead-pane bar drawn"));
+            let reversed: Vec<u16> = (0..area.width)
+                .filter(|x| buf[(*x, row)].style().add_modifier.contains(Modifier::REVERSED))
+                .collect();
+            assert!(!reversed.is_empty(), "{name}: the bar is not reversed at all");
+            let (first, last) = (reversed[0], *reversed.last().unwrap());
+            assert_eq!(
+                reversed.len() as u16,
+                last - first + 1,
+                "{name}: the bar's reversal is not contiguous across its row"
+            );
+            // Wider than the message itself — what the span-styled version
+            // could not be.
+            let text_cols =
+                (0..area.width).filter(|x| buf[(*x, row)].symbol() != " ").count();
+            assert!(
+                (last - first + 1) as usize > text_cols,
+                "{name}: the bar covers only its own glyphs, not the row"
+            );
+        }
+    }
+
+    /// §2 gate: **structure-only discipline.** `theme::rule()` (ANSI 8) is
+    /// the one theme-variant colour roost spends, and it may never carry a
+    /// word — a theme that renders ANSI 8 nearly invisible must cost a
+    /// hairline, not a label. Mechanical, over the real drawn frames: any
+    /// `DarkGray` cell has to be a rule glyph.
+    #[test]
+    fn structure_colour_never_carries_text() {
+        // Plain single-line box drawing (pane/modal borders), the tab
+        // separator, and blank fill. Nothing that spells anything.
+        const RULE_GLYPHS: &[&str] =
+            &[" ", "─", "│", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼"];
+        for (name, buf) in chrome_buffers() {
+            let area = *buf.area();
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    let cell = buf.cell((x, y)).expect("cell inside the buffer");
+                    if cell.style().fg != Some(Color::DarkGray) {
+                        continue;
+                    }
+                    assert!(
+                        RULE_GLYPHS.contains(&cell.symbol()),
+                        "{name}: structure colour carries text {:?} at ({x},{y})",
+                        cell.symbol(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// §2 gate: **no chrome element pairs two theme-variant colours.** Chrome
+    /// paints no colour fill at all — the two bars, the flash, the dead-pane
+    /// and alt-warning bars and the focused collapsed row all lost theirs —
+    /// so the only `bg` a chrome cell may carry is the `Color::Reset`
+    /// sentinel. Attention surfaces reverse the terminal's own pair instead,
+    /// which is contrasty in any theme by construction.
+    #[test]
+    fn chrome_paints_no_background_fill() {
+        for (name, buf) in chrome_buffers() {
+            let area = *buf.area();
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    let cell = buf.cell((x, y)).expect("cell inside the buffer");
+                    match cell.style().bg {
+                        None | Some(Color::Reset) => {}
+                        Some(other) => panic!(
+                            "{name}: chrome fills with {other:?} at ({x},{y}) — §2 allows no fill"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The heart of the 2026-07-27 stance: every word roost draws is the
+    /// terminal's own foreground on its own background — the one contrast
+    /// pair the user has already validated — optionally one rung quieter.
+    /// A chrome cell carrying a *letter* may therefore only be `Reset`, the
+    /// accent red, or unstyled; never a colour the theme is free to swallow.
+    #[test]
+    fn every_chrome_word_is_drawn_in_ink_the_user_already_reads() {
+        let legible = [Color::Reset, Color::Red, Color::LightRed];
+        for (name, buf) in chrome_buffers() {
+            let area = *buf.area();
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    let cell = buf.cell((x, y)).expect("cell inside the buffer");
+                    if !cell.symbol().chars().any(char::is_alphanumeric) {
+                        continue;
+                    }
+                    let Some(fg) = cell.style().fg else { continue };
+                    assert!(
+                        legible.contains(&fg),
+                        "{name}: the word cell {:?} at ({x},{y}) is drawn in {fg:?}",
+                        cell.symbol(),
+                    );
+                }
+            }
+        }
     }
 
     /// U15: hiding the hint bar used to hide the only mode indication

@@ -40,6 +40,25 @@ change · **[descoped]** decided against unless a use-case demands it.
   below — its foundation shipped with the fleet-features firehose gate,
   though golden-frame *color* scenarios remain deferred on the same trigger.
 
+- **[done, 2026-07-27] The chrome inherits your terminal's theme.** A user on
+  a light-theme terminal reported the tab bar and hint bar as near-black bands
+  and the **active tab's label invisible** — near-white ink drawn on
+  `Color::Reset`, i.e. white on their white background. That was the shipped
+  stance, not a slip (`DESIGN-ui.md` §2 "Truecolor stance", logged as
+  SPEC-GAP-4), so the fix was to change the stance: every fixed `Rgb` hue is
+  gone. Text is now the terminal's own fg on its own background (plus a `DIM`
+  rung), ANSI 8 is spent on borders and separators only, attention surfaces
+  reverse instead of filling, and the one red is ANSI 1 with ANSI 9 for the
+  bright half of the pulse. No chrome fills at all: `BG`, `TAB_STRIP` and
+  `BAR` are deleted, and the active tab and focused collapsed row are carried
+  by ink weight plus their `▎` marker. Correct on light, dark and tinted
+  themes alike, and it survives a live theme switch with no detection
+  machinery. Spec of record: `DESIGN-ui.md` §2 + the dated per-contract
+  amendments; SPEC-GAP-4 closed. Verified: 496 unit tests, three PTY
+  scenarios asserting the emitted SGR (`tests/chrome_theme.rs`), four
+  mechanical gates that fail if a fixed hue or a fill comes back, and a
+  design-supervisor audit.
+
 ## Fleet features — shipped
 
 - **[done] Navigate & arrange a bigger fleet.** Eight new surfaces landed on
