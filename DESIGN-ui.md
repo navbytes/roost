@@ -1952,6 +1952,32 @@ time-ordered log, not current state; a tab with three needy agents renders as
 one `◆`, identical to a tab with one (the C2 amendment of the same date
 addresses that last one from the tab bar's side).
 
+**[Correction 2026-07-28 — one of the tribunal's two reasons was wrong.]**
+The arithmetic above stands, with one clarification and one gap:
+
+- *Clarification:* a 20-column rail at the 80-column floor does not make
+  splitting impossible, it makes **side-by-side** panes impossible.
+  `spawn_child` picks its direction from the target's rect shape, so it
+  would stack instead — which is a real loss, but a narrower one than
+  "illegal by roost's own predicate" reads as.
+- *The gap:* the tribunal ran the numbers on **one** rail width — herdr's
+  20-column labelled one. A rail of **≤ 8 columns clears the floor**
+  (72 body ÷ 2 = 36, exactly `MIN_SPLIT_COLS`), which is what a *collapsed*
+  rail costs. That tier was never evaluated.
+
+**The second reason is simply false.** "A tier roost's singleton
+`Workspace` does not have" identified the missing tier as the workspace. It
+is the **directory**: every `PaneSpec` carries a `cwd`, C14's picker
+already keeps a recent-directory column and floats the ones you launch
+into, and nothing in roost has ever grouped by it. herdr's own sections are
+repositories and the agents inside them — which roost can express exactly.
+
+Recorded because it changes what a future sidebar would *be*, not just
+whether to build one: grouped by tab it rotates the axis C2 already draws,
+which is why it reads as duplication; grouped by **project → agent** it
+adds an axis roost has never shown. That variant is parked, not rejected —
+see ROADMAP's entry for the model, the tiers and the honest costs.
+
 **Current:** none of the above surfaces answers "what is my fleet, right
 now". `App::attention_ring` (`app.rs`) already enumerates the workspace in
 the right order but only over `NeedsInput` panes and only to move focus.
