@@ -1881,8 +1881,16 @@ you.**
   proven once for both.
 - **Content:** every pane in the workspace, **grouped by tab**, tabs in
   order, panes in that tab's `pane_order()`, the float (C22) last under its
-  own group when shown — i.e. exactly C19's ring enumeration, so the roster
-  and `Alt+a` can never disagree about what order the fleet is in.
+  own group — i.e. exactly C19's ring enumeration, so the roster and `Alt+a`
+  can never disagree about what order the fleet is in.
+  - **The float is listed whether or not it is shown.** [Amended
+    2026-07-28, supervisor SG-1] Hidden is a display state, not an absence,
+    and C19's ring carries a hidden float that needs you — so a roster that
+    listed it only while shown could *open with its cursor on a row that
+    isn't there*: no `❯` drawn anywhere and `Enter` acting on something
+    invisible. The invariant is the general one: **every pane the opening
+    cursor can land on is a row.** `Enter` on the float's row shows it, the
+    same way a ring jump does.
   - **Group header rows** use C6's idiom: an uppercase label
     (`" 1 MAIN · 4 PANES"` — the tab's own bar label, then how many of its
     panes are being shown), `quiet()`, `Modifier::UNDERLINED` across every
@@ -1896,18 +1904,46 @@ you.**
     glyph table are all shared, so a pane reads identically here, in a
     collapsed stack row, and on its badge. **No new glyphs**: §2's inventory
     holds.
+  - **A pane that has never been spawned reads "not started", never
+    "exited".** [Amended 2026-07-28, supervisor D1] The roster is the only
+    surface that lists panes outside the active tab, and `spawn_active_tab`
+    starts *only* the active tab's panes — so **a workspace restored from
+    disk has no runtime for any other tab**, which is precisely C27's
+    headline case. Rendering a runtime-less pane as dead turned the first
+    `Alt+Shift+a` of a session into a morgue, contradicting the `·` the tab
+    bar drew on those same tabs in the same frame. The single source is
+    `App::row_status(id) -> Option<AgentStatus>` (`None` = no runtime and
+    not recorded dead), which is also the control plane's `status_str`
+    `"unknown"` rung, so the CLI and the chrome answer this from one place.
+    The `None` row's glyph and style come from
+    `theme::tab_summary_style(TabSummary::Unknown)` — **the tab bar's own
+    call** — so the two surfaces cannot disagree by construction, and the
+    state word is `not started`. Still no new glyph: `Unknown` already
+    resolves to the idle dot.
+  - **Empty state.** [Amended 2026-07-28, supervisor SG-2] The type-ahead
+    is the only way to empty the list (a workspace always has a pane), and
+    an empty overlay would read as a broken one. It draws a single centered
+    `no pane matches` line in `quiet()` at the inner area's middle row —
+    C20's empty-feed shape verbatim, for the same reason: a modal that
+    explains its own emptiness beats one that just goes blank.
   - **Two marks, two meanings.** The row's leading column is the *cursor*
     (`❯`, `accent()` — the C14/C20 idiom), and C8's own `▎` still marks the
     *focused* pane inside the row. "What will Enter act on" and "where am I
     right now" are different questions and get different marks rather than
     one overloaded one.
-- **Opening cursor lands on the pane `Alt+a` would pick** — the same
+- **Opening cursor lands on the pane `Alt+a` would jump to** — the same
   worst-first ring order, through the shared `App::attention_next` that
   `jump_attention` itself now calls. This is load-bearing: it makes
-  `Alt+Shift+a` `Enter` *exactly equivalent* to `Alt+a`, so the roster is a
+  `Alt+Shift+a` `Enter` land exactly where `Alt+a` lands, so the roster is a
   superset of the chord users already know rather than a competing command
   (pinned by `roster_enter_lands_exactly_where_alt_a_would_have`). With
   nothing needing attention it opens on the focused pane.
+  - **One case is deliberately not equivalent** [Amended 2026-07-28,
+    supervisor SG-1]: with the float *focused*, `Alt+a` dismisses the float
+    instead of jumping (C22 rule 2), while the roster still opens on
+    `attention_next`. The equivalence claim is about where a jump *lands*,
+    not about C22's dismissal shortcut — the roster's job is to show you the
+    fleet, and it has no row that means "hide this".
 - **Keys.** `↑`/`↓` move by pane (headers are skipped by construction —
   the cursor is a `PaneId`, and a header has none), clamped at both ends
   rather than wrapping; `PgUp`/`PgDn` page by half the overlay's height (C20's
@@ -1990,6 +2026,9 @@ the CLI is also where the fat-finger-unsafe verbs deliberately live (§7's
 
 **Unit tests (the executable form of this contract):** ring-order opening
 cursor and the `Alt+a` equivalence · row grouping incl. the float's own group
+· a **hidden** float still listed, so the opening cursor is always a real row
+· a **restored, never-spawned** tab's panes reading `not started` under the
+tab bar's own `Unknown` glyph rather than `exited`
 · header skipping and end clamping · type-ahead over id/name/adapter with
 Backspace widening and header collapse · `Enter` through the shared helper
 across tabs · stale-cursor flash · entry-chord and `Esc` toggling closed ·

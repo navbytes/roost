@@ -831,12 +831,15 @@ fn roster_row_spans<B: PaneBackend>(
         RosterRow::Pane { id } => {
             let id = *id;
             let spec = app.find_spec(id);
-            let status =
-                app.runtimes.get(&id).map(|rt| rt.status()).unwrap_or(AgentStatus::Exited);
+            // `row_status`, not `runtimes` directly: the roster is the one
+            // surface that lists panes in tabs the lazy spawn has never
+            // started, and `None` is what the tab bar reads as `·` for the
+            // very same tab in the very same frame.
+            let status = app.row_status(id);
             let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
             let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
             let name = if spec.is_some() { app.display_name(id) } else { "?".into() };
-            let (_, base, pulses) = theme::status_style(status);
+            let (_, base, pulses) = row_status_style(status);
             let glyph_style = if pulses { pulse } else { base };
             let marker = if id == cursor {
                 Span::styled(theme::PICKER_SELECTED.to_string(), theme::accent())
@@ -1049,7 +1052,7 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
 /// matches `mouse::tab_width` (`display_width(label) + 8`) exactly.
 ///
 /// [Amended 2026-07-28] `count` is how many of the tab's panes are in the
-/// summarized state (`App::tab_summary_counted`). It renders in the glyph's
+/// summarized state (the second half of `App::tab_summary`). It renders in the glyph's
 /// own style — pulse included, so `●3` flips as one token rather than as a
 /// dot with a number stuck to it: the count is part of the signal, not a
 /// separate remark about it.
@@ -1143,6 +1146,32 @@ pub fn state_word(status: AgentStatus) -> &'static str {
     }
 }
 
+/// C8's state word for a row whose pane may have no runtime yet
+/// (`App::row_status` → `None`): a tab this session has not visited, whose
+/// panes the lazy spawn has not started. "not started" is the row-length
+/// spelling of what `tab_summary` reports as `TabSummary::Unknown` for the
+/// same tab — never "exited", which claims a life that has not happened.
+fn row_word(status: Option<AgentStatus>) -> &'static str {
+    match status {
+        Some(s) => state_word(s),
+        None => "not started",
+    }
+}
+
+/// C8's glyph + style for a row whose pane may have no runtime yet — the
+/// counterpart to `row_word`. `None` routes through the *tab bar's* own
+/// `Unknown` styling, so the roster's glyph for an unspawned pane is by
+/// construction the glyph its tab is wearing in the same frame.
+fn row_status_style(status: Option<AgentStatus>) -> (char, Style, bool) {
+    match status {
+        Some(s) => theme::status_style(s),
+        None => {
+            let (glyph, style) = theme::tab_summary_style(crate::core::app::TabSummary::Unknown);
+            (glyph, style, false)
+        }
+    }
+}
+
 /// C8's collapsed-row name style, by status and focus.
 ///
 /// [Amended 2026-07-27, theme inheritance] The focused row used to be a
@@ -1151,13 +1180,15 @@ pub fn state_word(status: AgentStatus) -> &'static str {
 /// the `▎` marker. The status ramp still speaks on unfocused rows — and it
 /// is two rungs deep, not three, so Waiting/Idle/Exited share the quiet one
 /// (the `✕` glyph and the `exited` state word already say which is dead).
-fn collapsed_name_style(status: AgentStatus, focused: bool) -> Style {
+fn collapsed_name_style(status: Option<AgentStatus>, focused: bool) -> Style {
     if focused {
         return theme::ink();
     }
     match status {
-        AgentStatus::Working | AgentStatus::NeedsInput => theme::ink(),
-        AgentStatus::Waiting | AgentStatus::Idle | AgentStatus::Exited => theme::quiet(),
+        Some(AgentStatus::Working | AgentStatus::NeedsInput) => theme::ink(),
+        Some(AgentStatus::Waiting | AgentStatus::Idle | AgentStatus::Exited) | None => {
+            theme::quiet()
+        }
     }
 }
 
@@ -1232,11 +1263,10 @@ fn draw_pane<B: PaneBackend>(
         // find_spec, not the active tab's map directly: C22 learns the
         // float here too (its spec lives on the `Float`, not `Tab::panes`).
         let spec = app.find_spec(pr.id);
-        let status = app
-            .runtimes
-            .get(&pr.id)
-            .map(|rt| rt.status())
-            .unwrap_or(AgentStatus::Exited);
+        // A drawn pane lives in the active tab or is the float, so it has
+        // been spawned and `row_status` answers `Some`; the fallback only
+        // covers a pane whose spec vanished mid-frame, which is dead.
+        let status = app.row_status(pr.id).unwrap_or(AgentStatus::Exited);
         let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
         let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
         // U2 (amended, P6): the shared display name — explicit title, else
@@ -1380,11 +1410,14 @@ fn paint_stack_edge(f: &mut Frame, rect: Rect) {
 /// so titled panes keep the full `"{adapter} · {word}"`.
 /// [Amended, C23] a raw pane's right segment gains a `raw · ` prefix ahead
 /// of whichever of the above it would otherwise be.
+/// [Amended, C27] `status` is optional because the roster reuses this row
+/// for panes in tabs the lazy spawn has not started: `None` is "not started"
+/// (`row_word`/`row_status_style`), not a corpse.
 #[allow(clippy::too_many_arguments)]
 fn collapsed_row_spans(
     width: u16,
     focused: bool,
-    status: AgentStatus,
+    status: Option<AgentStatus>,
     id: layout::PaneId,
     name: &str,
     adapter: &str,
@@ -1392,7 +1425,7 @@ fn collapsed_row_spans(
     raw: bool,
     glyph_style: Style,
 ) -> Vec<Span<'static>> {
-    let (glyph, ..) = theme::status_style(status);
+    let (glyph, ..) = row_status_style(status);
     let marker = if focused {
         (theme::MARKER_ACTIVE.to_string(), theme::accent())
     } else {
@@ -1405,9 +1438,9 @@ fn collapsed_row_spans(
     ];
     let left_w: u16 = left.iter().map(|(t, _)| mouse::display_width(t)).sum();
     let right = if has_title {
-        format!("{adapter} · {} ", state_word(status))
+        format!("{adapter} · {} ", row_word(status))
     } else {
-        format!("{} ", state_word(status))
+        format!("{} ", row_word(status))
     };
     let right = if raw { format!("raw · {right}") } else { right };
     let right_w = mouse::display_width(&right);
@@ -1442,8 +1475,20 @@ fn draw_collapsed_row(
 ) {
     let (_, base, pulses) = theme::status_style(status);
     let glyph_style = if pulses { pulse } else { base };
-    let spans =
-        collapsed_row_spans(rect.width, focused, status, id, name, adapter, has_title, raw, glyph_style);
+    // `Some`, always: a drawn row belongs to the active tab (or the float),
+    // and those are spawned by construction — only C27's roster reaches
+    // across into tabs that aren't.
+    let spans = collapsed_row_spans(
+        rect.width,
+        focused,
+        Some(status),
+        id,
+        name,
+        adapter,
+        has_title,
+        raw,
+        glyph_style,
+    );
     f.render_widget(Paragraph::new(Line::from(spans)), rect);
 }
 
@@ -2033,18 +2078,22 @@ mod tests {
     /// that used to carry focus is gone.
     #[test]
     fn collapsed_name_style_by_state_and_focus() {
-        assert_eq!(collapsed_name_style(AgentStatus::Working, false), theme::ink());
-        assert_eq!(collapsed_name_style(AgentStatus::NeedsInput, false), theme::ink());
-        assert_eq!(collapsed_name_style(AgentStatus::Waiting, false), theme::quiet());
-        assert_eq!(collapsed_name_style(AgentStatus::Idle, false), theme::quiet());
-        assert_eq!(collapsed_name_style(AgentStatus::Exited, false), theme::quiet());
+        assert_eq!(collapsed_name_style(Some(AgentStatus::Working), false), theme::ink());
+        assert_eq!(collapsed_name_style(Some(AgentStatus::NeedsInput), false), theme::ink());
+        assert_eq!(collapsed_name_style(Some(AgentStatus::Waiting), false), theme::quiet());
+        assert_eq!(collapsed_name_style(Some(AgentStatus::Idle), false), theme::quiet());
+        assert_eq!(collapsed_name_style(Some(AgentStatus::Exited), false), theme::quiet());
+        // C27: a pane its tab has never spawned reads with the quiet rung —
+        // it is not working, and it is not dead either.
+        assert_eq!(collapsed_name_style(None, false), theme::quiet());
         // Focus overrides the ramp: the row you are on is never the quiet one.
         for s in [
-            AgentStatus::Working,
-            AgentStatus::NeedsInput,
-            AgentStatus::Waiting,
-            AgentStatus::Idle,
-            AgentStatus::Exited,
+            Some(AgentStatus::Working),
+            Some(AgentStatus::NeedsInput),
+            Some(AgentStatus::Waiting),
+            Some(AgentStatus::Idle),
+            Some(AgentStatus::Exited),
+            None,
         ] {
             assert_eq!(collapsed_name_style(s, true), theme::ink(), "{s:?} focused");
         }
@@ -2053,7 +2102,7 @@ mod tests {
     #[test]
     fn collapsed_row_shows_right_segment_when_it_fits() {
         let spans =
-            collapsed_row_spans(40, false, AgentStatus::Working, 2, "pi", "pi", true, false, theme::accent());
+            collapsed_row_spans(40, false, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::accent());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("pi · working "));
     }
@@ -2065,7 +2114,7 @@ mod tests {
         // right segment is the bare state word — "your turn", not
         // "shell · your turn". [DESIGN-ui.md amended 2026-07-22, ux #3.]
         let spans =
-            collapsed_row_spans(40, false, AgentStatus::Waiting, 2, "shell", "shell", false, false, theme::ink());
+            collapsed_row_spans(40, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, false, theme::ink());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("your turn "));
         assert!(!text.contains("shell ·"));
@@ -2078,7 +2127,7 @@ mod tests {
         // nothing more (U2: the id rides with the name on the left).
         let left_w = 5 + name.chars().count() as u16;
         let spans =
-            collapsed_row_spans(left_w, false, AgentStatus::Idle, 2, name, "shell", true, false, theme::quiet());
+            collapsed_row_spans(left_w, false, Some(AgentStatus::Idle), 2, name, "shell", true, false, theme::quiet());
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" · 2 {name}"));
         assert!(!text.contains("shell"));
@@ -2089,7 +2138,7 @@ mod tests {
         let spans = collapsed_row_spans(
             4,
             false,
-            AgentStatus::Waiting,
+            Some(AgentStatus::Waiting),
             2,
             "a-very-long-pane-name",
             "shell",
@@ -2105,19 +2154,19 @@ mod tests {
     #[test]
     fn collapsed_row_focused_marker_is_accent() {
         let spans =
-            collapsed_row_spans(40, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::accent());
+            collapsed_row_spans(40, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::accent());
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style, theme::accent());
     }
 
     #[test]
     fn collapsed_row_raw_gains_the_prefix_ahead_of_the_usual_right_segment() {
-        let titled = collapsed_row_spans(60, false, AgentStatus::Working, 2, "pi", "pi", true, true, theme::accent());
+        let titled = collapsed_row_spans(60, false, Some(AgentStatus::Working), 2, "pi", "pi", true, true, theme::accent());
         let text: String = titled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · pi · working "), "{text}");
 
         let untitled =
-            collapsed_row_spans(60, false, AgentStatus::Waiting, 2, "shell", "shell", false, true, theme::ink());
+            collapsed_row_spans(60, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, true, theme::ink());
         let text: String = untitled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · your turn "), "{text}");
     }
@@ -2540,7 +2589,7 @@ mod tests {
     #[test]
     fn collapsed_row_spans_at_zero_width_is_empty_not_panicking() {
         let spans =
-            collapsed_row_spans(0, true, AgentStatus::Working, 2, "pi", "pi", true, false, theme::accent());
+            collapsed_row_spans(0, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::accent());
         assert!(spans.is_empty());
     }
 
@@ -3270,6 +3319,87 @@ mod tests {
         assert!(!frame.contains("1 MAIN · 2 PANES"), "tab 1 filtered away whole:\n{frame}");
     }
 
+    /// C27 + C5, the headline restore case: a workspace reloaded from disk
+    /// has runtimes for the active tab only (`spawn_active_tab`), so the
+    /// first `Alt+Shift+a` of a session lists panes that have never been
+    /// started. Those rows must read "not started" behind the tab bar's own
+    /// `·`, never "exited" behind `✕` — the roster used to call every
+    /// runtime-less pane dead, which showed a restored fleet as a morgue
+    /// while the tab strip above it said the opposite in the same frame.
+    #[test]
+    fn a_restored_tab_that_has_never_spawned_reads_not_started_not_exited() {
+        use crate::agents;
+        use crate::ports::fakes::{FakePane, MemStore};
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+        use std::sync::mpsc;
+
+        // Build a two-tab workspace, then *reload* it the way a restart
+        // does: a fresh App over the same saved `Workspace`.
+        let size = Size::new(100, 30);
+        let mut built = mk_app(size);
+        built.apply(Action::NewTab); // tab2, now active
+        built.apply(Action::NewPane); // tab2: two panes
+        built.apply(Action::PrevTab); // leave tab 1 as the active one
+        let ws = built.ws.clone();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            agents::registry(),
+            Box::new(MemStore::default()),
+            tx,
+            size,
+            (0, 0),
+            None,
+        )
+        .unwrap();
+
+        // Precondition: tab 2's panes really are runtime-less — this test is
+        // worthless if the restore spawned them after all.
+        let unspawned: Vec<crate::core::layout::PaneId> =
+            app.ws.tabs[1].panes.keys().copied().filter(|id| !app.runtimes.contains_key(id)).collect();
+        assert_eq!(unspawned.len(), 2, "a non-active restored tab spawns nothing");
+        for id in &unspawned {
+            assert_eq!(app.row_status(*id), None, "pane {id} has no runtime and is not dead");
+        }
+
+        app.apply(Action::ToggleRoster);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let frame: String = (0..30)
+            .map(|y| {
+                (0..100)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(frame.contains("2 TAB2 · 2 PANES"), "the unspawned tab is listed:\n{frame}");
+        assert_eq!(frame.matches("not started").count(), 2, "both its rows:\n{frame}");
+        assert!(!frame.contains("exited"), "nothing in the roster is dead:\n{frame}");
+        assert!(!frame.contains(theme::GLYPH_EXITED), "no ✕ glyph anywhere:\n{frame}");
+
+        // …and the row's glyph is the same one the tab bar puts on that tab
+        // in this very frame, which is the whole point of routing both
+        // through `TabSummary::Unknown`.
+        let (tab_glyph, _) = theme::tab_summary_style(crate::core::app::TabSummary::Unknown);
+        let row: String = super::roster_row_spans(
+            &app,
+            &RosterRow::Pane { id: unspawned[0] },
+            50,
+            app.focused,
+            theme::accent(),
+        )
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+        assert!(row.contains(tab_glyph), "row {row:?} wears the tab's own glyph {tab_glyph:?}");
+    }
+
     /// C27 borrows C6's header idiom: the group row is underlined edge to
     /// edge (text *and* the fill after it), so it reads as a rule rather than
     /// as another pane.
@@ -3318,7 +3448,7 @@ mod tests {
         let c8: String = collapsed_row_spans(
             49,
             false,
-            AgentStatus::Idle,
+            Some(AgentStatus::Idle),
             other,
             &app.display_name(other),
             "shell",

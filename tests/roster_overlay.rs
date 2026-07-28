@@ -123,12 +123,20 @@ fn the_roster_lists_another_tabs_panes_and_jumps_across_to_one() {
     // NOT active, whose panes have no other resting surface in roost.
     assert!(frame.contains("1 MAIN · 1 PANE"), "tab 1's group header:\n{frame}");
     assert!(frame.contains("2 API · 2 PANES"), "the INACTIVE tab's group header:\n{frame}");
-    // C8's row format for each of the inactive tab's panes: the id leads.
+    // C8's row format for each of the inactive tab's panes: the id leads,
+    // and — the case this whole fixture *is* — a tab restored from disk has
+    // never been spawned, so its rows say "not started" behind the quiet dot
+    // the tab bar itself is drawing on that tab in this very frame. Rows
+    // reading "exited" here would be the roster calling a fleet that has yet
+    // to start a morgue.
     for id in [2, 3] {
-        assert!(
-            frame.lines().any(|l| l.contains(&format!("{id} shell"))),
-            "pane {id} (inactive tab) is listed:\n{frame}",
-        );
+        let row = frame
+            .lines()
+            .find(|l| l.contains(&format!("{id} shell")))
+            .unwrap_or_else(|| panic!("pane {id} (inactive tab) is listed:\n{frame}"));
+        assert!(row.contains("not started"), "pane {id}'s row has not spawned: {row:?}");
+        assert!(!row.contains("exited"), "pane {id} is not dead: {row:?}");
+        assert!(!row.contains('✕'), "no dead glyph on pane {id}'s row: {row:?}");
     }
     assert!(frame.contains("ROSTER"), "the C9 mode word is on the bar:\n{frame}");
 

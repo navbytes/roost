@@ -1193,21 +1193,37 @@ impl<B: PaneBackend> App<B> {
         self.ws.tabs.iter().position(|t| t.panes.contains_key(&id))
     }
 
-    fn status_str(&self, id: PaneId) -> &'static str {
+    /// What any surface — chrome or control plane — should say about pane
+    /// `id`'s state. `Some` once the pane has a runtime (or is known dead),
+    /// `None` while it has none: a pane in a tab this session has never
+    /// visited, which the lazy spawn has not started yet.
+    ///
+    /// One source for that three-rung distinction, because two surfaces read
+    /// it in the same frame. C27's roster used to call every runtime-less
+    /// pane `Exited` while `tab_summary` called the same tab `Unknown` — so
+    /// a workspace restored from disk (every non-active tab unspawned) opened
+    /// its first roster showing the entire fleet as corpses under a tab bar
+    /// of quiet dots.
+    pub fn row_status(&self, id: PaneId) -> Option<AgentStatus> {
         if let Some(rt) = self.runtimes.get(&id) {
-            match rt.status() {
-                AgentStatus::Working => "working",
-                AgentStatus::NeedsInput => "needs_input",
-                AgentStatus::Waiting => "waiting",
-                AgentStatus::Idle => "idle",
-                AgentStatus::Exited => "exited",
-            }
-        } else if self.dead.contains_key(&id) || self.find_spec(id).is_none() {
+            return Some(rt.status());
+        }
+        if self.dead.contains_key(&id) || self.find_spec(id).is_none() {
             // Spawn failed, or the pane is closed/never existed — either way
             // nothing further will happen to it.
-            "exited"
-        } else {
-            "unknown" // a background pane not spawned yet (lazy)
+            return Some(AgentStatus::Exited);
+        }
+        None // a background pane not spawned yet (lazy)
+    }
+
+    fn status_str(&self, id: PaneId) -> &'static str {
+        match self.row_status(id) {
+            Some(AgentStatus::Working) => "working",
+            Some(AgentStatus::NeedsInput) => "needs_input",
+            Some(AgentStatus::Waiting) => "waiting",
+            Some(AgentStatus::Idle) => "idle",
+            Some(AgentStatus::Exited) => "exited",
+            None => "unknown",
         }
     }
 
@@ -3131,10 +3147,15 @@ impl<B: PaneBackend> App<B> {
     /// honest either way).
     ///
     /// The opening cursor is load-bearing: landing it on `attention_next`
-    /// makes `Alt+Shift+a` `Enter` *exactly* `Alt+a`, so the roster is a
-    /// superset of the chord users already know rather than a competing
-    /// command. With nothing needing attention it lands on the focused pane
-    /// — the roster then opens where you already are.
+    /// makes `Alt+Shift+a` `Enter` land on the pane `Alt+a` would *jump* to,
+    /// so the roster is a superset of the chord users already know rather
+    /// than a competing command. With nothing needing attention it lands on
+    /// the focused pane — the roster then opens where you already are.
+    ///
+    /// One case is deliberately not equivalent: with the float focused,
+    /// `Alt+a` dismisses the float instead of jumping (C22 rule 2), while
+    /// the roster still opens on `attention_next`. The roster's job is to
+    /// show you the fleet, and there is no row that means "hide this".
     fn toggle_roster(&mut self) {
         if matches!(self.mode, Mode::Roster { .. }) {
             self.mode = Mode::Normal;
@@ -3147,8 +3168,14 @@ impl<B: PaneBackend> App<B> {
 
     /// C27: every row the roster shows right now — each tab's header
     /// followed by that tab's panes in `pane_order()`, tabs in order, the
-    /// float last when shown. Exactly C19's ring enumeration, so the roster
-    /// and `Alt+a` can never disagree about what order the fleet is in.
+    /// float last. Exactly C19's ring enumeration, so the roster and `Alt+a`
+    /// can never disagree about what order the fleet is in — which is also
+    /// why the float is listed whether or not it is *shown*: C19's ring
+    /// carries a hidden float that needs you, so a roster that hid it could
+    /// open with its cursor on a row that isn't there (no `❯` drawn
+    /// anywhere, Enter acting on something invisible). Hidden is a display
+    /// state, not an absence; Enter on the row shows it, exactly as a ring
+    /// jump does.
     ///
     /// The type-ahead filter applies to panes only; a group whose panes all
     /// filter out drops its header too (an empty group is a row that says
@@ -3171,7 +3198,7 @@ impl<B: PaneBackend> App<B> {
             rows.extend(panes.into_iter().map(|id| RosterRow::Pane { id }));
         }
         if let Some(f) = &self.float {
-            if f.shown && self.roster_matches(f.id, &filter) {
+            if self.roster_matches(f.id, &filter) {
                 rows.push(RosterRow::Group { label: roster_float_label() });
                 rows.push(RosterRow::Pane { id: f.id });
             }
@@ -7573,9 +7600,34 @@ mod tests {
         assert!(matches!(&rows[rows.len() - 2], RosterRow::Group { label } if label.contains("FLOAT")));
     }
 
+    /// C27: a *hidden* float is still fleet, so it is still a row. C19's
+    /// ring carries a hidden float that needs you, and the opening cursor is
+    /// defined as the ring's next member — so a roster that listed the float
+    /// only while it was shown could open with its cursor on a row that does
+    /// not exist: no `❯` drawn anywhere, and Enter acting on something the
+    /// user cannot see. Every cursor the roster can open on must be listed.
+    #[test]
+    fn roster_lists_a_hidden_float_so_the_opening_cursor_is_always_a_real_row() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat); // spawn + show + focus
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide it again
+        assert!(!app.float.as_ref().unwrap().shown, "the float is hidden");
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert!(app.attention_ring().contains(&float_id), "C19 rings a hidden needy float");
+
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_cursor(&app), float_id, "the cursor opens on it");
+        assert!(
+            roster_panes(&app).contains(&float_id),
+            "…and it is one of the rows: {:?}",
+            roster_panes(&app)
+        );
+    }
+
     /// The load-bearing one: the opening cursor is the pane `Alt+a` would
-    /// pick, so `Alt+Shift+a` `Enter` is exactly `Alt+a`. Pinned against
-    /// `attention_ring` itself rather than a hand-written id.
+    /// pick, so `Alt+Shift+a` `Enter` lands where `Alt+a` jumps. Pinned
+    /// against `attention_ring` itself rather than a hand-written id.
     #[test]
     fn roster_opens_on_the_pane_alt_a_would_jump_to() {
         let (mut app, tab0, tab1) = roster_fixture();
