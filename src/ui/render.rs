@@ -148,7 +148,7 @@ fn hint_pairs(
         // mode is where a search starts and where its hits are walked, and
         // an unadvertised key is an absent one. 59 columns — comfortably
         // inside the 100-col floor alongside the right segment.
-        Mode::Scroll { .. } => vec![
+        Mode::Scroll => vec![
             ("↑↓", "scroll"),
             ("PgUp/Dn", "page"),
             ("/", "search"),
@@ -214,7 +214,7 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Normal => "NORMAL",
         Mode::Rename { .. } => "RENAME",
         Mode::Picker { .. } => "PICKER",
-        Mode::Scroll { .. } => "SCROLL",
+        Mode::Scroll => "SCROLL",
         Mode::Copy { .. } => "COPY",
         Mode::Help { .. } => "HELP",
         Mode::Feed { .. } => "FEED",
@@ -340,7 +340,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // `↑N/M` beside `3/17` would be two answers to one question.
     let (query, position) = match &app.mode {
         Mode::Search { .. } => search_segment(app.search.as_ref()),
-        Mode::Scroll { .. } => {
+        Mode::Scroll => {
             let (off, total) = app.scroll_position();
             (None, Some(format!("{}{off}/{total}", theme::SCROLLED)))
         }
@@ -796,7 +796,7 @@ fn dialog_rect(
         // drawn in-pane (C17/C24). [P21] Nor does search: its prompt lives
         // in the hint bar's right segment, so the pane it is searching
         // stays fully visible while the query narrows.
-        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } | Mode::Search { .. } => None,
+        Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => None,
         Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
         Mode::Picker { .. } => {
             // U20: as tall as the longer of the two columns (a filter can
@@ -839,7 +839,7 @@ fn draw_mode_overlay<B: PaneBackend>(
         return;
     };
     match &app.mode {
-        Mode::Normal | Mode::Scroll { .. } | Mode::Copy { .. } | Mode::Search { .. } => {}
+        Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => {}
         Mode::Rename { buffer, cursor, target } => {
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
@@ -2538,7 +2538,7 @@ mod tests {
             "RENAME"
         );
         assert_eq!(mode_word(&Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false }, false, false), "PICKER");
-        assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, false, false), "SCROLL");
+        assert_eq!(mode_word(&Mode::Scroll, false, false), "SCROLL");
         assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false), "COPY");
         assert_eq!(mode_word(&Mode::Help { top: 0 }, false, false), "HELP");
     }
@@ -2549,7 +2549,7 @@ mod tests {
         // other mode's own word wins regardless of the zoomed flag.
         assert_eq!(mode_word(&Mode::Normal, true, false), "ZOOM");
         assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
-        assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, true, false), "SCROLL");
+        assert_eq!(mode_word(&Mode::Scroll, true, false), "SCROLL");
         assert_eq!(mode_word(&Mode::Help { top: 0 }, true, false), "HELP");
     }
 
@@ -2559,7 +2559,7 @@ mod tests {
         // but any real (non-Normal) mode word still wins over both.
         assert_eq!(mode_word(&Mode::Normal, false, true), "RAW");
         assert_eq!(mode_word(&Mode::Normal, true, true), "RAW", "raw beats zoom");
-        assert_eq!(mode_word(&Mode::Scroll { offset: 0 }, true, true), "SCROLL", "a real mode word always wins");
+        assert_eq!(mode_word(&Mode::Scroll, true, true), "SCROLL", "a real mode word always wins");
     }
 
     #[test]

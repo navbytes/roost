@@ -72,6 +72,29 @@
 /// Progressive-enhancement flag: "disambiguate escape codes" (bit 0). This is
 /// the bit that makes an app want modified keys as CSI-u.
 const DISAMBIGUATE: u8 = 0x1;
+
+/// P8: **the flags roost actually implements.** A push is masked to this
+/// before it is stored, so the stack — and therefore both `disambiguate()`
+/// and the `CSI ? <flags> u` reply — can only ever describe behaviour roost
+/// really delivers.
+///
+/// Before this mask, a push of 7 was stored and echoed back verbatim, which
+/// promised the app three things: disambiguated escape codes (bit 1), event
+/// types — press/repeat/**release** (bit 2), and alternate keys (bit 4).
+/// roost delivered the first and neither of the others; release events are
+/// filtered out before `translate` ever sees them, and nothing anywhere
+/// reports shifted/base-layout key codes. Apps that trust the ACK (fish 4,
+/// helix, kakoune) then misparse — they are entitled to, because the reply is
+/// the terminal's word.
+///
+/// Growing this constant is the *only* way to promise more, and it must move
+/// in lockstep with `input::kitty_upgrade`: the mask is the promise, that
+/// function is the delivery. Bits deliberately not claimed today:
+/// `0x2` report event types (needs release events to survive the host's own
+/// key filtering — an architecture decision, not a patch), `0x4` report
+/// alternate keys, `0x8` report all keys as escape codes, `0x10` report
+/// associated text.
+const SUPPORTED: u8 = DISAMBIGUATE;
 /// Cap the stack depth, matching kitty, so a misbehaving app can't grow it
 /// without bound.
 const MAX_STACK: usize = 16;
@@ -180,10 +203,12 @@ impl QueryResponder {
                 // `?`: a flag *report* (`CSI ? Pn u` — our own reply shape)
                 // is not a query.
                 b"?" => out.extend_from_slice(format!("\x1b[?{}u", self.flags()).as_bytes()),
-                // CSI > <flags> u — push (omitted/malformed flags ⇒ 0).
+                // CSI > <flags> u — push (omitted/malformed flags ⇒ 0),
+                // masked to what roost implements (P8: the reply is a
+                // promise, so it may only carry flags roost keeps).
                 [b'>', rest @ ..] => {
                     let flags =
-                        parse_num(rest).and_then(|v| u8::try_from(v).ok()).unwrap_or(0);
+                        parse_num(rest).and_then(|v| u8::try_from(v).ok()).unwrap_or(0) & SUPPORTED;
                     if self.stack.len() >= MAX_STACK {
                         // Overflow: evict the oldest, per the spec.
                         self.stack.remove(0);
@@ -359,14 +384,41 @@ mod tests {
         assert!(!k.disambiguate());
     }
 
+    /// P8: the reply is a **promise**, so it may only carry flags roost
+    /// keeps. A push of 7 asks for three things — disambiguate (1), event
+    /// types incl. release (2), alternate keys (4) — and roost implements
+    /// only the first. It used to echo `?7u` verbatim, and apps that took
+    /// the terminal at its word (fish 4, helix, kakoune) misparsed. The
+    /// push is masked on the way in, so the stack itself can never describe
+    /// behaviour that doesn't exist.
     #[test]
-    fn push_enables_disambiguate_and_query_reflects_it() {
+    fn a_push_is_masked_to_the_flags_roost_actually_implements() {
         let mut k = QueryResponder::new();
-        // pi pushes flags 7 (disambiguate | report-event-types | alternate-keys).
         assert!(feed(&mut k, b"\x1b[>7u").is_empty());
+        assert!(k.disambiguate(), "the bit roost does implement survives");
+        assert_eq!(feed(&mut k, b"\x1b[?u"), b"\x1b[?1u", "and only that bit is promised");
+
+        // A push of *only* unimplemented bits promises nothing at all —
+        // the app then keeps its legacy encodings, which roost does send
+        // correctly, instead of waiting for CSI-u that never comes.
+        let mut k = QueryResponder::new();
+        feed(&mut k, b"\x1b[>6u"); // event types | alternate keys
+        assert!(!k.disambiguate());
+        assert_eq!(feed(&mut k, b"\x1b[?u"), b"\x1b[?0u");
+    }
+
+    /// The mask must not leak across a pop: popping a masked push returns to
+    /// whatever the previous (also masked) entry promised.
+    #[test]
+    fn masking_survives_push_and_pop_nesting() {
+        let mut k = QueryResponder::new();
+        feed(&mut k, b"\x1b[>1u");
+        feed(&mut k, b"\x1b[>30u"); // every bit roost does NOT implement
+        assert!(!k.disambiguate());
+        assert_eq!(feed(&mut k, b"\x1b[?u"), b"\x1b[?0u");
+        feed(&mut k, b"\x1b[<u"); // pop back to the disambiguate push
         assert!(k.disambiguate());
-        // A subsequent query now reports the pushed flags.
-        assert_eq!(feed(&mut k, b"\x1b[?u"), b"\x1b[?7u");
+        assert_eq!(feed(&mut k, b"\x1b[?u"), b"\x1b[?1u");
     }
 
     #[test]
