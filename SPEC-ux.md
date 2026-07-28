@@ -397,17 +397,46 @@ No border drag-resize, no middle-click close, no drag-reorder.
 **Proposed contract:** drag a shared border to resize; middle-click closes a
 tab through the same confirm guard.
 
-### U22 · Low · OPEN (window mismatch FIXED, this branch) — busy-close confirm fires on heuristic Working; window mismatch
+### U22 · Low · FIXED (both halves) — busy-close confirm fires on heuristic Working; window mismatch
 Any PTY output in the last ~2 s counts as Working, so closing a shell right
 after your own `ls` double-prompts (the live QA script codes around this); the
 confirm stays armed 3 s but its flash dies at 2 s — a final second accepts the
 second press with no visible prompt.
 **Proposed contract:** confirm only on extension-confirmed Working (or exempt
 `shell`); flash window == confirm window for confirm flashes.
-**Fixed (window half only):** flashes now carry their own window — confirm
+**Fixed (window half):** flashes now carry their own window — confirm
 prompts live exactly `CONFIRM_WINDOW`, and a confirm that dies early (consumed
 second press, or disarmed by another action) takes its prompt down with it.
-The heuristic-Working half stays OPEN.
+
+**Fixed (heuristic half, 2026-07-28):** the close guard now asks
+`App::mid_turn` rather than `is_busy(status())`, and that predicate reads
+*how roost learned the status*. `PaneBackend::status_reported` splits the two
+sources the badge deliberately merges: an extension/hook saying "working"
+means a turn is in flight and always arms; `ACTIVE_WINDOW`'s two seconds of
+PTY bytes arms only for a **non-`shell`** adapter. Both halves of the
+proposed contract are in there and neither alone would have been right —
+"extension-confirmed only" would have dropped the guard for a pi/claude pane
+with no hook installed, which has a real turn to lose and for which output
+*is* the best available evidence; "exempt shell" alone would have ignored a
+hook that did report.
+
+*Recorded trade-off:* a shell running something long (`cargo build`) now
+closes on the first `Alt+w`. roost cannot tell that from `ls` — both are
+"recent output" — so the choice was between a guard that fires on every
+close and one that fires on none, and a guard that fires on ordinary use is
+one people learn to double-tap through. `Alt+u` reopens the pane.
+
+*Deliberately asymmetric:* the exemption stops at `Alt+w`. `Alt+q` still
+arms on any busy pane, shells included, because it kills the whole fleet
+with no undo, including panes you are not looking at — and U1's "sessions
+resume on relaunch" is an *agent* argument that a half-finished build does
+not get. One spurious keypress against the session's live work is not a
+close call.
+
+The QA drive used to code around this finding — a fallback second press
+labelled "heuristic Working from recent shell output". That workaround is
+now a check: `Alt+w` closes a shell on the first press *right after it
+printed*.
 
 ### U23 · Low · FIXED (this branch) — help overlay teaches chords, nothing else
 Live QA: the overlay contains no status-glyph legend (`●◆○·✕` — the product's

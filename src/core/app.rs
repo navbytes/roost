@@ -2874,6 +2874,45 @@ impl<B: PaneBackend> App<B> {
         Some(id)
     }
 
+    /// U12 × U22: is pane `id` **mid-turn** — the predicate the destructive
+    /// guards (`Alt+w`'s confirm, `Alt+q`'s) arm on?
+    ///
+    /// `Working || NeedsInput` is U12's answer and still is, but *how roost
+    /// learned it* now matters, because the two sources are not equally
+    /// strong:
+    ///
+    /// - **An extension/hook reported it** (`status_reported`) — a real turn
+    ///   is in flight, whatever the pane is running. Always guarded.
+    /// - **roost inferred it** from PTY traffic — `ACTIVE_WINDOW` (2s) of
+    ///   bytes. For an agent that is the best evidence available and roost
+    ///   guards on it: a pi/claude pane with no hook installed still deserves
+    ///   the confirm. For a **shell** it is not evidence of anything: the
+    ///   bytes are usually the echo of the command you just ran, so closing a
+    ///   shell within two seconds of your own `ls` armed a confirm and made
+    ///   you press `Alt+w` twice. That is U22's report, and it is why the
+    ///   guard cost more than it bought there.
+    ///
+    /// Recorded trade-off: a `shell` running something long (`cargo build`)
+    /// now closes on the first press. roost cannot tell that from `ls` —
+    /// both are "recent output" — so the choice is between a guard that
+    /// fires on every close and one that fires on none, and a guard that
+    /// fires constantly is one people learn to double-tap through. The
+    /// pane-level undo (`Alt+u`) reopens it, and the *last-pane* and quit
+    /// guards are untouched.
+    fn mid_turn(&self, id: PaneId) -> bool {
+        let Some(rt) = self.runtimes.get(&id) else { return false };
+        if !is_busy(rt.status()) {
+            return false;
+        }
+        rt.status_reported() || !self.is_shell(id)
+    }
+
+    /// Is pane `id` a plain shell rather than an agent? The `shell` adapter
+    /// is the one roost ships that has no turns to be mid-way through.
+    fn is_shell(&self, id: PaneId) -> bool {
+        self.find_spec(id).is_some_and(|s| s.adapter == "shell")
+    }
+
     fn close_pane(&mut self) {
         // C22 rule 4: Alt+w on the float kills it for real, no confirm
         // guard (scratch is not precious — the whole point of the confirm
@@ -2890,7 +2929,7 @@ impl<B: PaneBackend> App<B> {
         // second Alt+w within the window; a non-busy pane closes immediately
         // (undo covers an accidental one). Busy is `Working || NeedsInput`
         // (U12): an agent blocked on your approval is mid-turn all the same.
-        let is_busy = self.runtimes.get(&id).map(|rt| is_busy(rt.status())).unwrap_or(false);
+        let is_busy = self.mid_turn(id);
         let would_quit = self.ws.tabs.len() == 1 && self.ws.active_tab().panes.len() == 1;
         let armed = self.confirm_close.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
         if (is_busy || would_quit) && !armed {
@@ -2925,6 +2964,17 @@ impl<B: PaneBackend> App<B> {
     /// A quiet fleet still quits instantly: sessions resume on relaunch, so
     /// there's nothing in flight to protect.
     fn quit_guarded(&mut self) {
+        // U22's shell exemption is deliberately **not** applied here, and
+        // the asymmetry is the point. `Alt+w` closes one pane you are
+        // looking at, having just typed in it — the heuristic fires on your
+        // own echo, and `Alt+u` reopens what it closed. `Alt+q` kills the
+        // whole fleet, including panes you are not looking at and may have
+        // forgotten are running, and nothing reopens that. U1's "a quiet
+        // fleet quits instantly, sessions resume on relaunch" is an
+        // *agent* argument: pi and claude resume, a shell halfway through a
+        // build does not. So a busy shell is exactly the pane a quit should
+        // still ask about. One spurious keypress against the session's live
+        // work is not a close call.
         let busy = self.runtimes.values().filter(|rt| is_busy(rt.status())).count();
         let armed = self.confirm_quit.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
         if busy > 0 && !armed {
@@ -5055,7 +5105,10 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         let id = app.focused;
-        app.on_pty_output(id, b"x"); // FakePane: output ⇒ Working
+        // U22: a *reported* Working — the hook saying a turn is in flight,
+        // which is what the guard is for. (Heuristic output on a shell no
+        // longer arms it; that case has its own test below.)
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
         assert_eq!(app.runtimes.len(), 2);
         app.apply(Action::ClosePane); // armed, not closed
         assert_eq!(app.runtimes.len(), 2);
@@ -5078,6 +5131,76 @@ mod tests {
         assert_eq!(app.runtimes.len(), 1);
     }
 
+    /// U22: **a shell echoing your own command is not mid-turn.** Any PTY
+    /// output in the last two seconds reads as Working, so closing a shell
+    /// right after `ls` used to arm the confirm and cost a second `Alt+w` —
+    /// a guard that fires on ordinary use is one people learn to double-tap
+    /// through, which is exactly what it must not become.
+    #[test]
+    fn a_shell_with_only_heuristic_output_closes_on_the_first_press() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // FakePane: output ⇒ heuristic Working
+        assert_eq!(app.runtimes.get(&id).unwrap().status(), AgentStatus::Working);
+        assert!(!app.runtimes.get(&id).unwrap().status_reported(), "nothing reported it");
+        assert_eq!(app.runtimes.len(), 2);
+        app.apply(Action::ClosePane);
+        assert_eq!(app.runtimes.len(), 1, "closed on the first press");
+        assert_eq!(app.flash(), None, "and armed nothing");
+    }
+
+    /// …but the guard is kept everywhere it earns its keep. An **agent**
+    /// pane with the same heuristic evidence still arms — a pi/claude pane
+    /// with no hook installed has a real turn to lose, and PTY traffic is
+    /// the best evidence roost has for it.
+    #[test]
+    fn an_agent_pane_still_arms_on_heuristic_output_alone() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.spawn_child("pi", None, None).expect("a pi pane");
+        app.set_focus(id);
+        app.on_pty_output(id, b"x"); // heuristic Working, no extension report
+        assert!(!app.runtimes.get(&id).unwrap().status_reported());
+        let before = app.runtimes.len();
+        app.apply(Action::ClosePane);
+        assert_eq!(app.runtimes.len(), before, "armed, not closed");
+        assert!(app.flash().is_some_and(|m| m.contains("busy")), "{:?}", app.flash());
+        app.apply(Action::ClosePane);
+        assert_eq!(app.runtimes.len(), before - 1, "confirmed");
+    }
+
+    /// …and a *reported* Working arms whatever the adapter is: a hook saying
+    /// a turn is in flight outranks any guess about what the pane runs.
+    #[test]
+    fn a_reported_working_arms_even_on_a_shell() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
+        app.apply(Action::ClosePane);
+        assert_eq!(app.runtimes.len(), 2, "armed, not closed");
+    }
+
+    /// U22's shell exemption stops at `Alt+w`, and the asymmetry is the
+    /// point: `Alt+q` kills the whole fleet with no undo, including panes
+    /// you are not looking at. U1's "sessions resume on relaunch" is an
+    /// *agent* argument — a shell halfway through a build resumes nothing —
+    /// so a busy shell is exactly what a quit should still ask about.
+    #[test]
+    fn quit_still_arms_on_a_shell_that_is_merely_producing_output() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.on_pty_output(id, b"x"); // heuristic Working on a shell
+        // …which `Alt+w` would now close on the first press:
+        assert!(!app.mid_turn(id));
+        // …but `Alt+q` still arms, because it takes the fleet with it.
+        app.apply(Action::Quit);
+        assert!(!app.quit, "the quit armed instead");
+        assert_eq!(app.flash(), Some("1 agent busy — Alt+q again to quit"));
+        app.apply(Action::Quit);
+        assert!(app.quit);
+    }
+
     #[test]
     fn quit_with_a_quiet_fleet_is_instant() {
         // U1: the guard protects in-flight turns; a quiet fleet has none —
@@ -5092,7 +5215,7 @@ mod tests {
         // U1: closing one busy pane double-confirms, so killing the whole
         // fleet must too — first press arms + prompts, second quits.
         let (mut app, _) = mk_app(shell_ws());
-        app.on_pty_output(1, b"x"); // Working
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Working);
         app.apply(Action::Quit);
         assert!(!app.quit);
         assert_eq!(app.flash(), Some("1 agent busy — Alt+q again to quit"));
@@ -5106,7 +5229,7 @@ mod tests {
         // working one, and the prompt reports how much is at stake.
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
-        app.on_pty_output(1, b"x"); // Working
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Working);
         let id = app.focused;
         app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         app.apply(Action::Quit);
@@ -5119,7 +5242,7 @@ mod tests {
     #[test]
     fn another_action_disarms_the_quit_confirm_and_drops_its_prompt() {
         let (mut app, _) = mk_app(shell_ws());
-        app.on_pty_output(1, b"x"); // Working
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Working);
         app.apply(Action::Quit); // armed
         assert!(app.flash().is_some());
         app.apply(Action::ToggleHints); // any other action disarms...
@@ -5138,7 +5261,7 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         let id = app.focused;
-        app.on_pty_output(id, b"x"); // Working
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
         app.apply(Action::ClosePane); // close armed
         app.apply(Action::Quit); // must ARM the quit, not confirm-quit
         assert!(!app.quit);
@@ -5157,7 +5280,7 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         let id = app.focused;
-        app.on_pty_output(id, b"x"); // Working
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
         app.apply(Action::ClosePane); // armed
         assert_eq!(app.flash.as_ref().unwrap().2, CONFIRM_WINDOW);
         app.apply(Action::ClosePane); // confirmed ⇒ closed, prompt gone
@@ -9022,7 +9145,7 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         let id = app.focused;
-        app.on_pty_output(id, b"x"); // Working
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
         app.apply(Action::ClosePane); // armed
         assert_eq!(app.flash(), Some("shell · tmp busy — Alt+w again to close"));
     }

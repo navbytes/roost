@@ -699,17 +699,17 @@ fn ux_navigation_session() {
     std::thread::sleep(Duration::from_millis(2600)); // let it go quiet
     qa.obs("dead-pane 'f' (fresh, drops resume) acted immediately with no confirmation");
     // close + undo
+    // U22: this used to need a fallback second press — a shell that had
+    // printed anything in the last 2s read as "busy", so the drive coded
+    // around its own echo. One press is now the contract for a shell, and
+    // the drive checks that rather than accommodating it.
     let n = pane_count(&sd);
     h.write_bytes(&alt(b'w'));
     settle(&mut h);
-    let closed = n > 0 && pane_count(&sd) == n - 1;
-    if !closed {
-        // busy-confirm armed (recent output): second press
-        h.write_bytes(&alt(b'w'));
-        settle(&mut h);
-        qa.obs("Alt+w needed a second press (heuristic Working from recent shell output)");
-    }
-    qa.check(pane_count(&sd) == n - 1, "Alt+w closed the pane");
+    qa.check(
+        pane_count(&sd) == n - 1,
+        "U22: Alt+w closes a shell on the FIRST press, even right after it printed",
+    );
     h.write_bytes(&alt(b'u'));
     settle(&mut h);
     qa.check(pane_count(&sd) == n, "Alt+u restored the closed pane");

@@ -535,6 +535,10 @@ impl PaneBackend for PtyPane {
         self.status.current()
     }
 
+    fn status_reported(&self) -> bool {
+        self.status.reported()
+    }
+
     fn set_extension_status(&mut self, s: AgentStatus) {
         self.status.set_extension_status(s);
     }
