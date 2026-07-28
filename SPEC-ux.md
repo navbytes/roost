@@ -427,6 +427,20 @@ the longer rows can't clip mid-word). The legend's text is checked against
 the `theme::GLYPH_*` constants, so a retheme breaks a test rather than the
 lesson.
 
+**[Reopened and re-fixed 2026-07-28, C28 — the scroll option was taken after
+all.]** This finding's own proposal offered two ways out and the merge was
+chosen. Five more merges followed in eight days, and by C28 the next chord
+would have landed on a row already carrying two: the cap had stopped being a
+constraint and started being the thing shaping the artifact. So the cap is
+retired (C15's last amendment), the merges above are undone, the overlay is
+grouped and columned, and it scrolls only when it must. The objection
+recorded above is answered rather than overruled: **the carve-out from "any
+key closes it" is conditional on there being somewhere to scroll to**, so on
+a terminal showing the whole table `↓` closes the overlay exactly as it
+always did, and when it *is* scrolled the title and the hint bar both say
+so. The legend's `theme::GLYPH_*` check survives untouched — it moved into
+the overlay's `READING THE SCREEN` group.
+
 ### U24 · Low · FIXED (this branch) — wide-char blit is approximate
 `render.rs` self-documents approximate CJK/emoji handling (continuation cells
 overwritten with spaces); agent TUIs are emoji-heavy.

@@ -2074,6 +2074,11 @@ you.**
   `Alt+a / Alt+Shift+a` → `jump to next pane that needs you / list every
   pane` — the merge idiom the ≤20-row cap has always demanded, and here also
   the honest presentation of a deliberate pair.
+  **[Superseded 2026-07-28, C15's cap retirement]** the merge is undone:
+  `Alt+a` and `Alt+Shift+a` are two rows of the overlay's `FLEET` group,
+  which is where the pairing is now legible without cramming. The chords,
+  their meanings and this contract are unchanged — only the row packing was,
+  and it was only ever a consequence of the cap.
 
 **The C20 distinction (contracted, so the two never drift):**
 > **`Alt+e` answers "what happened"** — a time-ordered history of transitions,
@@ -2479,6 +2484,21 @@ legend, mouse verbs, `Alt+click`). Rows 5+6, 8+9 and 14+15 render merged
 (`Alt+s / Alt+o`, `Alt+z / Alt+f`, `Alt+w / Alt+u`) to pay for them within
 the ≤20 cap — the chords, their meanings and their contracts are unchanged;
 only the row packing is.]
+
+[Amended 2026-07-28, C15's cap retirement — **every merge recorded in the
+two amendments above is undone.** `Alt+c`/`Alt+PgUp`, `Alt+/`/`Alt+?`,
+`Alt+s`/`Alt+o`, `Alt+z`/`Alt+f`, `Alt+w`/`Alt+u` and `Alt+a`/`Alt+Shift+a`
+each get their own overlay row again, and the reference rows above become
+the overlay's own `READING THE SCREEN` group. The rows are also no longer
+rendered "verbatim and in order" from this table: they are grouped by what
+the chord acts on (C15's amendment names the groups). This table stays the
+canonical *list* — what is bound, and to what contract — and the check that
+the two agree is `every_bound_chord_is_documented_in_the_keymap`, which
+supersedes the retired `help_keys_fit_the_cap` /
+`help_keys_match_the_c8_key_table_verbatim_and_in_order` /
+`help_dialog_fits_the_eighty_column_floor` trio named in the older text
+(`one_help_column_fits_the_eighty_column_floor` carries the width rule
+forward).]
 
 [Amended 2026-07-27, SPEC-ux U16 — rename-dialog editing keys. The dialog
 is a text field, and inside it `Ctrl+U` (clear the line) and `Ctrl+W` (rub
