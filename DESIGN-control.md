@@ -149,8 +149,9 @@ protect.
    boundary. The boundary roost does enforce is **cross-UID** — 0600 inside an
    owner-verified 0700 dir stops other users, not other same-uid processes.
 3. **Capability is per-verb, not per-principal.** A "set my status" credential
-   must be structurally incapable of spawn/read/write/kill. Control verbs are
-   rejected from *any* principal presenting a pane token, even a valid one.
+   must be structurally incapable of spawn/read/write/kill. Pane tokens are
+   scoped to the pane's own subtree (see Open decisions §3 for the resolved
+   in-pane trust model).
 4. **Reports and commands do not share an authorization surface.**
 5. **Reads are scoped + consented.** Owner-created panes only; no in-pane read
    verb; no all-panes passive stream without explicit consent.
@@ -247,8 +248,8 @@ reflexively expose the whole `Action` enum.
 - **Phase 0 — core plumbing (no user-facing verbs yet).** Add the reply path
   (`AppEvent::Command{req, reply}`); pane-addressed ops (`send_input_to`, `spawn`
   returning id, `read_pane`, `close_pane_by_id`); CSPRNG control-token issuance to
-  `<state>/control.token` (0600); the capability check that rejects pane tokens
-  from control verbs. *This is the load-bearing refactor* (the focus-relative →
+  `<state>/control.token` (0600); pane-token scoping to the pane's own subtree
+  (resolved per Open decisions §3). *This is the load-bearing refactor* (the focus-relative →
   pane-addressed conversion the earlier code reviews already flagged).
 - **Phase 1 — MVP verbs + the CLI skin.** ✅ Done. The verbs over the socket
   (`list`/`status`/`spawn`/`fork`/`send`/`read`/`close`); `roost <verb>` one-shot
