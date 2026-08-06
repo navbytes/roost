@@ -178,11 +178,16 @@ fn merge_claude_hooks(settings_path: &Path, exe: &str) -> Option<String> {
     }
 
     // Snapshot the file exactly as the user left it, once, before roost ever
-    // writes to it — best effort, never blocks the install.
+    // writes to it — best effort, never blocks the install. The snapshot
+    // inherits the original's mode rather than the umask default: settings.json
+    // can carry an `env` block or `apiKeyHelper`, so a 0644 copy of a 0600 file
+    // would leak exactly what the original was locked down to protect.
     if let Some(raw) = &raw {
         let bak = settings_path.with_extension("json.bak");
-        if !bak.exists() {
-            let _ = std::fs::write(&bak, raw);
+        if !bak.exists() && std::fs::write(&bak, raw).is_ok() {
+            if let Ok(meta) = std::fs::metadata(settings_path) {
+                let _ = std::fs::set_permissions(&bak, meta.permissions());
+            }
         }
     }
 
@@ -607,6 +612,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&foreign_tmp).unwrap(), "mid-write-from-another-roost");
         // ...and nothing is left under the old, collision-prone `<path>.tmp` name.
         assert!(!dir.join("settings.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `.bak` is a verbatim copy of a file that can hold `env` secrets or
+    /// `apiKeyHelper`. Writing it at the umask default would publish exactly
+    /// what a 0600 settings.json was locked down to protect.
+    #[test]
+    fn the_backup_inherits_the_original_mode_rather_than_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("bak-mode");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"env\":{\"ANTHROPIC_API_KEY\":\"sk-secret\"}}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let msg = merge_claude_hooks(&path, "/opt/roost/roost").expect("should install");
+        assert!(msg.contains("installed"), "{msg}");
+
+        let bak = path.with_extension("json.bak");
+        assert!(bak.exists(), "no backup was written at {}", bak.display());
+        let mode = std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the backup published a locked-down file at the umask default");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
