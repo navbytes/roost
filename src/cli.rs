@@ -9,9 +9,15 @@
 //! in-pane agent's own pane token — authenticates it as its pane, scoped to
 //! its spawned subtree and audited as that pane), else `<state>/control.token`
 //! (the fleet token, for an external operator with no pane env).
+//!
+//! `__status` is a separate, undocumented internal verb (not in `VERBS`):
+//! the Claude Code hooks `infra::extension::ensure_claude_hooks` installs
+//! call back into this same binary instead of piping through `nc`/`socat` —
+//! see `run_status_hook` below.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 use crate::infra::sock::socket_path;
 use crate::infra::store::FsStore;
@@ -23,6 +29,9 @@ const VERBS: &[&str] = &["list", "status", "spawn", "fork", "send", "read", "clo
 pub fn maybe_run() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verb = args.first()?;
+    if verb == "__status" {
+        return Some(run_status_hook(&args[1..]));
+    }
     if verb == "--help" || verb == "-h" {
         eprintln!("{USAGE}");
         return Some(0);
@@ -31,6 +40,52 @@ pub fn maybe_run() -> Option<i32> {
         return None; // not a control verb → run the TUI
     }
     Some(run(&args))
+}
+
+/// `roost __status <working|waiting|needs_input>` — what the auto-installed
+/// Claude Code hooks run. Reads the pane's own `ROOST_PANE`/`ROOST_TOKEN`/
+/// `ROOST_SOCK` (set on every pane roost spawns, inherited by every
+/// descendant process) and reports status the same way the pi extension
+/// does, over the same socket, in the same one-way wire format `infra::sock`
+/// already parses — no `nc`/`socat` involved, so it works identically on
+/// macOS (whose system `/usr/bin/nc` lacks netcat-openbsd's `-q`) and Linux.
+///
+/// Not a public verb (kept out of `VERBS`/`USAGE`/`--help`): it's plumbing a
+/// hook config invokes, not something a human is meant to type. Matches the
+/// old hand-copied hooks' contract exactly: a no-op, not just non-fatal, the
+/// instant `$ROOST_PANE` is unset (i.e. outside roost), and never writes to
+/// stdout/stderr or returns nonzero — a broken or unreachable socket must
+/// never surface as hook noise or an error in the user's Claude Code session.
+fn run_status_hook(args: &[String]) -> i32 {
+    status_hook(
+        std::env::var("ROOST_PANE").ok(),
+        std::env::var("ROOST_TOKEN").unwrap_or_default(),
+        std::env::var_os("ROOST_SOCK").map(Into::into),
+        args.first().map(String::as_str),
+    )
+}
+
+/// The pure-ish core behind `run_status_hook`, taking its inputs as
+/// parameters instead of reading them from the environment — so tests can
+/// drive it against a real (but test-owned) socket without touching process
+/// env at all.
+fn status_hook(
+    pane: Option<String>,
+    token: String,
+    sock: Option<std::path::PathBuf>,
+    status: Option<&str>,
+) -> i32 {
+    let Some(pane) = pane.filter(|p| !p.is_empty()) else { return 0 };
+    let Some(status) = status else { return 0 };
+    let sock = sock.unwrap_or_else(socket_path);
+    let msg = serde_json::json!({
+        "pane": pane,
+        "token": token,
+        "event": "status",
+        "status": status,
+    });
+    let _ = write_line(&sock, &msg); // best-effort: a hook must never fail loudly
+    0
 }
 
 const USAGE: &str = "\
@@ -211,12 +266,23 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
-fn send_request(sock: &std::path::Path, req: &serde_json::Value) -> std::io::Result<serde_json::Value> {
+/// Connect to `sock` and write `msg` as one newline-terminated JSON line —
+/// the wire framing every message on this socket uses, control requests and
+/// one-way status/session reports alike (see `infra::sock`). Returns the
+/// connected stream so a caller that wants a reply (control verbs, via
+/// `send_request`) can keep reading it; a fire-and-forget caller (the
+/// `__status` hook, via `status_hook`) just drops it.
+fn write_line(sock: &Path, msg: &serde_json::Value) -> std::io::Result<UnixStream> {
     let mut stream = UnixStream::connect(sock)?;
-    let mut line = serde_json::to_string(req).unwrap_or_default();
+    let mut line = serde_json::to_string(msg).unwrap_or_default();
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
+    Ok(stream)
+}
+
+fn send_request(sock: &Path, req: &serde_json::Value) -> std::io::Result<serde_json::Value> {
+    let stream = write_line(sock, req)?;
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
     reader.read_line(&mut resp)?;
@@ -285,5 +351,61 @@ mod tests {
         // in by mistake — usage error, not a guess.
         let owned: Vec<String> = ["send", "--all", "3", "x"].iter().map(|s| s.to_string()).collect();
         assert!(build_request(&owned, "T".into()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod status_hook_tests {
+    use super::status_hook;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+
+    fn scratch_sock(name: &str) -> (PathBuf, UnixListener) {
+        let dir = std::env::temp_dir().join(format!("roost-status-hook-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        (path, listener)
+    }
+
+    #[test]
+    fn no_pane_or_no_status_is_a_true_noop() {
+        // "True" no-op, not just a swallowed connection error: if the guard
+        // didn't short-circuit before ever touching the socket, a listener
+        // sitting right there would still see the connection land.
+        let (sock, listener) = scratch_sock("noop");
+        listener.set_nonblocking(true).unwrap();
+
+        assert_eq!(status_hook(None, String::new(), Some(sock.clone()), Some("working")), 0);
+        assert_eq!(status_hook(Some(String::new()), String::new(), Some(sock.clone()), Some("working")), 0);
+        assert_eq!(status_hook(Some("3".into()), "t".into(), Some(sock.clone()), None), 0);
+
+        assert!(
+            listener.accept().is_err(),
+            "status_hook connected to the socket despite no pane/status"
+        );
+        let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+    }
+
+    #[test]
+    fn writes_exactly_the_status_line_the_socket_expects() {
+        let (sock, listener) = scratch_sock("wire");
+
+        let code = status_hook(Some("7".into()), "tok".into(), Some(sock.clone()), Some("needs_input"));
+        assert_eq!(code, 0);
+
+        let (stream, _) = listener.accept().expect("status_hook never connected");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read the status line");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("valid JSON");
+        assert_eq!(v["pane"], "7");
+        assert_eq!(v["token"], "tok");
+        assert_eq!(v["event"], "status");
+        assert_eq!(v["status"], "needs_input");
+
+        let _ = std::fs::remove_dir_all(sock.parent().unwrap());
     }
 }
