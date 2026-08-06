@@ -3,7 +3,9 @@
 //! an OSC 52 escape to the terminal. Whichever the environment supports
 //! lands the text; OSC 52 also covers SSH / tmux where no local helper runs.
 
+#[cfg(not(test))]
 use std::io::Write;
+#[cfg(not(test))]
 use std::process::{Command, Stdio};
 
 use crate::ports::ClipboardOutcome;
@@ -13,7 +15,31 @@ use crate::ports::ClipboardOutcome;
 /// copy — the emission is unchanged; what changed is that the results are
 /// no longer thrown away, so the hint bar can stop claiming a copy that
 /// never happened.
+///
+/// B2 (PR #46 code review): under `cargo test` this is the `#[cfg(test)]`
+/// twin below instead — `handle_mouse`/`handle_copy_mouse`'s test suites
+/// drive this function for real (that's the point: the gesture-matrix
+/// tests exercise the actual composition-root path), and doing so for
+/// real left a stray `pbcopy` write sitting in the *operator's own*
+/// system clipboard after every `cargo test` run (confirmed: `pbpaste`
+/// afterwards) and OSC 52 bytes leaking into captured stdout, which
+/// `--show-output` (CI's `ci.yml`) prints straight into the run's log.
+///
+/// **`#[cfg(test)]` only ever reaches this crate's own test binary.**
+/// `tests/*.rs` spawns the real `roost` binary (built *without*
+/// `cfg(test)`) through a PTY, and that process still carries this exact
+/// code path — a pre-existing gap, not something this contract's own new
+/// copy-on-release gestures introduced (`live_qa.rs` already documented
+/// "writes the macOS clipboard" as a known, opt-in-only cost; this is the
+/// same class of leak reaching a run that never opted in). `host_io_
+/// disabled` (`infra/mod.rs`) is the runtime half of the fix: the harness
+/// sets it on every spawned roost, so the real binary refuses both
+/// channels the same way the test-build stub below always has.
+#[cfg(not(test))]
 pub fn copy(text: &str) -> ClipboardOutcome {
+    if super::host_io_disabled() {
+        return ClipboardOutcome::Failed;
+    }
     let native = native_copy(text);
     let osc52 = emit_osc52(text);
     match (native, osc52) {
@@ -23,12 +49,30 @@ pub fn copy(text: &str) -> ClipboardOutcome {
     }
 }
 
+/// The test build's `copy`: touches neither the real system clipboard nor
+/// real stdout, and reports `Native` (so a test can pin the exact
+/// `copied N chars` flash text instead of whichever real channel happened
+/// to win on the machine running it) — unless the same runtime hatch the
+/// real `copy` above honors is set, in which case it reports `Failed` too.
+/// Sharing the check here as well is what makes it possible to unit-test
+/// at all (the real, `#[cfg(not(test))]` copy is by definition never
+/// compiled into a `cargo test` run): the two bodies differ, but both gate
+/// on the identical `host_io_disabled()` call.
+#[cfg(test)]
+pub fn copy(_text: &str) -> ClipboardOutcome {
+    if super::host_io_disabled() {
+        return ClipboardOutcome::Failed;
+    }
+    ClipboardOutcome::Native
+}
+
 /// Pipe `text` into the first clipboard helper that succeeds. Returns
 /// whether one actually took the text: spawning is not success — a helper
 /// can exist and still fail (no `$DISPLAY` for xclip, no compositor for
 /// wl-copy, a broken pipe), and the old "we spawned something" answer is
 /// exactly how an empty clipboard got reported as `copied N chars`. A
 /// helper that fails is skipped in favour of the next candidate.
+#[cfg(not(test))]
 fn native_copy(text: &str) -> bool {
     // (program, args) candidates in preference order.
     let candidates: &[(&str, &[&str])] = &[
@@ -62,6 +106,7 @@ fn native_copy(text: &str) -> bool {
 /// whether the bytes made it out of this process — that is the *most* this
 /// channel can ever know (there is no acknowledgement to wait for), which is
 /// why its flash says "(OSC 52)" rather than an unqualified "copied".
+#[cfg(not(test))]
 fn emit_osc52(text: &str) -> bool {
     let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
     let mut out = std::io::stdout();
@@ -89,7 +134,8 @@ pub fn base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::base64;
+    use super::{base64, copy};
+    use crate::ports::ClipboardOutcome;
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -98,5 +144,22 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"hello"), "aGVsbG8=");
+    }
+
+    /// B2 round 2 (PR #46 review): the runtime hatch the *real* binary
+    /// needs (this crate's own test build can't stand in for it — that's
+    /// the whole finding) is proven here instead, since `copy`'s
+    /// `#[cfg(test)]` twin shares the identical `host_io_disabled()` guard
+    /// as the `#[cfg(not(test))]` one. `remove_var` first/last: this is
+    /// process-global state, so the window it's set is kept as short as
+    /// the assertion needs.
+    #[test]
+    fn copy_no_ops_when_the_runtime_hatch_is_set() {
+        assert_eq!(copy("unaffected"), ClipboardOutcome::Native, "off by default");
+        std::env::set_var("ROOST_TEST_NO_HOST_IO", "1");
+        assert_eq!(copy("must not land anywhere"), ClipboardOutcome::Failed);
+        std::env::set_var("ROOST_TEST_NO_HOST_IO", "0"); // the live_qa.rs override form
+        assert_eq!(copy("0 means back on"), ClipboardOutcome::Native);
+        std::env::remove_var("ROOST_TEST_NO_HOST_IO");
     }
 }

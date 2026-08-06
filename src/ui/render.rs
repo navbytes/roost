@@ -774,7 +774,11 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "READING THE SCREEN",
         rows: &[
             ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
-            ("mouse", "wheel scrolls · click focuses · drag selects"),
+            // D2 (PR #46 design audit, C29 amendment): widened for native
+            // selection — a chord (Shift+click) gets a row here by C15's
+            // own stated rule ("Alt+click gets its own row because it is a
+            // chord"), applied to the mouse verb that is now also one.
+            ("mouse", "wheel scrolls · click focuses · drag/2x/3x/shift selects"),
             ("Alt+click / o", "open the URL under the pointer / copy cursor"),
         ],
     },
@@ -3186,6 +3190,12 @@ mod tests {
     /// U23: the overlay documents the mouse — the wheel, click-to-focus,
     /// drag-select and the Alt+click URL verb, which had lived only in the
     /// source until now.
+    ///
+    /// D2 (PR #46 design audit, C29 amendment): widened for double/triple-
+    /// click and shift-click-extend — `every_bound_chord_is_documented_in_
+    /// the_keymap` above only ever checked Alt chords, so it passed
+    /// vacuously over these three (none is a chord); this is the test that
+    /// actually has to know they exist.
     #[test]
     fn help_rows_document_every_mouse_verb() {
         let text = HELP_GROUPS
@@ -3194,7 +3204,7 @@ mod tests {
             .map(|(k, d)| format!("{k} {d}"))
             .collect::<Vec<_>>()
             .join("\n");
-        for token in ["mouse", "wheel", "click", "drag", "Alt+click", "URL"] {
+        for token in ["mouse", "wheel", "click", "drag", "2x", "3x", "shift", "Alt+click", "URL"] {
             assert!(text.contains(token), "the help overlay must mention {token:?}");
         }
     }
@@ -3394,6 +3404,19 @@ mod tests {
         app.on_pty_exit(focused);
         app.dead.insert(focused, "no such file or directory".into());
         out.push(("dead pane with a spawn error", snap(&mut app)));
+
+        // C17/C29 (PR #46 code review): a lit text selection. Copy mode's
+        // REVERSED highlight (C17) and native selection's identical one
+        // (C29) both paint through `highlight_selection`, but no fixture
+        // above ever set `app.selection` — the "copy mode" entry enters
+        // `Mode::Copy` without marking anything — so the §2 gates below
+        // never looked at a single reversed-selection cell. A multi-cell
+        // span, not a single cell, so the run isn't degenerate.
+        let mut app = three_panes();
+        let focused = app.focused;
+        app.begin_selection(focused, 0, 0);
+        app.extend_selection(0, 5);
+        out.push(("lit text selection", snap(&mut app)));
 
         out
     }
