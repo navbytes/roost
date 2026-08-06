@@ -25,10 +25,13 @@ use crate::infra::store::FsStore;
 const VERBS: &[&str] = &["list", "status", "spawn", "fork", "send", "read", "close", "wait"];
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
-/// code. Otherwise return None so `main` launches the TUI.
+/// code. Otherwise return None so `main` launches the TUI. Only a genuinely
+/// empty argument list returns None, though — an unrecognized argument is a
+/// hard error (below), not a fallthrough: a script or an LLM probing the
+/// binary needs an answer it can act on, not a seized terminal.
 pub fn maybe_run() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let verb = args.first()?;
+    let verb = args.first()?; // no args → launch the TUI
     if verb == "__status" {
         return Some(run_status_hook(&args[1..]));
     }
@@ -36,8 +39,16 @@ pub fn maybe_run() -> Option<i32> {
         eprintln!("{USAGE}");
         return Some(0);
     }
+    if verb == "--version" || verb == "-V" {
+        println!("roost {}", env!("CARGO_PKG_VERSION"));
+        return Some(0);
+    }
     if !VERBS.contains(&verb.as_str()) {
-        return None; // not a control verb → run the TUI
+        // Same convention as a bad flag inside a known verb: hard error,
+        // instead of falling through to the TUI (which used to seize the
+        // terminal on a typo, or panic off one).
+        eprintln!("roost: unrecognized argument: {verb}\n\n{USAGE}");
+        return Some(2);
     }
     Some(run(&args))
 }
@@ -99,6 +110,7 @@ roost — control a running instance:
   roost read PANE [--tail N | --full]
   roost close PANE [--force]
   roost wait PANE... [--until STATUS] [--timeout SEC]
+  roost --version | -V
 (run `roost` with no args to launch the multiplexer)";
 
 fn run(args: &[String]) -> i32 {
