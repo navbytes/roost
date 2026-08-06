@@ -3671,15 +3671,22 @@ mod tests {
         assert!(drawn.contains("/tmp"), "the recent-cwd column:\n{drawn}");
         assert!(drawn.contains(theme::PICKER_SELECTED), "the adapter column has the marker");
 
-        // Type-ahead: the title carries the query and the rows narrow.
-        app.handle_mode_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
+        // Type-ahead: the title carries the query and the rows narrow. Two
+        // characters, not one: a bare `p` also matches `opencode`, so it no
+        // longer isolates a single row — and the point here is that the
+        // filter narrows to exactly one, not that any particular adapter
+        // happens to be alone under a one-letter query.
+        for c in ['p', 'i'] {
+            app.handle_mode_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
         let drawn = rows(&mut app).join("\n");
-        assert!(drawn.contains(&format!("p{}", theme::RENAME_CURSOR)), "the live query:\n{drawn}");
-        assert!(drawn.contains("1 pi"), "`p` keeps pi:\n{drawn}");
+        assert!(drawn.contains(&format!("pi{}", theme::RENAME_CURSOR)), "the live query:\n{drawn}");
+        assert!(drawn.contains("1 pi"), "`pi` keeps pi:\n{drawn}");
         assert!(!drawn.contains("claude"), "and drops the rest:\n{drawn}");
+        assert!(!drawn.contains("opencode"), "including the other `p` match:\n{drawn}");
         assert!(!drawn.contains(" 2 "), "no second row survives the filter:\n{drawn}");
         assert!(matches!(app.mode, Mode::Picker { .. }));
     }
