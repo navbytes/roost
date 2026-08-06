@@ -106,7 +106,13 @@ fn live_qa_evidence() {
     let _ = std::fs::create_dir_all(&cwd);
     let cwd = cwd.to_string_lossy().to_string();
 
-    let mut h = match Harness::try_spawn(&fixture(&cwd)) {
+    // This drive is the one scenario that means to reach the real
+    // clipboard (its own #[ignore] reason says so) — override the
+    // harness's default `ROOST_TEST_NO_HOST_IO=1` back off (B2 round 2,
+    // PR #46 review) so pbcopy/OSC 52 fire for real, as evidence-gathering
+    // requires.
+    let mut h = match Harness::try_spawn_with_env(&fixture(&cwd), &[("ROOST_TEST_NO_HOST_IO", "0")])
+    {
         Ok(h) => h,
         Err(why) => {
             eprintln!("SKIP: {why}");

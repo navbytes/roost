@@ -7,9 +7,18 @@ use std::process::{Command, Stdio};
 /// test driving `handle_mouse`'s Alt+click-URL path for real (see
 /// `main.rs`'s `alt_click_opening_a_url_clears_a_different_panes_selection`)
 /// would otherwise spawn the operator's actual browser on every
-/// `cargo test` run. `#[cfg(test)]` swaps in a no-op.
+/// `cargo test` run. `#[cfg(test)]` swaps in a no-op — and, same as
+/// `clipboard::copy`, `#[cfg(test)]` only reaches *this crate's own* test
+/// binary. `tests/*.rs` spawns the real, non-test `roost` binary through a
+/// PTY, which still carries the live `Command::new("open"/"xdg-open")`
+/// path below; `host_io_disabled` (`infra/mod.rs`) is what actually closes
+/// that door, honored by both bodies here so the real one is proven by the
+/// same check the test one is.
 #[cfg(not(test))]
 pub fn open_url(url: &str) {
+    if super::host_io_disabled() {
+        return;
+    }
     // `open` on macOS, `xdg-open` on Linux. Detach stdio so it can't disturb
     // the TUI, and reap in a thread so we don't leak a zombie.
     let prog = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };

@@ -100,6 +100,15 @@ impl Harness {
         // does, and says why.
         // Never let a test run mutate the developer's real ~/.pi extension.
         cmd.env("ROOST_NO_EXT_INSTALL", "1");
+        // B2 round 2 (PR #46 review): never let a test run touch the
+        // developer's real system clipboard or open their real browser —
+        // `#[cfg(test)]` inside src/infra/{clipboard,open}.rs only covers
+        // this crate's own unit tests; the binary spawned right below is
+        // built without it, so this is the runtime half of that same
+        // fix. A scenario that genuinely needs the real channel (only
+        // `live_qa.rs`'s ignored evidence drive, so far) overrides this
+        // back to "0" via `envs` below, which runs after this default.
+        cmd.env("ROOST_TEST_NO_HOST_IO", "1");
         // Scenario-specific extras last, so a scenario can override any of
         // the defaults above.
         for (k, v) in envs {
