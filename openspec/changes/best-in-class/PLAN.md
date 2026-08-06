@@ -217,10 +217,16 @@ requirement.
 
 ## Phase 3 — Fleet & robustness UX (promoted deferred items)
 
-- ☐ **Attention works on default setup** (the #1 switch bet): auto-install
-  Claude Code hooks the way pi's extension is auto-installed + let the
-  Alt+a ring fall through to Waiting-after-Working when no ◆ exists
-  (status.rs:176–187). [ux P1-5, promoted]
+- ◐ **Attention works on default setup** (the #1 switch bet). **(PR #45)**
+  Claude Code hooks now auto-install, mirroring pi's contract. Found on the
+  way: the *documented* hooks never worked on macOS — they piped through
+  `nc -U -q0` and BSD netcat has no `-q` — so the netcat dependency is gone
+  entirely, replaced by an internal `roost __status` verb. Two write-path
+  leaks were caught in review and verification: `fs::rename` replaced a
+  **symlinked** settings.json (this machine's is a dotfiles symlink), and
+  the `.bak` published a 0600 file at 0644.
+  **Still open:** let the Alt+a ring fall through to Waiting-after-Working
+  when no ◆ exists (status.rs:176–187) — the other half of P1-5.
 - ☐ **Relay the BEL** — heuristic ◆ transitions never reach the host bell;
   README's "rings the bell" is false in the exact fallback case it serves
   (ports.rs:59–62, main.rs:366,385). [ux P1-6]
