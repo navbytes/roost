@@ -227,14 +227,24 @@ fn scrub_host_identity(cmd: &mut CommandBuilder) {
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 }
 
-/// L3: every var `cli.rs` (`resolve_token`/`socket_path`) would accept as
-/// targeting or a credential for *this* roost — ROOST_SOCK (targeting) and
-/// both credential tiers, `ROOST_CONTROL_TOKEN` (checked *first*, and it's
-/// the fleet-wide one: unscoped, unlike a pane's own `ROOST_TOKEN`) and
-/// `ROOST_TOKEN` itself. The rest of roost's ROOST_* vars (`ROOST_STATE`,
-/// `ROOST_NO_EXT_INSTALL`, `ROOST_SYNC_CAP_MS`, `ROOST_DEBUG`) are config,
-/// not authority — none of them alone lets a pane act as Fleet or as
-/// another pane, so they're left alone same as `ROOST_PANE`.
+/// L3: the vars that hand a child a *ready-made* credential for this roost —
+/// ROOST_SOCK (targeting) and both credential tiers, `ROOST_CONTROL_TOKEN`
+/// (checked *first* by `resolve_token`, and it's the fleet-wide one:
+/// unscoped, unlike a pane's own `ROOST_TOKEN`) and `ROOST_TOKEN` itself.
+///
+/// `ROOST_STATE` is deliberately **not** here, and the distinction is not
+/// "config vs authority" — it is targeting too: `socket_path` reads it first
+/// (`sock.rs`), and `resolve_token`'s file fallback resolves through it to
+/// `$ROOST_STATE/control.token` (`store.rs`). It is left alone because
+/// scrubbing it would obscure a path, not remove a capability: under this
+/// threat model the pane is same-uid and can compute the default state dir
+/// itself, so a token it could already read is not protected by hiding the
+/// variable that names it. The genuinely inert ones — `ROOST_NO_EXT_INSTALL`,
+/// `ROOST_SYNC_CAP_MS`, `ROOST_DEBUG`, `ROOST_PANE` — are left alone because
+/// they carry no authority at all.
+///
+/// Keep that split honest when `resolve_token` changes: anything that becomes
+/// a *carried* credential belongs in this list.
 const CONTROL_ENV_VARS: &[&str] = &["ROOST_SOCK", "ROOST_CONTROL_TOKEN", "ROOST_TOKEN"];
 
 /// L3: drop roost's own control-plane credentials from the base env a pane
