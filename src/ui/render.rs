@@ -22,6 +22,10 @@ use crate::ui::theme;
 pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     let area = f.area();
     if area.height < 2 {
+        // ux P3-16: below the tab-bar-plus-one-body-row floor there is no
+        // room for real chrome — this used to `return` here and leave the
+        // screen blank, with nothing telling the user why.
+        draw_too_small(f, area);
         return;
     }
     let tab_bar = Rect::new(area.x, area.y, area.width, 1);
@@ -73,6 +77,22 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // of the whole screen, so it's visually obvious which pane they affect.
     let anchor = rects.iter().find(|pr| pr.id == app.focused).map(|pr| pr.rect).unwrap_or(body);
     draw_mode_overlay(f, app, body, anchor, pulse);
+}
+
+/// ux P3-16: what `draw` shows instead of nothing when the terminal is
+/// shorter than the tab-bar-plus-one-body-row floor (`area.height < 2`) —
+/// there's no room left for real chrome, but a blank screen with no
+/// explanation is worse than one plain line. At zero rows there is no cell
+/// to draw into, so the only safe move is to draw nothing; at exactly one
+/// row, that row is spent on the notice. `Paragraph` clips without
+/// wrapping — the same idiom `draw_hint_bar` leans on — so the message
+/// degrades character by character as the terminal narrows, down to 1×1,
+/// with no manual width arithmetic of its own to get wrong.
+fn draw_too_small(f: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    f.render_widget(Paragraph::new("too small — resize").style(theme::ink()), area);
 }
 
 /// C9: Normal-mode hint pairs — exactly these seven; bindings the old
@@ -3892,6 +3912,49 @@ mod tests {
         let backend = TestBackend::new(36, 10);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| super::draw(f, &mut app)).unwrap();
+    }
+
+    /// ux P3-16: below the tab-bar-plus-one-body-row floor, `draw` used to
+    /// `return` with nothing drawn — an empty screen with no explanation.
+    /// `draw_too_small` is what it shows instead; pinned directly (no
+    /// `App` needed — it only ever takes a `Rect`) at 1×1, the tightest
+    /// non-zero case the reviewer's stress pass exercised, and at two
+    /// shapes either side of it so the notice is proven to degrade with
+    /// the terminal rather than just surviving one magic size.
+    #[test]
+    fn too_small_notice_is_never_blank_and_never_panics() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for (w, h) in [(1u16, 1u16), (1, 20), (2, 10)] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| super::draw_too_small(f, Rect::new(0, 0, w, h))).unwrap();
+            let buf = term.backend().buffer().clone();
+            let area = *buf.area();
+            let non_blank = (area.y..area.y + area.height).any(|y| {
+                (area.x..area.x + area.width).any(|x| buf.cell((x, y)).unwrap().symbol() != " ")
+            });
+            assert!(non_blank, "{w}x{h}: the too-small notice drew an entirely blank screen");
+        }
+    }
+
+    /// The same guarantee through the real entry point: `draw` must reach
+    /// `draw_too_small` at the exact boundary it bails at (`height < 2`,
+    /// i.e. zero rows and one row) without panicking, at a realistic
+    /// width — the case a resize event can actually hand it.
+    #[test]
+    fn draw_does_not_panic_below_the_two_row_floor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        for size in [Size::new(80, 0), Size::new(80, 1)] {
+            let mut app = mk_app(size);
+            let backend = TestBackend::new(size.width, size.height);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| super::draw(f, &mut app)).unwrap();
+        }
     }
 
     /// Blit a parsed screen into a buffer of the same size and read the row
