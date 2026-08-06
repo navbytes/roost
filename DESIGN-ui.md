@@ -2392,6 +2392,24 @@ the two share machinery it is called out below rather than duplicated —
   struct and the one `app.selection` field C24 already had — the brief's
   instruction to reuse the existing REVERSED treatment and the U14 outcome
   path is implemented as *the same code path*, not a parallel one.
+- **Contracted: tracks grid coordinates, not content** (raised in the PR #46
+  review — settled here rather than left undefined). `Selection` is
+  `(pane, anchor, cursor)` in inner-cell space; it does not snapshot what
+  is under those cells at press time. If the pane's program prints new
+  output while a drag is in progress (or between release and the next
+  interaction, since the highlight stays lit), the reversed region and
+  whatever `grab_text` later extracts follow the *screen positions*, not
+  the characters that were there when the gesture started — a fast-moving
+  pane can highlight, and copy, text that scrolled into those cells after
+  the drag began. **This is deliberate, not a gap**: it is the same
+  behavior every terminal emulator's own native selection has (none of
+  them diff the grid either — a selection is coordinates over a mutable
+  surface in every one of them), C17's copy-mode selection already works
+  this way and always has, and coordinate-tracking is what makes
+  `highlight_selection`/`grab_text` shareable between the two gestures at
+  all. A content-tracking alternative would need the selection to pin a
+  *snapshot* of the grid rather than read the live one, which nothing else
+  in roost's selection model does and no part of this brief asked for.
 - **Mouse-capture cost.** The pre-existing blanket `EnableMouseCapture`
   requested five DEC private modes; roost now asks for exactly the three it
   uses — `mouse::MOUSE_CAPTURE_ENABLE`/`_DISABLE` (`mouse.rs:49–55`) drop
