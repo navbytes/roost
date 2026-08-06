@@ -37,7 +37,47 @@ roost tells it [ux, handoffs/ux-audit.md]:
 - ☐ **Unknown flags silently dropped; no `--` separator** — `send 5 hi
   --entr` sends without Enter and replies ok; `send 5 "--- x ---"` sends
   empty. Reject unknown flags, add `--` (cli.rs:186–204). [ux P1-9]
-- *Reviewer + security-auditor findings pending.*
+
+Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
+[sec, handoffs/security-audit.md]:
+
+- ☐ **H1 (High): pane cwd/title escapes into the operator's real terminal.**
+  `sync_host_title` (app.rs:1934–1936) writes `ESC]2;` + label + BEL straight
+  to stdout, bypassing ratatui's control-char filter; the label is
+  `spec.title` or `cwd.file_name()` **verbatim**. An in-pane agent mkdirs a
+  directory whose name carries OSC 52 and spawns there → clipboard poisoning
+  / title spoof on the human's terminal. Fix: `sanitize_title` at that
+  boundary. [sec H1]
+- ☐ **M1: the "private" scratch float is readable/writable over the control
+  plane.** `ctl_close`/`ctl_broadcast` exclude the float; `ctl_read`/
+  `ctl_send` don't (app.rs:1643, 1716, 1114). Any token-reading agent can
+  `roost read` the human's private scratch shell. Fix: same `is_float`
+  refusal. Also README:311 wrongly claims broadcast reaches the float. [sec M1]
+- ☐ **M3: no per-principal connection/rate cap** — one pane opens all 64
+  conns (or 16 waits) and locks out the human + the real orchestrator; it is
+  also the enabler for M2's audit-log rolling. Per-token conn cap (~8) +
+  token bucket on resolved Actor (sock.rs:148, app.rs:224). [sec M3,
+  supersedes the roadmap "choice" entry]
+- ☐ **L2: control-token file mode not reset on reuse** — `.mode(0o600)`
+  applies at creation only; a crash-left token keeps its old mode
+  (main.rs:448). [sec L2]
+- ☐ **L3: pane token/socket env leak when the listener fails to bind** —
+  panes then inherit roost's own env, so a nested roost hands children the
+  *outer* live token (main.rs:238, app.rs:4498). `env_remove`
+  unconditionally. [sec L3]
+- ☐ **M2: audit log is not tamper-evident** against a same-uid pane
+  (truncate, or flood to force double rotation). Fix M3 first, then either
+  an out-of-process sink (`ROOST_AUDIT_FD`/syslog) or — minimum — document
+  the log as advisory against same-uid. [sec M2]
+- ☐ **Info-c: DESIGN-control.md §5.3 + §8 checklist are stale** — they claim
+  control verbs are rejected from pane tokens; code accepts them
+  (app.rs:1243), superseded by §Open-decisions-3. Doc fix. [sec Info]
+- ☐ notify.rs:17 AppleScript interpolation is quoting-by-luck (no break-out
+  found); pass the body as an `on run {b}` argument. [sec Info-b]
+- ☐ L1: control spawn splits the *human's* active tab rather than the
+  caller's context (app.rs:2884) — layout churn under the human's hands.
+  [sec L1, phase 3 candidate]
+- *Reviewer findings pending.*
 
 ## Phase 2 — UX quick wins
 
