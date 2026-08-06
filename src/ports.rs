@@ -435,7 +435,8 @@ pub mod fakes {
         }
         fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
             if !self.rows.is_empty() && start.0 == end.0 {
-                return self.rows.get(start.0 as usize).cloned().unwrap_or_default();
+                let row = self.rows.get(start.0 as usize).cloned().unwrap_or_default();
+                return slice_cells(&row, start.1 as usize, end.1 as usize);
             }
             self.grab.clone()
         }
@@ -445,6 +446,30 @@ pub mod fakes {
         fn row_wrapped(&self, row: u16) -> bool {
             self.wrapped.get(row as usize).copied().unwrap_or(false)
         }
+    }
+
+    /// B1 (PR #46 code review): a test-only mirror of the real backend's
+    /// cell-indexed extraction (`pty::extract_selection`, P15) — slice
+    /// `line` by grid CELL columns `[c0, c1]` inclusive, wide glyphs
+    /// counting for their real width rather than one slot per char. Before
+    /// this, `grab_text` ignored columns entirely (returned the whole
+    /// row), so no fake-backed test could ever fail on the app-side bug
+    /// this same review found (cell columns handed to a char-indexed
+    /// lookup): the row was always right regardless of the range asked
+    /// for. `c0`/`c1` swap if given in reverse (`Selection`'s anchor/
+    /// cursor aren't pre-ordered).
+    fn slice_cells(line: &str, c0: usize, c1: usize) -> String {
+        use unicode_width::UnicodeWidthChar;
+        let (c0, c1) = if c0 <= c1 { (c0, c1) } else { (c1, c0) };
+        let mut cell = 0usize;
+        line.chars()
+            .filter(|c| {
+                let w = c.width().unwrap_or(1).max(1);
+                let hit = cell + w > c0 && cell <= c1;
+                cell += w;
+                hit
+            })
+            .collect()
     }
 
     /// Shared in-memory store; clone to keep a handle for assertions.
