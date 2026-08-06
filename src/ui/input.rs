@@ -108,7 +108,13 @@ pub fn translate(key: KeyEvent) -> InputResult {
             KeyCode::Char('p') if shift => Some(Action::ToggleRaw),
             KeyCode::Char('P') => Some(Action::ToggleRaw),
             KeyCode::Enter => Some(Action::QuickLaunch),
-            KeyCode::Char('/') => Some(Action::ToggleHints),
+            // `?` *is* Shift+`/`, and terminals disagree about which half of
+            // that they report: some deliver `Char('?')` with the shift
+            // already applied, others deliver `Char('/')` and leave SHIFT in
+            // the modifiers. Matching only the first meant Alt+? silently
+            // toggled the hint bar on the second kind — reported on macOS.
+            // Same shape as the Alt+Shift+r / Alt+R tolerance above.
+            KeyCode::Char('/') => Some(if shift { Action::Help } else { Action::ToggleHints }),
             KeyCode::Char('c') => Some(Action::CopyMode),
             KeyCode::Char('u') => Some(Action::Undo),
             KeyCode::Char('?') => Some(Action::Help),
@@ -996,6 +1002,9 @@ mod tests {
             (alt(KeyCode::Char('c')), Action::CopyMode),
             (alt(KeyCode::Char('u')), Action::Undo),
             (alt(KeyCode::Char('?')), Action::Help),
+            // The other half of the same physical chord: a terminal that
+            // reports Alt+? as `/`+SHIFT must reach Help, not the hint bar.
+            (alt_shift(KeyCode::Char('/')), Action::Help),
             (alt(KeyCode::Char('a')), Action::JumpAttention),
             (alt(KeyCode::Char('z')), Action::ToggleZoom),
             (alt(KeyCode::Char('g')), Action::CycleLayout),

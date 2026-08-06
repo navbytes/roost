@@ -2902,6 +2902,17 @@ shows only the C9-curated subsets.
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
 | 20 | `Alt+?` | full keymap overlay (this table) | C15 |
+
+*Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
+terminals disagree about which half of that they report: some deliver
+`Char('?')` with the shift folded in, others deliver `Char('/')` and leave
+SHIFT in the modifiers. Row 20 is accepted **either way** — `Char('/')`
+dispatches on shift, so `Alt+Shift+/` reaches the overlay and unshifted
+`Alt+/` still reaches row 19. Same class of tolerance as C23's
+Alt+`'P'`, C27's and C28's uppercase forms, and stated here for the same
+reason: one physical chord, two spellings on the wire. Reported from real
+use on macOS, where the unshifted arm was claiming the event first and row
+20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
 
 [Amended 2026-07-22, supervisor SPEC-GAP: row 20 `Alt+?` was bound in
