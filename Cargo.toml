@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, ...). No daemon: layouts and session IDs persist; processes are disposable."
 license = "MIT"
+repository = "https://github.com/navbytes/roost"
+keywords = ["terminal", "multiplexer", "tmux", "pty", "tui"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
@@ -29,3 +32,13 @@ vt100 = { path = "vendor/vt100" }
 [profile.release]
 lto = true
 strip = true
+
+# Lets `cargo binstall roost` resolve prebuilt binaries from GitHub Releases
+# instead of compiling from source, once a release exists. Matches the
+# tarball layout .github/workflows/release.yml produces: a
+# roost-<version>-<target>.tar.gz whose top-level dir is that same name.
+# Conventions per https://github.com/cargo-bins/cargo-binstall SUPPORT.md.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"

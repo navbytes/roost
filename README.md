@@ -36,7 +36,14 @@ cargo build --release
 ./target/release/roost
 ```
 
-Or install it onto your `$PATH` with `cargo install --path .` (then just run `roost`), or skip the build step with `cargo run`.
+Or skip the build step with `cargo run`.
+
+### Install
+
+- **Prebuilt binaries** from [GitHub Releases](https://github.com/navbytes/roost/releases) — coming with the first tagged release, not published yet.
+- **`cargo binstall roost`** — once a release exists, fetches the prebuilt binary for your platform instead of compiling.
+- **`cargo install --path .`** — clone and build locally onto your `$PATH`. Works today.
+- **Homebrew tap** (`navbytes/homebrew-roost`) — planned, not live yet.
 
 Only one roost runs per workspace at a time — a second instance on the same
 state dir refuses to start (they'd race and corrupt `workspace.json`). Run an
