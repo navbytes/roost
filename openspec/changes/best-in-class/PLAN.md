@@ -21,6 +21,41 @@ Status legend: ☐ open · 🔨 in progress · ✅ shipped (PR#) · ❌ descoped
 
 ## Phase 1 — Correctness & security (P0/P1 from audits)
 
+**P0 — the control plane wedges permanently** [rev, handoffs/code-review.md]:
+
+- ☐ **Malformed control request gets NO reply; client hangs forever.**
+  `parse_control` (control.rs:110–114) returns None on any deser failure,
+  falls through `parse_line` into `log_dropped`, writes nothing back;
+  `cli.rs:222` read_line has no timeout. Reproduced: missing token, unknown
+  method, missing text, bad pane type — all hang. 64 of them (MAX_CONN) park
+  64 threads forever and the next legit client is shed with BrokenPipe →
+  control plane dead until restart. An agent retrying a typo'd verb reaches
+  64 in seconds. Fix: reply `{"err":…}` whenever a line has a `method` key
+  but fails to deserialize; add `set_read_timeout(30s)`; log the shed
+  (sock.rs:148–149, 176–202). [rev P0]
+- ☐ **A terminal resize can kill the entire fleet.** ratatui-core 0.1.2
+  changed `Terminal::clear()` to query the cursor (`ESC[6n`, blocks up to
+  2 s); arrived via patch bump under the `ratatui = "0.30"` pin. On a host
+  that doesn't answer DSR (nested muxes, some CI/serial terminals, dropped
+  ssh mid-resize) `terminal.clear()?` at main.rs:346 returns Err → `run()`
+  Err → `shutdown()` SIGKILLs every pane. Reproduced. Fix: don't propagate a
+  cosmetic clear; count consecutive draw/size failures and bail only after
+  N. [rev P1-1, treated as P0 — it destroys user work]
+- ☐ **Socket listener failure silently swallowed** (main.rs:238 `.ok()`) —
+  roost looks normal with no control plane at all: no $ROOST_SOCK in panes,
+  extension/hooks never report status, no audit log, every `roost <verb>`
+  fails. Hit accidentally with a 112-char state dir (macOS sun_path limit
+  104). Fix: flash the error; keep the `dir_is_private_and_ours` security
+  refusal fatal. [rev P1-2]
+- ☐ OSC 52 clipboard relay is size-capped but not **rate**-capped
+  (pty.rs:342–348) — one shell loop relayed 5000 sequences / 129 KB to the
+  operator's real clipboard. Give it the per-pane interval gate OSC 9
+  already has (pty.rs:365). [rev P2-3]
+- ☐ P3 hardening trio: `workspace.rs:68,72` `len()-1` underflow class (pub
+  `active_tab()`, ~40 callers) → `.get().or(first())`; `main.rs:188` panic
+  hook restores the terminal from *any* thread while main keeps drawing;
+  `pty.rs:595` `kill(-pid)` needs `if pid > 1`. [rev P3-4/5/6]
+
 Control-CLI contract fixes — an orchestrator must be able to trust what
 roost tells it [ux, handoffs/ux-audit.md]:
 
@@ -77,7 +112,7 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
 - ☐ L1: control spawn splits the *human's* active tab rather than the
   caller's context (app.rs:2884) — layout churn under the human's hands.
   [sec L1, phase 3 candidate]
-- *Reviewer findings pending.*
+- L1: see Phase 3.
 
 ## Phase 2 — UX quick wins
 
