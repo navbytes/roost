@@ -50,6 +50,16 @@ pub fn maybe_run() -> Option<i32> {
         eprintln!("roost: unrecognized argument: {verb}\n\n{USAGE}");
         return Some(2);
     }
+    // A verb's own `--help`/`-h`, honored before the verb ever runs for real
+    // — but only ahead of a literal `--` (send/spawn's end-of-options
+    // marker), so `send PANE -- --help` still sends that text as data
+    // instead of showing help.
+    let rest = &args[1..];
+    let end = rest.iter().position(|a| a == "--").unwrap_or(rest.len());
+    if rest[..end].iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", verb_help(verb));
+        return Some(0);
+    }
     Some(run(&args))
 }
 
@@ -110,10 +120,30 @@ roost — control a running instance:
   roost read PANE [--tail N | --full]
   roost close PANE [--force]
   roost wait PANE... [--until STATUS] [--timeout SEC]
+  roost VERB --help              (a verb's own usage)
   roost --help | -h
   roost --version | -V
 (run `roost` with no args to launch the multiplexer)
 Exit codes: 0 ok / 1 runtime error / 2 usage error / 3 `wait` timed out.";
+
+/// `roost VERB --help` / `-h` — this verb's own usage, checked (in
+/// `maybe_run`) before the verb is ever allowed to run for real, so a help
+/// request can't fall through into executing it (the `list --help` bug this
+/// closes: it used to return live pane JSON, exit 0). `verb` is always one
+/// of `VERBS` here — every caller checks membership first.
+fn verb_help(verb: &str) -> &'static str {
+    match verb {
+        "list" => "roost list\nList every pane: id, adapter, cwd, status, …",
+        "status" => "roost status [PANE]\nOne pane's status, or every pane's if PANE is omitted.",
+        "spawn" => "roost spawn ADAPTER [--cwd DIR] [--input TEXT]\nLaunch a new pane running ADAPTER.",
+        "fork" => "roost fork [PANE]\nA sibling pane in the same context; the focused pane's if PANE is omitted.",
+        "send" => "roost send PANE TEXT... [--enter]\nroost send --all TEXT... [--enter]\nType TEXT into PANE (or, with --all, every reachable pane). --enter also submits it.",
+        "read" => "roost read PANE [--tail N | --full]\nA pane's current screen (default), its last N lines, or its full scrollback.",
+        "close" => "roost close PANE [--force]\nClose a pane; --force kills its process instead of asking it to exit.",
+        "wait" => "roost wait PANE... [--until STATUS] [--timeout SEC]\nBlock until a pane reaches STATUS (default: waiting) or the timeout elapses.",
+        _ => unreachable!("verb_help called with {verb:?}, not a member of VERBS"),
+    }
+}
 
 /// `wait`'s timeout reply (`{"timed_out":true}`, see app.rs's `poll_waiters`)
 /// is the one outcome a caller MUST branch on — printing it with the same
@@ -379,6 +409,22 @@ mod tests {
         // in by mistake — usage error, not a guess.
         let owned: Vec<String> = ["send", "--all", "3", "x"].iter().map(|s| s.to_string()).collect();
         assert!(build_request(&owned, "T".into()).is_err());
+    }
+
+    /// Every verb needs its own, real help text — not the generic usage
+    /// (byte-identical to a bare invocation was the QA-caught bug) and not
+    /// two verbs sharing text that would make the wrong one look right.
+    #[test]
+    fn cli_verb_help_is_distinct_and_leads_with_its_own_usage() {
+        use std::collections::HashSet;
+        let texts: HashSet<&str> = super::VERBS.iter().map(|v| super::verb_help(v)).collect();
+        assert_eq!(texts.len(), super::VERBS.len(), "two verbs must not share identical help text");
+        for v in super::VERBS {
+            assert!(
+                super::verb_help(v).starts_with(&format!("roost {v}")),
+                "{v}'s help must lead with its own usage"
+            );
+        }
     }
 }
 
