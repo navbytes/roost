@@ -36,6 +36,14 @@ use crate::ports::{MouseProto, Notifier, PaneBackend, StateStore};
 use crate::ui::input::{self, Action, InputResult};
 use crate::ui::mouse::{self, MouseAction};
 
+/// The one `spawn_listener` failure that must stay fatal: the socket
+/// directory exists but isn't privately ours, which is what an attacker
+/// pre-creating it looks like. Every other failure degrades to "no control
+/// plane, and roost says so".
+fn is_unsafe_socket_dir(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("unsafe ownership/permissions")
+}
+
 fn main() -> Result<()> {
     // Client mode: `roost <verb> ...` talks to a running instance and exits,
     // before any terminal/lock setup. No args → launch the multiplexer.
@@ -264,17 +272,36 @@ fn run(
             std::env::current_dir().unwrap_or_else(|_| "/".into()),
         )
     });
-    let sock_path = infra::sock::spawn_listener(tx.clone()).ok();
+    // `.ok()` here used to swallow three very different failures — the state
+    // dir being uncreatable, `dir_is_private_and_ours` refusing (a *security*
+    // bail: someone else's directory sitting where our socket goes), and
+    // bind() failing (e.g. a state dir path past macOS's 104-byte sun_path
+    // limit). roost then ran looking entirely normal with no control plane at
+    // all: no $ROOST_SOCK in panes, so the pi extension and the Claude hooks
+    // silently never report status, nothing is written to the audit log, and
+    // every `roost <verb>` fails. Surface it instead. The security refusal
+    // stays fatal: degrading "someone may be intercepting the control socket"
+    // into "quietly no socket" is the wrong default.
+    let (sock_path, sock_err) = match infra::sock::spawn_listener(tx.clone()) {
+        Ok(p) => (Some(p), None),
+        Err(e) if is_unsafe_socket_dir(&e) => return Err(e),
+        Err(e) => (None, Some(format!("no control plane: {e:#}"))),
+    };
     let sock_cleanup = sock_path.clone();
     let mut notifier = TermNotifier;
     let size = terminal.size()?;
     let mut app: App<PtyPane> =
         App::new(ws, agents::registry(), Box::new(store), tx, size, host_pixels(), sock_path)?;
     app.relayout();
+    if let Some(msg) = sock_err {
+        app.set_flash(msg);
+    }
 
     // Keep the pi status extension in sync with this build so it can't silently
     // go stale (a stale one's socket messages are now dropped for lacking the
     // per-pane token). No-op when pi isn't installed or ROOST_NO_EXT_INSTALL set.
+    // A missing control plane matters more than either extension notice, so it
+    // is flashed first and therefore last-written wins the visible slot.
     if let Some(msg) = infra::extension::ensure_pi_extension() {
         app.set_flash(msg);
     }
@@ -378,7 +405,17 @@ fn run(
             // geometry travels with it (P4) — same ioctl, re-read together.
             let sz = terminal.size()?;
             app.on_resize(sz, host_pixels());
-            terminal.clear()?;
+            // Deliberately NOT `?`. ratatui-core 0.1.2 made `clear()` snapshot
+            // the cursor first, which writes `ESC[6n` and blocks up to 2 s
+            // waiting for the terminal to answer — and this arrived under the
+            // `ratatui = "0.30"` pin via a patch bump, with no roost change.
+            // A host that never answers DSR (a nested multiplexer that
+            // swallows it, some CI and serial terminals, an ssh hop dropped
+            // mid-resize) therefore turned a *cosmetic* clear into `run()`
+            // returning Err, which sends `shutdown()` through every pane with
+            // SIGHUP then SIGKILL. Resizing a window must never be able to
+            // destroy the fleet: a failed clear costs one stale frame.
+            let _ = terminal.clear();
         }
 
         // ...then drain PTY output and socket events — but cap how many per
@@ -827,6 +864,36 @@ fn inner_cell(rect: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
 
 #[cfg(test)]
 mod tests {
+
+    /// rev P1-2: only the security refusal may be fatal. Every other
+    /// listener failure has to degrade to "no control plane, and roost says
+    /// so" — a bind() failure taking the whole session down would be a worse
+    /// outcome than the missing socket it is reporting.
+    #[test]
+    fn only_an_unsafe_socket_dir_is_a_fatal_listener_failure() {
+        let unsafe_dir = anyhow::anyhow!(
+            "roost: socket directory /tmp/x has unsafe ownership/permissions"
+        );
+        assert!(super::is_unsafe_socket_dir(&unsafe_dir));
+
+        for benign in [
+            "No such file or directory (os error 2)",
+            "path must be shorter than SUN_LEN",
+            "Permission denied (os error 13)",
+        ] {
+            let e = anyhow::anyhow!(benign.to_string());
+            assert!(
+                !super::is_unsafe_socket_dir(&e),
+                "{benign} must not be fatal — it should flash, not exit"
+            );
+        }
+
+        // The real bail! is wrapped in context by the time main sees it; the
+        // check reads the whole chain, so a wrapped one still counts.
+        let wrapped = anyhow::anyhow!("roost: socket directory /tmp/x has unsafe ownership/permissions")
+            .context("starting the control listener");
+        assert!(super::is_unsafe_socket_dir(&wrapped));
+    }
     use super::*;
     use crate::core::app::Mode;
     use crate::core::workspace::Workspace;
