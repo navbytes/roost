@@ -30,6 +30,30 @@ pub const WHEEL_LINES: i32 = 3;
 /// scrollback by, so it feels the same either side of the alternate screen.
 pub const ALT_SCROLL_KEYS: usize = 3;
 
+/// D9: roost's own mouse-capture sequences, deliberately a **subset** of
+/// crossterm's `EnableMouseCapture`/`DisableMouseCapture`, which bundle five
+/// DEC private modes: `1000` (press/release), `1002` (button-drag motion),
+/// `1003` (**any**-motion tracking — every pointer move, button held or
+/// not), `1015` (RXVT extended coordinates) and `1006` (SGR extended
+/// coordinates — "preferred over RXVT mode" per crossterm's own comment on
+/// the command). `route_mouse` drops every `Moved` event unconditionally
+/// (the match arm below has no case for it), so `1003` buys a continuous
+/// stream of events roost pays to parse and immediately discards; `1006`
+/// alone already gives unbounded coordinates in the one format
+/// `encode_sgr` emits, so `1015` is a second protocol for a job `1006`
+/// already does. `1000` and `1002` are the two modes every gesture in this
+/// module (click-to-focus, seam-drag, native selection, SGR forwarding)
+/// actually needs. Exact byte-for-byte subset of crossterm 0.29's own
+/// `EnableMouseCapture::write_ansi` (verified against its source), so a
+/// terminal sees nothing it wouldn't have seen from the blanket enable.
+pub const MOUSE_CAPTURE_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// The exact inverse, reverse order — same idiom as crossterm's own
+/// `DisableMouseCapture`. Symmetric with `MOUSE_CAPTURE_ENABLE` on purpose:
+/// clearing an already-clear DEC private mode is a harmless no-op on every
+/// terminal, but there is no reason for enable and disable to name a
+/// different set of modes.
+pub const MOUSE_CAPTURE_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum MouseAction {
     /// Forward these bytes to the pane's PTY (mouse-aware app).
@@ -491,6 +515,26 @@ mod tests {
     /// P9: a pager — alternate screen, no mouse protocol.
     fn pager(app_cursor: bool) -> PaneMouseState {
         PaneMouseState { alternate_screen: true, app_cursor_keys: app_cursor, ..plain() }
+    }
+
+    /// D9: the capture sequences are the exact subset of crossterm 0.29's
+    /// `EnableMouseCapture`/`DisableMouseCapture` (`?1000` `?1002` `?1003`
+    /// `?1015` `?1006` on enable, reverse order on disable) that drops
+    /// `?1003` (any-motion — pure cost, `route_mouse` never handles `Moved`)
+    /// and `?1015` (RXVT coords — superseded by `?1006` SGR, which every
+    /// gesture in this module already speaks). Enable and disable name the
+    /// same three modes, reverse order, mirroring crossterm's own idiom.
+    #[test]
+    fn mouse_capture_sequences_are_the_1000_1002_1006_subset_symmetric_in_reverse() {
+        assert_eq!(MOUSE_CAPTURE_ENABLE, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        assert_eq!(MOUSE_CAPTURE_DISABLE, "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+        fn modes(s: &str, suffix: char) -> Vec<&str> {
+            s.split("\x1b[?").filter(|p| !p.is_empty()).map(|p| p.trim_end_matches(suffix)).collect()
+        }
+        let enabled = modes(MOUSE_CAPTURE_ENABLE, 'h');
+        let mut disabled = modes(MOUSE_CAPTURE_DISABLE, 'l');
+        disabled.reverse();
+        assert_eq!(enabled, disabled, "disable must turn off exactly what enable turned on");
     }
 
     #[test]
