@@ -227,6 +227,37 @@ fn scrub_host_identity(cmd: &mut CommandBuilder) {
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 }
 
+/// L3: the vars that hand a child a *ready-made* credential for this roost —
+/// ROOST_SOCK (targeting) and both credential tiers, `ROOST_CONTROL_TOKEN`
+/// (checked *first* by `resolve_token`, and it's the fleet-wide one:
+/// unscoped, unlike a pane's own `ROOST_TOKEN`) and `ROOST_TOKEN` itself.
+///
+/// `ROOST_STATE` is deliberately **not** here, and the distinction is not
+/// "config vs authority" — it is targeting too: `socket_path` reads it first
+/// (`sock.rs`), and `resolve_token`'s file fallback resolves through it to
+/// `$ROOST_STATE/control.token` (`store.rs`). It is left alone because
+/// scrubbing it would obscure a path, not remove a capability: under this
+/// threat model the pane is same-uid and can compute the default state dir
+/// itself, so a token it could already read is not protected by hiding the
+/// variable that names it. The genuinely inert ones — `ROOST_NO_EXT_INSTALL`,
+/// `ROOST_SYNC_CAP_MS`, `ROOST_DEBUG`, `ROOST_PANE` — are left alone because
+/// they carry no authority at all.
+///
+/// Keep that split honest when `resolve_token` changes: anything that becomes
+/// a *carried* credential belongs in this list.
+const CONTROL_ENV_VARS: &[&str] = &["ROOST_SOCK", "ROOST_CONTROL_TOKEN", "ROOST_TOKEN"];
+
+/// L3: drop roost's own control-plane credentials from the base env a pane
+/// child would otherwise inherit. Kept separate from `scrub_host_identity`
+/// on purpose — that one's contract is explicitly that TERM/ROOST_* vars
+/// are `spawn`'s to own, unchanged; this is `spawn` exercising that
+/// ownership.
+fn scrub_control_env(cmd: &mut CommandBuilder) {
+    for var in CONTROL_ENV_VARS {
+        cmd.env_remove(var);
+    }
+}
+
 /// Every live pid in session `sid`, **excluding the leader itself** (that one
 /// is already covered by the process-group kill).
 ///
@@ -446,6 +477,19 @@ impl PaneBackend for PtyPane {
         // Pane identity for the status socket (roost.ts pi extension /
         // Claude Code hooks) — design doc §6.1.
         cmd.env("ROOST_PANE", id.to_string());
+        // L3: a `CommandBuilder` otherwise inherits *this* process's own
+        // environment. Two ways that bites: if roost's own control listener
+        // never bound (main.rs's listener setup is `.ok()`), `spec.env`
+        // below carries no ROOST_SOCK/ROOST_TOKEN, and without this the
+        // child would silently inherit roost's own live ones instead of
+        // simply having none — worst case a roost nested inside a roost
+        // pane, handing its children the *outer* pane's socket and token.
+        // And separately, ROOST_CONTROL_TOKEN (cli.rs's fleet-wide, checked-
+        // first credential) is never in `spec.env` at all — it only ever
+        // reaches a pane by inheritance, from an operator's shell or an
+        // outer roost, so it must be scrubbed unconditionally too. Removed
+        // here, before `spec.env` conditionally re-sets the two it does own.
+        scrub_control_env(&mut cmd);
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
@@ -859,8 +903,9 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 mod tests {
     use super::{
         extract_selection, host_clipboard_bytes, host_notify_bytes, sanitize_for_host,
-        scrub_host_identity, sync_presented, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP,
-        HOST_NOTIFY_INTERVAL, OSC52_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
+        scrub_control_env, scrub_host_identity, sync_presented, CONTROL_ENV_VARS,
+        HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL, OSC52_INTERVAL,
+        OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -1079,6 +1124,51 @@ mod tests {
         scrub_host_identity(&mut cmd);
         assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("host-term")));
         assert_eq!(cmd.get_env("ROOST_PANE"), Some(OsStr::new("7")));
+    }
+
+    /// L3: a pane child must never inherit roost's own live control-plane
+    /// credentials. Set as real *process* env vars rather than directly on
+    /// the builder — `CommandBuilder::new` materializes `std::env::vars_os()`
+    /// into its base env, so only this proves `env_remove` suppresses true
+    /// inheritance; setting them via `cmd.env()` first would only prove
+    /// removal of an explicit override. Restores the real values before
+    /// asserting, so a failure here can't leave them redirected for the
+    /// rest of the test binary.
+    #[test]
+    fn scrub_control_env_removes_truly_inherited_vars() {
+        let saved: Vec<_> = CONTROL_ENV_VARS.iter().map(|&v| (v, std::env::var_os(v))).collect();
+        for &var in CONTROL_ENV_VARS {
+            std::env::set_var(var, "leaked-from-outer-roost");
+        }
+        let mut cmd = CommandBuilder::new("true");
+        scrub_control_env(&mut cmd);
+        for (var, prev) in &saved {
+            match prev {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        for &var in CONTROL_ENV_VARS {
+            assert!(cmd.get_env(var).is_none(), "{var} must not survive as inherited env");
+        }
+    }
+
+    /// L3's other half: when this pane's spec *does* carry a real
+    /// ROOST_SOCK/ROOST_TOKEN (the control listener bound), the scrub must
+    /// not stand in the way of `spawn`'s own `spec.env` loop setting them —
+    /// same ordering `spawn` uses (scrub, then apply `spec.env`).
+    /// ROOST_CONTROL_TOKEN isn't part of this: nothing ever re-sets it
+    /// after the scrub, in `spec.env` or anywhere else in `spawn` — the
+    /// removal test above is its whole story.
+    #[test]
+    fn scrub_control_env_does_not_block_spec_env_from_setting_them_after() {
+        let mut cmd = CommandBuilder::new("true");
+        cmd.env("ROOST_SOCK", "/tmp/outer.sock");
+        scrub_control_env(&mut cmd);
+        cmd.env("ROOST_SOCK", "/tmp/this-pane.sock");
+        cmd.env("ROOST_TOKEN", "this-pane-token");
+        assert_eq!(cmd.get_env("ROOST_SOCK"), Some(OsStr::new("/tmp/this-pane.sock")));
+        assert_eq!(cmd.get_env("ROOST_TOKEN"), Some(OsStr::new("this-pane-token")));
     }
 
     #[test]

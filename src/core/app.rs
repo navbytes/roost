@@ -717,6 +717,23 @@ impl<B: PaneBackend> App<B> {
         self.float.as_ref().is_some_and(|f| f.id == id)
     }
 
+    /// C22/M1: the one guard every control-plane verb that resolves a
+    /// specific pane id shares — the float is the human's private
+    /// interactive scratch shell, never a control-plane target, for
+    /// *any* verb, not just the ones an earlier pass happened to touch
+    /// (close/send/read only — status/wait/fork still reached it: a
+    /// same-uid pane reading `control.token` off disk *is* Fleet, and
+    /// `spawn_float`'s `spawned_by: None` puts the float outside every
+    /// subtree, so Fleet was never the only actor that needed refusing).
+    /// `verb` slots into "cannot {verb} the scratch pane" — ctl_close's own
+    /// wording — so every caller reads naturally without each inventing
+    /// its own phrasing. Callers check this before authz: an actor doesn't
+    /// get told "forbidden" for a pane it could never legitimately reach
+    /// anyway, it gets told the truth, unconditionally.
+    fn float_refusal(&self, id: PaneId, verb: &str) -> Option<String> {
+        self.is_float(id).then(|| format!("cannot {verb} the scratch pane"))
+    }
+
     /// Is the float currently the focused pane? Equivalent to "is it
     /// shown" (rule 1: shown ⇒ focused) — checking focus directly is
     /// simpler and doesn't also require reading `shown`.
@@ -1108,9 +1125,12 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// C22: learns the float — `send`/`read`/badges/rename/respawn by id
-    /// all route through this, so they work on the scratch pane exactly
-    /// like any other, with zero extra code at those call sites.
+    /// C22: learns the float — badges/rename/respawn by id all route
+    /// through this, so they work on the scratch pane exactly like any
+    /// other, with zero extra code at those call sites. `send`/`read`/
+    /// `close` resolve it here too (so "no such pane" is still right for
+    /// them), but each then adds its own is-float refusal (M1) — the float
+    /// is the human's private scratch shell, never a control-plane target.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
         if let Some(f) = &self.float {
             if f.id == id {
@@ -1457,6 +1477,13 @@ impl<B: PaneBackend> App<B> {
                 let _ = reply.send(Reply::err(msg.clone()));
                 return Err(msg);
             }
+            // M1: `wait <float> --until idle` would be a typing oracle on
+            // the human's private scratch shell — same refusal as every
+            // other verb that resolves a specific pane id.
+            if let Some(msg) = self.float_refusal(p, "wait on") {
+                let _ = reply.send(Reply::err(msg.clone()));
+                return Err(msg);
+            }
             if !self.may_target(actor, p) {
                 let msg = "forbidden: pane not in your subtree";
                 let _ = reply.send(Reply::err(msg));
@@ -1503,7 +1530,17 @@ impl<B: PaneBackend> App<B> {
             // fully gone id (no live spec at all) still resolves normally
             // below: "it's gone" discloses nothing pane-specific, so it
             // needs no re-check.
+            //
+            // M1: the same recycling can hand `p` to the float instead of
+            // to an unrelated real pane — and Fleet's `may_target` is
+            // unconditionally `true`, so the check above alone would not
+            // catch it. An explicit is_float re-check is the only thing
+            // that closes that gap for a wait registered before the float
+            // existed at this id.
             let hit = w.panes.iter().copied().find(|&p| {
+                if self.is_float(p) {
+                    return false;
+                }
                 if self.find_spec(p).is_some() && !self.may_target(w.actor, p) {
                     return false;
                 }
@@ -1556,6 +1593,14 @@ impl<B: PaneBackend> App<B> {
             Some(p) => {
                 if self.find_spec(p).is_none() {
                     return Reply::err("no such pane");
+                }
+                // M1: `None` (the fleet-wide list) already excludes the
+                // float structurally — it lives outside `ws.tabs`, which
+                // `ctl_list` is the only thing that iterates — but a
+                // specific id resolves it via `find_spec` same as any
+                // other verb, so it needs the same explicit refusal.
+                if let Some(msg) = self.float_refusal(p, "get the status of") {
+                    return Reply::err(msg);
                 }
                 if !self.may_target(actor, p) {
                     return Reply::err("forbidden: pane not in your subtree");
@@ -1613,6 +1658,12 @@ impl<B: PaneBackend> App<B> {
             (None, Actor::Pane(a)) => a,
             (None, Actor::Fleet) => return Reply::err("fork requires a pane id for a fleet caller"),
         };
+        // M1: forking the float would clone its spec into a brand-new real
+        // pane (and surface its cwd in `list`) — refused before authz, same
+        // as every other verb that resolves a specific pane id.
+        if let Some(msg) = self.float_refusal(target, "fork") {
+            return Reply::err(msg);
+        }
         if !self.may_target(actor, target) {
             return Reply::err("forbidden: pane not in your subtree");
         }
@@ -1643,6 +1694,9 @@ impl<B: PaneBackend> App<B> {
     fn ctl_send(&mut self, actor: Actor, pane: PaneId, text: &str, submit: bool) -> Reply {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
+        }
+        if let Some(msg) = self.float_refusal(pane, "send to") {
+            return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
@@ -1717,6 +1771,9 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
+        if let Some(msg) = self.float_refusal(pane, "read") {
+            return Reply::err(msg);
+        }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
         }
@@ -1742,11 +1799,8 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        // C22: the scratch pane never closes via the control plane —
-        // checked for every caller (including Fleet), before authz, since
-        // the refusal is unconditional either way.
-        if self.is_float(pane) {
-            return Reply::err("cannot close the scratch pane");
+        if let Some(msg) = self.float_refusal(pane, "close") {
+            return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
@@ -1922,10 +1976,20 @@ impl<B: PaneBackend> App<B> {
         if self.last_host_title.is_some_and(|t| t.elapsed() < HOST_TITLE_INTERVAL) {
             return;
         }
-        // `display_name` is already sanitized and bounded (`live_title`), and
-        // an Alt+r title comes from roost's own rename buffer — so nothing
-        // here can carry a control byte into the sequence.
-        let want = format!("roost · {}", self.feed_label(self.focused));
+        // H1: this is the one write path in roost that bypasses ratatui's
+        // buffer (W3) and lands raw bytes on the host terminal's own stdout
+        // — so, unlike everything else `display_name` feeds (badge,
+        // collapsed rows, feed, notifications), the label here needs its
+        // own sanitization pass, not a borrowed guarantee from upstream.
+        // `live_title` sanitizes the OSC-set title, but `display_name_live`
+        // also returns `spec.title` (an Alt+r rename, but also a
+        // hand-editable `title` field in workspace.json) and a `shell`
+        // pane's `cwd.file_name()` (attacker-controlled via `roost spawn
+        // --cwd`) verbatim — either can carry ESC/BEL/OSC bytes straight
+        // into this escape sequence. Same cap as the live title, so a
+        // hostile name can't grow the sequence unbounded either.
+        let label = sanitize_title(&self.feed_label(self.focused), LIVE_TITLE_CAP);
+        let want = format!("roost · {label}");
         if want == self.host_title {
             return;
         }
@@ -9199,6 +9263,39 @@ mod tests {
         assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 1 TASK-8\x07"));
     }
 
+    /// H1: `spec.title` reaches `sync_host_title` verbatim from
+    /// `display_name_live` (an Alt+r rename, but also a hand-edited
+    /// `title` field in workspace.json) — a hostile one must not carry its
+    /// own OSC/BEL out through roost's own escape sequence to the host's
+    /// real terminal, since that write bypasses ratatui entirely (W3).
+    #[test]
+    fn host_title_strips_control_bytes_from_a_hostile_pane_title() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.find_spec_mut(1).unwrap().title = Some("safe\x1b]52;c;cGduZWQ=\x07evil".into());
+        app.last_host_title = None;
+        let out = app.take_host_output();
+        // Exactly roost's own introducer/terminator — the pane-supplied
+        // ESC/BEL embedded in the title must not add a second pair.
+        assert_eq!(out.iter().filter(|&&b| b == 0x1b).count(), 1);
+        assert_eq!(out.iter().filter(|&&b| b == 0x07).count(), 1);
+        assert_eq!(out, b"\x1b]2;roost \xc2\xb7 1 safe]52;c;cGduZWQ=evil\x07".to_vec());
+    }
+
+    /// H1: the same escape, via the *other* unsanitized fallback in
+    /// `display_name_live` — an untitled shell pane's `cwd.file_name()`,
+    /// which an in-pane agent fully controls via `roost spawn --cwd
+    /// '<hostile dir name>'`.
+    #[test]
+    fn host_title_strips_control_bytes_from_a_hostile_cwd_tag() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.find_spec_mut(1).unwrap().cwd = PathBuf::from("/tmp/evil\x1b]52;c;AA==\x07dir");
+        app.last_host_title = None;
+        let out = app.take_host_output();
+        assert_eq!(out.iter().filter(|&&b| b == 0x1b).count(), 1);
+        assert_eq!(out.iter().filter(|&&b| b == 0x07).count(), 1);
+        assert_eq!(out, b"\x1b]2;roost \xc2\xb7 1 shell \xc2\xb7 evil]52;c;AA==dir\x07".to_vec());
+    }
+
     /// P6: the throttle — an agent republishing its OSC title on every
     /// spinner frame must not repaint the host title bar ~30x a second, and
     /// a change it skips must still be published on the next pass.
@@ -9880,23 +9977,140 @@ mod tests {
         assert!(app.float.as_ref().unwrap().shown, "the float must survive the refused close");
     }
 
+    /// M1: `find_spec` still learns the float (badges/rename/respawn need
+    /// that), but `send`/`read` must refuse it over the control plane —
+    /// otherwise any actor holding control.token could `read` the human's
+    /// private scratch shell verbatim, or type into it.
     #[test]
-    fn find_spec_learns_the_float_send_and_read_work_by_id() {
+    fn control_send_and_read_of_the_float_are_refused() {
         use crate::core::control::{Method, ReadMode, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
+        // Resolved, so the refusal below is is_float's, not "no such pane".
         assert!(app.find_spec(float_id).is_some());
         let ct = app.control_token().to_string();
         let reply = app.handle_control(Request {
             token: ct.clone(),
             method: Method::Send { pane: float_id, text: "hi".into(), submit: false },
         });
-        assert!(matches!(reply, Reply::Ok { .. }));
-        assert_eq!(app.runtimes.get(&float_id).unwrap().input, b"hi");
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot send to the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(app.runtimes.get(&float_id).unwrap().input.is_empty(), "nothing must reach the float");
         let reply =
             app.handle_control(Request { token: ct, method: Method::Read { pane: float_id, mode: ReadMode::Screen } });
-        assert!(matches!(reply, Reply::Ok { .. }));
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot read the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    /// M1 (review round 2): `ctl_status(Some(float_id))` would leak the
+    /// live status of the human's private scratch shell — same refusal,
+    /// through the same `float_refusal` helper, as close/send/read.
+    #[test]
+    fn control_status_of_the_float_is_refused() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let reply =
+            app.handle_control(Request { token: ct, method: Method::Status { pane: Some(float_id) } });
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot get the status of the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    /// M1 (review round 2): forking the float would clone its spec into a
+    /// brand-new real pane — and surface its cwd in `list` — so it gets the
+    /// same refusal as close/send/read.
+    #[test]
+    fn control_fork_of_the_float_is_refused() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let panes_before = app.runtimes.len();
+        let ct = app.control_token().to_string();
+        let reply =
+            app.handle_control(Request { token: ct, method: Method::Fork { pane: Some(float_id) } });
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot fork the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert_eq!(app.runtimes.len(), panes_before, "no clone of the float must be spawned");
+    }
+
+    /// M1 (review round 2): `wait <float> --until idle` would be a typing
+    /// oracle on the human's private scratch shell — refused at
+    /// registration, so it never parks a waiter that could later fire.
+    #[test]
+    fn control_wait_on_the_float_is_refused() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        let ct = app.control_token().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct,
+                method: Method::Wait { panes: vec![float_id], until: "idle".into(), timeout_ms: None },
+            },
+            tx,
+        );
+        match rx.recv().unwrap() {
+            Reply::Err { err } => assert_eq!(err, "cannot wait on the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(app.waiters.is_empty(), "must not park a wait on the float");
+    }
+
+    /// M1 (review round 2): `poll_waiters`' own LOW-3 re-check already
+    /// re-verifies `may_target` at fire time because a recycled pane id can
+    /// belong to someone new by the time a parked wait fires — the same
+    /// recycling can hand that id to the float instead of another real
+    /// pane, and Fleet's `may_target` is unconditionally `true`, so only an
+    /// explicit `is_float` re-check (not just registration-time refusal)
+    /// closes that gap. Engineered the same way LOW-3's own regression
+    /// test is (`wait_does_not_leak_a_recycled_pane_ids_status_cross_subtree`):
+    /// close the highest-numbered pane so its id is genuinely recycled,
+    /// then let the float claim it — no reaching into `app.waiters`.
+    #[test]
+    fn poll_waiters_refuses_an_id_recycled_onto_the_float() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        app.apply(Action::NewPane); // panes 1 | 2
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Working);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle_control_msg(
+            Request {
+                token: ct.clone(),
+                method: Method::Wait { panes: vec![2], until: "idle".into(), timeout_ms: Some(60_000) },
+            },
+            tx,
+        );
+        assert!(rx.try_recv().is_err(), "working, not idle yet -> parked");
+        assert_eq!(app.waiters.len(), 1);
+
+        // Pane 2 (highest id) closes, freeing its id, and the float —
+        // spawned fresh, so it starts idle same as any shell pane —
+        // recycles it.
+        let close = app.handle_control(Request { token: ct, method: Method::Close { pane: 2, force: true } });
+        assert!(matches!(close, Reply::Ok { .. }), "{close:?}");
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert_eq!(float_id, 2, "test assumes the float actually recycled the freed id");
+
+        app.poll_waiters();
+        assert!(rx.try_recv().is_err(), "must not disclose the float's status, even to Fleet");
+        assert_eq!(app.waiters.len(), 1, "the waiter stays parked, not silently dropped");
     }
 
     #[test]
