@@ -697,6 +697,20 @@ struct HelpGroup {
 ///
 /// Group order is "how often you reach for it": panes, then their layout,
 /// then tabs, then the fleet surfaces, then reading, then the session.
+///
+/// [Amended, ux P2-15] `CONTROL CLI` closes the table. Every group above it
+/// teaches keys pressed *inside* roost; this one is the odd surface out —
+/// the reference block for `roost send`/`read`/`status`/`spawn`/`wait`, the
+/// control CLI an outside actor (an LLM, a script, another pane) drives the
+/// fleet with. Before this the whole surface was invisible from inside the
+/// product, even though U2 put the pane id on every badge *specifically* as
+/// the join key between what's on screen and what a caller types — a join
+/// key nothing on screen ever named. Rows are the verbs a caller reaches
+/// for, not a man page: the CLI's own `--help` covers `list`/`fork`/`close`
+/// and every flag. It sorts last for the same reason `READING THE SCREEN`
+/// does — it teaches the product rather than a binding — and follows it
+/// rather than leading, since a user opens this overlay to remember a
+/// chord first and learns the fleet is scriptable second.
 const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "PANES",
@@ -762,6 +776,17 @@ const HELP_GROUPS: &[HelpGroup] = &[
             ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
             ("mouse", "wheel scrolls · click focuses · drag selects"),
             ("Alt+click / o", "open the URL under the pointer / copy cursor"),
+        ],
+    },
+    HelpGroup {
+        title: "CONTROL CLI",
+        rows: &[
+            ("<id>", "same id shown on each pane's badge"),
+            ("roost send <id> \"text\"", "type into that pane (--enter submits)"),
+            ("roost read <id>", "print its current screen"),
+            ("roost status", "list every pane and its status"),
+            ("roost spawn ADAPTER", "launch a new pane"),
+            ("roost wait <id>", "block until its turn ends"),
         ],
     },
 ];
@@ -3182,6 +3207,32 @@ mod tests {
     fn one_help_column_fits_the_eighty_column_floor() {
         let w = help_layout(Rect::new(0, 1, 200, 200)).size.0;
         assert!(w <= 80, "the keymap is {w} cols wide; the 80-col floor would clip it");
+    }
+
+    /// ux P2-15: the overlay used to teach every chord and never mention
+    /// that roost has a control CLI at all — the category differentiator
+    /// (an outside actor can drive the fleet) was invisible from inside the
+    /// product. This pins the fix: a group documenting the verbs, with the
+    /// pane-id join (U2's badge/tab id) spelled out rather than assumed.
+    #[test]
+    fn help_documents_the_control_cli_and_the_pane_id_join() {
+        let cli = HELP_GROUPS
+            .iter()
+            .find(|g| g.title == "CONTROL CLI")
+            .expect("a CONTROL CLI group");
+        let text =
+            cli.rows.iter().map(|(k, d)| format!("{k} {d}")).collect::<Vec<_>>().join("\n");
+        for verb in ["roost send", "roost read", "roost status", "roost spawn", "roost wait"] {
+            assert!(text.contains(verb), "the control-CLI group must mention {verb:?}");
+        }
+        // The join key itself, not just the verbs that consume it — the
+        // gap U2 named was that nothing said the badge/tab id is what a
+        // caller passes.
+        assert!(text.contains("<id>"), "the pane-id join must be spelled out:\n{text}");
+        assert!(
+            text.to_lowercase().contains("badge") || text.to_lowercase().contains("tab"),
+            "the join must point back at where the id is shown on screen:\n{text}",
+        );
     }
 
     // -- C24 keyboard copy cursor ----------------------------------------------
