@@ -108,6 +108,21 @@ fn host_notify_bytes(
 /// correct it — a rejected relay is logged at the parser boundary, and the
 /// dropped case is only reachable by a payload that isn't a clipboard write
 /// in the first place (or arrived too soon after the last one).
+///
+/// **Not gated by `ROOST_TEST_NO_HOST_IO`** (B2 round 2, PR #46 review's
+/// runtime hatch for `infra::clipboard::copy`/`infra::open::open_url`) —
+/// deliberately a different question. This function only produces bytes
+/// roost queues for its *own* stdout (`host_writes`, flushed once per
+/// frame in `main.rs`); where those bytes actually land depends entirely
+/// on what roost's stdout is connected to — the operator's real terminal
+/// in normal use, or a PTY-harness test's own private pty when spawned
+/// under `tests/`, which is exactly what `tests/pane_clipboard.rs`
+/// exercises and asserts on (the relay reaching "the host" is the test).
+/// Gating this with the same var would silently break that test's own
+/// premise for no safety gain: unlike `native_copy`'s `pbcopy` subprocess,
+/// this never reaches the *system* clipboard service directly — only
+/// through whatever terminal (real or harness-contained) is already
+/// listening on the other end of roost's own output.
 fn host_clipboard_bytes(
     selection: &str,
     payload_base64: &str,
