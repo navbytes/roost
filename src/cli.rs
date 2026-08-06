@@ -36,7 +36,7 @@ pub fn maybe_run() -> Option<i32> {
         return Some(run_status_hook(&args[1..]));
     }
     if verb == "--help" || verb == "-h" {
-        eprintln!("{USAGE}");
+        println!("{USAGE}"); // an explicit request, not an error: stdout, exit 0
         return Some(0);
     }
     if verb == "--version" || verb == "-V" {
@@ -110,6 +110,7 @@ roost — control a running instance:
   roost read PANE [--tail N | --full]
   roost close PANE [--force]
   roost wait PANE... [--until STATUS] [--timeout SEC]
+  roost --help | -h
   roost --version | -V
 (run `roost` with no args to launch the multiplexer)";
 
