@@ -87,14 +87,14 @@ Stated directly by the client; these outrank findings the team inferred.
 Control-CLI contract fixes — an orchestrator must be able to trust what
 roost tells it [ux, handoffs/ux-audit.md]:
 
-- ☐ **`roost spawn` returns ok for a failed spawn** — PTY failure lands
+- ☐ **`roost spawn` returns ok for a failed spawn** (still open) — PTY failure lands
   async in `App::dead`, invisible to the socket; status says only
   `exited`, orchestrators retry forever (app.rs:1593–1607, 916–918).
   Make the failure readable: reason in `status`/reply + feed. [ux P0-2]
-- ☐ **`wait` timeout exits 0** — `{timed_out:true}` printed, exit 0;
+- ✅ **(PR #49) `wait` timeout exits 0** → now exit 3 — `{timed_out:true}` printed, exit 0;
   `wait … && read` proceeds as if done. Nonzero exit on timeout
   (app.rs:1519, cli.rs:60–62). [ux P1-7]
-- ☐ **Unknown first arg launches the full-screen TUI — and panics off-tty.**
+- ✅ **(PR #49) Unknown first arg launches the full-screen TUI — and panics off-tty.**
   `roost --version`, `roost ls`, typos seize the terminal; piped or in CI it
   **panics with a raw Rust backtrace** (`failed to initialize terminal`, exit
   101). A script probing the binary hangs or gets a stack trace — the most
@@ -106,11 +106,11 @@ roost tells it [ux, handoffs/ux-audit.md]:
   reporting the *requested* cwd while the process runs elsewhere. An
   orchestrator spawning into a mistyped path gets no error and a worker in
   the wrong directory. Validate cwd at spawn; fail loudly. [qa QA-2, new]
-- ☐ **No subcommand `--help`** — `roost spawn --help` is byte-identical to a
+- ✅ **(PR #49) No subcommand `--help`** — `roost spawn --help` is byte-identical to a
   usage error; `roost list --help` / `status --help` / `fork --help`
   **silently execute the real command** (`list --help` returned real pane
   JSON, exit 0). [qa QA-3, new]
-- ☐ **Unknown flags silently dropped; no `--` separator** — `send 5 hi
+- ✅ **(PR #49) Unknown flags silently dropped; no `--` separator** — `send 5 hi
   --entr` sends without Enter and replies ok; `send 5 "--- x ---"` sends
   empty. Reject unknown flags, add `--` (cli.rs:186–204). [ux P1-9]
 
@@ -169,14 +169,19 @@ complained-about thing about tmux on macOS. Every native gesture roost
 breaks and replaces with a chord (copy mode, Alt+…) is a defect under this
 requirement.
 
-- 🔨 Map current behavior + native-gap audit. [client, principal]
-- ☐ Decide the interaction model (don't-capture / bypass-modifier /
-  mirror-native-selection / hybrid) — one recommendation, logged in
-  DECISIONS.md, then build. Must not steal the mouse from panes whose app
-  requested mouse reporting itself (vim, Claude Code's own UI).
-- ☐ Ship it, with the gesture matrix pinned by tests.
+- ✅ Map current behavior + native-gap audit. [client, principal]
+- ✅ Decide the interaction model — option (c), mirror native selection,
+  scoped by the pane's own mouse appetite. Logged as D9.
+- ✅ **(PR #46) Shipped**, contract C29: drag selects and copies on release,
+  double-click word, triple-click line, Shift-click extends, any click or
+  keypress clears; panes that requested mouse reporting keep the mouse
+  untouched. Gesture matrix pinned by tests. Review caught a wide-glyph
+  cell/char mixup that copied the *wrong text* on any row with a CJK or
+  emoji character — fixed at the shared tokenizer, so `find_url_at`
+  benefited too.
 - ☐ README: state plainly which native gestures work and where roost
-  deliberately stays out of the emulator's way.
+  deliberately stays out of the emulator's way — its "Selecting text"
+  section still says copy mode is the only way. [now stale, PR #46]
 
 ## Phase 2 — UX quick wins
 
@@ -289,6 +294,31 @@ resurrection are already category-leading; what's missing is reach
   like shell. Revisit if demand shows. [res]
 - ❌ Synchronized panes / session groups / plugin-WASM extensibility —
   classic-multiplexer table stakes not demanded by fleet users. [res: LOW]
+
+## Known issues — carried, not fixed
+
+- ☐ **The integration suite can disturb the operator's system pasteboard.**
+  A canary in the pasteboard is replaced by a full parallel `cargo test`.
+  Confirmed **pre-existing**: current `main` reproduces it 2 runs out of 2,
+  identically to any feature branch, and it never reproduces when the test
+  binaries are run one at a time. PR #46 closed the source-level path
+  (`clipboard::copy` / `open::open_url` now honor a runtime hatch the
+  harness sets on every spawned roost; the test-build stubs touch nothing),
+  so what remains is something else. Telling detail: what lands in the
+  pasteboard is the *operator's own older clipboard content*, not any test
+  string — the signature of a clipboard manager restoring history after a
+  brief disturbance, not roost writing test data. The OSC 52 host relay is
+  deliberately ungated (it writes only to roost's own stdout, the harness's
+  private pty during tests) and is the next place to look.
+  [principal, verified]
+- ☐ **One merge landed without CI** — PR #46. A force-push seconds before
+  the merge reset the check status, and the merge watcher read the momentary
+  gap as "this repo has no CI configured" and merged. The tree was verified
+  locally (638 unit + integration green, both critical fixes hand-checked)
+  and CI on `main` was re-run after the fact, but the two-runner gate every
+  other PR cleared was skipped. The watcher now treats an empty check
+  reading as "not registered yet" and refuses to merge at the deadline
+  rather than merging unverified. [principal]
 
 ## Phase 5 — Health & performance
 
