@@ -22,6 +22,7 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use std::io::IsTerminal;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -39,6 +40,21 @@ fn main() -> Result<()> {
     // before any terminal/lock setup. No args → launch the multiplexer.
     if let Some(code) = cli::maybe_run() {
         std::process::exit(code);
+    }
+
+    // Reaching here means no args at all: launch the TUI. It needs a real
+    // terminal on stdout — ratatui::init() below enables raw mode, which
+    // panics with a raw Rust backtrace (not a message) when stdout is
+    // redirected: piped, backgrounded, or driven by a script/CI runner with
+    // no pty. Fail the same clean way every rejected `cli::maybe_run` path
+    // does instead — message on stderr, nonzero exit — before touching the
+    // terminal at all.
+    if !std::io::stdout().is_terminal() {
+        eprintln!(
+            "roost: stdout is not a terminal; the multiplexer needs one to run.\n\
+             For scripting, use `roost <verb> ...` — see `roost --help`."
+        );
+        std::process::exit(1);
     }
 
     // One roost per state dir: two instances sharing a workspace.json race

@@ -25,19 +25,40 @@ use crate::infra::store::FsStore;
 const VERBS: &[&str] = &["list", "status", "spawn", "fork", "send", "read", "close", "wait"];
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
-/// code. Otherwise return None so `main` launches the TUI.
+/// code. Otherwise return None so `main` launches the TUI. Only a genuinely
+/// empty argument list returns None, though — an unrecognized argument is a
+/// hard error (below), not a fallthrough: a script or an LLM probing the
+/// binary needs an answer it can act on, not a seized terminal.
 pub fn maybe_run() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let verb = args.first()?;
+    let verb = args.first()?; // no args → launch the TUI
     if verb == "__status" {
         return Some(run_status_hook(&args[1..]));
     }
     if verb == "--help" || verb == "-h" {
-        eprintln!("{USAGE}");
+        println!("{USAGE}"); // an explicit request, not an error: stdout, exit 0
+        return Some(0);
+    }
+    if verb == "--version" || verb == "-V" {
+        println!("roost {}", env!("CARGO_PKG_VERSION"));
         return Some(0);
     }
     if !VERBS.contains(&verb.as_str()) {
-        return None; // not a control verb → run the TUI
+        // Same convention as a bad flag inside a known verb: hard error,
+        // instead of falling through to the TUI (which used to seize the
+        // terminal on a typo, or panic off one).
+        eprintln!("roost: unrecognized argument: {verb}\n\n{USAGE}");
+        return Some(2);
+    }
+    // A verb's own `--help`/`-h`, honored before the verb ever runs for real
+    // — but only ahead of a literal `--` (send/spawn's end-of-options
+    // marker), so `send PANE -- --help` still sends that text as data
+    // instead of showing help.
+    let rest = &args[1..];
+    let end = rest.iter().position(|a| a == "--").unwrap_or(rest.len());
+    if rest[..end].iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", verb_help(verb));
+        return Some(0);
     }
     Some(run(&args))
 }
@@ -99,9 +120,43 @@ roost — control a running instance:
   roost read PANE [--tail N | --full]
   roost close PANE [--force]
   roost wait PANE... [--until STATUS] [--timeout SEC]
-(run `roost` with no args to launch the multiplexer)";
+  roost VERB --help              (a verb's own usage)
+  roost --help | -h
+  roost --version | -V
+(run `roost` with no args to launch the multiplexer)
+`--` ends options for any verb — later words are taken verbatim, dashes and
+all (e.g. `roost send 5 -- --not-a-flag`).
+Exit codes: 0 ok / 1 runtime error / 2 usage error / 3 `wait` timed out.";
+
+/// `roost VERB --help` / `-h` — this verb's own usage, checked (in
+/// `maybe_run`) before the verb is ever allowed to run for real, so a help
+/// request can't fall through into executing it (the `list --help` bug this
+/// closes: it used to return live pane JSON, exit 0). `verb` is always one
+/// of `VERBS` here — every caller checks membership first.
+fn verb_help(verb: &str) -> &'static str {
+    match verb {
+        "list" => "roost list\nList every pane: id, adapter, cwd, status, …",
+        "status" => "roost status [PANE]\nOne pane's status, or every pane's if PANE is omitted.",
+        "spawn" => "roost spawn ADAPTER [--cwd DIR] [--input TEXT]\nLaunch a new pane running ADAPTER.",
+        "fork" => "roost fork [PANE]\nA sibling pane in the same context; the focused pane's if PANE is omitted.",
+        "send" => "roost send PANE TEXT... [--enter]\nroost send --all TEXT... [--enter]\nType TEXT into PANE (or, with --all, every reachable pane). --enter also submits it.",
+        "read" => "roost read PANE [--tail N | --full]\nA pane's current screen (default), its last N lines, or its full scrollback.",
+        "close" => "roost close PANE [--force]\nClose a pane; --force kills its process instead of asking it to exit.",
+        "wait" => "roost wait PANE... [--until STATUS] [--timeout SEC]\nBlock until a pane reaches STATUS (default: waiting) or the timeout elapses.",
+        _ => unreachable!("verb_help called with {verb:?}, not a member of VERBS"),
+    }
+}
+
+/// `wait`'s timeout reply (`{"timed_out":true}`, see app.rs's `poll_waiters`)
+/// is the one outcome a caller MUST branch on — printing it with the same
+/// exit 0 as a resolved wait let `wait … && read` proceed as though the pane
+/// had actually finished. A dedicated code rather than reusing 1: a caller
+/// that only checks `$?` for "nonzero" still needs to tell a timeout apart
+/// from every other kind of failure. Documented in `USAGE`.
+const EXIT_WAIT_TIMEOUT: i32 = 3;
 
 fn run(args: &[String]) -> i32 {
+    let verb = args[0].as_str();
     let req = match build_request(args, resolve_token()) {
         Ok(r) => r,
         Err(e) => {
@@ -114,7 +169,12 @@ fn run(args: &[String]) -> i32 {
         Ok(reply) => {
             if let Some(ok) = reply.get("ok") {
                 println!("{}", serde_json::to_string_pretty(ok).unwrap_or_default());
-                0
+                // The JSON is unchanged either way — only the exit status
+                // tells a shell caller `wait` actually timed out rather than
+                // resolved normally.
+                let timed_out =
+                    verb == "wait" && ok.get("timed_out") == Some(&serde_json::Value::Bool(true));
+                if timed_out { EXIT_WAIT_TIMEOUT } else { 0 }
             } else {
                 let err = reply.get("err").and_then(|e| e.as_str()).unwrap_or("unknown error");
                 eprintln!("roost: {err}");
@@ -150,13 +210,17 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
     m.insert("token".into(), token.into());
     m.insert("method".into(), verb.into());
     match verb {
-        "list" => {}
+        "list" => {
+            reject_unknown_flags(verb, rest, &[])?;
+        }
         "status" => {
+            reject_unknown_flags(verb, rest, &[])?;
             if let Some(p) = positional(rest).first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
         }
         "spawn" => {
+            reject_unknown_flags(verb, rest, &["--cwd", "--input"])?;
             let pos = positional(rest);
             let adapter = pos.first().ok_or("spawn needs an ADAPTER")?;
             m.insert("adapter".into(), adapter.as_str().into());
@@ -168,11 +232,13 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             }
         }
         "fork" => {
+            reject_unknown_flags(verb, rest, &[])?;
             if let Some(p) = positional(rest).first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
         }
         "send" => {
+            reject_unknown_flags(verb, rest, &["--all", "--enter"])?;
             let pos = positional(rest);
             if has_flag(rest, "--all") {
                 // --all replaces the PANE positional; a leading token that
@@ -195,6 +261,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             }
         }
         "read" => {
+            reject_unknown_flags(verb, rest, &["--tail", "--full"])?;
             let pos = positional(rest);
             let pane = pos.first().ok_or("read needs a PANE")?;
             m.insert("pane".into(), parse_pane(pane)?.into());
@@ -209,12 +276,14 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             m.insert("mode".into(), mode);
         }
         "close" => {
+            reject_unknown_flags(verb, rest, &["--force"])?;
             let pos = positional(rest);
             let pane = pos.first().ok_or("close needs a PANE")?;
             m.insert("pane".into(), parse_pane(pane)?.into());
             m.insert("force".into(), has_flag(rest, "--force").into());
         }
         "wait" => {
+            reject_unknown_flags(verb, rest, &["--until", "--timeout"])?;
             let pos = positional(rest);
             if pos.is_empty() {
                 return Err("wait needs at least one PANE".into());
@@ -237,11 +306,41 @@ fn parse_pane(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| format!("not a pane id: {s}"))
 }
 
-/// Args that aren't flags or flag values.
+/// Index of the first literal `--` in `args`, or `args.len()` if there is
+/// none — the end-of-options boundary every flag-parsing helper below
+/// shares. Nothing at or past it is ever read as a flag, so text that
+/// itself starts with `-`/`--` (e.g. `send 5 -- "--- plan ---"`) can only be
+/// mistaken for an option before this point.
+fn end_of_options(args: &[String]) -> usize {
+    args.iter().position(|a| a == "--").unwrap_or(args.len())
+}
+
+/// Every `--flag` in `args` ahead of `--` must be in `allowed`, or this is a
+/// usage error — a typo (`--entr` for `--enter`) or, worse, an arbitrary
+/// `--`-prefixed piece of prompt text used to be silently swallowed (along
+/// with whatever it introduced) while the reply still said ok. Mirrors the
+/// wire side's own invalid-`--until` error: name what was wrong, then
+/// enumerate what's actually valid for this verb.
+fn reject_unknown_flags(verb: &str, args: &[String], allowed: &[&str]) -> Result<(), String> {
+    for a in &args[..end_of_options(args)] {
+        if a.starts_with("--") && !allowed.contains(&a.as_str()) {
+            let opts = if allowed.is_empty() { "(none)".to_string() } else { allowed.join("|") };
+            return Err(format!("{verb}: unknown flag {a} (valid: {opts})"));
+        }
+    }
+    Ok(())
+}
+
+/// Args that aren't flags or flag values. A literal `--` ends option parsing
+/// (`end_of_options`): everything after it is positional verbatim, dashes
+/// and all — the escape hatch for text that would otherwise look like a
+/// flag, since every `--`-prefixed token *before* that point must already
+/// be one `reject_unknown_flags` has approved.
 fn positional(args: &[String]) -> Vec<String> {
+    let end = end_of_options(args);
     let mut out = Vec::new();
     let mut i = 0;
-    while i < args.len() {
+    while i < end {
         let a = &args[i];
         if a.starts_with("--") {
             // --cwd/--input/--tail take a value; skip it.
@@ -255,15 +354,23 @@ fn positional(args: &[String]) -> Vec<String> {
             i += 1;
         }
     }
+    if end < args.len() {
+        out.extend(args[end + 1..].iter().cloned()); // literal, past the `--`
+    }
     out
 }
 
+/// The value following `flag` — only if `flag` appears before `--`, so a
+/// flag *name* typed as literal data past the end-of-options marker (e.g.
+/// `send 5 -- --cwd`) is never mistaken for the real flag.
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    let end = end_of_options(args);
+    args[..end].iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
 }
 
+/// Same `--`-boundary rule as `flag_value`, for a boolean flag.
 fn has_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| a == flag)
+    args[..end_of_options(args)].iter().any(|a| a == flag)
 }
 
 /// Connect to `sock` and write `msg` as one newline-terminated JSON line —
@@ -351,6 +458,56 @@ mod tests {
         // in by mistake — usage error, not a guess.
         let owned: Vec<String> = ["send", "--all", "3", "x"].iter().map(|s| s.to_string()).collect();
         assert!(build_request(&owned, "T".into()).is_err());
+    }
+
+    /// QA repro: `send 5 hi --entr` used to silently drop the typo'd flag
+    /// and send without Enter anyway, replying ok. Now a usage error naming
+    /// the flag this verb actually accepts.
+    #[test]
+    fn cli_rejects_an_unknown_flag_instead_of_dropping_it() {
+        let owned: Vec<String> =
+            ["send", "5", "hi", "--entr"].iter().map(|s| s.to_string()).collect();
+        let err = build_request(&owned, "T".into()).unwrap_err();
+        assert!(err.contains("--entr"), "must name what was wrong: {err}");
+        assert!(err.contains("--enter"), "must name the valid flag: {err}");
+    }
+
+    /// QA repro: `send 5 "--- plan ---"` used to send an empty string and
+    /// still reply ok — the worst failure mode for LLM-authored prompt text.
+    /// `--` is the fix: an explicit end-of-options marker after which
+    /// everything is literal, however many leading dashes it has.
+    #[test]
+    fn cli_dash_dash_ends_options_so_dashed_text_sends_verbatim() {
+        match parse(&["send", "5", "--", "--- plan ---"]).method {
+            Method::Send { pane, text, submit } => {
+                assert_eq!(pane, 5);
+                assert_eq!(text, "--- plan ---");
+                assert!(!submit, "-- text must never be misread as --enter");
+            }
+            _ => panic!(),
+        }
+        // The same marker works for spawn's ADAPTER and wait's PANE list —
+        // it's a property of `positional`, not a `send`-only special case.
+        match parse(&["wait", "--", "5"]).method {
+            Method::Wait { panes, .. } => assert_eq!(panes, vec![5]),
+            _ => panic!(),
+        }
+    }
+
+    /// Every verb needs its own, real help text — not the generic usage
+    /// (byte-identical to a bare invocation was the QA-caught bug) and not
+    /// two verbs sharing text that would make the wrong one look right.
+    #[test]
+    fn cli_verb_help_is_distinct_and_leads_with_its_own_usage() {
+        use std::collections::HashSet;
+        let texts: HashSet<&str> = super::VERBS.iter().map(|v| super::verb_help(v)).collect();
+        assert_eq!(texts.len(), super::VERBS.len(), "two verbs must not share identical help text");
+        for v in super::VERBS {
+            assert!(
+                super::verb_help(v).starts_with(&format!("roost {v}")),
+                "{v}'s help must lead with its own usage"
+            );
+        }
     }
 }
 
