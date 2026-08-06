@@ -7,11 +7,27 @@ appended to their phase with a `[src]` tag naming which lens found them.
 
 Sources: `[roadmap]` ROADMAP.md · `[ux]` ux-expert audit · `[rev]` reviewer
 sweep · `[sec]` security audit · `[qa]` black-box QA · `[res]` competitive
-research · `[principal]` found during the work.
+research · `[client]` stated by the client · `[principal]` found during the
+work.
 
 Status legend: ☐ open · 🔨 in progress · ✅ shipped (PR#) · ❌ descoped.
 
 ---
+
+## Standing client requirements
+
+Stated directly by the client; these outrank findings the team inferred.
+
+1. **Native macOS feel for common actions — no new shortcuts to learn.**
+   (2026-08-06) "Selection of text, copy etc. work seamlessly without user
+   learning any new shortcuts. The UI/UX should be like a native experience
+   on macOS." Concretely: drag-select, double/triple-click, Cmd+C, Cmd+V,
+   Cmd+A, shift-click extend, wheel scrollback, Cmd+F find must behave the
+   way they do in a plain iTerm2/Terminal.app window — or roost must stay
+   out of the emulator's way so they keep working. Any gesture that forces
+   the user into a roost-specific chord (copy mode, Alt+something) to do a
+   thing macOS does natively is a defect, not a feature. Owns Phase 2N
+   below; ux-expert + scout reports pending.
 
 ## Phase 0 — Baseline & housekeeping
 
@@ -112,6 +128,30 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
 - ☐ L1: control spawn splits the *human's* active tab rather than the
   caller's context (app.rs:2884) — layout churn under the human's hands.
   [sec L1, phase 3 candidate]
+
+## Phase 2N — Native macOS interaction parity [client requirement #1]
+
+Elevated to run alongside Phase 1 — this is a client-stated requirement, and
+it is the difference between "a tool you configure" and "a tool that just
+works". Scoping in flight: a scout is mapping the current
+mouse/selection/copy/paste reality end to end, and the ux-expert is auditing
+it against native macOS expectations (including the Cmd-key reality check —
+what a TUI can actually receive through iTerm2 / Terminal.app / Ghostty).
+
+The known shape of the problem: a multiplexer that captures the mouse takes
+away the terminal emulator's own native selection — the single most-
+complained-about thing about tmux on macOS. Every native gesture roost
+breaks and replaces with a chord (copy mode, Alt+…) is a defect under this
+requirement.
+
+- 🔨 Map current behavior + native-gap audit. [client, principal]
+- ☐ Decide the interaction model (don't-capture / bypass-modifier /
+  mirror-native-selection / hybrid) — one recommendation, logged in
+  DECISIONS.md, then build. Must not steal the mouse from panes whose app
+  requested mouse reporting itself (vim, Claude Code's own UI).
+- ☐ Ship it, with the gesture matrix pinned by tests.
+- ☐ README: state plainly which native gestures work and where roost
+  deliberately stays out of the emulator's way.
 
 ## Phase 2 — UX quick wins
 
