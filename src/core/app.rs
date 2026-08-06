@@ -38,6 +38,13 @@ const HOST_TITLE_INTERVAL: Duration = Duration::from_millis(200);
 /// launch before we assume the user isn't going to press one / already saw it.
 const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
 
+/// P0-3: how much of a spawn failure's full cause chain (`dead_reason`) is
+/// kept for the dead-pane bar (`spawn failed: {reason}`, C16) and the feed —
+/// one line, bounded so a pathological program path or a long chain can't
+/// blow past either. Comfortably wider than any real ENOENT/EACCES message;
+/// same shape as `pty::HOST_NOTIFY_CAP`.
+const DEAD_REASON_CAP: usize = 200;
+
 /// Adapters offered by the quick-launch picker (Alt+Enter), derived from the
 /// single adapter list in `agents` so the picker can never drift out of sync
 /// with the registry.
@@ -970,7 +977,17 @@ impl<B: PaneBackend> App<B> {
                 self.push_feed(line, false, Some(id));
             }
             Err(e) => {
-                self.dead.insert(id, e.to_string());
+                // P0-3: `e.to_string()` (anyhow's default Display) shows only
+                // the outermost `.context()` pty.rs adds ("spawning pi") —
+                // the real cause (ENOENT/EACCES) is computed, carried, and
+                // then dropped right here, one call before the dead-pane bar
+                // would show it. `dead_reason` walks the whole chain instead.
+                let reason = dead_reason(&e);
+                // P0-2: same reason, on the activity feed — the spawn success
+                // arm above already logs a "spawned" line; a failure deserves
+                // the symmetric "spawn failed" one, not silence.
+                self.push_feed(format!("spawn failed: {reason}"), false, Some(id));
+                self.dead.insert(id, reason);
             }
         }
     }
@@ -1611,6 +1628,11 @@ impl<B: PaneBackend> App<B> {
             "spawned_by": spec.and_then(|s| s.spawned_by),
             "status": self.status_str(id),
             "focused": id == self.focused,
+            // P0-2: null unless the pane is dead *and* roost knows why —
+            // `list`/`status` are what a `spawn` caller polls afterward, so
+            // this is the same reason `spawn_reply` folds into the spawn
+            // reply itself when it's already known by then.
+            "error": self.dead.get(&id),
         })
     }
 
@@ -1644,7 +1666,15 @@ impl<B: PaneBackend> App<B> {
                 if !self.may_target(actor, p) {
                     return Reply::err("forbidden: pane not in your subtree");
                 }
-                Reply::ok(serde_json::json!({ "pane": p, "status": self.status_str(p) }))
+                // P0-2: `status` is what an orchestrator polls after `spawn`
+                // — a dead pane's reason (`self.dead`) has to reach it here,
+                // not just the bare "exited" `status_str` already gave, or a
+                // caller that only checks `status` still retries forever.
+                Reply::ok(serde_json::json!({
+                    "pane": p,
+                    "status": self.status_str(p),
+                    "error": self.dead.get(&p),
+                }))
             }
             None => self.ctl_list(actor),
         }
@@ -1688,7 +1718,20 @@ impl<B: PaneBackend> App<B> {
         }
         self.relayout();
         self.save();
-        Reply::ok(serde_json::json!({ "pane": id }))
+        self.spawn_reply(id)
+    }
+
+    /// P0-2: the `{"pane": id}` reply `ctl_spawn`/`ctl_fork` both end on,
+    /// folding in whatever `spawn_child` → `spawn_pane` already learned
+    /// *synchronously* (`self.dead`) — the ENOENT/EACCES class of failure
+    /// finding #1 is about, fully known by the time this reply goes out, at
+    /// no extra latency. A pane that starts fine and dies moments later is a
+    /// different, later event with no reason string to attach here yet; that
+    /// one reaches the caller through `status`/`list` instead (`pane_json`,
+    /// `ctl_status`), never by delaying THIS reply to wait and see — a
+    /// spawn call must answer promptly, not hang on a race it can't win.
+    fn spawn_reply(&self, id: PaneId) -> Reply {
+        Reply::ok(serde_json::json!({ "pane": id, "error": self.dead.get(&id) }))
     }
 
     fn ctl_fork(&mut self, actor: Actor, pane: Option<PaneId>) -> Reply {
@@ -1727,7 +1770,7 @@ impl<B: PaneBackend> App<B> {
         };
         self.relayout();
         self.save();
-        Reply::ok(serde_json::json!({ "pane": id }))
+        self.spawn_reply(id)
     }
 
     fn ctl_send(&mut self, actor: Actor, pane: PaneId, text: &str, submit: bool) -> Reply {
@@ -5229,6 +5272,24 @@ fn abbreviate_home(cwd: &Path, home: Option<&Path>) -> String {
     }
 }
 
+/// P0-3: what `spawn_pane` records for a dead pane, and what the dead-pane
+/// bar and feed line show — anyhow's default `Display` (`{}`) keeps only the
+/// outermost `.context()` pty.rs adds ("spawning pi"); the alternate format
+/// (`{:#}`) walks the whole chain on one line ("spawning pi: No such file or
+/// directory (os error 2)"), which is the difference between a message and
+/// an answer. Capped and truncated on a char boundary — same shape as
+/// `pty::sanitize_for_host` — so a pathological chain still reads as one
+/// line in the bar instead of spilling past it.
+fn dead_reason(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    if full.chars().count() <= DEAD_REASON_CAP {
+        return full;
+    }
+    let mut truncated: String = full.chars().take(DEAD_REASON_CAP.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — the whole app core runs against fakes, no PTYs involved.
 // ---------------------------------------------------------------------------
@@ -6378,6 +6439,108 @@ mod tests {
             method: Method::Close { pane: p, force: false },
         }));
         assert_eq!(app.runtimes.len(), 1);
+    }
+
+    /// A registered adapter whose `launch`/`resume` always name FakePane's
+    /// dedicated spawn-failure hook (`program == "spawn-fail"`) — deterministic
+    /// and hermetic, unlike coercing this through ShellAdapter's real `$SHELL`
+    /// (every other test's `mk_app(shell_ws())` reads that same process-global
+    /// var while constructing its own app, which is exactly the kind of
+    /// cross-test race a mutated env var risks).
+    struct AlwaysFailsAdapter;
+    impl agents::AgentAdapter for AlwaysFailsAdapter {
+        fn id(&self) -> &'static str {
+            "always-fails"
+        }
+        fn launch(&self, cwd: &Path) -> agents::CommandSpec {
+            agents::CommandSpec::new("spawn-fail", cwd)
+        }
+        fn resume(&self, cwd: &Path, _session: &str) -> agents::CommandSpec {
+            self.launch(cwd)
+        }
+    }
+
+    /// P0-2 / P0-3 end-to-end: a synchronous PTY spawn failure must be
+    /// visible over the socket — in the SAME `spawn` reply that used to say
+    /// only `{"pane": id}`, and again on every later `status`/`list` poll,
+    /// and on the feed. All from the one place `spawn_pane`'s `Err` arm now
+    /// runs.
+    #[test]
+    fn ctl_spawn_status_list_and_feed_all_surface_a_synchronous_spawn_failure() {
+        use crate::core::control::{Method, Reply, Request};
+        let mut registry = agents::registry();
+        registry.insert("always-fails", Box::new(AlwaysFailsAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+        )
+        .unwrap();
+        let ct = app.control_token().to_string();
+        let ok = |r: Reply| match r {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("expected ok, got err: {err}"),
+        };
+
+        // P0-2: the spawn reply already knows — spawn_pane ran synchronously
+        // inside spawn_child, before this reply was ever built.
+        let spawned = ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Spawn { adapter: "always-fails".into(), cwd: None, initial_input: None },
+        }));
+        let id = spawned["pane"].as_u64().unwrap();
+        // FakePane::spawn's hook is a bare `anyhow::bail!` — no chain to
+        // walk, so this also pins that a plain, unchained message still
+        // survives `dead_reason` unchanged (the chained case is
+        // `dead_reason_keeps_the_real_cause_reachable`, and the real chain
+        // pty.rs actually produces is `spawn_failure_keeps_the_real_cause_
+        // reachable_via_alternate_format` in infra::pty).
+        assert_eq!(spawned["error"].as_str(), Some("spawn-fail requested"));
+
+        // And a caller that only polls afterward gets the same reason.
+        let status = ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Status { pane: Some(id) },
+        }));
+        assert_eq!(status["status"], "exited");
+        assert_eq!(status["error"].as_str(), Some("spawn-fail requested"));
+
+        let list = ok(app.handle_control(Request { token: ct, method: Method::List }));
+        let entry =
+            list.as_array().unwrap().iter().find(|p| p["pane"].as_u64() == Some(id)).unwrap();
+        assert_eq!(entry["error"].as_str(), Some("spawn-fail requested"));
+
+        // P0-2's "ideally the activity feed" half.
+        assert!(
+            app.feed().iter().any(|e| e.text == "spawn failed: spawn-fail requested"),
+            "{:?}",
+            app.feed()
+        );
+    }
+
+    /// The non-regression this all rides on: a healthy pane's `error` is
+    /// `null`, not just absent-when-convenient — `status`/`list` must not
+    /// start crying wolf for panes that spawned fine.
+    #[test]
+    fn pane_json_and_status_report_a_null_error_for_a_healthy_pane() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let ok = |r: Reply| match r {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("expected ok, got err: {err}"),
+        };
+        let id = app.focused;
+        let status =
+            ok(app.handle_control(Request { token: ct.clone(), method: Method::Status { pane: Some(id) } }));
+        assert!(status["error"].is_null());
+        let list = ok(app.handle_control(Request { token: ct, method: Method::List }));
+        assert!(list.as_array().unwrap()[0]["error"].is_null());
     }
 
     #[test]
@@ -8519,6 +8682,34 @@ mod tests {
         // of it — guards against a naive str::starts_with reimplementation.
         let home = PathBuf::from("/home/nav");
         assert_eq!(abbreviate_home(&PathBuf::from("/home/navvy/work"), Some(&home)), "/home/navvy/work");
+    }
+
+    /// P0-3: the exact bug — a chained error's default `Display` drops
+    /// everything past the outermost `.context()`. `dead_reason` must not:
+    /// the cause has to actually reach the string the dead-pane bar (and
+    /// now the feed/status `error` field) renders.
+    #[test]
+    fn dead_reason_keeps_the_real_cause_reachable() {
+        let err = anyhow::anyhow!("No such file or directory (os error 2)").context("spawning pi");
+        let reason = dead_reason(&err);
+        assert!(reason.contains("spawning pi"), "{reason:?}");
+        assert!(reason.contains("No such file or directory"), "{reason:?}");
+        assert!(!reason.contains('\n'), "must stay on one line: {reason:?}");
+        // `{}` alone is exactly the outer context — the bug this replaces.
+        assert_eq!(reason, format!("{err:#}"));
+        assert_ne!(reason, format!("{err}"));
+    }
+
+    /// P0-3: a pathological chain is capped, not left to blow past the
+    /// dead-pane bar — truncated on a char boundary so a multi-byte glyph
+    /// is never split.
+    #[test]
+    fn dead_reason_caps_a_long_chain_on_a_char_boundary() {
+        let err = anyhow::anyhow!("{}", "x".repeat(DEAD_REASON_CAP * 2)).context("spawning wide 日");
+        let reason = dead_reason(&err);
+        assert_eq!(reason.chars().count(), DEAD_REASON_CAP);
+        assert!(reason.ends_with('…'));
+        assert!(std::str::from_utf8(reason.as_bytes()).is_ok(), "never split a glyph");
     }
 
     #[test]
