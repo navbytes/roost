@@ -1,0 +1,23 @@
+schema: spec-driven
+
+# Shown to AI when creating artifacts.
+context: |
+  roost: a session-native terminal multiplexer for AI agent CLIs (pi, Claude
+  Code, shell), in Rust + ratatui. No daemon — workspace resurrection rides on
+  each adapter's own session ids. Specs of record: DESIGN.md (philosophy),
+  DESIGN-ui.md (chrome contracts C1–C27), DESIGN-control.md (control surface),
+  SPEC-ux.md, SPEC-parity.md; ROADMAP.md tracks deferred scope. TUI chrome is
+  "ink · paper · one red" — terminal-theme-inherited, no fixed RGB, no fills;
+  any src/ui/** change gets a design-supervisor audit. Tests: cargo test
+  (unit + PTY harness integration under tests/). CI: .github/workflows/ci.yml.
+  Company conventions: single writer per file-set; effort scales to task
+  weight; durable lessons/decisions get promoted to nt, not left in
+  engagement docs.
+
+rules:
+  proposal:
+    - Keep under 400 words; include a Non-goals line under What Changes
+  tasks:
+    - 'Every task names an owner agent and its exclusive file-set, e.g. "1.1 [coder] (claude/TEAM.md) Update section 6"'
+  design:
+    - 'List each decision as: choice — why — revisit-when'
