@@ -31,6 +31,10 @@ Status legend: ☐ open · 🔨 in progress · ✅ shipped (PR#) · ❌ descoped
 
 ## Phase 3 — Fleet & robustness UX (promoted deferred items)
 
+- ☐ P21's dump-to-editor half (copy-mode scrollback → $EDITOR) — the one
+  SPEC-parity sub-item deliberately left undone; assess promotion.
+  [principal, SPEC-parity P21]
+
 - ☐ Dead-pane `Enter` retry re-runs the same resume command even after a
   permanent failure; distinguish transient vs permanent. [roadmap: choice]
 - ☐ Per-principal connection/rate cap on the control socket (global 64-conn
@@ -39,11 +43,43 @@ Status legend: ☐ open · 🔨 in progress · ✅ shipped (PR#) · ❌ descoped
 
 ## Phase 4 — Category-best differentiators
 
+Research verdict [res]: roost's send/wait race-safety and no-daemon
+resurrection are already category-leading; what's missing is reach
+(install, adapters) not architecture. Full report: handoffs/research.md.
+
+- ☐ **Distribution — the #1 gap.** Zero install channels today (no releases,
+  no tap, no crates.io, no binstall). Every peer ships 3+. Ship: GitHub
+  Release binaries (mac arm64/x64 + linux x64/arm64) via release workflow,
+  Homebrew tap, cargo-binstall metadata; consider crates.io. [res: HIGH]
+- ☐ **codex CLI adapter** — `codex resume <id>`, JSONL sessions under
+  `~/.codex/sessions/YYYY/MM/DD/`. Cleanest, highest-payoff new adapter. [res: HIGH]
+- ☐ **gemini CLI adapter** — `gemini --resume <uuid>`, project-scoped
+  history. [res: HIGH]
+- ☐ **opencode adapter** — `--session <id>`; defend against sst/opencode#2086
+  (`--continue` can grab a subagent thread — always resume by explicit id). [res: MED]
+- ☐ **`roost spawn --worktree` (opt-in)** — create/enter a git worktree per
+  pane; neutralizes claude-squad's headline differentiator without lifecycle
+  management. Claude adapter already cwd-scopes its session files, so
+  worktree = clean session namespace for free. [res: MED-HIGH]
+- ☐ **README: state the send/wait no-race guarantee as a named edge** —
+  claude-squad's most-commented open bug (prompt sent before CLI ready,
+  lost) is the exact failure roost's status-socket + `wait` prevent; say so
+  with the receipts. [res: MED, docs-only]
 - ☐ Real session-branching `fork` (needs pi extension to go bidirectional;
   scope may be pi-side — assess). [roadmap: gap]
 - ☐ Persistent fleet rail (projects → agents) — parked with full design
   notes in ROADMAP; decision on promotion pends ux-expert verdict. [roadmap]
-- *Adapters / distribution / table-stakes gaps pend researcher report.*
+- ☐ **DECIDE (not auto-promoted): thin opt-in read-only remote check-in**
+  (`roost serve`-shape, "did my agent finish" from a phone). Category
+  normalized (Zellij web client, VibeTunnel, Cowork handoff) but collides
+  with the standing HTTP-transport descope and §5.5 consent posture —
+  needs advisor + security assessment before any build. [res: MED]
+- ❌ amp adapter — thread-based, breaks the (adapter,cwd,session-id) model;
+  do only after the easy three prove the pattern. [res]
+- ❌ aider adapter — no session-id resume mechanism; would be heuristic-only
+  like shell. Revisit if demand shows. [res]
+- ❌ Synchronized panes / session groups / plugin-WASM extensibility —
+  classic-multiplexer table stakes not demanded by fleet users. [res: LOW]
 
 ## Phase 5 — Health & performance
 
