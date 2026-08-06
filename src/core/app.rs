@@ -2698,8 +2698,10 @@ impl<B: PaneBackend> App<B> {
         if matches!(self.mode, Mode::Picker { .. }) {
             // U20: hit-test against the FILTERED list — the rows that are
             // actually drawn. A click on row 2 must launch what row 2 says,
-            // whatever the type-ahead has narrowed away.
-            let rows = self.picker_filtered().len();
+            // whatever the type-ahead has narrowed away. Row *count* only,
+            // so this skips `picker_filtered`'s PATH checks — same number of
+            // rows either way, they just don't need re-proving per click.
+            let rows = self.picker_filtered_ids().len();
             match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, rows, me.column, me.row)) {
                 Some(i) => self.picker_launch(i),
                 None if !inside => self.mode = Mode::Normal,
@@ -3975,13 +3977,18 @@ impl<B: PaneBackend> App<B> {
         // index (a digit past the end of a narrowed list) launches nothing
         // and leaves the picker up: the rows carry their own numbers, so it
         // is self-evidently out of range.
-        let items = self.picker_filtered();
-        let Some(adapter) = items.get(index).cloned() else { return };
+        //
+        // P2-13: addressed through the *raw* ids, not `picker_filtered`'s
+        // annotated display text — a not-installed row still reads as
+        // "codex gone" in the list, and launching has to spawn `codex`, not
+        // a string with a marker glued onto it.
+        let ids = self.picker_filtered_ids();
+        let Some(&adapter) = ids.get(index) else { return };
         let cwd = self.picker_cwd();
         self.mode = Mode::Normal;
         self.exit_zoom(); // C21: "picker launch" is a structural action
         self.hide_float(); // C22 rule 3: ditto
-        self.spawn_child(&adapter, cwd.clone(), None);
+        self.spawn_child(adapter, cwd.clone(), None);
         // Launching into a directory is the strongest evidence it is one you
         // are working in — float it to the top of the column for next time.
         if let Some(cwd) = cwd {
@@ -3991,13 +3998,17 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    /// U20: the adapter rows the picker is currently showing — every adapter
-    /// whose id contains the type-ahead query, in registry order. An empty
-    /// query shows everything, so the pre-U20 picker is the zero-keystroke
-    /// case of this one. Matching is ASCII-case-insensitive substring, not
-    /// prefix: `laud` should find `claude`, because a picker that only
-    /// honors prefixes makes you know the list you came to read.
-    pub fn picker_filtered(&self) -> Vec<String> {
+    /// U20: the RAW adapter ids the picker is currently showing — every
+    /// adapter whose id contains the type-ahead query, in registry order. An
+    /// empty query shows everything, so the pre-U20 picker is the
+    /// zero-keystroke case of this one. Matching is ASCII-case-insensitive
+    /// substring, not prefix: `laud` should find `claude`, because a picker
+    /// that only honors prefixes makes you know the list you came to read.
+    ///
+    /// What `picker_launch` addresses by index; `picker_filtered` is the
+    /// annotated *display* text derived from this exact same list, so the
+    /// two can never disagree about which row is which adapter.
+    fn picker_filtered_ids(&self) -> Vec<&'static str> {
         let filter = match &self.mode {
             Mode::Picker { filter, .. } => filter.to_ascii_lowercase(),
             _ => String::new(),
@@ -4005,7 +4016,32 @@ impl<B: PaneBackend> App<B> {
         picker_items()
             .into_iter()
             .filter(|id| filter.is_empty() || id.to_ascii_lowercase().contains(&filter))
-            .map(str::to_string)
+            .collect()
+    }
+
+    /// U20 / P2-13: the picker rows as display text — `picker_filtered_ids`,
+    /// each annotated when its launch program isn't actually on `$PATH` (a
+    /// Claude-only user's first `Alt+Enter` → `pi` used to be a dead pane
+    /// with no warning at all). Annotated rather than hidden: this registry
+    /// has five adapters, and on a single-agent machine hiding the other
+    /// four would leave one or two rows under a title that still reads "pick
+    /// agent" — confusingly short, and indistinguishable from a picker that
+    /// lost its adapters (the exact failure U20's own type-ahead title
+    /// already guards against). `" gone"` echoes this file's own voice for
+    /// "not here" (`roster_jump`'s "that pane is gone") and — checked against
+    /// the fixed 16-column adapter field `picker_row_body` budgets — is the
+    /// longest suffix that never crowds the cwd column even for the longest
+    /// ids (`claude`/`gemini`).
+    pub fn picker_filtered(&self) -> Vec<String> {
+        self.picker_filtered_ids()
+            .into_iter()
+            .map(|id| {
+                if adapter_installed(id, &self.registry) {
+                    id.to_string()
+                } else {
+                    format!("{id} gone")
+                }
+            })
             .collect()
     }
 
@@ -4353,8 +4389,9 @@ impl<B: PaneBackend> App<B> {
             Mode::Picker { .. } => {
                 // U20: both column lengths, read before the mode is borrowed
                 // mutably below — the adapter list depends on the live
-                // type-ahead filter, so it can't be a constant.
-                let rows = self.picker_filtered().len();
+                // type-ahead filter, so it can't be a constant. Row count
+                // only, so this is `picker_filtered_ids` (no PATH checks).
+                let rows = self.picker_filtered_ids().len();
                 let cwds = self.recent_cwds.len();
                 let Mode::Picker { selection, filter, cwd, on_cwd } = &mut self.mode else {
                     return true;
@@ -5325,6 +5362,50 @@ fn validate_spawn_cwd(cwd: &Path) -> Result<(), String> {
         return Err(format!("cwd {}: {e}", cwd.display()));
     }
     Ok(())
+}
+
+/// P2-13: does `program` resolve to a real, executable file the way a shell
+/// would find it? An absolute/relative path (contains `/`) is checked
+/// directly; a bare name is looked up across `path_dirs`, in order. Pure —
+/// the directories are a parameter, not read from the environment here — so
+/// a test can prove the search itself without depending on what happens to
+/// be installed on the machine that runs it.
+fn resolves_on_path<P: AsRef<Path>>(program: &str, mut path_dirs: impl Iterator<Item = P>) -> bool {
+    if program.contains('/') {
+        return is_executable_file(Path::new(program));
+    }
+    path_dirs.any(|dir| is_executable_file(&dir.as_ref().join(program)))
+}
+
+/// A regular file with at least one executable bit set — what actually lets
+/// a shell (or `spawn_command`) run it, not just see it.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// P2-13: is `id`'s launch program actually installed? Derived from the same
+/// `CommandSpec` `spawn_pane` would build (`adapter.launch`), not a
+/// hardcoded program name, so a new adapter's launch command is PATH-checked
+/// automatically without touching `agents/**`. An id the registry doesn't
+/// know (never happens today — `picker_items()` *is* the registry) is
+/// treated as installed: nothing here to warn about.
+fn adapter_installed(id: &str, registry: &Registry) -> bool {
+    let Some(adapter) = registry.get(id) else { return true };
+    let program = adapter.launch(Path::new(".")).program;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    resolves_on_path(&program, std::env::split_paths(&path))
 }
 
 // ---------------------------------------------------------------------------
@@ -8267,23 +8348,28 @@ mod tests {
     /// U20: typing filters the adapter list, Backspace widens it back. The
     /// picker was a fixed list you could only walk; with three adapters that
     /// is already two keystrokes more than naming one.
+    ///
+    /// Asserts against `picker_filtered_ids` (raw ids), not `picker_filtered`
+    /// (P2-13's *installed* annotation) — this test is about the substring
+    /// filter, and pinning it to which adapters this machine happens to have
+    /// on `$PATH` would make it pass or fail by host, not by logic.
     #[test]
     fn picker_type_ahead_filters_the_adapter_list_and_backspace_widens_it() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::QuickLaunch);
-        assert_eq!(app.picker_filtered().len(), picker_items().len(), "no filter shows all");
+        assert_eq!(app.picker_filtered_ids().len(), picker_items().len(), "no filter shows all");
         app.handle_mode_key(key('l'));
         // Substring, not prefix: `l` finds both `claude` and `shell`.
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude", "shell"]);
         app.handle_mode_key(key('a'));
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude"]);
         app.handle_mode_key(key('z'));
-        assert!(app.picker_filtered().is_empty(), "a query matching nothing shows nothing");
+        assert!(app.picker_filtered_ids().is_empty(), "a query matching nothing shows nothing");
         assert!(matches!(app.mode, Mode::Picker { .. }), "and the picker stays up");
         press(&mut app, crossterm::event::KeyCode::Backspace);
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude"]);
         press(&mut app, crossterm::event::KeyCode::Backspace);
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude", "shell"]);
     }
 
     /// U20: the `1..9` accelerators keep working *through* a filter — they
@@ -8374,6 +8460,64 @@ mod tests {
         );
         // ...and using a directory floats it back to the top.
         assert_eq!(app.picker_cwds()[0], PathBuf::from("/tmp"));
+    }
+
+    /// A registry substitute for "pi" whose `launch()` names a program that
+    /// will never exist on any real `$PATH` — deterministic proof that an
+    /// adapter is "not installed" without mutating the real `$PATH` (every
+    /// picker test — including render.rs's own — reads the SAME process-
+    /// global var through `App::registry`, which would make `$PATH`
+    /// mutation here exactly as unsafe as `$SHELL` is for `mk_app`).
+    struct NeverInstalledAdapter;
+    impl agents::AgentAdapter for NeverInstalledAdapter {
+        fn id(&self) -> &'static str {
+            "pi"
+        }
+        fn launch(&self, cwd: &Path) -> agents::CommandSpec {
+            agents::CommandSpec::new("roost-test-definitely-does-not-exist-anywhere-xyz123", cwd)
+        }
+        fn resume(&self, cwd: &Path, _session: &str) -> agents::CommandSpec {
+            self.launch(cwd)
+        }
+    }
+
+    /// P2-13 end-to-end: a not-installed adapter's picker row is annotated
+    /// (not hidden — five adapters is short enough that hiding four would
+    /// read as a picker that lost its list), and — the property that
+    /// actually matters — launching that row still spawns the RAW id, never
+    /// the annotated display text. `picker_items()` is the static, always-5
+    /// registry list (`agents::adapter_specs()`), so the substitution has to
+    /// happen in `App::registry` (what `adapter_installed` actually
+    /// consults), not in what rows get drawn.
+    #[test]
+    fn picker_filtered_annotates_uninstalled_adapters_but_launch_still_spawns_the_raw_id() {
+        let mut registry = agents::registry();
+        registry.insert("pi", Box::new(NeverInstalledAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+        )
+        .unwrap();
+
+        app.apply(Action::QuickLaunch);
+        let rows = app.picker_filtered();
+        app.handle_mode_key(key('1')); // row 1 = index 0 = "pi" (picker_items() order)
+        let spawned = app.find_spec(app.focused).map(|s| s.adapter.clone());
+
+        assert_eq!(rows[0], "pi gone", "pi's substituted launch program can never resolve");
+        // ShellAdapter resolves an absolute $SHELL (or /bin/bash fallback)
+        // path directly, not via a $PATH scan — real, unmodified, and
+        // guaranteed to exist on any machine this suite already assumes one
+        // on (session_members's pgrep, every shell-spawning test, ...).
+        let shell_at = picker_items().iter().position(|&id| id == "shell").unwrap();
+        assert_eq!(rows[shell_at], "shell", "resolved via an absolute path, not $PATH");
+        assert_eq!(spawned, Some("pi".to_string()), "launch used the raw id, not the annotated text");
     }
 
     /// U20: `↑`/`↓` steer whichever column has the keyboard, and `←`/`→`
@@ -8832,6 +8976,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(err.contains("is not a directory"), "{err:?}");
         assert!(err.contains(&file.display().to_string()), "{err:?}");
+    }
+
+    /// P2-13: the PATH-scan logic itself, against a synthetic directory
+    /// instead of whatever happens to be installed on the machine running
+    /// this — deterministic on any host.
+    #[test]
+    fn resolves_on_path_finds_an_executable_and_rejects_a_non_executable_or_missing_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("roost-path-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let exe = dir.join("real-program");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let not_exe = dir.join("not-executable");
+        std::fs::write(&not_exe, "just text").unwrap();
+        std::fs::set_permissions(&not_exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dirs = [dir.clone()];
+        assert!(resolves_on_path("real-program", dirs.iter()), "an executable on PATH is found");
+        assert!(
+            !resolves_on_path("not-executable", dirs.iter()),
+            "present but not executable ⇒ not found, same as absent"
+        );
+        assert!(!resolves_on_path("does-not-exist-at-all", dirs.iter()), "absent ⇒ not found");
+        // An absolute/relative path (contains '/') is checked directly, the
+        // way ShellAdapter's $SHELL-derived program always is — never
+        // scanned across `dirs`, so an empty iterator still finds it.
+        assert!(resolves_on_path(exe.to_str().unwrap(), std::iter::empty::<PathBuf>()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adapter_installed_checks_the_real_path_and_treats_an_unknown_id_as_installed() {
+        // ShellAdapter falls back to /bin/bash when $SHELL is unset; either
+        // way it's an absolute path, so this is the one adapter guaranteed
+        // not to depend on which agent CLIs happen to be on the machine
+        // running this test.
+        assert!(adapter_installed("shell", &agents::registry()));
+        // Nothing to warn about for an id the registry doesn't even have —
+        // `picker_items()` IS the registry, so this never happens through
+        // the picker, but the function must still answer something sane.
+        assert!(adapter_installed("not-a-real-adapter-id", &agents::registry()));
     }
 
     #[test]
