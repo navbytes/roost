@@ -227,14 +227,25 @@ fn scrub_host_identity(cmd: &mut CommandBuilder) {
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 }
 
+/// L3: every var `cli.rs` (`resolve_token`/`socket_path`) would accept as
+/// targeting or a credential for *this* roost — ROOST_SOCK (targeting) and
+/// both credential tiers, `ROOST_CONTROL_TOKEN` (checked *first*, and it's
+/// the fleet-wide one: unscoped, unlike a pane's own `ROOST_TOKEN`) and
+/// `ROOST_TOKEN` itself. The rest of roost's ROOST_* vars (`ROOST_STATE`,
+/// `ROOST_NO_EXT_INSTALL`, `ROOST_SYNC_CAP_MS`, `ROOST_DEBUG`) are config,
+/// not authority — none of them alone lets a pane act as Fleet or as
+/// another pane, so they're left alone same as `ROOST_PANE`.
+const CONTROL_ENV_VARS: &[&str] = &["ROOST_SOCK", "ROOST_CONTROL_TOKEN", "ROOST_TOKEN"];
+
 /// L3: drop roost's own control-plane credentials from the base env a pane
 /// child would otherwise inherit. Kept separate from `scrub_host_identity`
 /// on purpose — that one's contract is explicitly that TERM/ROOST_* vars
 /// are `spawn`'s to own, unchanged; this is `spawn` exercising that
-/// ownership, for exactly the two vars a nested roost must never pass on.
+/// ownership.
 fn scrub_control_env(cmd: &mut CommandBuilder) {
-    cmd.env_remove("ROOST_SOCK");
-    cmd.env_remove("ROOST_TOKEN");
+    for var in CONTROL_ENV_VARS {
+        cmd.env_remove(var);
+    }
 }
 
 /// Every live pid in session `sid`, **excluding the leader itself** (that one
@@ -457,13 +468,17 @@ impl PaneBackend for PtyPane {
         // Claude Code hooks) — design doc §6.1.
         cmd.env("ROOST_PANE", id.to_string());
         // L3: a `CommandBuilder` otherwise inherits *this* process's own
-        // environment — so if roost's own control listener never bound
-        // (main.rs's listener setup is `.ok()`), `spec.env` below carries no
-        // ROOST_SOCK/ROOST_TOKEN, and without this the child would silently
-        // inherit roost's own live ones instead of simply having none. That
-        // matters most for a roost nested inside a roost pane: it would hand
-        // its children the *outer* pane's socket and token. Removed
-        // unconditionally, before `spec.env` conditionally re-sets them.
+        // environment. Two ways that bites: if roost's own control listener
+        // never bound (main.rs's listener setup is `.ok()`), `spec.env`
+        // below carries no ROOST_SOCK/ROOST_TOKEN, and without this the
+        // child would silently inherit roost's own live ones instead of
+        // simply having none — worst case a roost nested inside a roost
+        // pane, handing its children the *outer* pane's socket and token.
+        // And separately, ROOST_CONTROL_TOKEN (cli.rs's fleet-wide, checked-
+        // first credential) is never in `spec.env` at all — it only ever
+        // reaches a pane by inheritance, from an operator's shell or an
+        // outer roost, so it must be scrubbed unconditionally too. Removed
+        // here, before `spec.env` conditionally re-sets the two it does own.
         scrub_control_env(&mut cmd);
         for (k, v) in &spec.env {
             cmd.env(k, v);
@@ -878,9 +893,9 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 mod tests {
     use super::{
         extract_selection, host_clipboard_bytes, host_notify_bytes, sanitize_for_host,
-        scrub_control_env, scrub_host_identity, sync_presented, HOST_IDENTITY_VARS,
-        HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL, OSC52_INTERVAL, OSC52_PAYLOAD_CAP,
-        SYNC_STALE_CAP_DEFAULT,
+        scrub_control_env, scrub_host_identity, sync_presented, CONTROL_ENV_VARS,
+        HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL, OSC52_INTERVAL,
+        OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -1102,23 +1117,39 @@ mod tests {
     }
 
     /// L3: a pane child must never inherit roost's own live control-plane
-    /// credentials — simulated here the same way the base env would carry
-    /// them into `CommandBuilder` (which inherits the spawning process's
-    /// env by default) if this roost were itself a pane inside another one.
+    /// credentials. Set as real *process* env vars rather than directly on
+    /// the builder — `CommandBuilder::new` materializes `std::env::vars_os()`
+    /// into its base env, so only this proves `env_remove` suppresses true
+    /// inheritance; setting them via `cmd.env()` first would only prove
+    /// removal of an explicit override. Restores the real values before
+    /// asserting, so a failure here can't leave them redirected for the
+    /// rest of the test binary.
     #[test]
-    fn scrub_control_env_removes_inherited_sock_and_token() {
+    fn scrub_control_env_removes_truly_inherited_vars() {
+        let saved: Vec<_> = CONTROL_ENV_VARS.iter().map(|&v| (v, std::env::var_os(v))).collect();
+        for &var in CONTROL_ENV_VARS {
+            std::env::set_var(var, "leaked-from-outer-roost");
+        }
         let mut cmd = CommandBuilder::new("true");
-        cmd.env("ROOST_SOCK", "/tmp/outer.sock");
-        cmd.env("ROOST_TOKEN", "outer-secret");
         scrub_control_env(&mut cmd);
-        assert!(cmd.get_env("ROOST_SOCK").is_none());
-        assert!(cmd.get_env("ROOST_TOKEN").is_none());
+        for (var, prev) in &saved {
+            match prev {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        for &var in CONTROL_ENV_VARS {
+            assert!(cmd.get_env(var).is_none(), "{var} must not survive as inherited env");
+        }
     }
 
     /// L3's other half: when this pane's spec *does* carry a real
     /// ROOST_SOCK/ROOST_TOKEN (the control listener bound), the scrub must
     /// not stand in the way of `spawn`'s own `spec.env` loop setting them —
     /// same ordering `spawn` uses (scrub, then apply `spec.env`).
+    /// ROOST_CONTROL_TOKEN isn't part of this: nothing ever re-sets it
+    /// after the scrub, in `spec.env` or anywhere else in `spawn` — the
+    /// removal test above is its whole story.
     #[test]
     fn scrub_control_env_does_not_block_spec_env_from_setting_them_after() {
         let mut cmd = CommandBuilder::new("true");
