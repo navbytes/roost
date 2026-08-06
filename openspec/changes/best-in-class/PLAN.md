@@ -16,7 +16,10 @@ Status legend: ☐ open · 🔨 in progress · ◐ partly shipped · ✅ shipped
 **Shipped so far:** #31 scaffold · #32–34, #36 audit folds + decisions ·
 **#35 distribution** (release binaries, Homebrew formula, binstall) ·
 **#37 control-surface hardening** (H1/M1/L2/L3/Info-b) ·
-**#38 control-plane P0** (malformed-request wedge, OSC 52 rate gate,
+**#37 control-surface hardening merged** (H1 host-terminal escape, M1 float
+refusal across all six verbs + a recycled-id guard at wait fire-time, L2,
+L3 incl. ROOST_CONTROL_TOKEN, notify `--`) · **#42 UI discoverability** ·
+**#44 mise install** · **#38 control-plane P0** (malformed-request wedge, OSC 52 rate gate,
 underflow class, kill guard) · **#39 doc accuracy** (detach honesty,
 macOS bypass modifier, broadcast/float, send-wait guarantee, stale
 DESIGN-control checklist) · **#40 codex + gemini adapters** (3 → 5 CLIs).
@@ -126,7 +129,7 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
   `ctl_send` don't (app.rs:1643, 1716, 1114). Any token-reading agent can
   `roost read` the human's private scratch shell. Fix: same `is_float`
   refusal. Also README:311 wrongly claims broadcast reaches the float. [sec M1]
-- ☐ **M3: no per-principal connection/rate cap** — one pane opens all 64
+- ☐ **M3: no per-principal connection/rate cap** (NOT in #37 — still open) — one pane opens all 64
   conns (or 16 waits) and locks out the human + the real orchestrator; it is
   also the enabler for M2's audit-log rolling. Per-token conn cap (~8) +
   token bucket on resolved Actor (sock.rs:148, app.rs:224). [sec M3,
