@@ -7,6 +7,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod opencode;
 pub mod pi;
 pub mod shell;
 
@@ -185,6 +186,7 @@ fn adapter_specs() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(claude::ClaudeAdapter),
         Box::new(codex::CodexAdapter),
         Box::new(gemini::GeminiAdapter),
+        Box::new(opencode::OpencodeAdapter),
         Box::new(shell::ShellAdapter),
     ]
 }
