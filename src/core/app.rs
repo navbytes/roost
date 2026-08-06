@@ -1690,6 +1690,20 @@ impl<B: PaneBackend> App<B> {
         if self.registry.get(adapter).is_none() {
             return Reply::err(format!("unknown adapter: {adapter}"));
         }
+        // QA-2: an explicit --cwd is the one path a caller can name a
+        // directory roost has never seen — validate it before anything is
+        // created. `None` (inherit the split target's cwd) needs no check:
+        // that path was already validated when ITS pane spawned.
+        let cwd = match cwd {
+            Some(c) => {
+                let path = PathBuf::from(c);
+                if let Err(e) = validate_spawn_cwd(&path) {
+                    return Reply::err(e);
+                }
+                Some(path)
+            }
+            None => None,
+        };
         let owner = match actor {
             Actor::Fleet => None,
             Actor::Pane(a) => Some(a),
@@ -1701,7 +1715,7 @@ impl<B: PaneBackend> App<B> {
         // §5.2). Save + restore around the call; the new pane is still
         // created, spawned, and its id returned either way.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
-        let id = self.spawn_child(adapter, cwd.map(PathBuf::from), owner);
+        let id = self.spawn_child(adapter, cwd, owner);
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
@@ -5290,6 +5304,29 @@ fn dead_reason(e: &anyhow::Error) -> String {
     truncated
 }
 
+/// QA-2: validate a spawn's cwd BEFORE a pane is created for it, so a
+/// mistyped or just-deleted path fails loudly here instead of the PTY child
+/// silently landing somewhere else (confirmed: `$HOME`) while `list`/`status`
+/// keep reporting the *requested* path. Two distinct failures, on purpose:
+/// a path that doesn't resolve at all (also covers a directory this process
+/// can't even see, e.g. a blocked parent) gets the raw OS error; a path that
+/// resolves but names a file, not a directory, gets its own clearer message
+/// — both are "you can't spawn there," but naming which is which saves a
+/// round trip. A directory that exists and is *listable* is treated as
+/// enterable — the same permission `chdir` itself needs — so this doubles as
+/// the "unreadable directory" case: `read_dir` opens it far enough to prove
+/// that without walking its contents.
+fn validate_spawn_cwd(cwd: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(cwd).map_err(|e| format!("cwd {}: {e}", cwd.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("cwd {} is not a directory", cwd.display()));
+    }
+    if let Err(e) = std::fs::read_dir(cwd) {
+        return Err(format!("cwd {}: {e}", cwd.display()));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — the whole app core runs against fakes, no PTYs involved.
 // ---------------------------------------------------------------------------
@@ -6541,6 +6578,54 @@ mod tests {
         assert!(status["error"].is_null());
         let list = ok(app.handle_control(Request { token: ct, method: Method::List }));
         assert!(list.as_array().unwrap()[0]["error"].is_null());
+    }
+
+    /// QA-2 through the real control path: `roost spawn --cwd <nonexistent>`
+    /// must refuse loudly, naming the path, and leave no pane behind for the
+    /// orchestrator to (wrongly) think is running there.
+    #[test]
+    fn ctl_spawn_refuses_a_nonexistent_cwd_and_creates_no_pane() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let before = app.runtimes.len();
+        let missing =
+            std::env::temp_dir().join(format!("roost-ctl-cwd-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: Some(missing.to_string_lossy().into_owned()),
+                initial_input: None,
+            },
+        });
+
+        match reply {
+            Reply::Err { err } => assert!(err.contains(&missing.display().to_string()), "{err:?}"),
+            Reply::Ok { ok } => panic!("expected a refusal, got ok: {ok}"),
+        }
+        assert_eq!(app.runtimes.len(), before, "no pane left behind for a rejected cwd");
+    }
+
+    /// The happy path around the QA-2 fix: a `--cwd` that IS a real
+    /// directory spawns exactly as before.
+    #[test]
+    fn ctl_spawn_accepts_a_real_cwd() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                initial_input: None,
+            },
+        });
+        let Reply::Ok { ok } = reply else { panic!("a real cwd must not be refused") };
+        assert!(ok["pane"].as_u64().is_some());
     }
 
     #[test]
@@ -8710,6 +8795,43 @@ mod tests {
         assert_eq!(reason.chars().count(), DEAD_REASON_CAP);
         assert!(reason.ends_with('…'));
         assert!(std::str::from_utf8(reason.as_bytes()).is_ok(), "never split a glyph");
+    }
+
+    #[test]
+    fn validate_spawn_cwd_accepts_a_real_directory() {
+        assert!(validate_spawn_cwd(&std::env::temp_dir()).is_ok());
+    }
+
+    /// QA-2: the confirmed repro — `roost spawn --cwd <nonexistent>` must
+    /// fail loudly, naming the path, with the real OS reason rather than a
+    /// made-up one.
+    #[test]
+    fn validate_spawn_cwd_names_the_path_when_it_does_not_exist() {
+        let missing =
+            std::env::temp_dir().join(format!("roost-cwd-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let err = validate_spawn_cwd(&missing).unwrap_err();
+        assert!(err.contains(&missing.display().to_string()), "{err:?}");
+        assert!(err.to_lowercase().contains("no such file"), "{err:?}");
+    }
+
+    /// QA-2's deliberate design call: a path that resolves but names a file,
+    /// not a directory, is a DIFFERENT, more specific failure than "doesn't
+    /// exist" — worth its own message instead of a raw (and here, absent)
+    /// OS error.
+    #[test]
+    fn validate_spawn_cwd_distinguishes_a_file_from_a_missing_directory() {
+        let dir = std::env::temp_dir().join(format!("roost-cwd-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+
+        let err = validate_spawn_cwd(&file).unwrap_err();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("is not a directory"), "{err:?}");
+        assert!(err.contains(&file.display().to_string()), "{err:?}");
     }
 
     #[test]
