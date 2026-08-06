@@ -307,6 +307,19 @@ fn encode_key(key: KeyEvent) -> InputResult {
         }
     };
     let bytes: Vec<u8> = match key.code {
+        // Safety (D9): a SUPER-modified char (⌘-anything) must never leak
+        // into a pane as a bare keystroke. Terminal.app/kitty/Ghostty keep ⌘
+        // for their own menu/copy-paste bindings and it never reaches roost
+        // at all; iTerm2 only delivers it if the user remapped it away from
+        // those. But *if* one ever does — e.g. under the kitty keyboard
+        // protocol roost negotiates — forwarding just the base char would
+        // silently drop the modifier: a ⌘C the emulator didn't intercept
+        // would type a bare `c` into the agent's prompt instead of doing
+        // nothing. Swallow it rather than bind or forward it. Checked ahead
+        // of the Ctrl arm below so Ctrl+⌘+char is swallowed too.
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::SUPER) => {
+            return InputResult::Ignore;
+        }
         KeyCode::Char(c) if ctrl => match ctrl_byte(c) {
             Some(b) => vec![b],
             // P12: no real C0 mapping — forward nothing rather than a wrong
@@ -884,6 +897,27 @@ mod tests {
                 "Ctrl+{c:?} must forward nothing"
             );
         }
+    }
+
+    // -- D9: a SUPER-modified char is swallowed, never forwarded ----------
+
+    /// Safety fix alongside D9 (native selection): most emulators keep ⌘ for
+    /// their own bindings so this never fires in practice, but if a ⌘-chord
+    /// ever does reach roost, it must not leak the base char into whatever
+    /// pane is focused (a `⌘C` that missed the emulator's own copy binding
+    /// typing a bare `c` into an agent's prompt).
+    #[test]
+    fn super_modified_chars_are_swallowed_not_forwarded() {
+        let cmd_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        assert!(matches!(translate(cmd_c), InputResult::Ignore));
+        // Composed with Ctrl too: must not fall into the C0 ctrl-byte path.
+        let ctrl_cmd_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER | KeyModifiers::CONTROL);
+        assert!(matches!(translate(ctrl_cmd_c), InputResult::Ignore));
+        // The C23 raw-mode path shares the guard (it delegates to the same
+        // `encode_key`), so a raw-focused pane is equally protected.
+        assert_eq!(encode_raw(cmd_c), Vec::<u8>::new());
+        // A plain, unmodified char is unaffected.
+        assert!(matches!(translate(plain(KeyCode::Char('c'))), InputResult::Forward(_)));
     }
 
     // -- P13: Ctrl+Alt is never a chord -----------------------------------
