@@ -307,7 +307,7 @@ fn encode_key(key: KeyEvent) -> InputResult {
         }
     };
     let bytes: Vec<u8> = match key.code {
-        // Safety (D9): a SUPER-modified char (⌘-anything) must never leak
+        // Safety (C29): a SUPER-modified char (⌘-anything) must never leak
         // into a pane as a bare keystroke. Terminal.app/kitty/Ghostty keep ⌘
         // for their own menu/copy-paste bindings and it never reaches roost
         // at all; iTerm2 only delivers it if the user remapped it away from
@@ -899,9 +899,9 @@ mod tests {
         }
     }
 
-    // -- D9: a SUPER-modified char is swallowed, never forwarded ----------
+    // -- C29: a SUPER-modified char is swallowed, never forwarded ----------
 
-    /// Safety fix alongside D9 (native selection): most emulators keep ⌘ for
+    /// Safety fix alongside C29 (native selection): most emulators keep ⌘ for
     /// their own bindings so this never fires in practice, but if a ⌘-chord
     /// ever does reach roost, it must not leak the base char into whatever
     /// pane is focused (a `⌘C` that missed the emulator's own copy binding

@@ -30,7 +30,7 @@ pub const WHEEL_LINES: i32 = 3;
 /// scrollback by, so it feels the same either side of the alternate screen.
 pub const ALT_SCROLL_KEYS: usize = 3;
 
-/// D9: roost's own mouse-capture sequences, deliberately a **subset** of
+/// C29: roost's own mouse-capture sequences, deliberately a **subset** of
 /// crossterm's `EnableMouseCapture`/`DisableMouseCapture`, which bundle five
 /// DEC private modes: `1000` (press/release), `1002` (button-drag motion),
 /// `1003` (**any**-motion tracking — every pointer move, button held or
@@ -517,7 +517,7 @@ mod tests {
         PaneMouseState { alternate_screen: true, app_cursor_keys: app_cursor, ..plain() }
     }
 
-    /// D9: the capture sequences are the exact subset of crossterm 0.29's
+    /// C29: the capture sequences are the exact subset of crossterm 0.29's
     /// `EnableMouseCapture`/`DisableMouseCapture` (`?1000` `?1002` `?1003`
     /// `?1015` `?1006` on enable, reverse order on disable) that drops
     /// `?1003` (any-motion — pure cost, `route_mouse` never handles `Moved`)
