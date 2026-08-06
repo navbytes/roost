@@ -1719,7 +1719,9 @@ impl<B: PaneBackend> App<B> {
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
-            return Reply::err("spawn refused: not enough room to split");
+            return Reply::err(
+                "spawn refused: not enough room to split; stack a pane with Alt+s first",
+            );
         };
         if let Some(text) = initial_input {
             let mut bytes = text.into_bytes();
@@ -1780,7 +1782,9 @@ impl<B: PaneBackend> App<B> {
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
-            return Reply::err("fork refused: not enough room to split");
+            return Reply::err(
+                "fork refused: not enough room to split; stack a pane with Alt+s first",
+            );
         };
         self.relayout();
         self.save();
@@ -2400,7 +2404,15 @@ impl<B: PaneBackend> App<B> {
             // may not be listening. The qualifier is the whole point — it
             // tells you where to look when the paste comes up empty.
             ClipboardOutcome::Osc52 => format!("copied {chars} chars (OSC 52)"),
-            ClipboardOutcome::Failed => "copy failed".to_string(),
+            // Both channels tried and lost (ClipboardOutcome::Failed's own
+            // contract: "neither channel got the text anywhere") — name that
+            // plainly, and point at the one thing actually worth checking:
+            // the terminal's own clipboard support, since a missing native
+            // helper is the far more common half of "both".
+            ClipboardOutcome::Failed => {
+                "copy failed: no clipboard channel worked; check your terminal's clipboard support"
+                    .to_string()
+            }
         }
     }
 
@@ -3715,7 +3727,7 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
         }
-        self.set_flash("no room to rearrange");
+        self.set_flash("no room to rearrange; stack a pane with Alt+s first");
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -5657,7 +5669,8 @@ mod tests {
             App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Osc52),
             "copied 13 chars (OSC 52)"
         );
-        assert_eq!(App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Failed), "copy failed");
+        let failed = App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Failed);
+        assert_eq!(failed, "copy failed: no clipboard channel worked; check your terminal's clipboard support");
         // A failure never quotes a count — there is no N to have copied.
         assert!(!App::<FakePane>::copy_flash_text(0, ClipboardOutcome::Failed).contains('0'));
     }
@@ -5670,7 +5683,10 @@ mod tests {
         app.flash_copy(4, ClipboardOutcome::Osc52);
         assert_eq!(app.flash(), Some("copied 4 chars (OSC 52)"));
         app.flash_copy(4, ClipboardOutcome::Failed);
-        assert_eq!(app.flash(), Some("copy failed"));
+        assert_eq!(
+            app.flash(),
+            Some("copy failed: no clipboard channel worked; check your terminal's clipboard support")
+        );
     }
 
     #[test]
@@ -9998,7 +10014,7 @@ mod tests {
         let before = format!("{:?}", app.ws.tabs[0].layout);
         app.apply(Action::CycleLayout);
         assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
-        assert_eq!(app.flash(), Some("no room to rearrange"));
+        assert_eq!(app.flash(), Some("no room to rearrange; stack a pane with Alt+s first"));
     }
 
     #[test]
