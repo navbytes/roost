@@ -444,10 +444,14 @@ fn host_pixels() -> (u16, u16) {
     crossterm::terminal::window_size().map(|ws| (ws.width, ws.height)).unwrap_or((0, 0))
 }
 
-/// Write the control token 0600, owner-only.
+/// Write the control token 0600, owner-only. `.mode(0o600)` only governs
+/// the mode a *new* file is created with — a token file a crash left
+/// behind (so `open()` here reuses it instead of creating fresh) keeps
+/// whatever mode it already had. `set_permissions` after opening acts on
+/// the file we now hold either way, so a stale file's mode is reset too.
 fn write_control_token(path: &std::path::Path, token: &str) {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -455,6 +459,7 @@ fn write_control_token(path: &std::path::Path, token: &str) {
         .mode(0o600)
         .open(path)
     {
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
         let _ = f.write_all(token.as_bytes());
     }
 }
@@ -1267,5 +1272,26 @@ mod tests {
         handle_mouse(&mut app, click(0, 1));
         assert_eq!(app.focused, 1);
         assert_eq!(app.display_rects().len(), app.rects().len(), "float no longer in the display list");
+    }
+
+    /// L2: `.mode(0o600)` on `OpenOptions` only applies when `open()`
+    /// actually creates the file — a token left behind by a crash (so this
+    /// call reuses it) must still end up owner-only, not whatever mode it
+    /// had before.
+    #[test]
+    fn write_control_token_resets_the_mode_of_a_pre_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("roost-token-mode-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("control.token");
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_control_token(&path, "fresh-token");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "a pre-existing file's mode must be reset, not inherited");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh-token");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
