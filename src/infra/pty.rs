@@ -37,6 +37,18 @@ const HOST_NOTIFY_CAP: usize = 200;
 /// roost's own stdout. tmux caps the same path for the same reason.
 const OSC52_PAYLOAD_CAP: usize = 100_000;
 
+/// P2 (this is the OSC 52 side of the same problem): at most one clipboard
+/// relay per pane per this window. `OSC52_PAYLOAD_CAP` bounds one write, not
+/// how often one arrives — a measured shell loop relayed 5000 sequences
+/// (129 KB) to the operator's real system clipboard with nothing to stop it.
+/// A real "copy this file/diff" action happens at human cadence, seconds
+/// apart at most; one relay per second is silent for that case and caps the
+/// abuse case at the same rate OSC 9 already caps notifications
+/// (`HOST_NOTIFY_INTERVAL`) — a separate constant because the two are
+/// unrelated features that just happen to want the same cadence, not
+/// because they must move together.
+const OSC52_INTERVAL: Duration = Duration::from_secs(1);
+
 /// P3: the selection targets xterm defines for OSC 52 — clipboard, primary,
 /// secondary, select, and cut-buffers 0–7. Anything outside this set is not
 /// a selection roost will name in a sequence it writes to its own terminal.
@@ -80,7 +92,11 @@ fn host_notify_bytes(
 /// P3: the OSC 52 roost relays to its own terminal for a pane's clipboard
 /// write, or `None` when the write must be dropped.
 ///
-/// Two gates, both about roost's terminal rather than the pane's intent:
+/// Three gates, all about roost's terminal/host rather than the pane's intent:
+/// * rate — at most one relay per pane per `interval`, mirroring OSC 9's
+///   `queue_host_notify`/`host_notify_bytes` gate: a runaway pane must not
+///   turn every clipboard write it makes into a write to the operator's real
+///   system clipboard;
 /// * the payload must be *actual base64* (`A–Z a–z 0–9 + / =`) and within
 ///   `cap` — a payload carrying ESC/BEL would close roost's own sequence
 ///   early and have its tail read as host commands, and an unbounded one is
@@ -91,8 +107,18 @@ fn host_notify_bytes(
 /// copied (the lie SPEC-ux U14 documents), and roost has no channel to
 /// correct it — a rejected relay is logged at the parser boundary, and the
 /// dropped case is only reachable by a payload that isn't a clipboard write
-/// in the first place.
-fn host_clipboard_bytes(selection: &str, payload_base64: &str, cap: usize) -> Option<Vec<u8>> {
+/// in the first place (or arrived too soon after the last one).
+fn host_clipboard_bytes(
+    selection: &str,
+    payload_base64: &str,
+    cap: usize,
+    last: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> Option<Vec<u8>> {
+    if last.is_some_and(|t| now.duration_since(t) < interval) {
+        return None;
+    }
     if payload_base64.len() > cap {
         return None;
     }
@@ -291,6 +317,9 @@ pub struct PtyPane {
     /// P2: when this pane last re-emitted an OSC 9 to the host, for
     /// `HOST_NOTIFY_INTERVAL`. `None` until the first one.
     last_host_notify: Option<Instant>,
+    /// P2/P3: when this pane last relayed an OSC 52 clipboard write to the
+    /// host, for `OSC52_INTERVAL`. `None` until the first one.
+    last_host_clipboard: Option<Instant>,
     /// P7: the cursor shape this pane asked for via DECSCUSR (`CSI Ps SP q`),
     /// 1..=6; `None` when it wants roost's own default. Mirrored to the host
     /// only while the pane is focused — one terminal, one cursor.
@@ -340,11 +369,7 @@ impl PtyPane {
             // apps too (the other half of SPEC-ux U14). Reads never arrive
             // here — the parser refuses to surface them at all.
             vt100::Effect::Osc52Write { selection, payload_base64 } => {
-                if let Some(bytes) =
-                    host_clipboard_bytes(&selection, &payload_base64, OSC52_PAYLOAD_CAP)
-                {
-                    self.effects.host_writes.extend_from_slice(&bytes);
-                }
+                self.queue_host_clipboard(&selection, &payload_base64);
             }
             // P7: DECSCUSR. Remembered per pane; only the *focused* pane's
             // shape is mirrored to the host, by the composition root. Shape
@@ -370,6 +395,26 @@ impl PtyPane {
             return;
         };
         self.last_host_notify = Some(now);
+        self.effects.host_writes.extend_from_slice(&bytes);
+    }
+
+    /// P2/P3: relay a pane's clipboard write to the host, rate-gated the
+    /// same shape as `queue_host_notify` — the timestamp only advances on an
+    /// actual emission, so a tight loop still gets one relay per interval
+    /// instead of resetting its own clock and being starved indefinitely.
+    fn queue_host_clipboard(&mut self, selection: &str, payload_base64: &str) {
+        let now = Instant::now();
+        let Some(bytes) = host_clipboard_bytes(
+            selection,
+            payload_base64,
+            OSC52_PAYLOAD_CAP,
+            self.last_host_clipboard,
+            now,
+            OSC52_INTERVAL,
+        ) else {
+            return;
+        };
+        self.last_host_clipboard = Some(now);
         self.effects.host_writes.extend_from_slice(&bytes);
     }
 }
@@ -456,6 +501,7 @@ impl PaneBackend for PtyPane {
             sync_view: None,
             effects: PaneEffects::default(),
             last_host_notify: None,
+            last_host_clipboard: None,
             cursor_shape: None,
             alive,
         })
@@ -591,8 +637,16 @@ impl PaneBackend for PtyPane {
         // one of them can itself fail to exit. Signalling -pgid (== -pid for a
         // leader) is a no-op if there's no such group.
         if let Some(pid) = self.pid {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            // P3: `process_id()` isn't documented to promise > 1, and
+            // `-(pid)` as a killpg target would be 0 (roost's own process
+            // group) if it were ever 0, or -1 — kill(2)'s "every process the
+            // caller may signal", pid 1 being init — if it were ever 1.
+            // Neither is "the pane's own process tree," so guard rather than
+            // assume.
+            if pid > 1 {
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
             }
             // ...and then sweep the whole **session**, because the group kill
             // above provably does not cover it. An interactive shell with job
@@ -806,7 +860,7 @@ mod tests {
     use super::{
         extract_selection, host_clipboard_bytes, host_notify_bytes, sanitize_for_host,
         scrub_host_identity, sync_presented, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP,
-        HOST_NOTIFY_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
+        HOST_NOTIFY_INTERVAL, OSC52_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -934,11 +988,14 @@ mod tests {
     }
 
     /// P3: a pane's clipboard write is relayed verbatim to the host — and
-    /// only when it really is a clipboard write.
+    /// only when it really is a clipboard write. Each call passes `last:
+    /// None` so the rate gate (pinned separately below) never interferes.
     #[test]
     fn host_clipboard_relays_writes_and_refuses_anything_else() {
         let cap = OSC52_PAYLOAD_CAP;
-        let emit = |sel: &str, payload: &str| host_clipboard_bytes(sel, payload, cap);
+        let emit = |sel: &str, payload: &str| {
+            host_clipboard_bytes(sel, payload, cap, None, Instant::now(), OSC52_INTERVAL)
+        };
 
         // Verbatim relay, every xterm selection target.
         assert_eq!(emit("c", "aGk=").unwrap(), b"\x1b]52;c;aGk=\x07".to_vec());
@@ -959,6 +1016,26 @@ mod tests {
         for sel in ["c\x07x", "clipboard", "c;p"] {
             assert!(emit(sel, "aGk=").is_none(), "must refuse selection {sel:?}");
         }
+    }
+
+    /// P2/P3: at most one OSC 52 relay per pane per interval — the measured
+    /// abuse case (a shell loop relaying 5000 sequences to the operator's
+    /// real clipboard) is exactly what `OSC52_PAYLOAD_CAP` alone does not
+    /// stop, since it bounds one write's size, not how often one arrives.
+    #[test]
+    fn host_clipboard_is_rate_limited_per_pane() {
+        let now = Instant::now();
+        let cap = OSC52_PAYLOAD_CAP;
+        let emit = |last| host_clipboard_bytes("c", "aGk=", cap, last, now, OSC52_INTERVAL);
+
+        // Just inside the window: dropped, even though the payload is fine.
+        let recent = Some(now - OSC52_INTERVAL + Duration::from_millis(1));
+        assert!(emit(recent).is_none());
+        // Past it: relayed again.
+        let old = Some(now - OSC52_INTERVAL - Duration::from_millis(1));
+        assert!(emit(old).is_some());
+        // The first write of a pane's life is never rate-limited.
+        assert!(emit(None).is_some());
     }
 
     /// P2/P3 share the sanitizer; pin that it keeps ordinary text intact.
