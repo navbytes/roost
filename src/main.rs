@@ -249,6 +249,12 @@ fn run(
     if let Some(msg) = infra::extension::ensure_pi_extension() {
         app.set_flash(msg);
     }
+    // Same idea for Claude Code: merge roost's status hooks into
+    // ~/.claude/settings.json. No-op when Claude Code isn't set up or
+    // ROOST_NO_EXT_INSTALL is set — see infra::extension module docs.
+    if let Some(msg) = infra::extension::ensure_claude_hooks() {
+        app.set_flash(msg);
+    }
 
     // Write the fleet control token where an external `roost <verb>` client can
     // read it (0600, owner-only, next to the socket). Never placed in a pane's
