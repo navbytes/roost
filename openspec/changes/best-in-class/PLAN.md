@@ -112,7 +112,6 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
 - ☐ L1: control spawn splits the *human's* active tab rather than the
   caller's context (app.rs:2884) — layout churn under the human's hands.
   [sec L1, phase 3 candidate]
-- L1: see Phase 3.
 
 ## Phase 2 — UX quick wins
 
