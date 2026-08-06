@@ -91,17 +91,7 @@ pub trait AgentAdapter: Send + Sync {
         taken: &HashSet<String>,
     ) -> Option<String> {
         let root = self.session_root(cwd)?;
-        for path in session_files_since(&root, since) {
-            if !self.owns_session_file(&path, cwd) {
-                continue;
-            }
-            if let Some(id) = self.session_id_from_path(&path) {
-                if !taken.contains(&id) {
-                    return Some(id);
-                }
-            }
-        }
-        None
+        newest_unclaimed_session(self, &root, cwd, since, taken)
     }
 
     /// Is a resumable session with this id still on disk? Distinguishes
@@ -111,25 +101,8 @@ pub trait AgentAdapter: Send + Sync {
     /// free; adapters without a session root (shell) return Unknown.
     fn session_state(&self, cwd: &Path, id: &str) -> SessionState {
         let Some(root) = self.session_root(cwd) else { return SessionState::Unknown };
-        // A missing sessions ROOT usually means the tool changed its on-disk
-        // layout or $HOME resolved differently — not that *this* session is
-        // gone, so don't wipe a possibly-still-valid resume pointer over it.
-        // An unreadable root (permission/transient) is the same "can't tell".
-        // Only an id absent from a root that's actually present and readable
-        // is Gone (below).
-        if std::fs::read_dir(&root).is_err() {
-            return SessionState::Unknown;
-        }
-        let exists = session_files_since(&root, SystemTime::UNIX_EPOCH).iter().any(|p| {
-            self.owns_session_file(p, cwd) && self.session_id_from_path(p).as_deref() == Some(id)
-        });
-        if exists {
-            SessionState::Exists
-        } else {
-            SessionState::Gone
-        }
+        session_file_state(self, &root, cwd, id)
     }
-
 }
 
 /// Is `id` a plausible session id we're willing to hand to `pi --session` /
@@ -172,6 +145,55 @@ pub fn session_files_since(root: &Path, since: SystemTime) -> Vec<PathBuf> {
     }
     found.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
     found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Shared core of `AgentAdapter::detect_session`'s default: the newest file
+/// under `root` that `adapter` owns for `cwd` and that isn't in `taken`.
+/// Pulled out to a free function (rather than left inline in the trait
+/// default) so an adapter that overrides `detect_session` to try a cheaper
+/// candidate root first (pi, below) can fall back to scanning a wider root
+/// through the exact same matching rules — not a re-derived copy of them.
+pub fn newest_unclaimed_session<A: AgentAdapter + ?Sized>(
+    adapter: &A,
+    root: &Path,
+    cwd: &Path,
+    since: SystemTime,
+    taken: &HashSet<String>,
+) -> Option<String> {
+    for path in session_files_since(root, since) {
+        if !adapter.owns_session_file(&path, cwd) {
+            continue;
+        }
+        if let Some(id) = adapter.session_id_from_path(&path) {
+            if !taken.contains(&id) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Shared core of `AgentAdapter::session_state`'s default, once a root is in
+/// hand: is `id` present under `root` and owned by `cwd`? See
+/// `newest_unclaimed_session` for why this is a free function.
+///
+/// A missing/unreadable `root` is Unknown, not Gone — don't wipe a possibly-
+/// still-valid resume pointer just because we can't currently read the
+/// directory (permission hiccup, or — for a narrowed root passed in by an
+/// override — simply a cwd whose subdirectory doesn't exist yet). Only an id
+/// absent from a root that's actually present and readable is Gone.
+pub fn session_file_state<A: AgentAdapter + ?Sized>(adapter: &A, root: &Path, cwd: &Path, id: &str) -> SessionState {
+    if std::fs::read_dir(root).is_err() {
+        return SessionState::Unknown;
+    }
+    let exists = session_files_since(root, SystemTime::UNIX_EPOCH).iter().any(|p| {
+        adapter.owns_session_file(p, cwd) && adapter.session_id_from_path(p).as_deref() == Some(id)
+    });
+    if exists {
+        SessionState::Exists
+    } else {
+        SessionState::Gone
+    }
 }
 
 pub type Registry = HashMap<&'static str, Box<dyn AgentAdapter>>;
