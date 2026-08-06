@@ -285,7 +285,9 @@ Status arrives two ways:
      present (set `ROOST_NO_EXT_INSTALL` to manage it yourself). Uses pi's
      `agent_start`/`agent_end`/`session_start`/ask-tool events, and reports
      session ids instantly.
-   - Claude Code: hook snippets in
+   - Claude Code: roost installs/updates three hooks into
+     `~/.claude/settings.json` automatically at startup when Claude Code is
+     present (same `ROOST_NO_EXT_INSTALL` opt-out). Details:
      [`extensions/claude-code-hooks.md`](extensions/claude-code-hooks.md).
 2. **Heuristic fallback** — recent PTY output ⇒ working; silence ⇒ waiting; a
    terminal bell (`0x07`) ⇒ needs-you (tmux-style). The bell also supplements
