@@ -3418,6 +3418,40 @@ mod tests {
         app.extend_selection(0, 5);
         out.push(("lit text selection", snap(&mut app)));
 
+        // C30: sub-two-row floor notice. The top-level draw() pre-empts all
+        // chrome when area.height < 2; the §2 gates that verify
+        // "every cell of every drawn chrome state" are vacuous over this case
+        // without a fixture for it. Render the full 80×1 state: the notice
+        // only and nothing else, no tab bar (would need height >= 2).
+        // This is the one case draw() handles before the usual header/body
+        // split, so the snapshot must come from a direct Terminal::draw
+        // with the small area — mk_app() and three_panes() both build 100×30,
+        // too large to trigger the early return.
+        {
+            use crate::agents;
+            use crate::core::workspace::Workspace;
+            use crate::ports::fakes::MemStore;
+            use std::path::PathBuf;
+            use std::sync::mpsc;
+
+            let store = MemStore::default();
+            let (tx, _rx) = mpsc::sync_channel(64);
+            let ws = Workspace::default_in(PathBuf::from("/tmp"));
+            let mut app = App::<crate::ports::fakes::FakePane>::new(
+                ws,
+                agents::registry(),
+                Box::new(store),
+                tx,
+                Size::new(80, 1),
+                (0, 0),
+                None,
+            )
+            .unwrap();
+            let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+            term.draw(|f| super::draw(f, &mut app)).unwrap();
+            out.push(("sub-two-row floor notice (80×1)", term.backend().buffer().clone()));
+        }
+
         out
     }
 
