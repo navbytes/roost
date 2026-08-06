@@ -17,9 +17,9 @@ mod ui;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use std::io::IsTerminal;
@@ -28,10 +28,11 @@ use std::time::Duration;
 
 use crate::core::app::App;
 use crate::core::event::AppEvent;
+use crate::core::layout::PaneRect;
 use crate::infra::notify::TermNotifier;
 use crate::infra::pty::PtyPane;
 use crate::infra::store::FsStore;
-use crate::ports::{Notifier, PaneBackend, StateStore};
+use crate::ports::{MouseProto, Notifier, PaneBackend, StateStore};
 use crate::ui::input::{self, Action, InputResult};
 use crate::ui::mouse::{self, MouseAction};
 
@@ -77,7 +78,9 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // Without mouse capture the hosting terminal consumes wheel events and
     // scrolls its own buffer — content *outside* the TUI. Capture them.
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // D9: a deliberate subset of crossterm's blanket `EnableMouseCapture` —
+    // see `mouse::MOUSE_CAPTURE_ENABLE` for which modes and why.
+    write_raw(mouse::MOUSE_CAPTURE_ENABLE.as_bytes());
     // Ask the host terminal to wrap pastes in the 200~/201~ guards so a paste
     // arrives as one Event::Paste instead of a keystroke flood — without
     // this, every newline in pasted text lands as a pressed Enter (a
@@ -126,8 +129,9 @@ fn main() -> Result<()> {
     // here — and popping with nothing pushed is a no-op terminals ignore
     // (the panic hook already relies on exactly that).
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    let _ =
-        execute!(std::io::stdout(), DisableBracketedPaste, DisableFocusChange, DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableFocusChange);
+    // D9: symmetric with the subset write at startup — see MOUSE_CAPTURE_ENABLE.
+    write_raw(mouse::MOUSE_CAPTURE_DISABLE.as_bytes());
     // P7: hand the cursor back the way the user's terminal had it — a pane's
     // insert bar must not outlive roost.
     let _ = execute!(std::io::stdout(), cursor_style(None));
@@ -143,9 +147,17 @@ fn main() -> Result<()> {
 /// no way to read its own title back, so the honest reset is roost's own
 /// name, which is what the user launched.)
 fn reset_host_title() {
+    write_raw(b"\x1b]2;roost\x07");
+}
+
+/// Write raw bytes straight to the host terminal, best-effort. Shared by
+/// `reset_host_title` above and D9's own mouse-capture sequences
+/// (`mouse::MOUSE_CAPTURE_ENABLE`/`_DISABLE`) — plain escape bytes crossterm
+/// has no dedicated `Command` for.
+fn write_raw(bytes: &[u8]) {
     use std::io::Write;
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b]2;roost\x07");
+    let _ = out.write_all(bytes);
     let _ = out.flush();
 }
 
@@ -214,9 +226,10 @@ fn install_panic_hook() {
             // P10: and the focus reporting roost switched on, for the same
             // reason — a crash must not leave the user's shell being told
             // about every focus change by a terminal nobody is listening to.
-            DisableFocusChange,
-            DisableMouseCapture
+            DisableFocusChange
         );
+        // D9: same subset-disable used on the normal exit path.
+        write_raw(mouse::MOUSE_CAPTURE_DISABLE.as_bytes());
         // P7: and the cursor shape a pane may have installed, for the same
         // reason the flags above are popped — a crash must not leave the
         // user's shell wearing a pane's insert bar.
@@ -663,10 +676,70 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
             app_cursor_keys: rt.app_cursor_keys(),
         })
         .unwrap_or_default();
+
+    // D9: native text selection — drag-select, double/triple-click,
+    // shift-click-extend — over a pane whose app never asked for the mouse.
+    // Rides the exact `pane` the P20 latch above already resolved, so a
+    // selection drag clamps to the originating pane for free. A mouse-aware
+    // pane (`state.proto != None`) is untouched: `route_mouse` below still
+    // owns it completely, exactly as it did before this feature existed
+    // (C29).
+    if !pane.collapsed && state.proto == MouseProto::None {
+        handle_native_selection(app, &pane, &me);
+    }
+
     match mouse::route_mouse(state, &pane, &me) {
         MouseAction::Forward(bytes) => app.forward_mouse(pane.id, &bytes),
         MouseAction::Scroll(delta) => app.wheel_scroll(pane.id, delta),
         MouseAction::None => {}
+    }
+}
+
+/// D9: native text selection over a pane whose app never asked for the
+/// mouse (`MouseProto::None`) — the macOS reflexes that were dead gestures
+/// before: drag-select, double/triple-click word/line, shift-click-extend.
+/// Paints through the same `app.selection` / `highlight_selection` (C17)
+/// Copy mode uses, and releases through the same U14 clipboard-outcome
+/// flash; the full gesture contract is C29. Only ever called for a
+/// `MouseProto::None` pane — the call site in `handle_mouse` gates that.
+///
+/// Double/triple-click interval and tolerance: crossterm reports no click
+/// count at all, so `App::click_count` derives it from timing (macOS's
+/// standard 500ms double-click window, `DOUBLE_CLICK_INTERVAL`) and a
+/// 1-cell position tolerance (`CLICK_TOLERANCE`) — a real press drifts a
+/// pixel even when the user means the same character.
+fn handle_native_selection<B: PaneBackend>(
+    app: &mut App<B>,
+    pane: &PaneRect,
+    me: &crossterm::event::MouseEvent,
+) {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    let (r, c) = inner_cell(pane.rect, me.column, me.row);
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) if me.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.extend_selection_to(pane.id, r, c);
+        }
+        MouseEventKind::Down(MouseButton::Left) => match app.click_count(pane.id, r, c) {
+            2 => app.select_word_at(pane.id, r, c),
+            3 => app.select_line_at(pane.id, r),
+            _ => app.begin_selection(pane.id, r, c),
+        },
+        MouseEventKind::Drag(MouseButton::Left) => app.extend_selection(r, c),
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(sel) = app.selection else { return };
+            if sel.anchor == sel.cursor {
+                app.selection = None; // a plain click selects nothing
+            } else if let Some(text) = app.finish_native_selection() {
+                let outcome = infra::clipboard::copy(&text); // U14
+                app.flash_copy(text.chars().count(), outcome);
+                // Highlight intentionally left showing — the contract says
+                // it stays lit until the next click (`App::on_click`) or
+                // keypress (`App::handle_mode_key`).
+            } else {
+                app.selection = None; // dragged over nothing extractable
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1262,6 +1335,147 @@ mod tests {
         handle_mouse(&mut app, release(a.x + 2, a.y + 2));
         assert!(app.runtimes.get(&1).unwrap().input.is_empty());
         assert!(app.runtimes.get(&2).unwrap().input.is_empty());
+    }
+
+    // ---- D9: native selection over a mouse-unaware pane -------------------
+
+    /// D9: a plain left-drag over a pane that never asked for the mouse
+    /// selects text and copies it on release — the gesture that was
+    /// entirely dead before (`route_mouse` returned `MouseAction::None` for
+    /// every Down/Drag/Up over a `MouseProto::None` pane). The highlight
+    /// then stays lit: the contract clears it on the *next* click or
+    /// keypress, not on the copy itself (`app_clears_a_lingering...` below,
+    /// and `core::app`'s own `finish_native_selection` tests).
+    #[test]
+    fn dragging_over_a_native_pane_selects_and_copies_on_release() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "dragged text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+        let sel = app.selection.expect("the drag left a selection behind");
+        assert_ne!(sel.anchor, sel.cursor, "a real drag, not a 0-length click");
+
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+        assert!(app.selection.is_some(), "the highlight stays lit after release");
+        assert!(app.flash().is_some(), "release flashes the U14 clipboard outcome");
+        assert_eq!(app.mouse_latch(), None, "the release still ends the P20 gesture");
+    }
+
+    /// D9: double-click selects the whitespace-delimited word under the
+    /// pointer and copies it on release, same as a drag.
+    #[test]
+    fn double_click_selects_the_word_and_copies_on_release() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["hello world".into()];
+        let r = app.display_rects()[0].rect;
+        let (x, y) = (r.x + 1 + 7, r.y + 1); // inner col 7 → inside "world"
+
+        handle_mouse(&mut app, click(x, y));
+        handle_mouse(&mut app, release(x, y));
+        assert!(app.selection.is_none(), "a plain click-release selects nothing");
+
+        handle_mouse(&mut app, click(x, y)); // 2nd click, same spot
+        let sel = app.selection.expect("the double-click marked a word selection");
+        assert_eq!((sel.anchor.1, sel.cursor.1), (6, 10), "the whole word \"world\"");
+
+        handle_mouse(&mut app, release(x, y));
+        assert!(app.selection.is_some(), "copies and leaves the highlight lit");
+    }
+
+    /// D9: triple-click selects the whole row and copies it on release.
+    #[test]
+    fn triple_click_selects_the_line_and_copies_on_release() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["hello world".into()];
+        let r = app.display_rects()[0].rect;
+        let (x, y) = (r.x + 3, r.y + 1);
+        let last = r.width - 3; // inner width (r.width - 2) minus 1
+
+        for _ in 0..2 {
+            handle_mouse(&mut app, click(x, y));
+            handle_mouse(&mut app, release(x, y));
+        }
+        handle_mouse(&mut app, click(x, y)); // 3rd click
+        let sel = app.selection.expect("the triple-click marked the whole row");
+        assert_eq!((sel.anchor, sel.cursor), ((0, 0), (0, last)));
+
+        handle_mouse(&mut app, release(x, y));
+        assert!(app.selection.is_some(), "copies and leaves the highlight lit");
+    }
+
+    /// D9: shift-click extends an existing selection to the pointer
+    /// (keeping the anchor) and copies the extended range on release.
+    #[test]
+    fn shift_click_extends_the_selection_and_copies_on_release() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "dragged text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 4, r.y + 1));
+        let anchor = app.selection.unwrap().anchor;
+
+        let mut shift_click = click(r.x + 8, r.y + 1);
+        shift_click.modifiers = KeyModifiers::SHIFT;
+        handle_mouse(&mut app, shift_click);
+        let sel = app.selection.expect("shift-click extended the selection");
+        assert_eq!(sel.anchor, anchor, "the anchor is unchanged by a shift-click");
+        assert_ne!(sel.cursor, anchor, "the cursor moved to the shift-click point");
+
+        handle_mouse(&mut app, release(r.x + 8, r.y + 1));
+        assert!(app.selection.is_some(), "copies and leaves the highlight lit");
+    }
+
+    /// D9: a plain click — including on a *different* pane than the one
+    /// holding the selection — dismisses a lingering native-selection
+    /// highlight (`App::on_click`'s cross-pane rule).
+    #[test]
+    fn a_plain_click_clears_a_lingering_native_selection() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // panes 1 | 2, side by side, focus 2
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "dragged text".into();
+        let r = app.display_rects().iter().find(|p| p.id == id).unwrap().rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+        assert!(app.selection.is_some(), "the drag left a highlight behind");
+
+        // The other pane is made SGR-mouse-aware, so this click cannot
+        // start a fresh native selection of its own there — isolating
+        // `on_click`'s cross-pane clearing rule from "a fresh press always
+        // restarts the gesture", which a second `MouseProto::None` pane
+        // would also exercise and confound this assertion with.
+        let other = app.display_rects().iter().find(|p| p.id != id).copied().unwrap();
+        app.runtimes.get_mut(&other.id).unwrap().proto = ports::MouseProto::Sgr;
+        handle_mouse(&mut app, click(other.rect.x + 2, other.rect.y + 1));
+        assert!(app.selection.is_none(), "clicking a different pane cleared the highlight");
+    }
+
+    /// D9: a pane that speaks SGR mouse reporting keeps the mouse entirely —
+    /// every gesture above forwards to the app instead, and `app.selection`
+    /// is never touched. Same shape as the existing P20 latch test above.
+    #[test]
+    fn a_mouse_aware_pane_is_untouched_by_native_selection_gestures() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().proto = ports::MouseProto::Sgr;
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+
+        assert!(app.selection.is_none(), "an SGR pane never gets a native selection");
+        let input = String::from_utf8(app.runtimes.get(&id).unwrap().input.clone()).unwrap();
+        assert_eq!(input.matches('\x1b').count(), 3, "every event forwarded instead: {input:?}");
     }
 
     /// C22: float-first hit-test ordering (a click inside its centered rect
