@@ -5,6 +5,7 @@
 //! fallback for arbitrary commands.
 
 pub mod claude;
+pub mod codex;
 pub mod pi;
 pub mod shell;
 
@@ -181,6 +182,7 @@ fn adapter_specs() -> Vec<Box<dyn AgentAdapter>> {
     vec![
         Box::new(pi::PiAdapter),
         Box::new(claude::ClaudeAdapter),
+        Box::new(codex::CodexAdapter),
         Box::new(shell::ShellAdapter),
     ]
 }
