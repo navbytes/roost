@@ -38,6 +38,13 @@ const HOST_TITLE_INTERVAL: Duration = Duration::from_millis(200);
 /// launch before we assume the user isn't going to press one / already saw it.
 const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
 
+/// P0-3: how much of a spawn failure's full cause chain (`dead_reason`) is
+/// kept for the dead-pane bar (`spawn failed: {reason}`, C16) and the feed —
+/// one line, bounded so a pathological program path or a long chain can't
+/// blow past either. Comfortably wider than any real ENOENT/EACCES message;
+/// same shape as `pty::HOST_NOTIFY_CAP`.
+const DEAD_REASON_CAP: usize = 200;
+
 /// Adapters offered by the quick-launch picker (Alt+Enter), derived from the
 /// single adapter list in `agents` so the picker can never drift out of sync
 /// with the registry.
@@ -970,7 +977,17 @@ impl<B: PaneBackend> App<B> {
                 self.push_feed(line, false, Some(id));
             }
             Err(e) => {
-                self.dead.insert(id, e.to_string());
+                // P0-3: `e.to_string()` (anyhow's default Display) shows only
+                // the outermost `.context()` pty.rs adds ("spawning pi") —
+                // the real cause (ENOENT/EACCES) is computed, carried, and
+                // then dropped right here, one call before the dead-pane bar
+                // would show it. `dead_reason` walks the whole chain instead.
+                let reason = dead_reason(&e);
+                // P0-2: same reason, on the activity feed — the spawn success
+                // arm above already logs a "spawned" line; a failure deserves
+                // the symmetric "spawn failed" one, not silence.
+                self.push_feed(format!("spawn failed: {reason}"), false, Some(id));
+                self.dead.insert(id, reason);
             }
         }
     }
@@ -1611,6 +1628,11 @@ impl<B: PaneBackend> App<B> {
             "spawned_by": spec.and_then(|s| s.spawned_by),
             "status": self.status_str(id),
             "focused": id == self.focused,
+            // P0-2: null unless the pane is dead *and* roost knows why —
+            // `list`/`status` are what a `spawn` caller polls afterward, so
+            // this is the same reason `spawn_reply` folds into the spawn
+            // reply itself when it's already known by then.
+            "error": self.dead.get(&id),
         })
     }
 
@@ -1644,7 +1666,15 @@ impl<B: PaneBackend> App<B> {
                 if !self.may_target(actor, p) {
                     return Reply::err("forbidden: pane not in your subtree");
                 }
-                Reply::ok(serde_json::json!({ "pane": p, "status": self.status_str(p) }))
+                // P0-2: `status` is what an orchestrator polls after `spawn`
+                // — a dead pane's reason (`self.dead`) has to reach it here,
+                // not just the bare "exited" `status_str` already gave, or a
+                // caller that only checks `status` still retries forever.
+                Reply::ok(serde_json::json!({
+                    "pane": p,
+                    "status": self.status_str(p),
+                    "error": self.dead.get(&p),
+                }))
             }
             None => self.ctl_list(actor),
         }
@@ -1660,6 +1690,20 @@ impl<B: PaneBackend> App<B> {
         if self.registry.get(adapter).is_none() {
             return Reply::err(format!("unknown adapter: {adapter}"));
         }
+        // QA-2: an explicit --cwd is the one path a caller can name a
+        // directory roost has never seen — validate it before anything is
+        // created. `None` (inherit the split target's cwd) needs no check:
+        // that path was already validated when ITS pane spawned.
+        let cwd = match cwd {
+            Some(c) => {
+                let path = PathBuf::from(c);
+                if let Err(e) = validate_spawn_cwd(&path) {
+                    return Reply::err(e);
+                }
+                Some(path)
+            }
+            None => None,
+        };
         let owner = match actor {
             Actor::Fleet => None,
             Actor::Pane(a) => Some(a),
@@ -1671,11 +1715,13 @@ impl<B: PaneBackend> App<B> {
         // §5.2). Save + restore around the call; the new pane is still
         // created, spawned, and its id returned either way.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
-        let id = self.spawn_child(adapter, cwd.map(PathBuf::from), owner);
+        let id = self.spawn_child(adapter, cwd, owner);
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
-            return Reply::err("spawn refused: not enough room to split");
+            return Reply::err(
+                "spawn refused: not enough room to split; stack a pane with Alt+s first",
+            );
         };
         if let Some(text) = initial_input {
             let mut bytes = text.into_bytes();
@@ -1688,7 +1734,20 @@ impl<B: PaneBackend> App<B> {
         }
         self.relayout();
         self.save();
-        Reply::ok(serde_json::json!({ "pane": id }))
+        self.spawn_reply(id)
+    }
+
+    /// P0-2: the `{"pane": id}` reply `ctl_spawn`/`ctl_fork` both end on,
+    /// folding in whatever `spawn_child` → `spawn_pane` already learned
+    /// *synchronously* (`self.dead`) — the ENOENT/EACCES class of failure
+    /// finding #1 is about, fully known by the time this reply goes out, at
+    /// no extra latency. A pane that starts fine and dies moments later is a
+    /// different, later event with no reason string to attach here yet; that
+    /// one reaches the caller through `status`/`list` instead (`pane_json`,
+    /// `ctl_status`), never by delaying THIS reply to wait and see — a
+    /// spawn call must answer promptly, not hang on a race it can't win.
+    fn spawn_reply(&self, id: PaneId) -> Reply {
+        Reply::ok(serde_json::json!({ "pane": id, "error": self.dead.get(&id) }))
     }
 
     fn ctl_fork(&mut self, actor: Actor, pane: Option<PaneId>) -> Reply {
@@ -1723,11 +1782,13 @@ impl<B: PaneBackend> App<B> {
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
-            return Reply::err("fork refused: not enough room to split");
+            return Reply::err(
+                "fork refused: not enough room to split; stack a pane with Alt+s first",
+            );
         };
         self.relayout();
         self.save();
-        Reply::ok(serde_json::json!({ "pane": id }))
+        self.spawn_reply(id)
     }
 
     fn ctl_send(&mut self, actor: Actor, pane: PaneId, text: &str, submit: bool) -> Reply {
@@ -2343,7 +2404,15 @@ impl<B: PaneBackend> App<B> {
             // may not be listening. The qualifier is the whole point — it
             // tells you where to look when the paste comes up empty.
             ClipboardOutcome::Osc52 => format!("copied {chars} chars (OSC 52)"),
-            ClipboardOutcome::Failed => "copy failed".to_string(),
+            // Both channels tried and lost (ClipboardOutcome::Failed's own
+            // contract: "neither channel got the text anywhere") — name that
+            // plainly, and point at the one thing actually worth checking:
+            // the terminal's own clipboard support, since a missing native
+            // helper is the far more common half of "both".
+            ClipboardOutcome::Failed => {
+                "copy failed: no clipboard channel worked; check your terminal's clipboard support"
+                    .to_string()
+            }
         }
     }
 
@@ -2641,8 +2710,10 @@ impl<B: PaneBackend> App<B> {
         if matches!(self.mode, Mode::Picker { .. }) {
             // U20: hit-test against the FILTERED list — the rows that are
             // actually drawn. A click on row 2 must launch what row 2 says,
-            // whatever the type-ahead has narrowed away.
-            let rows = self.picker_filtered().len();
+            // whatever the type-ahead has narrowed away. Row *count* only,
+            // so this skips `picker_filtered`'s PATH checks — same number of
+            // rows either way, they just don't need re-proving per click.
+            let rows = self.picker_filtered_ids().len();
             match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, rows, me.column, me.row)) {
                 Some(i) => self.picker_launch(i),
                 None if !inside => self.mode = Mode::Normal,
@@ -3656,7 +3727,7 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
         }
-        self.set_flash("no room to rearrange");
+        self.set_flash("no room to rearrange; stack a pane with Alt+s first");
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -3918,13 +3989,18 @@ impl<B: PaneBackend> App<B> {
         // index (a digit past the end of a narrowed list) launches nothing
         // and leaves the picker up: the rows carry their own numbers, so it
         // is self-evidently out of range.
-        let items = self.picker_filtered();
-        let Some(adapter) = items.get(index).cloned() else { return };
+        //
+        // P2-13: addressed through the *raw* ids, not `picker_filtered`'s
+        // annotated display text — a not-installed row still reads as
+        // "codex gone" in the list, and launching has to spawn `codex`, not
+        // a string with a marker glued onto it.
+        let ids = self.picker_filtered_ids();
+        let Some(&adapter) = ids.get(index) else { return };
         let cwd = self.picker_cwd();
         self.mode = Mode::Normal;
         self.exit_zoom(); // C21: "picker launch" is a structural action
         self.hide_float(); // C22 rule 3: ditto
-        self.spawn_child(&adapter, cwd.clone(), None);
+        self.spawn_child(adapter, cwd.clone(), None);
         // Launching into a directory is the strongest evidence it is one you
         // are working in — float it to the top of the column for next time.
         if let Some(cwd) = cwd {
@@ -3934,13 +4010,17 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    /// U20: the adapter rows the picker is currently showing — every adapter
-    /// whose id contains the type-ahead query, in registry order. An empty
-    /// query shows everything, so the pre-U20 picker is the zero-keystroke
-    /// case of this one. Matching is ASCII-case-insensitive substring, not
-    /// prefix: `laud` should find `claude`, because a picker that only
-    /// honors prefixes makes you know the list you came to read.
-    pub fn picker_filtered(&self) -> Vec<String> {
+    /// U20: the RAW adapter ids the picker is currently showing — every
+    /// adapter whose id contains the type-ahead query, in registry order. An
+    /// empty query shows everything, so the pre-U20 picker is the
+    /// zero-keystroke case of this one. Matching is ASCII-case-insensitive
+    /// substring, not prefix: `laud` should find `claude`, because a picker
+    /// that only honors prefixes makes you know the list you came to read.
+    ///
+    /// What `picker_launch` addresses by index; `picker_filtered` is the
+    /// annotated *display* text derived from this exact same list, so the
+    /// two can never disagree about which row is which adapter.
+    fn picker_filtered_ids(&self) -> Vec<&'static str> {
         let filter = match &self.mode {
             Mode::Picker { filter, .. } => filter.to_ascii_lowercase(),
             _ => String::new(),
@@ -3948,7 +4028,32 @@ impl<B: PaneBackend> App<B> {
         picker_items()
             .into_iter()
             .filter(|id| filter.is_empty() || id.to_ascii_lowercase().contains(&filter))
-            .map(str::to_string)
+            .collect()
+    }
+
+    /// U20 / P2-13: the picker rows as display text — `picker_filtered_ids`,
+    /// each annotated when its launch program isn't actually on `$PATH` (a
+    /// Claude-only user's first `Alt+Enter` → `pi` used to be a dead pane
+    /// with no warning at all). Annotated rather than hidden: this registry
+    /// has five adapters, and on a single-agent machine hiding the other
+    /// four would leave one or two rows under a title that still reads "pick
+    /// agent" — confusingly short, and indistinguishable from a picker that
+    /// lost its adapters (the exact failure U20's own type-ahead title
+    /// already guards against). `" gone"` echoes this file's own voice for
+    /// "not here" (`roster_jump`'s "that pane is gone") and — checked against
+    /// the fixed 16-column adapter field `picker_row_body` budgets — is the
+    /// longest suffix that never crowds the cwd column even for the longest
+    /// ids (`claude`/`gemini`).
+    pub fn picker_filtered(&self) -> Vec<String> {
+        self.picker_filtered_ids()
+            .into_iter()
+            .map(|id| {
+                if adapter_installed(id, &self.registry) {
+                    id.to_string()
+                } else {
+                    format!("{id} gone")
+                }
+            })
             .collect()
     }
 
@@ -4296,8 +4401,9 @@ impl<B: PaneBackend> App<B> {
             Mode::Picker { .. } => {
                 // U20: both column lengths, read before the mode is borrowed
                 // mutably below — the adapter list depends on the live
-                // type-ahead filter, so it can't be a constant.
-                let rows = self.picker_filtered().len();
+                // type-ahead filter, so it can't be a constant. Row count
+                // only, so this is `picker_filtered_ids` (no PATH checks).
+                let rows = self.picker_filtered_ids().len();
                 let cwds = self.recent_cwds.len();
                 let Mode::Picker { selection, filter, cwd, on_cwd } = &mut self.mode else {
                     return true;
@@ -5229,6 +5335,91 @@ fn abbreviate_home(cwd: &Path, home: Option<&Path>) -> String {
     }
 }
 
+/// P0-3: what `spawn_pane` records for a dead pane, and what the dead-pane
+/// bar and feed line show — anyhow's default `Display` (`{}`) keeps only the
+/// outermost `.context()` pty.rs adds ("spawning pi"); the alternate format
+/// (`{:#}`) walks the whole chain on one line ("spawning pi: No such file or
+/// directory (os error 2)"), which is the difference between a message and
+/// an answer. Capped and truncated on a char boundary — same shape as
+/// `pty::sanitize_for_host` — so a pathological chain still reads as one
+/// line in the bar instead of spilling past it.
+fn dead_reason(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    if full.chars().count() <= DEAD_REASON_CAP {
+        return full;
+    }
+    let mut truncated: String = full.chars().take(DEAD_REASON_CAP.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// QA-2: validate a spawn's cwd BEFORE a pane is created for it, so a
+/// mistyped or just-deleted path fails loudly here instead of the PTY child
+/// silently landing somewhere else (confirmed: `$HOME`) while `list`/`status`
+/// keep reporting the *requested* path. Two distinct failures, on purpose:
+/// a path that doesn't resolve at all (also covers a directory this process
+/// can't even see, e.g. a blocked parent) gets the raw OS error; a path that
+/// resolves but names a file, not a directory, gets its own clearer message
+/// — both are "you can't spawn there," but naming which is which saves a
+/// round trip. A directory that exists and is *listable* is treated as
+/// enterable — the same permission `chdir` itself needs — so this doubles as
+/// the "unreadable directory" case: `read_dir` opens it far enough to prove
+/// that without walking its contents.
+fn validate_spawn_cwd(cwd: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(cwd).map_err(|e| format!("cwd {}: {e}", cwd.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("cwd {} is not a directory", cwd.display()));
+    }
+    if let Err(e) = std::fs::read_dir(cwd) {
+        return Err(format!("cwd {}: {e}", cwd.display()));
+    }
+    Ok(())
+}
+
+/// P2-13: does `program` resolve to a real, executable file the way a shell
+/// would find it? An absolute/relative path (contains `/`) is checked
+/// directly; a bare name is looked up across `path_dirs`, in order. Pure —
+/// the directories are a parameter, not read from the environment here — so
+/// a test can prove the search itself without depending on what happens to
+/// be installed on the machine that runs it.
+fn resolves_on_path<P: AsRef<Path>>(program: &str, mut path_dirs: impl Iterator<Item = P>) -> bool {
+    if program.contains('/') {
+        return is_executable_file(Path::new(program));
+    }
+    path_dirs.any(|dir| is_executable_file(&dir.as_ref().join(program)))
+}
+
+/// A regular file with at least one executable bit set — what actually lets
+/// a shell (or `spawn_command`) run it, not just see it.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// P2-13: is `id`'s launch program actually installed? Derived from the same
+/// `CommandSpec` `spawn_pane` would build (`adapter.launch`), not a
+/// hardcoded program name, so a new adapter's launch command is PATH-checked
+/// automatically without touching `agents/**`. An id the registry doesn't
+/// know (never happens today — `picker_items()` *is* the registry) is
+/// treated as installed: nothing here to warn about.
+fn adapter_installed(id: &str, registry: &Registry) -> bool {
+    let Some(adapter) = registry.get(id) else { return true };
+    let program = adapter.launch(Path::new(".")).program;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    resolves_on_path(&program, std::env::split_paths(&path))
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — the whole app core runs against fakes, no PTYs involved.
 // ---------------------------------------------------------------------------
@@ -5478,7 +5669,8 @@ mod tests {
             App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Osc52),
             "copied 13 chars (OSC 52)"
         );
-        assert_eq!(App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Failed), "copy failed");
+        let failed = App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Failed);
+        assert_eq!(failed, "copy failed: no clipboard channel worked; check your terminal's clipboard support");
         // A failure never quotes a count — there is no N to have copied.
         assert!(!App::<FakePane>::copy_flash_text(0, ClipboardOutcome::Failed).contains('0'));
     }
@@ -5491,7 +5683,10 @@ mod tests {
         app.flash_copy(4, ClipboardOutcome::Osc52);
         assert_eq!(app.flash(), Some("copied 4 chars (OSC 52)"));
         app.flash_copy(4, ClipboardOutcome::Failed);
-        assert_eq!(app.flash(), Some("copy failed"));
+        assert_eq!(
+            app.flash(),
+            Some("copy failed: no clipboard channel worked; check your terminal's clipboard support")
+        );
     }
 
     #[test]
@@ -6378,6 +6573,156 @@ mod tests {
             method: Method::Close { pane: p, force: false },
         }));
         assert_eq!(app.runtimes.len(), 1);
+    }
+
+    /// A registered adapter whose `launch`/`resume` always name FakePane's
+    /// dedicated spawn-failure hook (`program == "spawn-fail"`) — deterministic
+    /// and hermetic, unlike coercing this through ShellAdapter's real `$SHELL`
+    /// (every other test's `mk_app(shell_ws())` reads that same process-global
+    /// var while constructing its own app, which is exactly the kind of
+    /// cross-test race a mutated env var risks).
+    struct AlwaysFailsAdapter;
+    impl agents::AgentAdapter for AlwaysFailsAdapter {
+        fn id(&self) -> &'static str {
+            "always-fails"
+        }
+        fn launch(&self, cwd: &Path) -> agents::CommandSpec {
+            agents::CommandSpec::new("spawn-fail", cwd)
+        }
+        fn resume(&self, cwd: &Path, _session: &str) -> agents::CommandSpec {
+            self.launch(cwd)
+        }
+    }
+
+    /// P0-2 / P0-3 end-to-end: a synchronous PTY spawn failure must be
+    /// visible over the socket — in the SAME `spawn` reply that used to say
+    /// only `{"pane": id}`, and again on every later `status`/`list` poll,
+    /// and on the feed. All from the one place `spawn_pane`'s `Err` arm now
+    /// runs.
+    #[test]
+    fn ctl_spawn_status_list_and_feed_all_surface_a_synchronous_spawn_failure() {
+        use crate::core::control::{Method, Reply, Request};
+        let mut registry = agents::registry();
+        registry.insert("always-fails", Box::new(AlwaysFailsAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+        )
+        .unwrap();
+        let ct = app.control_token().to_string();
+        let ok = |r: Reply| match r {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("expected ok, got err: {err}"),
+        };
+
+        // P0-2: the spawn reply already knows — spawn_pane ran synchronously
+        // inside spawn_child, before this reply was ever built.
+        let spawned = ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Spawn { adapter: "always-fails".into(), cwd: None, initial_input: None },
+        }));
+        let id = spawned["pane"].as_u64().unwrap();
+        // FakePane::spawn's hook is a bare `anyhow::bail!` — no chain to
+        // walk, so this also pins that a plain, unchained message still
+        // survives `dead_reason` unchanged (the chained case is
+        // `dead_reason_keeps_the_real_cause_reachable`, and the real chain
+        // pty.rs actually produces is `spawn_failure_keeps_the_real_cause_
+        // reachable_via_alternate_format` in infra::pty).
+        assert_eq!(spawned["error"].as_str(), Some("spawn-fail requested"));
+
+        // And a caller that only polls afterward gets the same reason.
+        let status = ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Status { pane: Some(id) },
+        }));
+        assert_eq!(status["status"], "exited");
+        assert_eq!(status["error"].as_str(), Some("spawn-fail requested"));
+
+        let list = ok(app.handle_control(Request { token: ct, method: Method::List }));
+        let entry =
+            list.as_array().unwrap().iter().find(|p| p["pane"].as_u64() == Some(id)).unwrap();
+        assert_eq!(entry["error"].as_str(), Some("spawn-fail requested"));
+
+        // P0-2's "ideally the activity feed" half.
+        assert!(
+            app.feed().iter().any(|e| e.text == "spawn failed: spawn-fail requested"),
+            "{:?}",
+            app.feed()
+        );
+    }
+
+    /// The non-regression this all rides on: a healthy pane's `error` is
+    /// `null`, not just absent-when-convenient — `status`/`list` must not
+    /// start crying wolf for panes that spawned fine.
+    #[test]
+    fn pane_json_and_status_report_a_null_error_for_a_healthy_pane() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let ok = |r: Reply| match r {
+            Reply::Ok { ok } => ok,
+            Reply::Err { err } => panic!("expected ok, got err: {err}"),
+        };
+        let id = app.focused;
+        let status =
+            ok(app.handle_control(Request { token: ct.clone(), method: Method::Status { pane: Some(id) } }));
+        assert!(status["error"].is_null());
+        let list = ok(app.handle_control(Request { token: ct, method: Method::List }));
+        assert!(list.as_array().unwrap()[0]["error"].is_null());
+    }
+
+    /// QA-2 through the real control path: `roost spawn --cwd <nonexistent>`
+    /// must refuse loudly, naming the path, and leave no pane behind for the
+    /// orchestrator to (wrongly) think is running there.
+    #[test]
+    fn ctl_spawn_refuses_a_nonexistent_cwd_and_creates_no_pane() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let before = app.runtimes.len();
+        let missing =
+            std::env::temp_dir().join(format!("roost-ctl-cwd-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: Some(missing.to_string_lossy().into_owned()),
+                initial_input: None,
+            },
+        });
+
+        match reply {
+            Reply::Err { err } => assert!(err.contains(&missing.display().to_string()), "{err:?}"),
+            Reply::Ok { ok } => panic!("expected a refusal, got ok: {ok}"),
+        }
+        assert_eq!(app.runtimes.len(), before, "no pane left behind for a rejected cwd");
+    }
+
+    /// The happy path around the QA-2 fix: a `--cwd` that IS a real
+    /// directory spawns exactly as before.
+    #[test]
+    fn ctl_spawn_accepts_a_real_cwd() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                initial_input: None,
+            },
+        });
+        let Reply::Ok { ok } = reply else { panic!("a real cwd must not be refused") };
+        assert!(ok["pane"].as_u64().is_some());
     }
 
     #[test]
@@ -8019,23 +8364,28 @@ mod tests {
     /// U20: typing filters the adapter list, Backspace widens it back. The
     /// picker was a fixed list you could only walk; with three adapters that
     /// is already two keystrokes more than naming one.
+    ///
+    /// Asserts against `picker_filtered_ids` (raw ids), not `picker_filtered`
+    /// (P2-13's *installed* annotation) — this test is about the substring
+    /// filter, and pinning it to which adapters this machine happens to have
+    /// on `$PATH` would make it pass or fail by host, not by logic.
     #[test]
     fn picker_type_ahead_filters_the_adapter_list_and_backspace_widens_it() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::QuickLaunch);
-        assert_eq!(app.picker_filtered().len(), picker_items().len(), "no filter shows all");
+        assert_eq!(app.picker_filtered_ids().len(), picker_items().len(), "no filter shows all");
         app.handle_mode_key(key('l'));
         // Substring, not prefix: `l` finds both `claude` and `shell`.
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude", "shell"]);
         app.handle_mode_key(key('a'));
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude"]);
         app.handle_mode_key(key('z'));
-        assert!(app.picker_filtered().is_empty(), "a query matching nothing shows nothing");
+        assert!(app.picker_filtered_ids().is_empty(), "a query matching nothing shows nothing");
         assert!(matches!(app.mode, Mode::Picker { .. }), "and the picker stays up");
         press(&mut app, crossterm::event::KeyCode::Backspace);
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude"]);
         press(&mut app, crossterm::event::KeyCode::Backspace);
-        assert_eq!(app.picker_filtered(), vec!["claude".to_string(), "shell".to_string()]);
+        assert_eq!(app.picker_filtered_ids(), vec!["claude", "shell"]);
     }
 
     /// U20: the `1..9` accelerators keep working *through* a filter — they
@@ -8126,6 +8476,64 @@ mod tests {
         );
         // ...and using a directory floats it back to the top.
         assert_eq!(app.picker_cwds()[0], PathBuf::from("/tmp"));
+    }
+
+    /// A registry substitute for "pi" whose `launch()` names a program that
+    /// will never exist on any real `$PATH` — deterministic proof that an
+    /// adapter is "not installed" without mutating the real `$PATH` (every
+    /// picker test — including render.rs's own — reads the SAME process-
+    /// global var through `App::registry`, which would make `$PATH`
+    /// mutation here exactly as unsafe as `$SHELL` is for `mk_app`).
+    struct NeverInstalledAdapter;
+    impl agents::AgentAdapter for NeverInstalledAdapter {
+        fn id(&self) -> &'static str {
+            "pi"
+        }
+        fn launch(&self, cwd: &Path) -> agents::CommandSpec {
+            agents::CommandSpec::new("roost-test-definitely-does-not-exist-anywhere-xyz123", cwd)
+        }
+        fn resume(&self, cwd: &Path, _session: &str) -> agents::CommandSpec {
+            self.launch(cwd)
+        }
+    }
+
+    /// P2-13 end-to-end: a not-installed adapter's picker row is annotated
+    /// (not hidden — five adapters is short enough that hiding four would
+    /// read as a picker that lost its list), and — the property that
+    /// actually matters — launching that row still spawns the RAW id, never
+    /// the annotated display text. `picker_items()` is the static, always-5
+    /// registry list (`agents::adapter_specs()`), so the substitution has to
+    /// happen in `App::registry` (what `adapter_installed` actually
+    /// consults), not in what rows get drawn.
+    #[test]
+    fn picker_filtered_annotates_uninstalled_adapters_but_launch_still_spawns_the_raw_id() {
+        let mut registry = agents::registry();
+        registry.insert("pi", Box::new(NeverInstalledAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            shell_ws(),
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+        )
+        .unwrap();
+
+        app.apply(Action::QuickLaunch);
+        let rows = app.picker_filtered();
+        app.handle_mode_key(key('1')); // row 1 = index 0 = "pi" (picker_items() order)
+        let spawned = app.find_spec(app.focused).map(|s| s.adapter.clone());
+
+        assert_eq!(rows[0], "pi gone", "pi's substituted launch program can never resolve");
+        // ShellAdapter resolves an absolute $SHELL (or /bin/bash fallback)
+        // path directly, not via a $PATH scan — real, unmodified, and
+        // guaranteed to exist on any machine this suite already assumes one
+        // on (session_members's pgrep, every shell-spawning test, ...).
+        let shell_at = picker_items().iter().position(|&id| id == "shell").unwrap();
+        assert_eq!(rows[shell_at], "shell", "resolved via an absolute path, not $PATH");
+        assert_eq!(spawned, Some("pi".to_string()), "launch used the raw id, not the annotated text");
     }
 
     /// U20: `↑`/`↓` steer whichever column has the keyboard, and `←`/`→`
@@ -8519,6 +8927,118 @@ mod tests {
         // of it — guards against a naive str::starts_with reimplementation.
         let home = PathBuf::from("/home/nav");
         assert_eq!(abbreviate_home(&PathBuf::from("/home/navvy/work"), Some(&home)), "/home/navvy/work");
+    }
+
+    /// P0-3: the exact bug — a chained error's default `Display` drops
+    /// everything past the outermost `.context()`. `dead_reason` must not:
+    /// the cause has to actually reach the string the dead-pane bar (and
+    /// now the feed/status `error` field) renders.
+    #[test]
+    fn dead_reason_keeps_the_real_cause_reachable() {
+        let err = anyhow::anyhow!("No such file or directory (os error 2)").context("spawning pi");
+        let reason = dead_reason(&err);
+        assert!(reason.contains("spawning pi"), "{reason:?}");
+        assert!(reason.contains("No such file or directory"), "{reason:?}");
+        assert!(!reason.contains('\n'), "must stay on one line: {reason:?}");
+        // `{}` alone is exactly the outer context — the bug this replaces.
+        assert_eq!(reason, format!("{err:#}"));
+        assert_ne!(reason, format!("{err}"));
+    }
+
+    /// P0-3: a pathological chain is capped, not left to blow past the
+    /// dead-pane bar — truncated on a char boundary so a multi-byte glyph
+    /// is never split.
+    #[test]
+    fn dead_reason_caps_a_long_chain_on_a_char_boundary() {
+        let err = anyhow::anyhow!("{}", "x".repeat(DEAD_REASON_CAP * 2)).context("spawning wide 日");
+        let reason = dead_reason(&err);
+        assert_eq!(reason.chars().count(), DEAD_REASON_CAP);
+        assert!(reason.ends_with('…'));
+        assert!(std::str::from_utf8(reason.as_bytes()).is_ok(), "never split a glyph");
+    }
+
+    #[test]
+    fn validate_spawn_cwd_accepts_a_real_directory() {
+        assert!(validate_spawn_cwd(&std::env::temp_dir()).is_ok());
+    }
+
+    /// QA-2: the confirmed repro — `roost spawn --cwd <nonexistent>` must
+    /// fail loudly, naming the path, with the real OS reason rather than a
+    /// made-up one.
+    #[test]
+    fn validate_spawn_cwd_names_the_path_when_it_does_not_exist() {
+        let missing =
+            std::env::temp_dir().join(format!("roost-cwd-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let err = validate_spawn_cwd(&missing).unwrap_err();
+        assert!(err.contains(&missing.display().to_string()), "{err:?}");
+        assert!(err.to_lowercase().contains("no such file"), "{err:?}");
+    }
+
+    /// QA-2's deliberate design call: a path that resolves but names a file,
+    /// not a directory, is a DIFFERENT, more specific failure than "doesn't
+    /// exist" — worth its own message instead of a raw (and here, absent)
+    /// OS error.
+    #[test]
+    fn validate_spawn_cwd_distinguishes_a_file_from_a_missing_directory() {
+        let dir = std::env::temp_dir().join(format!("roost-cwd-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+
+        let err = validate_spawn_cwd(&file).unwrap_err();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("is not a directory"), "{err:?}");
+        assert!(err.contains(&file.display().to_string()), "{err:?}");
+    }
+
+    /// P2-13: the PATH-scan logic itself, against a synthetic directory
+    /// instead of whatever happens to be installed on the machine running
+    /// this — deterministic on any host.
+    #[test]
+    fn resolves_on_path_finds_an_executable_and_rejects_a_non_executable_or_missing_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("roost-path-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let exe = dir.join("real-program");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let not_exe = dir.join("not-executable");
+        std::fs::write(&not_exe, "just text").unwrap();
+        std::fs::set_permissions(&not_exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dirs = [dir.clone()];
+        assert!(resolves_on_path("real-program", dirs.iter()), "an executable on PATH is found");
+        assert!(
+            !resolves_on_path("not-executable", dirs.iter()),
+            "present but not executable ⇒ not found, same as absent"
+        );
+        assert!(!resolves_on_path("does-not-exist-at-all", dirs.iter()), "absent ⇒ not found");
+        // An absolute/relative path (contains '/') is checked directly, the
+        // way ShellAdapter's $SHELL-derived program always is — never
+        // scanned across `dirs`, so an empty iterator still finds it.
+        assert!(resolves_on_path(exe.to_str().unwrap(), std::iter::empty::<PathBuf>()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adapter_installed_checks_the_real_path_and_treats_an_unknown_id_as_installed() {
+        // ShellAdapter falls back to /bin/bash when $SHELL is unset; either
+        // way it's an absolute path, so this is the one adapter guaranteed
+        // not to depend on which agent CLIs happen to be on the machine
+        // running this test.
+        assert!(adapter_installed("shell", &agents::registry()));
+        // Nothing to warn about for an id the registry doesn't even have —
+        // `picker_items()` IS the registry, so this never happens through
+        // the picker, but the function must still answer something sane.
+        assert!(adapter_installed("not-a-real-adapter-id", &agents::registry()));
     }
 
     #[test]
@@ -9494,7 +10014,7 @@ mod tests {
         let before = format!("{:?}", app.ws.tabs[0].layout);
         app.apply(Action::CycleLayout);
         assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
-        assert_eq!(app.flash(), Some("no room to rearrange"));
+        assert_eq!(app.flash(), Some("no room to rearrange; stack a pane with Alt+s first"));
     }
 
     #[test]
