@@ -82,9 +82,22 @@ roost tells it [ux, handoffs/ux-audit.md]:
 - ☐ **`wait` timeout exits 0** — `{timed_out:true}` printed, exit 0;
   `wait … && read` proceeds as if done. Nonzero exit on timeout
   (app.rs:1519, cli.rs:60–62). [ux P1-7]
-- ☐ **Unknown first arg launches the full-screen TUI** — `roost --version`,
-  `roost ls`, typos seize the terminal; `--help` prints to stderr. Hard
-  error on unknown verbs; help/version on stdout (cli.rs:27–32). [ux P1-8]
+- ☐ **Unknown first arg launches the full-screen TUI — and panics off-tty.**
+  `roost --version`, `roost ls`, typos seize the terminal; piped or in CI it
+  **panics with a raw Rust backtrace** (`failed to initialize terminal`, exit
+  101). A script probing the binary hangs or gets a stack trace — the most
+  orchestrator-hostile bug found. `--help` also prints to stderr. Hard error
+  on unknown verbs; help/version on stdout; never panic off-tty
+  (cli.rs:27–32). [ux P1-8 + qa QA-1/QA-4]
+- ☐ **`roost spawn --cwd <nonexistent>` returns success and lies** — replies
+  `{"pane":2}` exit 0, silently launches in `$HOME`, and `roost list` keeps
+  reporting the *requested* cwd while the process runs elsewhere. An
+  orchestrator spawning into a mistyped path gets no error and a worker in
+  the wrong directory. Validate cwd at spawn; fail loudly. [qa QA-2, new]
+- ☐ **No subcommand `--help`** — `roost spawn --help` is byte-identical to a
+  usage error; `roost list --help` / `status --help` / `fork --help`
+  **silently execute the real command** (`list --help` returned real pane
+  JSON, exit 0). [qa QA-3, new]
 - ☐ **Unknown flags silently dropped; no `--` separator** — `send 5 hi
   --entr` sends without Enter and replies ok; `send 5 "--- x ---"` sends
   empty. Reject unknown flags, add `--` (cli.rs:186–204). [ux P1-9]
@@ -172,6 +185,19 @@ requirement.
   [ux P2-15]
 - ☐ "copy failed" flash names neither cause nor next step (app.rs:2164).
   [ux P3-17]
+- ☐ README: "`roost --help` prints this same reference" is only approximately
+  true — same verbs, different order/format (README.md:293–306 vs cli.rs
+  USAGE). [qa QA-5]
+- ☐ README:144–145 names the **wrong bypass modifier for macOS**: Shift is
+  the bypass in Ghostty/kitty, but iTerm2's is Option and Terminal.app has
+  none (only the global View ▸ Allow Mouse Reporting toggle). This is the
+  only fallback roost advertises. [ux, DECISIONS D10]
+- ☐ **Verify `Alt`+click-to-open-URL on real iTerm2** — Option held *is*
+  iTerm2's suspend-mouse-reporting gesture, so the click likely never reaches
+  roost, making a documented feature (README:134, C24, help overlay) silently
+  dead on the recommended terminal. Needs a human at a real iTerm2 for 30
+  seconds; if confirmed, re-home the gesture off Option on macOS.
+  [ux, DECISIONS D11 — NEEDS CLIENT]
 - ☐ Room-exhaustion flashes should point at Alt+s/stacks as the exit.
   [ux P3-18]
 - ☐ <2-row terminals render blank; show a "too small" notice
