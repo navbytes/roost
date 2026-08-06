@@ -15,31 +15,80 @@ Status legend: ☐ open · 🔨 in progress · ✅ shipped (PR#) · ❌ descoped
 
 ## Phase 0 — Baseline & housekeeping
 
-- ✅ Sync main, delete 5 stale local + 4 stale remote branches. [principal]
-- 🔨 Baseline `cargo test` on this host — confirm green before any change.
-- ☐ Commit engagement scaffolding (openspec/), PR, merge.
+- ✅ Sync main, delete 5 stale local + 5 stale remote branches. [principal]
+- ✅ Baseline `cargo test` green on host: 553 unit + 24 integration.
+- ✅ Engagement scaffolding merged (PR #31).
 
 ## Phase 1 — Correctness & security (P0/P1 from audits)
 
-*Placeholder — populated when reviewer + security-auditor reports land.*
+Control-CLI contract fixes — an orchestrator must be able to trust what
+roost tells it [ux, handoffs/ux-audit.md]:
+
+- ☐ **`roost spawn` returns ok for a failed spawn** — PTY failure lands
+  async in `App::dead`, invisible to the socket; status says only
+  `exited`, orchestrators retry forever (app.rs:1593–1607, 916–918).
+  Make the failure readable: reason in `status`/reply + feed. [ux P0-2]
+- ☐ **`wait` timeout exits 0** — `{timed_out:true}` printed, exit 0;
+  `wait … && read` proceeds as if done. Nonzero exit on timeout
+  (app.rs:1519, cli.rs:60–62). [ux P1-7]
+- ☐ **Unknown first arg launches the full-screen TUI** — `roost --version`,
+  `roost ls`, typos seize the terminal; `--help` prints to stderr. Hard
+  error on unknown verbs; help/version on stdout (cli.rs:27–32). [ux P1-8]
+- ☐ **Unknown flags silently dropped; no `--` separator** — `send 5 hi
+  --entr` sends without Enter and replies ok; `send 5 "--- x ---"` sends
+  empty. Reject unknown flags, add `--` (cli.rs:186–204). [ux P1-9]
+- *Reviewer + security-auditor findings pending.*
 
 ## Phase 2 — UX quick wins
 
-- ☐ Spawn-failure error says nothing about *why* (ENOENT vs PATH vs perm).
-  Surface the cause in the dead-pane hint. [roadmap]
-- *More on ux-expert + qa reports.*
+- ☐ **Spawn-failure error drops the why** — anyhow Display keeps the outer
+  context only; ENOENT/EACCES discarded one call before display. `{:#}`
+  chain format (pty.rs:411, app.rs:917). [roadmap + ux P0-3]
+- ☐ **macOS Option-trap hint mistimed** — 8s launch-anchored window
+  false-fires on healthy terminals (and C11-hides the hint row on first
+  keystroke) while missing read-first users entirely. Re-anchor the
+  trigger to evidence, not launch time (app.rs:39, :4869). [ux P0-4]
+- ☐ **README states the detach cost honestly** + sanctioned run-under-tmux
+  recipe for SSH; extend busy-quit confirm to the hangup path
+  (app.rs:3059). [ux P0-1]
+- ☐ Picker offers adapters not on PATH → guaranteed dead pane; annotate or
+  filter by `which` (app.rs:41). [ux P2-13]
+- ☐ Help overlay never mentions the control CLI (`roost send <id>`) — the
+  category differentiator is invisible in-product (render.rs:680–747).
+  [ux P2-15]
+- ☐ "copy failed" flash names neither cause nor next step (app.rs:2164).
+  [ux P3-17]
+- ☐ Room-exhaustion flashes should point at Alt+s/stacks as the exit.
+  [ux P3-18]
+- ☐ <2-row terminals render blank; show a "too small" notice
+  (render.rs:24–26). [ux P3-16]
 
 ## Phase 3 — Fleet & robustness UX (promoted deferred items)
 
-- ☐ P21's dump-to-editor half (copy-mode scrollback → $EDITOR) — the one
-  SPEC-parity sub-item deliberately left undone; assess promotion.
-  [principal, SPEC-parity P21]
-
-- ☐ Dead-pane `Enter` retry re-runs the same resume command even after a
-  permanent failure; distinguish transient vs permanent. [roadmap: choice]
-- ☐ Per-principal connection/rate cap on the control socket (global 64-conn
-  cap today; one pane can starve a legit orchestrator). [roadmap: choice]
-- *Promotion/demotion calls pending ux-expert + security verdicts.*
+- ☐ **Attention works on default setup** (the #1 switch bet): auto-install
+  Claude Code hooks the way pi's extension is auto-installed + let the
+  Alt+a ring fall through to Waiting-after-Working when no ◆ exists
+  (status.rs:176–187). [ux P1-5, promoted]
+- ☐ **Relay the BEL** — heuristic ◆ transitions never reach the host bell;
+  README's "rings the bell" is false in the exact fallback case it serves
+  (ports.rs:59–62, main.rs:366,385). [ux P1-6]
+- ☐ **Roster urgency ordering** — sort worst-first, optional status filter;
+  turns Alt+Shift+a into the fleet dashboard at zero column cost
+  (app.rs:3481–3487). [ux P2-11, top-5 bet]
+- ☐ · idle vs ○ waiting collapses at first byte — every shell at a prompt
+  reads "your turn"; rethink Idle survival (status.rs:176–186). [ux P2-10]
+- ☐ N2/N4 silent no-ops (Alt+o outside split; Alt+←/→ in stack) vs the
+  every-no-op-flashes rule. [ux P2-14, SPEC-ux]
+- ☐ Dead-pane `Enter` retry: distinguish transient vs permanent — do AFTER
+  the Phase-2 error-cause fix makes that decidable. [roadmap + ux]
+- ☐ Per-principal connection/rate cap on the control socket. [roadmap:
+  choice; security verdict pending]
+- ☐ P21's dump-to-editor half (copy-mode scrollback → $EDITOR) — assess
+  promotion. [principal, SPEC-parity P21]
+- ☐ **DECISION FORK: minimal config file.** Zero-config is stated
+  philosophy, but monochrome ●/◆ ambiguity (no motion opt-out) and the
+  Alt+f/b/d readline collisions have no escape hatch without one. Consult
+  cos + advisor before Phase 3 build; log in DECISIONS.md. [ux P2-12]
 
 ## Phase 4 — Category-best differentiators
 
@@ -67,8 +116,10 @@ resurrection are already category-leading; what's missing is reach
   with the receipts. [res: MED, docs-only]
 - ☐ Real session-branching `fork` (needs pi extension to go bidirectional;
   scope may be pi-side — assess). [roadmap: gap]
-- ☐ Persistent fleet rail (projects → agents) — parked with full design
-  notes in ROADMAP; decision on promotion pends ux-expert verdict. [roadmap]
+- ❌ Persistent fleet rail (projects → agents) — STAYS PARKED per ux-expert
+  verdict: the missing thing is urgency ordering *inside the roster* (zero
+  columns, Phase 3), not a second spatial axis; free-Alt pool is ~empty.
+  Full design notes remain in ROADMAP for a future round. [roadmap + ux]
 - ☐ **DECIDE (not auto-promoted): thin opt-in read-only remote check-in**
   (`roost serve`-shape, "did my agent finish" from a phone). Category
   normalized (Zellij web client, VibeTunnel, Cowork handoff) but collides
