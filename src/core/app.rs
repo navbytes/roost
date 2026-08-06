@@ -1922,10 +1922,20 @@ impl<B: PaneBackend> App<B> {
         if self.last_host_title.is_some_and(|t| t.elapsed() < HOST_TITLE_INTERVAL) {
             return;
         }
-        // `display_name` is already sanitized and bounded (`live_title`), and
-        // an Alt+r title comes from roost's own rename buffer — so nothing
-        // here can carry a control byte into the sequence.
-        let want = format!("roost · {}", self.feed_label(self.focused));
+        // H1: this is the one write path in roost that bypasses ratatui's
+        // buffer (W3) and lands raw bytes on the host terminal's own stdout
+        // — so, unlike everything else `display_name` feeds (badge,
+        // collapsed rows, feed, notifications), the label here needs its
+        // own sanitization pass, not a borrowed guarantee from upstream.
+        // `live_title` sanitizes the OSC-set title, but `display_name_live`
+        // also returns `spec.title` (an Alt+r rename, but also a
+        // hand-editable `title` field in workspace.json) and a `shell`
+        // pane's `cwd.file_name()` (attacker-controlled via `roost spawn
+        // --cwd`) verbatim — either can carry ESC/BEL/OSC bytes straight
+        // into this escape sequence. Same cap as the live title, so a
+        // hostile name can't grow the sequence unbounded either.
+        let label = sanitize_title(&self.feed_label(self.focused), LIVE_TITLE_CAP);
+        let want = format!("roost · {label}");
         if want == self.host_title {
             return;
         }
@@ -9197,6 +9207,39 @@ mod tests {
         app.find_spec_mut(1).unwrap().title = Some("TASK-8".into());
         app.last_host_title = None;
         assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 1 TASK-8\x07"));
+    }
+
+    /// H1: `spec.title` reaches `sync_host_title` verbatim from
+    /// `display_name_live` (an Alt+r rename, but also a hand-edited
+    /// `title` field in workspace.json) — a hostile one must not carry its
+    /// own OSC/BEL out through roost's own escape sequence to the host's
+    /// real terminal, since that write bypasses ratatui entirely (W3).
+    #[test]
+    fn host_title_strips_control_bytes_from_a_hostile_pane_title() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.find_spec_mut(1).unwrap().title = Some("safe\x1b]52;c;cGduZWQ=\x07evil".into());
+        app.last_host_title = None;
+        let out = app.take_host_output();
+        // Exactly roost's own introducer/terminator — the pane-supplied
+        // ESC/BEL embedded in the title must not add a second pair.
+        assert_eq!(out.iter().filter(|&&b| b == 0x1b).count(), 1);
+        assert_eq!(out.iter().filter(|&&b| b == 0x07).count(), 1);
+        assert_eq!(out, b"\x1b]2;roost \xc2\xb7 1 safe]52;c;cGduZWQ=evil\x07".to_vec());
+    }
+
+    /// H1: the same escape, via the *other* unsanitized fallback in
+    /// `display_name_live` — an untitled shell pane's `cwd.file_name()`,
+    /// which an in-pane agent fully controls via `roost spawn --cwd
+    /// '<hostile dir name>'`.
+    #[test]
+    fn host_title_strips_control_bytes_from_a_hostile_cwd_tag() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.find_spec_mut(1).unwrap().cwd = PathBuf::from("/tmp/evil\x1b]52;c;AA==\x07dir");
+        app.last_host_title = None;
+        let out = app.take_host_output();
+        assert_eq!(out.iter().filter(|&&b| b == 0x1b).count(), 1);
+        assert_eq!(out.iter().filter(|&&b| b == 0x07).count(), 1);
+        assert_eq!(out, b"\x1b]2;roost \xc2\xb7 1 shell \xc2\xb7 evil]52;c;AA==dir\x07".to_vec());
     }
 
     /// P6: the throttle — an agent republishing its OSC title on every
