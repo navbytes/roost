@@ -176,6 +176,16 @@ impl Search {
 
 /// An in-progress / completed text selection within one pane. Coordinates are
 /// (row, col) in the pane's inner (border-excluded) cell space, 0-based.
+///
+/// D9: the same struct now backs two gestures that never run at once — the
+/// C24 keyboard/mouse selection inside `Mode::Copy`, and a **native**
+/// selection made directly in `Mode::Normal` over a pane whose app never
+/// asked for the mouse (`MouseProto::None`). Both paint through the same C17
+/// `highlight_selection` pass and extract through the same `grab_text` path;
+/// only how each is started/extended/cleared differs — compare
+/// `begin_selection`/`extend_selection`/`finish_selection` (shared by both)
+/// with `click_count`/`select_word_at`/`select_line_at`/
+/// `extend_selection_to`/`finish_native_selection` (native-only).
 #[derive(Debug, Clone, Copy)]
 pub struct Selection {
     pub pane: PaneId,
@@ -212,6 +222,16 @@ const FLASH_WINDOW: Duration = Duration::from_secs(2);
 /// long as the second press would fire — the old FLASH_WINDOW-sized prompt
 /// left a silent final second where Alt+w/Alt+q still confirmed.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
+/// D9: the standard macOS double-click interval. Crossterm reports no click
+/// count at all, so roost derives double/triple-click itself, from the gap
+/// between two presses (`click_count`).
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+/// D9: a repeat click within this many *cells* of the last one still counts
+/// as "the same spot". A terminal cell is already coarser than a mouse
+/// pixel, so even a tolerance of one is generous — but zero would fail a
+/// double-click exactly when a real hand drifts a hair between two presses.
+const CLICK_TOLERANCE: u16 = 1;
 
 /// How many closed panes/tabs the undo stack keeps.
 const UNDO_DEPTH: usize = 20;
@@ -448,6 +468,10 @@ pub struct App<B: PaneBackend> {
     /// button-down like `mouse_latch` and for the same reason — the pointer
     /// leaves the two-cell border almost immediately once the drag starts.
     resize_drag: Option<crate::ui::mouse::Seam>,
+    /// D9: the last left click's (pane, row, col, count, at), for native
+    /// selection's double/triple-click detection. Crossterm reports no
+    /// click count — see `click_count`.
+    last_click: Option<(PaneId, u16, u16, u8, Instant)>,
     /// W3: bytes roost owes its OWN terminal — pane OSC 9 notifications
     /// (P2) and OSC 52 clipboard writes (P3) forwarded on a pane's behalf.
     /// Queued rather than written because core does no I/O (module doc) and
@@ -529,6 +553,7 @@ impl<B: PaneBackend> App<B> {
             pending_open: None,
             mouse_latch: None,
             resize_drag: None,
+            last_click: None,
             host_out: Vec::new(),
             host_title: String::new(),
             last_host_title: None,
@@ -2182,7 +2207,7 @@ impl<B: PaneBackend> App<B> {
             .unwrap_or((1, 1))
     }
 
-    // -- copy mode / selection --------------------------------------------
+    // -- selection: Copy mode (C24) + native Normal-mode (D9) -------------
 
     pub fn in_copy_mode(&self) -> bool {
         matches!(self.mode, Mode::Copy { .. })
@@ -2209,6 +2234,70 @@ impl<B: PaneBackend> App<B> {
         }
         if let Mode::Copy { cursor } = &mut self.mode {
             *cursor = (row, col);
+        }
+    }
+
+    /// D9: classify a left click at (pane, row, col) as the 1st/2nd/3rd of a
+    /// run — crossterm hands roost no click count, so this derives one from
+    /// timing (`DOUBLE_CLICK_INTERVAL`) and position (`CLICK_TOLERANCE`). A
+    /// 4th click within the window wraps back to 1st rather than climbing
+    /// past triple, since nothing above triple-click is bound.
+    pub fn click_count(&mut self, pane: PaneId, row: u16, col: u16) -> u8 {
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((p, r, c, n, at))
+                if p == pane
+                    && row.abs_diff(r) <= CLICK_TOLERANCE
+                    && col.abs_diff(c) <= CLICK_TOLERANCE
+                    && now.saturating_duration_since(at) < DOUBLE_CLICK_INTERVAL =>
+            {
+                if n >= 3 {
+                    1
+                } else {
+                    n + 1
+                }
+            }
+            _ => 1,
+        };
+        self.last_click = Some((pane, row, col, count, now));
+        count
+    }
+
+    /// D9: double-click — select the whitespace-delimited word under (row,
+    /// col), the same tokenizer `find_url_at` uses (`word_bounds_at`). No
+    /// word there (whitespace, or past the row's trimmed content) degrades
+    /// to a single-point selection at the click — the same "nothing to
+    /// select yet" state a plain click starts, so it reads as cleared once
+    /// released rather than showing an empty highlight.
+    pub fn select_word_at(&mut self, pane: PaneId, row: u16, col: u16) {
+        let line = self.row_text(pane, row);
+        let (start, end) = word_bounds_at(&line, col as usize).unwrap_or((col as usize, col as usize));
+        self.selection =
+            Some(Selection { pane, anchor: (row, start as u16), cursor: (row, end as u16), dragging: false });
+    }
+
+    /// D9: triple-click — select the whole row, mirroring Copy mode's `V`
+    /// (same anchor/cursor shape, `dragging: false` so a further drag does
+    /// not silently widen it word-by-word — out of scope here, see C29).
+    pub fn select_line_at(&mut self, pane: PaneId, row: u16) {
+        let last = self.pane_inner_dims(pane).1.saturating_sub(1);
+        self.selection = Some(Selection { pane, anchor: (row, 0), cursor: (row, last), dragging: false });
+    }
+
+    /// D9: shift-click — extend the live selection to the pointer, keeping
+    /// its anchor. With nothing to extend (no selection yet, or one that
+    /// belongs to a different pane) it starts a fresh one at the click point
+    /// instead, exactly like a plain click — there is no persistent caret to
+    /// extend from otherwise. Also arms `dragging`, so a shift-click
+    /// followed by a held drag keeps extending through the ordinary drag
+    /// path rather than freezing at the shift-click's own point.
+    pub fn extend_selection_to(&mut self, pane: PaneId, row: u16, col: u16) {
+        match &mut self.selection {
+            Some(sel) if sel.pane == pane => {
+                sel.cursor = (row, col);
+                sel.dragging = true;
+            }
+            _ => self.begin_selection(pane, row, col),
         }
     }
 
@@ -2247,6 +2336,23 @@ impl<B: PaneBackend> App<B> {
         let text = self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
         self.mode = Mode::Normal;
         self.selection = None;
+        if text.is_empty() {
+            return None;
+        }
+        Some(text)
+    }
+
+    /// D9: end a native (Normal-mode) selection gesture *without* discarding
+    /// it. Unlike `finish_selection` above — which always exits Copy mode,
+    /// dropping the highlight with it — a native selection stays lit until
+    /// the next click (`on_click`) or keypress (`handle_mode_key`), so this
+    /// only clears `dragging` and returns the grabbed text, leaving
+    /// `self.selection` (and `self.mode`, already `Normal`) untouched.
+    pub fn finish_native_selection(&mut self) -> Option<String> {
+        let sel = self.selection.as_mut()?;
+        sel.dragging = false;
+        let (pane, anchor, cursor) = (sel.pane, sel.anchor, sel.cursor);
+        let text = self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
         if text.is_empty() {
             return None;
         }
@@ -2325,6 +2431,16 @@ impl<B: PaneBackend> App<B> {
     /// Clicking the float's own rect (id == the already-focused float) is
     /// not "outside" and leaves it shown.
     pub fn on_click(&mut self, id: PaneId) {
+        // D9: a plain click elsewhere dismisses a lingering native
+        // selection — its highlight stays lit only until "the next click or
+        // keypress" (the native-selection contract, C29), and a click on a
+        // *different* pane is exactly that. A click back inside the same
+        // pane is left alone here: the caller starts a fresh gesture right
+        // after this (`begin_selection`/`select_word_at`/…), which already
+        // supersedes whatever was there.
+        if self.selection.is_some_and(|s| s.pane != id) {
+            self.selection = None;
+        }
         if self.float_focused() && id != self.focused {
             self.hide_float();
         }
@@ -3885,6 +4001,17 @@ impl<B: PaneBackend> App<B> {
     /// Keys while in a non-Normal mode. Returns true when consumed.
     pub fn handle_mode_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::KeyCode;
+        // D9: any keypress dismisses a lingering native selection — its
+        // highlight stays lit only until "the next click or keypress" (C29).
+        // Gated on `Mode::Normal` specifically (not just "not Copy") so this
+        // can never fire *while* Copy mode is managing `self.selection` for
+        // its own cursor (by the time that mode is active, `self.mode` is
+        // already `Mode::Copy`, not `Normal`) — including the Alt+c keypress
+        // that enters it: this runs first, so Copy mode always starts from
+        // a clean `self.selection` rather than inheriting a stale highlight.
+        if matches!(self.mode, Mode::Normal) && self.selection.is_some() {
+            self.selection = None;
+        }
         // Alt-chords always reach the global bindings (Alt+q must quit from
         // anywhere), so any mode yields to them. If we were scrolling, snap the
         // pane back to its live tail first — otherwise moving focus (Alt+arrow)
@@ -4561,10 +4688,13 @@ fn gen_token() -> String {
     })
 }
 
-/// Find an http(s) URL that covers character index `col` in `line`. The URL
-/// is the surrounding non-whitespace run, with wrapping/trailing punctuation
-/// stripped. Pure, so it's unit-tested.
-pub fn find_url_at(line: &str, col: usize) -> Option<String> {
+/// D9: the whitespace-delimited run containing char column `col` of `line`
+/// — the shared tokenizer `find_url_at` (URL validation layered on top) and
+/// double-click word selection (`App::select_word_at`) both walk, so the two
+/// can never disagree about where a token starts and ends. `None` when `col`
+/// sits on whitespace or past the line's (trailing-space-trimmed) end —
+/// there is no token there to grab.
+fn word_bounds_at(line: &str, col: usize) -> Option<(usize, usize)> {
     let chars: Vec<char> = line.chars().collect();
     if col >= chars.len() || chars[col].is_whitespace() {
         return None;
@@ -4577,7 +4707,15 @@ pub fn find_url_at(line: &str, col: usize) -> Option<String> {
     while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
         end += 1;
     }
-    let token: String = chars[start..=end].iter().collect();
+    Some((start, end))
+}
+
+/// Find an http(s) URL that covers character index `col` in `line`. The URL
+/// is the surrounding non-whitespace run, with wrapping/trailing punctuation
+/// stripped. Pure, so it's unit-tested.
+pub fn find_url_at(line: &str, col: usize) -> Option<String> {
+    let (start, end) = word_bounds_at(line, col)?;
+    let token: String = line.chars().skip(start).take(end - start + 1).collect();
     // Strip wrapping brackets/quotes and trailing sentence punctuation.
     let trimmed = token.trim_matches(|c: char| "()[]{}<>\"'`.,;:!?".contains(c));
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -7332,6 +7470,171 @@ mod tests {
         assert!(app.flash().is_none());
         app.flash_copy(13, ClipboardOutcome::Native);
         assert_eq!(app.flash(), Some("copied 13 chars"));
+    }
+
+    // ---- D9: native (Normal-mode) selection -------------------------------
+
+    /// Crossterm hands roost no click count, so `click_count` derives
+    /// 1st/2nd/3rd from timing + position and wraps a 4th click back to 1st
+    /// (nothing above triple-click is bound). A different pane, or one that
+    /// arrives cold, always restarts the count.
+    #[test]
+    fn click_count_cycles_through_1_2_3_and_wraps_on_a_4th() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert_eq!(app.click_count(1, 5, 5), 1);
+        assert_eq!(app.click_count(1, 5, 5), 2);
+        assert_eq!(app.click_count(1, 5, 5), 3);
+        assert_eq!(app.click_count(1, 5, 5), 1, "a 4th click restarts the cycle");
+        // A one-cell drift is still "the same spot" (CLICK_TOLERANCE).
+        assert_eq!(app.click_count(1, 5, 5), 2);
+        assert_eq!(app.click_count(1, 6, 5), 3);
+        // A different pane never continues another pane's run.
+        assert_eq!(app.click_count(2, 6, 5), 1);
+    }
+
+    /// Double-click selects the whitespace-delimited word under the
+    /// pointer — the same tokenizer `find_url_at` uses (`word_bounds_at`).
+    #[test]
+    fn select_word_at_grabs_the_whitespace_delimited_word() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["hello world".into()];
+
+        app.select_word_at(id, 0, 2); // inside "hello"
+        let sel = app.selection.expect("double-click marks a selection");
+        assert_eq!((sel.anchor, sel.cursor), ((0, 0), (0, 4)));
+        assert!(!sel.dragging);
+
+        app.select_word_at(id, 0, 8); // inside "world"
+        assert_eq!((app.selection.unwrap().anchor, app.selection.unwrap().cursor), ((0, 6), (0, 10)));
+
+        // The gap between the words: nothing to grab, degrades to a single
+        // point — the same "cleared on release" state a plain click starts.
+        app.select_word_at(id, 0, 5);
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor, sel.cursor);
+    }
+
+    /// Triple-click selects the whole row — the same shape Copy mode's `V`
+    /// produces (`copy_mode_capital_v_selects_the_whole_row_and_extends_by_lines`).
+    #[test]
+    fn select_line_at_grabs_the_whole_row() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let (_, w) = app.pane_inner_dims(id);
+        app.select_line_at(id, 3);
+        let sel = app.selection.expect("triple-click marks a selection");
+        assert_eq!((sel.anchor, sel.cursor), ((3, 0), (3, w - 1)));
+        assert!(!sel.dragging);
+    }
+
+    /// Shift-click extends the live selection's cursor to the pointer,
+    /// keeping the anchor, and arms `dragging` so a held drag after the
+    /// shift-click keeps extending. With nothing to extend — no selection,
+    /// or one that belongs to a different pane — it starts a fresh one at
+    /// the click point instead.
+    #[test]
+    fn extend_selection_to_extends_the_live_selection_or_starts_fresh() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.begin_selection(1, 2, 2);
+        app.extend_selection_to(1, 2, 9);
+        let sel = app.selection.unwrap();
+        assert_eq!((sel.anchor, sel.cursor), ((2, 2), (2, 9)), "anchor stays, cursor moves");
+        assert!(sel.dragging, "a held drag after shift-click should keep extending");
+
+        // A different pane: nothing of its own to extend, so a fresh start.
+        app.extend_selection_to(2, 4, 4);
+        let sel = app.selection.unwrap();
+        assert_eq!((sel.pane, sel.anchor, sel.cursor), (2, (4, 4), (4, 4)));
+
+        // No selection at all: same fresh start.
+        app.selection = None;
+        app.extend_selection_to(1, 1, 1);
+        assert_eq!(app.selection.unwrap().anchor, (1, 1));
+    }
+
+    /// The defining difference from `finish_selection`: a native release
+    /// copies but does NOT drop the highlight (Copy mode's version always
+    /// exits the mode, taking the selection with it). It stays lit until
+    /// the next click or keypress (`on_click` / `handle_mode_key`, below).
+    #[test]
+    fn finish_native_selection_extracts_text_but_leaves_the_highlight_lit() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "selected text".into();
+        app.begin_selection(id, 0, 0);
+        app.extend_selection(0, 5);
+        assert_eq!(app.finish_native_selection().as_deref(), Some("selected text"));
+        assert!(app.selection.is_some(), "the highlight survives the release");
+        assert!(!app.selection.unwrap().dragging);
+        assert!(matches!(app.mode, Mode::Normal), "native selection never touches mode");
+
+        // Nothing to copy: reports None. Clearing the now-pointless
+        // highlight is the caller's job (main.rs), not this function's.
+        app.runtimes.get_mut(&id).unwrap().grab = String::new();
+        assert_eq!(app.finish_native_selection(), None);
+    }
+
+    /// `on_click` drops a lingering native selection when the click lands on
+    /// a *different* pane — the highlight must not survive once focus moves
+    /// elsewhere. A click back on the SAME pane leaves it for the caller's
+    /// fresh gesture (begin_selection/select_word_at/…) to supersede.
+    #[test]
+    fn on_click_clears_a_selection_that_belongs_to_a_different_pane_only() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 | 2, focus 2
+        app.begin_selection(1, 0, 0);
+        app.extend_selection(0, 3);
+        assert!(app.selection.is_some());
+
+        app.on_click(2); // clicking the OTHER pane
+        assert!(app.selection.is_none(), "the other pane's click dismissed it");
+
+        app.begin_selection(2, 1, 1);
+        app.on_click(2); // clicking the pane it belongs to
+        assert!(app.selection.is_some(), "on_click doesn't clear its own pane's selection");
+    }
+
+    /// Any keypress dismisses a lingering native selection while in Normal
+    /// mode — but the guard must never fire once Copy mode owns
+    /// `self.selection` for its own cursor, or every hjkl press there would
+    /// erase the very selection it just extended.
+    #[test]
+    fn any_keypress_clears_a_normal_mode_selection_but_copy_mode_is_exempt() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.begin_selection(1, 0, 0);
+        app.extend_selection(0, 3);
+        assert!(app.selection.is_some());
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.selection.is_none(), "a plain keypress in Normal mode clears it");
+
+        // Copy mode manages `self.selection` itself — its own motions must
+        // survive its own keypresses.
+        app.apply(Action::CopyMode);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.selection.is_some(), "v marked a Copy-mode selection");
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(app.selection.is_some(), "hjkl inside copy mode must not self-clear");
+    }
+
+    /// Entering Copy mode (Alt+c) clears any lingering native selection
+    /// first, in the same order main.rs's event loop calls things:
+    /// `handle_mode_key` (which does the clearing, then falls through
+    /// unhandled) followed by the global binding it fell through to.
+    #[test]
+    fn entering_copy_mode_clears_a_lingering_native_selection_first() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.begin_selection(id, 0, 0);
+        app.extend_selection(0, 3);
+        assert!(app.selection.is_some());
+        assert!(!app.handle_mode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)));
+        assert!(app.selection.is_none(), "cleared before Copy mode is even entered");
+        app.apply(Action::CopyMode);
+        assert!(matches!(app.mode, Mode::Copy { .. }));
+        assert!(app.selection.is_none(), "Copy mode starts with no inherited selection");
     }
 
     #[test]
