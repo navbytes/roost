@@ -1338,6 +1338,40 @@ So the cap goes, and with it the merges:
   It is the check that actually matters, and it only became available by
   removing the constraint that made it unsatisfiable.
 
+**[Amended 2026-08-06, PR #46 design audit (D2) — the mouse row grows]**
+C29's three new gestures had no discoverability surface at all:
+`every_bound_chord_is_documented_in_the_keymap` only ever walks Alt chords,
+so it passed **vacuously** over double-click, triple-click and
+shift-click — none of them binds a chord, so the check that exists to
+catch an undocumented one structurally cannot see them. This is the same
+gap U23 closed for the wheel/click/drag/Alt+click verbs, applied to the
+verbs C29 added on top of them, and it resolves the §8 key table's own
+loose end from that amendment (a note there, now withdrawn in favour of
+this one — mouse verbs belong in this contract's `READING THE SCREEN`
+group per U23's own precedent, not in a table whose subject is chords).
+
+- **Content.** The `mouse` row (`READING THE SCREEN`) widens from
+  `wheel scrolls · click focuses · drag selects` to
+  `wheel scrolls · click focuses · drag/2x/3x/shift selects` — 75 columns
+  with its key prefix, still inside the 80-col floor (`Alt+c`'s row, at
+  71, was the previous widest; this becomes the new widest, and the
+  dialog is 3 columns of border/padding narrower than that, `74` → `78`).
+  Terse by the row's own convention: the original never said "copies"
+  either, and the full account is C29, not a legend line.
+  **Why Shift+click earns a place and a miss doesn't get one of its
+  own:** this contract's own rule for the sibling row — "`Alt+click` gets
+  its own row because it is a *chord*" — applies verbatim to Shift+click,
+  which is why it is spelled out rather than folded wordlessly into
+  "drag selects" the way a plain click already is.
+- **No new glyph, no new colour** (§2's inventory governs symbols; `2x`/
+  `3x` are ASCII text in the row's own style, the same class of thing as
+  the C2 tab-count cell's digit).
+- **Test:** `help_rows_document_every_mouse_verb` (amended) now asserts
+  `2x`/`3x`/`shift` are present, alongside the pre-existing `mouse`/
+  `wheel`/`click`/`drag`/`Alt+click`/`URL` — the check that actually has
+  to know the three new gestures exist, since the chord-table check
+  cannot.
+
 ### C16 — Dead-pane overlay
 
 **Current:** `render.rs:387–403` — error line Red fg; action bar Black on Red.
@@ -1783,8 +1817,9 @@ reading order).
   distinguishable within the reversed region. Painted after the selection
   pass. Any color-token styling of the cursor is a DEVIATED.
 - **Selection semantics — identical to the mouse path** (one selection
-  model, two input methods): inclusive anchor→cursor, reading order, same
-  `Selection` struct, same `highlight_selection`, same `grab_text`. Honest
+  model, three input methods as of C29's native selection — [Amended
+  2026-08-06, PR #46 audit, D4]): inclusive anchor→cursor, reading order,
+  same `Selection` struct, same `highlight_selection`, same `grab_text`. Honest
   limit, shared with the mouse path and documented: the **visible grid
   only** — no scrollback paging inside copy mode (deliberately left out;
   Scroll mode remains a separate concern).
@@ -2409,13 +2444,13 @@ the two share machinery it is called out below rather than duplicated —
 module, driven through the real `handle_mouse` entry point:**
 drag-selects-and-copies, leaving the highlight lit
 (`dragging_over_a_native_pane_selects_and_copies_on_release`) · double-click
-word (`double_click_selects_the_word_and_copies_on_release`) · triple-click
-line (`triple_click_selects_the_line_and_copies_on_release`) · shift-click
-extend (`shift_click_extends_the_selection_and_copies_on_release`) · a plain
-click elsewhere clears it (`a_plain_click_clears_a_lingering_native_selection`)
-· a mouse-aware pane is untouched
-(`a_mouse_aware_pane_is_untouched_by_native_selection_gestures`). Plus the
-underlying `App` methods in isolation, in `core::app`'s test module:
+word (`double_click_selects_the_word_and_stages_the_copy_on_release`) ·
+triple-click line (`triple_click_selects_the_line_and_copies_on_release`) ·
+shift-click extend (`shift_click_extends_the_selection_and_copies_on_release`)
+· a plain click elsewhere clears it
+(`a_plain_click_clears_a_lingering_native_selection`) · a mouse-aware pane is
+untouched (`a_mouse_aware_pane_is_untouched_by_native_selection_gestures`).
+Plus the underlying `App` methods in isolation, in `core::app`'s test module:
 `click_count_cycles_through_1_2_3_and_wraps_on_a_4th`,
 `select_word_at_grabs_the_whitespace_delimited_word`,
 `select_line_at_grabs_the_whole_row`,
@@ -2425,6 +2460,160 @@ underlying `App` methods in isolation, in `core::app`'s test module:
 `any_keypress_clears_a_normal_mode_selection_but_copy_mode_is_exempt`,
 `entering_copy_mode_clears_a_lingering_native_selection_first`. The SUPER
 guard: `ui::input::tests::super_modified_chars_are_swallowed_not_forwarded`.
+**[Superseded/extended 2026-08-06 — see the PR #46 amendment below for the
+post-audit test list.]**
+
+**[Amended 2026-08-06, PR #46 design + code audit — two behavioural bugs and
+two correctness gaps, fixed; the bullets above describe the intent
+correctly but several undersold what enforced it. Restated where it
+matters, not rewritten wholesale.]**
+
+- **D1 — the "in `Mode::Normal`" scope clause is now actually enforced.**
+  `handle_mouse` had exactly two mode-aware early returns (Copy mode,
+  a C12 modal) and `Mode::Scroll` was neither, so a drag during Scroll mode
+  fell all the way through to `handle_native_selection` and quietly
+  selected and copied — while the keypress-clear stayed `Mode::Normal`-gated
+  and so couldn't clean up the result until Scroll mode was left. Fixed at
+  the one call site (`main.rs:764`, inside `handle_mouse`):
+  `matches!(app.mode, Mode::Normal)` joins the existing `!pane.collapsed &&
+  state.proto == MouseProto::None` gate. **Chosen over the alternative**
+  (permit it in Scroll, since a frozen view is exactly what Copy mode
+  already lets you select from via its own U9 Alt+c handoff) because the
+  contract always said Normal-only, and permitting Scroll would have needed
+  the clear path widened too, for a mode nothing in the brief asked native
+  selection to cover. Pinned by
+  `main.rs::tests::a_drag_in_scroll_mode_does_not_select`.
+- **D3 — "found nothing" is tracked, not inferred from geometry.**
+  `select_word_at` (`app.rs:2227`) used to degrade "no word under the
+  pointer" to a same-point (anchor == cursor) selection — indistinguishable
+  from a genuine **one-character** word, which also has anchor == cursor by
+  construction. Release logic that read "anchor == cursor" as "nothing
+  selected" therefore silently dropped double-clicks on `a`, `$`, or any
+  other 1-char token. Fixed two ways that compose: `select_word_at` now
+  clears `self.selection` outright (`None`, not a degenerate point) when
+  `word_bounds_at` finds nothing, so `Some` afterward already means "there
+  is something here" regardless of its width; and the release decision
+  (`App::release_native_selection`, `app.rs:2352`) keys "nothing selected"
+  off `sel.dragging` — true only for an un-upgraded click/shift-click that
+  never moved — rather than off the resulting range. Pinned by
+  `select_word_at_a_one_char_word_is_a_real_selection_not_nothing_found`
+  and, end to end, `main.rs::tests::double_click_on_a_one_char_word_still_selects_it`.
+- **B1 — word lookup is grid-CELL-indexed, not char-indexed.**
+  `row_text`/`grab_text` (P15) drop wide glyphs' continuation cells, so the
+  extracted string's char positions and the row's cell positions diverge
+  the moment a row holds one; `word_bounds_at` used to index that string
+  directly with the caller's cell column, so a row like `日本語 hello`
+  walked off by however many extra cells the glyphs ate and could select
+  (and, on release, copy) the wrong word entirely. The same flaw was
+  already latent in `find_url_at`/`url_at`'s single-row case (documented
+  and accepted there — SPEC-ux U19 — because a wrong-URL click just fails
+  silently) but this contract turns it into silently copying the *wrong
+  text*, which is worse. Fixed at the shared level: `word_bounds_at`
+  (`app.rs:4756`) now converts the incoming cell column to a char index via
+  the new `cell_to_char` (`:4727`) before walking, and `select_word_at`
+  converts the resulting char bounds back to cell columns via `char_to_cell`
+  (`:4742`) — including a trailing wide glyph's full cell span, not just its
+  first column. `find_url_at`'s own char-based slicing needed no change
+  (the bounds it receives were always meant to be char-space; only what fed
+  them in was wrong). `find_url_at`'s single-row callers are a pure
+  correctness improvement as a result; `url_in_wrapped_rows`'s own
+  cross-row char-count accumulation (a *different*, already-documented gap,
+  same U19 citation) is untouched — out of this contract's scope.
+  `ports::fakes::FakePane::grab_text` also grew a `slice_cells` mirror of
+  the real backend's cell-indexed extraction (it used to ignore columns
+  entirely and return the whole row, which is exactly why no test could
+  have caught the bug it was hiding). Pinned by
+  `select_word_at_accounts_for_a_wide_glyph_earlier_in_the_row`.
+- **S3 — a selection could be extended/copied by a pane it didn't belong
+  to.** The Alt+click-URL branch (`main.rs`, inside `handle_mouse`) latches
+  the clicked pane and, on a hit, `return`s *before* `App::on_click` runs —
+  so the cross-pane clear this contract's own "Clearing" bullet relies on
+  never fired for that gesture. A drag-select left lit in pane A, then an
+  Alt+click that opens a URL in pane B, then a further drag/release on B's
+  now-latched gesture, could extend or re-copy pane A's stale selection
+  under a pane B event that had nothing to do with it. Fixed two ways: the
+  URL-hit branch now clears `app.selection` itself before opening the
+  browser (a URL open is its own complete gesture, same as any other
+  click); and `handle_native_selection`'s `Drag`/`Up` arms are now guarded
+  on `app.selection.is_some_and(|s| s.pane == pane.id)`, so neither can
+  touch a selection that isn't the current gesture's own regardless of how
+  it was left stale. Pinned by
+  `alt_click_opening_a_url_clears_a_different_panes_selection`.
+  **Decided (the "uncontracted path" question): an Alt+click that *misses*
+  a URL falls through to the ordinary click path unchanged** — Alt is
+  roost's own layer and a miss most plausibly means the user simply
+  clicked there (Alt incidental or misjudged), so it starts a selection
+  like any other left press. No special-casing needed or added.
+- **S4 — a double-click's own release no longer fires a premature copy.**
+  A real triple-click arrives as three full press/release pairs, and the
+  2nd click's own `Up` used to commit its word selection immediately —
+  before the 3rd click had a chance to arrive and supersede it with the
+  whole line — so every triple-click copied the word, then the line, a
+  heartbeat later: two clipboard writes and two flashes for one gesture.
+  Fixed with a short, explicit defer: `App::release_native_selection`
+  (`app.rs:2352`) stages a double-click's release instead of committing it
+  (`self.pending_copy`, keyed off `App::click_count`'s own last-recorded
+  count — nothing else needs to know a click happened twice) for exactly
+  `DOUBLE_CLICK_INTERVAL`; `App::due_copy` (`:2378`), polled once per
+  event-loop iteration by the composition root (not gated on any
+  particular event, since it fires on a deadline), reports the staged text
+  once that window passes **and** `self.selection` still matches what was
+  staged — a 3rd click overwriting it with the line, or any other clear,
+  silently cancels the stage. A plain click/drag and a triple-click's own
+  release are never staged (nothing above triple-click exists to wait for;
+  shift-click never touches `click_count` at all), so they still commit on
+  the spot. Pinned by
+  `core::app::tests::release_native_selection_stages_a_double_click_and_due_copy_fires_it_later`
+  and `a_third_click_cancels_the_staged_double_click_copy`; end to end,
+  `main.rs::tests::double_click_selects_the_word_and_stages_the_copy_on_release`
+  asserts the release does *not* flash immediately.
+- **B2 — the test suite no longer touches the operator's real clipboard or
+  browser.** `infra::clipboard::copy` and `infra::open::open_url` are both
+  reached by this contract's own `handle_mouse`-driven tests (that's the
+  point — they exercise the real composition-root path), and doing so for
+  real left a `pbcopy` write sitting in the *operator's own* system
+  clipboard after every `cargo test` run (confirmed via `pbpaste`) and OSC
+  52 bytes leaking into captured stdout that CI's `--show-output` prints
+  straight into the log; `open_url` would have spawned the operator's
+  actual browser the moment a test exercised the Alt+click-URL path (S3's
+  own regression test above is the first to). Both now have a `#[cfg(test)]`
+  twin that touches neither: `clipboard::copy` deterministically reports
+  `Native` so a test can pin the *exact* flash text (`copied N chars`)
+  instead of whichever real channel wins on the machine running it —
+  before this, `assert!(flash().is_some())` passed identically for
+  `copy failed`, pinning nothing about U14. Every `...copies_on_release`
+  test above now asserts the literal flash string.
+- **Test list, current as of this amendment (`main.rs`'s test module unless
+  noted):** `dragging_over_a_native_pane_selects_and_copies_on_release` ·
+  `a_drag_in_scroll_mode_does_not_select` (D1) ·
+  `double_click_selects_the_word_and_stages_the_copy_on_release` (S4) ·
+  `double_click_on_a_one_char_word_still_selects_it` (D3) ·
+  `triple_click_selects_the_line_and_copies_on_release` ·
+  `shift_click_extends_the_selection_and_copies_on_release` ·
+  `alt_click_opening_a_url_clears_a_different_panes_selection` (S3) ·
+  `a_plain_click_clears_a_lingering_native_selection` ·
+  `a_mouse_aware_pane_is_untouched_by_native_selection_gestures`; in
+  `core::app`'s own test module, `click_count_cycles_through_1_2_3_and_wraps_on_a_4th`,
+  `select_word_at_grabs_the_whitespace_delimited_word`,
+  `select_word_at_a_one_char_word_is_a_real_selection_not_nothing_found` (D3),
+  `select_word_at_accounts_for_a_wide_glyph_earlier_in_the_row` (B1),
+  `select_line_at_grabs_the_whole_row`,
+  `extend_selection_to_extends_the_live_selection_or_starts_fresh`,
+  `finish_native_selection_extracts_text_but_leaves_the_highlight_lit`,
+  `release_native_selection_stages_a_double_click_and_due_copy_fires_it_later` (S4),
+  `a_third_click_cancels_the_staged_double_click_copy` (S4),
+  `on_click_clears_a_selection_that_belongs_to_a_different_pane_only`,
+  `any_keypress_clears_a_normal_mode_selection_but_copy_mode_is_exempt`,
+  `entering_copy_mode_clears_a_lingering_native_selection_first`. The C17
+  gates' own fixture (`ui::render::tests::chrome_buffers`) gained a
+  `"lit text selection"` case, since none of its entries had ever set
+  `app.selection` and every §2 mechanical gate was therefore vacuous over
+  `highlight_selection`'s output for *both* tenants of C17's modifier-only
+  rule (Copy mode and this contract) — not a regression this PR
+  introduced, but one it made newly worth noticing. The SUPER guard:
+  `ui::input::tests::super_modified_chars_are_swallowed_not_forwarded`.
+  The mouse-capture subset:
+  `ui::mouse::tests::mouse_capture_sequences_are_the_1000_1002_1006_subset_symmetric_in_reverse`.
 
 ---
 
@@ -2803,13 +2992,15 @@ because a list you filter by typing cannot reserve letters (U20's rule, paid
 for by the picker). All of them are advertised on the roster's own hint list
 (C9) and the chord itself on C15's merged `Alt+a / Alt+Shift+a` row.]
 
-[Amended 2026-08-06, C29 — native selection is mouse-only, no chord. Left
-press, drag, double-click, triple-click and shift-click over a
-`MouseProto::None` pane join no row in this table — none of them is a key
-at all, so none could join it before either. Listed here for the same
-reason as the mode-local blocks above: the canonical page should still know
-they exist. Nothing above changes: no new Alt chord, no reassigned key, and
-the free-Alt-keys tally below is untouched.]
+[Amended 2026-08-06, C29, **withdrawn the same day (PR #46 design audit,
+D2)**: native selection's gestures are mouse verbs, not keys, and this
+table's subject is chords — the withdrawn text placed them here anyway,
+telling the reader in the same breath that none of them belonged. C15's
+own `READING THE SCREEN` group is where U23 already put the sibling mouse
+verbs (wheel/click/drag/Alt+click), and that contract's amendment is where
+double-click/triple-click/shift-click now live too. Nothing here changes:
+no new Alt chord, no reassigned key, and the free-Alt-keys tally below is
+untouched.]
 
 Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
 raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes
