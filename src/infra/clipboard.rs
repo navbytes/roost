@@ -3,7 +3,9 @@
 //! an OSC 52 escape to the terminal. Whichever the environment supports
 //! lands the text; OSC 52 also covers SSH / tmux where no local helper runs.
 
+#[cfg(not(test))]
 use std::io::Write;
+#[cfg(not(test))]
 use std::process::{Command, Stdio};
 
 use crate::ports::ClipboardOutcome;
@@ -13,6 +15,16 @@ use crate::ports::ClipboardOutcome;
 /// copy — the emission is unchanged; what changed is that the results are
 /// no longer thrown away, so the hint bar can stop claiming a copy that
 /// never happened.
+///
+/// B2 (PR #46 code review): under `cargo test` this is the `#[cfg(test)]`
+/// twin below instead — `handle_mouse`/`handle_copy_mouse`'s test suites
+/// drive this function for real (that's the point: the gesture-matrix
+/// tests exercise the actual composition-root path), and doing so for
+/// real left a stray `pbcopy` write sitting in the *operator's own*
+/// system clipboard after every `cargo test` run (confirmed: `pbpaste`
+/// afterwards) and OSC 52 bytes leaking into captured stdout, which
+/// `--show-output` (CI's `ci.yml`) prints straight into the run's log.
+#[cfg(not(test))]
 pub fn copy(text: &str) -> ClipboardOutcome {
     let native = native_copy(text);
     let osc52 = emit_osc52(text);
@@ -23,12 +35,24 @@ pub fn copy(text: &str) -> ClipboardOutcome {
     }
 }
 
+/// The test build's `copy`: touches neither the real system clipboard nor
+/// real stdout, and always reports `Native` so a test can pin the exact
+/// `copied N chars` flash text (§U14) instead of whichever real channel
+/// happened to win on the machine running it — with the real `copy`
+/// unconditionally discarding both channels' results the old way, these
+/// tests would have passed identically for `copy failed`, pinning nothing.
+#[cfg(test)]
+pub fn copy(_text: &str) -> ClipboardOutcome {
+    ClipboardOutcome::Native
+}
+
 /// Pipe `text` into the first clipboard helper that succeeds. Returns
 /// whether one actually took the text: spawning is not success — a helper
 /// can exist and still fail (no `$DISPLAY` for xclip, no compositor for
 /// wl-copy, a broken pipe), and the old "we spawned something" answer is
 /// exactly how an empty clipboard got reported as `copied N chars`. A
 /// helper that fails is skipped in favour of the next candidate.
+#[cfg(not(test))]
 fn native_copy(text: &str) -> bool {
     // (program, args) candidates in preference order.
     let candidates: &[(&str, &[&str])] = &[
@@ -62,6 +86,7 @@ fn native_copy(text: &str) -> bool {
 /// whether the bytes made it out of this process — that is the *most* this
 /// channel can ever know (there is no acknowledgement to wait for), which is
 /// why its flash says "(OSC 52)" rather than an unqualified "copied".
+#[cfg(not(test))]
 fn emit_osc52(text: &str) -> bool {
     let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
     let mut out = std::io::stdout();
