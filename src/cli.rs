@@ -112,9 +112,19 @@ roost — control a running instance:
   roost wait PANE... [--until STATUS] [--timeout SEC]
   roost --help | -h
   roost --version | -V
-(run `roost` with no args to launch the multiplexer)";
+(run `roost` with no args to launch the multiplexer)
+Exit codes: 0 ok / 1 runtime error / 2 usage error / 3 `wait` timed out.";
+
+/// `wait`'s timeout reply (`{"timed_out":true}`, see app.rs's `poll_waiters`)
+/// is the one outcome a caller MUST branch on — printing it with the same
+/// exit 0 as a resolved wait let `wait … && read` proceed as though the pane
+/// had actually finished. A dedicated code rather than reusing 1: a caller
+/// that only checks `$?` for "nonzero" still needs to tell a timeout apart
+/// from every other kind of failure. Documented in `USAGE`.
+const EXIT_WAIT_TIMEOUT: i32 = 3;
 
 fn run(args: &[String]) -> i32 {
+    let verb = args[0].as_str();
     let req = match build_request(args, resolve_token()) {
         Ok(r) => r,
         Err(e) => {
@@ -127,7 +137,12 @@ fn run(args: &[String]) -> i32 {
         Ok(reply) => {
             if let Some(ok) = reply.get("ok") {
                 println!("{}", serde_json::to_string_pretty(ok).unwrap_or_default());
-                0
+                // The JSON is unchanged either way — only the exit status
+                // tells a shell caller `wait` actually timed out rather than
+                // resolved normally.
+                let timed_out =
+                    verb == "wait" && ok.get("timed_out") == Some(&serde_json::Value::Bool(true));
+                if timed_out { EXIT_WAIT_TIMEOUT } else { 0 }
             } else {
                 let err = reply.get("err").and_then(|e| e.as_str()).unwrap_or("unknown error");
                 eprintln!("roost: {err}");
