@@ -1108,9 +1108,12 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// C22: learns the float — `send`/`read`/badges/rename/respawn by id
-    /// all route through this, so they work on the scratch pane exactly
-    /// like any other, with zero extra code at those call sites.
+    /// C22: learns the float — badges/rename/respawn by id all route
+    /// through this, so they work on the scratch pane exactly like any
+    /// other, with zero extra code at those call sites. `send`/`read`/
+    /// `close` resolve it here too (so "no such pane" is still right for
+    /// them), but each then adds its own is-float refusal (M1) — the float
+    /// is the human's private scratch shell, never a control-plane target.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
         if let Some(f) = &self.float {
             if f.id == id {
@@ -1644,6 +1647,12 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
+        // C22/M1: same refusal as ctl_close — the float is the human's
+        // private interactive scratch shell, never a control-plane target,
+        // checked before authz since it's unconditional either way.
+        if self.is_float(pane) {
+            return Reply::err("cannot send to the scratch pane");
+        }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
         }
@@ -1716,6 +1725,12 @@ impl<B: PaneBackend> App<B> {
     fn ctl_read(&self, actor: Actor, pane: PaneId, mode: ReadMode) -> Reply {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
+        }
+        // C22/M1: same refusal as ctl_close — the float is the human's
+        // private interactive scratch shell, never a control-plane target,
+        // checked before authz since it's unconditional either way.
+        if self.is_float(pane) {
+            return Reply::err("cannot read the scratch pane");
         }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
@@ -9923,23 +9938,34 @@ mod tests {
         assert!(app.float.as_ref().unwrap().shown, "the float must survive the refused close");
     }
 
+    /// M1: `find_spec` still learns the float (badges/rename/respawn need
+    /// that), but `send`/`read` must refuse it over the control plane —
+    /// otherwise any actor holding control.token could `read` the human's
+    /// private scratch shell verbatim, or type into it.
     #[test]
-    fn find_spec_learns_the_float_send_and_read_work_by_id() {
+    fn control_send_and_read_of_the_float_are_refused() {
         use crate::core::control::{Method, ReadMode, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
+        // Resolved, so the refusal below is is_float's, not "no such pane".
         assert!(app.find_spec(float_id).is_some());
         let ct = app.control_token().to_string();
         let reply = app.handle_control(Request {
             token: ct.clone(),
             method: Method::Send { pane: float_id, text: "hi".into(), submit: false },
         });
-        assert!(matches!(reply, Reply::Ok { .. }));
-        assert_eq!(app.runtimes.get(&float_id).unwrap().input, b"hi");
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot send to the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(app.runtimes.get(&float_id).unwrap().input.is_empty(), "nothing must reach the float");
         let reply =
             app.handle_control(Request { token: ct, method: Method::Read { pane: float_id, mode: ReadMode::Screen } });
-        assert!(matches!(reply, Reply::Ok { .. }));
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot read the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
     }
 
     #[test]
