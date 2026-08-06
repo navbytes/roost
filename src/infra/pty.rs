@@ -1284,4 +1284,37 @@ mod tests {
         assert_eq!(selected.lines().collect::<Vec<_>>(), history);
         assert_eq!(selected, "日本語 abc\n\u{1f600}x");
     }
+
+    /// P0-3: a spawn that fails at `spawn_command` (~line 512) carries the
+    /// real OS cause (ENOENT here) *underneath* the `.with_context(||
+    /// format!("spawning {program}"))` this file adds — anyhow's default
+    /// `Display` shows only that outer context, which is the bug (app.rs
+    /// used to store exactly that truncated string). The alternate format
+    /// walks the whole chain on one line. Real `PtyPane::spawn`, not a
+    /// fake, so this pins the actual failure path finding #1 is about.
+    #[test]
+    fn spawn_failure_keeps_the_real_cause_reachable_via_alternate_format() {
+        use crate::agents::CommandSpec;
+        use crate::core::event::AppEvent;
+        use crate::ports::PaneBackend;
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<AppEvent>(8);
+        let spec = CommandSpec::new(
+            "roost-test-definitely-does-not-exist-9f3c",
+            &std::env::temp_dir(),
+        );
+        // `PtyPane` has no `Debug` impl (it holds trait objects), so
+        // `expect_err` can't be used here — match instead.
+        let err = match super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx) {
+            Err(e) => e,
+            Ok(_) => panic!("a nonexistent program must fail to spawn"),
+        };
+        let outer = format!("{err}");
+        let full = format!("{err:#}");
+        assert_eq!(outer, format!("spawning {}", spec.program), "the context this file adds");
+        assert!(
+            full.len() > outer.len() && full.starts_with(&outer),
+            "{{:#}} must carry the real cause {{}} drops on the floor: {full:?}"
+        );
+    }
 }
