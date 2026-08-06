@@ -25,6 +25,20 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, shell)
 
 Full design rationale: [DESIGN.md](DESIGN.md).
 
+## No daemon, so no detach
+
+roost has **no daemon and no detach.** When you quit (`Alt+q`) or close the terminal, roost stops immediately — it does not reattach. What survives is the layout tree and each pane's `(adapter, cwd, session-id)`, stored in `workspace.json`. Next time you run `roost`, every tab and split comes back, and agents resume their conversations by session id. What does **not** survive is an in-flight turn: an agent mid-turn when roost exits loses that turn, though its session state persists for the next resume.
+
+This is deliberate — no daemon means nothing leaks, nothing to restart, and roost never runs invisible in the background. SSH is the one case where this matters: when an SSH session dies, roost dies with it. The fix is to run roost *inside* tmux or screen on the remote:
+
+```sh
+ssh user@host
+screen  # or: tmux
+roost
+```
+
+Then roost's local `(layout, session-id)` persistence works normally, and the outer screen/tmux session survives the SSH reconnect. When you reconnect, reattach to screen/tmux, and roost resumes from where it left off.
+
 ## Quick start
 
 Needs a Rust toolchain — grab one at [rustup.rs](https://rustup.rs) if you don't have one.
@@ -141,8 +155,7 @@ clicks), your terminal's own drag-to-select is intercepted. Use **copy mode**
 instead: press `Alt+c`, drag to select within a pane, and it copies to your
 system clipboard on release (via a native helper — pbcopy / wl-copy / xclip —
 and OSC 52, so it works locally and over SSH). This is pane-scoped, unlike the
-terminal's native whole-window selection. (Your terminal's Shift+drag native
-selection still works too, if you prefer it.)
+terminal's native whole-window selection. Most terminals have a modifier to bypass roost's mouse capture and use their native selection — **Ghostty and kitty use Shift+drag; iTerm2 uses Option+drag; Terminal.app has no hold-to-bypass modifier** (the only control is View ▸ Allow Mouse Reporting).
 
 </details>
 
@@ -309,15 +322,18 @@ roost fork 5                                  # a sibling in the same context
 roost close 5 [--force]
 ```
 
-(`roost --help` prints this same reference.)
+(`roost --help` prints the same verb set, in a different order.)
 
 `wait` is what turns "spawn then poll" into "spawn → await → read": block until a
 pane hits a status (or a timeout), so an orchestrator doesn't sleep-and-grep.
+When you `spawn` with `initial_input`, roost holds that input and delivers it after
+the pane's first PTY output, guaranteeing the CLI is alive and reading before a
+prompt lands — no silent loss like a script racing a not-yet-ready agent.
 
 `send --all` is `send`'s broadcast form, not a separate verb — it fans out to
-every **running** pane the caller may target: every spawned pane (float
-included) for the fleet token, or just its own spawned subtree for a pane
-acting via its own `$ROOST_TOKEN`. Non-running panes are skipped, not errors;
+every **running** pane the caller may target, except the floating scratch shell:
+every spawned pane for the fleet token (float excluded), or just its own spawned
+subtree for a pane acting via its own `$ROOST_TOKEN`. Non-running panes are skipped, not errors;
 the reply reports which pane ids it reached. Audited like every control
 action, by shape only — `broadcast len=<n> submit=<bool> -> ok count=<n>` —
 the message text itself is never written to `control.log`.
