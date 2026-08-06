@@ -64,13 +64,28 @@ impl Workspace {
             + 1
     }
 
+    /// `tabs` is never actually empty (`validate_and_repair` guarantees it on
+    /// load; `close_pane_id` only removes a tab when more than one remains),
+    /// but this is called from ~40 sites, so the access itself stays
+    /// underflow-proof rather than relying on that invariant: no
+    /// `tabs.len() - 1`, which panics on subtraction overflow in debug and
+    /// silently wraps to `usize::MAX` (before an equally confusing
+    /// out-of-bounds panic) in release, the moment `tabs` is ever empty.
     pub fn active_tab(&self) -> &Tab {
-        &self.tabs[self.active_tab.min(self.tabs.len() - 1)]
+        self.tabs
+            .get(self.active_tab)
+            .or(self.tabs.first())
+            .expect("a workspace always has at least one tab (validate_and_repair)")
     }
 
     pub fn active_tab_mut(&mut self) -> &mut Tab {
-        let i = self.active_tab.min(self.tabs.len() - 1);
-        &mut self.tabs[i]
+        // Same guard as `active_tab`, adapted for `&mut`: `Option::or` would
+        // need two live mutable borrows of `self.tabs` at once, so clamp the
+        // index first (no subtraction) and take a single `get_mut`.
+        let i = if self.active_tab < self.tabs.len() { self.active_tab } else { 0 };
+        self.tabs
+            .get_mut(i)
+            .expect("a workspace always has at least one tab (validate_and_repair)")
     }
 
     /// Repair layout ↔ panes inconsistencies after loading a (possibly
@@ -121,6 +136,25 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
         assert_eq!(ws.active_tab().panes[&1].adapter, "shell");
         assert_eq!(ws.next_pane_id(), 2);
+    }
+
+    /// P3: an empty `tabs` (unreachable via the public API, but not via a
+    /// direct struct literal) has no tab to hand back, so this still panics
+    /// — but it must be OUR clear panic, not the `len() - 1` underflow one.
+    /// `#[should_panic(expected = ...)]` fails if the message reverts to the
+    /// arithmetic-overflow wording, which is exactly the regression this pins.
+    #[test]
+    #[should_panic(expected = "a workspace always has at least one tab")]
+    fn active_tab_on_an_empty_workspace_panics_clearly_not_via_underflow() {
+        let empty = Workspace { version: 1, active_tab: 0, tabs: Vec::new() };
+        let _ = empty.active_tab();
+    }
+
+    #[test]
+    #[should_panic(expected = "a workspace always has at least one tab")]
+    fn active_tab_mut_on_an_empty_workspace_panics_clearly_not_via_underflow() {
+        let mut empty = Workspace { version: 1, active_tab: 0, tabs: Vec::new() };
+        let _ = empty.active_tab_mut();
     }
 
     #[test]
