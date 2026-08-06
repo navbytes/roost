@@ -189,9 +189,9 @@ requirement.
   (app.rs:3059). [ux P0-1]
 - ☐ Picker offers adapters not on PATH → guaranteed dead pane; annotate or
   filter by `which` (app.rs:41). [ux P2-13]
-- ☐ Help overlay never mentions the control CLI (`roost send <id>`) — the
-  category differentiator is invisible in-product (render.rs:680–747).
-  [ux P2-15]
+- ✅ **(PR #42)** Help overlay never mentions the control CLI
+  (`roost send <id>`) — the category differentiator was invisible
+  in-product (render.rs:680–747). [ux P2-15]
 - ☐ "copy failed" flash names neither cause nor next step (app.rs:2164).
   [ux P3-17]
 - ✅ **(PR #39)** README: "`roost --help` prints this same reference" is only approximately
@@ -209,7 +209,7 @@ requirement.
   [ux, DECISIONS D11 — NEEDS CLIENT]
 - ☐ Room-exhaustion flashes should point at Alt+s/stacks as the exit.
   [ux P3-18]
-- ☐ <2-row terminals render blank; show a "too small" notice
+- ✅ **(PR #42)** <2-row terminals render blank; show a "too small" notice
   (render.rs:24–26). [ux P3-16]
 
 ## Phase 3 — Fleet & robustness UX (promoted deferred items)
@@ -282,6 +282,28 @@ resurrection are already category-leading; what's missing is reach
   classic-multiplexer table stakes not demanded by fleet users. [res: LOW]
 
 ## Phase 5 — Health & performance
+
+Spec hygiene from the design-supervisor audit of PR #42 — neither is
+user-visible drift, both block "specs are the truth" at exit:
+
+- ☐ **C15 has eight groups in code, seven in the spec.** The justifying
+  amendment for the new CONTROL CLI group was written into a source
+  doc-comment (render.rs:700–712) instead of a dated C15 amendment in
+  DESIGN-ui.md:1285–1287. U23's precedent is unambiguous: reference rows
+  got a dated amendment. Add one. [design-supervisor SG]
+- ☐ **Write a contract for the sub-two-row surface.** Confirmed there is no
+  contract governing `height < 2` — every floor mention in DESIGN-ui.md is
+  a *sizing target* for an overlay/rail/split, and §7's exclusion list
+  omits it. Contract shape: trigger `area.height < 2`; one line
+  `too small — resize` in `ink()`, no bg, no glyph; `Paragraph` clips
+  rather than wraps; zero dimensions draw nothing; it preempts all chrome
+  and all modals (C12 never runs). [design-supervisor SG-1]
+- ☐ **A §2 gate passes vacuously over the new surface.** `chrome_buffers()`
+  (render.rs:3322–3398) builds every state at 100×30, so the three
+  render-buffer gates never see the too-small path — while DESIGN-ui.md:
+  181–183 claims they cover "every cell of every drawn chrome state". The
+  stance holds today only because the source-scan gates catch it. Push an
+  80×1 too-small snapshot into `chrome_buffers()`. [design-supervisor SG-2]
 
 - ☐ Dependency inversion: `core` imports `ui::Action` + raw crossterm key
   types; arrow should point ui → core. [roadmap: health]
