@@ -57,7 +57,31 @@ Or skip the build step with `cargo run`.
 - **Prebuilt binaries** from [GitHub Releases](https://github.com/navbytes/roost/releases) — coming with the first tagged release, not published yet.
 - **`cargo binstall roost`** — once a release exists, fetches the prebuilt binary for your platform instead of compiling.
 - **`cargo install --path .`** — clone and build locally onto your `$PATH`. Works today.
+- **[mise](https://mise.jdx.dev)** — see below. Works today via the cargo
+  backend; gets faster once a release exists.
 - **Homebrew tap** (`navbytes/homebrew-roost`) — planned, not live yet.
+
+#### With mise
+
+roost isn't in mise's registry and doesn't need to be — name the backend and
+mise installs it straight from this repo.
+
+Building from source (works today, needs a Rust toolchain):
+
+```sh
+mise use -g "cargo:https://github.com/navbytes/roost@branch:main"
+```
+
+Once the first release is tagged, this fetches the prebuilt binary for your
+platform instead of compiling — no Rust toolchain needed:
+
+```sh
+mise use -g github:navbytes/roost
+```
+
+Pin a version by appending it, e.g. `github:navbytes/roost@0.1.0`, or swap
+`@branch:main` for `@tag:v0.1.0` on the cargo backend. Drop `-g` to pin roost
+per-project in that directory's `mise.toml` instead of globally.
 
 Only one roost runs per workspace at a time — a second instance on the same
 state dir refuses to start (they'd race and corrupt `workspace.json`). Run an
