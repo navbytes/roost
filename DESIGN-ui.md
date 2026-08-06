@@ -1372,6 +1372,50 @@ group per U23's own precedent, not in a table whose subject is chords).
   to know the three new gestures exist, since the chord-table check
   cannot.
 
+**[Amended 2026-08-06, PR #42 spec audit — the CONTROL CLI group]:**
+`HELP_GROUPS` contains eight groups in the code; DESIGN-ui.md listed only
+seven. The eighth is `CONTROL CLI` (`render.rs:700–713`), which closes the
+table with the scriptable fleet verbs (`roost
+send`/`read`/`status`/`spawn`/`wait`/`fork`/`close`). It was added per ux
+P2-15 — the pane id appeared on badges specifically as the join key between
+what's on screen and what a caller types, but that key went unnamed in the
+UI until now. Justification: it sorts last for the same reason `READING THE
+SCREEN` does (it teaches the product rather than a binding), and follows
+rather than leading (a user opens `Alt+?` to remember a chord first, learns
+the fleet is scriptable second). Covered by the existing width rule and
+`every_bound_chord_is_documented_in_the_keymap` gate (as a non-Alt surface
+it poses no new bindings).
+
+### C30 — Sub-two-row floor notice — [Added 2026-08-06]
+
+**Current:** `render.rs:24–29` (`draw_too_small`) — when `area.height < 2`,
+draw the message "too small — resize" and return, pre-empting all other
+chrome.
+
+**Target:**
+- **Trigger:** iff the top-level `area.height < 2` — no room for even tab bar
+  + one-row body minimum (§4's sizing contracts all refer to the body area
+  after the tab bar consumes one row; the floor is therefore `area.height ≥
+  2`). The sub-two case is not a resize-target; it is a "you're too tight"
+  notice: terminals at 80×1 or a split down to one row mid-transaction
+  briefly, or a constraint roost inherited from its launcher.
+- **Rendering:** one line, left-aligned (plain `Paragraph`, no alignment
+  set), `too small — resize` in `ink()`, no
+  background, no glyph. `Paragraph` clips long content at the area boundary
+  rather than wrapping — the message is terse enough to fit the 80-column
+  floor by construction (`"too small — resize"` is 18 chars; an 80×1 buffer
+  has 80 cells, plenty). Zero-sized area draws nothing (the `return` at
+  `render.rs:93–94`).
+- **Precedence:** this is the **first and only thing `draw()` checks**
+  (`render.rs:24–30`). It pre-empts tab bar, panes, modals, floating scratch,
+  hints — everything. The user sees the notice immediately; nothing else
+  paints.
+- **Unit test:** the §2 mechanical gates include the sub-two-row case. The
+  fixture (`chrome_buffers`) receives an 80×1 snapshot; `chrome_paints_no_background_fill`
+  and `every_chrome_word_is_drawn_in_ink_the_user_already_reads` audit it.
+  A 0-height area test is implicitly covered by the `if area.height == 0`
+  guard at `:92`.
+
 ### C16 — Dead-pane overlay
 
 **Current:** `render.rs:387–403` — error line Red fg; action bar Black on Red.

@@ -159,7 +159,7 @@ In a **dead pane** (process exited or spawn failed): `Enter` relaunches or
 resumes, `f` starts fresh (drops the stored session id).
 
 <details>
-<summary><strong>Mouse, links & copy mode</strong></summary>
+<summary><strong>Mouse, links & text selection</strong></summary>
 
 **Mouse**: the wheel scrolls the pane under the cursor — forwarded to the
 inner app when it has mouse reporting enabled (pi/claude TUIs, vim, less),
@@ -174,12 +174,34 @@ a tab in the tab bar to switch to it.
 plain click so it doesn't fight click-to-focus, and because a terminal can't
 report Cmd-clicks to it.
 
-**Selecting text**: because roost holds mouse capture (to route the wheel and
-clicks), your terminal's own drag-to-select is intercepted. Use **copy mode**
-instead: press `Alt+c`, drag to select within a pane, and it copies to your
-system clipboard on release (via a native helper — pbcopy / wl-copy / xclip —
-and OSC 52, so it works locally and over SSH). This is pane-scoped, unlike the
-terminal's native whole-window selection. Most terminals have a modifier to bypass roost's mouse capture and use their native selection — **Ghostty and kitty use Shift+drag; iTerm2 uses Option+drag; Terminal.app has no hold-to-bypass modifier** (the only control is View ▸ Allow Mouse Reporting).
+**Text selection**: in a normal pane, **drag to select — the highlight stays
+lit until the next click or keypress**. Double-click selects a word,
+triple-click selects the whole line, Shift+click extends the selection. On
+release, roost copies the text to your system clipboard (via a native helper
+— pbcopy / wl-copy / xclip — and OSC 52, so it works locally and over SSH).
+No mode, no chord: exactly like a native macOS or Linux terminal.
+
+If a pane is running an app that asked to handle the mouse itself (vim, Claude
+Code's TUI, or any interactive command), roost stays out of the way — the app
+sees clicks and drags directly, and you can use **`Alt+c` copy mode** instead
+(press `Alt+c`, move the cursor with hjkl/arrows, press `v` to mark, press `y`
+or `Enter` to copy and exit). That's also the way to copy from scrollback: scroll
+with `Alt+PgUp`, then `Alt+c` to select.
+
+**Why there's no ⌘C to press:** a terminal application cannot receive ⌘C on
+macOS at all — Terminal.app routes it to its own Edit menu, kitty and Ghostty
+bind it to their own copy, and iTerm2 only delivers it if you remap Command
+and give up system-wide copy/paste in that profile. So roost doesn't try:
+it puts the text on the system pasteboard itself the moment you release the
+mouse (or press `y` in copy mode), which is why ⌘V works everywhere
+afterwards and there is nothing to press in between. On Linux, your terminal's own
+clipboard shortcuts (Shift+Ctrl+C/V, middle-click, etc.) work for the system
+clipboard; roost's own selection uses the same pasteboard they do.
+
+If your terminal has a modifier to suspend mouse reporting (Shift+drag in
+Ghostty/kitty, Option+drag in iTerm2), you can use it to fall back to your
+terminal's native selection in any pane — but a mouse-aware app keeps the
+mouse regardless, and copy mode is there if you need it.
 
 </details>
 
