@@ -6,11 +6,16 @@ Claude Code's hooks at roost's status socket.
 **roost does this for you.** At startup it merges the three hooks below into
 `~/.claude/settings.json`, the same way it installs the pi extension: only
 when `~/.claude` already exists (it never creates the directory itself),
-and only adding/updating its own three entries — anything else already in
-that file, your own hooks included, is left exactly as it was. Running roost
-again never appends duplicates: it recognizes its own entries (and any
-hand-copied hook from an older version of this doc) and updates them in
-place if this build changed, e.g. the binary moved.
+and only adding/updating its own three entries — the *values* already in
+that file, your own hooks included, aren't touched. (The file does get
+reformatted through roost's own JSON pretty-printer, so a hand-tab-indented
+file will show a whitespace-only diff even though nothing semantic changed.)
+Running roost again never appends duplicates: it recognizes its own entries
+(and any hand-copied hook from an older version of this doc) and updates
+them in place if this build changed, e.g. the binary moved. If
+`~/.claude/settings.json` is a symlink — common for dotfiles-managed
+configs — roost writes through it to the real file and leaves the link
+itself alone.
 
 Opt out with `ROOST_NO_EXT_INSTALL=1` (the same variable that disables the pi
 extension install) and manage the hooks yourself — see below.
@@ -21,13 +26,13 @@ extension install) and manage the hooks yourself — see below.
 {
   "hooks": {
     "PreToolUse": [
-      { "hooks": [ { "type": "command", "command": "/path/to/roost __status working" } ] }
+      { "hooks": [ { "type": "command", "command": "/path/to/roost __status working # roost-status-hook" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "/path/to/roost __status waiting" } ] }
+      { "hooks": [ { "type": "command", "command": "/path/to/roost __status waiting # roost-status-hook" } ] }
     ],
     "Notification": [
-      { "hooks": [ { "type": "command", "command": "/path/to/roost __status needs_input" } ] }
+      { "hooks": [ { "type": "command", "command": "/path/to/roost __status needs_input # roost-status-hook" } ] }
     ]
   }
 }
@@ -35,6 +40,9 @@ extension install) and manage the hooks yourself — see below.
 
 `/path/to/roost` is the absolute path roost resolved for its own binary at
 install time (`std::env::current_exe()`), so it works regardless of `PATH`.
+The trailing `# roost-status-hook` is a shell comment (inert — it's how a
+later launch recognizes and updates its own entries rather than appending
+duplicates); harmless to drop if you're copying this by hand.
 
 `roost __status <status>` is an internal subcommand — it doesn't appear in
 `roost --help`, it's plumbing a hook config invokes. It reads `$ROOST_PANE`,
