@@ -10,7 +10,16 @@ sweep · `[sec]` security audit · `[qa]` black-box QA · `[res]` competitive
 research · `[client]` stated by the client · `[principal]` found during the
 work.
 
-Status legend: ☐ open · 🔨 in progress · ✅ shipped (PR#) · ❌ descoped.
+Status legend: ☐ open · 🔨 in progress · ◐ partly shipped · ✅ shipped (PR#)
+· ❌ descoped.
+
+**Shipped so far:** #31 scaffold · #32–34, #36 audit folds + decisions ·
+**#35 distribution** (release binaries, Homebrew formula, binstall) ·
+**#37 control-surface hardening** (H1/M1/L2/L3/Info-b) ·
+**#38 control-plane P0** (malformed-request wedge, OSC 52 rate gate,
+underflow class, kill guard) · **#39 doc accuracy** (detach honesty,
+macOS bypass modifier, broadcast/float, send-wait guarantee, stale
+DESIGN-control checklist) · **#40 codex + gemini adapters** (3 → 5 CLIs).
 
 ---
 
@@ -39,7 +48,7 @@ Stated directly by the client; these outrank findings the team inferred.
 
 **P0 — the control plane wedges permanently** [rev, handoffs/code-review.md]:
 
-- ☐ **Malformed control request gets NO reply; client hangs forever.**
+- ✅ **(PR #38) Malformed control request gets NO reply; client hangs forever.**
   `parse_control` (control.rs:110–114) returns None on any deser failure,
   falls through `parse_line` into `log_dropped`, writes nothing back;
   `cli.rs:222` read_line has no timeout. Reproduced: missing token, unknown
@@ -63,11 +72,11 @@ Stated directly by the client; these outrank findings the team inferred.
   fails. Hit accidentally with a 112-char state dir (macOS sun_path limit
   104). Fix: flash the error; keep the `dir_is_private_and_ours` security
   refusal fatal. [rev P1-2]
-- ☐ OSC 52 clipboard relay is size-capped but not **rate**-capped
+- ✅ **(PR #38)** OSC 52 clipboard relay is size-capped but not **rate**-capped
   (pty.rs:342–348) — one shell loop relayed 5000 sequences / 129 KB to the
   operator's real clipboard. Give it the per-pane interval gate OSC 9
   already has (pty.rs:365). [rev P2-3]
-- ☐ P3 hardening trio: `workspace.rs:68,72` `len()-1` underflow class (pub
+- ◐ P3 hardening trio (2 of 3 in PR #38; panic-hook item open): `workspace.rs:68,72` `len()-1` underflow class (pub
   `active_tab()`, ~40 callers) → `.get().or(first())`; `main.rs:188` panic
   hook restores the terminal from *any* thread while main keeps drawing;
   `pty.rs:595` `kill(-pid)` needs `if pid > 1`. [rev P3-4/5/6]
@@ -105,14 +114,14 @@ roost tells it [ux, handoffs/ux-audit.md]:
 Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
 [sec, handoffs/security-audit.md]:
 
-- ☐ **H1 (High): pane cwd/title escapes into the operator's real terminal.**
+- ✅ **(PR #37) H1 (High): pane cwd/title escapes into the operator's real terminal.**
   `sync_host_title` (app.rs:1934–1936) writes `ESC]2;` + label + BEL straight
   to stdout, bypassing ratatui's control-char filter; the label is
   `spec.title` or `cwd.file_name()` **verbatim**. An in-pane agent mkdirs a
   directory whose name carries OSC 52 and spawns there → clipboard poisoning
   / title spoof on the human's terminal. Fix: `sanitize_title` at that
   boundary. [sec H1]
-- ☐ **M1: the "private" scratch float is readable/writable over the control
+- ✅ **(PR #37) M1: the "private" scratch float is readable/writable over the control
   plane.** `ctl_close`/`ctl_broadcast` exclude the float; `ctl_read`/
   `ctl_send` don't (app.rs:1643, 1716, 1114). Any token-reading agent can
   `roost read` the human's private scratch shell. Fix: same `is_float`
@@ -122,10 +131,10 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
   also the enabler for M2's audit-log rolling. Per-token conn cap (~8) +
   token bucket on resolved Actor (sock.rs:148, app.rs:224). [sec M3,
   supersedes the roadmap "choice" entry]
-- ☐ **L2: control-token file mode not reset on reuse** — `.mode(0o600)`
+- ✅ **(PR #37) L2: control-token file mode not reset on reuse** — `.mode(0o600)`
   applies at creation only; a crash-left token keeps its old mode
   (main.rs:448). [sec L2]
-- ☐ **L3: pane token/socket env leak when the listener fails to bind** —
+- ✅ **(PR #37) L3: pane token/socket env leak when the listener fails to bind** —
   panes then inherit roost's own env, so a nested roost hands children the
   *outer* live token (main.rs:238, app.rs:4498). `env_remove`
   unconditionally. [sec L3]
@@ -133,10 +142,10 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
   (truncate, or flood to force double rotation). Fix M3 first, then either
   an out-of-process sink (`ROOST_AUDIT_FD`/syslog) or — minimum — document
   the log as advisory against same-uid. [sec M2]
-- ☐ **Info-c: DESIGN-control.md §5.3 + §8 checklist are stale** — they claim
+- ✅ **(PR #39) Info-c: DESIGN-control.md §5.3 + §8 checklist are stale** — they claim
   control verbs are rejected from pane tokens; code accepts them
   (app.rs:1243), superseded by §Open-decisions-3. Doc fix. [sec Info]
-- ☐ notify.rs:17 AppleScript interpolation is quoting-by-luck (no break-out
+- ✅ **(PR #37)** notify.rs:17 AppleScript interpolation is quoting-by-luck (no break-out
   found); pass the body as an `on run {b}` argument. [sec Info-b]
 - ☐ L1: control spawn splits the *human's* active tab rather than the
   caller's context (app.rs:2884) — layout churn under the human's hands.
@@ -175,7 +184,7 @@ requirement.
   false-fires on healthy terminals (and C11-hides the hint row on first
   keystroke) while missing read-first users entirely. Re-anchor the
   trigger to evidence, not launch time (app.rs:39, :4869). [ux P0-4]
-- ☐ **README states the detach cost honestly** + sanctioned run-under-tmux
+- ✅ **(PR #39) README states the detach cost honestly** + sanctioned run-under-tmux
   recipe for SSH; extend busy-quit confirm to the hangup path
   (app.rs:3059). [ux P0-1]
 - ☐ Picker offers adapters not on PATH → guaranteed dead pane; annotate or
@@ -185,10 +194,10 @@ requirement.
   [ux P2-15]
 - ☐ "copy failed" flash names neither cause nor next step (app.rs:2164).
   [ux P3-17]
-- ☐ README: "`roost --help` prints this same reference" is only approximately
+- ✅ **(PR #39)** README: "`roost --help` prints this same reference" is only approximately
   true — same verbs, different order/format (README.md:293–306 vs cli.rs
   USAGE). [qa QA-5]
-- ☐ README:144–145 names the **wrong bypass modifier for macOS**: Shift is
+- ✅ **(PR #39)** README:144–145 names the **wrong bypass modifier for macOS**: Shift is
   the bypass in Ghostty/kitty, but iTerm2's is Option and Terminal.app has
   none (only the global View ▸ Allow Mouse Reporting toggle). This is the
   only fallback roost advertises. [ux, DECISIONS D10]
@@ -236,13 +245,13 @@ Research verdict [res]: roost's send/wait race-safety and no-daemon
 resurrection are already category-leading; what's missing is reach
 (install, adapters) not architecture. Full report: handoffs/research.md.
 
-- ☐ **Distribution — the #1 gap.** Zero install channels today (no releases,
+- ✅ **(PR #35) Distribution — the #1 gap.** Zero install channels today (no releases,
   no tap, no crates.io, no binstall). Every peer ships 3+. Ship: GitHub
   Release binaries (mac arm64/x64 + linux x64/arm64) via release workflow,
   Homebrew tap, cargo-binstall metadata; consider crates.io. [res: HIGH]
-- ☐ **codex CLI adapter** — `codex resume <id>`, JSONL sessions under
+- ✅ **(PR #40) codex CLI adapter** — `codex resume <id>`, JSONL sessions under
   `~/.codex/sessions/YYYY/MM/DD/`. Cleanest, highest-payoff new adapter. [res: HIGH]
-- ☐ **gemini CLI adapter** — `gemini --resume <uuid>`, project-scoped
+- ✅ **(PR #40) gemini CLI adapter** — `gemini --resume <uuid>`, project-scoped
   history. [res: HIGH]
 - ☐ **opencode adapter** — `--session <id>`; defend against sst/opencode#2086
   (`--continue` can grab a subagent thread — always resume by explicit id). [res: MED]
@@ -250,7 +259,7 @@ resurrection are already category-leading; what's missing is reach
   pane; neutralizes claude-squad's headline differentiator without lifecycle
   management. Claude adapter already cwd-scopes its session files, so
   worktree = clean session namespace for free. [res: MED-HIGH]
-- ☐ **README: state the send/wait no-race guarantee as a named edge** —
+- ✅ **(PR #39) README: state the send/wait no-race guarantee as a named edge** —
   claude-squad's most-commented open bug (prompt sent before CLI ready,
   lost) is the exact failure roost's status-socket + `wait` prevent; say so
   with the receipts. [res: MED, docs-only]
