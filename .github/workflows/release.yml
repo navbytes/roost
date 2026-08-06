@@ -1,0 +1,94 @@
+name: Release
+
+# Builds release binaries and publishes a GitHub Release when a `vX.Y.Z` tag
+# is pushed. Never runs on a normal push or PR — see ci.yml for that.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # Native arm64 runner (GA on public repos since early 2025) rather
+          # than cross-compiling — one less moving part.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Cheap guard against shipping a binary whose --version-equivalent
+      # (the crate version baked into the tarball name) doesn't match what
+      # was actually tagged — a mismatch here would silently break the
+      # cargo-binstall pkg-url template in Cargo.toml.
+      - name: Check tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (version $tag_version) does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+
+      - run: rustup target add ${{ matrix.target }}
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        # Binaries are already stripped by `[profile.release] strip = true`
+        # in Cargo.toml — no separate strip step needed here.
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          pkg="roost-${version}-${{ matrix.target }}"
+          mkdir "$pkg"
+          cp "target/${{ matrix.target }}/release/roost" "$pkg/"
+          cp LICENSE README.md "$pkg/"
+          tar czf "${pkg}.tar.gz" "$pkg"
+          shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            roost-*.tar.gz
+            roost-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Combine per-target checksums into one file
+        working-directory: dist
+        run: cat -- *.tar.gz.sha256 > SHA256SUMS.txt
+
+      # No artifact signing yet.
+      # TODO: sign release artifacts (e.g. cosign or minisign) once a
+      # signing key is provisioned.
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
