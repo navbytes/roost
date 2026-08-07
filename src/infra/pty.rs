@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,39 @@ use crate::infra::queries::QueryResponder;
 use crate::ports::{MouseProto, Observation, PaneBackend, PaneEffects};
 
 const SCROLLBACK_LINES: usize = 5000;
+
+/// How many writes may be queued for one pane's child before roost refuses
+/// more.
+///
+/// **Why a queue exists at all.** A write to a PTY master blocks whenever the
+/// kernel's tty input queue is full and the child isn't draining it — a few KB
+/// is all it holds. The child may be paused (SIGSTOP), stuck in a foreground
+/// command that never reads stdin, or a line editor mid-redraw; none of that is
+/// roost's business, and none of it is guaranteed to end. Done on the event
+/// loop, that write took the whole process down: measured with one 60 KB
+/// `roost send` (under the control plane's 64 KiB line cap, so accepted), the
+/// main thread parked in `write(2)` inside `ctl_send`, which is also the only
+/// thread that drains the PTY event channel — so the pane's reader thread
+/// filled that channel and parked too, the pane's own output queue backed up,
+/// its line discipline stopped consuming input, and the write could never
+/// complete. A closed cycle: no render, no keystrokes, no control requests, no
+/// recovery short of killing the process. See `tests/send_backpressure.rs`.
+///
+/// So the write moves to a per-pane thread and the event loop only ever
+/// enqueues. The queue is **bounded** because the child genuinely may never
+/// drain, and an unbounded one would trade a freeze for an OOM: past this many
+/// pending writes `write_input_raw` reports `false`, which is already the
+/// codebase's "this pane did not take your input" signal (`ctl_send` turns it
+/// into an error reply rather than a dishonest `sent` count).
+///
+/// 64 is far above any real burst — a keystroke is one message, a paste is one
+/// message, a query reply is one message — so a pane that is merely busy is
+/// absorbed and delivered in full, in order, as soon as it reads again.
+///
+/// ponytail: a message count, not a byte budget. One message is already capped
+/// by the control plane's 64 KiB line cap, so a wedged pane holds ~4 MB worst
+/// case. Switch to a byte budget if a pane ever legitimately queues megabytes.
+const PENDING_WRITES: usize = 64;
 
 /// P2: at most one OSC 9 re-emission per pane per this window. An agent that
 /// notifies in a loop (or a `cat` of a log full of them) must not turn the
@@ -343,7 +376,14 @@ fn session_members(sid: u32) -> Vec<u32> {
 pub struct PtyPane {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    /// Input queued for the child, drained by this pane's writer thread. The
+    /// event loop must never touch the PTY writer directly — see
+    /// `PENDING_WRITES`.
+    writes: SyncSender<Vec<u8>>,
+    /// Set by the writer thread once a write to the child has actually failed
+    /// (broken pipe: it exited). Keeps `write_input_raw`'s "did this pane take
+    /// your input" answer honest now that the write itself happens off-thread.
+    write_failed: Arc<AtomicBool>,
     parser: vt100::Parser,
     status: StatusTracker,
     /// The pane's child pid, for OS observation (live cwd / running agent).
@@ -547,10 +587,35 @@ impl PaneBackend for PtyPane {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
-        let writer = pair.master.take_writer().context("take pty writer")?;
+        let mut writer = pair.master.take_writer().context("take pty writer")?;
 
         let alive = Arc::new(AtomicBool::new(true));
         let reader_alive = alive.clone();
+
+        // The write half gets its own thread for the reason `PENDING_WRITES`
+        // documents: `write_all` here can block forever on a child that isn't
+        // reading, and on the event loop that is a whole-process deadlock.
+        // Single thread, single queue, so input still reaches the child in the
+        // exact order it was produced.
+        let (writes, pending) = sync_channel::<Vec<u8>>(PENDING_WRITES);
+        let write_failed = Arc::new(AtomicBool::new(false));
+        let writer_failed = write_failed.clone();
+        let writer_alive = alive.clone();
+        std::thread::spawn(move || {
+            // Ends when the pane drops its sender, or when this spawn is
+            // killed — a write blocked on a doomed child unblocks by itself
+            // once the child dies and the slave side closes.
+            for chunk in pending {
+                if !writer_alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                if writer.write_all(&chunk).is_err() {
+                    writer_failed.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        });
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -581,7 +646,8 @@ impl PaneBackend for PtyPane {
         Ok(Self {
             master: pair.master,
             child,
-            writer,
+            writes,
+            write_failed,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
             status: StatusTracker::new(),
             pid,
@@ -691,13 +757,22 @@ impl PaneBackend for PtyPane {
         self.write_input_raw(bytes)
     }
 
-    /// Returns whether the write actually reached the child — a dead/broken
-    /// pipe must not be reported as delivered by a caller that counts
-    /// successful sends (`ctl_send`/`ctl_broadcast`).
+    /// Hand `bytes` to the pane's writer thread. Returns whether this pane
+    /// accepted them for delivery — a caller that counts successful sends
+    /// (`ctl_send`/`ctl_broadcast`) must not report a refusal as delivered.
+    ///
+    /// **Never blocks**, which is the whole point (`PENDING_WRITES`): the
+    /// event loop calls this, and the only thing standing between a PTY write
+    /// and an indefinite block is a child that chooses to read. `false` means
+    /// one of the two honest failures — the child's pipe is already dead, or
+    /// this pane has `PENDING_WRITES` writes outstanding, i.e. it has stopped
+    /// consuming input entirely. Both are exactly what "pane did not accept
+    /// input" is meant to say.
     fn write_input_raw(&mut self, bytes: &[u8]) -> bool {
-        let ok = self.writer.write_all(bytes).is_ok();
-        let _ = self.writer.flush();
-        ok
+        if self.write_failed.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.writes.try_send(bytes.to_vec()).is_ok()
     }
 
     fn resize(&mut self, rows: u16, cols: u16, pixels: (u16, u16)) {
