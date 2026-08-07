@@ -39,9 +39,11 @@ use crate::ui::mouse::{self, MouseAction};
 /// The one `spawn_listener` failure that must stay fatal: the socket
 /// directory exists but isn't privately ours, which is what an attacker
 /// pre-creating it looks like. Every other failure degrades to "no control
-/// plane, and roost says so".
+/// plane, and roost says so". Matches against `sock::UNSAFE_SOCKET_DIR_MSG`
+/// rather than a hand-typed copy of `sock.rs`'s `bail!` wording (P2) — see
+/// that const's doc comment.
 fn is_unsafe_socket_dir(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("unsafe ownership/permissions")
+    format!("{e:#}").contains(crate::infra::sock::UNSAFE_SOCKET_DIR_MSG)
 }
 
 fn main() -> Result<()> {
@@ -58,12 +60,23 @@ fn main() -> Result<()> {
     // no pty. Fail the same clean way every rejected `cli::maybe_run` path
     // does instead — message on stderr, nonzero exit — before touching the
     // terminal at all.
+    //
+    // Exit 2 (P3), not 1: cli.rs's USAGE documents 1 as a runtime error (an
+    // invocation that was fine but failed when actually attempted, e.g.
+    // "cannot reach a running roost") and 2 as a usage error (this
+    // invocation itself is wrong; retrying it unchanged won't help). A bare
+    // `roost` off a tty is the latter — the fix is calling it differently
+    // (`roost <verb> ...`, per the message below), exactly the class
+    // `cli::maybe_run`'s own hard errors (unrecognized verb, an unknown
+    // flag) already exit 2 for. That the specific *reason* here is
+    // environmental rather than a bad argument doesn't change which bucket
+    // a scripted caller needs to sort it into.
     if !std::io::stdout().is_terminal() {
         eprintln!(
             "roost: stdout is not a terminal; the multiplexer needs one to run.\n\
              For scripting, use `roost <verb> ...` — see `roost --help`."
         );
-        std::process::exit(1);
+        std::process::exit(2);
     }
 
     // One roost per state dir: two instances sharing a workspace.json race
@@ -869,11 +882,17 @@ mod tests {
     /// listener failure has to degrade to "no control plane, and roost says
     /// so" — a bind() failure taking the whole session down would be a worse
     /// outcome than the missing socket it is reporting.
+    ///
+    /// P2: the fatal fixture is built from `sock::UNSAFE_SOCKET_DIR_MSG`,
+    /// the same const the real `bail!` in `spawn_listener` uses, instead of
+    /// a hand-typed copy of its wording. A hand-typed copy can never catch
+    /// the check drifting from what `sock.rs` actually says — it would just
+    /// as happily go on matching itself. Sharing the identifier makes that
+    /// divergence impossible.
     #[test]
     fn only_an_unsafe_socket_dir_is_a_fatal_listener_failure() {
-        let unsafe_dir = anyhow::anyhow!(
-            "roost: socket directory /tmp/x has unsafe ownership/permissions"
-        );
+        use crate::infra::sock::UNSAFE_SOCKET_DIR_MSG;
+        let unsafe_dir = anyhow::anyhow!("roost: socket directory /tmp/x has {UNSAFE_SOCKET_DIR_MSG}");
         assert!(super::is_unsafe_socket_dir(&unsafe_dir));
 
         for benign in [
@@ -890,7 +909,7 @@ mod tests {
 
         // The real bail! is wrapped in context by the time main sees it; the
         // check reads the whole chain, so a wrapped one still counts.
-        let wrapped = anyhow::anyhow!("roost: socket directory /tmp/x has unsafe ownership/permissions")
+        let wrapped = anyhow::anyhow!("roost: socket directory /tmp/x has {UNSAFE_SOCKET_DIR_MSG}")
             .context("starting the control listener");
         assert!(super::is_unsafe_socket_dir(&wrapped));
     }

@@ -64,6 +64,18 @@ const PRE_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// generous, since a legitimate caller may pause between commands. The
 /// existing `Err(_) => break` below already exits without logging, so a
 /// timeout firing is silent, not spammy.
+///
+/// Exception (P1): a connection promoted only by a status/session line,
+/// never a control request (`guard.principal.is_none()` in
+/// `spawn_accept_loop`), retries past this instead of ending the
+/// connection — see the comment on that retry clause. That's the pi
+/// extension's actual shape: it dials once and holds the socket for the
+/// pane's whole process lifetime with no keepalive and no reconnect on
+/// error, so a `READ_TIMEOUT` firing on it is an ordinary gap between an
+/// agent's status transitions (a human reading the output for a while is
+/// the normal case), not a hung client — the P0 wedge this constant exists
+/// to prevent. A connection that *did* send a control request is
+/// unaffected: it's still reaped here, unchanged.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max bytes accepted for one status line. A well-formed message is well under
@@ -164,6 +176,18 @@ const MAX_TOKEN_LEN: usize = 128;
 /// eviction only ever engages under actual token-rotation abuse, never
 /// legitimate use.
 const MAX_TRACKED_TOKENS: usize = 512;
+
+/// The exact substring `main.rs`'s `is_unsafe_socket_dir` matches a
+/// `spawn_listener` failure against to decide whether it's the one fatal
+/// case (an attacker may have pre-created the socket directory) versus
+/// every other failure, which degrades to "no control plane" instead (P2).
+/// A `pub const` shared by the `bail!` below and that check, rather than two
+/// hand-typed copies of the same wording: with two copies, rewording this
+/// message here left nothing to notice the check in `main.rs` — or its
+/// test, which built its own `anyhow!` strings instead of driving this
+/// code — no longer matching it. Sharing the identifier makes that
+/// divergence impossible to introduce by editing wording alone.
+pub const UNSAFE_SOCKET_DIR_MSG: &str = "unsafe ownership/permissions";
 
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
 /// an attacker who pre-created the runtime dir from hosting our control socket
@@ -532,8 +556,11 @@ impl Drop for ConnGuard<'_> {
 /// connection's `read()` syscall forever and this loop would never get back
 /// around to checking the deadline at all. Once `pre_auth_start` is `None`
 /// (promoted), a read-timeout error propagates immediately instead of being
-/// retried — same as `read_until` always did, and still the mechanism that
-/// bounds a fully idle *promoted* connection (P0, `READ_TIMEOUT`).
+/// retried here — same as `read_until` always did. For a connection that has
+/// authenticated (has a `guard.principal`), that's still what bounds a fully
+/// idle promoted connection (P0, `READ_TIMEOUT`); `spawn_accept_loop`'s call
+/// site adds one more retry clause, past this function, for a promoted
+/// connection that never has — a status-only reporter (P1).
 fn read_line_deadlined(
     reader: &mut BufReader<UnixStream>,
     buf: &mut Vec<u8>,
@@ -600,7 +627,7 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
         // ...and refuse to run if it isn't actually ours and private (an
         // attacker may have pre-created it to intercept the socket).
         if !dir_is_private_and_ours(dir) {
-            bail!("roost: socket directory {} has unsafe ownership/permissions", dir.display());
+            bail!("roost: socket directory {} has {UNSAFE_SOCKET_DIR_MSG}", dir.display());
         }
     }
     let _ = fs::remove_file(&path); // stale socket from a previous run
@@ -679,15 +706,63 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                 // earn promotion is the same already-open, already-documented
                 // path 2 as a garbage-token control request.
                 let mut promoted = false;
-                loop {
+                'conn: loop {
                     buf.clear();
                     // `None` once promoted — from then on only the per-read
-                    // timeout applies.
+                    // timeout applies (except the status-only retry just
+                    // below).
                     let pre_auth_start = (!promoted).then_some(start);
-                    let n = match read_line_deadlined(&mut reader, &mut buf, pre_auth_start) {
-                        Ok(0) => break,       // EOF
-                        Ok(n) => n,
-                        Err(_) => break,      // read error, or the pre-auth deadline
+                    let n = loop {
+                        match read_line_deadlined(&mut reader, &mut buf, pre_auth_start) {
+                            Ok(0) => break 'conn, // EOF
+                            Ok(n) => break n,
+                            // P1: a promoted connection that has never sent a
+                            // control request (no `guard.principal`) is
+                            // status-only — the pi extension's actual shape
+                            // (extensions/roost.ts): dials once at pane
+                            // start, holds the socket for the pane's whole
+                            // process lifetime, no keepalive, no reconnect on
+                            // error. A `READ_TIMEOUT` firing on it is the
+                            // *normal* gap between an agent's status
+                            // transitions (a human reading the output for a
+                            // while — routinely >30s — is the everyday case,
+                            // not an edge one), not a hung client, so retry
+                            // past it exactly like a pre-auth connection
+                            // retries past `PRE_AUTH_READ_TIMEOUT` above.
+                            // Without this, the read timeout silently ended
+                            // the connection here (`Err(_) => break`); the
+                            // extension's next write then EPIPEs, nulls its
+                            // socket handle for good (no reconnect anywhere
+                            // in it), and every status/session report for
+                            // that pane is dropped for the rest of its life.
+                            //
+                            // Retrying the inner loop (not `continue 'conn`)
+                            // matters: `'conn`'s top clears `buf`, which
+                            // would silently drop a line that had already
+                            // partly arrived before this read timed out.
+                            //
+                            // A connection that DID authenticate
+                            // (`guard.principal.is_some()`) is untouched:
+                            // P0's wedge — reap a silent *control* client
+                            // after `READ_TIMEOUT` — still applies to it
+                            // unchanged. So is the pre-auth wall-clock
+                            // deadline: it's enforced inside
+                            // `read_line_deadlined` independently of
+                            // `promoted`, and only ever returned while
+                            // `pre_auth_start` is `Some` — before `promoted`
+                            // (required below) can even be true.
+                            Err(e)
+                                if promoted
+                                    && guard.principal.is_none()
+                                    && matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                    ) =>
+                            {
+                                continue;
+                            }
+                            Err(_) => break 'conn, // read error, or the pre-auth deadline
+                        }
                     };
                     // Hit the cap without terminating — oversized line; drop the
                     // connection rather than trying to resync.
@@ -1245,17 +1320,52 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// P1's "does this reopen anything" question, half one: a connection
+    /// that DID authenticate (sent a well-formed control request, so
+    /// `guard.principal` is set) must still be reaped after `READ_TIMEOUT`
+    /// of silence — the P0 wedge this constant exists to prevent. The new
+    /// retry clause is gated on `guard.principal.is_none()` specifically so
+    /// it never reaches this case; this pins that it doesn't. Mirrors
+    /// `an_idle_pre_auth_connection_is_recycled_well_under_read_timeout`
+    /// above, but for the promoted/authenticated side, at `READ_TIMEOUT`'s
+    /// own scale rather than the pre-auth one.
+    #[test]
+    fn an_authenticated_connection_gone_silent_is_still_reaped_after_read_timeout() {
+        let (path, listener) = scratch_listener("control-still-reaped");
+        spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+        c.get_ref().set_read_timeout(Some(READ_TIMEOUT + Duration::from_secs(10))).unwrap();
+
+        let reply = roundtrip(&mut c, r#"{"token":"t","method":"list"}"#);
+        assert!(reply.get("ok").is_some(), "setup: the control request should succeed");
+
+        let mut discard = String::new();
+        let n = c.read_line(&mut discard).expect("must be reaped, not hang forever");
+        assert_eq!(
+            n, 0,
+            "an authenticated connection gone silent must still be closed after READ_TIMEOUT: {discard:?}"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     /// A connection that only ever sends status/session lines (no `method`
     /// key, so never a control `Request`) must not be treated as forever
-    /// pre-auth. This is the real pi extension's shape
-    /// (`extensions/roost.ts`): it connects once at pane start and holds
-    /// that socket for the pane's whole process lifetime, writing only
-    /// status/session lines whenever the agent's state changes — gaps that
-    /// can easily exceed `PRE_AUTH_READ_TIMEOUT`. `guard.principal` never
-    /// gets set for these (they aren't a "principal" for connection-cap/
-    /// rate-limit purposes), so gating promotion on that alone left every
-    /// such connection permanently pre-auth: killed the first time it went
-    /// quiet past the deadline, with no reconnect anywhere in the extension.
+    /// pre-auth: `guard.principal` never gets set for these (they aren't a
+    /// "principal" for connection-cap/rate-limit purposes), so gating
+    /// promotion on that alone left every such connection permanently
+    /// pre-auth, killed the first time it went quiet past
+    /// `PRE_AUTH_READ_TIMEOUT`.
+    ///
+    /// This only proves promotion itself happens — it sleeps 2.5s, just past
+    /// that 2s deadline, deliberately not the larger gap that actually
+    /// matters in practice.
+    /// `a_status_only_connection_survives_an_idle_gap_past_read_timeout`
+    /// below is the real pi-extension shape (`extensions/roost.ts`: dials
+    /// once, holds the socket for the pane's whole process lifetime, no
+    /// keepalive, no reconnect) at the timescale that matters —
+    /// `READ_TIMEOUT` (30s), not `PRE_AUTH_READ_TIMEOUT` (2s), since a
+    /// *promoted* connection is bound by the former, not the latter (P1).
     #[test]
     fn a_status_only_connection_survives_past_the_pre_auth_deadline() {
         let (path, listener) = scratch_listener("status-survives");
@@ -1278,6 +1388,41 @@ mod tests {
         // by now, so this would come back as EOF, and `roundtrip` panics).
         let reply = roundtrip(&mut c, r#"{"token":"t","method":"list"}"#);
         assert!(reply.get("ok").is_some(), "a status-only connection must survive past the pre-auth deadline: {reply}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// P1, the real bug (the finding the test above's doc points to): a
+    /// promoted status-only connection must survive an idle gap past
+    /// `READ_TIMEOUT` (30s) itself, not merely past the much smaller
+    /// pre-auth deadline. Before this fix: a pi pane finishes a turn
+    /// (`agent_end` → `waiting`), the human reads the output for more than
+    /// 30s — the *normal* operating condition, not an edge case — the
+    /// server silently closed the connection (`Err(_) => break` on the
+    /// `READ_TIMEOUT` firing), and the extension's next write EPIPEs and
+    /// nulls its socket handle for good (`sock.on("error", () => sock =
+    /// null)`, no reconnect anywhere in it): every later status/session
+    /// report for that pane is dropped for the rest of its life. Sleeps past
+    /// the real constant on purpose — this is the timescale that matters,
+    /// not a shortened stand-in for it.
+    #[test]
+    fn a_status_only_connection_survives_an_idle_gap_past_read_timeout() {
+        let (path, listener) = scratch_listener("status-survives-read-timeout");
+        spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        c.get_mut().write_all(br#"{"pane":"1","token":"t","event":"status","status":"working"}"#).unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+
+        // The gap size the P1 finding is actually about — past READ_TIMEOUT
+        // itself, not just the pre-auth deadline.
+        std::thread::sleep(READ_TIMEOUT + Duration::from_secs(1));
+
+        let reply = roundtrip(&mut c, r#"{"token":"t","method":"list"}"#);
+        assert!(
+            reply.get("ok").is_some(),
+            "a status-only connection must survive an idle gap past READ_TIMEOUT: {reply}"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
