@@ -54,29 +54,38 @@ Or skip the build step with `cargo run`.
 
 ### Install
 
-- **Prebuilt binaries** from [GitHub Releases](https://github.com/navbytes/roost/releases) — coming with the first tagged release, not published yet.
-- **`cargo binstall roost`** — once a release exists, fetches the prebuilt binary for your platform instead of compiling.
-- **`cargo install --path .`** — clone and build locally onto your `$PATH`. Works today.
-- **[mise](https://mise.jdx.dev)** — see below. Works today via the cargo
-  backend; gets faster once a release exists.
-- **Homebrew tap** (`navbytes/homebrew-roost`) — planned, not live yet.
+- **[mise](https://mise.jdx.dev)** — `mise use -g github:navbytes/roost`.
+  Prebuilt binary, no Rust toolchain. See below.
+- **Prebuilt binaries** from
+  [GitHub Releases](https://github.com/navbytes/roost/releases) — macOS and
+  Linux, arm64 and x86_64, with `SHA256SUMS.txt` to check them against.
+- **`cargo binstall --git https://github.com/navbytes/roost roost`** —
+  fetches the release binary instead of compiling. **The `--git` is not
+  optional:** the crates.io name `roost` belongs to
+  [an unrelated 2018 crate](https://crates.io/crates/roost), so a bare
+  `cargo binstall roost` installs something else entirely.
+- **`cargo install --git https://github.com/navbytes/roost`** — build from
+  source onto your `$PATH`, no clone needed.
+- **Homebrew tap** (`navbytes/homebrew-roost`) — the formula is written and
+  carries v0.1.0's real checksums, but the tap repo doesn't exist yet, so
+  there is nothing to `brew install` today.
 
 #### With mise
 
 roost isn't in mise's registry and doesn't need to be — name the backend and
 mise installs it straight from this repo.
 
-Building from source (works today, needs a Rust toolchain):
-
-```sh
-mise use -g "cargo:https://github.com/navbytes/roost@branch:main"
-```
-
-Once the first release is tagged, this fetches the prebuilt binary for your
-platform instead of compiling — no Rust toolchain needed:
+The short way — a prebuilt binary from the latest release, no Rust
+toolchain needed:
 
 ```sh
 mise use -g github:navbytes/roost
+```
+
+Or build from source, if you'd rather (needs a Rust toolchain):
+
+```sh
+mise use -g "cargo:https://github.com/navbytes/roost@branch:main"
 ```
 
 Pin a version by appending it, e.g. `github:navbytes/roost@0.1.0`, or swap
