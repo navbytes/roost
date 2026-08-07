@@ -957,6 +957,35 @@ seven gain nothing** — the 100-column argument in this contract's 2026-07-22
 amendment is unchanged, and `Alt+Shift+a` is discoverable through `Alt+?`
 (C15) beside the `Alt+a` it pairs with.
 
+**[Amended 2026-08-07, exit UX audit F1 — precedence flips]** "Precedence
+unchanged: alt-warning (C11) takes the bar over flash (C10), which takes it
+over hints" is reversed: **flash now wins over the alt-warning**; hints stay
+last. The old order let the alt-warning pre-empt `draw_hint_bar`'s flash
+branch outright, so a copy performed while the warning wanted the bar showed
+no confirmation at all — and since C11's elapsed gate is also gone this same
+date, an unresolved alt-trap would otherwise have swallowed every flash for
+the rest of the session, not just a startup window. With flash checked
+first, a transient confirmation always gets its `FLASH_WINDOW`; the
+alt-warning (which now persists until resolved, not for a fixed window)
+reclaims the bar the moment the flash expires. Pinned by
+`flash_wins_the_hint_bar_over_the_alt_warning`.
+
+**[Amended 2026-08-07, exit UX audit F2 — right segment gains the ○
+fallback]** `"◆ {N} needs you · Alt+a"` is no longer the segment's only
+shape. It now renders `App::attention_segment()`: unchanged text/style when
+a real ◆ exists (`Some((n, true))`), `"○ {n} your turn · Alt+a"` fg `ink()`
+when the ◆ pass is empty but `attention_ring`'s Waiting fallback isn't
+(`Some((n, false))`), omitted only when `Alt+a` truly has nothing to do
+(`None`). `ink()`, not `accent()`, is deliberate: it's the same style
+`theme::status_style` already gives the Waiting glyph everywhere else, one
+visual step back from the accent-red ◆ case so a real ◆ still reads as more
+urgent. This closes C19's 2026-08-07 "known gap" amendment — see there for
+the full rationale — and means the segment now matches what `Alt+a` will
+actually do in every case, not only N > 0. Pinned by
+`attention_segment_matches_the_ring_in_every_case` (app.rs) and
+`hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input`
+(render.rs).
+
 ### C10 — Flash message
 
 **Current:** `render.rs:56–64` — Black on Green BOLD.
@@ -1030,6 +1059,90 @@ primitives that survive any palette — reversing `accent()` paints the row in
 the user's red with their background as the ink, so a problem still reads as a
 problem, while the flash keeps the plain reversal.
 Trigger and wording are untouched.
+
+**[Amended 2026-08-07, exit UX audit F1 — trigger re-anchored to the accent
+signature, elapsed gate dropped]** The 2026-07-27 amendment's "self-timing"
+reasoning does not hold up: "keys are arriving and not one of them has
+carried Alt" is true of nearly all typing, not only a swallowed chord — a
+healthy Ghostty/iTerm2 user's first action (typing a shell prompt) satisfies
+it inside the 8s window, so the bar fired on a correctly-configured
+terminal, and it fired *before* the user had pressed anything roost cares
+about. Worse, it pre-empted `draw_hint_bar`'s flash branch outright (see the
+companion C9 amendment), so a copy performed in that window showed no
+confirmation either.
+- **Evidence, corrected.** SPEC-ux U4's originally proposed "Option-accent
+  signature", dropped in the 2026-07-27 amendment as "unnecessary", turns out
+  to be exactly what was missing: the character the **standard US** macOS
+  keyboard layout emits for `Option+<letter>` with Option-as-Meta off,
+  arriving with **no Alt modifier at all**, is what actually distinguishes a
+  swallowed chord from ordinary typing — "some key arrived" does not. The
+  full set is 26 characters, one per `a..=z` (`Alt+n` → `˜`, `Alt+w` → `∑`,
+  and 24 more — `is_alt_swallow_char`'s `matches!` arm list in `app.rs` is
+  itself the complete definition, nothing abbreviated). Scoped to the US
+  layout only: a non-US layout's own Option+letter table is a different 26
+  characters, and this does not attempt to cover them (see the false
+  positive this creates, next amendment). `App::note_key_seen` now takes the
+  `KeyEvent` itself and only records evidence when the unmodified key
+  matches that table. `note_alt_seen` (a real Alt key getting through,
+  ending the warning for the session) is unchanged.
+- **The elapsed-time gate is re-keyed to the evidence, not dropped** —
+  corrected the same day by the design-audit amendment immediately below
+  (SG1): dropping it outright was wrong. See there for why and for what
+  still holds from the reasoning here (the read-first user's requirement).
+- Trigger function: `wants_alt_hint(alt_seen, since_evidence)` — see SG1
+  below for the current signature; wording (previous amendment) is
+  untouched.
+- Both hard requirements from the original finding are pinned by `App`-level
+  tests: a healthy terminal typing an ordinary shell prompt never sets
+  `alt_swallow_at` (`healthy_terminal_typing_a_shell_prompt_never_fires_the_alt_hint`);
+  a read-first user whose first Alt press lands at t=40s still gets the bar
+  (`read_first_user_still_gets_the_hint_however_late_the_first_alt_press_is`).
+
+**[Amended 2026-08-07, design audit SG1 — the evidence is real but not
+unambiguous, so it must not latch]** The amendment above dropped
+`ALT_HINT_WINDOW` on the reasoning that evidence this specific "needs no
+clock to stay accurate". That reasoning was wrong: every character in
+`is_alt_swallow_char`'s table is *also* a directly-typed letter on some
+non-US macOS layout — `ç` (Portuguese, French, Turkish), `å`/`ø` (Nordic),
+`ß` (German), `µ`, `´`, `¨` among them. A user typing their own language can
+produce the identical evidence with Alt never involved, and with no window
+at all, `alt_seen == false` latched the red `attention_problem` bar over the
+hint row **for the rest of the session** — worse than the false positive
+this contract set out to fix, which at least expired after 8s. This is the
+tradeoff being deliberately acknowledged, not a gap that went unnoticed: the
+evidence narrows the *rate* of false positives a great deal (ordinary
+English-language shell use essentially never produces these 26 characters)
+but cannot eliminate them, so the design has to bound their *cost* instead.
+- **`ALT_HINT_WINDOW` returns, keyed to the evidence's own timestamp
+  (`App::alt_swallow_at: Option<Instant>`), not to launch.**
+  `wants_alt_hint(alt_seen, since_evidence: Option<Duration>)` shows the bar
+  only while `since_evidence < ALT_HINT_WINDOW` — a false positive clears
+  itself in a few seconds instead of owning the row for the session. The
+  read-first-user requirement the original elapsed-gate removal was for
+  survives intact: the window starts at the *evidence's* timestamp, still
+  never at launch, so a first Alt attempt at t=40s (or any t) still raises
+  the bar the moment it lands.
+- **Fresh evidence re-arms the window.** Each matching keystroke overwrites
+  `alt_swallow_at` with the current time, so a genuinely broken Alt layer —
+  the user keeps trying Alt chords, keeps producing the evidence — keeps
+  being told, not just once.
+- **A real Alt chord dismisses the warning permanently, for the rest of the
+  session, regardless of any evidence that arrives afterward** — `alt_seen`
+  is checked first in `wants_alt_hint` and never reset. This is what
+  protects a multilingual user who *does* use Alt chords: the first real one
+  ends it for good, the same guarantee the original fix always made.
+- Pinned by
+  `a_non_us_layouts_own_letter_self_clears_instead_of_latching_for_the_session`
+  (the false positive named above, and its bound),
+  `fresh_evidence_re_arms_the_window`, and the unchanged
+  `the_alt_warning_appears_on_swallowed_alt_evidence_and_dies_on_the_first_real_alt`
+  (evidence after `alt_seen` stays suppressed).
+- The "no dead-key composition" assumption `is_alt_swallow_char` relies on
+  (a terminal emits `Option+n` as `˜` immediately, not composed with a
+  following vowel) is believed true of every terminal this project targets
+  but is **not verified by anything in this suite** — it would need a real
+  terminal and a real OS keyboard driver. Said plainly here rather than
+  implied as tested (design audit SG3).
 
 ### C12 — Modal system (shared)
 
@@ -1199,6 +1312,26 @@ is fully superseded.
 `ink()`, unselected `quiet()`, title `ink()`, border `accent()`. C14's "**no
 bg highlight**" was already the right instinct and is now the house rule (§2);
 the two-column selection idiom is untouched.
+
+**[Amended 2026-08-07, exit UX audit F8 — not-installed wording and the
+adapter column's width]** Two things this contract never wrote down (both
+lived only as `app.rs`/`render.rs` doc comments, P2-13) drifted stale
+together:
+- **`App::picker_filtered` annotates a not-installed adapter's row with a
+  `"not found"` suffix, not `"gone"`.** "Gone" implies the adapter *was*
+  reachable and disappeared; it never was, on this machine, so every fresh
+  install would show the identical "gone" the moment after setup. "Not
+  found" — the familiar shell idiom for "no such program on `$PATH`" —
+  claims nothing about history.
+- **The fixed adapter column (this contract's "16-column adapter column")
+  is now 23, not 16.** It was sized for the registry's then-longest id
+  (`claude`/`gemini`, 6 chars) and the old 5-char `"gone"` suffix. The
+  registry has grown since (six adapters now, not five —
+  `agents::adapter_specs`) and its longest id is now `opencode` (8 chars,
+  longer than `claude`/`gemini`); the new suffix is 5 columns longer
+  besides. `picker_dialog_width`'s formula (adapter column, plus a gap,
+  plus the widest cwd label, plus another gap) is otherwise untouched —
+  same 2-column gaps, same pre-U20 32-column floor.
 
 ### C15 — Help overlay
 
@@ -1585,6 +1718,56 @@ to reach it.
   the fallback exists. Left alone rather than inventing a new hint-bar
   surface in an audit-response pass; a Normal-mode pair (dropping the
   N > 0-only rule) is the fix if this needs to be discoverable cold.
+
+**[Amended 2026-08-07, exit UX audit F2 — the gap above is closed]** The
+right segment itself now carries the fallback, rather than growing a
+Normal-mode pair: `hint_bar_right_spans` takes `App::attention_segment()` —
+`Some((n, true))` for the real ◆ count (unchanged text/style), `Some((n,
+false))` rendering `"○ {n} your turn · Alt+a"` in `ink()` when the ◆ pass is
+empty but the Waiting pass isn't, `None` when `Alt+a` has nothing to do at
+all (C9 amended alongside). This was chosen over the Normal-mode pair the
+prior amendment named as the alternative: a static pair would cost columns
+at every N (colliding with C9's "the Normal-mode seven gain nothing"
+100-column budget) and can't say *how many* panes are waiting the way the
+existing aggregate slot already does for free. The segment now matches
+`attention_ring` in every case, not only N > 0 — closing this gap and
+making the ring/count invariant this contract opened with fully true again,
+not just true when N > 0.
+
+**[Amended 2026-08-07, exit UX audit F3 — the Waiting fallback now empties]**
+The two-pass ring above never removed a pane from its fallback pass once
+that pane had been visited: a real ◆ clears itself the moment you act on it
+(its own status moves on), but a quiet `Waiting` pane's status doesn't
+change just because focus landed on it, so `Alt+a` over an all-Waiting fleet
+round-robinned forever and "nothing else needs you" (the empty-ring flash)
+only ever fired with exactly one pane in the fallback. Bit hardest at the
+fleet size this feature exists for.
+- **Fix: a visited-set, cleared per-pane the moment that pane leaves
+  `Waiting`.** `App::visited_waiting: HashSet<PaneId>` — `set_focus` (P10's
+  single funnel for every focus move: `Alt+a`, a click, arrow-focus, the
+  roster) adds a pane the instant focus lands on it while its
+  `display_status` is `Waiting`; `attention_ring`'s fallback pass filters
+  the id out. Chosen over "clear the whole set whenever the fleet changes"
+  (the mechanism this amendment's originating finding suggested as one
+  option): a spawn/close elsewhere in the fleet has nothing to do with
+  whether *this* pane's finished turn was already seen, and clearing
+  per-pane on close would still leave a revisit-without-a-new-turn
+  underspecified — the real invariant needed is per-pane, not fleet-wide.
+- **Cleared on the transition that matters, not a timer.** `diff_statuses`
+  (already the one place that diffs every pane's status once per tick, C20)
+  removes a pane from `visited_waiting` the instant its status is observed
+  leaving `Waiting` — so a pane that starts a new turn and finishes it again
+  is never silently swallowed by a mark the *previous* turn left behind.
+  Pruned on pane close alongside `last_status`, same cadence, same reason.
+  The ◆ pass is entirely untouched — a real ◆ can never be hidden by a
+  stale visit.
+- Unit tests added: the fallback ring shrinks by one with each visit and
+  the fourth press over a three-pane all-Waiting fleet flashes `nothing
+  needs you` rather than wrapping (`jump_attention_waiting_fallback_shrinks_as_each_pane_is_visited`);
+  a plain spatial focus move retires a pane exactly as a jump does
+  (`any_focus_move_not_just_alt_a_retires_a_visited_waiting_pane`); a pane
+  that leaves and re-enters `Waiting` is eligible again, not stuck excluded
+  (`a_revisited_pane_re_enters_the_fallback_after_a_fresh_finished_turn`).
 
 ### C20 — Activity feed (Alt+e) — [Added 2026-07-22, fleet features]
 
@@ -2755,6 +2938,47 @@ matters, not rewritten wholesale.]**
   and `a_third_click_cancels_the_staged_double_click_copy`; end to end,
   `main.rs::tests::double_click_selects_the_word_and_stages_the_copy_on_release`
   asserts the release does *not* flash immediately.
+
+**[Amended 2026-08-07, exit UX audit F5 + code review — what "still
+matches" meant was wrong twice over]** "`due_copy` reports the staged text
+once that window passes **and** `self.selection` still matches what was
+staged … any other clear silently cancels the stage" is withdrawn. That one
+check conflated two unrelated things, both bugs:
+- **Grid staleness (code review).** `self.pending_copy` staged coordinates
+  (`pane, anchor, cursor`), and `due_copy` re-extracted the text from the
+  **live** grid when the deadline passed. A streaming pane can scroll or
+  overwrite those cells inside the 500ms window, so the clipboard could
+  silently get whatever now occupies them — not the word actually
+  double-clicked, and no error, no wrong-looking flash, nothing.
+- **Silent drop on an unrelated keypress (F5).** "Any other clear" included
+  a keypress clearing `self.selection` (C29's own "any click or keypress
+  clears" rule, above) — so double-click a word, then type anything at all
+  within the window, and the clipboard silently didn't update. A keypress
+  has nothing to do with whether the word that was actually double-clicked
+  should still land; the check couldn't tell a keypress from a real
+  supersession (a 3rd click) because it never looked at *why*
+  `self.selection` had changed, only *that* it had.
+
+**Fixed by moving both jobs to where they actually belong.** `PendingCopy`
+is now `(text, fire-at)` — `App::release_native_selection`'s double-click
+branch grabs the text immediately via `finish_native_selection` and stages
+*that*, so there is nothing left to re-derive from the grid later.
+Supersession is detected at the only place a real one can originate — a
+new mouse release — not at fire time: every call to
+`release_native_selection` clears `self.pending_copy` unconditionally
+before doing anything else, so a 3rd click's own release (which commits
+its wider selection immediately, per the bullet above) cancels the
+narrower stage as a direct side effect of *being* a new release, the same
+way a plain click or drag elsewhere would. `due_copy` no longer reads
+`self.selection` at all — once the deadline passes, the staged text fires,
+full stop. Pinned by
+`an_unrelated_keypress_does_not_cancel_the_staged_double_click_copy` (F5)
+and `the_staged_copy_is_fixed_at_release_time_not_re_read_from_a_later_grid`
+(review); `a_third_click_cancels_the_staged_double_click_copy` now drives
+the 3rd click's own release for real rather than only mutating
+`self.selection` by hand, so it continues to pin the supersession case
+under the new mechanism.
+
 - **B2 — the test suite no longer touches the operator's real clipboard or
   browser.** `infra::clipboard::copy` and `infra::open::open_url` are both
   reached by this contract's own `handle_mouse`-driven tests (that's the
@@ -2918,6 +3142,25 @@ lands somewhere surprising is worse than one that predictably does nothing.
   switch), U11's `remember_tab_focus` bookkeeping, `spawn_active_tab` for a
   never-visited destination — and calls `set_focus` exactly once, with the
   geometric target.
+
+**[Amended 2026-08-07, exit UX audit F7 — both refusals now flash]** The two
+`focus_dir_cross_tab` early returns above — a full-width pane, and fewer
+than two tabs — were silent: `Alt+→`/`Alt+←` visibly does something at every
+other edge in the same tab (a spatial move, or now a tab switch), so a
+no-op indistinguishable from an unbound key read as broken rather than
+deliberate. roost's own rule, stated plainly elsewhere in this document, is
+that every no-op flashes; these two were the last cross-tab-focus refusals
+that didn't. Fixed with one line each, no behavior change: the full-width
+case flashes `full-width pane — nothing to cross into`; the fewer-than-two-
+tabs case flashes `only one tab`, reusing `move_pane_to_tab`'s identical
+wording for its own `n < 2` refusal (C28) so the two read as one rule
+rather than two independently-worded ones. `Up`/`Down`'s dead end is
+unchanged and stays silent — it predates C31 and is a different,
+unaudited surface. Pinned by amending
+`cross_tab_focus_is_a_no_op_with_only_one_tab` and
+`cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane` to
+assert the flash text, and `cross_tab_focus_never_fires_for_up_or_down` to
+assert the *absence* of one — pinning the fix's scope, not just its effect.
 
 **Unit tests (`core::app::tests`):**
 `cross_tab_right_edge_lands_on_next_tabs_leftmost_pane` ·

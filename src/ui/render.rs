@@ -246,13 +246,22 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
     }
 }
 
-/// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" —
-/// omitted at `n == 0` rather than shown as a hollow "0 needs you" — then
+/// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" — then
 /// (P21) the search prompt, then (Scroll/Search, U3) the dim position, then
 /// the uppercase mode word, then one trailing space. Everything rides inside
 /// the segment so C9's fit/yield machinery covers it for free: pairs drop
 /// whole before any of it clips. Pure so the omission rules are
 /// unit-testable without a `Frame`.
+///
+/// F2 (exit UX audit 2026-08-07): `attention` is `App::attention_segment()`
+/// verbatim — `None` omits the aggregate entirely (rather than a hollow "0
+/// needs you"); `Some((n, true))` is the real ◆ count, unchanged wording and
+/// `accent()`; `Some((n, false))` is `attention_ring`'s ○ fallback count,
+/// `"○ {n} your turn · Alt+a"` in `ink()` (one visual step back from the
+/// accent-red ◆ case — the same style `theme::status_style` already gives
+/// the Waiting glyph everywhere else). Passing the tuple straight through
+/// rather than re-deciding "real vs fallback" here is what keeps this
+/// function unable to show anything `Alt+a` wouldn't actually do.
 ///
 /// [P21] `query` is the live search prompt (`/foo`) and is the one token on
 /// this bar drawn in `ink`: it is text the user is typing right now, and
@@ -260,17 +269,19 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
 /// Scroll mode and the `i/n` hit counter while searching — both `quiet`, both
 /// the same "where am I" role.
 fn hint_bar_right_spans(
-    n: usize,
+    attention: Option<(usize, bool)>,
     query: Option<String>,
     position: Option<String>,
     word: &str,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if n > 0 {
-        spans.push(Span::styled(
-            format!("◆ {n} needs you · Alt+a"),
-            theme::accent(),
-        ));
+    if let Some((n, needs_input)) = attention {
+        let (text, style) = if needs_input {
+            (format!("◆ {n} needs you · Alt+a"), theme::accent())
+        } else {
+            (format!("○ {n} your turn · Alt+a"), theme::ink())
+        };
+        spans.push(Span::styled(text, style));
         spans.push(Span::raw("  "));
     }
     if let Some(q) = query {
@@ -299,8 +310,9 @@ fn search_segment(search: Option<&Search>) -> (Option<String>, Option<String>) {
 }
 
 /// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
-/// actually press right now. Precedence (C9): alt-warning, then flash, then
-/// the hint pairs — each takes over the whole bar from the next.
+/// actually press right now. Precedence (C9, reordered F1 2026-08-07):
+/// flash, then alt-warning, then the hint pairs — each takes over the whole
+/// bar from the next.
 /// Rendered column width of one hint pair. THE single source both the fit
 /// calculation and the actual draw use, so they can never drift (a +3/+4
 /// mismatch once dropped the whole right segment at widths 111–116).
@@ -326,21 +338,24 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
 }
 
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
+    // F1 (exit UX audit 2026-08-07, C9 amended): flash now wins the bar over
+    // the alt-warning — the reverse order let a persistent problem bar
+    // swallow a just-performed copy's confirmation for its entire window.
+    // A transient action result (e.g. "copied") takes over the bar briefly.
+    if let Some(msg) = app.flash() {
+        f.render_widget(
+            Paragraph::new(format!(" {msg} ")).style(theme::attention()),
+            area,
+        );
+        return;
+    }
+
     if app.show_alt_hint() {
         // C11/U4: same bar, per-terminal wording — the app knows the host's
         // TERM_PROGRAM and picks the real menu path where there is one. A
         // problem bar, so the red-tinted reversal, not the neutral one.
         f.render_widget(
             Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()),
-            area,
-        );
-        return;
-    }
-
-    // A transient action result (e.g. "copied") takes over the bar briefly.
-    if let Some(msg) = app.flash() {
-        f.render_widget(
-            Paragraph::new(format!(" {msg} ")).style(theme::attention()),
             area,
         );
         return;
@@ -370,7 +385,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         _ => (None, None),
     };
     let right = hint_bar_right_spans(
-        app.needs_input_count(),
+        app.attention_segment(),
         query,
         position,
         mode_word(&app.mode, app.zoomed(), focused_raw),
@@ -503,12 +518,20 @@ fn picker_cwd_label(path: &std::path::Path) -> String {
     }
 }
 
-/// C14 (U20): the picker dialog's width — the adapter column (a fixed 16,
-/// as before the cwd column existed) plus the widest cwd label, plus the
-/// gap and the two border columns. `centered_near` still clamps it to the
-/// screen. Pure so the sizing and the drawing can't drift.
+/// C14 (U20): the picker dialog's width — the adapter column (a fixed
+/// width, as before the cwd column existed) plus the widest cwd label, plus
+/// the gap and the two border columns. `centered_near` still clamps it to
+/// the screen. Pure so the sizing and the drawing can't drift.
+///
+/// [Amended F8, exit UX audit 2026-08-07] `ADAPTER_COL` was 16, sized for
+/// the registry's then-longest id (`claude`/`gemini`, 6 chars) plus
+/// `App::picker_filtered`'s old `" gone"` suffix (5 chars) plus the 3-char
+/// row prefix (`picker_row_body`'s `" {digit} "`) — 14, plus 2 columns of
+/// slack. The registry has since grown a longer id (`opencode`, 8 chars),
+/// and the suffix is now `" not found"` (10 chars, replacing "gone" — see
+/// `picker_filtered`): 3 + 8 + 10 = 21, plus the same 2 columns of slack.
 fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
-    const ADAPTER_COL: u16 = 16;
+    const ADAPTER_COL: u16 = 23;
     let widest = cwds
         .iter()
         .map(|p| mouse::display_width(&picker_cwd_label(p)))
@@ -2258,14 +2281,31 @@ mod tests {
     fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
         // U3: `↑N/M` rides inside the right segment (quiet), so C9's yield
         // machinery covers it — and it only exists when a position is given.
-        let spans = hint_bar_right_spans(0, None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(None, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "↑12/300 SCROLL ");
         assert_eq!(spans[0].style, theme::quiet());
 
-        let spans = hint_bar_right_spans(2, None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(Some((2, true)), None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
+    }
+
+    /// F2 (exit UX audit 2026-08-07): the ○ fallback renders in the same
+    /// slot as a real ◆, with its own wording and one visual step back
+    /// (`ink()` rather than `accent()`) so a real ◆ still reads as more
+    /// urgent.
+    #[test]
+    fn hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input() {
+        let spans = hint_bar_right_spans(Some((3, false)), None, None, "NORMAL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "○ 3 your turn · Alt+a  NORMAL ");
+        assert_eq!(spans[0].style, theme::ink());
+
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
+        assert_eq!(spans[0].style, theme::accent());
     }
 
     /// P21: the search prompt lives in C9's right segment — `/query▏` in
@@ -2279,7 +2319,7 @@ mod tests {
         let lines: Vec<String> = ["alpha beta", "beta beta"].map(String::from).to_vec();
         let mut s = Search::over(lines, "beta", 1);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/beta{} 2/3 SEARCH ", theme::RENAME_CURSOR));
         assert_eq!(spans[0].style, theme::ink(), "the typed query is legible, not dim");
@@ -2289,7 +2329,7 @@ mod tests {
         // empty result is the answer, not the absence of one.
         s = Search::over(vec!["alpha beta".into()], "gamma", 0);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/gamma{} 0/0 SEARCH ", theme::RENAME_CURSOR));
 
@@ -2527,7 +2567,7 @@ mod tests {
             ],
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        let right_w = super::hint_bar_right_spans(0, None, None, "COPY")
+        let right_w = super::hint_bar_right_spans(None, None, None, "COPY")
             .iter()
             .map(|s| mouse::display_width(&s.content))
             .sum::<u16>();
@@ -2557,7 +2597,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_omits_needs_segment_at_zero() {
-        let spans = hint_bar_right_spans(0, None, None, "NORMAL");
+        let spans = hint_bar_right_spans(None, None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "NORMAL ");
         assert!(!text.contains('◆'));
@@ -2565,7 +2605,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
-        let spans = hint_bar_right_spans(3, None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::accent());
@@ -3179,16 +3219,20 @@ mod tests {
 
     /// C14 (U20): the dialog grows to fit the widest cwd label, and stays
     /// the pre-U20 32 columns when there is no cwd column to show.
+    ///
+    /// [Amended F8, exit UX audit 2026-08-07] `ADAPTER_COL` grew from 16 to
+    /// 23 (see its own doc comment) — the "src/roost" case used to land
+    /// under the 32-column floor and no longer does.
     #[test]
     fn picker_dialog_width_covers_the_cwd_column() {
         use std::path::PathBuf;
         assert_eq!(super::picker_dialog_width(&[]), 32, "no cwds ⇒ the old dialog");
         let cwds = vec![PathBuf::from("/home/me/src/roost"), PathBuf::from("/tmp")];
-        // widest label = "src/roost" (9) ⇒ 16 + 2 + 9 + 2 = 29, floored at
-        // 32: the picker must never be narrower than the one it replaced.
-        assert_eq!(super::picker_dialog_width(&cwds), 32);
+        // widest label = "src/roost" (9) ⇒ 23 + 2 + 9 + 2 = 36, past the
+        // pre-U20 32-column floor.
+        assert_eq!(super::picker_dialog_width(&cwds), 23 + 2 + 9 + 2);
         let long = vec![PathBuf::from("/home/me/a-rather-long/checkout-name")];
-        assert_eq!(super::picker_dialog_width(&long), 16 + 2 + 27 + 2, "label = a-rather-long/checkout-name");
+        assert_eq!(super::picker_dialog_width(&long), 23 + 2 + 27 + 2, "label = a-rather-long/checkout-name");
     }
 
     /// U20: the accelerator is on the hint bar too — a key you can only
@@ -3393,9 +3437,32 @@ mod tests {
         out.push(("flash", snap(&mut app)));
 
         let mut app = three_panes();
-        app.note_key_seen(); // U4's evidence: keys arriving, none with Alt
+        // F1's evidence: a swallowed Option chord (Option+n -> '˜' with no
+        // Alt modifier), not just any key.
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
         assert!(app.show_alt_hint());
         out.push(("alt-trap warning bar", snap(&mut app)));
+
+        // [design-supervisor, SG4, exit UX audit 2026-08-07] No fixture here
+        // ever set a Waiting pane with nothing needing input anywhere, so
+        // the C9 ○ fallback segment (F2) was invisible to the §2 gates
+        // below — its style was pinned only by a unit test, the exact
+        // vacuous-gate pattern PR #61 was meant to close. A shell's Waiting
+        // downgrades to Idle (P2-10) and never pulls the fallback, so this
+        // promotes one pane to a real adapter first.
+        {
+            use crate::core::status::AgentStatus;
+            use crate::ports::PaneBackend;
+            let mut app = three_panes();
+            let id = app.pane_order()[0];
+            app.ws.tabs[0].panes.get_mut(&id).unwrap().adapter = "pi".into();
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+            // Self-verifying: if a future change quietly routes this back to
+            // the ◆ path (or to nothing), this fixture must not go on
+            // silently exercising the wrong state.
+            assert_eq!(app.attention_segment(), Some((1, false)), "fixture must actually hit the ○ fallback");
+            out.push(("hint bar ○ fallback (waiting, nothing needs input)", snap(&mut app)));
+        }
 
         for (name, action) in [
             ("help overlay", Action::Help),
@@ -3525,6 +3592,30 @@ mod tests {
         }
 
         out
+    }
+
+    /// F1 (exit UX audit 2026-08-07, C9 reordered): the alt-warning used to
+    /// pre-empt `draw_hint_bar`'s flash branch outright, so a copy performed
+    /// while the warning wanted to be up showed no confirmation at all. Both
+    /// conditions true at once, flash must still win the row.
+    #[test]
+    fn flash_wins_the_hint_bar_over_the_alt_warning() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.set_flash("copied 12 chars");
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
+        assert!(app.show_alt_hint(), "evidence is present — the warning wants the bar too");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let row: String = (0..100)
+            .filter_map(|x| term.backend().buffer().cell((x, 29)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(row.contains("copied 12 chars"), "flash must win the bar: {row:?}");
+        assert!(!row.contains("Alt keys"), "the alt-warning must not pre-empt the flash: {row:?}");
     }
 
     /// [design-supervisor pattern, SG-2's own shape] The three §2 gates below

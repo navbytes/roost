@@ -23,6 +23,15 @@ use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// F1 (design audit SG1, exit UX audit 2026-08-07): how long the "Alt keys
+/// aren't reaching roost" hint stays up after its most recent evidence
+/// (`App::alt_swallow_at`) — not since launch. `is_alt_swallow_char`'s
+/// evidence is real but not unambiguous (every character in it is also a
+/// directly-typed letter on some non-US macOS layout), so this bounds a
+/// false positive to a few seconds instead of latching for the session; a
+/// user who keeps producing the evidence keeps re-arming the window.
+const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
+
 /// P6: how much of a pane's live OSC 0/2 title is adopted as its display
 /// name. Claude Code publishes `spinner + task` continuously, and a task
 /// line can be a paragraph; every fleet surface that shows a display name
@@ -34,10 +43,6 @@ const LIVE_TITLE_CAP: usize = 48;
 /// republishes its OSC title on every spinner frame would otherwise have
 /// roost repaint the host's title bar ~30x a second.
 const HOST_TITLE_INTERVAL: Duration = Duration::from_millis(200);
-
-/// How long the "Alt keys aren't reaching roost" hint stays up on a fresh
-/// launch before we assume the user isn't going to press one / already saw it.
-const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
 
 /// P0-3: how much of a spawn failure's full cause chain (`dead_reason`) is
 /// kept for the dead-pane bar (`spawn failed: {reason}`, C16) and the feed —
@@ -187,9 +192,16 @@ impl Search {
     }
 }
 
-/// S4: (pane, anchor, cursor, fire-at) for a copy staged from a
-/// double-click's own release — see `App::release_native_selection`.
-type PendingCopy = (PaneId, (u16, u16), (u16, u16), Instant);
+/// S4: (text, fire-at) for a copy staged from a double-click's own release
+/// — see `App::release_native_selection`.
+///
+/// [Amended, code review, exit UX audit 2026-08-07] Used to be `(pane,
+/// anchor, cursor, fire-at)`, re-extracted from the *live* grid when the
+/// deadline passed. A streaming pane can scroll or overwrite those cells in
+/// the meantime, so that re-read could silently copy whatever now occupies
+/// them instead of the word actually double-clicked. The text is grabbed
+/// once, at release time, and staged as itself — nothing left to re-derive.
+type PendingCopy = (String, Instant);
 
 /// An in-progress / completed text selection within one pane. Coordinates are
 /// (row, col) in the pane's inner (border-excluded) cell space, 0-based.
@@ -384,12 +396,28 @@ pub struct App<B: PaneBackend> {
     started: Instant,
     /// Set the first time an Alt-modified key event arrives, so the
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
-    /// they are (or the window has simply run out).
+    /// they are.
     alt_seen: bool,
-    /// U4: set the first time ANY key event arrives. Keys flowing with no
-    /// Alt among them is the evidence the alt-trap warning now triggers on,
-    /// instead of an allowlist of terminals known to eat Option.
-    keys_seen: bool,
+    /// F1 (exit UX audit 2026-08-07): when a key last arrived that looks
+    /// like a *swallowed* Alt chord — the character the standard US macOS
+    /// keyboard layout emits for `Option+<letter>` with Option-as-Meta off
+    /// (`˜` for Option+n, `∑` for Option+w, …), carrying no Alt modifier at
+    /// all. Not "any key arrives": that was the old (wrong) evidence — true
+    /// of nearly every keystroke, including the shell prompt a healthy user
+    /// types first. See `is_alt_swallow_char`.
+    ///
+    /// [Amended, design audit SG1, 2026-08-07] Even this narrower evidence
+    /// has a real false-positive: every one of `is_alt_swallow_char`'s
+    /// characters is a directly-typed letter on some non-US macOS layout
+    /// (`ç` on Portuguese/French/Turkish, `å`/`ø` on Nordic, `ß` on German,
+    /// …), so a user typing their own language can trip it with Alt never
+    /// involved. A `bool` latch made that permanent for the rest of the
+    /// session — worse than the bug this fix replaced, which at least
+    /// expired after 8s. Timestamped instead: `show_alt_hint` only reads
+    /// this within `ALT_HINT_WINDOW` of the *most recent* match, so a false
+    /// positive is bounded to a few seconds, not a session, while a user who
+    /// keeps hitting real Alt-swallow evidence keeps re-arming it.
+    alt_swallow_at: Option<Instant>,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
     /// P21: the live scrollback search, if one is running. Outlives the
@@ -443,6 +471,19 @@ pub struct App<B: PaneBackend> {
     /// a feed transition line (`diff_statuses`). Pruned to just the
     /// currently-running panes on the same cadence.
     last_status: HashMap<PaneId, AgentStatus>,
+    /// F3 (exit UX audit 2026-08-07): panes `attention_ring`'s ○ fallback
+    /// must skip because focus already landed on them *during their current
+    /// Waiting spell* — unlike ◆, which self-clears the moment you act on a
+    /// pane (its status itself moves on), a finished-and-quiet agent's
+    /// `Waiting` doesn't change just because you looked at it, so without
+    /// this `Alt+a` round-robins the same panes forever and "nothing else
+    /// needs you" only ever fires with exactly one waiting. Added by
+    /// `set_focus` (every focus move funnels through there — Alt+a, a
+    /// click, arrows, the roster all count); removed by `diff_statuses` the
+    /// moment a pane's status leaves `Waiting`, so a *new* finished turn is
+    /// never silently swallowed by a mark the previous turn left behind.
+    /// Pruned alongside `last_status` on the same cadence.
+    visited_waiting: HashSet<PaneId>,
     /// C20: activity-feed ring buffer (status/spawn/close/exit/ctl),
     /// capacity `FEED_CAP`, oldest evicted first. Session-only — never
     /// persisted.
@@ -490,13 +531,13 @@ pub struct App<B: PaneBackend> {
     /// click count — see `click_count`.
     last_click: Option<(PaneId, u16, u16, u8, Instant)>,
     /// S4 (PR #46 review): a copy staged from a double-click's own release
-    /// — (pane, anchor, cursor, fire-at). Firing it immediately made every
-    /// triple-click copy the word (2nd click's release) and then the line
-    /// (3rd click's) a heartbeat later: two clipboard writes, two flashes,
-    /// for one gesture. A double-click's release is the only one that has
-    /// to wait, since it is the only one a further click can still
-    /// supersede within the same window — see `release_native_selection`
-    /// and `due_copy`.
+    /// — (text, fire-at), grabbed once at release time (see `PendingCopy`).
+    /// Firing it immediately made every triple-click copy the word (2nd
+    /// click's release) and then the line (3rd click's) a heartbeat later:
+    /// two clipboard writes, two flashes, for one gesture. A double-click's
+    /// release is the only one that has to wait, since it is the only one a
+    /// further click can still supersede within the same window — see
+    /// `release_native_selection` and `due_copy`.
     pending_copy: Option<PendingCopy>,
     /// W3: bytes roost owes its OWN terminal — pane OSC 9 notifications
     /// (P2) and OSC 52 clipboard writes (P3) forwarded on a pane's behalf.
@@ -558,7 +599,7 @@ impl<B: PaneBackend> App<B> {
             home: dirs::home_dir(),
             started: Instant::now(),
             alt_seen: false,
-            keys_seen: false,
+            alt_swallow_at: None,
             selection: None,
             search: None,
             recent_cwds: Vec::new(),
@@ -571,6 +612,7 @@ impl<B: PaneBackend> App<B> {
             waiters: Vec::new(),
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
+            visited_waiting: HashSet::new(),
             feed: VecDeque::new(),
             float: None,
             raw: HashSet::new(),
@@ -654,11 +696,29 @@ impl<B: PaneBackend> App<B> {
         self.alt_seen = true;
     }
 
-    /// U4: record that *some* key arrived — the evidence half of the
-    /// alt-trap trigger. Keys flowing with no Alt among them is what
-    /// "the terminal is eating the Alt layer" looks like from in here.
-    pub fn note_key_seen(&mut self) {
-        self.keys_seen = true;
+    /// F1 (exit UX audit 2026-08-07): record a key event as possible
+    /// evidence the Alt layer isn't reaching roost. Only counts when the key
+    /// carries no Alt modifier AND its character is one the standard US
+    /// macOS layout produces for `Option+<letter>` with Option-as-Meta off —
+    /// "a key arrived" is not evidence (nearly all typing satisfies that,
+    /// including the shell prompt a healthy user types first); "the
+    /// specific character a swallowed Option chord produces" is.
+    ///
+    /// [Amended, design audit SG1, 2026-08-07] Stamps the time rather than
+    /// latching a bool — every fresh match re-arms `ALT_HINT_WINDOW` (see
+    /// `show_alt_hint`), so a user who keeps producing the evidence (a
+    /// genuinely broken Alt layer) keeps being told, while one unlucky
+    /// keystroke (a non-US layout's own letter, see `alt_swallow_at`) only
+    /// costs a few seconds, not the session.
+    pub fn note_key_seen(&mut self, key: crossterm::event::KeyEvent) {
+        if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            return;
+        }
+        if let crossterm::event::KeyCode::Char(c) = key.code {
+            if is_alt_swallow_char(c) {
+                self.alt_swallow_at = Some(Instant::now());
+            }
+        }
     }
 
     /// C11/U4: should the "Alt keys aren't reaching roost" bar be up? Many
@@ -667,10 +727,21 @@ impl<B: PaneBackend> App<B> {
     /// `Esc+`) — with it off, every Alt chord roost relies on silently does
     /// nothing and there is no other signal saying why. Gating this on
     /// `TERM_PROGRAM == "Apple_Terminal"` only meant the README's own
-    /// recommended terminal (iTerm2) never warned; the trigger is now the
+    /// recommended terminal (iTerm2) never warned; the trigger is the
     /// evidence itself, on any terminal (see `wants_alt_hint`).
+    ///
+    /// [Amended, design audit SG1, 2026-08-07] The evidence is real but not
+    /// unambiguous — deliberately, and not merely unnoticed (see
+    /// `alt_swallow_at`'s doc): every `is_alt_swallow_char` match is also a
+    /// directly-typed letter on some non-US macOS layout, so this *can*
+    /// false-fire on ordinary typing in those languages. What bounds the
+    /// cost is `ALT_HINT_WINDOW`, checked against the *most recent* match,
+    /// not against launch — a false positive clears itself within the
+    /// window instead of owning the hint row for the rest of the session,
+    /// and a real Alt chord (`alt_seen`) dismisses it outright, for good,
+    /// regardless of any evidence that arrives after.
     pub fn show_alt_hint(&self) -> bool {
-        wants_alt_hint(self.alt_seen, self.keys_seen, self.started.elapsed())
+        wants_alt_hint(self.alt_seen, self.alt_swallow_at.map(|t| t.elapsed()))
     }
 
     /// C11/U4: the warning's text, with the real menu path for terminals
@@ -1055,6 +1126,13 @@ impl<B: PaneBackend> App<B> {
                 None => {} // first observation: spawn owns birth, no line
                 Some(old) if old == status || status == AgentStatus::Exited => {}
                 Some(old) => {
+                    // F3: leaving `Waiting` starts a fresh attention cycle —
+                    // any "you already looked at this" mark belongs to the
+                    // turn that just ended, not the one that just started,
+                    // so it must not silently swallow a real new ○.
+                    if old == AgentStatus::Waiting {
+                        self.visited_waiting.remove(&id);
+                    }
                     // U2: `{id} {display_name}`, so four identical shells'
                     // transitions stop being indistinguishable in the feed.
                     let text = format!(
@@ -1069,8 +1147,10 @@ impl<B: PaneBackend> App<B> {
         }
         // Drop entries for panes that no longer have a runtime (closed) —
         // ids are never reused, so without this the map would grow by one
-        // stale entry per pane ever spawned over a long session.
+        // stale entry per pane ever spawned over a long session. F3's
+        // visited-set is pruned on the same cadence, same reason.
         self.last_status.retain(|id, _| self.runtimes.contains_key(id));
+        self.visited_waiting.retain(|id| self.runtimes.contains_key(id));
     }
 
     /// Persist what each pane is *actually* running — its live working
@@ -2505,17 +2585,36 @@ impl<B: PaneBackend> App<B> {
     /// triple-click's own release, which has nothing left to wait for)
     /// commits straight through `finish_native_selection`.
     ///
+    /// [Amended, code review + F5, exit UX audit 2026-08-07] Every release
+    /// — staged or immediate — now starts by clearing any earlier stage
+    /// outright: a real mouse release always supersedes one, most commonly
+    /// the 3rd click of a triple-click, whose own (wider) selection is the
+    /// one that should win. What no longer cancels a stage is anything
+    /// *other* than a mouse release — a keypress clearing `self.selection`
+    /// (C29's "any click or keypress clears" rule) used to read as
+    /// "superseded" too, silently dropping a double-click's copy if the
+    /// user so much as typed within the window, with nothing telling them
+    /// (F5). A keypress has nothing to do with whether the word actually
+    /// double-clicked should still land on the clipboard, so it no longer
+    /// touches the stage at all — `due_copy` fires it regardless.
+    ///
     /// Returns the text to copy *now*, if any — `None` covers "nothing was
     /// selected", "staged for later" (see `due_copy`) and "nothing
     /// extractable" alike; the caller doesn't need to tell them apart.
     pub fn release_native_selection(&mut self) -> Option<String> {
+        self.pending_copy = None;
         let sel = self.selection?;
         if sel.dragging && sel.anchor == sel.cursor {
             self.selection = None;
             return None;
         }
         if self.last_click.is_some_and(|(.., n, _)| n == 2) {
-            self.pending_copy = Some((sel.pane, sel.anchor, sel.cursor, Instant::now() + DOUBLE_CLICK_INTERVAL));
+            // Grab the text now — not a promise to re-read the grid later,
+            // which a streaming pane could scroll or overwrite by the time
+            // the deadline passes (see `PendingCopy`).
+            if let Some(text) = self.finish_native_selection() {
+                self.pending_copy = Some((text, Instant::now() + DOUBLE_CLICK_INTERVAL));
+            }
             return None;
         }
         let text = self.finish_native_selection();
@@ -2527,24 +2626,24 @@ impl<B: PaneBackend> App<B> {
 
     /// S4: the staged double-click copy's text, once its deadline has
     /// passed — `None` otherwise, whether because it's still waiting on a
-    /// possible 3rd click, or because there was never one staged. Consumes
-    /// the stage the moment the deadline passes either way, so a
-    /// superseded one (a 3rd click replaced `self.selection` with the
-    /// whole line, or a click/keypress cleared it) is silently dropped
-    /// exactly once rather than checked forever. The composition root
-    /// calls this once per event-loop tick and performs the actual
-    /// clipboard write when it answers (core has no I/O of its own).
+    /// possible 3rd click, or because there was never one staged.
+    ///
+    /// [Amended, code review + F5, exit UX audit 2026-08-07] Used to
+    /// re-check `self.selection` against the staged coordinates and drop
+    /// the copy on any mismatch — which conflated two different things: a
+    /// real supersession (now handled at stage-time, see
+    /// `release_native_selection`) and an unrelated keypress clearing the
+    /// highlight, which used to cancel the copy too, silently. The text is
+    /// already fixed at release time, so once the deadline passes there is
+    /// nothing left to check — it fires. The composition root calls this
+    /// once per event-loop tick and performs the actual clipboard write
+    /// when it answers (core has no I/O of its own).
     pub fn due_copy(&mut self) -> Option<String> {
-        let (pane, anchor, cursor, at) = self.pending_copy?;
+        let at = self.pending_copy.as_ref()?.1;
         if Instant::now() < at {
             return None;
         }
-        self.pending_copy = None;
-        let still_current = self.selection.is_some_and(|s| (s.pane, s.anchor, s.cursor) == (pane, anchor, cursor));
-        if !still_current {
-            return None;
-        }
-        self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).filter(|t| !t.is_empty())
+        self.pending_copy.take().map(|(text, _)| text)
     }
 
     /// Set a transient hint-bar message (e.g. a startup notice).
@@ -3189,6 +3288,14 @@ impl<B: PaneBackend> App<B> {
     fn set_focus(&mut self, id: PaneId) {
         let old = self.focused;
         self.focused = id;
+        // F3: landing focus on a pane that's currently in the ○ fallback
+        // takes it out of `attention_ring`'s rotation — see
+        // `visited_waiting`. Every focus move funnels through here, so
+        // Alt+a, a click, arrow-focus and the roster all count the same way
+        // (the finding named "visiting", not "Alt+a specifically").
+        if self.display_status(id) == Some(AgentStatus::Waiting) {
+            self.visited_waiting.insert(id);
+        }
         // Nothing inside roost is focused while roost isn't: the old pane
         // was already told it lost focus when the window blurred, and the
         // new one collects its `CSI I` when the window comes back.
@@ -3296,10 +3403,17 @@ impl<B: PaneBackend> App<B> {
                 .find(|p| p.id == self.focused)
                 .is_some_and(|p| p.rect.width == self.body_area().width);
         if spans_full_width {
+            // F7 (exit UX audit 2026-08-07): this same key teleports across
+            // tabs at a real edge — a silent refusal here reads as broken,
+            // not deliberate. roost's own rule is every no-op flashes.
+            self.set_flash("full-width pane — nothing to cross into");
             return;
         }
         let n = self.ws.tabs.len();
         if n < 2 {
+            // F7: same reasoning as `move_pane_to_tab`'s identical refusal —
+            // reuse its wording so the two read as one rule, not two.
+            self.set_flash("only one tab");
             return; // C31: only when more than one tab exists
         }
         let next = (self.ws.active_tab as isize + delta).rem_euclid(n as isize) as usize;
@@ -3720,10 +3834,10 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// C19: every pane whose runtime status is `NeedsInput` — the exact
-    /// predicate `needs_input_count` uses, so the ring's size can never
-    /// disagree with the hint bar's advertised N. Ordered by (tab index
-    /// ascending, position within that tab's `pane_order()`); the float
-    /// (C22), if needy, is last — `needs_input_count` counts `runtimes`
+    /// predicate `needs_input_count` uses, so the ring's ◆ pass can never
+    /// disagree with the hint bar's advertised N whenever N > 0. Ordered by
+    /// (tab index ascending, position within that tab's `pane_order()`); the
+    /// float (C22), if needy, is last — `needs_input_count` counts `runtimes`
     /// directly (float included), so it must be too.
     ///
     /// [Amended, ux P1-5] `Alt+a` promises "one key jumps there", but a ◆-only
@@ -3739,12 +3853,49 @@ impl<B: PaneBackend> App<B> {
     /// raw runtime status, so a plain shell sitting at its prompt (P2-10: it
     /// has no turn to hand back) can never pull the ring — only a pane whose
     /// `Waiting` actually means something does.
+    ///
+    /// [Amended F2, exit UX audit 2026-08-07] At N = 0 this ring's fallback
+    /// pass used to run with **no on-screen affordance saying so**: the hint
+    /// bar omitted its segment outright (`n > 0` in `render.rs`), so `Alt+a`
+    /// visibly promised nothing yet still jumped somewhere — the best half
+    /// of the P1-5 work above was invisible. `attention_segment` (below) now
+    /// reads this same ring, so the hint bar's right segment matches what
+    /// `Alt+a` will actually do in *every* case, not just N > 0.
+    ///
+    /// [Amended F3, exit UX audit 2026-08-07] The fallback pass also drops
+    /// any pane in `visited_waiting` — panes focus has already landed on
+    /// during their current `Waiting` spell. Without this, the fallback
+    /// never empties: a real ◆ clears itself the moment you act on it (its
+    /// own status moves on), but a quiet `Waiting` pane's status doesn't
+    /// change just because you looked at it, so a six-pane fleet with
+    /// nothing but finished turns turned `Alt+a` into an endless
+    /// round-robin, and "nothing else needs you" only ever fired with
+    /// exactly one pane waiting. The ◆ pass is untouched — a real ◆ must
+    /// never be hidden by a stale visit.
     fn attention_ring(&self) -> Vec<PaneId> {
         let needy = self.status_ring(AgentStatus::NeedsInput);
         if !needy.is_empty() {
             return needy;
         }
         self.status_ring(AgentStatus::Waiting)
+            .into_iter()
+            .filter(|id| !self.visited_waiting.contains(id))
+            .collect()
+    }
+
+    /// C9/F2 (exit UX audit 2026-08-07): what the hint bar's right segment
+    /// should announce about `Alt+a` — `Some((n, true))` for a real ◆ count
+    /// (`needs_input_count`, unchanged wording/style), `Some((n, false))`
+    /// for `attention_ring`'s ○ fallback count once none do, `None` only
+    /// when `Alt+a` has nowhere to go at all. Reads `attention_ring` itself
+    /// rather than recomputing the two passes, so the segment is
+    /// structurally the ring's size — the two can never drift apart.
+    pub fn attention_segment(&self) -> Option<(usize, bool)> {
+        let ring = self.attention_ring();
+        if ring.is_empty() {
+            return None;
+        }
+        Some((ring.len(), self.needs_input_count() > 0))
     }
 
     /// Every pane — tab order, then that tab's `pane_order()`, the float
@@ -4162,8 +4313,8 @@ impl<B: PaneBackend> App<B> {
         //
         // P2-13: addressed through the *raw* ids, not `picker_filtered`'s
         // annotated display text — a not-installed row still reads as
-        // "codex gone" in the list, and launching has to spawn `codex`, not
-        // a string with a marker glued onto it.
+        // "codex not found" in the list, and launching has to spawn `codex`,
+        // not a string with a marker glued onto it.
         let ids = self.picker_filtered_ids();
         let Some(&adapter) = ids.get(index) else { return };
         let cwd = self.picker_cwd();
@@ -4205,15 +4356,25 @@ impl<B: PaneBackend> App<B> {
     /// each annotated when its launch program isn't actually on `$PATH` (a
     /// Claude-only user's first `Alt+Enter` → `pi` used to be a dead pane
     /// with no warning at all). Annotated rather than hidden: this registry
-    /// has five adapters, and on a single-agent machine hiding the other
-    /// four would leave one or two rows under a title that still reads "pick
+    /// has six adapters, and on a single-agent machine hiding the other five
+    /// would leave one or two rows under a title that still reads "pick
     /// agent" — confusingly short, and indistinguishable from a picker that
     /// lost its adapters (the exact failure U20's own type-ahead title
-    /// already guards against). `" gone"` echoes this file's own voice for
-    /// "not here" (`roster_jump`'s "that pane is gone") and — checked against
-    /// the fixed 16-column adapter field `picker_row_body` budgets — is the
-    /// longest suffix that never crowds the cwd column even for the longest
-    /// ids (`claude`/`gemini`).
+    /// already guards against).
+    ///
+    /// [Amended F8, exit UX audit 2026-08-07] The suffix used to be `"
+    /// gone"`, echoing this file's own voice for "not here" (`roster_jump`'s
+    /// "that pane is gone") — but "gone" implies something that *was* here
+    /// and disappeared, which is false for an adapter that was never
+    /// installed on this machine at all; every other roost picker session
+    /// would show it exactly the same "gone" the moment after a fresh
+    /// install too. Reworded to `" not found"` (the familiar shell idiom for
+    /// "no such program on `$PATH`"), which makes no claim about history.
+    /// Checked against `render.rs`'s `ADAPTER_COL` (widened alongside this
+    /// change, same reasoning there) for the longest id: `opencode` (8
+    /// chars, longer than `claude`/`gemini` since this registry grew to six
+    /// — the comment this amendment replaces was already stale on that
+    /// count too).
     pub fn picker_filtered(&self) -> Vec<String> {
         self.picker_filtered_ids()
             .into_iter()
@@ -4221,7 +4382,7 @@ impl<B: PaneBackend> App<B> {
                 if adapter_installed(id, &self.registry) {
                     id.to_string()
                 } else {
-                    format!("{id} gone")
+                    format!("{id} not found")
                 }
             })
             .collect()
@@ -5040,10 +5201,29 @@ fn method_summary(m: &Method) -> String {
 /// take a length of time the rate limiter can then make impractical; the
 /// buckets alone never could, because they bound calls and the log bounds
 /// bytes. 512 is far past any legitimate adapter name or status word.
+///
+/// [Amended, code review, exit UX audit 2026-08-07] This is a **byte**
+/// budget — `sanitize` used to cap by `.chars().take(512)`, so 512
+/// 4-byte codepoints (an adapter-name field stuffed with astral-plane
+/// characters) bought ~2 KiB, not the ~1 KiB "far past any legitimate
+/// name" reads as. Every number in this comment is about bytes on disk
+/// against `AUDIT_LOG_MAX`, so bytes is what the cap now counts.
 const AUDIT_FIELD_CAP: usize = 512;
 
+/// Cleans control chars, then caps at `AUDIT_FIELD_CAP` **bytes** (not
+/// chars — see the amendment above), never splitting a multi-byte
+/// character: each candidate char is checked against the byte budget
+/// before it's pushed, so truncation always lands on a char boundary.
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_control() { ' ' } else { c }).take(AUDIT_FIELD_CAP).collect()
+    let mut out = String::new();
+    for c in s.chars() {
+        let c = if c.is_ascii_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > AUDIT_FIELD_CAP {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is
@@ -5531,16 +5711,52 @@ fn edge_pane(rects: &[PaneRect], rightmost: bool) -> Option<PaneId> {
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
 /// without depending on process env vars or wall-clock time.
 ///
-/// U4: the trigger is evidence, not an allowlist — keys are arriving and
-/// not one of them has carried Alt, inside the startup window. That covers
-/// every terminal with the setting off (the old `TERM_PROGRAM ==
-/// "Apple_Terminal"` test left iTerm2, the README's recommendation, silent),
-/// and it fires at exactly the right moment: when Option-as-Meta is off, the
-/// chord you just tried arrives as an unmodified key (Option+b → `∫`), so
-/// the failed chord is itself the evidence. One Alt key ever, or the window
-/// running out, ends it for the session.
-fn wants_alt_hint(alt_seen: bool, keys_seen: bool, elapsed: Duration) -> bool {
-    !alt_seen && keys_seen && elapsed < ALT_HINT_WINDOW
+/// U4/F1 (exit UX audit 2026-08-07): the trigger is evidence, not an
+/// allowlist — that part of the original U4 fix was right. What was wrong
+/// was the *evidence*: "keys are arriving and not one of them has carried
+/// Alt" is true of nearly all typing, so it fired on a healthy terminal the
+/// moment the user typed a shell prompt. The real signature of a swallowed
+/// Option chord is narrower — `is_alt_swallow_char` — but, per the design
+/// audit (SG1), still not unambiguous: every character in that set is also
+/// a directly-typed letter on some non-US macOS layout. `since_evidence` is
+/// time elapsed since the *most recent* match (`App::alt_swallow_at`), not
+/// since launch — checked against `ALT_HINT_WINDOW` so a false positive
+/// clears itself in a few seconds rather than latching for the session,
+/// while fresh evidence keeps re-arming the window for a genuinely broken
+/// Alt layer. One real Alt key ever ends it outright, for the rest of the
+/// session, regardless of any evidence timestamp.
+fn wants_alt_hint(alt_seen: bool, since_evidence: Option<Duration>) -> bool {
+    !alt_seen && since_evidence.is_some_and(|d| d < ALT_HINT_WINDOW)
+}
+
+/// F1 (exit UX audit 2026-08-07): the complete set of characters the
+/// standard **US** macOS keyboard layout emits for `Option+<letter>`,
+/// `letter` in `a..=z`, when Option isn't configured as Meta — one entry
+/// per letter, 26 total (this `matches!` arm list *is* the definition; nothing
+/// is abbreviated or approximated here). One of these arriving with no Alt
+/// modifier at all is evidence that *some* Alt chord was just swallowed,
+/// unlike "a key arrived" (true of nearly every keystroke) — see the design
+/// audit's SG1 for the false-positive this still carries on non-US layouts,
+/// and `wants_alt_hint` for how that's bounded.
+///
+/// Scoped to the US layout only (SG2): a non-US layout's own Option+letter
+/// table is a different 26 characters (mostly overlapping, not identical),
+/// and this does not attempt to cover them.
+///
+/// Assumes terminals apply the OS keyboard layout without dead-key
+/// composition — i.e. `Option+n` arrives immediately as `˜` rather than
+/// held pending a following vowel. That assumption is believed true of
+/// Terminal.app/iTerm2/Ghostty/kitty (none composes dead keys itself; a
+/// pty is not the `NSTextInputClient` a composing app would need) but is
+/// **not verified by anything in this suite** (SG3) — it would need a real
+/// terminal emulator and a real OS keyboard driver, neither of which a unit
+/// or integration test here drives.
+fn is_alt_swallow_char(c: char) -> bool {
+    matches!(
+        c,
+        'å' | '∫' | 'ç' | '∂' | '´' | 'ƒ' | '©' | '˙' | 'ˆ' | '∆' | '˚' | '¬' | 'µ' | '˜' | 'ø'
+            | 'π' | 'œ' | '®' | 'ß' | '†' | '¨' | '√' | '∑' | '≈' | '¥' | 'Ω'
+    )
 }
 
 /// C11/U4: the warning line for a given host `TERM_PROGRAM` — the real menu
@@ -5688,6 +5904,23 @@ mod tests {
         assert!(!ctrl.chars().any(|c| c.is_ascii_control()), "control bytes still neutralised");
         let ordinary = "adapter=claude until=needs_input";
         assert_eq!(super::sanitize(ordinary), ordinary, "a legitimate field is untouched");
+    }
+
+    /// Code review (exit UX audit 2026-08-07): the cap bounds bytes written
+    /// to the byte-bounded log (`AUDIT_LOG_MAX`), not chars — capping by
+    /// `.chars().take(512)` let 512 4-byte codepoints buy ~2 KiB, ~4x what
+    /// the comment on `AUDIT_FIELD_CAP` reasons in, making the
+    /// rotation-attack arithmetic that far optimistic. The test above uses
+    /// pure ASCII, where chars and bytes coincide and can't catch this.
+    #[test]
+    fn an_audit_field_caps_bytes_not_chars_and_never_splits_one() {
+        // U+1F600, 4 bytes in UTF-8: 512 / 4 = 128 whole emoji exactly fill
+        // the byte budget; capping by chars would have let all 1000 through
+        // at 4000 bytes.
+        let hostile = "😀".repeat(1000);
+        let out = super::sanitize(&hostile);
+        assert_eq!(out, "😀".repeat(128), "must cap bytes (512 / 4), not chars (1000)");
+        assert_eq!(out.len(), super::AUDIT_FIELD_CAP);
     }
     use super::*;
     use crate::agents;
@@ -8545,9 +8778,8 @@ mod tests {
     /// S4 (PR #46 code review): a double-click's own release is *staged*,
     /// not committed immediately — it's the one release a still-possible
     /// 3rd click can supersede within the same double-click window.
-    /// `due_copy` reports the staged text once the deadline passes,
-    /// provided nothing changed `self.selection` since — backdated here
-    /// rather than slept for, so the test costs nothing.
+    /// `due_copy` reports the staged text once the deadline passes —
+    /// backdated here rather than slept for, so the test costs nothing.
     #[test]
     fn release_native_selection_stages_a_double_click_and_due_copy_fires_it_later() {
         let (mut app, _) = mk_app(shell_ws());
@@ -8562,7 +8794,7 @@ mod tests {
         assert_eq!(app.due_copy(), None, "the window hasn't passed yet");
 
         app.pending_copy =
-            app.pending_copy.map(|(p, a, c, _)| (p, a, c, Instant::now() - Duration::from_millis(1)));
+            app.pending_copy.map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
         assert_eq!(app.due_copy().as_deref(), Some("world"));
         assert_eq!(app.due_copy(), None, "consumed exactly once");
     }
@@ -8571,6 +8803,14 @@ mod tests {
     /// entirely — the word is never copied, only the line the 3rd click
     /// selects instead. Before S4's fix, the word copied on the 2nd
     /// click's own release regardless, so a triple-click copied twice.
+    ///
+    /// [Amended, code review, exit UX audit 2026-08-07] Supersession used
+    /// to be detected at `due_copy` time, by comparing the live
+    /// `self.selection` against the staged coordinates. It's now the 3rd
+    /// click's own release that cancels the stage directly (every release
+    /// clears `pending_copy` unconditionally — see
+    /// `release_native_selection`), so this test now drives that release
+    /// for real instead of only mutating `self.selection` by hand.
     #[test]
     fn a_third_click_cancels_the_staged_double_click_copy() {
         let (mut app, _) = mk_app(shell_ws());
@@ -8580,13 +8820,72 @@ mod tests {
         assert_eq!(app.click_count(id, 0, 8), 2);
         app.select_word_at(id, 0, 8);
         assert_eq!(app.release_native_selection(), None, "the word's release stages, doesn't commit");
+        assert!(app.pending_copy.is_some());
 
         assert_eq!(app.click_count(id, 0, 8), 3, "the 3rd click");
         app.select_line_at(id, 0); // overwrites self.selection with the line
+        assert_eq!(
+            app.release_native_selection().as_deref(),
+            Some("hello world"),
+            "the 3rd click's own release commits the line immediately"
+        );
+        assert!(app.pending_copy.is_none(), "the word's stage was cancelled outright, not just outrun");
+        assert_eq!(app.due_copy(), None, "nothing left to fire, staged or otherwise");
+    }
+
+    /// F5 (exit UX audit 2026-08-07): a keypress clearing the highlight
+    /// (C29's "any click or keypress clears" rule) used to read exactly
+    /// like a supersession at `due_copy` time — `self.selection` no longer
+    /// matched the staged coordinates either way — so double-click, then
+    /// type anything within the window, and the clipboard silently didn't
+    /// update; no flash, no error, nothing. A keypress has nothing to do
+    /// with whether the word actually double-clicked should still be
+    /// copied, so it no longer touches the stage at all.
+    #[test]
+    fn an_unrelated_keypress_does_not_cancel_the_staged_double_click_copy() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["hello world".into()];
+        app.click_count(id, 0, 8);
+        app.click_count(id, 0, 8);
+        app.select_word_at(id, 0, 8);
+        app.release_native_selection();
+        assert!(app.pending_copy.is_some());
+
+        // Not a click: e.g. the pane forwarding a typed key, which clears
+        // the native-selection highlight per C29.
+        app.selection = None;
 
         app.pending_copy =
-            app.pending_copy.map(|(p, a, c, _)| (p, a, c, Instant::now() - Duration::from_millis(1)));
-        assert_eq!(app.due_copy(), None, "superseded by the 3rd click's own selection");
+            app.pending_copy.map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
+        assert_eq!(app.due_copy().as_deref(), Some("world"), "the copy still lands");
+    }
+
+    /// Code review (exit UX audit 2026-08-07): the staged copy is the
+    /// string grabbed at release time (`PendingCopy`), not a promise to
+    /// re-read the grid later. Before this, `due_copy` re-extracted the
+    /// text from the *live* grid at fire time — so double-click a word in a
+    /// streaming pane, let the grid scroll or the row get overwritten
+    /// before the 500ms window closes, and the clipboard would silently get
+    /// whatever now occupies those cells instead of the word actually
+    /// double-clicked.
+    #[test]
+    fn the_staged_copy_is_fixed_at_release_time_not_re_read_from_a_later_grid() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["hello world".into()];
+        app.click_count(id, 0, 8);
+        app.click_count(id, 0, 8);
+        app.select_word_at(id, 0, 8);
+        app.release_native_selection();
+
+        // The pane's content changes before the deadline — a streaming
+        // agent printing new output, or the view scrolling.
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["totally different text".into()];
+
+        app.pending_copy =
+            app.pending_copy.map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
+        assert_eq!(app.due_copy().as_deref(), Some("world"), "must copy what was actually double-clicked");
     }
 
     /// `on_click` drops a lingering native selection when the click lands on
@@ -8960,10 +9259,10 @@ mod tests {
     }
 
     /// P2-13 end-to-end: a not-installed adapter's picker row is annotated
-    /// (not hidden — five adapters is short enough that hiding four would
+    /// (not hidden — six adapters is short enough that hiding five would
     /// read as a picker that lost its list), and — the property that
     /// actually matters — launching that row still spawns the RAW id, never
-    /// the annotated display text. `picker_items()` is the static, always-5
+    /// the annotated display text. `picker_items()` is the static, always-6
     /// registry list (`agents::adapter_specs()`), so the substitution has to
     /// happen in `App::registry` (what `adapter_installed` actually
     /// consults), not in what rows get drawn.
@@ -8988,7 +9287,7 @@ mod tests {
         app.handle_mode_key(key('1')); // row 1 = index 0 = "pi" (picker_items() order)
         let spawned = app.find_spec(app.focused).map(|s| s.adapter.clone());
 
-        assert_eq!(rows[0], "pi gone", "pi's substituted launch program can never resolve");
+        assert_eq!(rows[0], "pi not found", "pi's substituted launch program can never resolve");
         // ShellAdapter resolves an absolute $SHELL (or /bin/bash fallback)
         // path directly, not via a $PATH scan — real, unmodified, and
         // guaranteed to exist on any machine this suite already assumes one
@@ -9367,19 +9666,36 @@ mod tests {
     }
 
     #[test]
-    fn alt_hint_gates_on_seen_time_and_terminal() {
-        // U4: keys arriving with no Alt among them fires it — on ANY
-        // terminal, since that IS the symptom (the old Apple_Terminal-only
-        // test left iTerm2, the README's recommendation, silent).
-        assert!(wants_alt_hint(false, true, Duration::from_secs(1)));
-        // One Alt key ever ends it, and it never fires before any key: an
-        // untouched roost has no evidence of anything.
-        assert!(!wants_alt_hint(true, true, Duration::from_secs(1)));
-        assert!(!wants_alt_hint(false, false, Duration::from_secs(1)));
-        // The startup window still bounds it, at the boundary and past it.
-        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW));
-        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW + Duration::from_secs(60)));
-        assert!(wants_alt_hint(false, true, ALT_HINT_WINDOW - Duration::from_millis(1)));
+    fn alt_hint_gates_on_evidence_within_the_window_since_it_arrived() {
+        // F1 (exit UX audit 2026-08-07): evidence, not "a key arrived".
+        //
+        // [Amended, design audit SG1] The window is back, but keyed to the
+        // evidence's own timestamp, not launch: is_alt_swallow_char's
+        // evidence is real but not unambiguous (every character is also a
+        // directly-typed letter on some non-US layout — see its own doc),
+        // so it must not latch for the whole session. Bounded to
+        // ALT_HINT_WINDOW since the *most recent* match instead.
+        assert!(wants_alt_hint(false, Some(Duration::from_secs(1))));
+        assert!(wants_alt_hint(false, Some(ALT_HINT_WINDOW - Duration::from_millis(1))));
+        assert!(!wants_alt_hint(false, Some(ALT_HINT_WINDOW)), "at the boundary, already expired");
+        assert!(!wants_alt_hint(false, Some(ALT_HINT_WINDOW + Duration::from_secs(60))), "long expired");
+        // One Alt key ever ends it, and it never fires with no evidence at
+        // all: an untouched roost — or one that's only seen ordinary keys —
+        // has nothing to warn about.
+        assert!(!wants_alt_hint(true, Some(Duration::from_secs(1))));
+        assert!(!wants_alt_hint(false, None));
+    }
+
+    #[test]
+    fn is_alt_swallow_char_matches_the_examples_the_audit_named() {
+        assert!(is_alt_swallow_char('˜')); // Option+n with Option-as-Meta off
+        assert!(is_alt_swallow_char('∑')); // Option+w
+        // Plain letters — what a healthy terminal sends when Alt DOES get
+        // through (roost sees the ALT modifier bit instead) and what an
+        // unrelated keystroke looks like either way — are not evidence.
+        for c in 'a'..='z' {
+            assert!(!is_alt_swallow_char(c), "{c:?} is not swallowed-Alt evidence");
+        }
     }
 
     /// C11/U4: the bar names the real setting for terminals we know, and
@@ -9403,18 +9719,77 @@ mod tests {
         }
     }
 
-    /// The trigger end-to-end on a real `App`: silent until a key arrives,
-    /// up while keys flow without Alt, gone for good once one carries Alt.
+    /// The trigger end-to-end on a real `App`: silent until a swallowed-Alt
+    /// key arrives, unmoved by an ordinary keystroke, gone for good once a
+    /// real Alt chord gets through.
     #[test]
-    fn the_alt_warning_appears_on_the_first_alt_less_key_and_dies_on_the_first_alt() {
+    fn the_alt_warning_appears_on_swallowed_alt_evidence_and_dies_on_the_first_real_alt() {
         let (mut app, _) = mk_app(shell_ws());
         assert!(!app.show_alt_hint(), "nothing typed yet — nothing to warn about");
-        app.note_key_seen();
+        app.note_key_seen(key('n')); // plain 'n' — Alt was never involved
+        assert!(!app.show_alt_hint(), "an ordinary key is not evidence");
+        app.note_key_seen(key('˜')); // Option+n, swallowed — this is evidence
         assert!(app.show_alt_hint());
         app.note_alt_seen();
         assert!(!app.show_alt_hint(), "Alt got through — the warning is wrong now");
-        app.note_key_seen();
+        app.note_key_seen(key('˜'));
         assert!(!app.show_alt_hint(), "and it stays gone for the session");
+    }
+
+    /// F1 hard requirement 1 (exit UX audit 2026-08-07): a correctly
+    /// configured terminal must never see the warning just because the user
+    /// typed something — typing a shell prompt is the single most likely
+    /// first action on a fresh launch.
+    #[test]
+    fn healthy_terminal_typing_a_shell_prompt_never_fires_the_alt_hint() {
+        let (mut app, _) = mk_app(shell_ws());
+        for c in "ls -la && git status\r".chars() {
+            app.note_key_seen(key(c));
+        }
+        assert!(!app.show_alt_hint(), "ordinary typing must never look like a swallowed Alt chord");
+    }
+
+    /// F1 hard requirement 2 (exit UX audit 2026-08-07): a read-first user
+    /// who studies the screen for 40s before ever touching Alt must still
+    /// get the warning the moment their first (swallowed) Alt press arrives
+    /// — the window (`ALT_HINT_WINDOW`, design audit SG1) is keyed to that
+    /// press's own timestamp, not to launch, so `started` plays no part in
+    /// this decision at all, however long it's been.
+    #[test]
+    fn read_first_user_still_gets_the_hint_however_late_the_first_alt_press_is() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.started -= Duration::from_secs(40);
+        assert!(!app.show_alt_hint(), "no evidence yet, however long it's been");
+        app.note_key_seen(key('˜')); // their first Alt press: Option+n, swallowed
+        assert!(app.show_alt_hint());
+    }
+
+    /// Design audit SG1's own repro: every `is_alt_swallow_char` character
+    /// is also a directly-typed letter on some non-US macOS layout (`ç` on
+    /// Portuguese/French/Turkish, among others) — a user typing their own
+    /// language must not get a bar that owns the hint row for the rest of
+    /// the session. It still fires (that's the acknowledged tradeoff,
+    /// `is_alt_swallow_char`'s own doc), but it must self-clear.
+    #[test]
+    fn a_non_us_layouts_own_letter_self_clears_instead_of_latching_for_the_session() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.note_key_seen(key('ç')); // e.g. Portuguese "ação", typed directly, no Alt involved
+        assert!(app.show_alt_hint(), "the char alone still reads as evidence — the known tradeoff");
+        app.alt_swallow_at = app.alt_swallow_at.map(|t| t - ALT_HINT_WINDOW);
+        assert!(!app.show_alt_hint(), "must self-clear, not own the row for the rest of the session");
+    }
+
+    /// The other half of SG1's fix: a still-broken Alt layer must keep being
+    /// reported, not just once. Each fresh match resets the window rather
+    /// than merely extending the first one's original deadline.
+    #[test]
+    fn fresh_evidence_re_arms_the_window() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.note_key_seen(key('˜'));
+        app.alt_swallow_at = app.alt_swallow_at.map(|t| t - ALT_HINT_WINDOW);
+        assert!(!app.show_alt_hint(), "sanity: the first match alone has expired");
+        app.note_key_seen(key('∑')); // tried Alt again — still broken
+        assert!(app.show_alt_hint(), "a fresh match re-arms the window");
     }
 
     #[test]
@@ -9722,6 +10097,23 @@ mod tests {
         assert_eq!(app.attention_ring(), vec![3], "the one real ◆ wins outright, no ○ mixed in");
     }
 
+    /// F2 (exit UX audit 2026-08-07): the hint bar's right segment must
+    /// match what `Alt+a` actually does in every case — nothing, a real ◆,
+    /// or the ○ fallback — not just when a ◆ exists.
+    #[test]
+    fn attention_segment_matches_the_ring_in_every_case() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert_eq!(app.attention_segment(), None, "a fresh shell pane pulls neither pass");
+
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_segment(), Some((1, false)), "○ fallback: real, but not a ◆");
+
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.attention_segment(), Some((1, true)), "a real ◆ takes over");
+    }
+
     /// Interaction (items 1 + 4): a quiet shell's `Waiting` reads `Idle`
     /// (P2-10) through `display_status`, so it must not pull the fallback
     /// ring — only a pane whose `Waiting` means something (a real agent)
@@ -9741,6 +10133,92 @@ mod tests {
         assert!(app.attention_ring().is_empty(), "an all-shell fleet has nothing to jump to");
         app.apply(Action::JumpAttention);
         assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
+    /// F3 (exit UX audit 2026-08-07): unlike a real ◆, which clears itself
+    /// the moment you act on it, a quiet `Waiting` pane's status never
+    /// changes just because you looked at it — so before this fix, three
+    /// finished agents made `Alt+a` an endless 1→2→3→1→2→3… round-robin and
+    /// "nothing else needs you" never fired at all (it only ever fired with
+    /// exactly one pane waiting). Each visit must permanently retire that
+    /// pane from the rotation, so the ring shrinks to empty exactly once
+    /// every pane has been seen.
+    #[test]
+    fn jump_attention_waiting_fallback_shrinks_as_each_pane_is_visited() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // panes 1, 2, 3 — all real agents below
+        for id in [1u64, 2, 3] {
+            app.find_spec_mut(id).unwrap().adapter = "pi".into();
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        }
+        assert_eq!(app.attention_ring(), vec![1, 2, 3]);
+
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.attention_ring(), vec![2, 3], "visiting 1 retires it");
+
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.attention_ring(), vec![3], "visiting 2 retires it too");
+
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 3);
+        assert!(app.attention_ring().is_empty(), "all three visited — the tier is finally empty");
+
+        // A fourth press must say so, not silently wrap back to pane 1.
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 3, "nothing to jump to — focus does not move");
+        assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
+    /// The finding named "visiting a waiting pane", not "Alt+a-ing to it" —
+    /// `set_focus` is the one funnel every focus move shares (P10), so a
+    /// plain spatial focus move must retire a pane exactly as a jump does.
+    #[test]
+    fn any_focus_move_not_just_alt_a_retires_a_visited_waiting_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_ring(), vec![1, 2]);
+
+        app.apply(Action::Focus(layout::Dir::Left)); // 2 -> 1, no Alt+a involved
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.attention_ring(), vec![2], "a plain focus move counts as a visit too");
+    }
+
+    /// The other half of the fix, and the one that makes it safe: a pane
+    /// that starts a genuinely new turn after being visited must not stay
+    /// silently excluded forever — the stale mark belongs to the finished
+    /// turn that was already seen, not the fresh one.
+    #[test]
+    fn a_revisited_pane_re_enters_the_fallback_after_a_fresh_finished_turn() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+
+        app.apply(Action::JumpAttention); // visits and retires pane 1
+        assert_eq!(app.focused, 1);
+        assert!(app.attention_ring().is_empty());
+
+        // Baseline tick: `last_status[1]` learns it's Waiting (first
+        // observation — no transition yet).
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        // A new turn starts — `diff_statuses` must see the pane leave
+        // Waiting and clear its stale visited mark right then, not later.
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Working);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        // ...and finishes again: this is a brand new ○, not the one already seen.
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_ring(), vec![1], "a fresh finished turn must not be swallowed");
     }
 
     // -- C27 fleet roster -----------------------------------------------------
@@ -10399,6 +10877,12 @@ mod tests {
 
     /// Below two tabs this is exactly the pre-existing dead end: `neighbor`
     /// finds nothing and C31 declines to fire at all.
+    ///
+    /// [Amended F7, exit UX audit 2026-08-07] The same key teleports across
+    /// tabs at a real edge, so a refusal here must be visible, not silent —
+    /// roost's own rule is every no-op flashes. Reuses `move_pane_to_tab`'s
+    /// identical "only one tab" wording (its `n < 2` refusal is the same
+    /// shape) so the two read as one rule instead of two.
     #[test]
     fn cross_tab_focus_is_a_no_op_with_only_one_tab() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10406,6 +10890,7 @@ mod tests {
         app.apply(Action::Focus(layout::Dir::Right));
         assert_eq!(app.ws.tabs.len(), 1);
         assert_eq!(app.focused, 2, "a lone tab's edge stays a dead end");
+        assert_eq!(app.flash(), Some("only one tab"), "the no-op must be visible");
     }
 
     /// Design decision: only `Left`/`Right` pick up tab-switching semantics.
@@ -10419,9 +10904,13 @@ mod tests {
         app.apply(Action::Focus(layout::Dir::Up));
         assert_eq!(app.ws.active_tab, tab_before, "Up must never switch tabs, even at an edge");
         assert_eq!(app.focused, pane_before);
+        // F7's flash is scoped to Left/Right's new cross-tab refusals only —
+        // Up/Down's dead end predates C31 and is out of this fix's scope.
+        assert_eq!(app.flash(), None);
         app.apply(Action::Focus(layout::Dir::Down));
         assert_eq!(app.ws.active_tab, tab_before, "…nor Down");
         assert_eq!(app.focused, pane_before);
+        assert_eq!(app.flash(), None);
     }
 
     /// [Fixed 2026-08-07, design audit] `neighbor == None` is not the same
@@ -10431,6 +10920,11 @@ mod tests {
     /// the audit's own repro, `Alt+n`, `Alt+o`, `Alt+n`, from a single
     /// pane. Neither key may leave the tab from it; a pane that genuinely
     /// owns the tab's edge, in that same layout, still does.
+    ///
+    /// [Amended F7, exit UX audit 2026-08-07] The refusal above must flash
+    /// — before this it was indistinguishable from Alt+→ simply not being
+    /// bound, on the one key that visibly does something everywhere else in
+    /// the same tab.
     #[test]
     fn cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10447,9 +10941,11 @@ mod tests {
         app.apply(Action::Focus(layout::Dir::Right));
         assert_eq!(app.ws.active_tab, tab_before, "full width but not the tab's only pane — not an edge");
         assert_eq!(app.focused, 1);
+        assert_eq!(app.flash(), Some("full-width pane — nothing to cross into"));
         app.apply(Action::Focus(layout::Dir::Left));
         assert_eq!(app.ws.active_tab, tab_before);
         assert_eq!(app.focused, 1);
+        assert_eq!(app.flash(), Some("full-width pane — nothing to cross into"));
 
         // Sanity: a pane that genuinely owns the edge, in this same mixed
         // layout, is unaffected by the fix above.
