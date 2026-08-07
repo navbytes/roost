@@ -159,56 +159,106 @@ protect.
    `MAX_CONN=64`, or one pane opening 64 connections starves the real
    orchestrator).
 
-   **✅ Shipped** (`src/infra/sock.rs`, closing audit M3 — and, with it, M3's
-   role as the enabler of M2's log-rotation flood: a throttled/refused
-   request never reaches `App::audit`, so it can't force a rotation). Two
-   caps, both keyed on the caller's raw wire token — sock.rs cannot resolve
-   a token to an `Actor` (that needs `App::resolve_actor`, core/app.rs, a
-   different file's lane); exact-string token identity is what
-   `resolve_actor` itself keys on, so this loses nothing, and it beats
+   **✅ Shipped** (`src/infra/sock.rs`, closing audit M3), **revised once**
+   after a second security-review pass caught six real gaps in the first cut
+   (findings H1–M3, L1 below) — the shape survived, the accounting placement
+   didn't. All caps are keyed on the caller's raw wire token — sock.rs cannot
+   resolve a token to an `Actor` (that needs `App::resolve_actor`,
+   core/app.rs, a different file's lane); exact-string token identity is
+   what `resolve_actor` itself keys on, so this loses nothing, and it beats
    peer credentials (`SO_PEERCRED`/`getpeereid`) for this job — in the
    same-uid threat model the uid never varies, and the pid is a fresh
    one-shot-CLI process every call, so a pid-keyed cap would never trip
-   against the actual flood shape (a shell loop re-execing `roost <verb>`):
-   - **Per-principal connection cap**, 8 (the audit's number) alongside the
-     unchanged global 64 — one token can never hold more than 8/64 of the
-     pool. The old global-cap check-then-increment (load-then-add, audit
-     Info (a)) is also now race-free (atomic `fetch_update`).
-   - **Command token bucket**, 32 capacity / 5 per second per principal —
-     comfortably covers the documented "spawn x10 then wait x10" burst
-     (§7) while making M2's ~200k-call flood take on the order of 11h from
-     one token. A 128-capacity / 20-per-second **aggregate** bucket backs
-     it up, and here it is **load-bearing, not belt-and-braces**: sock.rs
-     can't tell a valid-but-unfamiliar token from a minted-per-request
-     garbage one (that needs `Actor` resolution — see below), so a caller
-     that varies its token gets a *fresh* per-principal bucket every
-     single request and is not rate-limited by the per-principal bucket
-     **at all**. The aggregate bucket is the only thing bounding that
-     caller's throughput.
-   - The per-principal bucket map is itself bounded at 512 distinct tokens
-     (`MAX_TRACKED_TOKENS`), evicting the fullest entry (idle long enough to
-     have refilled — carries no enforcement state, so it's free to drop)
-     to make room for a new one. Without this, the same rotating-token
-     caller that dodges per-principal rate limiting would also grow this
-     map forever: a mitigation for a flood attack that opened a slower
-     memory-exhaustion path for the same attacker. The eviction order
-     guarantees an actively-throttled principal's drained bucket is never
-     the one dropped out from under it — see the `evict_one` doc comment
-     for why "prefer a full bucket, else the fullest" is one comparison,
-     not two.
+   against the actual flood shape (a shell loop re-execing `roost <verb>`).
 
-   Either cap's rejection is a distinct, actionable `err` reply —
-   `"connection limit: ..."` / `"rate limited: ..."` — never a silent drop
-   and never a hang (both were real bugs in this file; see `parse_control`),
-   and deliberately worded not to collide with `"unauthorized: ..."` or a
-   malformed-request error. Neither cap fully closes the *identity* problem:
-   a caller that mints a fresh garbage token per request still gets a fresh
-   per-principal bucket/connection slot each time, bounded only by the
-   aggregate bucket and the (unchanged) global connection cap — fully
-   closing that needs token validation before accounting, i.e. `Actor`
-   resolution, which is core/app.rs's lane, not sock.rs's. That gap is
-   accepted, not fixed; the aggregate bucket above is the load-bearing
-   mitigation for it, not defense-in-depth on top of something else.
+   **Connections — two pools, not one:**
+   - **Unattributed (pre-auth) pool, 16.** *(Finding H1.)* The first cut only
+     charged a connection once it sent a well-formed request — connect and
+     never send anything (or trickle one blank line every <30s to dodge
+     `READ_TIMEOUT`) held a full `MAX_CONN` slot for free, which was M3's
+     original starvation, completely untouched. Every connection now starts
+     here; this pool also covers every status/session-report connection
+     (never sends a `method` line), which is fine — those are normally
+     connect/write/close, sub-millisecond.
+   - **Per-principal pool, 20**, alongside the unchanged global 64 — a
+     connection is promoted here, out of the unattributed pool, the instant
+     it sends its first well-formed request. Must be at least `app.rs`'s
+     `MAX_WAITS` (16): each parked `wait` holds one connection open for its
+     deferred reply, so a lower cap would refuse a fleet-wide wait the rest
+     of the system already considers and bounds — an early version shipped
+     at 8 and would have refused the documented 16-wait fleet outright
+     (finding M3). 20 leaves headroom for a few other commands alongside a
+     fully-parked wait set.
+   - The old global-cap check-then-increment (load-then-add, audit Info (a))
+     is race-free (atomic `fetch_update`).
+
+   **Commands — a per-line aggregate charge, then a per-*admitted*-principal
+   bucket:**
+   - **Aggregate bucket, 256 capacity / 20 per second**, charged once per
+     *line read* — independent of whether it parses, and checked before any
+     per-principal accounting. This is what makes "never complete a
+     well-formed request" (H1) and "flood raw/garbage/status lines"
+     (finding M2 — status-socket traffic bypassed both caps in the first
+     cut) cost something, since neither reaches a per-principal bucket.
+     Checking it *first* also fixed finding H2: the first cut charged the
+     principal before the aggregate bucket, so a caller throttled by a
+     *shared*, attacker-drained resource also burned its *own* budget for a
+     request that was always going to be refused.
+   - **Per-principal bucket, 64 capacity / 5 per second**, charged only for
+     a well-formed request that already passed the aggregate check —
+     re-derived from a *real* 20-pane fleet (`spawn`×20 + `wait`×20 = 40
+     commands), not the 10-pane hello-world §7 illustrates for brevity; an
+     early version sized this from the smaller example and would have
+     throttled ~8 calls of a real fan-out with no retry anywhere in
+     `cli.rs` (finding M3) — worse than the bug it fixed.
+   - **This bucket is keyed on the connection's *admitted* identity — the
+     token its first request succeeded with — never a raw per-request
+     token** (finding H2). The first cut kept a bucket per `req.token`,
+     so a connection could vary the token field on every subsequent
+     request and mint an endless supply of fresh, full buckets, defeating
+     per-principal rate limiting entirely from inside one already-open
+     connection — cheaper to mount than the 64-connection attack it
+     replaced. An in-body token that never admitted a connection therefore
+     never becomes a bucket map key at all.
+   - The bucket map is bounded at 512 distinct identities (`MAX_TRACKED_TOKENS`),
+     evicting the fullest entry (idle long enough to have refilled — carries
+     no enforcement state, so it's free to drop) to make room for a new one;
+     an actively-throttled principal's drained bucket is never the one
+     dropped out from under it. Tokens over 128 bytes are rejected outright
+     in `parse_control` (finding M1): the first cut's eviction scan cloned
+     every key under the map's mutex on the hot path, so an attacker-chosen
+     64 KiB token made that scan tens of MiB of alloc+memcpy per request,
+     run *before* the aggregate check.
+   - A panic partway through a connection (including from a poisoned mutex —
+     the accounting mutexes now recover from poisoning rather than
+     propagate it) is handled by an RAII guard, so it can't leak a slot
+     forever (finding L1).
+
+   Any rejection is a distinct, actionable `err` reply — `"connection
+   limit: ..."` / `"rate limited: ..."` — never a silent drop and never a
+   hang (both were real bugs in this file; see `parse_control`), worded not
+   to collide with `"unauthorized: ..."` or a malformed-request error.
+
+   **Residual gap, unchanged by the revision:** sock.rs still can't validate
+   a token before accounting it (that needs `Actor` resolution, core/app.rs's
+   lane, not reached into here) — a caller that mints a fresh admitted
+   identity per *connection* (not merely per request, which the H2 fix now
+   closes) still gets a fresh per-principal pool of its own, bounded only by
+   the aggregate bucket and the unchanged global/unattributed connection
+   caps. The aggregate bucket is **load-bearing** for this, not
+   belt-and-braces.
+
+   **Audit finding H3 correction (the arithmetic, not the cap numbers):**
+   `app.rs`'s audit-log write is bounded by *bytes* attacker-controlled
+   fields contribute (`sanitize`, app.rs, does not truncate — **NEED**: fix
+   there, out of this file's lane), not by call count. With `MAX_LINE` (64
+   KiB) against a 4 MiB log kept at one generation, as few as ~140 *allowed*
+   requests roll it twice and erase everything — not the ~200k an earlier
+   version of this section assumed. At the aggregate bucket's 20/s that's
+   ~7s; at one principal's 5/s alone it's ~22s. The command buckets above
+   slow this flood from "as fast as the wire allows" to that; they do not
+   make the log-rotation attack impractical by themselves the way an
+   earlier draft of this section claimed.
 7. **Graceful at 0 instances; defined addressing at N.** Absent socket → clean
    no-op. (v1 scopes to one instance; multi-instance discovery is a non-goal.)
 8. **Preserve single-owner + daemonless.** Commands marshal through the mpsc onto
@@ -352,12 +402,15 @@ that makes control-mode the adversary's lowest-ranked option.
   correction). Cross-UID is the boundary that actually holds.
 - **Fork-bomb / recursion** in self-referential orchestration — leaf tokens +
   pane budget + depth counter.
-- **Command flood stalling the render loop** — ✅ closed: per-principal command
-  token bucket + per-principal connection cap (§5 constraint #6, `sock.rs`);
-  the bounded channel already prevented OOM regardless. Residual: sock.rs
-  can't validate a token, so a caller minting a fresh one per request isn't
-  capped per-identity, only by the aggregate bucket and the global
-  connection cap — see #6 above.
+- **Command flood stalling the render loop** — ✅ closed, including
+  status-socket traffic (an earlier version of this fix didn't — see #6
+  above, finding M2): a per-line aggregate charge, a per-*admitted*-principal
+  command bucket, and connection caps (§5 constraint #6, `sock.rs`); the
+  bounded channel already prevented OOM regardless. Residual: sock.rs can't
+  validate a token, so a caller minting a fresh *admitted connection* (not
+  merely a fresh per-request token — see #6's H2 note) still gets a fresh
+  per-principal pool, bounded only by the aggregate bucket and the global
+  connection caps — see #6 above.
 - **Secret exfiltration via reads** — owner-scoped, snapshot-only, consented.
 - **Destructive verbs bypassing the human busy-guard** — `force` semantics +
   default-deny self/last-pane close over the API.

@@ -24,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::core::control::{Reply, Request};
@@ -45,53 +45,94 @@ const MAX_LINE: u64 = 64 * 1024;
 /// reconnects rapidly can't spawn unbounded threads/FDs.
 const MAX_CONN: usize = 64;
 
-/// Per-principal share of `MAX_CONN` (DESIGN-control.md §5.6 / audit M3). The
-/// threat this closes: one pane (or the fleet token — same-uid-readable off
-/// `<state>/control.token`, see the design doc's §5.2 correction) opening
-/// enough connections/parked `wait`s to starve the human's CLI and any real
-/// orchestrator. 8 is the audit's own number: generous for one caller (a
-/// handful of concurrent `wait`s on a small fleet) while leaving most of the
-/// 64-connection pool for everyone else — a single flooding principal can
-/// never fill more than 8/64 of it by itself.
-const PRINCIPAL_MAX_CONN: usize = 8;
+/// Cap on connections that have *not yet* sent a well-formed control request
+/// (DESIGN-control.md §5.6 / audit M3, finding H1). The per-principal cap
+/// below only ever engages once a connection sends one — before this, connect
+/// and never send anything (or trickle one blank/garbage line every <30s to
+/// dodge `READ_TIMEOUT`) held a full `MAX_CONN` slot with zero accounting,
+/// which is M3's original starvation, completely untouched. This pool also
+/// covers every status/session-report connection (it never sends a `method`
+/// line, so it's "unattributed" for its whole life) — those are normally
+/// connect/write/close, sub-millisecond, so 16 is small enough to bound an
+/// attacker far below `MAX_CONN` while comfortably absorbing a legitimate
+/// status-report burst.
+const UNATTRIBUTED_MAX_CONN: usize = 16;
+
+/// Per-principal share of `MAX_CONN`, for connections that *have* sent a
+/// well-formed request (DESIGN-control.md §5.6 / audit M3). Must be at least
+/// `app.rs`'s `MAX_WAITS` (16, private to that file — a cross-file invariant
+/// kept in sync by hand; NEED: consider making it `pub(crate)`): each parked
+/// `wait` holds one connection open for its deferred reply, so a cap below
+/// MAX_WAITS refuses a fleet-wide wait the rest of the system already
+/// considers and bounds — a self-inflicted product regression, not a
+/// security property (audit M3, finding M3-in-M3: caught by review). 20
+/// leaves a few spare connections for other commands (list/spawn/send)
+/// alongside a fully-parked 16-wait fleet, while still bounding one
+/// principal under a third of the global pool.
+const PRINCIPAL_MAX_CONN: usize = 20;
 
 /// Token-bucket capacity for control *commands* (not connections) from one
-/// principal — see `Bucket`/`Limits::take_command`. DESIGN-control.md §7's
-/// hello-world fans out as `spawn` x N then `wait` x N; 32 comfortably covers
-/// the documented "spawn x10 then wait x10" burst (20) plus room for a few
-/// interleaved `list`/`status` calls, without being anywhere near the ~200k
-/// calls M2 needs to force two log rotations.
-const PRINCIPAL_BUCKET_CAPACITY: f64 = 32.0;
+/// principal — see `Bucket`/`Limits::take_principal`. A real fan-out is two
+/// commands per pane (`spawn` then `wait`); DESIGN-control.md §7 illustrates
+/// this with 10 panes for brevity, but a realistic fleet is closer to 20
+/// panes = 40 commands back-to-back (audit finding M3). 64 covers that with
+/// room for a dozen more interleaved `list`/`status`/`read` calls.
+const PRINCIPAL_BUCKET_CAPACITY: f64 = 64.0;
 
 /// Steady-state refill for one principal once its burst is spent. Real
 /// control actions (spawn/send/read/close) are issued one at a time by a
 /// human or an orchestrator reacting to a `wait` reply — `wait` exists
-/// precisely so a caller never has to poll in a tight loop. At 5/s, M2's
-/// ~200k-call flood takes on the order of 11 hours of sustained traffic from
-/// a single principal: a real deterrent, while an order of magnitude above
-/// any legitimate command cadence.
+/// precisely so a caller never has to poll in a tight loop, so 5/s is
+/// generous headroom above any legitimate cadence. This bucket is *not* by
+/// itself an effective deterrent against the audit-log-rotation flood (an
+/// earlier version of this comment claimed "~11h", which was wrong by ~3
+/// orders of magnitude) — see `GLOBAL_BUCKET_CAPACITY` and
+/// DESIGN-control.md §5.6 for the corrected (audit finding H3) arithmetic.
 const PRINCIPAL_REFILL_PER_SEC: f64 = 5.0;
 
-/// Aggregate backstop across *all* principals, keyed on nothing (one bucket).
-/// sock.rs cannot tell a valid-but-unfamiliar token from a garbage one (that
-/// needs `App::resolve_actor`, which lives in core/app.rs) — so a caller that
-/// varies the `token` field per request gets a fresh per-principal bucket
-/// every time and would otherwise dodge `PRINCIPAL_BUCKET_CAPACITY` entirely.
-/// This bucket bounds total command throughput regardless of how many
-/// identities a flood claims. 4x the per-principal numbers: generous enough
-/// for a few distinct legitimate principals (fleet + a couple of panes) to
-/// burst at once, still only ~2.8h to reach M2's 200k calls.
-const GLOBAL_BUCKET_CAPACITY: f64 = 128.0;
+/// Aggregate backstop across *all* principals *and* every line read
+/// (`Limits::take_global`) — not just successfully-dispatched control
+/// requests. Checked before any per-principal accounting (see the `Limits`
+/// doc comment for why order matters — audit finding H2). This is what makes
+/// "never complete a well-formed request" (H1) and "flood raw/garbage/status
+/// lines" (M2) cost something, since neither of those ever reaches a
+/// per-principal bucket. 256 (4x the per-principal capacity) covers one
+/// principal's full burst with headroom for a couple more concurrent
+/// principals bursting at once.
+///
+/// Audit finding H3 correction: `app.rs`'s audit-log write is bounded by
+/// *bytes* attacker-controlled fields contribute (`sanitize`, app.rs, does
+/// not truncate — NEED: fix there, out of this file's lane), not by call
+/// count. With `MAX_LINE` (64 KiB) against a 4 MiB log kept at one
+/// generation, as few as ~140 *allowed* requests roll it twice and erase
+/// everything — not the ~200k an earlier version of this file assumed. At
+/// this bucket's 20/s steady state that's ~7s; at one principal's 5/s alone
+/// it's ~22s. These buckets slow a flood from "as fast as the wire allows"
+/// to that — they do not make the log-rotation attack impractical by
+/// themselves; only truncating the audit line (app.rs) does.
+const GLOBAL_BUCKET_CAPACITY: f64 = 256.0;
 const GLOBAL_REFILL_PER_SEC: f64 = 20.0;
+
+/// Reject any control request whose token exceeds this, in `parse_control`,
+/// before it can reach per-principal bookkeeping (audit finding M1). Real
+/// tokens are 32 hex chars; 128 is generous headroom. Without this cap, a
+/// same-uid attacker could set an arbitrarily long (up to `MAX_LINE`, 64 KiB)
+/// token and make `evict_one`'s scan (bounded to `MAX_TRACKED_TOKENS`
+/// entries) clone up to 64 KiB *per entry scanned* — tens of MiB of
+/// alloc+memcpy, on the hot path, before the aggregate check even runs.
+/// Cheapest fix: refuse it at the source rather than pay for it later.
+const MAX_TOKEN_LEN: usize = 128;
 
 /// Cap on distinct tokens tracked in `Limits::buckets` at once (see
 /// `evict_one`). A same-uid attacker fully controls the wire `token` field,
 /// so nothing stops it minting a fresh one per request; without a bound the
-/// map — and with it, roost's memory — grows without limit. Real principal
-/// counts here are tiny (the fleet token plus however many panes exist,
-/// itself accidentally bounded by terminal size — MIN_SPLIT_COLS, per the
-/// audit); 512 is generous headroom above that, so eviction only ever
-/// engages under actual token-rotation abuse, never legitimate use.
+/// map — and with it, roost's memory — grows without limit. `MAX_TOKEN_LEN`
+/// bounds the cost *per* tracked entry; this bounds how many entries there
+/// can be. Real principal counts here are tiny (the fleet token plus however
+/// many panes exist, itself accidentally bounded by terminal size —
+/// MIN_SPLIT_COLS, per the audit); 512 is generous headroom above that, so
+/// eviction only ever engages under actual token-rotation abuse, never
+/// legitimate use.
 const MAX_TRACKED_TOKENS: usize = 512;
 
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
@@ -147,11 +188,12 @@ struct Msg {
 ///   `method` key): falls through to the one-way `parse_line` path, exactly
 ///   as before.
 /// - `Some(Err(_))` — it WAS addressed to the control plane (has `method`)
-///   but failed to deserialize into a `Request`. P0: the caller must reply
-///   with this rather than dropping the line — a client's read has no
-///   timeout of its own (`src/cli.rs`), so silently dropping a malformed
-///   request used to hang it forever, and 64 of them (`MAX_CONN`) wedged the
-///   whole control plane. The message is `serde_json`'s own: it already
+///   but failed to deserialize into a `Request`, or its token is longer than
+///   `MAX_TOKEN_LEN` (audit finding M1). P0: the caller must reply with this
+///   rather than dropping the line — a client's read has no timeout of its
+///   own (`src/cli.rs`), so silently dropping a malformed request used to
+///   hang it forever, and 64 of them (`MAX_CONN`) wedged the whole control
+///   plane. The deserialization message is `serde_json`'s own: it already
 ///   names the offending field/variant and carries nothing more internal.
 /// - `Some(Ok(_))` — parsed clean; dispatch as usual.
 fn parse_control(line: &str) -> Option<Result<Request, String>> {
@@ -159,7 +201,14 @@ fn parse_control(line: &str) -> Option<Result<Request, String>> {
     if v.get("method").is_none() {
         return None;
     }
-    Some(serde_json::from_value(v).map_err(|e| e.to_string()))
+    let req: Request = match serde_json::from_value(v) {
+        Ok(req) => req,
+        Err(e) => return Some(Err(e.to_string())),
+    };
+    if req.token.len() > MAX_TOKEN_LEN {
+        return Some(Err(format!("token too long (max {MAX_TOKEN_LEN} bytes)")));
+    }
+    Some(Ok(req))
 }
 
 /// Serialize `reply` and write it back down `reader`'s stream, newline-
@@ -240,41 +289,78 @@ impl Bucket {
     }
 }
 
+/// `lock().unwrap()` that survives a poisoned mutex (audit finding L1). These
+/// mutexes only ever guard plain counters/maps; a panic on *some other*
+/// thread leaving one "poisoned" is not a reason for *this* thread to also
+/// lose the ability to release its own slots — recovering the (still
+/// structurally valid) inner state and proceeding beats a cascading panic
+/// that leaks every connection behind it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Check-and-increment `counter` against `cap` in one atomic step — shared by
+/// `Limits::global` and `Limits::unattributed`. Was load-then-add (audit Info
+/// (a)): two threads could both observe `< cap` and both add, landing a few
+/// over. `fetch_update` makes the check and the increment one atomic step.
+fn try_reserve(counter: &AtomicUsize, cap: usize) -> bool {
+    counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c < cap).then_some(c + 1)).is_ok()
+}
+
 /// Connection and command accounting shared by the listener's accept loop
 /// and every per-connection thread it spawns (DESIGN-control.md §5.6).
 ///
-/// The per-principal cap is keyed on the caller's raw wire `token` string,
-/// not a resolved `Actor` — sock.rs has no access to `App::resolve_actor`
-/// (that's core/app.rs, a different owner) and doesn't need it:
-/// `resolve_actor` itself is exact-string-match against the fleet token or
-/// one pane token per pane, so distinct token strings already mean distinct
-/// principals. Peer credentials (`SO_PEERCRED`/`getpeereid`) were considered
-/// instead and rejected: in this same-uid threat model the uid is always the
-/// operator's own, and the pid is the *client* process on the other end of
-/// one connection — for the one-shot `roost <verb>` CLI that's a fresh pid
-/// every single invocation, so a `for i in (seq 200000); roost list; end`
-/// flood would never repeat a pid and a pid-keyed cap would never trip. The
-/// token is the one thing that *is* stable across exactly that loop (one
+/// Every cap here is keyed on the caller's raw wire `token` string, not a
+/// resolved `Actor` — sock.rs has no access to `App::resolve_actor` (that's
+/// core/app.rs, a different owner) and doesn't need it: `resolve_actor`
+/// itself is exact-string-match against the fleet token or one pane token
+/// per pane, so distinct token strings already mean distinct principals.
+/// Peer credentials (`SO_PEERCRED`/`getpeereid`) were considered instead and
+/// rejected: in this same-uid threat model the uid is always the operator's
+/// own, and the pid is the *client* process on the other end of one
+/// connection — for the one-shot `roost <verb>` CLI that's a fresh pid every
+/// single invocation, so a `for i in (seq 200000); roost list; end` flood
+/// would never repeat a pid and a pid-keyed cap would never trip. The token
+/// is the one thing that *is* stable across exactly that loop (one
 /// `ROOST_TOKEN` env var, inherited by every re-exec), so it is not merely
 /// "all we have" — it's the only stable handle on the actual attack shape.
+///
+/// Two invariants a first review round found missing, now load-bearing:
+/// - A connection only ever charges the identity it was *admitted* under,
+///   never a token that merely appears in a later request's body.
+///   `ConnGuard::principal` (see below) is set once, from the first
+///   well-formed request's token, and every later charge on that connection
+///   uses that same value — so varying the `token` field request-to-request
+///   on one already-open connection can't mint a fresh per-principal bucket
+///   (audit finding H2). An "unresolved" token — one that never admitted a
+///   connection — therefore never becomes a `buckets` key at all.
+/// - `take_global` is charged once per *line read*, independent of parsing
+///   outcome, and is always checked before any per-principal accounting: (a)
+///   a connection that never completes a well-formed request still costs
+///   something (finding H1), and (b) a caller rejected by this *shared*
+///   resource never also burns its *own* per-principal budget for a request
+///   that was always going to be refused (finding H2).
 struct Limits {
-    /// Race-free global connection count (replaces the old load-then-add —
-    /// audit Info (a)).
+    /// Race-free global connection count.
     global: AtomicUsize,
+    /// Connections that have not yet sent a well-formed control request
+    /// (audit finding H1) — released the instant one is admitted under a
+    /// real per-principal slot instead (see `ConnGuard`).
+    unattributed: AtomicUsize,
     /// Open connections per token, so one principal can't eat the whole
     /// `MAX_CONN` pool. Entries are removed at 0, so this can never hold
-    /// more entries than there are currently-open connections.
+    /// more entries than there are currently-open admitted connections.
     per_principal: Mutex<HashMap<String, usize>>,
-    /// Command-rate bucket per token. Unlike `per_principal`, entries persist
-    /// for the life of the listener — a flood-by-reconnect must not reset its
-    /// budget. Bounded at `MAX_TRACKED_TOKENS` (see `evict_one`): sock.rs
-    /// can't validate tokens, so leaving this unbounded would let the same
-    /// attacker this map exists to throttle instead exhaust memory by
-    /// minting a fresh token per request — a security fix that opens a
+    /// Command-rate bucket per *admitted* principal (see the struct doc
+    /// comment above). Entries persist for the life of the listener — a
+    /// flood-by-reconnect must not reset its budget. Bounded at
+    /// `MAX_TRACKED_TOKENS` (see `evict_one`): sock.rs can't validate
+    /// tokens, so leaving this unbounded would let the same attacker this
+    /// map exists to throttle instead exhaust memory by minting a fresh
+    /// admitted identity per connection — a security fix that opens a
     /// (smaller) security hole is not a deferral worth taking here.
     buckets: Mutex<HashMap<String, Bucket>>,
-    /// Aggregate command-rate backstop, independent of principal identity —
-    /// see the const doc comment above.
+    /// Aggregate command-rate backstop — see `GLOBAL_BUCKET_CAPACITY`.
     global_bucket: Mutex<Bucket>,
 }
 
@@ -282,31 +368,37 @@ impl Limits {
     fn new() -> Self {
         Limits {
             global: AtomicUsize::new(0),
+            unattributed: AtomicUsize::new(0),
             per_principal: Mutex::new(HashMap::new()),
             buckets: Mutex::new(HashMap::new()),
             global_bucket: Mutex::new(Bucket::new(GLOBAL_BUCKET_CAPACITY, GLOBAL_REFILL_PER_SEC)),
         }
     }
 
-    /// Atomically check-and-increment the global connection cap in one step.
-    /// Was load-then-add (audit Info (a)): two threads could both observe
-    /// `< MAX_CONN` and both add, landing a few over. `fetch_update` makes
-    /// the check and the increment one atomic step — no window between them.
     fn try_reserve_global(&self) -> bool {
-        self.global
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c < MAX_CONN).then_some(c + 1))
-            .is_ok()
+        try_reserve(&self.global, MAX_CONN)
     }
 
     fn release_global(&self) {
         self.global.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Called once, for the first control request seen on a connection: admit
-    /// it under `token`'s per-principal connection cap, or refuse. Every
-    /// `true` must be matched by exactly one later `release_principal` call.
+    /// Admit a connection into the small pre-auth pool (audit finding H1).
+    /// Every `true` must eventually be matched by exactly one
+    /// `release_unattributed` or (once promoted) `release_principal` call —
+    /// `ConnGuard` does this automatically, including on panic.
+    fn try_reserve_unattributed(&self) -> bool {
+        try_reserve(&self.unattributed, UNATTRIBUTED_MAX_CONN)
+    }
+
+    fn release_unattributed(&self) {
+        self.unattributed.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Called once, for the first well-formed request seen on a connection:
+    /// admit it under `token`'s per-principal connection cap, or refuse.
     fn try_reserve_principal(&self, token: &str) -> bool {
-        let mut map = self.per_principal.lock().unwrap();
+        let mut map = lock(&self.per_principal);
         let count = map.entry(token.to_string()).or_insert(0);
         if *count >= PRINCIPAL_MAX_CONN {
             false
@@ -317,7 +409,7 @@ impl Limits {
     }
 
     fn release_principal(&self, token: &str) {
-        let mut map = self.per_principal.lock().unwrap();
+        let mut map = lock(&self.per_principal);
         if let Some(count) = map.get_mut(token) {
             *count -= 1;
             if *count == 0 {
@@ -326,43 +418,78 @@ impl Limits {
         }
     }
 
-    /// One command from `token`: true if under both its own rate limit and
-    /// the aggregate backstop (and a token is consumed from each); false if
-    /// it should be throttled.
-    fn take_command(&self, token: &str) -> bool {
-        let principal_ok = {
-            let mut map = self.buckets.lock().unwrap();
-            if map.len() >= MAX_TRACKED_TOKENS && !map.contains_key(token) {
-                evict_one(&mut map);
-            }
-            map.entry(token.to_string())
-                .or_insert_with(|| Bucket::new(PRINCIPAL_BUCKET_CAPACITY, PRINCIPAL_REFILL_PER_SEC))
-                .take()
-        };
-        principal_ok && self.global_bucket.lock().unwrap().take()
+    /// The aggregate charge for one *line*, independent of parsing/dispatch
+    /// outcome and of any principal (audit findings H1/H2/M2). Must be
+    /// checked before any per-principal accounting — see the struct doc
+    /// comment.
+    fn take_global(&self) -> bool {
+        lock(&self.global_bucket).take()
+    }
+
+    /// One command already admitted past `take_global`, charged against
+    /// `principal` — the connection's *admitted* identity, not a raw
+    /// per-request token (audit finding H2; see the struct doc comment).
+    fn take_principal(&self, principal: &str) -> bool {
+        let mut map = lock(&self.buckets);
+        if map.len() >= MAX_TRACKED_TOKENS && !map.contains_key(principal) {
+            evict_one(&mut map);
+        }
+        map.entry(principal.to_string())
+            .or_insert_with(|| Bucket::new(PRINCIPAL_BUCKET_CAPACITY, PRINCIPAL_REFILL_PER_SEC))
+            .take()
     }
 }
 
 /// Free one slot in `map` for a new token, at `MAX_TRACKED_TOKENS`. Picks the
-/// entry with the most tokens *after* refilling it for elapsed idle time.
+/// entry with the most tokens *after* refilling it for elapsed idle time,
+/// cloning a key only when it becomes the new leader — not, as an earlier
+/// version did, unconditionally for every entry scanned (audit finding M1;
+/// `MAX_TOKEN_LEN` bounds what a clone costs, this bounds how often one
+/// happens).
 ///
-/// That single comparison covers both cases the policy cares about: a bucket
-/// idle long enough to have fully refilled (tokens == capacity) carries no
-/// enforcement state, so dropping it is free — and since every entry here
-/// shares the same capacity, "full" is simply the maximum possible token
-/// count, so it's always chosen first when one exists. If nothing is full
-/// (an active flood of single-use tokens, none idle yet), the same
-/// comparison falls back to "evict the fullest", exactly as it should. A
-/// principal still being actively throttled sits at the *low* end of this
-/// ordering, so it's the last one picked, not the first.
+/// The single "most tokens" comparison covers both cases the policy cares
+/// about: a bucket idle long enough to have fully refilled (tokens ==
+/// capacity) carries no enforcement state, so dropping it is free — and
+/// since every entry here shares the same capacity, "full" is simply the
+/// maximum possible token count, so it's always chosen first when one
+/// exists. If nothing is full (an active flood of single-use identities,
+/// none idle yet), the same comparison falls back to "evict the fullest",
+/// exactly as it should. A principal still being actively throttled sits at
+/// the *low* end of this ordering, so it's the last one picked, not the
+/// first.
 fn evict_one(map: &mut HashMap<String, Bucket>) {
-    let victim = map
-        .iter_mut()
-        .map(|(token, bucket)| (bucket.refill_and_peek(), token.clone()))
-        .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(_, token)| token);
-    if let Some(token) = victim {
+    let mut best: Option<(String, f64)> = None;
+    for (token, bucket) in map.iter_mut() {
+        let tokens = bucket.refill_and_peek();
+        if best.as_ref().map(|(_, best_tokens)| tokens > *best_tokens).unwrap_or(true) {
+            best = Some((token.clone(), tokens));
+        }
+    }
+    if let Some((token, _)) = best {
         map.remove(&token);
+    }
+}
+
+/// RAII: releases whatever connection-accounting slots this connection holds
+/// when dropped — including during a panic unwind (audit finding L1).
+/// Without this, a panic partway through the read loop (e.g. a
+/// poisoned-mutex `.unwrap()` after some *other* thread already panicked —
+/// see `lock` above) would skip the release-at-the-bottom calls entirely and
+/// leak the slot forever. `principal` starts `None` (the connection is
+/// charged to `unattributed`) and is set at most once, the moment it's
+/// admitted under a real principal.
+struct ConnGuard<'a> {
+    limits: &'a Limits,
+    principal: Option<String>,
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.limits.release_global();
+        match &self.principal {
+            Some(token) => self.limits.release_principal(token),
+            None => self.limits.release_unattributed(),
+        }
     }
 }
 
@@ -394,11 +521,14 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
 /// The accept loop, split out from `spawn_listener` so tests can drive it
 /// against a scratch `UnixListener` bound at a throwaway path instead of the
 /// real one (which is only reachable via the process-global `ROOST_STATE`/
-/// `XDG_RUNTIME_DIR` env vars — racy to poke from tests that run in
-/// parallel in the same process).
-fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
+/// `XDG_RUNTIME_DIR` env vars — racy to poke from tests that run in parallel
+/// in the same process). Returns the shared `Limits` so tests can also
+/// inspect accounting state directly instead of only through the wire.
+fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Limits> {
     let limits = Arc::new(Limits::new());
+    let accept_limits = limits.clone();
     std::thread::spawn(move || {
+        let limits = accept_limits;
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             // Shed load past the connection cap rather than spawning threads
@@ -414,14 +544,25 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
             let limits = limits.clone();
             let tx = tx.clone();
             std::thread::spawn(move || {
+                // Audit finding H1: every connection starts in the small
+                // pre-auth pool — never sending a well-formed request (or
+                // trickling a blank line every <30s to dodge
+                // `READ_TIMEOUT`) must not buy a full `MAX_CONN` slot for
+                // free, which is M3's original starvation.
+                if !limits.try_reserve_unattributed() {
+                    limits.release_global();
+                    log_debug("shed a connection: UNATTRIBUTED_MAX_CONN (16) already open");
+                    return;
+                }
+                // From here on, `guard` owns releasing every slot this
+                // connection holds — including on an early return or a
+                // panic unwind (audit finding L1).
+                let mut guard = ConnGuard { limits: &limits, principal: None };
+
                 // No connection may hold its slot forever (see `READ_TIMEOUT`).
                 let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
                 let mut reader = BufReader::new(stream);
                 let mut buf = Vec::new();
-                // The token this connection reserved a per-principal
-                // connection slot under (first control request only) —
-                // remembered so cleanup releases exactly what was reserved.
-                let mut principal: Option<String> = None;
                 loop {
                     buf.clear();
                     // Cap the bytes read per line so a newline-less flood can't
@@ -438,20 +579,52 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
                     }
                     let Ok(line) = std::str::from_utf8(&buf) else { continue };
                     let line = line.trim_end();
+
+                    let control = parse_control(line);
+
+                    // Audit findings H1/H2/M2: every line costs one token
+                    // from the aggregate bucket first, regardless of what
+                    // it parses to — a flood of blank/garbage/status lines
+                    // must not be free just because it's never dispatched
+                    // to App, and this check must happen before any
+                    // per-principal accounting (see the `Limits` doc
+                    // comment for why order matters).
+                    if !limits.take_global() {
+                        if control.is_some() {
+                            // Control-shaped: the caller expects exactly one
+                            // reply per line — never drop it silently.
+                            let msg = "rate limited: too many commands too fast; \
+                                       slow down and retry"
+                                .to_string();
+                            if !write_reply(&mut reader, &Reply::err(msg)) {
+                                break; // client hung up
+                            }
+                        } else {
+                            // Status/session report or garbage: no reply is
+                            // expected either way — drop this line's effects
+                            // and keep reading, same as a malformed one.
+                            log_dropped(line);
+                        }
+                        continue;
+                    }
+
                     // Control request (has a `method`): execute on the main loop
                     // and write the reply back down this connection. P0: a
                     // request that parsed as JSON-with-a-method but not into a
                     // `Request` still gets a reply (the error arm) instead of
                     // being dropped — see `parse_control`.
-                    match parse_control(line) {
+                    match control {
                         Some(Ok(req)) => {
-                            // First control request on this connection:
+                            // First well-formed request on this connection:
                             // charge it against `req.token`'s per-principal
-                            // connection cap. A connection that later sends a
-                            // *different* token isn't re-attributed — not a
-                            // pattern either the CLI or an orchestrator uses,
-                            // and not worth the bookkeeping (ponytail).
-                            if principal.is_none() {
+                            // connection cap and, if admitted, promote this
+                            // connection out of the pre-auth pool. A later
+                            // request on this same connection that claims a
+                            // *different* token is never re-attributed —
+                            // every charge below uses `guard.principal`, the
+                            // identity this connection was actually admitted
+                            // under (audit finding H2).
+                            if guard.principal.is_none() {
                                 if !limits.try_reserve_principal(&req.token) {
                                     let msg = format!(
                                         "connection limit: this token already has \
@@ -460,15 +633,17 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
                                     let _ = write_reply(&mut reader, &Reply::err(msg));
                                     break; // over cap: free the slot now
                                 }
-                                principal = Some(req.token.clone());
+                                guard.principal = Some(req.token.clone());
+                                limits.release_unattributed();
                             }
+                            let principal = guard.principal.clone().expect("just set above");
                             // Rate limit: a command this connection is
                             // otherwise allowed to make can still be
                             // throttled if it's coming too fast. Checked
                             // (and charged) before the request ever reaches
                             // the main loop / audit log — a throttled
                             // request must cost nothing there (M2).
-                            if !limits.take_command(&req.token) {
+                            if !limits.take_principal(&principal) {
                                 let msg = "rate limited: too many commands too fast; \
                                            slow down and retry"
                                     .to_string();
@@ -507,13 +682,13 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
                         None => log_dropped(line),
                     }
                 }
-                limits.release_global();
-                if let Some(token) = principal {
-                    limits.release_principal(&token);
-                }
+                // `guard` drops here (or during an unwind), releasing the
+                // global slot plus whichever of (principal, unattributed)
+                // this connection actually ended up holding — exactly once.
             });
         }
     });
+    limits
 }
 
 /// Append `line` to `<state>/roost.log` when ROOST_DEBUG is set. No-op
@@ -619,6 +794,23 @@ mod tests {
         assert!(parse_control(r#"{"pane":"1","event":"status","status":"working"}"#).is_none());
     }
 
+    /// Audit finding M1: an oversized token must be rejected as a malformed
+    /// request, before it can ever reach per-principal bookkeeping.
+    #[test]
+    fn parse_control_rejects_an_oversized_token() {
+        let long_token = "a".repeat(MAX_TOKEN_LEN + 1);
+        let line = format!(r#"{{"token":"{long_token}","method":"list"}}"#);
+        let err = parse_control(&line)
+            .expect("has a `method` key")
+            .expect_err("a token past MAX_TOKEN_LEN must be rejected");
+        assert!(err.contains("token"), "error should name the offending field: {err}");
+
+        // Right at the boundary is still fine.
+        let ok_token = "a".repeat(MAX_TOKEN_LEN);
+        let line = format!(r#"{{"token":"{ok_token}","method":"list"}}"#);
+        assert!(parse_control(&line).unwrap().is_ok(), "exactly MAX_TOKEN_LEN must still be accepted");
+    }
+
     #[test]
     fn global_connection_cap_reservation_is_race_free() {
         // Info (a): the old load-then-add could let two threads both pass
@@ -639,7 +831,42 @@ mod tests {
         assert_eq!(limits.global.load(Ordering::Relaxed), MAX_CONN, "counter must not exceed MAX_CONN");
     }
 
-    // --- §5.6 / M3: per-principal connection cap --------------------------
+    /// Audit finding L1: a panic between reserving and releasing (e.g. a
+    /// poisoned-mutex `.unwrap()` after some *other* thread already
+    /// panicked) must not leak the slot forever.
+    #[test]
+    fn a_panic_mid_connection_still_releases_its_slots() {
+        let limits = Arc::new(Limits::new());
+        assert!(limits.try_reserve_global());
+        assert!(limits.try_reserve_unattributed());
+
+        let l = limits.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = ConnGuard { limits: &l, principal: None };
+            panic!("simulated poisoned-mutex unwind mid-connection");
+        })
+        .join();
+
+        assert!(result.is_err(), "setup bug: the thread should have panicked");
+        assert_eq!(limits.global.load(Ordering::Relaxed), 0, "a panic must not leak the global slot");
+        assert_eq!(limits.unattributed.load(Ordering::Relaxed), 0, "a panic must not leak the unattributed slot");
+    }
+
+    /// Audit finding L1: `lock()` must recover a poisoned mutex rather than
+    /// propagate the poison into a second panic (which is worse than the
+    /// leak it would be guarding against).
+    #[test]
+    fn lock_survives_a_poisoned_mutex() {
+        let m = Mutex::new(5);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.lock().unwrap();
+            panic!("poison it");
+        }));
+        assert!(m.is_poisoned());
+        assert_eq!(*lock(&m), 5, "lock() must still recover the (structurally valid) inner value");
+    }
+
+    // --- §5.6 / M3: per-principal connection cap, unattributed cap --------
     //
     // These drive the real `spawn_accept_loop` over a scratch socket (never
     // the process-global `ROOST_STATE` path — racy across tests running in
@@ -720,6 +947,64 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// Audit finding H1: a connection that never sends a well-formed
+    /// control request is still bounded — by the small, shared
+    /// `UNATTRIBUTED_MAX_CONN` pool — rather than free to hold a `MAX_CONN`
+    /// slot forever. This is M3's *original* attack shape (connect, go
+    /// quiet) with nothing at all to attribute the connections to.
+    #[test]
+    fn never_completing_a_request_still_counts_against_a_small_shared_cap() {
+        let (path, listener) = scratch_listener("unattributed");
+        spawn_accept_loop(listener, fake_app());
+
+        // An already-admitted principal doesn't compete for the pre-auth
+        // pool at all — set that up first so we can prove it keeps working
+        // even while that pool is saturated below. (A *brand-new* caller
+        // racing against an already-full pre-auth pool is correctly
+        // rejected too — bounding the pool's size necessarily means a
+        // newcomer can be transiently turned away; that's the cost of the
+        // cap, not a bug. The invariant this test actually pins is that
+        // squatting there can't touch anyone already past it.)
+        let mut regular = connect(&path);
+        let reply = roundtrip(&mut regular, r#"{"token":"regular","method":"list"}"#);
+        assert!(reply.get("ok").is_some(), "setup: the regular caller's first request must succeed");
+
+        let mut silent = Vec::new();
+        for _ in 0..UNATTRIBUTED_MAX_CONN {
+            silent.push(connect(&path));
+        }
+
+        // One more must be shut down promptly — not accepted-and-parked
+        // (that would just be M3's starvation under a new name), not hung.
+        let mut over = connect(&path);
+        let mut discard = String::new();
+        let n = over.read_line(&mut discard).expect("must not hang — either EOF or a reply");
+        assert_eq!(n, 0, "an over-cap pre-auth connection must be closed, not left open: {discard:?}");
+
+        // The already-admitted principal is unaffected by the pre-auth pool
+        // being saturated by strangers.
+        let reply = roundtrip(&mut regular, r#"{"token":"regular","method":"list"}"#);
+        assert!(reply.get("ok").is_some(), "an already-admitted caller must be unaffected: {reply}");
+
+        // Freeing one pre-auth slot lets a brand-new caller in again — the
+        // cap is a transient bound, not a permanent lockout. Retry briefly:
+        // closing the popped connection's fd and the server noticing (EOF
+        // -> guard drop) are two independently OS-scheduled events.
+        silent.pop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let last = loop {
+            let mut newcomer = connect(&path);
+            let reply = roundtrip(&mut newcomer, r#"{"token":"newcomer","method":"list"}"#);
+            if reply.get("ok").is_some() || Instant::now() >= deadline {
+                break reply;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(last.get("ok").is_some(), "freeing a pre-auth slot must eventually let a new caller in: {last}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     // --- §5.6 / M3: token-bucket command rate limit ------------------------
 
     #[test]
@@ -754,24 +1039,118 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// Audit finding M3: re-derived from a *real* 20-pane fleet (not the
+    /// 10-pane hello-world DESIGN-control.md §7 uses for brevity) — spawn
+    /// x20 then wait x20, 40 commands fired back-to-back. Regressing this
+    /// (the burst getting throttled) would make the fix worse than the bug
+    /// it closes.
     #[test]
     fn a_legitimate_bursty_sequence_is_not_throttled() {
         let (path, listener) = scratch_listener("burst");
         spawn_accept_loop(listener, fake_app());
         let mut c = connect(&path);
 
-        // DESIGN-control.md §7's documented pattern: spawn x10 then wait x10,
-        // fired back-to-back exactly as a real fan-out/fan-in would.
-        // Regressing this (the burst getting throttled) would make the fix
-        // worse than the bug it closes.
-        for i in 0..10 {
+        for i in 0..20 {
             let reply = roundtrip(&mut c, r#"{"token":"orch","method":"spawn","adapter":"shell"}"#);
-            assert!(reply.get("ok").is_some(), "spawn #{i} of the burst was throttled: {reply}");
+            assert!(reply.get("ok").is_some(), "spawn #{i} of the 20-pane burst was throttled: {reply}");
         }
-        for i in 0..10 {
+        for i in 0..20 {
             let reply = roundtrip(&mut c, r#"{"token":"orch","method":"list"}"#);
-            assert!(reply.get("ok").is_some(), "op #{i} of the burst was throttled: {reply}");
+            assert!(reply.get("ok").is_some(), "op #{i} of the 20-pane burst was throttled: {reply}");
         }
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Audit finding H2: varying the `token` field per request on one
+    /// already-open connection must not mint an endless supply of fresh
+    /// per-principal buckets — only the identity the connection was
+    /// actually admitted under (its first request's token) is ever charged.
+    #[test]
+    fn rotating_the_bodys_token_does_not_mint_a_fresh_bucket_on_one_connection() {
+        let (path, listener) = scratch_listener("rotate");
+        let limits = spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        let total = PRINCIPAL_BUCKET_CAPACITY as usize + 20;
+        let mut throttled = 0;
+        for i in 0..total {
+            let token = if i == 0 { "admitted".to_string() } else { format!("rotated-{i}") };
+            let reply = roundtrip(&mut c, &format!(r#"{{"token":"{token}","method":"list"}}"#));
+            if reply.get("err").and_then(|v| v.as_str()).is_some() {
+                throttled += 1;
+            }
+        }
+        assert!(throttled > 0, "varying the token per request must still get throttled eventually");
+
+        // The only thing ever charged is the connection's real admission
+        // identity — none of the "rotated" in-body tokens minted their own.
+        let map = limits.buckets.lock().unwrap();
+        assert!(map.contains_key("admitted"), "the connection's admitted identity should have a bucket");
+        assert_eq!(
+            map.len(),
+            1,
+            "an in-body token that never admitted this connection must not get its own bucket: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Audit finding H2 (ordering): the aggregate gate is checked, and
+    /// charged, before any per-principal accounting — so a caller rejected
+    /// by the shared bucket never has its *own* budget touched at all, let
+    /// alone burned.
+    #[test]
+    fn a_caller_throttled_by_the_global_bucket_keeps_its_own_budget_untouched() {
+        let (path, listener) = scratch_listener("global-first");
+        let limits = spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        // Drain the aggregate bucket with blank lines, which never touch
+        // any principal's own bucket (they're never control-shaped).
+        for _ in 0..(GLOBAL_BUCKET_CAPACITY as usize + 10) {
+            c.get_mut().write_all(b"\n").unwrap();
+        }
+
+        // A brand-new token's very first-ever request is throttled...
+        let reply = roundtrip(&mut c, r#"{"token":"victim","method":"list"}"#);
+        let err = reply.get("err").and_then(|v| v.as_str()).expect("must be throttled by the drained global bucket");
+        assert!(err.contains("rate limited"), "{err}");
+
+        // ...and, critically, never even created a per-principal bucket
+        // entry — take_global rejected it before take_principal ever ran.
+        // The old order charged the principal first, so a victim starved by
+        // the global bucket burned its own budget too.
+        assert!(
+            !limits.buckets.lock().unwrap().contains_key("victim"),
+            "victim's own per-principal bucket was touched despite the shared gate rejecting it first"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Audit findings H1(a)/M2: a line that never parses as a control
+    /// request (blank, garbage, or a status/session report) still costs one
+    /// token from the shared aggregate bucket — status-socket traffic used
+    /// to bypass both caps entirely.
+    #[test]
+    fn blank_lines_drain_the_shared_global_budget_too() {
+        let (path, listener) = scratch_listener("global-line-charge");
+        spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        for _ in 0..(GLOBAL_BUCKET_CAPACITY as usize + 10) {
+            c.get_mut().write_all(b"\n").unwrap();
+        }
+
+        // A well-formed request from a token that never touched anything
+        // above is throttled at the *global* gate — proof the blank lines
+        // actually cost something, not just that this token's own bucket
+        // (which it never used) ran dry.
+        let reply = roundtrip(&mut c, r#"{"token":"never-used-elsewhere","method":"list"}"#);
+        let err = reply.get("err").and_then(|v| v.as_str()).expect("must be throttled");
+        assert!(err.contains("rate limited"), "must read as throttled: {err}");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -788,16 +1167,16 @@ mod tests {
         // instead of being throttled, handing the attacker a bypass (worse
         // than the memory leak this test is otherwise guarding against).
         for _ in 0..(PRINCIPAL_BUCKET_CAPACITY as usize) {
-            assert!(limits.take_command("active"));
+            assert!(limits.take_principal("active"));
         }
-        assert!(!limits.take_command("active"), "setup bug: active should be at its limit");
+        assert!(!limits.take_principal("active"), "setup bug: active should be at its limit");
 
-        // Rotate far more distinct, single-use tokens than MAX_TRACKED_TOKENS
-        // — exactly the "mint a fresh token per request" evasion. Each is
-        // used once then abandoned, so it carries no ongoing enforcement
-        // state (unlike "active", which keeps getting checked below).
+        // Rotate far more distinct, single-use identities than
+        // MAX_TRACKED_TOKENS — exactly the "mint a fresh admitted identity"
+        // evasion. Each is used once then abandoned, so it carries no
+        // ongoing enforcement state (unlike "active", checked below).
         for i in 0..(MAX_TRACKED_TOKENS * 3) {
-            limits.take_command(&format!("flood-{i}"));
+            limits.take_principal(&format!("flood-{i}"));
         }
 
         let map = limits.buckets.lock().unwrap();
