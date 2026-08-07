@@ -277,9 +277,16 @@ protect.
    into here). One well-formed request under *any* garbage token is
    sufficient to promote — nothing checks whether it resolves to a real
    principal — so an attacker can open up to `MAX_CONN` connections, each
-   with its own distinct, never-before-seen token, and each earns the full
-   30s `READ_TIMEOUT` the instant it's promoted; as each eventually closes
-   it can simply reconnect and repeat. This is a connection-*count*/
+   earning the full 30s `READ_TIMEOUT` the instant it's promoted; as each
+   eventually closes it can simply reconnect and repeat. There are **two**
+   promotion doors, and a closing fix must gate both: a control request
+   under any garbage token, and a well-formed *status* line, which needs no
+   token at all. The status door also sidesteps `PRINCIPAL_MAX_CONN`
+   entirely — a status-promoted connection never calls
+   `try_reserve_principal`, because a status-only connection is not a
+   principal — so it does not even require the distinct per-connection
+   tokens the control-request door does. Cost and outcome are identical
+   either way, so this is one gap with two entrances, not two gaps. This is a connection-*count*/
    connection-*duration* problem, not a command-rate one, so it is **not**
    "bounded by the global connection cap" the way an earlier draft of this
    section put it and the aggregate command bucket does not help either —
