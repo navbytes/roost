@@ -195,13 +195,19 @@ fn send_rejects_an_unknown_flag_instead_of_dropping_it() {
 /// message on stderr, nonzero exit — instead of ratatui/crossterm's raw
 /// panic ("failed to initialize terminal", the most orchestrator-hostile
 /// bug the QA pass found).
+///
+/// P3: exit code 2 specifically (a usage error, matching every other "you
+/// invoked it wrong" path and `USAGE`'s own "2 usage error"), not 1 (a
+/// runtime error) — which this used to return despite being exactly that
+/// class of failure. A bare `assert!(!o.status.success())` can't catch that
+/// drift: 1 is nonzero too.
 #[test]
 fn bare_invocation_off_tty_fails_cleanly_instead_of_panicking() {
     let o = Command::new(env!("CARGO_BIN_EXE_roost"))
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run bare roost");
-    assert!(!o.status.success(), "{o:?}");
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
     assert_ne!(o.status.code(), Some(101), "must not be a Rust panic exit code: {o:?}");
     assert!(out(&o).is_empty(), "stdout: {:?}", out(&o));
     assert!(!err(&o).to_lowercase().contains("panic"), "must not be a panic: {:?}", err(&o));

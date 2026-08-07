@@ -60,12 +60,23 @@ fn main() -> Result<()> {
     // no pty. Fail the same clean way every rejected `cli::maybe_run` path
     // does instead — message on stderr, nonzero exit — before touching the
     // terminal at all.
+    //
+    // Exit 2 (P3), not 1: cli.rs's USAGE documents 1 as a runtime error (an
+    // invocation that was fine but failed when actually attempted, e.g.
+    // "cannot reach a running roost") and 2 as a usage error (this
+    // invocation itself is wrong; retrying it unchanged won't help). A bare
+    // `roost` off a tty is the latter — the fix is calling it differently
+    // (`roost <verb> ...`, per the message below), exactly the class
+    // `cli::maybe_run`'s own hard errors (unrecognized verb, an unknown
+    // flag) already exit 2 for. That the specific *reason* here is
+    // environmental rather than a bad argument doesn't change which bucket
+    // a scripted caller needs to sort it into.
     if !std::io::stdout().is_terminal() {
         eprintln!(
             "roost: stdout is not a terminal; the multiplexer needs one to run.\n\
              For scripting, use `roost <verb> ...` — see `roost --help`."
         );
-        std::process::exit(1);
+        std::process::exit(2);
     }
 
     // One roost per state dir: two instances sharing a workspace.json race
