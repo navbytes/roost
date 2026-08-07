@@ -1534,6 +1534,47 @@ tab takes Alt+{digit} then Alt+arrows.
 - Unit tests: ring order across two tabs; wrap; focused-not-in-ring; empty
   ring flash; count == ring size.
 
+**[Amended 2026-08-07, ux P1-5 — the Waiting fallback]** "Nothing else is in
+the ring — not Exited, not Working: worst-first across roost's statuses means
+◆ is the only actionable severity, and the ring must match the advertised
+count" is withdrawn as an absolute: a ◆-only ring keeps `Alt+a`'s "one key
+jumps there" promise only for extension-instrumented panes, since without a
+hook `NeedsInput` is reachable solely via the BEL heuristic and a quiet
+turn-end lands on `Waiting` instead — which the ring used to ignore outright,
+leaving an uninstrumented agent's finished turn unreachable by the chord built
+to reach it.
+
+- **The ring now has two passes.** Pass one is unchanged (◆, the predicate
+  above, verbatim). **Only when pass one is empty** does a second pass run,
+  over every pane whose status is `Waiting` — same shape (tab order, that
+  tab's `pane_order()`, the float last). An instrumented fleet is untouched
+  by construction: the fallback is reachable only once the ◆ pass comes back
+  empty, so a real ◆ is never skipped for a ○, and the ring/count invariant
+  above still holds exactly whenever N > 0. It no longer holds when N = 0 and
+  the fallback ring is non-empty — deliberately: the hint bar's `◆ N needs
+  you` segment is already omitted at N = 0 (C9), so nothing visible asserts
+  the old equality in that case.
+- **The predicate is `display_status`, not the raw runtime status** (P2-10):
+  a plain shell reading heuristic `Waiting` is presented as `Idle` (it has no
+  turn to hand back), so it can never pull either ring pass. Only a pane
+  whose `Waiting` means something — a real agent — does. The roster (C27)
+  reads the identical two-pass ring for its opening cursor, so the two
+  surfaces cannot disagree about what a fleet with zero ◆s should jump to.
+- Unit tests added: fallback fires only with an empty ◆ pass; a real ◆
+  anywhere suppresses it outright; the fallback excludes a quiet shell (and
+  the scratch float, which is always a shell); the roster/ring agreement
+  test below covers the three-way interaction.
+- **Known gap, accepted rather than closed:** at N = 0 the hint bar's
+  `◆ N needs you · Alt+a` segment is omitted (C9), so the fallback this
+  amendment adds has *no* advertised surface — the one case it exists for
+  is the one where nothing on screen says `Alt+a` still does anything. This
+  is the same trade-off the original C9 amendment already made for `Alt+a`
+  generally (no Normal-mode hint pair at any N), just visible at a new edge:
+  a user who has never pressed `Alt+a` while N > 0 has no way to discover
+  the fallback exists. Left alone rather than inventing a new hint-bar
+  surface in an audit-response pass; a Normal-mode pair (dropping the
+  N > 0-only rule) is the fix if this needs to be discoverable cold.
+
 ### C20 — Activity feed (Alt+e) — [Added 2026-07-22, fleet features]
 
 **Current:** no surface. The data exists but scattered: control actions are
@@ -2099,10 +2140,46 @@ you.**
   copy: the two overlays answer the fleet's two questions and must not
   resize under a user toggling between them, and the 80×24 floor is then
   proven once for both.
-- **Content:** every pane in the workspace, **grouped by tab**, tabs in
-  order, panes in that tab's `pane_order()`, the float (C22) last under its
-  own group — i.e. exactly C19's ring enumeration, so the roster and `Alt+a`
-  can never disagree about what order the fleet is in.
+- **Content:** every pane in the workspace, **grouped by tab**, the float
+  (C22) last under its own group.
+  - **[Amended 2026-08-07, ux P2-11 — worst-first, not tab order]** "Tabs in
+    order, panes in that tab's `pane_order()`" is withdrawn as the sort key:
+    past one screenful — the fleet case the roster exists for — tab order
+    means scrolling past every quiet pane in every earlier tab to find the
+    one ◆ parked in a later one, which is the exact hunt `Alt+Shift+a` was
+    built to end. Both tiers now sort **worst-first**
+    (`roster_rank`: ◆→○→●→·(incl. "not started")→exited, C5's own severity
+    order): panes within a tab's group, and the groups themselves by their
+    own worst pane — so the tab holding the fleet's one ◆ is the *first*
+    group, and that pane its *first* row. Both sorts are Rust's stable sort,
+    so panes/groups tied on rank keep C19's ring order (tab index, that tab's
+    `pane_order()`) — the roster and `Alt+a` still agree on *tie* order,
+    just no longer on row order once severities mix; an all-quiet or
+    all-needy fleet (every existing fixture) reads exactly as before. The
+    rank read is `App::display_status`, not the raw runtime status — C27's
+    own "not started" rung (`None`) ranks with `Idle`, and P2-10's shell
+    downgrade (below) applies here too, so a quiet shell never out-ranks a
+    resting agent's ○. The float's own group is **not** reordered by
+    severity, matching C19's ring, which also pins it last regardless of
+    urgency — one placement rule for both surfaces.
+  - **[Amended 2026-08-07, ux P2-11 — status filter]** `Tab` cycles a status
+    filter forward through six stops (every tier, then ◆, ○, ●, ·, exited —
+    `roster_rank`'s own order, so the filter and the sort agree on what
+    "worse" means); `Shift+Tab` steps back; both wrap. It composes with the
+    type-ahead **by AND** — a row must satisfy both, the ordinary multi-facet-
+    search reading and the simplest rule that doesn't special-case either
+    filter. A group whose panes all fail *either* filter drops its header
+    too, same as type-ahead-only always did. The active tier tags the frame
+    title with its own C5 glyph **and color** (`fleet — ◆ only`, or
+    `fleet — ◆ clau▏` with a query too — the `◆` alone carries `accent()`,
+    the rest of the title stays `ink()` [design-supervisor D4: a bare `ink()`
+    glyph reads as no tier at all, which defeats the tag]) — the type-ahead's
+    own "a narrowed list always says why" idiom, extended to the second
+    filter rather than given a competing one.
+    `Tab`/`Shift+Tab` are not `Char`, so neither collides with type-ahead
+    text (U20's rule: a list you filter by typing cannot reserve letters) —
+    they are the two keys that were left over once every printable was
+    spoken for.
   - **The float is listed whether or not it is shown.** [Amended
     2026-07-28, supervisor SG-1] Hidden is a display state, not an absence,
     and C19's ring carries a hidden float that needs you — so a roster that
@@ -2146,6 +2223,9 @@ you.**
     `no pane matches` line in `quiet()` at the inner area's middle row —
     C20's empty-feed shape verbatim, for the same reason: a modal that
     explains its own emptiness beats one that just goes blank.
+    **[Amended 2026-08-07, ux P2-11]** No longer the *only* way: the status
+    filter can empty it too (a tier nothing is in). Same row, same reason —
+    the emptiness has one shape regardless of which filter caused it.
   - **Two marks, two meanings.** The row's leading column is the *cursor*
     (`❯`, `accent()` — the C14/C20 idiom), and C8's own `▎` still marks the
     *focused* pane inside the row. "What will Enter act on" and "where am I
@@ -2169,7 +2249,8 @@ you.**
   rather than wrapping; `PgUp`/`PgDn` page by half the overlay's height (C20's
   `feed_page` rule, one source for both keys); `Enter` jumps; `Esc` dismisses;
   `Alt+Shift+a` toggles closed (U18: a mode's entry chord exits it, derived
-  through `translate` like every other mode's).
+  through `translate` like every other mode's). **[Amended 2026-08-07, ux
+  P2-11]** `Tab`/`Shift+Tab` cycle the status filter — see below.
 - **Type-ahead filters the list**, U20's picker idiom: every printable
   character narrows it by ASCII-case-insensitive substring over **id, display
   name and adapter** (the three things a row shows — the id because it is the
@@ -2178,7 +2259,9 @@ you.**
   it is narrow. A group whose panes all filter out loses its header too — an
   empty group is a row that says nothing. `Enter` acts on the filtered
   selection, and the cursor follows the filter when the pane under it is
-  narrowed away.
+  narrowed away. **[Amended 2026-08-07, ux P2-11]** Composes by AND with the
+  status filter — full rule and the title-tag behavior are with the sort
+  amendment above, so the two P2-11 changes are described in one place.
   - **Deviation from the brief, recorded:** the brief asked for `j`/`k` as
     motions *and* type-ahead, and asked for `q` to dismiss. Those cannot both
     hold — U20 settled this exact conflict for the picker: *"a list you filter
@@ -2187,6 +2270,12 @@ you.**
     `k` and `q` are filter text like every other letter, and `Esc` (plus the
     entry chord) is the way out. The hint bar advertises exactly that set, so
     nothing advertised is lost.
+    **[Amended 2026-08-07, ux P2-11, design-supervisor D3]** The set gains
+    `Tab`/`Shift+Tab`, the status filter's cycle (above) — not `Char`, so
+    they cost the type-ahead nothing (same reasoning U16/U20/U25/P21 each
+    recorded when their own mode grew a key: an unadvertised key is an
+    absent one). The hint bar's `Tab status` pair and the C15 overlay's
+    `FLEET` row both say so; nothing here is silent.
 - **Jump goes through `focus_attention_target`** — the helper C19's ring and
   C20's `Enter` already share — so tab-switching (`go_to_tab` semantics, lazy
   spawn, C21's zoom rule), collapsed-stack expansion and float-reveal all come
@@ -2220,8 +2309,9 @@ you.**
   anybody meant to type.
 - **Chrome:** mode word `ROSTER` (C9's list); hint pairs
   `↑↓ select` · `PgUp/Dn page` · `↵ go to pane` · `type filter` · `Esc close`
-  (**68 columns**, inside the 100-col floor beside the right segment). The
-  C15 overlay teaches the chord on C19's own row, merged:
+  (**68 columns**, inside the 100-col floor beside the right segment).
+  **[Amended 2026-08-07, ux P2-11]** `Tab status` joins the list (**81
+  columns**, still inside the floor). The C15 overlay teaches the chord on C19's own row, merged:
   `Alt+a / Alt+Shift+a` → `jump to next pane that needs you / list every
   pane` — the merge idiom the ≤20-row cap has always demanded, and here also
   the honest presentation of a deliberate pair.
@@ -2263,6 +2353,18 @@ both marks, live query). Plus the PTY e2e `tests/roster_overlay.rs`: the
 roster lists a **non-active** tab's panes and jumps across to one, with
 `roost list` as ground truth — that cross-tab case is the whole point of the
 feature, so it gets a real terminal.
+
+**[Amended 2026-08-07, ux P2-11]** Added: worst-first reorders both panes
+within a group and groups by their own worst pane, an all-tied fleet keeping
+the old tab-order reading · `Tab`/`Shift+Tab` cycle the status filter through
+all six stops and wrap · the status filter composes with type-ahead by AND,
+including the group-drops-whole case with either filter as the cause · the
+title tags the active tier with its own glyph. Plus the three-way interaction
+with C19's P1-5 fallback and P2-10's shell downgrade
+(`roster_and_ring_agree_on_a_mixed_instrumented_and_shell_fleet`): a fleet
+mixing an instrumented ◆, an uninstrumented agent resting on a heuristic ○,
+and plain shells — the roster sorts the ○ ahead of every shell, and the ring
+opens the cursor on the real ◆, never the resting agent or a shell.
 
 ### C28 — Move a pane between tabs (Alt+Shift+i / Alt+Shift+m) — [Added 2026-07-28]
 
@@ -2933,7 +3035,7 @@ shows only the C9-curated subsets.
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
 | 9 | `Alt+f` | **floating scratch shell (toggle)** | C22 |
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
-| 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one** | C27 |
+| 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one. `Tab`/`Shift+Tab` inside it cycle a status filter** | C27 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
 | 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |

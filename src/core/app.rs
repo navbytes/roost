@@ -102,7 +102,12 @@ pub enum Mode {
     /// under it changed. `filter` is the type-ahead query (empty = every
     /// pane); `top` is the first visible row of the scrolled window, the one
     /// piece of view state the renderer and the mouse hit-test share.
-    Roster { cursor: PaneId, filter: String, top: usize },
+    ///
+    /// [Amended, ux P2-11] `status_filter` narrows the list to one severity
+    /// tier (`None` = every tier), cycled with `Tab`/`Shift+Tab` — the two
+    /// non-`Char` keys the type-ahead (every printable, C27's own rule)
+    /// cannot claim. Composes with `filter` by AND: a row must satisfy both.
+    Roster { cursor: PaneId, filter: String, top: usize, status_filter: Option<AgentStatus> },
     /// P21: the incremental scrollback-search prompt, opened with `/` from
     /// Scroll or Copy mode. The search itself lives on `App::search` (it
     /// outlives the prompt — `n`/`N` keep working after Enter); this only
@@ -1040,9 +1045,21 @@ impl<B: PaneBackend> App<B> {
     /// observation of a pane is silently baselined (`spawn_pane` owns
     /// birth); a transition landing on `Exited` is suppressed (`on_pty_exit`
     /// owns that line) — one source per transition, no double-reporting.
+    ///
+    /// [Amended, ux P2-10, design-supervisor D5] Reads `display_status`, not
+    /// the raw runtime status — same reasoning as D1's `tab_summary` fix:
+    /// the feed is chrome the user reads at a glance, and every other
+    /// surface (badge, roster, collapsed rows, tab bar) already reads a
+    /// quiet shell's `Waiting` as `Idle`. Left alone, the feed was logging
+    /// `1 shell: working → your turn` on every command any shell pane ran —
+    /// "your turn" false in exactly the case P2-10 named — while the rest
+    /// of the chrome, in the same frame, said `idle`.
     fn diff_statuses(&mut self) {
-        let current: Vec<(PaneId, AgentStatus)> =
-            self.runtimes.iter().map(|(id, rt)| (*id, rt.status())).collect();
+        let ids: Vec<PaneId> = self.runtimes.keys().copied().collect();
+        let current: Vec<(PaneId, AgentStatus)> = ids
+            .into_iter()
+            .map(|id| (id, self.display_status(id).unwrap_or(AgentStatus::Exited)))
+            .collect();
         for (id, status) in current {
             let prev = self.last_status.insert(id, status);
             match prev {
@@ -1230,22 +1247,27 @@ impl<B: PaneBackend> App<B> {
     /// ranking is unchanged (U13's order, verbatim), which is why the count
     /// rides along here rather than in a second function that could disagree
     /// with it about which state won.
+    ///
+    /// [Amended, ux P2-10, design-supervisor D1] Reads `display_status`, not
+    /// the raw runtime status: the badge and the roster already did, so a
+    /// one-shell workspace used to draw `○` on the tab bar and `·` on the
+    /// badge in the *same frame* — C5 is one table for every chrome surface
+    /// that shows status, tab bar included, and this was the exact
+    /// same-frame disagreement C27's own D1 amendment treats as the defect
+    /// that forced a single source. `None` (not spawned) still buckets as
+    /// `unknown`, `Some(Exited)` still as `exited` — `display_status` only
+    /// ever touches the `Waiting` rung, so both map onto today's rungs 1:1.
     pub fn tab_summary(&self, tab_index: usize) -> (TabSummary, usize) {
         let Some(tab) = self.ws.tabs.get(tab_index) else { return (TabSummary::Quiet, 0) };
         let (mut unknown, mut needs, mut working, mut waiting, mut exited) = (0, 0, 0, 0, 0);
         for id in tab.panes.keys() {
-            match self.runtimes.get(id) {
-                Some(rt) => match rt.status() {
-                    AgentStatus::NeedsInput => needs += 1,
-                    AgentStatus::Working => working += 1,
-                    AgentStatus::Waiting => waiting += 1,
-                    AgentStatus::Exited => exited += 1, // U13
-                    AgentStatus::Idle => {}
-                },
-                // No runtime and not a known spawn-failure ⇒ not spawned yet.
-                None if !self.dead.contains_key(id) => unknown += 1,
-                // A recorded spawn failure is a dead pane too (U13).
-                None => exited += 1,
+            match self.display_status(*id) {
+                Some(AgentStatus::NeedsInput) => needs += 1,
+                Some(AgentStatus::Working) => working += 1,
+                Some(AgentStatus::Waiting) => waiting += 1,
+                Some(AgentStatus::Exited) => exited += 1, // U13
+                Some(AgentStatus::Idle) => {}
+                None => unknown += 1, // not spawned yet
             }
         }
         if needs > 0 {
@@ -1377,6 +1399,31 @@ impl<B: PaneBackend> App<B> {
             return Some(AgentStatus::Exited);
         }
         None // a background pane not spawned yet (lazy)
+    }
+
+    /// [ux P2-10] `row_status`'s raw answer, with one presentation-layer
+    /// adjustment: a plain `shell` pane has no turn to hand back (`is_shell`'s
+    /// own words — "the one roost ships that has no turns to be mid-way
+    /// through"), so a heuristic `Waiting` reads as `Idle` here. Left as
+    /// `Waiting`, every shell sitting untouched at its prompt for more than
+    /// `ACTIVE_WINDOW` reads `○` "your turn" forever — wrong for a pane
+    /// nobody asked anything of, and it buries a real agent's ○ in a fleet of
+    /// quiet shells. Every other status, and every non-shell pane, passes
+    /// through unchanged.
+    ///
+    /// This is the one place that downgrade happens; the corner badge,
+    /// collapsed rows, the roster (C27) and the C19 ring all resolve a
+    /// pane's status through here rather than `row_status` directly, so the
+    /// three can't drift from each other. The control plane deliberately
+    /// does *not* route through here — `row_status`/`status_str`/
+    /// `wait --until` keep answering with the raw signal, because a script's
+    /// status contract must not shift out from under it over a chrome-only
+    /// judgment call.
+    pub fn display_status(&self, id: PaneId) -> Option<AgentStatus> {
+        match self.row_status(id) {
+            Some(AgentStatus::Waiting) if self.is_shell(id) => Some(AgentStatus::Idle),
+            other => other,
+        }
     }
 
     fn status_str(&self, id: PaneId) -> &'static str {
@@ -3624,17 +3671,40 @@ impl<B: PaneBackend> App<B> {
     /// ascending, position within that tab's `pane_order()`); the float
     /// (C22), if needy, is last — `needs_input_count` counts `runtimes`
     /// directly (float included), so it must be too.
+    ///
+    /// [Amended, ux P1-5] `Alt+a` promises "one key jumps there", but a ◆-only
+    /// ring keeps that promise only for extension-instrumented panes: without
+    /// a hook, `NeedsInput` is reachable solely via the BEL heuristic, so a
+    /// quiet turn-end lands on `Waiting` — which this ring used to ignore
+    /// outright. When the ◆ pass comes back **empty** (nothing anywhere needs
+    /// input), the ring falls through to every pane reading `Waiting` instead
+    /// — same tab/pane_order/float shape, so nothing else about a jump
+    /// changes. An instrumented fleet is untouched by construction: the
+    /// fallback only runs once the ◆ pass is empty, so a real ◆ is never
+    /// skipped in favor of a ○. The predicate is `display_status`, not the
+    /// raw runtime status, so a plain shell sitting at its prompt (P2-10: it
+    /// has no turn to hand back) can never pull the ring — only a pane whose
+    /// `Waiting` actually means something does.
     fn attention_ring(&self) -> Vec<PaneId> {
+        let needy = self.status_ring(AgentStatus::NeedsInput);
+        if !needy.is_empty() {
+            return needy;
+        }
+        self.status_ring(AgentStatus::Waiting)
+    }
+
+    /// Every pane — tab order, then that tab's `pane_order()`, the float
+    /// (C22) last — whose `display_status` is exactly `status`. The shared
+    /// shape behind `attention_ring`'s two passes (◆, then the ○ fallback).
+    fn status_ring(&self, status: AgentStatus) -> Vec<PaneId> {
         let mut ring = Vec::new();
         for tab in &self.ws.tabs {
             let mut order = Vec::new();
             layout::pane_order(&tab.layout, &mut order);
-            ring.extend(order.into_iter().filter(|id| {
-                self.runtimes.get(id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false)
-            }));
+            ring.extend(order.into_iter().filter(|&id| self.display_status(id) == Some(status)));
         }
         if let Some(f) = &self.float {
-            if self.runtimes.get(&f.id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false) {
+            if self.display_status(f.id) == Some(status) {
                 ring.push(f.id);
             }
         }
@@ -3771,43 +3841,75 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         let cursor = self.attention_next().unwrap_or(self.focused);
-        self.mode = Mode::Roster { cursor, filter: String::new(), top: 0 };
+        self.mode = Mode::Roster { cursor, filter: String::new(), top: 0, status_filter: None };
         self.roster_reveal();
     }
 
     /// C27: every row the roster shows right now — each tab's header
-    /// followed by that tab's panes in `pane_order()`, tabs in order, the
-    /// float last. Exactly C19's ring enumeration, so the roster and `Alt+a`
-    /// can never disagree about what order the fleet is in — which is also
-    /// why the float is listed whether or not it is *shown*: C19's ring
-    /// carries a hidden float that needs you, so a roster that hid it could
-    /// open with its cursor on a row that isn't there (no `❯` drawn
-    /// anywhere, Enter acting on something invisible). Hidden is a display
-    /// state, not an absence; Enter on the row shows it, exactly as a ring
-    /// jump does.
+    /// followed by that tab's panes, the float last. The float's group is
+    /// never reordered (C19's ring puts it last regardless of urgency too —
+    /// C22's own placement, unchanged); the float is listed whether or not it
+    /// is *shown*, because C19's ring carries a hidden float that needs you,
+    /// so a roster that hid it could open with its cursor on a row that isn't
+    /// there (no `❯` drawn anywhere, Enter acting on something invisible).
+    /// Hidden is a display state, not an absence; Enter on the row shows it,
+    /// exactly as a ring jump does.
     ///
-    /// The type-ahead filter applies to panes only; a group whose panes all
-    /// filter out drops its header too (an empty group is a row that says
+    /// [Amended, ux P2-11] Tab order is no longer the sort key. Both tiers
+    /// sort worst-first (`roster_rank`, C5's severity order: ◆→○→●→·→exited):
+    /// panes within a tab's group, and then the groups themselves by their
+    /// own worst pane — so the tab holding the one ◆ in a twenty-pane fleet
+    /// is the *first* group, and that pane is its *first* row, not something
+    /// you scroll a screenful to find. Both sorts are stable, so panes/tabs
+    /// tied on rank keep the ring's own (tab index, `pane_order()`) order —
+    /// C19 and the roster still agree on tie-order, just not on row order
+    /// once severities mix. `display_status`, not the raw status (P2-10): a
+    /// quiet shell ranks with Idle, not Waiting.
+    ///
+    /// The type-ahead filter and the status filter both apply to panes, AND
+    /// composed (a row must satisfy both); a group whose panes all filter out
+    /// (by either) drops its header too (an empty group is a row that says
     /// nothing).
     pub fn roster_rows(&self) -> Vec<RosterRow> {
-        let filter = match &self.mode {
-            Mode::Roster { filter, .. } => filter.to_ascii_lowercase(),
-            _ => String::new(),
+        let (filter, status_filter) = match &self.mode {
+            Mode::Roster { filter, status_filter, .. } => (filter.to_ascii_lowercase(), *status_filter),
+            _ => (String::new(), None),
         };
-        let mut rows = Vec::new();
+        // [design-supervisor D2] Compared by `roster_rank`, not equality: a
+        // never-started pane (`None`) ranks with `Idle` for the *sort*, and
+        // the filter has to agree — otherwise a pane that draws `·` and
+        // sorts in the `·` band could vanish under the `·` filter, which is
+        // exactly the never-spawned-tab case (C27's headline scenario) that
+        // a restored workspace hits on its very first roster open.
+        let shows = |id: PaneId| {
+            self.roster_matches(id, &filter)
+                && status_filter.is_none_or(|s| {
+                    roster_rank(self.display_status(id)) == roster_rank(Some(s))
+                })
+        };
+
+        let mut groups: Vec<(u8, usize, Vec<PaneId>)> = Vec::new();
         for (i, tab) in self.ws.tabs.iter().enumerate() {
             let mut order = Vec::new();
             layout::pane_order(&tab.layout, &mut order);
-            let panes: Vec<PaneId> =
-                order.into_iter().filter(|&id| self.roster_matches(id, &filter)).collect();
+            let mut panes: Vec<PaneId> = order.into_iter().filter(|&id| shows(id)).collect();
             if panes.is_empty() {
                 continue;
             }
-            rows.push(RosterRow::Group { label: roster_group_label(i, &tab.name, panes.len()) });
+            panes.sort_by_key(|&id| roster_rank(self.display_status(id)));
+            let rank = roster_rank(self.display_status(panes[0])); // panes[0] is worst after the sort
+            groups.push((rank, i, panes));
+        }
+        groups.sort_by_key(|&(rank, i, _)| (rank, i));
+
+        let mut rows = Vec::new();
+        for (_, i, panes) in groups {
+            let name = &self.ws.tabs[i].name;
+            rows.push(RosterRow::Group { label: roster_group_label(i, name, panes.len()) });
             rows.extend(panes.into_iter().map(|id| RosterRow::Pane { id }));
         }
         if let Some(f) = &self.float {
-            if self.roster_matches(f.id, &filter) {
+            if shows(f.id) {
                 rows.push(RosterRow::Group { label: roster_float_label() });
                 rows.push(RosterRow::Pane { id: f.id });
             }
@@ -3828,6 +3930,20 @@ impl<B: PaneBackend> App<B> {
         let adapter = self.find_spec(id).map(|s| s.adapter.clone()).unwrap_or_default();
         let hay = format!("{id} {} {adapter}", self.display_name(id)).to_ascii_lowercase();
         hay.contains(filter)
+    }
+
+    /// C27/U18: cycle the roster's status filter — `Tab` forward, `Shift+Tab`
+    /// back — through `ROSTER_STATUS_CYCLE` (worst-first, `None` = every
+    /// tier, at both ends so cycling never dead-ends). Reuses
+    /// `roster_clamp_cursor` (U20's own picker-filter idiom): a cursor
+    /// filtered away lands on the new list's first row, and the view scrolls
+    /// to keep it visible.
+    fn roster_cycle_status(&mut self, delta: isize) {
+        let Mode::Roster { status_filter, .. } = &mut self.mode else { return };
+        let n = ROSTER_STATUS_CYCLE.len() as isize;
+        let at = ROSTER_STATUS_CYCLE.iter().position(|s| s == status_filter).unwrap_or(0) as isize;
+        *status_filter = ROSTER_STATUS_CYCLE[(at + delta).rem_euclid(n) as usize];
+        self.roster_clamp_cursor();
     }
 
     /// C27: the roster overlay's visible row window — `top` clamped against
@@ -4689,7 +4805,9 @@ impl<B: PaneBackend> App<B> {
             // reserve letters (U20's finding, paid for by the picker), so the
             // motions here are the arrows and the paging keys; every
             // printable — `j`, `k` and `q` included — is filter text, and
-            // `Esc` (with Alt+Shift+a) is the way out.
+            // `Esc` (with Alt+Shift+a) is the way out. [Amended, ux P2-11]
+            // `Tab`/`Shift+Tab` cycle the status filter — the two keys left
+            // over once every `Char` is spoken for.
             Mode::Roster { .. } => {
                 let page = self.roster_page() as isize;
                 match key.code {
@@ -4697,6 +4815,8 @@ impl<B: PaneBackend> App<B> {
                     KeyCode::Down => self.roster_move(1),
                     KeyCode::PageUp => self.roster_move(-page),
                     KeyCode::PageDown => self.roster_move(page),
+                    KeyCode::Tab => self.roster_cycle_status(1),
+                    KeyCode::BackTab => self.roster_cycle_status(-1),
                     KeyCode::Enter => {
                         if let Mode::Roster { cursor, .. } = &self.mode {
                             let target = *cursor;
@@ -5246,6 +5366,37 @@ pub enum RosterRow {
     Pane { id: PaneId },
 }
 
+/// [ux P2-11] Worst-first severity rank for `roster_rows`' sort — lower
+/// sorts earlier, mirroring C5's glyph-severity order (◆→○→●→·→exited) and
+/// the roster's own status-filter cycle (`ROSTER_STATUS_CYCLE`) below it. A
+/// never-started pane (`None` — C27's own "not started" rung, `display_status`
+/// returns it for a lazy tab's pane) ranks with `Idle`: the tab bar already
+/// draws it as the same idle dot (C27's `Unknown` rule), and it is "nothing
+/// to report" exactly the way an idle pane is. A corpse still sorts last —
+/// dead news beats no news, but every live or pending pane beats a corpse.
+fn roster_rank(status: Option<AgentStatus>) -> u8 {
+    match status {
+        Some(AgentStatus::NeedsInput) => 0,
+        Some(AgentStatus::Waiting) => 1,
+        Some(AgentStatus::Working) => 2,
+        Some(AgentStatus::Idle) | None => 3,
+        Some(AgentStatus::Exited) => 4,
+    }
+}
+
+/// [ux P2-11] The roster's status filter cycle — `Tab` steps forward through
+/// this list, `Shift+Tab` back, wrapping both ways. Worst-first, same as
+/// `roster_rank`, with `None` ("every tier") at the front so the first press
+/// narrows from "everything" to the severity you'd actually go looking for.
+const ROSTER_STATUS_CYCLE: [Option<AgentStatus>; 6] = [
+    None,
+    Some(AgentStatus::NeedsInput),
+    Some(AgentStatus::Waiting),
+    Some(AgentStatus::Working),
+    Some(AgentStatus::Idle),
+    Some(AgentStatus::Exited),
+];
+
 /// C27: a tab group's header text, in C6's uppercase-label idiom
 /// (`" STACK · 3 PANES"`) — the tab's own bar label, then how many of its
 /// panes the roster is showing.
@@ -5626,6 +5777,11 @@ mod tests {
     fn tab_summary_reports_exited_and_ranks_it_between_waiting_and_quiet() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1 | 2 in one tab
+        // Pane 2 is a real agent, not the default shell: this test is U13's
+        // "a live agent outranks a corpse" ranking, and U13 is silent on
+        // shells — a shell's Waiting would read Idle (P2-10) and never
+        // exercise the Waiting rung this test means to pin.
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
         assert_eq!(app.tab_summary(0).0, TabSummary::Quiet);
 
         app.runtimes.get_mut(&1).unwrap().kill(); // pane 1 dies
@@ -5656,6 +5812,47 @@ mod tests {
         app.runtimes.remove(&id);
         app.dead.insert(id, "spawn-fail requested".into());
         assert_eq!(app.tab_summary(0).0, TabSummary::Exited);
+    }
+
+    /// [design-supervisor D1] The default one-shell workspace must not draw
+    /// `○` on the tab bar while the badge/roster (both `display_status`)
+    /// draw `·` for the very same pane in the very same frame — C5 is one
+    /// table for every chrome surface that shows status, tab bar included.
+    #[test]
+    fn tab_summary_reads_a_quiet_shells_waiting_as_quiet_not_waiting() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Quiet, "a shell's Waiting is not tab-bar news");
+        assert_eq!(app.display_status(id), Some(AgentStatus::Idle), "same answer the badge/roster read");
+    }
+
+    /// [ux P2-10] A quiet shell's heuristic `Waiting` reads `Idle` through
+    /// `display_status` — "your turn" is false for a pane nobody asked
+    /// anything of. `row_status` (the control plane's own ground truth) is
+    /// untouched: a script polling `roost status`/`wait --until waiting`
+    /// against a shell must not have its contract rewritten under it.
+    #[test]
+    fn display_status_downgrades_a_quiet_shells_waiting_to_idle() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.row_status(id), Some(AgentStatus::Waiting), "raw ground truth is unchanged");
+        assert_eq!(app.display_status(id), Some(AgentStatus::Idle), "a shell has no turn to hand back");
+
+        // A real agent pane's Waiting is untouched — it really might be
+        // "your turn".
+        app.find_spec_mut(id).unwrap().adapter = "pi".into();
+        assert_eq!(app.display_status(id), Some(AgentStatus::Waiting));
+
+        // Every other status, shell or not, passes through unchanged.
+        app.find_spec_mut(id).unwrap().adapter = "shell".into();
+        for s in [AgentStatus::Working, AgentStatus::NeedsInput, AgentStatus::Idle] {
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(s);
+            assert_eq!(app.display_status(id), Some(s));
+        }
+        app.runtimes.get_mut(&id).unwrap().kill();
+        assert_eq!(app.display_status(id), Some(AgentStatus::Exited));
     }
 
     /// U14: the flash says what actually happened. A native helper that
@@ -7213,6 +7410,35 @@ mod tests {
 
         // The broadcast's one ctl line must still be exactly one — untouched by the tick.
         assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
+    }
+
+    /// [design-supervisor D5] The feed reads `display_status`, not the raw
+    /// runtime status — the same fix D1 gave `tab_summary`. Left alone, a
+    /// shell's heuristic `Waiting` logged `{name}: working → your turn`
+    /// (P2-10's wrongness, on the one chrome surface the original pass
+    /// didn't reach) while every other surface, same frame, said `idle`.
+    #[test]
+    fn diff_statuses_logs_a_quiet_shells_waiting_as_idle_not_your_turn() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        let is_transition = |e: &&FeedEntry| e.text.contains('→') && !e.text.starts_with("ctl ");
+
+        // Baseline tick: first observation is silently seeded.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.feed().iter().filter(is_transition).count(), 0);
+
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
+        let last = transitions.last().expect("a transition line");
+        assert_eq!(last.text, format!("{}: working → idle", app.feed_label(id)), "not \"your turn\"");
     }
 
     #[test]
@@ -9168,6 +9394,59 @@ mod tests {
         assert_eq!(app.needs_input_count(), expected.len());
     }
 
+    /// [Amended, ux P1-5] With **no** ◆ anywhere, the ring falls through to
+    /// every `Waiting` pane — the fallback that makes an uninstrumented
+    /// agent's finished turn reachable by `Alt+a` at all, not just extension
+    /// panes' explicit `NeedsInput`.
+    #[test]
+    fn attention_ring_falls_through_to_waiting_when_nothing_needs_input() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_ring(), vec![1]);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 1, "Alt+a reaches a finished, uninstrumented turn");
+    }
+
+    /// A real ◆ anywhere in the fleet wins outright — the fallback only ever
+    /// runs once the ◆ pass comes back empty, so an instrumented fleet's ring
+    /// behaves exactly as it did before this amendment: no ◆ is ever skipped
+    /// in favor of a ○.
+    #[test]
+    fn attention_ring_never_skips_a_real_needs_input_for_the_waiting_fallback() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // panes 1, 2, 3
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.runtimes.get_mut(&3).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.attention_ring(), vec![3], "the one real ◆ wins outright, no ○ mixed in");
+    }
+
+    /// Interaction (items 1 + 4): a quiet shell's `Waiting` reads `Idle`
+    /// (P2-10) through `display_status`, so it must not pull the fallback
+    /// ring — only a pane whose `Waiting` means something (a real agent)
+    /// does. The case that matters: a fleet mixing instrumented/uninstrumented
+    /// agents with plain shells, and only the agent counts.
+    #[test]
+    fn attention_ring_waiting_fallback_excludes_quiet_shells() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 (shell), 2 (shell, promoted below)
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting); // shell: no turn
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting); // agent: your turn
+        assert_eq!(app.attention_ring(), vec![2], "the shell's Waiting never pulls the ring");
+
+        // A fleet of shells only, none of them ever needing a jump.
+        app.find_spec_mut(2).unwrap().adapter = "shell".into();
+        assert!(app.attention_ring().is_empty(), "an all-shell fleet has nothing to jump to");
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
     // -- C27 fleet roster -----------------------------------------------------
 
     /// A two-tab fixture with a needy pane parked in the *second* tab — the
@@ -9201,9 +9480,13 @@ mod tests {
         }
     }
 
-    /// C27: the roster lists **every** pane in the workspace grouped by tab,
-    /// in exactly C19's ring enumeration — tabs ascending, `pane_order()`
-    /// within each, one header ahead of each group.
+    /// C27: the roster lists **every** pane in the workspace grouped by tab.
+    /// With every pane tied on severity (the common case), the sort's tie-
+    /// break is C19's ring enumeration verbatim — tabs ascending,
+    /// `pane_order()` within each — so an all-quiet or all-needy fleet reads
+    /// exactly as it did before `roster_rank` existed. [Amended, ux P2-11]
+    /// The worst-first reorder itself is pinned separately below
+    /// (`roster_rows_sort_worst_first_reorders_both_panes_and_groups`).
     #[test]
     fn roster_rows_group_every_pane_by_tab_in_ring_order() {
         let (mut app, tab0, tab1) = roster_fixture();
@@ -9217,11 +9500,69 @@ mod tests {
         assert_eq!(rows[5], RosterRow::Pane { id: tab1[1] });
         assert_eq!(rows.len(), 6);
         // The pane sequence is the ring's own order, with nothing dropped:
-        // make every pane needy and the two lists must coincide.
+        // make every pane needy (still tied, all ◆) and the two lists must
+        // coincide.
         for id in tab0.iter().chain(tab1.iter()) {
             app.runtimes.get_mut(id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         }
         assert_eq!(roster_panes(&app), app.attention_ring());
+    }
+
+    /// [ux P2-11] Sort worst-first (◆→○→●→·→exited), both within a tab's
+    /// group and across groups by their own worst pane — the fix for
+    /// "past one screenful you scroll hunting for the ◆s": the tab holding
+    /// the one ◆ becomes the *first* group, and that pane its *first* row,
+    /// however late the tab sits in tab order.
+    #[test]
+    fn roster_rows_sort_worst_first_reorders_both_panes_and_groups() {
+        let (mut app, tab0, tab1) = roster_fixture(); // tab0=[a,b], tab1=[c,d]
+        // tab0 (earlier in tab order) is entirely quiet; tab1's *second*
+        // pane is the fleet's one ◆. Worst-first must promote tab1 to the
+        // first group, and that pane to the first row inside it.
+        app.find_spec_mut(tab1[1]).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&tab1[1]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleRoster);
+        let rows = app.roster_rows();
+        assert!(
+            matches!(&rows[0], RosterRow::Group { label } if label.contains("TAB2")),
+            "the tab with the ◆ leads: {rows:?}"
+        );
+        assert_eq!(rows[1], RosterRow::Pane { id: tab1[1] }, "and its ◆ leads inside it: {rows:?}");
+        assert_eq!(rows[2], RosterRow::Pane { id: tab1[0] }, "tab1's quiet pane trails its own ◆");
+        assert!(matches!(&rows[3], RosterRow::Group { label } if label.contains("MAIN")));
+        assert_eq!(roster_panes(&app), vec![tab1[1], tab1[0], tab0[0], tab0[1]]);
+    }
+
+    /// Interaction (items 1 + 3 + 4), the case that matters: a fleet mixing
+    /// an instrumented agent (explicit ◆), an uninstrumented agent resting
+    /// on a heuristic `Waiting`, and plain shells. The roster sorts the
+    /// agent's ○ ahead of every shell (P2-10's downgrade keeps a shell out of
+    /// the ○ band entirely), and `Alt+a`'s fallback ring (P1-5) opens the
+    /// roster's cursor on that same agent, not a shell.
+    #[test]
+    fn roster_and_ring_agree_on_a_mixed_instrumented_and_shell_fleet() {
+        let (mut app, tab0, tab1) = roster_fixture(); // tab0=[a,b], tab1=[c,d], all shell
+        app.find_spec_mut(tab0[1]).unwrap().adapter = "claude".into(); // instrumented, ◆
+        app.runtimes.get_mut(&tab0[1]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.find_spec_mut(tab1[0]).unwrap().adapter = "pi".into(); // uninstrumented, resting
+        app.runtimes.get_mut(&tab1[0]).unwrap().set_extension_status(AgentStatus::Waiting);
+        // tab1[1] and tab0[0] stay plain, untouched shells.
+
+        // Item 1: the ring has the real ◆ only — the ○ fallback never runs
+        // while a ◆ exists, and no shell is ever in it regardless.
+        assert_eq!(app.attention_ring(), vec![tab0[1]]);
+
+        // Item 3: MAIN (tab0) leads — its own worst pane is the fleet's ◆ —
+        // with that ◆ first inside it, its quiet shell trailing; TAB2 (tab1)
+        // follows, its resting agent's ○ leading its own quiet shell. A
+        // shell never out-sorts a real ○, but it never leaves its own tab's
+        // group either — sort reorders groups and reorders within them, it
+        // does not flatten the fleet into one cross-tab severity list.
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_panes(&app), vec![tab0[1], tab0[0], tab1[0], tab1[1]]);
+        // The opening cursor is the ring's own pick (C27's contract) — the
+        // real ◆, never the resting agent or a shell.
+        assert_eq!(roster_cursor(&app), tab0[1]);
     }
 
     /// C22's float is not a tab, so it rides last under its own header —
@@ -9395,6 +9736,89 @@ mod tests {
             app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
         }
         assert_eq!(roster_panes(&app).len(), 4);
+    }
+
+    /// [ux P2-11] `Tab`/`Shift+Tab` cycle the roster's status filter — worst-
+    /// first, `None` ("every tier") at both ends so cycling never dead-ends
+    /// — and each step narrows the visible rows to that tier alone.
+    #[test]
+    fn roster_tab_key_cycles_the_status_filter() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.runtimes.get_mut(&tab0[0]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&tab0[1]).unwrap().set_extension_status(AgentStatus::Working);
+        // tab1[0] stays the default Idle; tab1[1] dies outright.
+        app.runtimes.get_mut(&tab1[1]).unwrap().kill();
+        app.apply(Action::ToggleRoster);
+        assert_eq!(roster_panes(&app).len(), 4, "no filter: every pane");
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(roster_panes(&app), vec![tab0[0]], "◆ only");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
+        assert!(roster_panes(&app).is_empty(), "○ only — nothing is Waiting");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(roster_panes(&app), vec![tab0[1]], "● only");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(roster_panes(&app), vec![tab1[0]], "· only");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(roster_panes(&app), vec![tab1[1]], "exited only");
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(roster_panes(&app).len(), 4, "wraps back to every tier");
+
+        app.handle_mode_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(roster_panes(&app), vec![tab1[1]], "Shift+Tab steps back, to exited");
+    }
+
+    /// [ux P2-11] The status filter composes with the text filter by AND — a
+    /// row must satisfy both, exactly like a multi-facet search. A group
+    /// whose panes all fail *either* filter drops its header too, the same
+    /// rule the type-ahead alone already has.
+    #[test]
+    fn roster_status_filter_composes_with_text_filter_by_and() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.find_spec_mut(tab1[0]).unwrap().title = Some("backend".into());
+        app.runtimes.get_mut(&tab0[0]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.runtimes.get_mut(&tab1[0]).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleRoster);
+
+        // Status alone: both ◆ panes, across both tabs.
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(roster_panes(&app), vec![tab0[0], tab1[0]]);
+
+        // AND the text filter in: only the one satisfying both survives.
+        for c in "backend".chars() {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(roster_panes(&app), vec![tab1[0]], "must satisfy both filters");
+        assert_eq!(app.roster_rows().len(), 2, "tab0's group — its ◆ fails the text filter — drops whole");
+
+        // Widen the text filter back: the status filter alone still narrows.
+        for _ in 0..7 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        assert_eq!(roster_panes(&app), vec![tab0[0], tab1[0]]);
+    }
+
+    /// [design-supervisor D2] A never-started pane draws `·` and sorts in
+    /// the `·` band (`roster_rank` puts `None` with `Idle`) — the `·` filter
+    /// must show it too, or it draws idle yet vanishes under its own tier's
+    /// filter. Exactly C27's headline case: a restored workspace with an
+    /// unspawned background tab.
+    #[test]
+    fn roster_idle_filter_includes_a_never_started_pane() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.runtimes.remove(&tab1[0]); // never spawned: lazy background tab
+        assert_eq!(app.display_status(tab1[0]), None);
+        app.apply(Action::ToggleRoster);
+
+        for _ in 0..4 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Tab)); // cycle to Idle
+        }
+        assert!(roster_panes(&app).contains(&tab1[0]), "not-started sorts and filters with idle");
+        // The rest of the fixture is untouched shell, also Idle.
+        assert_eq!(roster_panes(&app), vec![tab0[0], tab0[1], tab1[0], tab1[1]]);
     }
 
     /// U18: a mode's entry chord exits it — `Alt+Shift+a` closes the roster,
@@ -10975,6 +11399,22 @@ mod tests {
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         assert_eq!(app.attention_ring(), vec![1, float_id]);
         assert_eq!(app.attention_ring().len(), app.needs_input_count());
+    }
+
+    /// Interaction (items 1 + 4): the float (C22) is always spawned as a
+    /// `shell` pane (`spawn_float`) — roost's own scratch shell, never an
+    /// agent — so its heuristic `Waiting` reads `Idle` (P2-10) the same as
+    /// any other shell, and it can never join the Waiting fallback ring. A
+    /// needy float still rings (NeedsInput is untouched by the P2-10
+    /// downgrade); a merely-quiet one does not.
+    #[test]
+    fn attention_ring_waiting_fallback_never_includes_the_scratch_float() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide it, focus back to pane 1
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert!(app.attention_ring().is_empty(), "a quiet scratch shell never rings");
     }
 
     #[test]

@@ -61,10 +61,13 @@ pub struct PaneEffects {
     /// backend; these are the *texts*, for the notifier.
     pub notifications: Vec<String>,
     /// Bytes roost must forward verbatim to the HOST terminal's own output —
-    /// P2's re-emitted OSC 9 (so native desktop notifications fire) and P3's
-    /// OSC 52 clipboard writes. Already rate-limited, capped and sanitized
-    /// by the backend; the composition root only has to write them between
-    /// frames.
+    /// P2's re-emitted OSC 9 (so native desktop notifications fire), P3's
+    /// OSC 52 clipboard writes, and (ux P1-6) a raw BEL for the bell
+    /// *heuristic* specifically: the one attention path with no text to
+    /// notify with, only the pane's own already-consumed bell to echo, so
+    /// README's "rings the bell" holds in the fallback case too. Already
+    /// rate-limited, capped and sanitized by the backend; the composition
+    /// root only has to write them between frames.
     pub host_writes: Vec<u8>,
 }
 

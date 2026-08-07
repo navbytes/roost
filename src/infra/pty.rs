@@ -89,6 +89,20 @@ fn host_notify_bytes(
     Some(out)
 }
 
+/// ux P1-6: the raw BEL roost relays to its own terminal for the bell
+/// *heuristic* — the fallback attention path that has no OSC 9 text to
+/// relay, only the pane's own bell (already consumed by the vt100 parser,
+/// see `process_output`) to echo. `None` when the last relay was too
+/// recent (`interval`) — shares `queue_host_notify`'s own gate, so a pane
+/// alternating BEL and OSC 9 in a loop still gets one relay per window, not
+/// two independent budgets to burn through.
+fn host_bell_bytes(last: Option<Instant>, now: Instant, interval: Duration) -> Option<Vec<u8>> {
+    if last.is_some_and(|t| now.duration_since(t) < interval) {
+        return None;
+    }
+    Some(vec![0x07])
+}
+
 /// P3: the OSC 52 roost relays to its own terminal for a pane's clipboard
 /// write, or `None` when the write must be dropped.
 ///
@@ -444,6 +458,22 @@ impl PtyPane {
         self.effects.host_writes.extend_from_slice(&bytes);
     }
 
+    /// ux P1-6: ring the HOST terminal's own bell for the fallback attention
+    /// path — see `host_bell_bytes`. Shares `last_host_notify`/
+    /// `HOST_NOTIFY_INTERVAL` with `queue_host_notify` rather than a gate of
+    /// its own: both exist to stop a pane from machine-gunning the
+    /// operator's real terminal, so one per-pane "how often may this pane
+    /// ping the host" budget for the two of them is the simpler rule, not a
+    /// weaker one.
+    fn queue_host_bell(&mut self) {
+        let now = Instant::now();
+        let Some(bytes) = host_bell_bytes(self.last_host_notify, now, HOST_NOTIFY_INTERVAL) else {
+            return;
+        };
+        self.last_host_notify = Some(now);
+        self.effects.host_writes.extend_from_slice(&bytes);
+    }
+
     /// P2/P3: relay a pane's clipboard write to the host, rate-gated the
     /// same shape as `queue_host_notify` — the timestamp only advances on an
     /// actual emission, so a tight loop still gets one relay per interval
@@ -573,6 +603,24 @@ impl PaneBackend for PtyPane {
         self.parser.process(bytes);
         if self.parser.screen().audible_bell_count() != bells_before {
             self.status.on_bell();
+            // ux P1-6: relay only the case the bell heuristic exists to
+            // serve — no *live* extension report is covering this pane
+            // (`reported()`: none installed, or a resting report a bell
+            // promotes, e.g. pi's built-in permission prompt, which its
+            // hook can't see). Checked here rather than against
+            // `current()`: `current()`'s own quiet-window grace (badges
+            // don't flip to ◆ until output settles) would mask almost every
+            // real case — a bell riding the same burst as its own dialog
+            // text, which is the common case, not the exception. An
+            // audible ring has to fire the moment the child rings its own
+            // (tmux's monitor-bell doesn't wait either); a live
+            // "working"/"needs you" report already owns or separately
+            // notifies the bell (`on_status`'s `Notifier::notify` rings the
+            // host bell of its own accord) — relaying here too would be a
+            // second, redundant ring for a signal that already has one.
+            if !self.status.reported() {
+                self.queue_host_bell();
+            }
         }
         // Answer the pane's terminal queries (and track its kitty keyboard
         // flags) — AFTER the chunk is parsed, so stateful replies (DSR 6
@@ -917,10 +965,10 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_selection, host_clipboard_bytes, host_notify_bytes, sanitize_for_host,
-        scrub_control_env, scrub_host_identity, sync_presented, CONTROL_ENV_VARS,
-        HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL, OSC52_INTERVAL,
-        OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
+        extract_selection, host_bell_bytes, host_clipboard_bytes, host_notify_bytes,
+        sanitize_for_host, scrub_control_env, scrub_host_identity, sync_presented,
+        CONTROL_ENV_VARS, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL,
+        OSC52_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -1045,6 +1093,20 @@ mod tests {
         assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
         // The first notification of a pane's life is never rate-limited.
         assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+    }
+
+    /// ux P1-6: the fallback bell relay is a single raw BEL, gated by the
+    /// exact same rate window as `host_notify_bytes` — pinned separately so
+    /// a future change to one gate can't silently desync the other.
+    #[test]
+    fn host_bell_is_a_single_bel_and_rate_limited_per_pane() {
+        let now = Instant::now();
+        assert_eq!(host_bell_bytes(None, now, HOST_NOTIFY_INTERVAL), Some(vec![0x07]));
+
+        let recent = Some(now - HOST_NOTIFY_INTERVAL + Duration::from_millis(1));
+        assert!(host_bell_bytes(recent, now, HOST_NOTIFY_INTERVAL).is_none());
+        let old = Some(now - HOST_NOTIFY_INTERVAL - Duration::from_millis(1));
+        assert!(host_bell_bytes(old, now, HOST_NOTIFY_INTERVAL).is_some());
     }
 
     /// P3: a pane's clipboard write is relayed verbatim to the host — and

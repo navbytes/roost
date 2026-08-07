@@ -195,12 +195,15 @@ fn hint_pairs(
         // [Added, C27] The roster's own key set — 68 columns, inside the
         // 100-col floor beside the right segment. `q` is deliberately absent
         // where the feed has it: this list filters as you type, so a letter
-        // is filter text (U20's rule), and `Esc` is the way out.
+        // is filter text (U20's rule), and `Esc` is the way out. [Amended,
+        // ux P2-11] `Tab status` joins it (81 columns, still inside the
+        // floor) — the one narrowing key that isn't filter text.
         Mode::Roster { .. } => vec![
             ("↑↓", "select"),
             ("PgUp/Dn", "page"),
             ("↵", "go to pane"),
             ("type", "filter"),
+            ("Tab", "status"),
             ("Esc", "close"),
         ],
         Mode::Normal if focused_dead => {
@@ -751,7 +754,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "FLEET",
         rows: &[
             ("Alt+a", "jump to the next pane that needs you"),
-            ("Alt+Shift+a", "roster: every pane, grouped by tab"),
+            ("Alt+Shift+a", "roster: every pane, grouped by tab · Tab filters by status"),
             ("Alt+e", "activity feed (status / spawns / exits / control)"),
         ],
     },
@@ -998,19 +1001,42 @@ fn draw_mode_overlay<B: PaneBackend>(
             f.render_widget(block, rect);
             draw_feed_entries(f, app.feed(), *offset, inner);
         }
-        Mode::Roster { cursor, filter, .. } => {
+        Mode::Roster { cursor, filter, status_filter, .. } => {
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             // The live query rides in the title, exactly as the picker's
             // does (U20): a list narrowed to two rows with an ordinary title
-            // reads as a fleet that lost its panes.
-            let heading = if filter.is_empty() {
-                " fleet ".to_string()
-            } else {
-                format!(" fleet — {filter}{} ", theme::RENAME_CURSOR)
-            };
+            // reads as a fleet that lost its panes. [Amended, ux P2-11] The
+            // status filter joins it as a glyph tag, in that status's own C5
+            // glyph *and* color (design-supervisor D4: a bare `ink()` glyph
+            // read as no tier at all) — the same pairing the narrowed rows
+            // themselves draw (`theme::status_style`) — so a narrowed list
+            // always says *why* it is narrow, same as the type-ahead already
+            // did. `ink()` everywhere else: the tag is the one thing this
+            // title borrows color for.
+            let glyph_span = status_filter.map(|s| {
+                let (glyph, style, _) = theme::status_style(s);
+                Span::styled(glyph.to_string(), style)
+            });
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            match (glyph_span, filter.is_empty()) {
+                (None, true) => spans.push(Span::styled(" fleet ".to_string(), theme::ink())),
+                (None, false) => {
+                    spans.push(Span::styled(format!(" fleet — {filter}{} ", theme::RENAME_CURSOR), theme::ink()));
+                }
+                (Some(glyph), true) => {
+                    spans.push(Span::styled(" fleet — ".to_string(), theme::ink()));
+                    spans.push(glyph);
+                    spans.push(Span::styled(" only ".to_string(), theme::ink()));
+                }
+                (Some(glyph), false) => {
+                    spans.push(Span::styled(" fleet — ".to_string(), theme::ink()));
+                    spans.push(glyph);
+                    spans.push(Span::styled(format!(" {filter}{} ", theme::RENAME_CURSOR), theme::ink()));
+                }
+            }
             let block = Block::bordered()
-                .title(Line::from(Span::styled(heading, theme::ink())))
+                .title(Line::from(spans))
                 .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
@@ -1085,11 +1111,13 @@ fn roster_row_spans<B: PaneBackend>(
         RosterRow::Pane { id } => {
             let id = *id;
             let spec = app.find_spec(id);
-            // `row_status`, not `runtimes` directly: the roster is the one
-            // surface that lists panes in tabs the lazy spawn has never
+            // `display_status`, not `runtimes` directly: the roster is the
+            // one surface that lists panes in tabs the lazy spawn has never
             // started, and `None` is what the tab bar reads as `·` for the
-            // very same tab in the very same frame.
-            let status = app.row_status(id);
+            // very same tab in the very same frame. [P2-10] Also the one
+            // place a quiet shell's `Waiting` reads `Idle`, same as every
+            // other chrome surface.
+            let status = app.display_status(id);
             let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
             let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
             let name = if spec.is_some() { app.display_name(id) } else { "?".into() };
@@ -1518,9 +1546,12 @@ fn draw_pane<B: PaneBackend>(
         // float here too (its spec lives on the `Float`, not `Tab::panes`).
         let spec = app.find_spec(pr.id);
         // A drawn pane lives in the active tab or is the float, so it has
-        // been spawned and `row_status` answers `Some`; the fallback only
-        // covers a pane whose spec vanished mid-frame, which is dead.
-        let status = app.row_status(pr.id).unwrap_or(AgentStatus::Exited);
+        // been spawned and `display_status` answers `Some`; the fallback
+        // only covers a pane whose spec vanished mid-frame, which is dead.
+        // [P2-10] `display_status`, not `row_status`: a quiet shell's
+        // `Waiting` reads `Idle` on the badge/collapsed row, same as
+        // everywhere else chrome shows status.
+        let status = app.display_status(pr.id).unwrap_or(AgentStatus::Exited);
         let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
         let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
         // U2 (amended, P6): the shared display name — explicit title, else
@@ -2685,7 +2716,8 @@ mod tests {
     /// typing, `q` is filter text (U20's rule).
     #[test]
     fn hint_pairs_roster_mode_is_the_c27_list_and_fits_the_floor() {
-        let pairs = hint_pairs(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, false, false, false);
+        let mode = Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None };
+        let pairs = hint_pairs(&mode, false, false, false);
         assert_eq!(
             pairs,
             vec![
@@ -2693,11 +2725,12 @@ mod tests {
                 ("PgUp/Dn", "page"),
                 ("↵", "go to pane"),
                 ("type", "filter"),
+                ("Tab", "status"),
                 ("Esc", "close"),
             ],
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        assert_eq!(cols, 68, "C27 quotes 68 columns");
+        assert_eq!(cols, 81, "C27 quotes 81 columns");
         assert!(cols < 100, "and it must fit beside the right segment at the floor");
         assert!(!pairs.iter().any(|(k, _)| k.contains('q')), "`q` filters, it does not close");
     }
@@ -2718,10 +2751,8 @@ mod tests {
 
     #[test]
     fn mode_word_roster_wins_regardless_of_zoom() {
-        assert_eq!(
-            mode_word(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, true, false),
-            "ROSTER"
-        );
+        let mode = Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None };
+        assert_eq!(mode_word(&mode, true, false), "ROSTER");
     }
 
     #[test]
@@ -3383,6 +3414,23 @@ mod tests {
             out.push((name, snap(&mut app)));
         }
 
+        // [design-supervisor, vacuous-gate] The "fleet roster" fixture above
+        // is unfiltered and all-tied (fresh three_panes()), so the §2 gates
+        // below never looked at a filtered title tag or a worst-first
+        // reorder — the two things ux P2-11 added. A mixed fleet with a
+        // status filter active exercises both: the ◆ pane (last in tab
+        // order) sorts first, and the title carries its own colored glyph.
+        {
+            use crate::core::status::AgentStatus;
+            use crate::ports::PaneBackend;
+            let mut app = three_panes();
+            let needy = app.pane_order()[2];
+            app.runtimes.get_mut(&needy).unwrap().set_extension_status(AgentStatus::NeedsInput);
+            app.apply(Action::ToggleRoster);
+            app.handle_mode_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab));
+            out.push(("fleet roster, filtered and reordered", snap(&mut app)));
+        }
+
         let mut app = three_panes();
         app.apply(Action::ToggleZoom);
         app.apply(Action::ToggleHints); // the tab bar picks up the mode word
@@ -3743,6 +3791,94 @@ mod tests {
         assert!(frame.contains(&format!("fleet — 3{}", theme::RENAME_CURSOR)), "query:\n{frame}");
         assert!(frame.contains("2 TAB2 · 1 PANE"), "pane 3 lives in tab 2:\n{frame}");
         assert!(!frame.contains("1 MAIN · 2 PANES"), "tab 1 filtered away whole:\n{frame}");
+    }
+
+    /// [ux P2-11], end to end through the real `draw()`: `Tab` narrows the
+    /// drawn rows to one severity tier and tags the frame title with that
+    /// tier's own glyph — the same discoverability idiom the type-ahead
+    /// query already has.
+    #[test]
+    fn the_roster_status_filter_narrows_rows_and_tags_the_title() {
+        use crate::core::status::AgentStatus;
+        use crate::ports::PaneBackend;
+        use crate::ui::input::Action;
+        use crossterm::event::{KeyCode, KeyEvent};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane); // panes 1 (needy below), 2 (stays idle)
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleRoster);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab)); // cycle to NeedsInput
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let frame: String = (0..30)
+            .map(|y| {
+                (0..100)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            frame.contains(&format!("fleet — {} only", theme::GLYPH_NEEDS_INPUT)),
+            "the title tags the active tier:\n{frame}"
+        );
+        assert!(frame.contains("needs you"), "the ◆ row survives:\n{frame}");
+        assert!(!frame.contains("idle"), "the idle pane is filtered out:\n{frame}");
+    }
+
+    /// [ux P2-10], end to end through the real `draw()`: a quiet shell's
+    /// heuristic `Waiting` draws `idle`/`·`, never `your turn`/`○` — C8's own
+    /// state word, fed by `App::display_status` rather than the raw
+    /// `row_status`. Checked on the corner badge's glyph (C4 carries no
+    /// spelled-out word, only `theme::status_style`'s glyph) and the roster
+    /// row's word (C27 reuses C8's format verbatim, glyph and word both).
+    #[test]
+    fn a_quiet_shells_waiting_draws_as_idle_not_your_turn() {
+        use crate::core::status::AgentStatus;
+        use crate::ports::PaneBackend;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        let id = app.pane_order()[0];
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+
+        let drawn_lines = |app: &mut App<crate::ports::fakes::FakePane>| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        // The corner badge, in the ordinary single-pane view: idle's `·`
+        // glyph (theme::GLYPH_IDLE), not waiting's `○`. Scoped to the
+        // badge's own row — the tab bar's separate (untouched by this fix,
+        // by design: item 4 scopes out C2/C5's tab aggregate) glyph lives
+        // above it and would otherwise collide with a whole-frame search.
+        let lines = drawn_lines(&mut app);
+        let badge_row = lines.iter().find(|l| l.contains("1 shell")).expect("the badge row");
+        assert!(badge_row.contains(theme::GLYPH_IDLE), "the corner badge's glyph reads idle:\n{badge_row}");
+        assert!(!badge_row.contains(theme::GLYPH_WAITING), "not waiting's ○:\n{badge_row}");
+
+        // The roster row (C27 reuses C8's format verbatim) spells the word.
+        app.apply(Action::ToggleRoster);
+        let frame = drawn_lines(&mut app).join("\n");
+        assert!(frame.contains("idle"), "the roster row reads idle:\n{frame}");
+        assert!(!frame.contains("your turn"), "\"your turn\" is false for a shell:\n{frame}");
     }
 
     /// C15 (amended), end to end through the real `draw()`: the keymap

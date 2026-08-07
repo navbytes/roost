@@ -102,6 +102,54 @@ fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }
 
+/// ux P1-6: the fallback case OSC 9 doesn't cover — a pane that only ever
+/// rings its bare terminal bell, no extension, no OSC 9. Before this,
+/// `Notifier::notify` fired only from `on_pty_output` (OSC 9) and
+/// `on_status` (the socket) — the bell heuristic updated the pane's own
+/// attention state but never reached the operator's real terminal, so
+/// README's "rings the bell the moment one needs you" was false in exactly
+/// the case the heuristic exists to serve.
+#[test]
+fn a_pane_bare_bell_relays_to_the_host_and_is_rate_limited() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP bare-bell gate: {reason}");
+            return;
+        }
+    };
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+    let bell_count = |h: &mut Harness| h.host_bytes().iter().filter(|&&b| b == 0x07).count();
+    // The OSC 2 host-title sequence is itself BEL-terminated and fires once
+    // at startup, then goes quiet (unchanged label, `HOST_TITLE_INTERVAL`) —
+    // `settle` already waited past it, so this baseline is stable for the
+    // rest of the test.
+    let baseline = bell_count(&mut h);
+
+    // A bare bell — no OSC 9, nothing an extension could have reported.
+    h.write_bytes(b"printf '\\007'\r");
+    let relayed = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
+        b.iter().filter(|&&x| x == 0x07).count() > baseline
+    });
+    assert!(
+        relayed,
+        "roost never relayed the pane's bare bell to the host; captured tail:\n{}",
+        String::from_utf8_lossy(&tail(&h.host_bytes(), 200))
+    );
+    let after_first = bell_count(&mut h);
+
+    // A burst right behind it must not machine-gun the operator's terminal —
+    // the same per-pane interval `queue_host_notify` already gates OSC 9
+    // with (P2's `HOST_NOTIFY_INTERVAL`).
+    h.write_bytes(b"for i in 1 2 3 4 5; do printf '\\007'; done\r");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(bell_count(&mut h), after_first, "a bell burst must relay at most once per window");
+
+    let _ = h.quit_and_wait(Duration::from_secs(5));
+}
+
 /// The body of the first well-formed `ESC ] 9 ; ... BEL` in the stream.
 fn find_osc9(bytes: &[u8]) -> Option<String> {
     let start = bytes.windows(4).position(|w| w == b"\x1b]9;")? + 4;

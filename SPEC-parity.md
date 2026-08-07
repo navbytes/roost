@@ -111,6 +111,17 @@ attention path as a bell (badge ◆ + notifier), and (b) is optionally
 re-emitted to the host terminal so native desktop notifications fire.
 OSC 9;4 progress may be surfaced later (badge percentage) — out of scope here.
 
+**Extended 2026-08-07 (ux P1-6):** (b) held only for OSC 9/777 — a pane's
+*own* bell (the heuristic ◆ path this same item put on "the same attention
+path as a bell") was consumed by the vt100 parser and never re-emitted, so
+the contract's own re-emission half was false in exactly the fallback case
+it exists to serve. `PtyPane::queue_host_bell` closes it: a raw BEL relay,
+gated on `!StatusTracker::reported()` (no live extension already owns the
+notify) and rate-limited on the same per-pane gate as (b)'s OSC 9 relay.
+e2e `tests/pane_notifications.rs::a_pane_bare_bell_relays_to_the_host_and_is_rate_limited`.
+Not a DESIGN-ui.md concern — this is host I/O (`PaneEffects.host_writes`),
+never a drawn `Frame`/`Buffer`; this file is its contract.
+
 ### P3 · FIXED (this branch) · High — inner-app OSC 52 clipboard writes are discarded
 *Fixed: the vendored parser surfaces `52;<sel>;<base64>` as
 `Effect::Osc52Write` and refuses to surface reads (`52;<sel>;?`, or a
