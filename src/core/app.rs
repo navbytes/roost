@@ -3265,7 +3265,7 @@ impl<B: PaneBackend> App<B> {
             layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
             return;
         }
-        self.focus_dir_cross_tab(dir);
+        self.focus_dir_cross_tab(dir, &rects);
     }
 
     /// C31, client request 2026-08-07: `Left`/`Right` off the edge of the
@@ -3291,12 +3291,34 @@ impl<B: PaneBackend> App<B> {
     /// time right after, and `set_focus` reports a real focus transition on
     /// every call that changes the id — a spurious CSI O/I pair to a pane
     /// that was never truly focused.
-    fn focus_dir_cross_tab(&mut self, dir: layout::Dir) {
+    ///
+    /// `rects` is the active tab's rects, already computed by the caller —
+    /// reused here, not recomputed, to check whether `self.focused` is
+    /// *genuinely* at that edge. `neighbor == None` alone isn't enough: a
+    /// pane spanning the tab's full width has no Left/Right neighbour
+    /// purely because nothing can sit beside a full-width rect
+    /// (`layout::neighbor`'s gap check excludes every other pane on both
+    /// sides at once, regardless of row) — that's an artifact of its shape,
+    /// not evidence it's "the last or first pane" the client asked about. A
+    /// pane that owns a whole row above/below a split row is exactly this:
+    /// reachable as `Alt+n`, `Alt+o`, `Alt+n` from a single pane. Excluded:
+    /// the tab's *only* pane, which necessarily spans the full width (and
+    /// height) and is unambiguously both ends at once — the base case every
+    /// other C31 test relies on.
+    fn focus_dir_cross_tab(&mut self, dir: layout::Dir, rects: &[PaneRect]) {
         let delta: isize = match dir {
             layout::Dir::Right => 1,
             layout::Dir::Left => -1,
             layout::Dir::Up | layout::Dir::Down => return,
         };
+        let spans_full_width = rects.len() > 1
+            && rects
+                .iter()
+                .find(|p| p.id == self.focused)
+                .is_some_and(|p| p.rect.width == self.body_area().width);
+        if spans_full_width {
+            return;
+        }
         let n = self.ws.tabs.len();
         if n < 2 {
             return; // C31: only when more than one tab exists
@@ -5506,21 +5528,25 @@ fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode 
 }
 
 /// C31: the geometric edge pane of a destination tab's rects — leftmost
-/// when `rightmost` is false, rightmost when true. Ties are broken by
-/// smallest y, then smallest id — `layout::neighbor`'s own tie-break,
-/// reused for the same reason (deterministic, not dependent on rect
-/// order) rather than invented fresh. `None` only if `rects` is empty,
-/// which a real tab's computed rects never are.
+/// when `rightmost` is false, rightmost when true. Ties on x — every member
+/// of a stack shares its column's x — are broken by `collapsed` (false
+/// first): the currently-*expanded* member wins over a 1-row collapsed
+/// title bar, so a navigation key lands on what the tab was actually left
+/// showing rather than rearranging it. Only below that does position decide
+/// (smallest y), then smallest id — `layout::neighbor`'s own tie-break,
+/// reused for the same reason (deterministic, not dependent on rect order)
+/// rather than invented fresh. `None` only if `rects` is empty, which a
+/// real tab's computed rects never are.
 fn edge_pane(rects: &[PaneRect], rightmost: bool) -> Option<PaneId> {
-    let mut best: Option<(i32, u16, PaneId)> = None;
+    let mut best: Option<(i32, bool, u16, PaneId)> = None;
     for p in rects {
         let x = p.rect.x as i32;
-        let key = (if rightmost { -x } else { x }, p.rect.y, p.id);
+        let key = (if rightmost { -x } else { x }, p.collapsed, p.rect.y, p.id);
         if best.is_none_or(|b| key < b) {
             best = Some(key);
         }
     }
-    best.map(|(_, _, id)| id)
+    best.map(|(_, _, _, id)| id)
 }
 
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
@@ -10235,12 +10261,48 @@ mod tests {
         assert_eq!(app.focused, pane_before);
     }
 
-    /// Landing on a collapsed stack member must expand it — otherwise the
-    /// jump lands on a pane the user can't see (a 1-row title bar), exactly
-    /// the "surprising" outcome ruled out up front. Mirrors
-    /// `zoom_expands_a_collapsed_stack_member_first`'s own proof.
+    /// [Fixed 2026-08-07, design audit] `neighbor == None` is not the same
+    /// as "at the tab's edge": a pane spanning the tab's full width (a row
+    /// above/below a split row) has no Left *or* Right neighbour, but is
+    /// not meaningfully "the last or first pane" the client asked about —
+    /// the audit's own repro, `Alt+n`, `Alt+o`, `Alt+n`, from a single
+    /// pane. Neither key may leave the tab from it; a pane that genuinely
+    /// owns the tab's edge, in that same layout, still does.
     #[test]
-    fn cross_tab_focus_expands_a_collapsed_stack_member_at_the_destination() {
+    fn cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // a second tab, so a wrong trigger has somewhere to go
+        app.apply(Action::GoToTab(0));
+        // The audit's repro: one pane spanning the row above a split row.
+        app.apply(Action::NewPane);
+        app.apply(Action::FlipSplit);
+        app.apply(Action::NewPane);
+        let bottom_right = app.focused; // genuinely at the right edge — the sanity check below
+        let tab_before = app.ws.active_tab;
+
+        app.set_focus(1); // the full-width top pane: touches both x edges, but shares the tab
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.ws.active_tab, tab_before, "full width but not the tab's only pane — not an edge");
+        assert_eq!(app.focused, 1);
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert_eq!(app.ws.active_tab, tab_before);
+        assert_eq!(app.focused, 1);
+
+        // Sanity: a pane that genuinely owns the edge, in this same mixed
+        // layout, is unaffected by the fix above.
+        app.set_focus(bottom_right);
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_ne!(app.ws.active_tab, tab_before, "a real edge still crosses");
+    }
+
+    /// [Corrected 2026-08-07, design audit] Landing on a stack's topmost
+    /// member would collapse whatever the tab had expanded — a navigation
+    /// key must not rearrange a tab you haven't looked at yet. `edge_pane`
+    /// prefers the *expanded* member on an x-tie, so the jump lands on
+    /// what was already visible and `expand_in_stacks` is a no-op: the
+    /// stack's shape is untouched.
+    #[test]
+    fn cross_tab_focus_lands_on_the_already_expanded_stack_member_at_the_destination() {
         fn spec() -> PaneSpec {
             PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None }
         }
@@ -10262,7 +10324,7 @@ mod tests {
                         ratios: vec![0.5, 0.5],
                         children: vec![
                             LayoutNode::Pane(20),
-                            LayoutNode::Stack { children: vec![21, 22, 23], expanded: 1 }, // 21 collapsed
+                            LayoutNode::Stack { children: vec![21, 22, 23], expanded: 1 }, // 22 expanded
                         ],
                     },
                     panes: panes1,
@@ -10273,16 +10335,15 @@ mod tests {
 
         // Tab 0's only pane has no left neighbour — wraps to tab 1
         // (previous, n=2), landing on its rightmost pane: the stack column,
-        // tie-broken to its topmost member (21), currently collapsed
-        // (`expanded` points at 22).
+        // tie-broken to the *expanded* member (22), not the topmost (21).
         app.apply(Action::Focus(layout::Dir::Left));
 
         assert_eq!(app.ws.active_tab, 1);
-        assert_eq!(app.focused, 21);
+        assert_eq!(app.focused, 22, "lands on the member already visible, not the topmost");
         match &app.ws.tabs[1].layout {
             LayoutNode::Split { children, .. } => match &children[1] {
                 LayoutNode::Stack { expanded, children } => {
-                    assert_eq!(children[*expanded], 21, "the landing pane must be expanded, not collapsed")
+                    assert_eq!(children[*expanded], 22, "the stack's shape is untouched — still 22 expanded")
                 }
                 other => panic!("expected the stack, got {other:?}"),
             },
