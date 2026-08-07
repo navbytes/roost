@@ -4976,8 +4976,20 @@ fn method_summary(m: &Method) -> String {
 /// ASCII control char) in an attacker-controlled value — an adapter name, a
 /// `wait` `until`, an error detail — could otherwise forge a fake extra log
 /// line attributed to whoever made the real call. One entry stays one line.
+/// Per-field cap on what a caller can push into one audit line. The log is
+/// byte-bounded (`AUDIT_LOG_MAX`, one rotated generation), and audit lines
+/// interpolate caller-controlled strings — an adapter name, a `wait --until`
+/// value — so without a cap the *bytes per call* are attacker-chosen up to
+/// the socket's 64 KiB line limit. That made rolling the log twice, which
+/// erases every record of what a compromised pane did, a ~140-request job:
+/// seconds, not hours. Capping the field is what makes the rotation attack
+/// take a length of time the rate limiter can then make impractical; the
+/// buckets alone never could, because they bound calls and the log bounds
+/// bytes. 512 is far past any legitimate adapter name or status word.
+const AUDIT_FIELD_CAP: usize = 512;
+
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_control() { ' ' } else { c }).collect()
+    s.chars().map(|c| if c.is_ascii_control() { ' ' } else { c }).take(AUDIT_FIELD_CAP).collect()
 }
 
 /// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is
@@ -5577,6 +5589,30 @@ fn adapter_installed(id: &str, registry: &Registry) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Security M2: the audit log is byte-bounded and rotates keeping one
+    /// generation, and audit lines interpolate caller-controlled strings.
+    /// Uncapped, a caller chose the bytes-per-call (up to the socket's 64 KiB
+    /// line limit) and could roll the log twice — erasing every record of
+    /// what it did — in ~140 requests. The cap is what turns that from
+    /// seconds into a duration the rate limiter can make impractical.
+    #[test]
+    fn an_audit_field_cannot_be_grown_without_bound_by_its_caller() {
+        let hostile = "A".repeat(64 * 1024);
+        let out = super::sanitize(&hostile);
+        assert_eq!(
+            out.chars().count(),
+            super::AUDIT_FIELD_CAP,
+            "a caller-controlled audit field must be capped, not echoed at its own length"
+        );
+
+        // The cap must not disturb what sanitize already existed to do:
+        // control bytes still become spaces, and ordinary values pass whole.
+        let ctrl = super::sanitize("spawn\u{1b}]2;evil\u{7} adapter=pi");
+        assert!(!ctrl.chars().any(|c| c.is_ascii_control()), "control bytes still neutralised");
+        let ordinary = "adapter=claude until=needs_input";
+        assert_eq!(super::sanitize(ordinary), ordinary, "a legitimate field is untouched");
+    }
     use super::*;
     use crate::agents;
     use crate::ports::fakes::{FakePane, MemStore};
