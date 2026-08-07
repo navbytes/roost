@@ -1379,6 +1379,31 @@ impl<B: PaneBackend> App<B> {
         None // a background pane not spawned yet (lazy)
     }
 
+    /// [ux P2-10] `row_status`'s raw answer, with one presentation-layer
+    /// adjustment: a plain `shell` pane has no turn to hand back (`is_shell`'s
+    /// own words — "the one roost ships that has no turns to be mid-way
+    /// through"), so a heuristic `Waiting` reads as `Idle` here. Left as
+    /// `Waiting`, every shell sitting untouched at its prompt for more than
+    /// `ACTIVE_WINDOW` reads `○` "your turn" forever — wrong for a pane
+    /// nobody asked anything of, and it buries a real agent's ○ in a fleet of
+    /// quiet shells. Every other status, and every non-shell pane, passes
+    /// through unchanged.
+    ///
+    /// This is the one place that downgrade happens; the corner badge,
+    /// collapsed rows, the roster (C27) and the C19 ring all resolve a
+    /// pane's status through here rather than `row_status` directly, so the
+    /// three can't drift from each other. The control plane deliberately
+    /// does *not* route through here — `row_status`/`status_str`/
+    /// `wait --until` keep answering with the raw signal, because a script's
+    /// status contract must not shift out from under it over a chrome-only
+    /// judgment call.
+    pub fn display_status(&self, id: PaneId) -> Option<AgentStatus> {
+        match self.row_status(id) {
+            Some(AgentStatus::Waiting) if self.is_shell(id) => Some(AgentStatus::Idle),
+            other => other,
+        }
+    }
+
     fn status_str(&self, id: PaneId) -> &'static str {
         match self.row_status(id) {
             Some(AgentStatus::Working) => "working",
@@ -5656,6 +5681,34 @@ mod tests {
         app.runtimes.remove(&id);
         app.dead.insert(id, "spawn-fail requested".into());
         assert_eq!(app.tab_summary(0).0, TabSummary::Exited);
+    }
+
+    /// [ux P2-10] A quiet shell's heuristic `Waiting` reads `Idle` through
+    /// `display_status` — "your turn" is false for a pane nobody asked
+    /// anything of. `row_status` (the control plane's own ground truth) is
+    /// untouched: a script polling `roost status`/`wait --until waiting`
+    /// against a shell must not have its contract rewritten under it.
+    #[test]
+    fn display_status_downgrades_a_quiet_shells_waiting_to_idle() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.row_status(id), Some(AgentStatus::Waiting), "raw ground truth is unchanged");
+        assert_eq!(app.display_status(id), Some(AgentStatus::Idle), "a shell has no turn to hand back");
+
+        // A real agent pane's Waiting is untouched — it really might be
+        // "your turn".
+        app.find_spec_mut(id).unwrap().adapter = "pi".into();
+        assert_eq!(app.display_status(id), Some(AgentStatus::Waiting));
+
+        // Every other status, shell or not, passes through unchanged.
+        app.find_spec_mut(id).unwrap().adapter = "shell".into();
+        for s in [AgentStatus::Working, AgentStatus::NeedsInput, AgentStatus::Idle] {
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(s);
+            assert_eq!(app.display_status(id), Some(s));
+        }
+        app.runtimes.get_mut(&id).unwrap().kill();
+        assert_eq!(app.display_status(id), Some(AgentStatus::Exited));
     }
 
     /// U14: the flash says what actually happened. A native helper that

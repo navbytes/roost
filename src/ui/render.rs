@@ -1085,11 +1085,13 @@ fn roster_row_spans<B: PaneBackend>(
         RosterRow::Pane { id } => {
             let id = *id;
             let spec = app.find_spec(id);
-            // `row_status`, not `runtimes` directly: the roster is the one
-            // surface that lists panes in tabs the lazy spawn has never
+            // `display_status`, not `runtimes` directly: the roster is the
+            // one surface that lists panes in tabs the lazy spawn has never
             // started, and `None` is what the tab bar reads as `·` for the
-            // very same tab in the very same frame.
-            let status = app.row_status(id);
+            // very same tab in the very same frame. [P2-10] Also the one
+            // place a quiet shell's `Waiting` reads `Idle`, same as every
+            // other chrome surface.
+            let status = app.display_status(id);
             let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
             let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
             let name = if spec.is_some() { app.display_name(id) } else { "?".into() };
@@ -1518,9 +1520,12 @@ fn draw_pane<B: PaneBackend>(
         // float here too (its spec lives on the `Float`, not `Tab::panes`).
         let spec = app.find_spec(pr.id);
         // A drawn pane lives in the active tab or is the float, so it has
-        // been spawned and `row_status` answers `Some`; the fallback only
-        // covers a pane whose spec vanished mid-frame, which is dead.
-        let status = app.row_status(pr.id).unwrap_or(AgentStatus::Exited);
+        // been spawned and `display_status` answers `Some`; the fallback
+        // only covers a pane whose spec vanished mid-frame, which is dead.
+        // [P2-10] `display_status`, not `row_status`: a quiet shell's
+        // `Waiting` reads `Idle` on the badge/collapsed row, same as
+        // everywhere else chrome shows status.
+        let status = app.display_status(pr.id).unwrap_or(AgentStatus::Exited);
         let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
         let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
         // U2 (amended, P6): the shared display name — explicit title, else
@@ -3743,6 +3748,55 @@ mod tests {
         assert!(frame.contains(&format!("fleet — 3{}", theme::RENAME_CURSOR)), "query:\n{frame}");
         assert!(frame.contains("2 TAB2 · 1 PANE"), "pane 3 lives in tab 2:\n{frame}");
         assert!(!frame.contains("1 MAIN · 2 PANES"), "tab 1 filtered away whole:\n{frame}");
+    }
+
+    /// [ux P2-10], end to end through the real `draw()`: a quiet shell's
+    /// heuristic `Waiting` draws `idle`/`·`, never `your turn`/`○` — C8's own
+    /// state word, fed by `App::display_status` rather than the raw
+    /// `row_status`. Checked on the corner badge's glyph (C4 carries no
+    /// spelled-out word, only `theme::status_style`'s glyph) and the roster
+    /// row's word (C27 reuses C8's format verbatim, glyph and word both).
+    #[test]
+    fn a_quiet_shells_waiting_draws_as_idle_not_your_turn() {
+        use crate::core::status::AgentStatus;
+        use crate::ports::PaneBackend;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        let id = app.pane_order()[0];
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+
+        let drawn_lines = |app: &mut App<crate::ports::fakes::FakePane>| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        // The corner badge, in the ordinary single-pane view: idle's `·`
+        // glyph (theme::GLYPH_IDLE), not waiting's `○`. Scoped to the
+        // badge's own row — the tab bar's separate (untouched by this fix,
+        // by design: item 4 scopes out C2/C5's tab aggregate) glyph lives
+        // above it and would otherwise collide with a whole-frame search.
+        let lines = drawn_lines(&mut app);
+        let badge_row = lines.iter().find(|l| l.contains("1 shell")).expect("the badge row");
+        assert!(badge_row.contains(theme::GLYPH_IDLE), "the corner badge's glyph reads idle:\n{badge_row}");
+        assert!(!badge_row.contains(theme::GLYPH_WAITING), "not waiting's ○:\n{badge_row}");
+
+        // The roster row (C27 reuses C8's format verbatim) spells the word.
+        app.apply(Action::ToggleRoster);
+        let frame = drawn_lines(&mut app).join("\n");
+        assert!(frame.contains("idle"), "the roster row reads idle:\n{frame}");
+        assert!(!frame.contains("your turn"), "\"your turn\" is false for a shell:\n{frame}");
     }
 
     /// C15 (amended), end to end through the real `draw()`: the keymap
