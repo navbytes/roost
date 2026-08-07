@@ -3863,9 +3863,17 @@ impl<B: PaneBackend> App<B> {
             Mode::Roster { filter, status_filter, .. } => (filter.to_ascii_lowercase(), *status_filter),
             _ => (String::new(), None),
         };
+        // [design-supervisor D2] Compared by `roster_rank`, not equality: a
+        // never-started pane (`None`) ranks with `Idle` for the *sort*, and
+        // the filter has to agree — otherwise a pane that draws `·` and
+        // sorts in the `·` band could vanish under the `·` filter, which is
+        // exactly the never-spawned-tab case (C27's headline scenario) that
+        // a restored workspace hits on its very first roster open.
         let shows = |id: PaneId| {
             self.roster_matches(id, &filter)
-                && status_filter.is_none_or(|s| self.display_status(id) == Some(s))
+                && status_filter.is_none_or(|s| {
+                    roster_rank(self.display_status(id)) == roster_rank(Some(s))
+                })
         };
 
         let mut groups: Vec<(u8, usize, Vec<PaneId>)> = Vec::new();
@@ -9749,6 +9757,27 @@ mod tests {
             app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
         }
         assert_eq!(roster_panes(&app), vec![tab0[0], tab1[0]]);
+    }
+
+    /// [design-supervisor D2] A never-started pane draws `·` and sorts in
+    /// the `·` band (`roster_rank` puts `None` with `Idle`) — the `·` filter
+    /// must show it too, or it draws idle yet vanishes under its own tier's
+    /// filter. Exactly C27's headline case: a restored workspace with an
+    /// unspawned background tab.
+    #[test]
+    fn roster_idle_filter_includes_a_never_started_pane() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let (mut app, tab0, tab1) = roster_fixture();
+        app.runtimes.remove(&tab1[0]); // never spawned: lazy background tab
+        assert_eq!(app.display_status(tab1[0]), None);
+        app.apply(Action::ToggleRoster);
+
+        for _ in 0..4 {
+            app.handle_mode_key(KeyEvent::from(KeyCode::Tab)); // cycle to Idle
+        }
+        assert!(roster_panes(&app).contains(&tab1[0]), "not-started sorts and filters with idle");
+        // The rest of the fixture is untouched shell, also Idle.
+        assert_eq!(roster_panes(&app), vec![tab0[0], tab0[1], tab1[0], tab1[1]]);
     }
 
     /// U18: a mode's entry chord exits it — `Alt+Shift+a` closes the roster,
