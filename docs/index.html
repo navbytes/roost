@@ -347,27 +347,50 @@
 
   <div>
     <div class="frow">
-      <p class="frow-num">01</p>
+      <div class="frow-mark">
+        <svg class="icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-1.6 5.6"/><path d="M20 5v6h-6"/></svg>
+        <p class="frow-num">01</p>
+      </div>
       <h3>Full workspace resurrection</h3>
       <p class="frow-body">Quit, reboot, reopen the terminal, run <code style="font-family:var(--font-mono);font-size:0.9em">roost</code>. It rebuilds every tab, split, and stacked pane, then resumes each agent into the exact session it was in — right working directory and all.</p>
     </div>
     <div class="frow">
-      <p class="frow-num">02</p>
+      <div class="frow-mark">
+        <svg class="icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h8l10 10-10 10-8-8z"/><circle cx="7.5" cy="7.5" r="1.3" fill="currentColor" stroke="none"/></svg>
+        <p class="frow-num">02</p>
+      </div>
       <h3>Session-native by design</h3>
       <p class="frow-body">Agent CLIs already persist their own conversation state and resume by id. So roost persists only the layout tree plus each pane's <code style="font-family:var(--font-mono);font-size:0.9em">(adapter, cwd, session-id)</code> — and relaunches processes on demand. No daemon required.</p>
     </div>
     <div class="frow">
-      <p class="frow-num">03</p>
+      <div class="frow-mark">
+        <svg class="icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h11M4 12h16M4 18h16"/><circle cx="18.5" cy="6" r="1.5" fill="currentColor" stroke="none"/></svg>
+        <p class="frow-num">03</p>
+      </div>
       <h3>Fleet at a glance</h3>
       <p class="frow-body">Stacked panes collapse to one-line title bars, each carrying a live status badge — working, needs input, waiting, idle, exited. Any number of agents fit in the space of one, and roost rings the bell when a background pane needs you.</p>
     </div>
     <div class="frow">
-      <p class="frow-num">04</p>
+      <div class="frow-mark">
+        <svg class="icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7l5 5-5 5"/><path d="M13 17h6"/></svg>
+        <p class="frow-num">04</p>
+      </div>
       <h3>Drive a fleet from the CLI</h3>
       <p class="frow-body"><code style="font-family:var(--font-mono);font-size:0.9em">list</code>, <code style="font-family:var(--font-mono);font-size:0.9em">status</code>, <code style="font-family:var(--font-mono);font-size:0.9em">spawn</code>, <code style="font-family:var(--font-mono);font-size:0.9em">fork</code>, <code style="font-family:var(--font-mono);font-size:0.9em">send</code>, <code style="font-family:var(--font-mono);font-size:0.9em">read</code>, <code style="font-family:var(--font-mono);font-size:0.9em">close</code>, <code style="font-family:var(--font-mono);font-size:0.9em">wait</code> — eight verbs, the same binary in client mode, including a <code style="font-family:var(--font-mono);font-size:0.9em">send --all</code> broadcast to reach every pane at once. An agent inside a pane can spawn and orchestrate its own workers while you watch the whole fleet live. Authorization is scoped by default, not sandboxed — any in-pane agent with shell access can still reach the fleet token.</p>
     </div>
     <div class="frow">
-      <p class="frow-num">05</p>
+      <div class="frow-mark">
+        <svg class="icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2h6"/><circle cx="12" cy="13" r="8"/><path d="M12 9v4l3 2"/></svg>
+        <p class="frow-num">05</p>
+      </div>
+      <h3>Never types into dead air</h3>
+      <p class="frow-body"><code style="font-family:var(--font-mono);font-size:0.9em">spawn --input</code> holds the prompt until the pane's first output, so it can never land in a CLI that isn't reading yet. <code style="font-family:var(--font-mono);font-size:0.9em">wait --until waiting</code> blocks until the agent settles — and exits <code style="font-family:var(--font-mono);font-size:0.9em">3</code> on timeout, not <code style="font-family:var(--font-mono);font-size:0.9em">0</code>, so a script chaining <code style="font-family:var(--font-mono);font-size:0.9em">wait &amp;&amp; read</code> can tell a stall from a finish. Exit codes: <code style="font-family:var(--font-mono);font-size:0.9em">0</code> ok · <code style="font-family:var(--font-mono);font-size:0.9em">1</code> runtime · <code style="font-family:var(--font-mono);font-size:0.9em">2</code> usage · <code style="font-family:var(--font-mono);font-size:0.9em">3</code> timeout.</p>
+    </div>
+    <div class="frow">
+      <div class="frow-mark">
+        <svg class="icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="7" width="10" height="10"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>
+        <p class="frow-num">06</p>
+      </div>
       <h3>Nothing heavy left over</h3>
       <p class="frow-body">No client/server protocol, no detach, no scrollback serialization, no process migration. roost is a single foreground process — the hardest parts of a multiplexer simply don't exist here. The release binary is about 1.4 MB.</p>
     </div>
@@ -408,7 +431,7 @@
         <div style="border:2px solid var(--color-text);font-family:var(--font-mono);font-size:13px">
           <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>core/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">pure domain</span></div>
           <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>ports.rs</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">trait boundaries</span></div>
-          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>agents/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">pi · claude · shell</span></div>
+          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between;gap:10px"><span style="flex-shrink:0">agents/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent);text-align:right">pi · claude · shell · codex · gemini · opencode</span></div>
           <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>infra/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">real I/O at the edges</span></div>
           <div style="padding:12px 16px;display:flex;justify-content:space-between"><span>ui/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">ratatui rendering</span></div>
         </div>
@@ -419,18 +442,19 @@
   <section id="keys" style="padding:clamp(40px,5vw,72px) 0;border-top:2px solid var(--color-divider)">
     <span class="kicker">Keys</span>
     <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 8px;max-width:20ch">One flat modifier layer.</h2>
-    <p style="font-size:16px;line-height:1.65;margin:0 0 36px;max-width:52ch;color:color-mix(in srgb, var(--color-text) 78%, transparent)">Everything's on <code style="font-family:var(--font-mono);font-size:0.9em">Alt</code>, so it never fights the agents' own <code style="font-family:var(--font-mono);font-size:0.9em">Ctrl</code> bindings. Everything else passes straight through to the focused pane.</p>
+    <p style="font-size:16px;line-height:1.65;margin:0 0 20px;max-width:52ch;color:color-mix(in srgb, var(--color-text) 78%, transparent)">Everything's on <code style="font-family:var(--font-mono);font-size:0.9em">Alt</code>, so it never fights the agents' own <code style="font-family:var(--font-mono);font-size:0.9em">Ctrl</code> bindings. Everything else passes straight through to the focused pane.</p>
+    <p style="font-size:16px;line-height:1.65;margin:0 0 36px;max-width:56ch;color:color-mix(in srgb, var(--color-text) 78%, transparent)"><strong style="color:var(--color-text)">Mouse selection needs no chord.</strong> Drag to select — it copies on release. Double-click a word, triple-click a line, Shift+click extends. It goes straight to the system clipboard, over SSH too (OSC 52). <code style="font-family:var(--font-mono);font-size:0.9em">Alt+c</code> is only for scrollback, or panes where the app underneath already owns the mouse.</p>
     <div class="keys-grid">
       <div class="keycell"><kbd>Alt+n</kbd><span>new pane</span></div>
       <div class="keycell"><kbd>Alt+Enter</kbd><span>quick-launch picker</span></div>
-      <div class="keycell"><kbd>Alt+←↓↑→ / hjkl</kbd><span>move focus</span></div>
+      <div class="keycell"><kbd>Alt+←↓↑→ / hjkl</kbd><span>move focus, ←→ crosses tabs at an edge</span></div>
       <div class="keycell"><kbd>Alt+Shift+arrow</kbd><span>resize pane</span></div>
       <div class="keycell"><kbd>Alt+s</kbd><span>stack ⇄ explode</span></div>
       <div class="keycell"><kbd>Alt+o</kbd><span>flip orientation</span></div>
       <div class="keycell"><kbd>Alt+g</kbd><span>cycle layouts</span></div>
       <div class="keycell"><kbd>Alt+z</kbd><span>zoom pane</span></div>
       <div class="keycell"><kbd>Alt+f</kbd><span>float scratch pane</span></div>
-      <div class="keycell"><kbd>Alt+a</kbd><span>jump to needs-input</span></div>
+      <div class="keycell"><kbd>Alt+a</kbd><span>jump to needs-input, else next waiting</span></div>
       <div class="keycell"><kbd>Alt+Shift+a</kbd><span>fleet roster</span></div>
       <div class="keycell"><kbd>Alt+e</kbd><span>activity feed</span></div>
       <div class="keycell"><kbd>Alt+r</kbd><span>rename pane</span></div>
