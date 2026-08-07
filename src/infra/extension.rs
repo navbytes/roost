@@ -8,8 +8,24 @@
 //!
 //! On startup we install/update both automatically, but only when the tool
 //! is actually set up (we never create `~/.pi` or `~/.claude` ourselves), and
-//! only when the on-disk copy is missing or differs. Opt out with
-//! `ROOST_NO_EXT_INSTALL`.
+//! only when the on-disk copy is missing or differs. Two independent knobs
+//! suppress this entirely — see `ext_install_disabled`:
+//! - `ROOST_NO_EXT_INSTALL`: user-facing — "I manage this myself".
+//! - `ROOST_TEST_NO_HOST_IO` (`infra::host_io_disabled`): machine-facing —
+//!   "this run must not touch anything outside itself", already set on every
+//!   roost `tests/harness/mod.rs` spawns.
+//!
+//! Both functions write into the operator's real, often dotfiles-managed
+//! `~/.pi`/`~/.claude` regardless of `ROOST_STATE` — an isolated *workspace*
+//! is not an isolated *machine*, so `ROOST_STATE` alone does not suppress
+//! this (deliberate: someone running two concurrent, equally-real roost
+//! fleets on one box, each with its own `ROOST_STATE`, still wants both
+//! wired to the one real Claude Code config on that machine; overloading
+//! `ROOST_STATE` to also mean "and don't touch my global config" would
+//! silently break that, with no opt-in back on). `ROOST_TEST_NO_HOST_IO`
+//! already exists to mean exactly "don't touch anything outside this
+//! process" — that's the knob for a harness/orchestrator that wants
+//! isolation, not a second meaning grafted onto `ROOST_STATE`.
 //!
 //! - pi: a single file we own outright (`~/.pi/agent/extensions/roost.ts`) —
 //!   compare-and-overwrite, see `ensure_pi_extension`.
@@ -19,13 +35,23 @@
 
 use std::path::{Path, PathBuf};
 
+/// Whether either install path (`ensure_pi_extension`, `ensure_claude_hooks`)
+/// must no-op — see the module doc for what each of the two knobs means.
+/// Checked before either function even resolves `dirs::home_dir()`, not just
+/// before it writes: the bug this exists to fix was a real, global
+/// `~/.claude/settings.json` getting mutated by a run that believed
+/// `ROOST_STATE`+`ROOST_TEST_NO_HOST_IO` made it isolated.
+fn ext_install_disabled() -> bool {
+    std::env::var_os("ROOST_NO_EXT_INSTALL").is_some() || super::host_io_disabled()
+}
+
 /// The extension source, embedded at build time so the binary is self-contained.
 const BUNDLED: &str = include_str!("../../extensions/roost.ts");
 
 /// Ensure `~/.pi/agent/extensions/roost.ts` matches this build. Returns a short
 /// message to surface when it installed or updated the file, else None.
 pub fn ensure_pi_extension() -> Option<String> {
-    if std::env::var_os("ROOST_NO_EXT_INSTALL").is_some() {
+    if ext_install_disabled() {
         return None;
     }
     let agent_dir = dirs::home_dir()?.join(".pi").join("agent");
@@ -61,7 +87,7 @@ pub fn ensure_pi_extension() -> Option<String> {
 /// json` is user-owned, so this merges instead of overwriting; see
 /// `merge_claude_hooks`.
 pub fn ensure_claude_hooks() -> Option<String> {
-    if std::env::var_os("ROOST_NO_EXT_INSTALL").is_some() {
+    if ext_install_disabled() {
         return None;
     }
     let claude_dir = dirs::home_dir()?.join(".claude");
@@ -652,5 +678,77 @@ mod tests {
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "file mode was not preserved through the atomic write");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fixture `$HOME` with both `.pi/agent` and `.claude` present — ready to
+    /// receive an install — so a test run against it proves whichever gate
+    /// is under test is what stopped the write, not "tool not present" (the
+    /// other, unrelated reason both `ensure_*` functions no-op).
+    fn ready_fixture_home(name: &str) -> PathBuf {
+        let dir = scratch_dir(name);
+        std::fs::create_dir_all(dir.join(".pi").join("agent")).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        dir
+    }
+
+    /// Run `f` with `$HOME` pointed at `home`, restoring the real value (or
+    /// absence) before returning. Same bare set/restore shape as
+    /// `core::app`'s `stale_session_falls_back_to_fresh_launch` fixture —
+    /// no crate-wide lock serializes `$HOME` mutation against other tests in
+    /// this binary there, and none is added here either; see that test's own
+    /// note. `ensure_pi_extension`/`ensure_claude_hooks` read `$HOME` once
+    /// per call, uncached, exactly like `host_io_disabled` reads its env var
+    /// — so this is trusted regardless of how many times it runs.
+    fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let real_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        let result = f();
+        match real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        result
+    }
+
+    /// The isolation gap this fix closes: `ROOST_STATE` + the old
+    /// `ROOST_NO_EXT_INSTALL`-only gate let a run that followed the
+    /// documented `ROOST_STATE=... ROOST_TEST_NO_HOST_IO=1 roost` isolation
+    /// recipe silently write into the operator's real `~/.pi`/`~/.claude`.
+    /// Both phases run in one test (rather than two) so this file's own
+    /// `$HOME` mutation can't race itself; it can still race `core::app`'s
+    /// or `clipboard`'s own env-mutating unit tests elsewhere in this same
+    /// binary — a pre-existing, accepted risk, not one this test adds.
+    #[test]
+    fn host_io_gate_blocks_both_installs_even_when_both_tools_are_present() {
+        let home = ready_fixture_home("host-io-gate");
+        std::env::remove_var("ROOST_NO_EXT_INSTALL");
+
+        // Phase 1: gate on, ROOST_NO_EXT_INSTALL deliberately left unset —
+        // a pass here proves ROOST_TEST_NO_HOST_IO alone is sufficient.
+        std::env::set_var("ROOST_TEST_NO_HOST_IO", "1");
+        let (pi_gated, claude_gated) =
+            with_home(&home, || (ensure_pi_extension(), ensure_claude_hooks()));
+        assert!(pi_gated.is_none(), "pi extension installed despite the gate: {pi_gated:?}");
+        assert!(
+            claude_gated.is_none(),
+            "Claude Code hooks installed despite the gate: {claude_gated:?}"
+        );
+        assert!(!home.join(".pi/agent/extensions/roost.ts").exists(), "pi extension file written");
+        assert!(!home.join(".claude/settings.json").exists(), "settings.json written");
+
+        // Phase 2 (positive control): identical fixture, gate off, must
+        // actually install — proves phase 1 passed *because of* the gate,
+        // not because the fixture was never "ready" (e.g. a typo'd path).
+        std::env::remove_var("ROOST_TEST_NO_HOST_IO");
+        let (pi_msg, claude_msg) =
+            with_home(&home, || (ensure_pi_extension(), ensure_claude_hooks()));
+        let pi_msg = pi_msg.expect("pi extension should install once the gate is off");
+        assert!(pi_msg.contains("installed"), "{pi_msg}");
+        let claude_msg = claude_msg.expect("claude hooks should install once the gate is off");
+        assert!(claude_msg.contains("installed"), "{claude_msg}");
+        assert!(home.join(".pi/agent/extensions/roost.ts").exists());
+        assert!(home.join(".claude/settings.json").exists());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
