@@ -116,14 +116,21 @@ change · **[descoped]** decided against unless a use-case demands it.
   combination and focus-permutation axes (C30, the roster filter, C7)
   aren't enum-shaped and stay a human-must-remember list.
 
-## Control interface — remaining
+## Control interface — shipped
 
 The interface is complete via the CLI (`list/status/spawn/fork/send/read/close/
-wait`, ownership-scoped, audit-logged, CSPRNG control token). Left:
+wait`, ownership-scoped, audit-logged, CSPRNG control token).
 
-- **[choice] Per-principal connection/rate cap.** Today there's a global 64-conn
-  cap; the design (§5.6) wanted a per-principal cap + command rate limit so one
-  pane can't open many connections and starve a legitimate orchestrator.
+- ~~**[choice] Per-principal connection/rate cap.**~~ **DONE 2026-08-07.** A
+  global 64-connection cap plus a per-principal cap of 20 connections (enforced
+  in `src/infra/sock.rs`, DESIGN-control.md §5.6, audit M3): so one pane can't
+  open many connections and starve a legitimate orchestrator. The per-principal
+  floor is pinned to support `app.rs`'s `MAX_WAITS` (16 parked wait commands
+  hold one connection each) with headroom for other commands alongside.
+
+## Control interface — remaining
+
+Left:
 - **[choice] Human-consent gate on reads.** Reads are ownership-scoped but not
   consented; the design (§5.5) noted "the model can see any screen it owns" is a
   different consent posture than managing layout.
