@@ -68,13 +68,26 @@ impl Harness {
         workspace_json: &str,
         envs: &[(&str, &str)],
     ) -> Result<Self, String> {
+        Self::try_spawn_sized(workspace_json, envs, ROWS, COLS)
+    }
+
+    /// Like `try_spawn_with_env`, but at an explicit PTY geometry instead of
+    /// the shared `ROWS`x`COLS` default — the seam a golden-frame scenario
+    /// needs to drive a size no other tenant uses (e.g. C30's sub-two-row
+    /// notice, which only pre-empts chrome below a 2-row floor).
+    pub fn try_spawn_sized(
+        workspace_json: &str,
+        envs: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self, String> {
         let state_dir = fresh_state_dir();
         std::fs::write(state_dir.join("workspace.json"), workspace_json)
             .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
 
         let pty = native_pty_system();
         let pair = pty
-            .openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("no functional PTY available: {e}"))?;
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_roost"));
@@ -155,7 +168,7 @@ impl Harness {
             child,
             writer,
             rx,
-            parser: vt100::Parser::new(ROWS, COLS, 0),
+            parser: vt100::Parser::new(rows, cols, 0),
             state_dir,
             raw,
         })
