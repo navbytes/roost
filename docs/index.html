@@ -85,9 +85,15 @@
             <rect x="40" y="150" width="320" height="190" fill="none" style="stroke:var(--color-text);stroke-width:2"/>
           </g>
           <!-- The roost bird, verbatim from the client's concept SVG (2026-08-07),
-               translated y-95 so its feet land on this window's title bar. The
-               mascot palette is the client's own and intentionally sits outside
-               the site's three-hue tokens (like Ferris is orange on rust-lang.org). -->
+               translated y-95 so its feet land on this window's title bar, and
+               x+85 so the draped tail falls on the bar's empty stretch instead of
+               across the window title. The mascot palette is the client's own and
+               intentionally sits outside the site's three-hue tokens (like Ferris
+               is orange on rust-lang.org). -->
+          <!-- translate lives on this wrapper, NOT on .bird-breathe: the breathe
+               keyframes set `transform` in CSS, which would override an attribute
+               transform on the same node and snap the bird back left. -->
+          <g transform="translate(85,0)">
           <g class="bird-breathe">
             <path d="M 200 145 Q 170 175 190 185 Q 215 175 200 145" fill="#CC3333"/>
             <path d="M 185 145 L 180 150" stroke="#FFA500" stroke-width="3" stroke-linecap="round" fill="none"/>
@@ -107,6 +113,7 @@
               <circle cx="224" cy="78" r="2" fill="#FFFFFF"/>
             </g>
             <path d="M 192 93 L 208 93 L 200 105 Z" fill="#FFA500" stroke="#FF8C00" stroke-width="1" stroke-linejoin="round"/>
+          </g>
           </g>
         </svg>
       </div>
