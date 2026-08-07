@@ -61,7 +61,7 @@ Stated directly by the client; these outrank findings the team inferred.
   64 in seconds. Fix: reply `{"err":…}` whenever a line has a `method` key
   but fails to deserialize; add `set_read_timeout(30s)`; log the shed
   (sock.rs:148–149, 176–202). [rev P0]
-- ☐ **A terminal resize can kill the entire fleet.** ratatui-core 0.1.2
+- ✅ **(PR #56) A terminal resize can kill the entire fleet.** ratatui-core 0.1.2
   changed `Terminal::clear()` to query the cursor (`ESC[6n`, blocks up to
   2 s); arrived via patch bump under the `ratatui = "0.30"` pin. On a host
   that doesn't answer DSR (nested muxes, some CI/serial terminals, dropped
@@ -69,7 +69,7 @@ Stated directly by the client; these outrank findings the team inferred.
   Err → `shutdown()` SIGKILLs every pane. Reproduced. Fix: don't propagate a
   cosmetic clear; count consecutive draw/size failures and bail only after
   N. [rev P1-1, treated as P0 — it destroys user work]
-- ☐ **Socket listener failure silently swallowed** (main.rs:238 `.ok()`) —
+- ✅ **(PR #56) Socket listener failure silently swallowed** (main.rs:238 `.ok()`) —
   roost looks normal with no control plane at all: no $ROOST_SOCK in panes,
   extension/hooks never report status, no audit log, every `roost <verb>`
   fails. Hit accidentally with a 112-char state dir (macOS sun_path limit
@@ -87,7 +87,7 @@ Stated directly by the client; these outrank findings the team inferred.
 Control-CLI contract fixes — an orchestrator must be able to trust what
 roost tells it [ux, handoffs/ux-audit.md]:
 
-- ☐ **`roost spawn` returns ok for a failed spawn** (still open) — PTY failure lands
+- ✅ **(PR #54) `roost spawn` returns ok for a failed spawn** — verified shipped by the exit audit (`dead_reason` in the spawn reply, `error` in `pane_json`, feed line) — PTY failure lands
   async in `App::dead`, invisible to the socket; status says only
   `exited`, orchestrators retry forever (app.rs:1593–1607, 916–918).
   Make the failure readable: reason in `status`/reply + feed. [ux P0-2]
@@ -101,7 +101,7 @@ roost tells it [ux, handoffs/ux-audit.md]:
   orchestrator-hostile bug found. `--help` also prints to stderr. Hard error
   on unknown verbs; help/version on stdout; never panic off-tty
   (cli.rs:27–32). [ux P1-8 + qa QA-1/QA-4]
-- ☐ **`roost spawn --cwd <nonexistent>` returns success and lies** — replies
+- ✅ **(PR #54) `roost spawn --cwd <nonexistent>` returns success and lies** — replies
   `{"pane":2}` exit 0, silently launches in `$HOME`, and `roost list` keeps
   reporting the *requested* cwd while the process runs elsewhere. An
   orchestrator spawning into a mistyped path gets no error and a worker in
@@ -129,7 +129,7 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
   `ctl_send` don't (app.rs:1643, 1716, 1114). Any token-reading agent can
   `roost read` the human's private scratch shell. Fix: same `is_float`
   refusal. Also README:311 wrongly claims broadcast reaches the float. [sec M1]
-- ☐ **M3: no per-principal connection/rate cap** (NOT in #37 — still open) — one pane opens all 64
+- ✅ **(PR #57, 5 rounds) M3: no per-principal connection/rate cap** (NOT in #37 — still open) — one pane opens all 64
   conns (or 16 waits) and locks out the human + the real orchestrator; it is
   also the enabler for M2's audit-log rolling. Per-token conn cap (~8) +
   token bucket on resolved Actor (sock.rs:148, app.rs:224). [sec M3,
@@ -141,7 +141,7 @@ Security fixes — verdict is **fix-first**, minimum-to-ship is H1+M1+M3
   panes then inherit roost's own env, so a nested roost hands children the
   *outer* live token (main.rs:238, app.rs:4498). `env_remove`
   unconditionally. [sec L3]
-- ☐ **M2: audit log is not tamper-evident** against a same-uid pane
+- ✅ **(PR #59) M2: audit log is not tamper-evident** against a same-uid pane
   (truncate, or flood to force double rotation). Fix M3 first, then either
   an out-of-process sink (`ROOST_AUDIT_FD`/syslog) or — minimum — document
   the log as advisory against same-uid. [sec M2]
@@ -179,13 +179,13 @@ requirement.
   cell/char mixup that copied the *wrong text* on any row with a CJK or
   emoji character — fixed at the shared tokenizer, so `find_url_at`
   benefited too.
-- ☐ README: state plainly which native gestures work and where roost
+- ✅ **(PR #52)** README states plainly which native gestures work and where roost
   deliberately stays out of the emulator's way — its "Selecting text"
   section still says copy mode is the only way. [now stale, PR #46]
 
 ## Phase 2 — UX quick wins
 
-- ☐ **Spawn-failure error drops the why** — anyhow Display keeps the outer
+- ✅ **(PR #54) Spawn-failure error drops the why** — anyhow Display keeps the outer
   context only; ENOENT/EACCES discarded one call before display. `{:#}`
   chain format (pty.rs:411, app.rs:917). [roadmap + ux P0-3]
 - ☐ **macOS Option-trap hint mistimed** — 8s launch-anchored window
@@ -195,12 +195,12 @@ requirement.
 - ✅ **(PR #39) README states the detach cost honestly** + sanctioned run-under-tmux
   recipe for SSH; extend busy-quit confirm to the hangup path
   (app.rs:3059). [ux P0-1]
-- ☐ Picker offers adapters not on PATH → guaranteed dead pane; annotate or
+- ✅ **(PR #54)** Picker offers adapters not on PATH → guaranteed dead pane; annotate or
   filter by `which` (app.rs:41). [ux P2-13]
 - ✅ **(PR #42)** Help overlay never mentions the control CLI
   (`roost send <id>`) — the category differentiator was invisible
   in-product (render.rs:680–747). [ux P2-15]
-- ☐ "copy failed" flash names neither cause nor next step (app.rs:2164).
+- ✅ **(PR #54)** "copy failed" flash names neither cause nor next step (app.rs:2164).
   [ux P3-17]
 - ✅ **(PR #39)** README: "`roost --help` prints this same reference" is only approximately
   true — same verbs, different order/format (README.md:293–306 vs cli.rs
@@ -215,7 +215,7 @@ requirement.
   dead on the recommended terminal. Needs a human at a real iTerm2 for 30
   seconds; if confirmed, re-home the gesture off Option on macOS.
   [ux, DECISIONS D11 — NEEDS CLIENT]
-- ☐ Room-exhaustion flashes should point at Alt+s/stacks as the exit.
+- ✅ **(PR #54)** Room-exhaustion flashes point at Alt+s/stacks as the exit.
   [ux P3-18]
 - ✅ **(PR #42)** <2-row terminals render blank; show a "too small" notice
   (render.rs:24–26). [ux P3-16]
@@ -232,13 +232,13 @@ requirement.
   the `.bak` published a 0600 file at 0644.
   **Still open:** let the Alt+a ring fall through to Waiting-after-Working
   when no ◆ exists (status.rs:176–187) — the other half of P1-5.
-- ☐ **Relay the BEL** — heuristic ◆ transitions never reach the host bell;
+- ✅ **(PR #58) Relay the BEL** — heuristic ◆ transitions never reach the host bell;
   README's "rings the bell" is false in the exact fallback case it serves
   (ports.rs:59–62, main.rs:366,385). [ux P1-6]
-- ☐ **Roster urgency ordering** — sort worst-first, optional status filter;
+- ✅ **(PR #58) Roster urgency ordering** — sort worst-first, optional status filter;
   turns Alt+Shift+a into the fleet dashboard at zero column cost
   (app.rs:3481–3487). [ux P2-11, top-5 bet]
-- ☐ · idle vs ○ waiting collapses at first byte — every shell at a prompt
+- ✅ **(PR #58)** · idle vs ○ waiting collapses at first byte — every shell at a prompt
   reads "your turn"; rethink Idle survival (status.rs:176–186). [ux P2-10]
 - ☐ N2/N4 silent no-ops (Alt+o outside split; Alt+←/→ in stack) vs the
   every-no-op-flashes rule. [ux P2-14, SPEC-ux]
@@ -267,7 +267,7 @@ resurrection are already category-leading; what's missing is reach
   `~/.codex/sessions/YYYY/MM/DD/`. Cleanest, highest-payoff new adapter. [res: HIGH]
 - ✅ **(PR #40) gemini CLI adapter** — `gemini --resume <uuid>`, project-scoped
   history. [res: HIGH]
-- ☐ **opencode adapter** — `--session <id>`; defend against sst/opencode#2086
+- ✅ **(PR #53) opencode adapter** — `--session <id>`; defend against sst/opencode#2086
   (`--continue` can grab a subagent thread — always resume by explicit id). [res: MED]
 - ☐ **`roost spawn --worktree` (opt-in)** — create/enter a git worktree per
   pane; neutralizes claude-squad's headline differentiator without lifecycle
@@ -294,6 +294,66 @@ resurrection are already category-leading; what's missing is reach
   like shell. Revisit if demand shows. [res]
 - ❌ Synchronized panes / session groups / plugin-WASM extensibility —
   classic-multiplexer table stakes not demanded by fleet users. [res: LOW]
+
+## Exit-wave findings (2026-08-07) — open
+
+From the closing verify wave. The UX advisor's headline: *"the product is
+done enough that the biggest remaining risk is your own bookkeeping, not the
+code"* — twenty-one items above were marked open while actually shipped, now
+corrected against the code rather than against this file.
+
+**UX exit audit** (handoffs/, ux-expert):
+- 🔨 **F1 [major] The Option-key warning accuses healthy terminals.** Fires
+  within 8s of *any* keystroke on a correctly-configured terminal, and
+  pre-empts the flash so a copy in those seconds shows nothing — while the
+  read-first user it exists for (first Alt press at t=40s) still never sees
+  it. Trigger is "wrong time"; it must be "wrong terminal". [in flight]
+- 🔨 **F6 [mod] Known flags with a *missing value* are still silently
+  dropped.** `read 5 --tail` returns the screen; `wait 5 --timeout` silently
+  takes the default. Unknown flags were fixed; this is the same class.
+  `--tail $N` with an unset variable is how a script hits it. [in flight]
+- 🔨 **F2 [mod] The hint bar and `Alt+a` disagree**, and three places claim
+  they can't (app.rs:3723's doc, README:213–217, C9's omit-at-zero rule).
+  The ring falls back to Waiting; the count is ◆-only. [in flight]
+- 🔨 **F3 [mod] The Waiting tier never empties** — visiting a pane doesn't
+  clear it, so `Alt+a` becomes an endless round-robin at the fleet size the
+  feature exists for. [in flight]
+- ☐ **F4 [mod] Selection is anchored to screen coordinates, not content** —
+  output arriving mid-drag scrolls the grid under the anchor, so the
+  clipboard gets something other than what was highlighted. Contracted in
+  C29 as deliberate; the advisor argues the core case ("copy the path the
+  agent just printed, while it's still streaming") makes it wrong. Also: no
+  auto-scroll past the pane edge, so a selection can never exceed one
+  screenful. **Needs a decision, not just a fix.**
+- 🔨 F5 [minor] double-click's staged copy can vanish silently; F7 [minor]
+  `Alt+→` silently no-ops in two cases while the same key teleports in
+  others; F8 [copy] picker says "gone" for a never-installed adapter.
+  [in flight]
+
+**Design-supervisor exit audit** — 0 chrome deviations, DESIGN-ui.md judged a
+truthful description of what roost draws. But:
+- ☐ **A fifth vacuous surface: the scrolled/frozen chrome.** No fixture or
+  PTY scenario ever sets `scroll_offset > 0` (the scroll-mode fixture enters
+  at offset 0), so the §2 whole-frame gates are vacuous over the badge's
+  `↑N` token, the hint bar's `↑N/M` segment, and the C5/N1 pulse and cursor
+  suppression. Each is unit-tested in isolation but never rendered through
+  `draw()` — exactly the shape of the four already closed, and this one is
+  normal-use chrome, not an edge state. `FakePane::scroll_by` exists, so it
+  is trivially fixture-reachable.
+- ☐ **A sixth, gate-shaped:** `every_bound_chord_is_documented_in_the_keymap`
+  compares a **hardcoded array** against `HELP_GROUPS` and reads neither §8
+  nor `translate()` — while §8 calls it "the check that the two agree". Its
+  list omits `Alt+←↓↑→` and `Alt+Shift+m`. Content is fine today; the gate
+  simply wouldn't notice if it weren't.
+- ☐ Weak link in the new mode gate: it asserts a fixture *name substring*, so
+  a misnamed fixture would satisfy it.
+- ☐ **SPEC-GAP-A:** the 2026-08-07 §8 amendment paragraph sits *between* rows
+  20 and 21, so `Alt+q` falls out of the rendered markdown table.
+- ☐ **SPEC-GAP-B:** live `file:line` pointers inside Targets/amendments have
+  drifted wholesale (e.g. `needs_input_count` cited at app.rs:526 vs 1274).
+  Documentation-side only.
+- ☐ ROADMAP's "human must remember" list is accurate but **incomplete** — the
+  pane view-state axis (scrolled/frozen) is a fourth non-enum axis, unlisted.
 
 ## Known issues — carried, not fixed
 
@@ -325,19 +385,19 @@ resurrection are already category-leading; what's missing is reach
 Spec hygiene from the design-supervisor audit of PR #42 — neither is
 user-visible drift, both block "specs are the truth" at exit:
 
-- ☐ **C15 has eight groups in code, seven in the spec.** The justifying
+- ✅ **(PR #52) C15 has eight groups in code, seven in the spec.** The justifying
   amendment for the new CONTROL CLI group was written into a source
   doc-comment (render.rs:700–712) instead of a dated C15 amendment in
   DESIGN-ui.md:1285–1287. U23's precedent is unambiguous: reference rows
   got a dated amendment. Add one. [design-supervisor SG]
-- ☐ **Write a contract for the sub-two-row surface.** Confirmed there is no
+- ✅ **(PR #52, as C30) Write a contract for the sub-two-row surface.** Confirmed there is no
   contract governing `height < 2` — every floor mention in DESIGN-ui.md is
   a *sizing target* for an overlay/rail/split, and §7's exclusion list
   omits it. Contract shape: trigger `area.height < 2`; one line
   `too small — resize` in `ink()`, no bg, no glyph; `Paragraph` clips
   rather than wraps; zero dimensions draw nothing; it preempts all chrome
   and all modals (C12 never runs). [design-supervisor SG-1]
-- ☐ **A §2 gate passes vacuously over the new surface.** `chrome_buffers()`
+- ✅ **(PR #52/#61) A §2 gate passes vacuously over the new surface.** `chrome_buffers()`
   (render.rs:3322–3398) builds every state at 100×30, so the three
   render-buffer gates never see the too-small path — while DESIGN-ui.md:
   181–183 claims they cover "every cell of every drawn chrome state". The
@@ -346,11 +406,11 @@ user-visible drift, both block "specs are the truth" at exit:
 
 - ☐ Dependency inversion: `core` imports `ui::Action` + raw crossterm key
   types; arrow should point ui → core. [roadmap: health]
-- ☐ Extract `SessionResolver` from app.rs private methods. [roadmap: health]
-- ☐ Scope pi `session_state` walk to the cwd (O(all sessions) per spawn
+- ✅ **(PR #62)** Extract `SessionResolver` from app.rs private methods. [roadmap: health]
+- ✅ **(PR #55)** Scope pi `session_state` walk to the cwd (O(all sessions) per spawn
   today). [roadmap: perf]
 - ☐ PTY read coalescing (64 KiB per-read batching). [roadmap: perf]
-- ☐ Golden-frame *color* scenarios for the vt100 harness — trigger was
+- ✅ **(PR #61)** Golden-frame *color* scenarios for the vt100 harness — trigger was
   "next engagement leaning on src/ui/render.rs", which this engagement
   likely is. [roadmap]
 
