@@ -1,5 +1,27 @@
 # PLAN.md — the living phased plan
 
+> **Archived 2026-08-07.** The engagement is complete: 40 PRs merged, tests
+> 553 → 742 unit plus 26 integration binaries, CI green on both runners.
+> Summary and evidence in `REPORT.md`; calls made autonomously in
+> `DECISIONS.md`; the five audit reports in `handoffs/`.
+>
+> **Still open when archived**, deliberately and recorded rather than
+> quietly dropped:
+> - `spawn --worktree` — the one real feature gap the UX advisor named
+>   against claude-squad. Nothing architectural blocks it.
+> - **Both** promotion doors need `Actor` validation (DESIGN-control.md
+>   §5.6). Gating only the control-request door would close half the gap
+>   while reading as closing all of it.
+> - Selection anchors to screen coordinates, not content — contracted as
+>   deliberate in C29; the advisor argues the streaming-output case makes
+>   it wrong. Needs a decision, not a fix.
+> - A minimal config file — the zero-config stance has no escape hatch for
+>   the `Alt+f`/`b`/`d` readline collisions or a motion opt-out.
+> - `Alt`+click on iTerm2 — needs 30 seconds at a real iTerm2; Option is
+>   iTerm2's own bypass gesture, so the click may never reach roost.
+> - One PR (`fix/oversize-message`) was still red on Linux at archive time
+>   — a platform-dependent socket-buffer assumption, under repair.
+
 The single ledger for the best-in-class engagement. Every issue, gap, and
 UI/UX gap found lands here with a phase assignment; nothing leaves except by
 shipping (✅ + PR#) or descoping (❌ + rationale). Newest findings get
