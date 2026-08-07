@@ -1235,22 +1235,27 @@ impl<B: PaneBackend> App<B> {
     /// ranking is unchanged (U13's order, verbatim), which is why the count
     /// rides along here rather than in a second function that could disagree
     /// with it about which state won.
+    ///
+    /// [Amended, ux P2-10, design-supervisor D1] Reads `display_status`, not
+    /// the raw runtime status: the badge and the roster already did, so a
+    /// one-shell workspace used to draw `○` on the tab bar and `·` on the
+    /// badge in the *same frame* — C5 is one table for every chrome surface
+    /// that shows status, tab bar included, and this was the exact
+    /// same-frame disagreement C27's own D1 amendment treats as the defect
+    /// that forced a single source. `None` (not spawned) still buckets as
+    /// `unknown`, `Some(Exited)` still as `exited` — `display_status` only
+    /// ever touches the `Waiting` rung, so both map onto today's rungs 1:1.
     pub fn tab_summary(&self, tab_index: usize) -> (TabSummary, usize) {
         let Some(tab) = self.ws.tabs.get(tab_index) else { return (TabSummary::Quiet, 0) };
         let (mut unknown, mut needs, mut working, mut waiting, mut exited) = (0, 0, 0, 0, 0);
         for id in tab.panes.keys() {
-            match self.runtimes.get(id) {
-                Some(rt) => match rt.status() {
-                    AgentStatus::NeedsInput => needs += 1,
-                    AgentStatus::Working => working += 1,
-                    AgentStatus::Waiting => waiting += 1,
-                    AgentStatus::Exited => exited += 1, // U13
-                    AgentStatus::Idle => {}
-                },
-                // No runtime and not a known spawn-failure ⇒ not spawned yet.
-                None if !self.dead.contains_key(id) => unknown += 1,
-                // A recorded spawn failure is a dead pane too (U13).
-                None => exited += 1,
+            match self.display_status(*id) {
+                Some(AgentStatus::NeedsInput) => needs += 1,
+                Some(AgentStatus::Working) => working += 1,
+                Some(AgentStatus::Waiting) => waiting += 1,
+                Some(AgentStatus::Exited) => exited += 1, // U13
+                Some(AgentStatus::Idle) => {}
+                None => unknown += 1, // not spawned yet
             }
         }
         if needs > 0 {
@@ -5752,6 +5757,11 @@ mod tests {
     fn tab_summary_reports_exited_and_ranks_it_between_waiting_and_quiet() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1 | 2 in one tab
+        // Pane 2 is a real agent, not the default shell: this test is U13's
+        // "a live agent outranks a corpse" ranking, and U13 is silent on
+        // shells — a shell's Waiting would read Idle (P2-10) and never
+        // exercise the Waiting rung this test means to pin.
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
         assert_eq!(app.tab_summary(0).0, TabSummary::Quiet);
 
         app.runtimes.get_mut(&1).unwrap().kill(); // pane 1 dies
@@ -5782,6 +5792,19 @@ mod tests {
         app.runtimes.remove(&id);
         app.dead.insert(id, "spawn-fail requested".into());
         assert_eq!(app.tab_summary(0).0, TabSummary::Exited);
+    }
+
+    /// [design-supervisor D1] The default one-shell workspace must not draw
+    /// `○` on the tab bar while the badge/roster (both `display_status`)
+    /// draw `·` for the very same pane in the very same frame — C5 is one
+    /// table for every chrome surface that shows status, tab bar included.
+    #[test]
+    fn tab_summary_reads_a_quiet_shells_waiting_as_quiet_not_waiting() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.tab_summary(0).0, TabSummary::Quiet, "a shell's Waiting is not tab-bar news");
+        assert_eq!(app.display_status(id), Some(AgentStatus::Idle), "same answer the badge/roster read");
     }
 
     /// [ux P2-10] A quiet shell's heuristic `Waiting` reads `Idle` through
