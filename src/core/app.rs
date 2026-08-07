@@ -3368,10 +3368,17 @@ impl<B: PaneBackend> App<B> {
                 .find(|p| p.id == self.focused)
                 .is_some_and(|p| p.rect.width == self.body_area().width);
         if spans_full_width {
+            // F7 (exit UX audit 2026-08-07): this same key teleports across
+            // tabs at a real edge — a silent refusal here reads as broken,
+            // not deliberate. roost's own rule is every no-op flashes.
+            self.set_flash("full-width pane — nothing to cross into");
             return;
         }
         let n = self.ws.tabs.len();
         if n < 2 {
+            // F7: same reasoning as `move_pane_to_tab`'s identical refusal —
+            // reuse its wording so the two read as one rule, not two.
+            self.set_flash("only one tab");
             return; // C31: only when more than one tab exists
         }
         let next = (self.ws.active_tab as isize + delta).rem_euclid(n as isize) as usize;
@@ -10770,6 +10777,12 @@ mod tests {
 
     /// Below two tabs this is exactly the pre-existing dead end: `neighbor`
     /// finds nothing and C31 declines to fire at all.
+    ///
+    /// [Amended F7, exit UX audit 2026-08-07] The same key teleports across
+    /// tabs at a real edge, so a refusal here must be visible, not silent —
+    /// roost's own rule is every no-op flashes. Reuses `move_pane_to_tab`'s
+    /// identical "only one tab" wording (its `n < 2` refusal is the same
+    /// shape) so the two read as one rule instead of two.
     #[test]
     fn cross_tab_focus_is_a_no_op_with_only_one_tab() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10777,6 +10790,7 @@ mod tests {
         app.apply(Action::Focus(layout::Dir::Right));
         assert_eq!(app.ws.tabs.len(), 1);
         assert_eq!(app.focused, 2, "a lone tab's edge stays a dead end");
+        assert_eq!(app.flash(), Some("only one tab"), "the no-op must be visible");
     }
 
     /// Design decision: only `Left`/`Right` pick up tab-switching semantics.
@@ -10790,9 +10804,13 @@ mod tests {
         app.apply(Action::Focus(layout::Dir::Up));
         assert_eq!(app.ws.active_tab, tab_before, "Up must never switch tabs, even at an edge");
         assert_eq!(app.focused, pane_before);
+        // F7's flash is scoped to Left/Right's new cross-tab refusals only —
+        // Up/Down's dead end predates C31 and is out of this fix's scope.
+        assert_eq!(app.flash(), None);
         app.apply(Action::Focus(layout::Dir::Down));
         assert_eq!(app.ws.active_tab, tab_before, "…nor Down");
         assert_eq!(app.focused, pane_before);
+        assert_eq!(app.flash(), None);
     }
 
     /// [Fixed 2026-08-07, design audit] `neighbor == None` is not the same
@@ -10802,6 +10820,11 @@ mod tests {
     /// the audit's own repro, `Alt+n`, `Alt+o`, `Alt+n`, from a single
     /// pane. Neither key may leave the tab from it; a pane that genuinely
     /// owns the tab's edge, in that same layout, still does.
+    ///
+    /// [Amended F7, exit UX audit 2026-08-07] The refusal above must flash
+    /// — before this it was indistinguishable from Alt+→ simply not being
+    /// bound, on the one key that visibly does something everywhere else in
+    /// the same tab.
     #[test]
     fn cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10818,9 +10841,11 @@ mod tests {
         app.apply(Action::Focus(layout::Dir::Right));
         assert_eq!(app.ws.active_tab, tab_before, "full width but not the tab's only pane — not an edge");
         assert_eq!(app.focused, 1);
+        assert_eq!(app.flash(), Some("full-width pane — nothing to cross into"));
         app.apply(Action::Focus(layout::Dir::Left));
         assert_eq!(app.ws.active_tab, tab_before);
         assert_eq!(app.focused, 1);
+        assert_eq!(app.flash(), Some("full-width pane — nothing to cross into"));
 
         // Sanity: a pane that genuinely owns the edge, in this same mixed
         // layout, is unaffected by the fix above.

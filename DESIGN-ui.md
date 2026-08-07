@@ -3073,6 +3073,25 @@ lands somewhere surprising is worse than one that predictably does nothing.
   never-visited destination — and calls `set_focus` exactly once, with the
   geometric target.
 
+**[Amended 2026-08-07, exit UX audit F7 — both refusals now flash]** The two
+`focus_dir_cross_tab` early returns above — a full-width pane, and fewer
+than two tabs — were silent: `Alt+→`/`Alt+←` visibly does something at every
+other edge in the same tab (a spatial move, or now a tab switch), so a
+no-op indistinguishable from an unbound key read as broken rather than
+deliberate. roost's own rule, stated plainly elsewhere in this document, is
+that every no-op flashes; these two were the last cross-tab-focus refusals
+that didn't. Fixed with one line each, no behavior change: the full-width
+case flashes `full-width pane — nothing to cross into`; the fewer-than-two-
+tabs case flashes `only one tab`, reusing `move_pane_to_tab`'s identical
+wording for its own `n < 2` refusal (C28) so the two read as one rule
+rather than two independently-worded ones. `Up`/`Down`'s dead end is
+unchanged and stays silent — it predates C31 and is a different,
+unaudited surface. Pinned by amending
+`cross_tab_focus_is_a_no_op_with_only_one_tab` and
+`cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane` to
+assert the flash text, and `cross_tab_focus_never_fires_for_up_or_down` to
+assert the *absence* of one — pinning the fix's scope, not just its effect.
+
 **Unit tests (`core::app::tests`):**
 `cross_tab_right_edge_lands_on_next_tabs_leftmost_pane` ·
 `cross_tab_left_edge_lands_on_previous_tabs_rightmost_pane` ·
