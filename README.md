@@ -4,7 +4,7 @@
 
 **Processes are disposable. Sessions are precious.**
 
-A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, shell) — no daemon, ever.
+A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, codex, gemini, opencode, shell) — no daemon, ever.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
@@ -327,7 +327,7 @@ Status arrives two ways:
 
 Each pane also carries a faint **corner badge**, top-right (iTerm2-style):
 `name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
-(`pi` / `claude` / `shell`) when unnamed, and the glyph is the pane's live
+(pi, claude, codex, gemini, opencode, or shell) when unnamed, and the glyph is the pane's live
 status. A cell TUI can't do true translucency, so it's rendered dim rather
 than see-through; the inner app's content still draws underneath it.
 
