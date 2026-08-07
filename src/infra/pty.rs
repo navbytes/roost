@@ -687,11 +687,11 @@ impl PaneBackend for PtyPane {
             self.status.on_bell();
             // ux P1-6: relay only the case the bell heuristic exists to
             // serve — no *live* extension report is covering this pane
-            // (`reported()`: none installed, or a resting report a bell
-            // promotes — an adapter/TUI genuinely ringing for a "needs you"
-            // its own hook can't see; NOT pi, which never emits an audible
-            // bell at all — see `StatusTracker::bell_after_ext`). Checked
-            // here rather than against
+            // (`recently_reported()`: none installed, or a resting report a
+            // bell promotes — an adapter/TUI genuinely ringing for a "needs
+            // you" its own hook can't see; NOT pi, which never emits an
+            // audible bell at all — see `StatusTracker::bell_after_ext`).
+            // Checked here rather than against
             // `current()`: `current()`'s own quiet-window grace (badges
             // don't flip to ◆ until output settles) would mask almost every
             // real case — a bell riding the same burst as its own dialog
@@ -702,7 +702,16 @@ impl PaneBackend for PtyPane {
             // notifies the bell (`on_status`'s `Notifier::notify` rings the
             // host bell of its own accord) — relaying here too would be a
             // second, redundant ring for a signal that already has one.
-            if !self.status.reported() {
+            //
+            // [F4] `recently_reported`, not `vouched_live`: this gate wants
+            // "did an extension actually say something recently", strictly
+            // time-bounded. `vouched_live` also trusts a live `ext_link`
+            // past that window (right, for the close guard it's for) — but
+            // `current()`'s own Working arm stops trusting a live-linked
+            // report the same way once it's gone stale (decays to Idle,
+            // D2), so using the link-aware check here would swallow a real,
+            // audible bell with no compensating signal at all.
+            if !self.status.recently_reported() {
                 self.queue_host_bell();
             }
         }
@@ -903,7 +912,7 @@ impl PaneBackend for PtyPane {
     }
 
     fn status_reported(&self) -> bool {
-        self.status.reported()
+        self.status.vouched_live()
     }
 
     fn set_extension_status(&mut self, s: AgentStatus) {

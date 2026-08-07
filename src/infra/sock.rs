@@ -308,6 +308,15 @@ fn parse_line(line: &str) -> Option<AppEvent> {
     };
     // Missing token → empty string, which App rejects (fails closed).
     let token = msg.token.unwrap_or_default();
+    // [F2] `parse_control` has enforced this on the control-request token
+    // since M1; status/session lines never did. Same reasoning applies here
+    // now that a token also becomes a `link_panes`/`AppEvent::ExtLink` key
+    // (D2) — an oversized one is dropped exactly like any other malformed
+    // line (`None` → the caller's `log_dropped`), before it can reach that
+    // bookkeeping at all.
+    if token.len() > MAX_TOKEN_LEN {
+        return None;
+    }
     match msg.event.as_str() {
         "session" => Some(AppEvent::Session(pane, token, msg.session?)),
         "status" => {
@@ -537,6 +546,18 @@ fn evict_one(map: &mut HashMap<String, Bucket>) {
     }
 }
 
+/// [F2] Cap on distinct panes one connection's `link_panes` will track. A
+/// real reporter — the pi extension, a Claude Code hook — serves exactly
+/// one pane for its whole life; this is a defensive bound against a
+/// buggy/malicious connection claiming to report for an unbounded number of
+/// panes (each entry is small — a `PaneId` and a token — but nothing else
+/// here caps how many distinct ones a single connection could otherwise
+/// mint). Past the cap, a line for a *new* pane on that connection still
+/// forwards its underlying status/session event exactly as before (App's
+/// own token check is what actually judges it) — only this connection's own
+/// link-liveness bookkeeping for that extra pane is skipped.
+const MAX_LINK_PANES_PER_CONN: usize = 4;
+
 /// RAII: releases whatever connection-accounting slots this connection holds
 /// when dropped — including during a panic unwind (audit finding L1).
 /// Without this, a panic partway through the read loop (e.g. a
@@ -558,6 +579,17 @@ fn evict_one(map: &mut HashMap<String, Bucket>) {
 /// this pane's link just went down". The benign `READ_TIMEOUT` retry for a
 /// status-only connection (P1, `spawn_accept_loop`) is a `continue`, not a
 /// `break`, so it never reaches here at all — no flap from that path.
+///
+/// [F1] `link_panes` being a map (keyed on pane, entry inserted at most once
+/// per connection — see the `Entry::Vacant` guard below) is exactly what
+/// makes `App::ext_link_counts` a sound refcount rather than a bool: this
+/// connection contributes at most one link-up and, here, at most one
+/// matching link-down *per pane*, no matter how many status/session lines
+/// it actually sent. A pane with two open connections (e.g. a nested
+/// claude's one-shot `roost __status` hooks alongside the pane's own
+/// long-lived pi extension link) nets to +1/-1 per connection, never more —
+/// so App's count always equals the number of connections genuinely still
+/// open for that pane.
 struct ConnGuard<'a> {
     limits: &'a Limits,
     principal: Option<String>,
@@ -1036,11 +1068,21 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                             // for a pane already in the map doesn't re-emit;
                             // the connection's liveness hasn't changed, only
                             // its status has (that's the `ev` send below).
+                            //
+                            // [F2] Past MAX_LINK_PANES_PER_CONN distinct
+                            // panes, a *new* one is skipped here — no entry,
+                            // no link-up — while `ev` itself still forwards
+                            // below exactly as it would for any other pane.
+                            // Plain contains_key+insert rather than the
+                            // Entry API: the cap check needs the *whole
+                            // map's* length, which can't be read while an
+                            // `Entry` (a mutable borrow of the same map)
+                            // is still live.
                             if let Some((pane, token)) = link_pane_token(&ev) {
-                                if let std::collections::hash_map::Entry::Vacant(e) =
-                                    guard.link_panes.entry(pane)
+                                if !guard.link_panes.contains_key(&pane)
+                                    && guard.link_panes.len() < MAX_LINK_PANES_PER_CONN
                                 {
-                                    e.insert(token.clone());
+                                    guard.link_panes.insert(pane, token.clone());
                                     let _ = tx.send(AppEvent::ExtLink(pane, token, true));
                                 }
                             }
@@ -1805,6 +1847,112 @@ mod tests {
                 "round {round}: expected link-down right after the connection closed"
             );
         }
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// [F2] A connection claiming to report for more than
+    /// `MAX_LINK_PANES_PER_CONN` distinct panes gets no further link
+    /// tracking past the cap — no entry, no link-up. The underlying
+    /// status report itself is unaffected (App's own token check judges
+    /// it, not this cap), and closing the connection proves the extra pane
+    /// really was never tracked: only the capped panes get a link-down.
+    #[test]
+    fn a_connections_link_tracking_is_capped_per_connection() {
+        let (path, listener) = scratch_listener("link-cap");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+        let mut c = connect(&path);
+
+        // Fill the cap: MAX_LINK_PANES_PER_CONN distinct panes, each earning
+        // a link-up + its status report.
+        for pane in 1..=MAX_LINK_PANES_PER_CONN as u64 {
+            c.get_mut()
+                .write_all(
+                    format!(
+                        r#"{{"pane":"{pane}","token":"t","event":"status","status":"working"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            c.get_mut().write_all(b"\n").unwrap();
+        }
+        for _ in 0..(MAX_LINK_PANES_PER_CONN * 2) {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("setup: link-up/status never arrived");
+        }
+
+        // One more pane, past the cap: the underlying report still forwards...
+        let extra_pane = MAX_LINK_PANES_PER_CONN as u64 + 1;
+        c.get_mut()
+            .write_all(
+                format!(
+                    r#"{{"pane":"{extra_pane}","token":"t","event":"status","status":"working"}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+        let ev = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the underlying status report must still forward past the cap");
+        assert!(matches!(ev, AppEvent::Status(p, ..) if p == extra_pane));
+        // ...but no link-up for it.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "past the cap, a new pane must not get link tracking"
+        );
+
+        // Closing proves it was never inserted: exactly the capped panes'
+        // link-downs arrive, never a 6th for the pane past the cap.
+        drop(c);
+        let mut downs = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while downs.len() < MAX_LINK_PANES_PER_CONN && Instant::now() < deadline {
+            if let Ok(AppEvent::ExtLink(p, _, false)) = rx.recv_timeout(Duration::from_millis(500))
+            {
+                downs.push(p);
+            }
+        }
+        downs.sort();
+        assert_eq!(
+            downs,
+            (1..=MAX_LINK_PANES_PER_CONN as u64).collect::<Vec<_>>()
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "no link-down for the pane past the cap — it was never tracked"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// [F2] A status/session line with a token past `MAX_TOKEN_LEN` is
+    /// dropped by `parse_line` itself, same as any other malformed line —
+    /// it never reaches `link_panes`, and its underlying report never
+    /// forwards either.
+    #[test]
+    fn an_oversized_token_status_line_is_dropped_before_touching_link_panes() {
+        let (path, listener) = scratch_listener("link-token-cap");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+        let mut c = connect(&path);
+
+        let long_token = "a".repeat(MAX_TOKEN_LEN + 1);
+        c.get_mut()
+            .write_all(
+                format!(
+                    r#"{{"pane":"1","token":"{long_token}","event":"status","status":"working"}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "an oversized-token status line must produce no event at all"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

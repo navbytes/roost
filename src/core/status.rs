@@ -116,31 +116,60 @@ impl StatusTracker {
         self.last_output.is_some_and(|t| t.elapsed() < ACTIVE_WINDOW)
     }
 
-    /// [U22] Is the status `current()` reports one an extension/hook actually
-    /// *reported*, or one roost inferred from PTY traffic?
-    ///
-    /// `current()` folds the two together on purpose — a badge should read
-    /// the same however roost learned it — but the destructive-close guard
-    /// cannot afford that: a hook saying "working" means a turn is in
-    /// flight, while `recent_output()` means bytes arrived, which is equally
-    /// true of `ls`. A report counts as live — and so as reported — while
-    /// its socket connection is up (`ext_link`: the strongest evidence there
-    /// is that the hook isn't dead), OR, absent that, while it's within
-    /// `STUCK_WORKING` of arriving. This can only ever be *more* permissive
-    /// than the plain elapsed check (an OR of it), so this never disagrees
-    /// with `current()` in the direction that matters for a destructive
-    /// guard: it may still call a heuristic-driven Working "reported" while
-    /// the link is live and a report is merely old, but it can never call a
-    /// truly dead hook's stale report "reported" once both conditions lapse.
-    pub fn reported(&self) -> bool {
-        let live = self.ext_link || self.ext_at.is_some_and(|t| t.elapsed() <= STUCK_WORKING);
+    /// Shared core of `vouched_live`/`recently_reported`: is the current
+    /// extension report a Working/NeedsInput one at all, and if so does
+    /// `live` — the caller's own definition of "still trustworthy" — hold?
+    /// A resting report that `current()` promoted to Working/NeedsInput was
+    /// promoted by a heuristic (fresh output, or a bell), not by the report
+    /// itself, so it never counts here either way.
+    fn reported_while(&self, live: bool) -> bool {
         match self.extension_status {
             Some(AgentStatus::Working | AgentStatus::NeedsInput) => live,
-            // A resting report that `current()` promoted to Working/NeedsInput
-            // was promoted by a heuristic (fresh output, or a bell), not by
-            // the report itself.
             _ => false,
         }
+    }
+
+    /// [U22] Is the status `current()` reports one an extension/hook
+    /// actually *reported*, or one roost inferred from PTY traffic? — for
+    /// the destructive-close guard (`PaneBackend::status_reported`)
+    /// specifically. `current()` folds the two together on purpose — a
+    /// badge should read the same however roost learned it — but the guard
+    /// cannot afford that: a hook saying "working" means a turn is in
+    /// flight, while `recent_output()` means bytes arrived, which is
+    /// equally true of `ls`.
+    ///
+    /// [F4] Link-aware, and deliberately so *only* here: a report counts as
+    /// live while its socket connection is up (`ext_link` — the strongest
+    /// evidence there is that the hook isn't dead), OR, absent that, while
+    /// it's within `STUCK_WORKING` of arriving. This can only ever be *more*
+    /// permissive than the plain elapsed check (an OR of it), so it never
+    /// disagrees with `current()` in the direction that matters for a
+    /// destructive guard — it may still call a heuristic-driven Working
+    /// "vouched for" while the link is live and the report itself is stale,
+    /// but it can never call a truly dead hook's stale report "vouched for"
+    /// once both conditions lapse. Do not reuse this for the bell relay
+    /// (`recently_reported` is that one): with the link live, `current()`'s
+    /// Working arm can sit at Idle on a long-stale report (D2) — this
+    /// method still (correctly, for a close guard) says "vouched for" there,
+    /// which would wrongly suppress an actual bell with nothing else
+    /// standing in for it.
+    pub fn vouched_live(&self) -> bool {
+        self.reported_while(
+            self.ext_link || self.ext_at.is_some_and(|t| t.elapsed() <= STUCK_WORKING),
+        )
+    }
+
+    /// [F4] The bell-relay gate's version (`PtyPane::process_output`):
+    /// strictly time-bounded, `ext_link` never consulted. That gate relays a
+    /// pane's own bell to the host only when nothing else already owns the
+    /// attention it would draw — and a live-linked but long-silent Working
+    /// report is exactly the case `current()` itself no longer treats as
+    /// "owned" (it decays to Idle, D2), so `vouched_live` would wrongly
+    /// swallow a real bell there with no compensating signal. This asks the
+    /// narrower, honest question instead: did an extension/hook report
+    /// Working/NeedsInput *recently* (within `STUCK_WORKING`), full stop.
+    pub fn recently_reported(&self) -> bool {
+        self.reported_while(self.ext_at.is_some_and(|t| t.elapsed() <= STUCK_WORKING))
     }
 
     /// A bell that arrived *after* the extension's last status report, and
@@ -454,6 +483,37 @@ mod tests {
             t.current(),
             AgentStatus::Waiting,
             "NeedsInput must still decay on a long silence even with the link live"
+        );
+    }
+
+    /// [F4] `vouched_live` and `recently_reported` must disagree exactly
+    /// where the split exists to make them: a Working report gone stale
+    /// while its link is live. `current()`'s own Working arm treats that as
+    /// unowned (decays to Idle, D2) — so `pty.rs`'s bell-relay gate (which
+    /// asks `recently_reported`) must see "not reported" and let a real
+    /// bell through, while the destructive-close guard (which asks
+    /// `vouched_live`, via `PaneBackend::status_reported`) still sees
+    /// "vouched for", because the hook provably isn't dead.
+    #[test]
+    fn vouched_live_and_recently_reported_disagree_on_a_stale_working_report_with_a_live_link() {
+        let mut t = StatusTracker::new();
+        t.set_ext_link(true);
+        t.set_extension_status(AgentStatus::Working);
+        t.ext_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
+        assert_eq!(
+            t.current(),
+            AgentStatus::Idle,
+            "setup: this is D2's live-link Working decay"
+        );
+
+        assert!(
+            t.vouched_live(),
+            "the close guard must still trust a report backed by a live link"
+        );
+        assert!(
+            !t.recently_reported(),
+            "the bell relay must not be gated by a live link on a stale report — nothing else is \
+             compensating for a real bell here"
         );
     }
 }

@@ -457,6 +457,20 @@ pub struct App<B: PaneBackend> {
     /// the pane it claims to be — so a process in one pane can't spoof another
     /// pane's status/session (they share the socket path via `ROOST_SOCK`).
     tokens: HashMap<PaneId, String>,
+    /// [F1] Open status-socket links per pane, refcounted rather than a bare
+    /// bool: a pane can have more than one open reporting connection at
+    /// once — a nested `claude` inside a pi pane inherits the same
+    /// ROOST_PANE/ROOST_TOKEN and fires its own one-shot `roost __status`
+    /// hooks (`cli.rs`'s `status_hook` has no isTTY guard, unlike
+    /// `roost.ts`) alongside the pane's own long-lived pi extension
+    /// connection. A bool would have the first of two connections to close
+    /// clear the link while the other is still live. Sound because
+    /// `sock.rs`'s `ConnGuard` dedups per *connection* (`link_panes`): each
+    /// connection contributes at most one up and one down per pane over its
+    /// lifetime, so this always nets to the count of connections actually
+    /// open. `StatusTracker::ext_link` stays the simple bool `count > 0`
+    /// collapses to.
+    ext_link_counts: HashMap<PaneId, u32>,
     /// The fleet control-interface token. Written to `<state>/control.token`
     /// (0600) and NEVER placed in any pane's environment, so only a deliberately
     /// authorized external client can drive panes it doesn't own.
@@ -608,6 +622,7 @@ impl<B: PaneBackend> App<B> {
             confirm_close: None,
             confirm_quit: None,
             tokens: HashMap::new(),
+            ext_link_counts: HashMap::new(),
             control_token,
             waiters: Vec::new(),
             pending_input: HashMap::new(),
@@ -2045,6 +2060,9 @@ impl<B: PaneBackend> App<B> {
             rt.kill();
         }
         self.tokens.remove(&id);
+        // [F1] Same bound-map hygiene as `tokens` — ids aren't reused, so an
+        // unremoved entry would just sit there for the rest of the session.
+        self.ext_link_counts.remove(&id);
         // Drop any spawn-error record for this pane too; otherwise a pane that
         // failed to spawn and is then closed leaves a stale `dead` entry that
         // never gets cleaned (pane ids are not reused for it).
@@ -2240,9 +2258,22 @@ impl<B: PaneBackend> App<B> {
     /// set_ext_link`. No notification: link state alone never means "needs
     /// you", only how much roost trusts a resting/Working report over PTY
     /// output while deciding what does.
+    ///
+    /// [F1] Refcounted via `ext_link_counts` — see its doc comment for why a
+    /// bool undercounts (two connections reporting for one pane, e.g. a
+    /// nested claude's one-shot hooks alongside the pane's own pi
+    /// extension). `StatusTracker::set_ext_link` only ever sees the
+    /// collapsed `count > 0`.
     pub fn on_status_link(&mut self, id: PaneId, up: bool) {
+        let count = self.ext_link_counts.entry(id).or_insert(0);
+        if up {
+            *count += 1;
+        } else {
+            *count = count.saturating_sub(1);
+        }
+        let live = *count > 0;
         if let Some(rt) = self.runtimes.get_mut(&id) {
-            rt.set_ext_link(up);
+            rt.set_ext_link(live);
         }
     }
 
@@ -4510,6 +4541,7 @@ impl<B: PaneBackend> App<B> {
             rt.kill();
         }
         self.tokens.remove(&f.id);
+        self.ext_link_counts.remove(&f.id); // [F1]
         self.dead.remove(&f.id);
         self.pending_input.remove(&f.id);
         self.raw.remove(&f.id);
@@ -7984,6 +8016,48 @@ mod tests {
         app.on_session(1, "sess-42".into());
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes[&1].session.as_deref(), Some("sess-42"));
+    }
+
+    /// [F1] The bug a bare bool had: two connections reporting for one pane
+    /// (a nested claude's one-shot `roost __status` hooks alongside the
+    /// pane's own long-lived pi extension link — both inherit the same
+    /// ROOST_PANE/ROOST_TOKEN). The first to close must not clear the link
+    /// while the second is still open.
+    #[test]
+    fn two_overlapping_links_for_one_pane_the_first_to_close_leaves_it_live() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.on_status_link(id, true); // the long-lived pi extension connects
+        app.on_status_link(id, true); // a nested claude's one-shot connects
+        assert!(app.runtimes.get(&id).unwrap().ext_link);
+        app.on_status_link(id, false); // the one-shot disconnects
+        assert!(
+            app.runtimes.get(&id).unwrap().ext_link,
+            "the pane's link must stay live while the other connection is still open"
+        );
+        app.on_status_link(id, false); // the long-lived connection finally closes too
+        assert!(
+            !app.runtimes.get(&id).unwrap().ext_link,
+            "down once every connection has closed"
+        );
+    }
+
+    /// [F1] The reviewer's probe, pinned permanently: a one-shot connection's
+    /// up/down landing *during* an already-live long-lived connection must
+    /// never revert the pane's link to down — the exact silent revert that
+    /// would have brought the D1 phantom-pulse bug back.
+    #[test]
+    fn a_one_shot_link_during_a_live_connection_never_reverts_it_down() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.on_status_link(id, true); // long-lived connection: up, and stays up
+        assert!(app.runtimes.get(&id).unwrap().ext_link);
+        app.on_status_link(id, true); // nested one-shot: up
+        app.on_status_link(id, false); // nested one-shot: down, same tick
+        assert!(
+            app.runtimes.get(&id).unwrap().ext_link,
+            "a one-shot's up/down must not revert the long-lived connection's link to down"
+        );
     }
 
     #[test]

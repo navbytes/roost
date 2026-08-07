@@ -56,15 +56,42 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  // [F3] project_trust fires on *every* launch of a project that needs a
+  // trust decision — remembered or not: pi emits it to extensions before it
+  // ever consults the trust store (verified against installed 0.81.1's
+  // dist/core/project-trust.js — resolveProjectTrusted calls
+  // emitProjectTrustEvent unconditionally, then only falls back to
+  // trustStore.get() if no extension decided). Reporting needs_input the
+  // instant it fires was wrong: a remembered "yes" resolves in milliseconds
+  // and the run proceeds straight through, so every pi launch in an
+  // already-trusted project fired a spurious "waiting for you" notification.
+  // Fix: schedule the send instead of firing it, and cancel the timer the
+  // moment any other lifecycle event proves the run is already moving.
+  // Remembered trust ⇒ session_start lands within ms ⇒ cancelled, nothing
+  // sent. A real blocking dialog ⇒ nothing else arrives in that window ⇒
+  // needs_input fires, correctly.
+  let projectTrustTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelProjectTrustNeedsInput = () => {
+    if (projectTrustTimer) {
+      clearTimeout(projectTrustTimer);
+      projectTrustTimer = null;
+    }
+  };
+
   pi.on("session_start", async (event, ctx) => {
+    cancelProjectTrustNeedsInput();
     // Report the session id so roost can persist it for resume.
     const id = ctx.sessionManager?.getSessionId?.() ?? (event as any)?.sessionId;
     if (id) send({ event: "session", session: id });
     send({ event: "status", status: "waiting" });
   });
 
-  pi.on("agent_start", async () => send({ event: "status", status: "working" }));
+  pi.on("agent_start", async () => {
+    cancelProjectTrustNeedsInput();
+    send({ event: "status", status: "working" });
+  });
   pi.on("agent_end", async () => send({ event: "status", status: "waiting" }));
+  pi.on("input", async () => cancelProjectTrustNeedsInput());
 
   // "Needs input" — the agent is explicitly blocked on *you*, mid-turn. pi
   // ships no generic per-tool permission/approval prompt at all (verified
@@ -79,13 +106,22 @@ export default function (pi: ExtensionAPI) {
   // handler and, if none decide, to the interactive dialog itself (see
   // emitProjectTrustEvent in runner.js). We are a status reporter, not a
   // trust policy, so we always report "undecided" — the human's own dialog
-  // must still show and decide it. The ◆ this reports needs no explicit
-  // clear: once the dialog resolves, the run proceeds and agent_start/
-  // tool_call send "working" same as any other turn; agent_end settles
-  // "waiting" at the end of it. The NeedsInput time-decay (roost-side,
-  // STUCK_WORKING) also backstops a dialog nobody ever answers.
-  pi.on("project_trust", async () => {
-    send({ event: "status", status: "needs_input" });
+  // must still show and decide it. The ◆ this (maybe) reports needs no
+  // explicit clear: once the dialog resolves, the run proceeds and
+  // agent_start/tool_call send "working" same as any other turn; agent_end
+  // settles "waiting" at the end of it. The NeedsInput time-decay
+  // (roost-side, STUCK_WORKING) also backstops a dialog nobody ever answers.
+  // `hasUI: false` means no dialog can ever show for this decision at all
+  // (see resolveProjectTrusted's own early return for it) — nothing to
+  // report as blocked on the human, so don't even schedule the send.
+  pi.on("project_trust", async (_event, ctx) => {
+    if (ctx.hasUI) {
+      cancelProjectTrustNeedsInput();
+      projectTrustTimer = setTimeout(() => {
+        projectTrustTimer = null;
+        send({ event: "status", status: "needs_input" });
+      }, 400);
+    }
     return { trusted: "undecided" };
   });
   //
@@ -111,6 +147,7 @@ export default function (pi: ExtensionAPI) {
   const isAsk = (name: unknown) => typeof name === "string" && ASK_TOOLS.has(name);
 
   pi.on("tool_call", async (event) => {
+    cancelProjectTrustNeedsInput();
     if (isAsk(event.toolName)) send({ event: "status", status: "needs_input" });
   });
   pi.on("tool_result", async (event) => {
