@@ -3248,7 +3248,9 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
-    /// Move focus spatially to the nearest pane in `dir`; stay put if none.
+    /// Move focus spatially to the nearest pane in `dir`; stay put if none
+    /// — except `Left`/`Right` off a tab's edge, which continue into the
+    /// next/previous tab (`focus_dir_cross_tab`, C31).
     fn focus_dir(&mut self, dir: layout::Dir) {
         // C22 rule 2: the float has no spatial position in the tiled tree,
         // so leaving it via a directional key always just returns focus to
@@ -3261,7 +3263,80 @@ impl<B: PaneBackend> App<B> {
         if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
             self.set_focus(id);
             layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
+            return;
         }
+        self.focus_dir_cross_tab(dir, &rects);
+    }
+
+    /// C31, client request 2026-08-07: `Left`/`Right` off the edge of the
+    /// active tab continue into the next/previous tab instead of stopping
+    /// dead — "keep going right" should behave like it sounds. `Up`/`Down`
+    /// are untouched: tabs are roost's own horizontal axis (the strip,
+    /// `Alt+i`/`Alt+m`), so only the two keys that already share that axis
+    /// pick up tab-switching semantics; giving all four directions that
+    /// meaning would surprise a vertical split's Up/Down.
+    ///
+    /// The landing pane is geometric, read from the *destination* tab's own
+    /// computed rects — never `tab_focus` (contrast U11 rule 2, C2): `Right`
+    /// lands on the destination's leftmost pane, `Left` on its rightmost
+    /// (`edge_pane`) — the edge nearest the one just crossed, matching "keep
+    /// going right" rather than wherever that tab was last left. Wraps at
+    /// both ends, exactly like `Alt+i`/`Alt+m` (`step_tab`); a no-op below
+    /// two tabs.
+    ///
+    /// Same skeleton as `go_to_tab` — C21 zoom exit, C22 float hide, U11
+    /// bookkeeping, lazy spawn — with the target swapped for `edge_pane`'s
+    /// pick. `go_to_tab` itself is deliberately not called here: it would
+    /// set focus once (to `tab_focus_target`) and this function a second
+    /// time right after, and `set_focus` reports a real focus transition on
+    /// every call that changes the id — a spurious CSI O/I pair to a pane
+    /// that was never truly focused.
+    ///
+    /// `rects` is the active tab's rects, already computed by the caller —
+    /// reused here, not recomputed, to check whether `self.focused` is
+    /// *genuinely* at that edge. `neighbor == None` alone isn't enough: a
+    /// pane spanning the tab's full width has no Left/Right neighbour
+    /// purely because nothing can sit beside a full-width rect
+    /// (`layout::neighbor`'s gap check excludes every other pane on both
+    /// sides at once, regardless of row) — that's an artifact of its shape,
+    /// not evidence it's "the last or first pane" the client asked about. A
+    /// pane that owns a whole row above/below a split row is exactly this:
+    /// reachable as `Alt+n`, `Alt+o`, `Alt+n` from a single pane. Excluded:
+    /// the tab's *only* pane, which necessarily spans the full width (and
+    /// height) and is unambiguously both ends at once — the base case every
+    /// other C31 test relies on.
+    fn focus_dir_cross_tab(&mut self, dir: layout::Dir, rects: &[PaneRect]) {
+        let delta: isize = match dir {
+            layout::Dir::Right => 1,
+            layout::Dir::Left => -1,
+            layout::Dir::Up | layout::Dir::Down => return,
+        };
+        let spans_full_width = rects.len() > 1
+            && rects
+                .iter()
+                .find(|p| p.id == self.focused)
+                .is_some_and(|p| p.rect.width == self.body_area().width);
+        if spans_full_width {
+            return;
+        }
+        let n = self.ws.tabs.len();
+        if n < 2 {
+            return; // C31: only when more than one tab exists
+        }
+        let next = (self.ws.active_tab as isize + delta).rem_euclid(n as isize) as usize;
+        let mut drects = Vec::new();
+        layout::compute_rects(&self.ws.tabs[next].layout, self.body_area(), &mut drects);
+        // Right enters the destination from its left edge (leftmost pane);
+        // Left enters from its right edge (rightmost).
+        let Some(target) = edge_pane(&drects, dir == layout::Dir::Left) else { return };
+
+        self.exit_zoom(); // C21: any (real) tab change exits zoom
+        self.hide_float(); // C22 rule 2: the float can't actually be shown here (focus_dir's float_focused() guard already returned above if it were) — kept for parity with every other tab switch
+        self.remember_tab_focus(); // U11 bookkeeping, before active_tab moves
+        self.ws.active_tab = next;
+        self.spawn_active_tab();
+        self.set_focus(target);
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
     }
 
     fn new_pane_with(&mut self, adapter: &str) {
@@ -5450,6 +5525,28 @@ fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode 
         }
         _ => layout::all_stack_layout(order, focused),
     }
+}
+
+/// C31: the geometric edge pane of a destination tab's rects — leftmost
+/// when `rightmost` is false, rightmost when true. Ties on x — every member
+/// of a stack shares its column's x — are broken by `collapsed` (false
+/// first): the currently-*expanded* member wins over a 1-row collapsed
+/// title bar, so a navigation key lands on what the tab was actually left
+/// showing rather than rearranging it. Only below that does position decide
+/// (smallest y), then smallest id — `layout::neighbor`'s own tie-break,
+/// reused for the same reason (deterministic, not dependent on rect order)
+/// rather than invented fresh. `None` only if `rects` is empty, which a
+/// real tab's computed rects never are.
+fn edge_pane(rects: &[PaneRect], rightmost: bool) -> Option<PaneId> {
+    let mut best: Option<(i32, bool, u16, PaneId)> = None;
+    for p in rects {
+        let x = p.rect.x as i32;
+        let key = (if rightmost { -x } else { x }, p.collapsed, p.rect.y, p.id);
+        if best.is_none_or(|b| key < b) {
+            best = Some(key);
+        }
+    }
+    best.map(|(_, _, _, id)| id)
 }
 
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
@@ -10057,6 +10154,231 @@ mod tests {
         assert_eq!(app.ws.active_tab, 1);
         app.apply(Action::NextTab);
         assert_eq!(app.ws.active_tab, 2);
+    }
+
+    // ---- C31: cross-tab directional focus at an edge ---------------------
+
+    /// Two tabs, each a horizontal row of panes — tab 0 is `[1, 2]`, tab 1
+    /// is `[10, 11, 12]`. Every id is DFS-first-vs-leftmost-vs-rightmost
+    /// distinguishable, so a test can tell "landed on the geometric edge"
+    /// apart from "landed on the tab's first/remembered pane" (U11).
+    fn two_tab_row_ws() -> Workspace {
+        fn row(ids: &[PaneId]) -> (LayoutNode, HashMap<PaneId, PaneSpec>) {
+            let mut panes = HashMap::new();
+            for &id in ids {
+                panes.insert(
+                    id,
+                    PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+                );
+            }
+            let children = ids.iter().map(|&id| LayoutNode::Pane(id)).collect::<Vec<_>>();
+            let n = children.len() as f32;
+            let layout = LayoutNode::Split { dir: SplitDir::Vertical, ratios: vec![1.0 / n; children.len()], children };
+            (layout, panes)
+        }
+        let (layout0, panes0) = row(&[1, 2]);
+        let (layout1, panes1) = row(&[10, 11, 12]);
+        Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![
+                Tab { name: "t0".into(), layout: layout0, panes: panes0 },
+                Tab { name: "t1".into(), layout: layout1, panes: panes1 },
+            ],
+        }
+    }
+
+    /// client request 2026-08-07: `Alt+Right` at a tab's rightmost pane
+    /// continues into the next tab, landing on *its* leftmost pane — not
+    /// wherever that tab was last left (contrast U11 rule 2's `tab_focus`).
+    #[test]
+    fn cross_tab_right_edge_lands_on_next_tabs_leftmost_pane() {
+        let (mut app, store) = mk_app(two_tab_row_ws());
+        app.set_focus(2); // tab 0's rightmost pane — nothing further right in-tab
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.ws.active_tab, 1);
+        assert_eq!(app.focused, 10, "lands on the destination's leftmost pane");
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert_eq!(saved.active_tab, 1, "the tab switch persists, same as Alt+i/Alt+m");
+    }
+
+    /// The mirror: `Alt+Left` at a tab's leftmost pane continues into the
+    /// *previous* tab, landing on *its* rightmost pane — "keep going left"
+    /// arrives nearest the edge just crossed.
+    #[test]
+    fn cross_tab_left_edge_lands_on_previous_tabs_rightmost_pane() {
+        let (mut app, _) = mk_app(two_tab_row_ws());
+        app.apply(Action::GoToTab(1));
+        assert_eq!(app.focused, 10, "tab 1's leftmost pane (also its DFS-first here)");
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert_eq!(app.ws.active_tab, 0);
+        assert_eq!(app.focused, 2, "lands on the previous tab's rightmost pane, not its first (1)");
+    }
+
+    /// Wraps at both ends, exactly like `Alt+i`/`Alt+m` — two ways of moving
+    /// between tabs disagreeing about hitting an end would be its own bug.
+    #[test]
+    fn cross_tab_focus_wraps_at_both_ends() {
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..2 {
+            app.apply(Action::NewTab); // three tabs: 0, 1, 2 — one pane each
+        }
+        assert_eq!(app.ws.active_tab, 2);
+        let last_tabs_pane = app.focused;
+
+        app.apply(Action::Focus(layout::Dir::Right)); // off the right edge of the last tab
+        assert_eq!(app.ws.active_tab, 0, "wraps forward past the last tab");
+
+        app.apply(Action::Focus(layout::Dir::Left)); // off the left edge of the first tab
+        assert_eq!(app.ws.active_tab, 2, "wraps backward past the first tab");
+        assert_eq!(app.focused, last_tabs_pane, "back on the tab it started from, and its only pane");
+    }
+
+    /// Below two tabs this is exactly the pre-existing dead end: `neighbor`
+    /// finds nothing and C31 declines to fire at all.
+    #[test]
+    fn cross_tab_focus_is_a_no_op_with_only_one_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2 (rightmost, one tab)
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.ws.tabs.len(), 1);
+        assert_eq!(app.focused, 2, "a lone tab's edge stays a dead end");
+    }
+
+    /// Design decision: only `Left`/`Right` pick up tab-switching semantics.
+    /// Tabs are roost's own horizontal axis, so `Up`/`Down` at an edge must
+    /// stay the dead end they always were, even with other tabs to reach.
+    #[test]
+    fn cross_tab_focus_never_fires_for_up_or_down() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // two tabs, one pane each — every direction is an edge
+        let (tab_before, pane_before) = (app.ws.active_tab, app.focused);
+        app.apply(Action::Focus(layout::Dir::Up));
+        assert_eq!(app.ws.active_tab, tab_before, "Up must never switch tabs, even at an edge");
+        assert_eq!(app.focused, pane_before);
+        app.apply(Action::Focus(layout::Dir::Down));
+        assert_eq!(app.ws.active_tab, tab_before, "…nor Down");
+        assert_eq!(app.focused, pane_before);
+    }
+
+    /// [Fixed 2026-08-07, design audit] `neighbor == None` is not the same
+    /// as "at the tab's edge": a pane spanning the tab's full width (a row
+    /// above/below a split row) has no Left *or* Right neighbour, but is
+    /// not meaningfully "the last or first pane" the client asked about —
+    /// the audit's own repro, `Alt+n`, `Alt+o`, `Alt+n`, from a single
+    /// pane. Neither key may leave the tab from it; a pane that genuinely
+    /// owns the tab's edge, in that same layout, still does.
+    #[test]
+    fn cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // a second tab, so a wrong trigger has somewhere to go
+        app.apply(Action::GoToTab(0));
+        // The audit's repro: one pane spanning the row above a split row.
+        app.apply(Action::NewPane);
+        app.apply(Action::FlipSplit);
+        app.apply(Action::NewPane);
+        let bottom_right = app.focused; // genuinely at the right edge — the sanity check below
+        let tab_before = app.ws.active_tab;
+
+        app.set_focus(1); // the full-width top pane: touches both x edges, but shares the tab
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.ws.active_tab, tab_before, "full width but not the tab's only pane — not an edge");
+        assert_eq!(app.focused, 1);
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert_eq!(app.ws.active_tab, tab_before);
+        assert_eq!(app.focused, 1);
+
+        // Sanity: a pane that genuinely owns the edge, in this same mixed
+        // layout, is unaffected by the fix above.
+        app.set_focus(bottom_right);
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_ne!(app.ws.active_tab, tab_before, "a real edge still crosses");
+    }
+
+    /// [Corrected 2026-08-07, design audit] Landing on a stack's topmost
+    /// member would collapse whatever the tab had expanded — a navigation
+    /// key must not rearrange a tab you haven't looked at yet. `edge_pane`
+    /// prefers the *expanded* member on an x-tie, so the jump lands on
+    /// what was already visible and `expand_in_stacks` is a no-op: the
+    /// stack's shape is untouched.
+    #[test]
+    fn cross_tab_focus_lands_on_the_already_expanded_stack_member_at_the_destination() {
+        fn spec() -> PaneSpec {
+            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None }
+        }
+        let mut panes0 = HashMap::new();
+        panes0.insert(1, spec());
+        let mut panes1 = HashMap::new();
+        for id in [20u64, 21, 22, 23] {
+            panes1.insert(id, spec());
+        }
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![
+                Tab { name: "t0".into(), layout: LayoutNode::Pane(1), panes: panes0 },
+                Tab {
+                    name: "t1".into(),
+                    layout: LayoutNode::Split {
+                        dir: SplitDir::Vertical,
+                        ratios: vec![0.5, 0.5],
+                        children: vec![
+                            LayoutNode::Pane(20),
+                            LayoutNode::Stack { children: vec![21, 22, 23], expanded: 1 }, // 22 expanded
+                        ],
+                    },
+                    panes: panes1,
+                },
+            ],
+        };
+        let (mut app, _) = mk_app(ws);
+
+        // Tab 0's only pane has no left neighbour — wraps to tab 1
+        // (previous, n=2), landing on its rightmost pane: the stack column,
+        // tie-broken to the *expanded* member (22), not the topmost (21).
+        app.apply(Action::Focus(layout::Dir::Left));
+
+        assert_eq!(app.ws.active_tab, 1);
+        assert_eq!(app.focused, 22, "lands on the member already visible, not the topmost");
+        match &app.ws.tabs[1].layout {
+            LayoutNode::Split { children, .. } => match &children[1] {
+                LayoutNode::Stack { expanded, children } => {
+                    assert_eq!(children[*expanded], 22, "the stack's shape is untouched — still 22 expanded")
+                }
+                other => panic!("expected the stack, got {other:?}"),
+            },
+            other => panic!("expected the split, got {other:?}"),
+        }
+    }
+
+    /// C21: a cross-tab jump is a tab change like any other, so it exits
+    /// zoom — the same rule `go_to_tab`/C28/`Alt+a`'s cross-tab jump follow.
+    #[test]
+    fn cross_tab_focus_exits_zoom_like_any_other_tab_change() {
+        let (mut app, _) = mk_app(two_tab_row_ws());
+        app.set_focus(2); // tab 0's rightmost pane
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.ws.active_tab, 1, "the jump happened");
+        assert!(!app.zoomed(), "…and it must exit zoom, exactly like any other tab change");
+    }
+
+    /// C22 rule 2 is untouched: the float has no spatial position, so
+    /// `focus_dir` returns before ever reaching C31 — the active tab must
+    /// never change while what's being left is the float, even with more
+    /// than one tab around to (wrongly) jump to.
+    #[test]
+    fn float_rule2_focus_dir_does_not_cross_tabs_even_with_more_than_one() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // two tabs, active = 1
+        let real_pane = app.focused;
+        let tab_before = app.ws.active_tab;
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::Focus(layout::Dir::Right));
+        assert_eq!(app.focused, real_pane, "rule 2: back to prev_focus, not a cross-tab jump");
+        assert_eq!(app.ws.active_tab, tab_before, "C31 must never fire while leaving the float");
+        assert!(!app.float.as_ref().unwrap().shown);
     }
 
     // ---- C28: move the focused pane between tabs -------------------------

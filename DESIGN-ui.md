@@ -487,6 +487,17 @@ C27 closes from the other side (the tribunal's provenance is recorded there).
 - No new glyph: the cell holds ASCII text (a digit or `+`) in the glyph's own
   style, so §2's inventory — which governs *symbols* — is unchanged.
 
+**[Amended 2026-08-07, client request — cross-tab arrow-key focus, C31]**
+U11 rule 2 above says every selector lands a tab switch on `tab_focus`
+(`App::tab_focus`, else the tab's first pane) and calls that true "for every
+selector" — **withdrawn as an absolute**: C31's `Alt+Right`/`Alt+Left` off a
+tab's geometric edge is a new selector, and it deliberately does not follow
+rule 2. It lands on the destination's geometric leftmost/rightmost pane
+instead — "keep going right" means arriving nearest the edge just crossed,
+not wherever that tab was last left. Rule 1 (selecting the active tab is a
+no-op) is untouched: a lone tab never reaches C31 at all — fewer than two
+tabs is its own gate, checked before any switch. See C31 for the mechanism.
+
 ### C3 — Pane borders
 
 **Current:** `render.rs:344–351` — focused = status-colored + BOLD, unfocused
@@ -1740,6 +1751,19 @@ behind the zoomed view. C4's `↑N` token and C9's `↑N/M` stay honest across a
 resize: the offset is re-read from the grid's own clamp afterwards, never
 carried over.
 
+**[Amended 2026-08-07, client request — cross-tab arrow-key focus, C31]**
+C31 adds a new way to change tabs: `Alt+Right`/`Alt+Left` off a tab's
+geometric edge. It follows the rule above exactly rather than becoming an
+exception to it — **quoted**, "any tab change (Alt+t, Alt+1..9, tab-bar
+click, cross-tab Alt+a)" now also reads *cross-tab Alt+arrows*: every one of
+them exits zoom, no new case. The one line worth narrowing is **"Keeps
+zoom: focus moves"** above, written before a focus move could also be a tab
+change — read it as *same-tab* focus moves only; a cross-tab edge jump is
+the tab-change branch, not this one. This is the same split C19 already
+draws for `Alt+a` ("a same-tab jump keeps zoom...; a cross-tab jump exits
+zoom (tab-switch rule)") — C31 follows that precedent rather than inventing
+a new one. Nothing else in this contract changes; see C31 for the feature.
+
 ### C22 — Floating scratch pane (Alt+f) — [Added 2026-07-22, fleet features]
 
 **Current:** no floating anything. All panes live in a tab's layout tree;
@@ -2781,6 +2805,135 @@ matters, not rewritten wholesale.]**
 
 ---
 
+### C31 — Cross-tab directional focus at a tab's edge (`Alt+←/→`) — [Added 2026-08-07, client request]
+
+**Current:** `Alt+←↓↑→`/`hjkl` (`Action::Focus`, §8 row 3) move focus
+spatially within the active tab via `layout::neighbor` and stop dead at an
+edge — `neighbor` returns `None` when nothing lies that way, and
+`App::focus_dir` leaves focus exactly where it was. Reaching a pane in
+another tab has always taken a separate chord first — a digit or
+`Alt+i`/`Alt+m`, then an arrow to reach a specific pane once there, or
+`Alt+a`'s direct ring jump (C19) — never a plain arrow at an edge.
+`neighbor`'s own edge/overlap/gap/id tie-break predates this document's
+contract numbering and stays uncontracted here — C31 governs only what
+happens at the edge it already finds, not the in-tab pick itself.
+
+**Client's ask, verbatim:** "Alt+ arrow keys are used to navigate b/w panes.
+If the user is on the last or first pane can we move to previous or next
+tab panes?" — conditional on reliability: a navigation key that occasionally
+lands somewhere surprising is worse than one that predictably does nothing.
+
+**Target:**
+- **`Left`/`Right` only.** `Up`/`Down` keep today's dead end,
+  unconditionally. Tabs are roost's own horizontal axis — the strip draws
+  left to right, and `Alt+i`/`Alt+m` (U7, C2) already step it horizontally
+  — so only the two keys sharing that axis pick up tab-switching semantics.
+  All four would hand a vertical split's `Up`/`Down` a surprise nothing
+  about them advertises. `h`/`l` inherit the behavior for free (§8 row 3:
+  they dispatch the identical `Action::Focus(Dir::Left/Right)`); `j`/`k` do
+  not, for the same reason `Up`/`Down` don't.
+- **Trigger: `layout::neighbor` returns `None`, *and* the focused pane is
+  genuinely at that edge.** `App::focus_dir` tries the in-tab move first
+  and falls through to C31 (`focus_dir_cross_tab`) only when that comes
+  back empty — within-tab behavior, stack tie-breaks included, is
+  untouched byte-for-byte. `neighbor == None` alone is **not** sufficient:
+  a pane spanning the tab's full width (a row sitting above or below a
+  split row) has no Left *or* Right neighbour either — `neighbor`'s gap
+  check excludes every other pane on both sides at once, since nothing can
+  sit beside a full-width rect, regardless of row — but such a pane is not
+  meaningfully "the last or first pane" the client asked about; it's
+  reachable from a single pane as `Alt+n`, `Alt+o`, `Alt+n`. C31
+  additionally requires the focused pane's rect to **not** span the tab
+  body's full width, unless it is the tab's only pane (`rects.len() == 1`)
+  — which necessarily spans the full width *and* height, and is
+  unambiguously both ends at once: the ordinary single-pane-tab case every
+  other test here relies on.
+- **Motion continues in the same direction.** `Right` at the right edge
+  switches to the **next** tab and focuses its **leftmost** pane; `Left` at
+  the left edge switches to the **previous** tab and focuses its
+  **rightmost** pane. The destination pane is nearest the edge just
+  crossed, not wherever that tab was last left — deliberately **not** U11
+  rule 2 (`tab_focus`, C2, amended same date): "keep going right" means
+  arriving next to where you came from.
+- **Leftmost/rightmost is geometric, read from the destination tab's own
+  freshly-computed rects** (`layout::compute_rects` over that tab's layout
+  and the current `body_area()` — pure, and correct for a tab that has
+  never been active, the same fact C28's own destination-geometry check
+  already relies on) — never pane-id order, never tree/DFS order.
+  **Tie-break: smallest x, then `collapsed == false`, then smallest y, then
+  smallest pane id** for leftmost; **largest x**, same remaining keys, for
+  rightmost (`edge_pane`, `app.rs`). Every member of a stack sits at the
+  same x, so the collapsed-vs-expanded key is what decides there: the jump
+  lands on the member the stack already had **expanded**, never a
+  collapsed 1-row title bar — a navigation key must not rearrange a tab
+  you haven't looked at yet, so `expand_in_stacks` (below) comes back a
+  no-op instead of silently collapsing whatever was open. The x/y pair is
+  `layout::neighbor`'s own tie-break vocabulary, and id-as-last-resort
+  borrows that same function's own rule, for whatever residual tie
+  position still can't break — a real tab never produces one (two panes at
+  the same x, collapsed-state, *and* y), but the guard costs one field and
+  keeps the pick total rather than order-dependent.
+- **Wraps at both ends**, exactly like `Alt+i`/`Alt+m` (`step_tab`):
+  `next = (active_tab + delta).rem_euclid(tab_count)`. Two ways to move
+  between tabs disagreeing about hitting an end would be its own bug.
+- **Only when more than one tab exists.** Below two tabs this is exactly
+  today's dead end — C31 declines to run at all rather than, say,
+  refocusing the same tab's own leftmost pane, which would be a different,
+  unrequested behavior change.
+- **Zoom (C21), decided:** a cross-tab jump exits zoom unconditionally —
+  the same "any (real) tab change exits zoom" rule `go_to_tab`/C28/C19's
+  cross-tab `Alt+a` already follow (C21's own amendment, same date), applied
+  here rather than invented fresh. A same-tab arrow move is unaffected — it
+  still keeps zoom (zoom follows focus), exactly as before.
+- **The float (C22) is untouched.** `focus_dir` already returns before
+  reaching C31 whenever the float is focused (rule 2: leaving it via a
+  directional key returns to `prev_focus`; `dir` doesn't apply to it) — and
+  by rule 1 ("shown ⇒ focused") the float cannot be shown while unfocused,
+  so C31 can never observe it shown. No float-handling code was added for
+  this contract; the existing guard is the whole story.
+- **`expand_in_stacks` still runs at the destination**, exactly as the
+  within-tab path already does. Typically a no-op now that the tie-break
+  above lands on the expanded member itself; it remains the fallback that
+  guarantees the landing pane is visible — never a collapsed 1-row title
+  bar, the "surprising" outcome the brief's caveat rules out — in whatever
+  case isn't a clean x-tie.
+- **Chrome:** §8's key table row 3 and C15's matching overlay row both gain
+  the same parenthetical (`←`/`→` continue at an edge) so the in-app keymap
+  doesn't fall out of step with the canonical table —
+  `every_bound_chord_is_documented_in_the_keymap` is chord-level and would
+  have passed either way, the same class of gap the 2026-08-06 C15
+  amendment closed for mouse verbs.
+- **Persistence and PTY sizing are unremarkable.** The switch runs inside
+  `App::apply`, whose trailing `relayout()`/`save()` (unconditional, after
+  every action) is exactly what `Alt+i`/`Alt+m`/`Alt+1..9` already rely on;
+  C31 adds no save/resize call of its own, so it cannot disagree with them
+  about when a switch persists.
+- **`go_to_tab` is deliberately not reused for the switch itself.** It would
+  set focus once, to `tab_focus_target`, and C31 a second time right after
+  to the geometric pick — and `App::set_focus` (P10) reports a real, if
+  momentary, focus transition on every call that changes the id, so that
+  shape would send a spurious `CSI O`/`CSI I` pair to a pane that was never
+  really focused. C31 instead inlines `go_to_tab`'s own skeleton — C21 zoom
+  exit, C22 float hide (a no-op here, kept for parity with every other tab
+  switch), U11's `remember_tab_focus` bookkeeping, `spawn_active_tab` for a
+  never-visited destination — and calls `set_focus` exactly once, with the
+  geometric target.
+
+**Unit tests (`core::app::tests`):**
+`cross_tab_right_edge_lands_on_next_tabs_leftmost_pane` ·
+`cross_tab_left_edge_lands_on_previous_tabs_rightmost_pane` ·
+`cross_tab_focus_wraps_at_both_ends` ·
+`cross_tab_focus_is_a_no_op_with_only_one_tab` ·
+`cross_tab_focus_never_fires_for_up_or_down` ·
+`cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane`
+(the `Alt+n`, `Alt+o`, `Alt+n` repro, both directions, plus a same-layout
+sanity check that a genuine edge still crosses) ·
+`cross_tab_focus_lands_on_the_already_expanded_stack_member_at_the_destination` ·
+`cross_tab_focus_exits_zoom_like_any_other_tab_change` ·
+`float_rule2_focus_dir_does_not_cross_tabs_even_with_more_than_one`.
+
+---
+
 ## 4. Pixel-idea translations (explicit)
 
 Every px-only construct in the mockup, and its cell-level fate:
@@ -3027,7 +3180,7 @@ shows only the C9-curated subsets.
 |---|---|---|---|
 | 1 | `Alt+n` | new shell pane (auto split) | — |
 | 2 | `Alt+Enter` | quick-launch picker (pi / claude / shell) | C14 |
-| 3 | `Alt+←↓↑→ / hjkl` | move focus | — |
+| 3 | `Alt+←↓↑→ / hjkl` | move focus (`←`/`→` continue into the next/prev tab at an edge) | C31 |
 | 4 | `Alt+Shift+←↓↑→` | resize along that axis | — |
 | 5 | `Alt+s` | toggle split ⇄ stack | C6–C8 |
 | 6 | `Alt+o` | flip split orientation | — |
@@ -3204,3 +3357,14 @@ Collision flags (all already swallowed by roost today, `input.rs:72–77`;
 raw mode C23 is the remedy): `Alt+f` readline forward-word · `Alt+a` zsh
 accept-and-hold · `Alt+b/d` left deliberately free (readline word ops — the
 most-missed bindings; do not assign them to chrome without strong cause).
+
+[Amended 2026-08-07, client request — cross-tab arrow-key focus, C31] Row 3's
+`←`/`→` now continue past a tab's geometric edge into the next/previous tab
+(wrapping, like rows 13b/13c) instead of stopping dead; `↑`/`↓` are
+untouched, for the reason C31 gives (tabs are roost's own horizontal axis,
+and all four directions taking on tab-switching semantics would surprise a
+vertical split). No new chord and no reassigned key — the free-Alt-keys
+tally above is unchanged, and `h`/`j`/`k`/`l`'s existing meanings don't move
+either (`h`/`l` already alias `←`/`→` at the `Action::Focus` dispatch, so
+they inherit the edge behavior for free; `j`/`k` don't, matching `↑`/`↓`).
+See C31 for the tie-break rule, the wrap, and the zoom/float interplay.

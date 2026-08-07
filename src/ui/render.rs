@@ -720,7 +720,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
         rows: &[
             ("Alt+n", "new shell pane (auto split)"),
             ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
-            ("Alt+←↓↑→ / hjkl", "move focus"),
+            ("Alt+←↓↑→ / hjkl", "move focus (←/→ continue to next/prev tab at an edge)"),
             ("Alt+r", "rename this pane"),
             ("Alt+w", "close pane (confirm if busy)"),
             ("Alt+u", "reopen the last pane or tab you closed"),
