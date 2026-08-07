@@ -178,15 +178,34 @@ protect.
    <verb>`).
 
    **Connections — time-bounded pre-auth, then a per-principal pool:**
-   - **Pre-auth: a short (2s) read timeout, not a shared pool.** *(Finding
-     H1, revised as C1.)* The first cut only charged a connection once it
-     sent a well-formed request — connect and never send anything held a
-     full `MAX_CONN` slot for free, M3's original starvation. The immediate
-     fix (a small *shared* pre-auth counter, capped at 16) was *worse*: 16
-     idle connections now permanently shed every new connection, including
-     the human's CLI — cheaper than the 64 the original bug needed. Bounding
-     by time instead means a pile of squatters recycles on its own within
-     seconds; nobody else is ever blocked from getting in.
+   - **Pre-auth: a wall-clock (2s) deadline from connection start, not a
+     shared pool and not merely a read timeout.** *(Finding H1, revised as
+     C1.)* The first cut only charged a connection once it sent a
+     well-formed request — connect and never send anything held a full
+     `MAX_CONN` slot for free, M3's original starvation. The immediate fix
+     (a small *shared* pre-auth counter, capped at 16) was *worse*: 16 idle
+     connections now permanently shed every new connection, including the
+     human's CLI — cheaper than the 64 the original bug needed. Bounding by
+     time instead of a shared counter was the right call — but a first
+     implementation of that only set `SO_RCVTIMEO` (`set_read_timeout`) to
+     2s and read lines with `read_until`, which bounds one `read()`
+     *syscall*, not the connection: a client drip-feeding one byte slower
+     than a full line but faster than the per-read timeout (repro: one byte
+     every 1.2s against a 2s timeout accumulated for 9.66s before
+     `read_until` returned) never trips it, and `read_until` loops
+     internally with no wall-clock check of its own, so it just kept
+     accumulating — charged nothing to `line_bucket`, never promoted, never
+     timed out. Sixty-four of those still fill `MAX_CONN` for free; the
+     starvation just moved from "connect and go silent" to "connect and
+     drip." The fix (`sock.rs`'s `read_line_deadlined`) drives
+     `fill_buf`/`consume` by hand instead of `read_until`, checking a real
+     `Instant` recorded at connection-thread start against the 2s deadline
+     on every iteration, independent of `SO_RCVTIMEO`. The per-read timeout
+     is still set — it's what makes that loop tick on a genuinely silent
+     connection rather than block forever inside one `read()` — but it no
+     longer has to *be* the deadline. A pile of squatters, silent or
+     dripping, now recycles within the 2s deadline of connecting either way;
+     nobody else is ever blocked from getting in.
    - **Per-principal pool, 20**, alongside the unchanged global 64 — a
      connection is promoted here, and onto the generous `READ_TIMEOUT` (30s),
      the instant it sends its first well-formed request. Must be at least
@@ -252,14 +271,29 @@ protect.
    hang (both were real bugs in this file; see `parse_control`), worded not
    to collide with `"unauthorized: ..."` or a malformed-request error.
 
-   **Residual gap, unchanged by the revision:** sock.rs still can't validate
-   a token before accounting it (that needs `Actor` resolution, core/app.rs's
-   lane, not reached into here) — a caller that mints a fresh admitted
-   identity per *connection* (not merely per request, which the H2 fix now
-   closes) still gets a fresh per-principal pool of its own, bounded only by
-   the aggregate bucket and the unchanged global/unattributed connection
-   caps. The aggregate bucket is **load-bearing** for this, not
-   belt-and-braces.
+   **Residual gap, unchanged by the revision — plainly open, not bounded:**
+   sock.rs still can't validate a token before promoting a connection past
+   pre-auth (that needs `Actor` resolution, core/app.rs's lane, not reached
+   into here). One well-formed request under *any* garbage token is
+   sufficient to promote — nothing checks whether it resolves to a real
+   principal — so an attacker can open up to `MAX_CONN` connections, each
+   with its own distinct, never-before-seen token, and each earns the full
+   30s `READ_TIMEOUT` the instant it's promoted; as each eventually closes
+   it can simply reconnect and repeat. This is a connection-*count*/
+   connection-*duration* problem, not a command-rate one, so it is **not**
+   "bounded by the global connection cap" the way an earlier draft of this
+   section put it and the aggregate command bucket does not help either —
+   the global cap is exactly the resource this starves, and a connection
+   sitting on one promoted, unvalidated identity need not send more than
+   the single request that got it promoted to hold its slot for the full
+   30s. Each such connection *is* individually per-principal-capped and
+   command-rate-limited once admitted (so it can't itself flood commands —
+   that part is the aggregate bucket's load-bearing job, described above),
+   but that is beside the point here: the attack is holding the connection
+   open, not what it sends afterward. Closing this needs the token
+   validated against `App::resolve_actor` before (or as part of) promotion
+   — access this file does not have; tracked as an open follow-up, not
+   fixed here.
 
    **Audit finding H3 correction (the arithmetic, not the cap numbers):**
    `app.rs`'s audit-log write is bounded by *bytes* attacker-controlled
@@ -419,11 +453,14 @@ that makes control-mode the adversary's lowest-ranked option.
   status-socket traffic (an earlier version of this fix didn't — see #6
   above, finding M2): a per-line aggregate charge, a per-*admitted*-principal
   command bucket, and connection caps (§5 constraint #6, `sock.rs`); the
-  bounded channel already prevented OOM regardless. Residual: sock.rs can't
-  validate a token, so a caller minting a fresh *admitted connection* (not
-  merely a fresh per-request token — see #6's H2 note) still gets a fresh
-  per-principal pool, bounded only by the aggregate bucket and the global
-  connection caps — see #6 above.
+  bounded channel already prevented OOM regardless. **Open gap** (see #6's
+  residual-gap paragraph): sock.rs can't validate a token before promoting a
+  connection, so a caller minting a fresh *admitted connection* per garbage
+  token (not merely a fresh per-request token — see #6's H2 note) can fill
+  the entire global connection pool with them and hold it for the full 30s
+  `READ_TIMEOUT` each, on repeat — a connection-count/duration problem the
+  command-rate buckets don't reach. Closing it needs `Actor` resolution in
+  `app.rs`, out of sock.rs's reach — see #6 above.
 - **Secret exfiltration via reads** — owner-scoped, snapshot-only, consented.
 - **Destructive verbs bypassing the human busy-guard** — `force` semantics +
   default-deny self/last-pane close over the API.
