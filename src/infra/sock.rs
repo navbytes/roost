@@ -662,11 +662,28 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                 // measured from here, independent of the per-read
                 // `SO_RCVTIMEO` set above.
                 let start = Instant::now();
+                // Promoted the instant this connection sends *any* well-formed
+                // line — a control request (below) or a one-way status/session
+                // report (`parse_line`), not only the former. A status-only
+                // connection (the pi extension: connects once, holds the
+                // socket for the pane's process lifetime, sends nothing but
+                // status/session lines) never sets `guard.principal` — it
+                // isn't a "principal" for connection-cap/rate-limit purposes —
+                // so gating promotion on that alone left every such connection
+                // permanently pre-auth: `pre_auth_start` never cleared, so it
+                // was killed ~`PRE_AUTH_READ_TIMEOUT` after connecting and
+                // never reconnects (the extension dials once, on load).
+                // Promoting it here is no new exposure: an attacker sending
+                // one *shape*-valid status/session line (nothing here
+                // validates its token — `parse_line` doesn't, App does) to
+                // earn promotion is the same already-open, already-documented
+                // path 2 as a garbage-token control request.
+                let mut promoted = false;
                 loop {
                     buf.clear();
-                    // `None` once promoted (`guard.principal` set, below) —
-                    // from then on only the per-read timeout applies.
-                    let pre_auth_start = guard.principal.is_none().then_some(start);
+                    // `None` once promoted — from then on only the per-read
+                    // timeout applies.
+                    let pre_auth_start = (!promoted).then_some(start);
                     let n = match read_line_deadlined(&mut reader, &mut buf, pre_auth_start) {
                         Ok(0) => break,       // EOF
                         Ok(n) => n,
@@ -733,9 +750,14 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                                     break; // over cap: free the slot now
                                 }
                                 guard.principal = Some(req.token.clone());
-                                // Promoted: this connection identified
-                                // itself, so it earns the generous timeout
-                                // (audit finding C1).
+                            }
+                            // Promoted: this connection identified itself, so
+                            // it earns the generous timeout (audit finding
+                            // C1). Idempotent — a second/third request on an
+                            // already-promoted connection must not re-touch
+                            // the socket option every time.
+                            if !promoted {
+                                promoted = true;
                                 let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
                             }
                             let principal = guard.principal.clone().expect("just set above");
@@ -798,6 +820,15 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                     }
                     match parse_line(line) {
                         Some(ev) => {
+                            // A well-formed status/session report promotes
+                            // this connection exactly like a control request
+                            // does, above — see the `promoted` doc comment at
+                            // its declaration. Nothing here validates the
+                            // token; App does, on every event this forwards.
+                            if !promoted {
+                                promoted = true;
+                                let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
+                            }
                             if tx.send(ev).is_err() {
                                 break;
                             }
@@ -1210,6 +1241,43 @@ mod tests {
         let mut discard = String::new();
         let n = squatter.read_line(&mut discard).expect("must recycle, not hang for the full READ_TIMEOUT");
         assert_eq!(n, 0, "an idle pre-auth connection must eventually be closed: {discard:?}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A connection that only ever sends status/session lines (no `method`
+    /// key, so never a control `Request`) must not be treated as forever
+    /// pre-auth. This is the real pi extension's shape
+    /// (`extensions/roost.ts`): it connects once at pane start and holds
+    /// that socket for the pane's whole process lifetime, writing only
+    /// status/session lines whenever the agent's state changes — gaps that
+    /// can easily exceed `PRE_AUTH_READ_TIMEOUT`. `guard.principal` never
+    /// gets set for these (they aren't a "principal" for connection-cap/
+    /// rate-limit purposes), so gating promotion on that alone left every
+    /// such connection permanently pre-auth: killed the first time it went
+    /// quiet past the deadline, with no reconnect anywhere in the extension.
+    #[test]
+    fn a_status_only_connection_survives_past_the_pre_auth_deadline() {
+        let (path, listener) = scratch_listener("status-survives");
+        spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        // One status line — exactly what the extension sends. No `method`
+        // key, so `parse_control` returns `None` and this never touches
+        // `guard.principal`.
+        c.get_mut().write_all(br#"{"pane":"1","token":"t","event":"status","status":"working"}"#).unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+
+        // Idle well past the pre-auth deadline, sending nothing — the real
+        // gap between an agent's status transitions.
+        std::thread::sleep(PRE_AUTH_READ_TIMEOUT + Duration::from_millis(500));
+
+        // Still alive and still being served: a request on the same
+        // connection must get a normal reply, not a hang or a dropped
+        // connection (the bug: the server would already have closed its end
+        // by now, so this would come back as EOF, and `roundtrip` panics).
+        let reply = roundtrip(&mut c, r#"{"token":"t","method":"list"}"#);
+        assert!(reply.get("ok").is_some(), "a status-only connection must survive past the pre-auth deadline: {reply}");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
