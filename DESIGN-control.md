@@ -178,10 +178,24 @@ protect.
      comfortably covers the documented "spawn x10 then wait x10" burst
      (§7) while making M2's ~200k-call flood take on the order of 11h from
      one token. A 128-capacity / 20-per-second **aggregate** bucket backs
-     it up: sock.rs can't tell a valid-but-unfamiliar token from a
-     minted-per-request garbage one, so a caller varying its token would
-     otherwise dodge the per-principal bucket entirely; the aggregate
-     bounds total throughput regardless.
+     it up, and here it is **load-bearing, not belt-and-braces**: sock.rs
+     can't tell a valid-but-unfamiliar token from a minted-per-request
+     garbage one (that needs `Actor` resolution — see below), so a caller
+     that varies its token gets a *fresh* per-principal bucket every
+     single request and is not rate-limited by the per-principal bucket
+     **at all**. The aggregate bucket is the only thing bounding that
+     caller's throughput.
+   - The per-principal bucket map is itself bounded at 512 distinct tokens
+     (`MAX_TRACKED_TOKENS`), evicting the fullest entry (idle long enough to
+     have refilled — carries no enforcement state, so it's free to drop)
+     to make room for a new one. Without this, the same rotating-token
+     caller that dodges per-principal rate limiting would also grow this
+     map forever: a mitigation for a flood attack that opened a slower
+     memory-exhaustion path for the same attacker. The eviction order
+     guarantees an actively-throttled principal's drained bucket is never
+     the one dropped out from under it — see the `evict_one` doc comment
+     for why "prefer a full bucket, else the fullest" is one comparison,
+     not two.
 
    Either cap's rejection is a distinct, actionable `err` reply —
    `"connection limit: ..."` / `"rate limited: ..."` — never a silent drop
@@ -192,7 +206,9 @@ protect.
    per-principal bucket/connection slot each time, bounded only by the
    aggregate bucket and the (unchanged) global connection cap — fully
    closing that needs token validation before accounting, i.e. `Actor`
-   resolution, which is core/app.rs's lane, not sock.rs's.
+   resolution, which is core/app.rs's lane, not sock.rs's. That gap is
+   accepted, not fixed; the aggregate bucket above is the load-bearing
+   mitigation for it, not defense-in-depth on top of something else.
 7. **Graceful at 0 instances; defined addressing at N.** Absent socket → clean
    no-op. (v1 scopes to one instance; multi-instance discovery is a non-goal.)
 8. **Preserve single-owner + daemonless.** Commands marshal through the mpsc onto
