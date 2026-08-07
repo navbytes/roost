@@ -39,9 +39,11 @@ use crate::ui::mouse::{self, MouseAction};
 /// The one `spawn_listener` failure that must stay fatal: the socket
 /// directory exists but isn't privately ours, which is what an attacker
 /// pre-creating it looks like. Every other failure degrades to "no control
-/// plane, and roost says so".
+/// plane, and roost says so". Matches against `sock::UNSAFE_SOCKET_DIR_MSG`
+/// rather than a hand-typed copy of `sock.rs`'s `bail!` wording (P2) — see
+/// that const's doc comment.
 fn is_unsafe_socket_dir(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("unsafe ownership/permissions")
+    format!("{e:#}").contains(crate::infra::sock::UNSAFE_SOCKET_DIR_MSG)
 }
 
 fn main() -> Result<()> {
@@ -869,11 +871,17 @@ mod tests {
     /// listener failure has to degrade to "no control plane, and roost says
     /// so" — a bind() failure taking the whole session down would be a worse
     /// outcome than the missing socket it is reporting.
+    ///
+    /// P2: the fatal fixture is built from `sock::UNSAFE_SOCKET_DIR_MSG`,
+    /// the same const the real `bail!` in `spawn_listener` uses, instead of
+    /// a hand-typed copy of its wording. A hand-typed copy can never catch
+    /// the check drifting from what `sock.rs` actually says — it would just
+    /// as happily go on matching itself. Sharing the identifier makes that
+    /// divergence impossible.
     #[test]
     fn only_an_unsafe_socket_dir_is_a_fatal_listener_failure() {
-        let unsafe_dir = anyhow::anyhow!(
-            "roost: socket directory /tmp/x has unsafe ownership/permissions"
-        );
+        use crate::infra::sock::UNSAFE_SOCKET_DIR_MSG;
+        let unsafe_dir = anyhow::anyhow!("roost: socket directory /tmp/x has {UNSAFE_SOCKET_DIR_MSG}");
         assert!(super::is_unsafe_socket_dir(&unsafe_dir));
 
         for benign in [
@@ -890,7 +898,7 @@ mod tests {
 
         // The real bail! is wrapped in context by the time main sees it; the
         // check reads the whole chain, so a wrapped one still counts.
-        let wrapped = anyhow::anyhow!("roost: socket directory /tmp/x has unsafe ownership/permissions")
+        let wrapped = anyhow::anyhow!("roost: socket directory /tmp/x has {UNSAFE_SOCKET_DIR_MSG}")
             .context("starting the control listener");
         assert!(super::is_unsafe_socket_dir(&wrapped));
     }

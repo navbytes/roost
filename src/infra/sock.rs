@@ -177,6 +177,18 @@ const MAX_TOKEN_LEN: usize = 128;
 /// legitimate use.
 const MAX_TRACKED_TOKENS: usize = 512;
 
+/// The exact substring `main.rs`'s `is_unsafe_socket_dir` matches a
+/// `spawn_listener` failure against to decide whether it's the one fatal
+/// case (an attacker may have pre-created the socket directory) versus
+/// every other failure, which degrades to "no control plane" instead (P2).
+/// A `pub const` shared by the `bail!` below and that check, rather than two
+/// hand-typed copies of the same wording: with two copies, rewording this
+/// message here left nothing to notice the check in `main.rs` — or its
+/// test, which built its own `anyhow!` strings instead of driving this
+/// code — no longer matching it. Sharing the identifier makes that
+/// divergence impossible to introduce by editing wording alone.
+pub const UNSAFE_SOCKET_DIR_MSG: &str = "unsafe ownership/permissions";
+
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
 /// an attacker who pre-created the runtime dir from hosting our control socket
 /// (tmux does the same for its socket dir).
@@ -615,7 +627,7 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
         // ...and refuse to run if it isn't actually ours and private (an
         // attacker may have pre-created it to intercept the socket).
         if !dir_is_private_and_ours(dir) {
-            bail!("roost: socket directory {} has unsafe ownership/permissions", dir.display());
+            bail!("roost: socket directory {} has {UNSAFE_SOCKET_DIR_MSG}", dir.display());
         }
     }
     let _ = fs::remove_file(&path); // stale socket from a previous run
