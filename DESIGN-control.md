@@ -159,67 +159,80 @@ protect.
    `MAX_CONN=64`, or one pane opening 64 connections starves the real
    orchestrator).
 
-   **✅ Shipped** (`src/infra/sock.rs`, closing audit M3), **revised once**
-   after a second security-review pass caught six real gaps in the first cut
-   (findings H1–M3, L1 below) — the shape survived, the accounting placement
-   didn't. All caps are keyed on the caller's raw wire token — sock.rs cannot
-   resolve a token to an `Actor` (that needs `App::resolve_actor`,
-   core/app.rs, a different file's lane); exact-string token identity is
-   what `resolve_actor` itself keys on, so this loses nothing, and it beats
-   peer credentials (`SO_PEERCRED`/`getpeereid`) for this job — in the
-   same-uid threat model the uid never varies, and the pid is a fresh
-   one-shot-CLI process every call, so a pid-keyed cap would never trip
-   against the actual flood shape (a shell loop re-execing `roost <verb>`).
+   **✅ Shipped** (`src/infra/sock.rs`, closing audit M3), **revised twice**
+   after two security-review passes — the first caught six real gaps
+   (findings H1–M3, L1 below); the second caught two more (C1/C2) in the
+   *fixes themselves*: a shared pool sized to bound an attacker also bounds
+   the victim, because sock.rs can't tell them apart, so two of the round-one
+   mitigations had each quietly become a *cheaper* lockout than the bug they
+   replaced. **Per-connection resources are the only ones an attacker can't
+   share with a victim** — that's the constraint the design now follows
+   wherever it can. All caps are keyed on the caller's raw wire token —
+   sock.rs cannot resolve a token to an `Actor` (that needs
+   `App::resolve_actor`, core/app.rs, a different file's lane); exact-string
+   token identity is what `resolve_actor` itself keys on, so this loses
+   nothing, and it beats peer credentials (`SO_PEERCRED`/`getpeereid`) for
+   this job — in the same-uid threat model the uid never varies, and the pid
+   is a fresh one-shot-CLI process every call, so a pid-keyed cap would never
+   trip against the actual flood shape (a shell loop re-execing `roost
+   <verb>`).
 
-   **Connections — two pools, not one:**
-   - **Unattributed (pre-auth) pool, 16.** *(Finding H1.)* The first cut only
-     charged a connection once it sent a well-formed request — connect and
-     never send anything (or trickle one blank line every <30s to dodge
-     `READ_TIMEOUT`) held a full `MAX_CONN` slot for free, which was M3's
-     original starvation, completely untouched. Every connection now starts
-     here; this pool also covers every status/session-report connection
-     (never sends a `method` line), which is fine — those are normally
-     connect/write/close, sub-millisecond.
+   **Connections — time-bounded pre-auth, then a per-principal pool:**
+   - **Pre-auth: a short (2s) read timeout, not a shared pool.** *(Finding
+     H1, revised as C1.)* The first cut only charged a connection once it
+     sent a well-formed request — connect and never send anything held a
+     full `MAX_CONN` slot for free, M3's original starvation. The immediate
+     fix (a small *shared* pre-auth counter, capped at 16) was *worse*: 16
+     idle connections now permanently shed every new connection, including
+     the human's CLI — cheaper than the 64 the original bug needed. Bounding
+     by time instead means a pile of squatters recycles on its own within
+     seconds; nobody else is ever blocked from getting in.
    - **Per-principal pool, 20**, alongside the unchanged global 64 — a
-     connection is promoted here, out of the unattributed pool, the instant
-     it sends its first well-formed request. Must be at least `app.rs`'s
-     `MAX_WAITS` (16): each parked `wait` holds one connection open for its
-     deferred reply, so a lower cap would refuse a fleet-wide wait the rest
-     of the system already considers and bounds — an early version shipped
-     at 8 and would have refused the documented 16-wait fleet outright
-     (finding M3). 20 leaves headroom for a few other commands alongside a
-     fully-parked wait set.
+     connection is promoted here, and onto the generous `READ_TIMEOUT` (30s),
+     the instant it sends its first well-formed request. Must be at least
+     `app.rs`'s `MAX_WAITS` (16): each parked `wait` holds one connection
+     open for its deferred reply, so a lower cap would refuse a fleet-wide
+     wait the rest of the system already considers and bounds — an early
+     version shipped at 8 and would have refused the documented 16-wait
+     fleet outright (finding M3). 20 leaves headroom for a few other
+     commands alongside a fully-parked wait set.
    - The old global-cap check-then-increment (load-then-add, audit Info (a))
      is race-free (atomic `fetch_update`).
 
-   **Commands — a per-line aggregate charge, then a per-*admitted*-principal
-   bucket:**
-   - **Aggregate bucket, 256 capacity / 20 per second**, charged once per
-     *line read* — independent of whether it parses, and checked before any
-     per-principal accounting. This is what makes "never complete a
-     well-formed request" (H1) and "flood raw/garbage/status lines"
-     (finding M2 — status-socket traffic bypassed both caps in the first
-     cut) cost something, since neither reaches a per-principal bucket.
-     Checking it *first* also fixed finding H2: the first cut charged the
-     principal before the aggregate bucket, so a caller throttled by a
-     *shared*, attacker-drained resource also burned its *own* budget for a
-     request that was always going to be refused.
+   **Commands — a per-*connection* line charge, then a per-*admitted*-
+   principal bucket, then the shared aggregate only on genuine dispatch:**
+   - **Line bucket, 128 capacity / 20 per second, per connection — plain
+     local state, no lock, no shared map.** *(Finding H1(a)/M2, revised as
+     C2.)* The first cut charged every line against the *shared* aggregate
+     bucket before parsing it, so it cost something even when never
+     dispatched — but one connection spewing blank lines emptied that shared
+     bucket in milliseconds and held every *other* connection at `rate
+     limited`, cheaper than the M3 flood it replaced (and it serialized all
+     control traffic on the aggregate's mutex besides). Moving the per-line
+     charge to a bucket only this connection can touch means a flood's cost
+     lands on the flooder, never on a caller sharing the socket with it.
    - **Per-principal bucket, 64 capacity / 5 per second**, charged only for
-     a well-formed request that already passed the aggregate check —
-     re-derived from a *real* 20-pane fleet (`spawn`×20 + `wait`×20 = 40
+     a well-formed request that already passed its connection's line bucket
+     — re-derived from a *real* 20-pane fleet (`spawn`×20 + `wait`×20 = 40
      commands), not the 10-pane hello-world §7 illustrates for brevity; an
      early version sized this from the smaller example and would have
      throttled ~8 calls of a real fan-out with no retry anywhere in
-     `cli.rs` (finding M3) — worse than the bug it fixed.
-   - **This bucket is keyed on the connection's *admitted* identity — the
-     token its first request succeeded with — never a raw per-request
-     token** (finding H2). The first cut kept a bucket per `req.token`,
-     so a connection could vary the token field on every subsequent
-     request and mint an endless supply of fresh, full buckets, defeating
-     per-principal rate limiting entirely from inside one already-open
-     connection — cheaper to mount than the 64-connection attack it
-     replaced. An in-body token that never admitted a connection therefore
-     never becomes a bucket map key at all.
+     `cli.rs` (finding M3) — worse than the bug it fixed. Keyed on the
+     connection's *admitted* identity — the token its first request
+     succeeded with — never a raw per-request token (finding H2): the first
+     cut kept a bucket per `req.token`, so a connection could vary the token
+     field on every subsequent request and mint an endless supply of fresh,
+     full buckets, defeating per-principal rate limiting entirely from
+     inside one already-open connection. An in-body token that never
+     admitted a connection therefore never becomes a bucket map key at all.
+   - **Aggregate bucket, 256 capacity / 20 per second**, charged only once a
+     request has *already* passed its connection's line bucket and its
+     per-principal bucket and is genuinely about to be dispatched — never
+     for raw line volume, which is now bounded per-connection above. Still
+     bounds total throughput regardless of how many admitted identities a
+     flood claims (finding H2), at a cost now roughly proportional to what
+     the attacker is genuinely spending, since reaching this check at all
+     requires already having paid a real per-principal cost.
    - The bucket map is bounded at 512 distinct identities (`MAX_TRACKED_TOKENS`),
      evicting the fullest entry (idle long enough to have refilled — carries
      no enforcement state, so it's free to drop) to make room for a new one;
