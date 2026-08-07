@@ -294,7 +294,12 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             m.insert("until".into(), flag_value(rest, "--until")?.unwrap_or_else(|| "waiting".into()).into());
             if let Some(secs) = flag_value(rest, "--timeout")? {
                 let secs: u64 = secs.parse().map_err(|_| "--timeout needs a number (seconds)")?;
-                m.insert("timeout_ms".into(), (secs * 1000).into());
+                // Code review (exit UX audit 2026-08-07): `secs * 1000`
+                // panics in a debug build and wraps in the shipped release
+                // profile for a large-enough `--timeout` (e.g. u64::MAX).
+                // Saturate instead — an absurd timeout should behave like
+                // "wait (almost) forever", not undefined-by-profile.
+                m.insert("timeout_ms".into(), secs.saturating_mul(1000).into());
             }
         }
         _ => return Err(format!("unknown verb: {verb}")),
@@ -541,6 +546,16 @@ mod tests {
             ["read", "5", "--tail", "--", "ignored"].iter().map(|s| s.to_string()).collect();
         let err = build_request(&owned, "T".into()).unwrap_err();
         assert!(err.contains("--tail"), "must name the flag: {err}");
+    }
+
+    /// Code review (exit UX audit 2026-08-07): `secs * 1000` panicked in a
+    /// debug build (and wrapped in release) for a `--timeout` this large.
+    #[test]
+    fn cli_wait_timeout_saturates_instead_of_overflowing() {
+        match parse(&["wait", "5", "--timeout", "18446744073709551615"]).method {
+            Method::Wait { timeout_ms, .. } => assert_eq!(timeout_ms, Some(u64::MAX)),
+            _ => panic!(),
+        }
     }
 
     /// Every verb needs its own, real help text — not the generic usage
