@@ -158,6 +158,41 @@ protect.
 6. **Rate-limited + per-principal connection cap** (not just the global
    `MAX_CONN=64`, or one pane opening 64 connections starves the real
    orchestrator).
+
+   **✅ Shipped** (`src/infra/sock.rs`, closing audit M3 — and, with it, M3's
+   role as the enabler of M2's log-rotation flood: a throttled/refused
+   request never reaches `App::audit`, so it can't force a rotation). Two
+   caps, both keyed on the caller's raw wire token — sock.rs cannot resolve
+   a token to an `Actor` (that needs `App::resolve_actor`, core/app.rs, a
+   different file's lane); exact-string token identity is what
+   `resolve_actor` itself keys on, so this loses nothing, and it beats
+   peer credentials (`SO_PEERCRED`/`getpeereid`) for this job — in the
+   same-uid threat model the uid never varies, and the pid is a fresh
+   one-shot-CLI process every call, so a pid-keyed cap would never trip
+   against the actual flood shape (a shell loop re-execing `roost <verb>`):
+   - **Per-principal connection cap**, 8 (the audit's number) alongside the
+     unchanged global 64 — one token can never hold more than 8/64 of the
+     pool. The old global-cap check-then-increment (load-then-add, audit
+     Info (a)) is also now race-free (atomic `fetch_update`).
+   - **Command token bucket**, 32 capacity / 5 per second per principal —
+     comfortably covers the documented "spawn x10 then wait x10" burst
+     (§7) while making M2's ~200k-call flood take on the order of 11h from
+     one token. A 128-capacity / 20-per-second **aggregate** bucket backs
+     it up: sock.rs can't tell a valid-but-unfamiliar token from a
+     minted-per-request garbage one, so a caller varying its token would
+     otherwise dodge the per-principal bucket entirely; the aggregate
+     bounds total throughput regardless.
+
+   Either cap's rejection is a distinct, actionable `err` reply —
+   `"connection limit: ..."` / `"rate limited: ..."` — never a silent drop
+   and never a hang (both were real bugs in this file; see `parse_control`),
+   and deliberately worded not to collide with `"unauthorized: ..."` or a
+   malformed-request error. Neither cap fully closes the *identity* problem:
+   a caller that mints a fresh garbage token per request still gets a fresh
+   per-principal bucket/connection slot each time, bounded only by the
+   aggregate bucket and the (unchanged) global connection cap — fully
+   closing that needs token validation before accounting, i.e. `Actor`
+   resolution, which is core/app.rs's lane, not sock.rs's.
 7. **Graceful at 0 instances; defined addressing at N.** Absent socket → clean
    no-op. (v1 scopes to one instance; multi-instance discovery is a non-goal.)
 8. **Preserve single-owner + daemonless.** Commands marshal through the mpsc onto
@@ -268,10 +303,11 @@ defense-in-depth, not a proven containment boundary, once a same-uid file read
 is in scope (see the §5.2 correction) — the boundary actually enforced is
 cross-UID. Otherwise met: per-verb capability (#3–4), owner-scoped reads (#5),
 0600 socket + off-env control token (#2), CSPRNG control token that hard-fails
-rather than falling back (#10), and an unconditional audit log at
+rather than falling back (#10), an unconditional audit log at
 `<state>/control.log` — principal + verb + target + outcome, never the message
-text (#9). Still open: a per-principal connection/rate cap (#6, beyond the
-global 64) and a human-consent gate on reads (#5). Remaining overall is a
+text (#9) — and, since then, a per-principal connection cap + command rate
+limit (#6, beyond the global 64; see #6 above for the shipped shape). Still
+open: a human-consent gate on reads (#5). Remaining overall is a
 live-terminal smoke test and, if ever wanted, the Phase 3 niceties above.
 
 ## 9. The three paradigms, compared
@@ -300,8 +336,12 @@ that makes control-mode the adversary's lowest-ranked option.
   correction). Cross-UID is the boundary that actually holds.
 - **Fork-bomb / recursion** in self-referential orchestration — leaf tokens +
   pane budget + depth counter.
-- **Command flood stalling the render loop** — per-connection token bucket +
-  per-principal connection cap; the bounded channel already prevents OOM.
+- **Command flood stalling the render loop** — ✅ closed: per-principal command
+  token bucket + per-principal connection cap (§5 constraint #6, `sock.rs`);
+  the bounded channel already prevented OOM regardless. Residual: sock.rs
+  can't validate a token, so a caller minting a fresh one per request isn't
+  capped per-identity, only by the aggregate bucket and the global
+  connection cap — see #6 above.
 - **Secret exfiltration via reads** — owner-scoped, snapshot-only, consented.
 - **Destructive verbs bypassing the human busy-guard** — `force` semantics +
   default-deny self/last-pane close over the API.
