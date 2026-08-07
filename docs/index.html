@@ -15,31 +15,34 @@
 <meta name="twitter:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for six AI agent CLIs, with no daemon.">
 <meta name="twitter:image" content="https://navbytes.github.io/roost/roost-hero.png">
 <!-- favicon is a hand-synced copy of #bird-mark below (data URIs can't <use> in-page symbols) — body+belly+beak only, no eyes; keep both in sync when the mark changes -->
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%23ec3013'/><ellipse cx='8' cy='12.5' rx='5' ry='3' fill='%23f3f2f2'/><polygon points='6.3,9.5 9.7,9.5 8,11.8' fill='%23ffd400'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><ellipse cx='8' cy='8' rx='8' ry='7' fill='%23FF6666'/><ellipse cx='8' cy='11.5' rx='5.5' ry='3.5' fill='%23FFFAFA'/><circle cx='5.5' cy='6.5' r='1.3' fill='%23111111'/><circle cx='10.5' cy='6.5' r='1.3' fill='%23111111'/><polygon points='6.6,8.2 9.4,8.2 8,10' fill='%23FFA500'/></svg>">
 <link rel="stylesheet" href="./site.css">
 </head>
 <body>
 
 <svg style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true">
   <!-- bird-mark: the one roost bird, cropped to body+belly+beak+eyes from the hero
-       illustration's own coordinates (same silhouette, same proportions, same palette).
-       body uses currentColor so instances can recolor it; belly/beak/eyes stay fixed
-       since they read fine on both paper and red backgrounds. stroke-width is preset
-       but stroke itself is left unset (defaults to none) — the footer CTA instance
-       turns it on to outline the body against the matching-red band.
+       illustration's own coordinates (same silhouette, same proportions). The mascot
+       palette comes from the client's concept SVG (2026-08-07) and intentionally
+       sits outside the site's three-hue tokens. Cheeks and sparkles are dropped at
+       mark sizes where they'd smear. stroke-width is preset but stroke itself is
+       left unset (defaults to none) — the footer CTA instance turns on a paper
+       stroke to separate the coral body from the red band.
        Hand-synced with the favicon <link> above — update both together. -->
-  <symbol id="bird-mark" viewBox="145 51 110 112">
-    <circle cx="200" cy="106" r="55" stroke-width="5" style="fill:currentColor"/>
-    <ellipse cx="200" cy="142" rx="34" ry="21" style="fill:var(--color-bg)"/>
-    <polygon points="190,119 210,119 200,133" style="fill:var(--funk-yellow)"/>
-    <circle cx="170" cy="96" r="9" style="fill:var(--color-text)"/>
-    <circle cx="230" cy="96" r="9" style="fill:var(--color-text)"/>
+  <symbol id="bird-mark" viewBox="135 40 130 110">
+    <ellipse cx="200" cy="95" rx="65" ry="55" stroke-width="5" fill="#FF6666"/>
+    <ellipse cx="200" cy="120" rx="45" ry="25" fill="#FFFAFA"/>
+    <circle cx="170" cy="80" r="10" fill="#FFFFFF"/>
+    <circle cx="174" cy="80" r="5" fill="#111111"/>
+    <circle cx="230" cy="80" r="10" fill="#FFFFFF"/>
+    <circle cx="226" cy="80" r="5" fill="#111111"/>
+    <path d="M 192 93 L 208 93 L 200 105 Z" fill="#FFA500" stroke="#FF8C00" stroke-width="1" stroke-linejoin="round"/>
   </symbol>
 </svg>
 
 <nav class="nav" style="position:sticky;top:0;z-index:20;background:var(--color-bg);padding-inline:max(var(--space-4),calc((100% - 1200px) / 2 + var(--edge)))">
   <span class="nav-brand" style="display:flex;align-items:center;gap:10px">
-    <svg width="20" height="20" style="color:var(--color-accent);flex-shrink:0" aria-hidden="true"><use href="#bird-mark"></use></svg>roost
+    <svg width="20" height="20" style="flex-shrink:0" aria-hidden="true"><use href="#bird-mark"></use></svg>roost
     <a class="tag tag-outline" href="https://github.com/navbytes/roost/releases/tag/v0.1.0" target="_blank" rel="noopener" style="text-decoration:none">v0.1.0</a>
   </span>
   <a href="#features">Features</a>
@@ -81,25 +84,29 @@
             <text x="60" y="266" style="font-family:var(--font-mono);font-size:14px"><tspan style="fill:var(--tui-accent)">$</tspan><tspan class="cursor-blink" style="fill:var(--tui-accent)"> ▍</tspan></text>
             <rect x="40" y="150" width="320" height="190" fill="none" style="stroke:var(--color-text);stroke-width:2"/>
           </g>
+          <!-- The roost bird, verbatim from the client's concept SVG (2026-08-07),
+               translated y-95 so its feet land on this window's title bar. The
+               mascot palette is the client's own and intentionally sits outside
+               the site's three-hue tokens (like Ferris is orange on rust-lang.org). -->
           <g class="bird-breathe">
-            <polygon points="160,110 160,132 128,121" style="fill:var(--color-accent-700)"/>
-            <circle cx="200" cy="106" r="55" style="fill:var(--color-accent)"/>
-            <ellipse cx="168" cy="120" rx="17" ry="27" transform="rotate(-14 168 120)" style="fill:var(--color-accent-700)"/>
-            <ellipse cx="232" cy="120" rx="17" ry="27" transform="rotate(14 232 120)" style="fill:var(--color-accent-700)"/>
-            <circle cx="155" cy="104" r="8" style="fill:var(--color-accent-2);opacity:0.35"/>
-            <circle cx="245" cy="104" r="8" style="fill:var(--color-accent-2);opacity:0.35"/>
-            <ellipse cx="200" cy="142" rx="34" ry="21" style="fill:#f3f2f2"/>
-            <rect x="182" y="146" width="12" height="9" style="fill:var(--funk-yellow);stroke:var(--color-text);stroke-width:1.5"/>
-            <rect x="206" y="146" width="12" height="9" style="fill:var(--funk-yellow);stroke:var(--color-text);stroke-width:1.5"/>
-            <polygon points="190,119 210,119 200,133" style="fill:var(--funk-yellow);stroke:var(--color-text);stroke-width:1.5;stroke-linejoin:round"/>
+            <path d="M 200 145 Q 170 175 190 185 Q 215 175 200 145" fill="#CC3333"/>
+            <path d="M 185 145 L 180 150" stroke="#FFA500" stroke-width="3" stroke-linecap="round" fill="none"/>
+            <path d="M 215 145 L 220 150" stroke="#FFA500" stroke-width="3" stroke-linecap="round" fill="none"/>
+            <ellipse cx="200" cy="95" rx="65" ry="55" fill="#FF6666"/>
+            <ellipse cx="200" cy="120" rx="45" ry="25" fill="#FFFAFA"/>
+            <path d="M 145 95 Q 130 115 150 135 Q 165 115 145 95" fill="#EE4444"/>
+            <path d="M 255 95 Q 270 115 250 135 Q 235 115 255 95" fill="#EE4444"/>
+            <circle cx="155" cy="100" r="8" fill="#FFC0CB" opacity="0.6"/>
+            <circle cx="245" cy="100" r="8" fill="#FFC0CB" opacity="0.6"/>
             <g class="bird-eyes">
-              <circle cx="170" cy="94" r="8" style="fill:#f3f2f2"/>
-              <circle cx="230" cy="94" r="8" style="fill:#f3f2f2"/>
-              <circle cx="170" cy="96" r="4.5" style="fill:var(--color-text)"/>
-              <circle cx="230" cy="96" r="4.5" style="fill:var(--color-text)"/>
-              <circle cx="171.5" cy="93.5" r="1.4" style="fill:#f3f2f2"/>
-              <circle cx="231.5" cy="93.5" r="1.4" style="fill:#f3f2f2"/>
+              <circle cx="170" cy="80" r="10" fill="#FFFFFF"/>
+              <circle cx="174" cy="80" r="5" fill="#111111"/>
+              <circle cx="176" cy="78" r="2" fill="#FFFFFF"/>
+              <circle cx="230" cy="80" r="10" fill="#FFFFFF"/>
+              <circle cx="226" cy="80" r="5" fill="#111111"/>
+              <circle cx="224" cy="78" r="2" fill="#FFFFFF"/>
             </g>
+            <path d="M 192 93 L 208 93 L 200 105 Z" fill="#FFA500" stroke="#FF8C00" stroke-width="1" stroke-linejoin="round"/>
           </g>
         </svg>
       </div>
@@ -496,10 +503,9 @@
 <section style="background:var(--color-accent);color:var(--color-bg)">
   <div style="max-width:1200px;margin:0 auto;padding:clamp(56px,7vw,96px) var(--edge)">
     <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
-      <!-- red-band colorway: SAME red body as everywhere else (currentColor), separated from the
-           matching-red background purely by the ink stroke defined on #bird-mark's body circle;
-           belly/beak stay paper/yellow as usual -->
-      <svg width="46" height="46" style="color:var(--color-accent);stroke:var(--color-text);flex-shrink:0" aria-hidden="true"><use href="#bird-mark"></use></svg>
+      <!-- red-band colorway: same coral body as everywhere else, separated from the
+           red band by a paper stroke (turned on here; #bird-mark presets only the width) -->
+      <svg width="46" height="46" style="stroke:var(--color-bg);flex-shrink:0" aria-hidden="true"><use href="#bird-mark"></use></svg>
       <h2 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(32px,4.6vw,60px);line-height:1.05;letter-spacing:-0.01em;margin:0">
         <span style="display:block">Bring your agents home.</span>
       </h2>
@@ -517,7 +523,7 @@
 
 <footer style="border-top:2px solid var(--color-divider)">
   <div style="max-width:1200px;margin:0 auto;padding:36px var(--edge);display:flex;flex-wrap:wrap;gap:24px;align-items:center;justify-content:space-between">
-    <span style="display:flex;align-items:center;gap:10px;font-family:var(--font-heading);font-weight:800;font-size:16px"><svg width="18" height="18" style="color:var(--color-accent);flex-shrink:0" aria-hidden="true"><use href="#bird-mark"></use></svg>roost</span>
+    <span style="display:flex;align-items:center;gap:10px;font-family:var(--font-heading);font-weight:800;font-size:16px"><svg width="18" height="18" style="flex-shrink:0" aria-hidden="true"><use href="#bird-mark"></use></svg>roost</span>
     <div style="display:flex;flex-wrap:wrap;gap:24px;font-family:var(--font-mono);font-size:13px">
       <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">GitHub</a>
       <a href="https://github.com/navbytes/roost/blob/main/DESIGN.md" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">DESIGN.md</a>
