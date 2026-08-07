@@ -33,6 +33,18 @@
     --color-accent-700: #ae1800;
     --color-accent-800: #7c1405;
 
+    /* Funk pass: two extra hues on top of the one brand red. Red stays
+       primary everywhere (buttons, primary CTAs); yellow/blue are accents —
+       rotated on kickers, stats, hover shadows, tags, ::selection.
+       Yellow is NEVER used as text on the paper bg (#ffd400 on #f3f2f2 is
+       ~1.3:1, fails AA outright) — ink-on-yellow fill only. Blue is tuned
+       dark enough to run as text on paper (~8.2:1, comfortably AA).
+       Note: this site's palette is deliberately NOT bound by DESIGN-ui.md
+       §2's one-red rule — that gate scans src/ui (roost's terminal chrome),
+       not docs/. */
+    --funk-yellow: #ffd400;
+    --funk-blue: #2318e0;
+
     /* System stacks only — no @font-face, no CDN, so the page makes zero
        external requests (see the self-contained hard constraint). */
     --font-heading: -apple-system, "Segoe UI", system-ui, "Helvetica Neue", Arial, sans-serif;
@@ -57,7 +69,9 @@
     --tui-bg: #15120f;
     --tui-fg: #eae5df;
     --tui-mut: #8f8983;
-    --tui-dim: #57524b;
+    --tui-dim: #8f8983; /* was #57524b (~2.4:1 on --tui-bg, fails AA at the 10.5–11.5px
+                            sizes it's used at) — reuses --tui-mut's value so dim
+                            and mut sit at the same, AA-passing (~5.4:1) level */
     --tui-rule: #332f2a;
     --tui-accent: #ff563c;
     --tui-accent-dim: #a83a28;
@@ -82,17 +96,20 @@
   a:hover { color: var(--color-accent-700); }
   :focus { outline: none; }
   :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
-  ::selection { background: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+  ::selection { background: var(--funk-yellow); color: var(--color-text); }
 
   .btn {
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     cursor: pointer; text-decoration: none;
-    font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+    font-family: var(--font-mono); font-weight: var(--font-heading-weight);
+    text-transform: uppercase; letter-spacing: 0.04em;
     font-size: 14px; line-height: 1.2; color: var(--color-text);
     background: transparent; border: 1px solid transparent;
     padding: var(--space-2) calc(var(--space-3) * 1.2);
     border-radius: var(--radius-md);
+    transition: transform 120ms ease, box-shadow 120ms ease;
   }
+  .btn:hover { transform: translate(-3px, -3px); box-shadow: 6px 6px 0 var(--btn-shadow, var(--color-accent)); }
   .btn-primary { background: var(--color-accent); color: var(--color-bg); }
   .btn-primary:hover { background: var(--color-accent-600); color: var(--color-bg); }
   .btn-primary:active { background: var(--color-accent-700); }
@@ -107,7 +124,7 @@
   }
   .tag-accent { background: var(--color-accent-100); color: var(--color-accent-800); }
   .tag-neutral { background: var(--color-neutral-100); color: var(--color-neutral-800); }
-  .tag-outline { border: 1px solid var(--color-accent); color: var(--color-accent); }
+  .tag-outline { border: 1px solid var(--funk-blue); color: var(--funk-blue); }
 
   .nav {
     display: flex; align-items: center; gap: var(--space-4);
@@ -126,20 +143,26 @@
   @keyframes roost-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
   .kicker {
-    display: block; font-family: var(--font-mono); font-size: 13px;
+    display: block; font-family: var(--font-mono); font-weight: 700; font-size: 13px;
     letter-spacing: 0.06em; text-transform: uppercase;
-    color: var(--color-accent-700); margin-bottom: 14px;
+    margin-bottom: 14px;
   }
+  .kicker-red { color: var(--color-accent-700); }
+  .kicker-blue { color: var(--funk-blue); }
+  .kicker-hi { display: inline-block; background: var(--funk-yellow); color: var(--color-text); padding: 2px 10px; }
 
   .demo-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,300px); min-height: 340px; }
   .demo-side { border: 1px solid var(--tui-rule); display: flex; flex-direction: column; font-family: var(--font-mono); font-size: 12.5px; }
 
   .stats { display: grid; grid-template-columns: repeat(4,1fr); gap: 32px 24px; }
+  .stat-cell { transition: transform 120ms ease, box-shadow 120ms ease; }
+  .stat-cell:hover { transform: translate(-3px,-3px); box-shadow: 6px 6px 0 var(--color-accent); }
   .stat-num {
-    font-family: var(--font-heading); font-weight: 800;
+    font-family: var(--font-mono); font-weight: 800;
     font-size: clamp(34px,3.6vw,52px); color: var(--color-accent);
-    margin: 0; letter-spacing: -0.02em;
+    margin: 0; letter-spacing: -0.01em;
   }
+  .stat-num-blue { color: var(--funk-blue); }
   .stat-label {
     font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase;
     color: color-mix(in srgb, var(--color-text) 66%, transparent); margin: 12px 0 0;
@@ -152,8 +175,8 @@
   }
   .frow:last-child { border-bottom: 2px solid var(--color-divider); }
   .frow-mark { display: flex; flex-direction: column; gap: 12px; }
-  .frow-num { font-family: var(--font-heading); font-weight: 800; font-size: 15px; margin: 0; font-feature-settings: 'tnum' 1; }
-  .frow h3 { font-family: var(--font-heading); font-weight: 800; font-size: clamp(22px,2vw,26px); letter-spacing: -0.01em; margin: 0; }
+  .frow-num { font-family: var(--font-mono); font-weight: 800; font-size: 15px; margin: 0; font-feature-settings: 'tnum' 1; }
+  .frow h3 { font-family: var(--font-mono); font-weight: 800; font-size: clamp(22px,2vw,26px); letter-spacing: -0.01em; margin: 0; }
   .frow-body { font-size: 16px; line-height: 1.65; margin: 0; color: color-mix(in srgb, var(--color-text) 78%, transparent); max-width: 56ch; }
 
   .icon { color: color-mix(in srgb, var(--color-text) 55%, transparent); flex-shrink: 0; }
@@ -177,8 +200,44 @@
   }
   .keycell span { font-size: 14.5px; }
 
+  /* ── funk pass additions ──────────────────────────────────────────── */
+  @keyframes cursor-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+  .cursor-blink { display: inline-block; animation: cursor-blink 1s steps(1) infinite; }
+
+  .adapter-card, .install-card { transition: transform 120ms ease, box-shadow 120ms ease; position: relative; }
+  .adapter-card:hover { transform: translate(-3px,-3px); box-shadow: 6px 6px 0 var(--funk-yellow); z-index: 1; }
+  .install-card { border: 2px solid var(--color-text); padding: 16px; }
+  .install-card:hover { transform: translate(-3px,-3px); box-shadow: 6px 6px 0 var(--funk-blue); z-index: 1; }
+
+  /* resurrection toggle — two real radios drive it via sibling selectors,
+     so the state swap works with CSS only (no JS dependency) */
+  .seg-input {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+  }
+  .seg {
+    display: inline-flex; border: 2px solid var(--color-text);
+    font-family: var(--font-mono); font-weight: 700; font-size: 13px;
+    letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .seg-label { display: flex; align-items: center; padding: 11px 18px; cursor: pointer; user-select: none; color: var(--color-text); }
+  .seg-label:not(:first-of-type) { border-left: 2px solid var(--color-text); }
+  /* the two radios sit flat inside .resurrect, as siblings of both .seg-row (the
+     visible control) and .resurrect-window — so one :checked state can reach
+     sideways into both via plain sibling + descendant selectors, no JS, no :has() */
+  #r-quit:checked ~ .seg-row label[for="r-quit"],
+  #r-roost:checked ~ .seg-row label[for="r-roost"] { background: var(--color-accent); color: var(--color-bg); }
+  #r-quit:focus-visible ~ .seg-row label[for="r-quit"],
+  #r-roost:focus-visible ~ .seg-row label[for="r-roost"] { outline: 2px solid var(--funk-blue); outline-offset: 2px; }
+
+  .resurrect-body-quit { display: none; }
+  #r-quit:checked ~ .resurrect-window .resurrect-body-roost { display: none; }
+  #r-quit:checked ~ .resurrect-window .resurrect-body-quit { display: block; }
+
   @media (max-width: 760px) {
-    .nav a:not(.btn):not(.tag) { display: none; }
+    .nav { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .nav::-webkit-scrollbar { display: none; }
+    .nav-brand, .nav > a { flex-shrink: 0; }
     .demo-grid { grid-template-columns: 1fr; }
     .stats { grid-template-columns: repeat(2,1fr); }
     .frow { grid-template-columns: 1fr; gap: 10px; }
@@ -190,14 +249,33 @@
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     * { animation: none !important; }
+    * { transition: none !important; }
   }
 </style>
 </head>
 <body>
 
+<svg style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true">
+  <!-- pixel-bird symbol: two blocky pixel-grid attempts (10×9) read as an inkblot at
+       18–20px, so this is the plump-wren silhouette fallback the brief allows —
+       recolored per instance via currentColor (red on paper, paper on the red footer) -->
+  <symbol id="bird" viewBox="0 0 28 22">
+    <g fill="currentColor">
+      <ellipse cx="13" cy="10" rx="8" ry="6.5"/>
+      <circle cx="19" cy="6" r="4.2"/>
+      <polygon points="22.5,5 27,6.3 22.5,7.8"/>
+      <polygon points="5,11 0,14.2 6,13.6"/>
+      <rect x="10" y="15.8" width="1.6" height="4.2"/>
+      <rect x="15" y="15.8" width="1.6" height="4.2"/>
+      <rect x="0" y="20" width="28" height="1.6"/>
+    </g>
+    <circle cx="20.4" cy="5.2" r="0.9" fill="#201e1d"/>
+  </symbol>
+</svg>
+
 <nav class="nav" style="position:sticky;top:0;z-index:20;background:var(--color-bg);padding-inline:max(var(--space-4),calc((100% - 1200px) / 2 + var(--edge)))">
   <span class="nav-brand" style="display:flex;align-items:center;gap:10px">
-    <span style="display:inline-block;width:13px;height:13px;background:var(--color-accent)"></span>roost
+    <svg width="24" height="19" viewBox="0 0 28 22" style="color:var(--color-accent);flex-shrink:0" aria-hidden="true"><use href="#bird"></use></svg>roost
     <a class="tag tag-outline" href="https://github.com/navbytes/roost/releases/tag/v0.1.0" target="_blank" rel="noopener" style="text-decoration:none">v0.1.0</a>
   </span>
   <a href="#features">Features</a>
@@ -212,137 +290,162 @@
 <div style="max-width:1200px;margin:0 auto;padding:0 var(--edge)">
 
   <section style="padding:clamp(48px,7vw,104px) 0 clamp(40px,5vw,72px)">
-    <span class="kicker" style="margin-bottom:28px">Session-native terminal multiplexer</span>
-    <h1 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(42px,6.6vw,88px);line-height:1.02;letter-spacing:-0.03em;margin:0;margin-left:-0.04em">
+    <span class="kicker kicker-red" style="margin-bottom:28px">Session-native terminal multiplexer</span>
+    <h1 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(34px,5.6vw,72px);line-height:1.05;letter-spacing:-0.01em;margin:0">
       <span style="display:block">Processes are disposable.</span>
-      <span style="display:block;color:var(--color-accent)">Sessions are precious.</span>
+      <span style="display:block;color:var(--color-accent)">Sessions are precious.<span class="cursor-blink" aria-hidden="true">▍</span></span>
     </h1>
     <p style="font-size:clamp(17px,1.5vw,20px);line-height:1.6;max-width:60ch;margin:32px 0 0;color:color-mix(in srgb, var(--color-text) 82%, transparent)">
-      roost is a terminal multiplexer built for AI agent CLIs — pi, Claude Code, Codex, Gemini, opencode, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — and every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon. No detach. Everything comes back except the turn in flight when you quit — roost resurrects the desk, not the sentence being typed on it.
+      roost is a terminal multiplexer for AI agent CLIs — pi, Claude Code, Codex, Gemini, opencode, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — every tab, split, and stacked pane comes back, each agent resumed into its exact session.
+    </p>
+    <p style="font-family:var(--font-mono);font-size:13px;line-height:1.6;max-width:60ch;margin:10px 0 0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">
+      No daemon. No detach. roost resurrects the desk, not the sentence being typed on it.
     </p>
     <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
       <div style="display:flex;align-items:stretch;border:2px solid var(--color-text);font-family:var(--font-mono);max-width:100%">
         <span style="display:flex;align-items:center;gap:10px;padding:12px 16px;font-size:15px;white-space:nowrap;overflow-x:auto;min-width:0">
           <span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost
         </span>
-        <button type="button" id="copy" style="flex-shrink:0;border:0;border-left:2px solid var(--color-text);background:var(--color-text);color:var(--color-bg);font-family:var(--font-mono);font-weight:500;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;padding:0 16px;cursor:pointer;min-width:88px">Copy</button>
+        <button type="button" class="js-copy" data-copy-text="mise use -g github:navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:0;border-left:2px solid var(--color-text);background:var(--color-text);color:var(--color-bg);font-family:var(--font-mono);font-weight:500;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;padding:0 16px;cursor:pointer;min-width:88px">Copy</button>
       </div>
       <a class="btn btn-secondary" href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="text-decoration:none;padding:12px 20px;font-size:15px">Star on GitHub ↗</a>
     </div>
   </section>
 
   <section aria-label="roost terminal demo" style="padding-bottom:clamp(40px,5vw,72px)">
-    <div style="border:2px solid var(--color-text);background:var(--tui-bg);box-shadow:var(--shadow-lg);font-family:var(--font-mono);color:var(--tui-fg)">
-      <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--tui-bar);border-bottom:1px solid rgba(255,255,255,0.07)">
-        <span style="display:flex;gap:7px">
-          <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
-          <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
-          <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
-        </span>
-        <span style="font-size:12.5px;color:var(--tui-mut);letter-spacing:0.02em">roost — ~/code</span>
+    <div class="resurrect">
+      <input type="radio" name="resurrect" id="r-quit" class="seg-input">
+      <input type="radio" name="resurrect" id="r-roost" class="seg-input" checked>
+
+      <div class="seg-row" style="display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin-bottom:20px">
+        <div class="seg">
+          <label for="r-quit" class="seg-label">⏻ quit &amp; reboot</label>
+          <label for="r-roost" class="seg-label">$ roost</label>
+        </div>
+        <span style="font-family:var(--font-mono);font-size:13px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">The whole pitch is this switch. Flip it.</span>
       </div>
 
-      <!-- tab bar: ▎ marker + "N name" + status glyph + │ separator, per tab -->
-      <div style="display:flex;flex-wrap:wrap;align-items:stretch;background:var(--tui-strip);font-size:12.5px">
-        <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-fg);background:var(--tui-bg)"><span style="color:var(--tui-accent)">▎</span>1 main<span style="color:var(--tui-accent)">◆</span></span>
-        <span style="color:var(--tui-rule);align-self:center">│</span>
-        <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-mut)"><span style="color:transparent">▎</span>2 api</span>
-        <span style="color:var(--tui-rule);align-self:center">│</span>
-        <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-mut)"><span style="color:transparent">▎</span>3 infra<span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span></span>
-        <span style="color:var(--tui-rule);align-self:center">│</span>
-        <span style="margin-left:auto;display:flex;align-items:center;padding:9px 16px;color:var(--tui-dim);font-size:11.5px;letter-spacing:0.02em">~/code · saved ✓</span>
-      </div>
+      <div class="resurrect-window" style="border:2px solid var(--color-text);background:var(--tui-bg);box-shadow:var(--shadow-lg);font-family:var(--font-mono);color:var(--tui-fg)">
+        <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--tui-bar);border-bottom:1px solid rgba(255,255,255,0.07)">
+          <span style="display:flex;gap:7px">
+            <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
+            <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
+            <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
+          </span>
+          <span style="font-size:12.5px;color:var(--tui-mut);letter-spacing:0.02em">roost — ~/code</span>
+        </div>
 
-      <!-- split: focused pane (left) + a stack (right) -->
-      <div class="demo-grid">
-        <div style="position:relative;border:1px solid var(--tui-accent);padding:14px 16px;font-size:13px;line-height:1.65;overflow:hidden">
-          <span style="position:absolute;top:6px;right:11px;font-size:11px;color:var(--tui-mut);letter-spacing:0.02em">refactor tui · pi <span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span></span>
-          <div style="color:var(--tui-mut)">~/code/pi-mono</div>
-          <div style="margin-top:3px"><span style="color:var(--tui-accent)">❯</span> split the pane renderer into one draw fn per node</div>
-          <div style="margin-top:10px;color:var(--tui-mut)"><span style="color:var(--tui-accent)">⏺</span> read <span style="color:var(--tui-fg)">src/ui/render.rs</span> <span style="color:var(--tui-dim)">· 342 lines</span></div>
-          <div style="color:var(--tui-mut)"><span style="color:var(--tui-accent)">⏺</span> edit <span style="color:var(--tui-fg)">src/ui/render.rs</span></div>
-          <div style="margin-top:8px;border:1px solid var(--tui-rule);padding:8px 10px;font-size:12.5px">
-            <div style="color:var(--tui-dim);font-size:11px">src/ui/render.rs · draw_pane()</div>
-            <div style="margin-top:5px;color:var(--tui-accent-dim)">-   fn draw_pane(f, pane) {</div>
-            <div style="color:var(--tui-ok)">+   fn draw_pane(f, pane, focus: bool) {</div>
-            <div style="color:var(--tui-ok)">+       let edge = if focus { ACCENT } else { RULE };</div>
-            <div style="color:var(--tui-mut)">        blit_grid(f, pane.grid, rect);</div>
+        <div class="resurrect-body-roost" style="min-height:420px">
+          <!-- tab bar: ▎ marker + "N name" + status glyph + │ separator, per tab -->
+          <div style="display:flex;flex-wrap:wrap;align-items:stretch;background:var(--tui-strip);font-size:12.5px">
+            <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-fg);background:var(--tui-bg)"><span style="color:var(--tui-accent)">▎</span>1 main<span style="color:var(--tui-accent)">◆</span></span>
+            <span style="color:var(--tui-rule);align-self:center">│</span>
+            <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-mut)"><span style="color:transparent">▎</span>2 api</span>
+            <span style="color:var(--tui-rule);align-self:center">│</span>
+            <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-mut)"><span style="color:transparent">▎</span>3 infra<span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span></span>
+            <span style="color:var(--tui-rule);align-self:center">│</span>
+            <span style="margin-left:auto;display:flex;align-items:center;padding:9px 16px;color:var(--tui-dim);font-size:11.5px;letter-spacing:0.02em">~/code · saved ✓</span>
           </div>
-          <div style="margin-top:10px;color:var(--tui-fg)">composing edit — 3 hunks, tests next</div>
+
+          <!-- split: focused pane (left) + a stack (right) -->
+          <div class="demo-grid">
+            <div style="position:relative;border:1px solid var(--tui-accent);padding:14px 16px;font-size:13px;line-height:1.65;overflow:hidden">
+              <span style="position:absolute;top:6px;right:11px;font-size:11px;color:var(--tui-mut);letter-spacing:0.02em">refactor tui · pi <span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span></span>
+              <div style="color:var(--tui-mut)">~/code/pi-mono</div>
+              <div style="margin-top:3px"><span style="color:var(--tui-accent)">❯</span> split the pane renderer into one draw fn per node</div>
+              <div style="margin-top:10px;color:var(--tui-mut)"><span style="color:var(--tui-accent)">⏺</span> read <span style="color:var(--tui-fg)">src/ui/render.rs</span> <span style="color:var(--tui-dim)">· 342 lines</span></div>
+              <div style="color:var(--tui-mut)"><span style="color:var(--tui-accent)">⏺</span> edit <span style="color:var(--tui-fg)">src/ui/render.rs</span></div>
+              <div style="margin-top:8px;border:1px solid var(--tui-rule);padding:8px 10px;font-size:12.5px">
+                <div style="color:var(--tui-dim);font-size:11px">src/ui/render.rs · draw_pane()</div>
+                <div style="margin-top:5px;color:var(--tui-accent-dim)">-   fn draw_pane(f, pane) {</div>
+                <div style="color:var(--tui-ok)">+   fn draw_pane(f, pane, focus: bool) {</div>
+                <div style="color:var(--tui-ok)">+       let edge = if focus { ACCENT } else { RULE };</div>
+                <div style="color:var(--tui-mut)">        blit_grid(f, pane.grid, rect);</div>
+              </div>
+              <div style="margin-top:10px;color:var(--tui-fg)">composing edit — 3 hunks, tests next</div>
+            </div>
+
+            <div class="demo-side">
+              <span style="padding:7px 12px;color:var(--tui-dim);font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;border-bottom:1px solid var(--tui-rule);display:flex;justify-content:space-between">
+                <span>stack · 5 panes</span><span>Alt+↑↓</span>
+              </span>
+
+              <!-- expanded member: unfocused stack member gets a RULE frame + accent-dim left edge -->
+              <span style="position:relative;flex:1;min-height:0;border-left:2px solid var(--tui-accent-dim);padding:11px 13px;overflow:hidden">
+                <span style="position:absolute;top:5px;right:10px;font-size:10.5px;color:var(--tui-mut)">write tests · claude <span style="color:var(--tui-accent)">◆</span></span>
+                <span style="display:block;color:var(--tui-mut)">~/code/pi-mono/tests</span>
+                <span style="display:block;margin-top:6px;color:var(--tui-fg)">Claude wants to edit <span style="color:var(--tui-info)">status_test.rs</span></span>
+                <span style="display:block;margin-top:8px;border:1px solid var(--tui-accent-dim);padding:8px 10px">
+                  <span style="display:block;color:var(--tui-fg)">Allow this edit?</span>
+                  <span style="display:block;margin-top:6px;color:var(--tui-fg)"><span style="color:var(--tui-accent)">❯</span> 1. Yes</span>
+                  <span style="display:block;color:var(--tui-mut)">&nbsp;&nbsp;2. Yes, and don't ask again</span>
+                </span>
+              </span>
+
+              <!-- collapsed rows: glyph + name + fill + "adapter · state-word" -->
+              <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+                <span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span><span style="color:var(--tui-fg)">api-worker</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">pi · working</span>
+              </span>
+              <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+                <span style="color:var(--tui-fg)">○</span><span style="color:var(--tui-mut)">write docs</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">claude · your turn</span>
+              </span>
+              <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+                <span style="color:var(--tui-dim)">·</span><span style="color:var(--tui-mut)">scratch</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">shell · idle</span>
+              </span>
+              <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
+                <span style="color:var(--tui-accent-dim)">✕</span><span style="color:var(--tui-dim)">old build</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">pi · exited</span>
+              </span>
+            </div>
+          </div>
+
+          <!-- hint bar: bg BAR, accent keys, right-aligned needs-you count + mode word -->
+          <div style="display:flex;flex-wrap:wrap;align-items:center;gap:18px;padding:9px 14px;background:var(--tui-bar);font-size:11.5px;color:var(--tui-mut)">
+            <span><span style="color:var(--tui-accent)">Alt+n</span> new</span>
+            <span><span style="color:var(--tui-accent)">Alt+↵</span> launch</span>
+            <span><span style="color:var(--tui-accent)">Alt+s</span> stack</span>
+            <span><span style="color:var(--tui-accent)">Alt+←↓↑→</span> focus</span>
+            <span><span style="color:var(--tui-accent)">Alt+r</span> rename</span>
+            <span><span style="color:var(--tui-accent)">Alt+w</span> close</span>
+            <span><span style="color:var(--tui-accent)">Alt+?</span> keys</span>
+            <span style="margin-left:auto;display:flex;align-items:center;gap:16px"><span style="color:var(--tui-accent)">◆ 1 needs you · Alt+a</span><span style="color:var(--tui-dim);letter-spacing:0.06em">NORMAL</span></span>
+          </div>
         </div>
 
-        <div class="demo-side">
-          <span style="padding:7px 12px;color:var(--tui-dim);font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;border-bottom:1px solid var(--tui-rule);display:flex;justify-content:space-between">
-            <span>stack · 5 panes</span><span>Alt+↑↓</span>
-          </span>
-
-          <!-- expanded member: unfocused stack member gets a RULE frame + accent-dim left edge -->
-          <span style="position:relative;flex:1;min-height:0;border-left:2px solid var(--tui-accent-dim);padding:11px 13px;overflow:hidden">
-            <span style="position:absolute;top:5px;right:10px;font-size:10.5px;color:var(--tui-mut)">write tests · claude <span style="color:var(--tui-accent)">◆</span></span>
-            <span style="display:block;color:var(--tui-mut)">~/code/pi-mono/tests</span>
-            <span style="display:block;margin-top:6px;color:var(--tui-fg)">Claude wants to edit <span style="color:var(--tui-info)">status_test.rs</span></span>
-            <span style="display:block;margin-top:8px;border:1px solid var(--tui-accent-dim);padding:8px 10px">
-              <span style="display:block;color:var(--tui-fg)">Allow this edit?</span>
-              <span style="display:block;margin-top:6px;color:var(--tui-fg)"><span style="color:var(--tui-accent)">❯</span> 1. Yes</span>
-              <span style="display:block;color:var(--tui-mut)">&nbsp;&nbsp;2. Yes, and don't ask again</span>
-            </span>
-          </span>
-
-          <!-- collapsed rows: glyph + name + fill + "adapter · state-word" -->
-          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
-            <span style="color:var(--tui-accent);animation:roost-pulse 1.1s ease-in-out infinite">●</span><span style="color:var(--tui-fg)">api-worker</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">pi · working</span>
-          </span>
-          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
-            <span style="color:var(--tui-fg)">○</span><span style="color:var(--tui-mut)">write docs</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">claude · your turn</span>
-          </span>
-          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
-            <span style="color:var(--tui-dim)">·</span><span style="color:var(--tui-mut)">scratch</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">shell · idle</span>
-          </span>
-          <span style="display:flex;align-items:center;gap:10px;padding:8px 13px;border-top:1px solid var(--tui-rule)">
-            <span style="color:var(--tui-accent-dim)">✕</span><span style="color:var(--tui-dim)">old build</span><span style="margin-left:auto;color:var(--tui-dim);font-size:10.5px">pi · exited</span>
-          </span>
+        <div class="resurrect-body-quit" style="min-height:420px;padding:22px 24px;font-size:13.5px;line-height:1.9">
+          <div><span style="color:var(--tui-accent)">$</span> roost</div>
+          <div style="color:var(--tui-dim)">quit — 3 tabs · 7 panes · every session saved to workspace.json</div>
+          <div>&nbsp;</div>
+          <div><span style="color:var(--tui-accent)">$</span> <span class="cursor-blink" aria-hidden="true">▍</span></div>
         </div>
       </div>
 
-      <!-- hint bar: bg BAR, accent keys, right-aligned needs-you count + mode word -->
-      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:18px;padding:9px 14px;background:var(--tui-bar);font-size:11.5px;color:var(--tui-mut)">
-        <span><span style="color:var(--tui-accent)">Alt+n</span> new</span>
-        <span><span style="color:var(--tui-accent)">Alt+↵</span> launch</span>
-        <span><span style="color:var(--tui-accent)">Alt+s</span> stack</span>
-        <span><span style="color:var(--tui-accent)">Alt+←↓↑→</span> focus</span>
-        <span><span style="color:var(--tui-accent)">Alt+r</span> rename</span>
-        <span><span style="color:var(--tui-accent)">Alt+w</span> close</span>
-        <span><span style="color:var(--tui-accent)">Alt+?</span> keys</span>
-        <span style="margin-left:auto;display:flex;align-items:center;gap:16px"><span style="color:var(--tui-accent)">◆ 1 needs you · Alt+a</span><span style="color:var(--tui-dim);letter-spacing:0.06em">NORMAL</span></span>
+      <div style="display:flex;flex-wrap:wrap;gap:20px 28px;margin-top:20px;font-family:var(--font-mono);font-size:12px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
+        <span><span style="color:var(--tui-accent)">●</span> working</span>
+        <span><span style="color:var(--tui-accent)">◆</span> needs input</span>
+        <span>○ waiting for you</span>
+        <span>· idle</span>
+        <span>✕ exited</span>
       </div>
+      <p style="margin:14px 0 0;font-family:var(--font-mono);font-size:12.5px;color:color-mix(in srgb, var(--color-text) 60%, transparent)">Real chrome, borrowed colors — these are roost's exact glyphs and layout, wearing a dark theme. In your terminal it wears yours: the chrome inherits your theme, always. Token spec: <a href="https://github.com/navbytes/roost/blob/main/DESIGN-ui.md" target="_blank" rel="noopener">DESIGN-ui.md ↗</a></p>
     </div>
-
-    <div style="display:flex;flex-wrap:wrap;gap:20px 28px;margin-top:20px;font-family:var(--font-mono);font-size:12px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">
-      <span><span style="color:var(--tui-accent)">●</span> working</span>
-      <span><span style="color:var(--tui-accent)">◆</span> needs input</span>
-      <span>○ waiting for you</span>
-      <span>· idle</span>
-      <span>✕ exited</span>
-    </div>
-    <p style="margin:14px 0 0;font-family:var(--font-mono);font-size:12.5px;color:color-mix(in srgb, var(--color-text) 60%, transparent)">This is roost's real chrome, token for token — read the <a href="https://github.com/navbytes/roost/blob/main/DESIGN-ui.md" target="_blank" rel="noopener">token spec (DESIGN-ui.md) ↗</a>.</p>
   </section>
 
   <hr style="height:2px;border:0;margin:0;background:var(--color-divider)">
 
   <section style="padding:clamp(40px,5vw,72px) 0" aria-label="roost by the numbers">
     <div class="stats">
-      <div><p class="stat-num">0</p><p class="stat-label">Daemons to run</p></div>
-      <div><p class="stat-num">6</p><p class="stat-label">Adapters — pi, Claude Code, shell, codex, gemini, opencode</p></div>
-      <div><p class="stat-num">8</p><p class="stat-label">Control-CLI verbs</p></div>
-      <div><p class="stat-num">742</p><p class="stat-label">Unit tests, plus 26 integration binaries</p></div>
+      <div class="stat-cell"><p class="stat-num">0</p><p class="stat-label">Daemons to run</p></div>
+      <div class="stat-cell"><p class="stat-num stat-num-blue">6</p><p class="stat-label">Agent CLIs, one desk</p></div>
+      <div class="stat-cell"><p class="stat-num">1.4 MB</p><p class="stat-label">The whole binary</p></div>
+      <div class="stat-cell"><p class="stat-num stat-num-blue">1</p><p class="stat-label">File of state: workspace.json</p></div>
     </div>
   </section>
 
   <hr style="height:2px;border:0;margin:0;background:var(--color-divider)">
 
   <section id="features" style="padding:clamp(40px,5vw,72px) 0 clamp(24px,3vw,40px)">
-    <span class="kicker">What roost does</span>
-    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 8px;max-width:22ch">The muxer contract, inverted.</h2>
+    <span class="kicker kicker-blue">What roost does</span>
+    <h2 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(24px,3vw,38px);letter-spacing:-0.01em;margin:0 0 8px;max-width:22ch">The muxer contract, inverted.</h2>
   </section>
 
   <div>
@@ -352,7 +455,7 @@
         <p class="frow-num">01</p>
       </div>
       <h3>Full workspace resurrection</h3>
-      <p class="frow-body">Quit, reboot, reopen the terminal, run <code style="font-family:var(--font-mono);font-size:0.9em">roost</code>. It rebuilds every tab, split, and stacked pane, then resumes each agent into the exact session it was in — right working directory and all.</p>
+      <p class="frow-body">Quit, reboot, reopen the terminal, run <code style="font-family:var(--font-mono);font-size:0.9em">roost</code>. It rebuilds every tab, split, and stacked pane, then resumes each agent into the exact session it was in — right working directory and all. One honest exception: a turn in flight at the moment you quit — the sessions come back, the half-typed sentence doesn't.</p>
     </div>
     <div class="frow">
       <div class="frow-mark">
@@ -397,8 +500,8 @@
   </div>
 
   <section id="how" style="padding:clamp(48px,6vw,88px) 0 clamp(40px,5vw,72px)">
-    <span class="kicker">How it works</span>
-    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 40px;max-width:24ch">Keep the map, not the machine.</h2>
+    <span class="kicker kicker-hi">How it works</span>
+    <h2 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(24px,3vw,38px);letter-spacing:-0.01em;margin:0 0 40px;max-width:24ch">Keep the map, not the machine.</h2>
     <div class="compare">
       <div class="compare-left">
         <span style="font-family:var(--font-mono);font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb, var(--color-text) 60%, transparent)">tmux / zellij</span>
@@ -411,7 +514,7 @@
     </div>
     <div class="how-grid">
       <div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:20px;margin:0 0 16px">The precious state</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:20px;margin:0 0 16px">The precious state</h3>
         <p style="font-size:15.5px;line-height:1.65;margin:0 0 20px;color:color-mix(in srgb, var(--color-text) 78%, transparent)">A single file — <code style="font-family:var(--font-mono);font-size:0.9em">workspace.json</code> — is the whole product, morally. Atomic writes on every change; delete it to start clean.</p>
         <pre style="font-family:var(--font-mono);font-size:12.5px;line-height:1.7;background:#181615;color:#d7d3d3;padding:18px;margin:0;overflow-x:auto;border:2px solid var(--color-text)"><span style="color:#8f8a88">{</span>
   <span style="color:#e6a15c">"active_tab"</span>: 0,
@@ -426,7 +529,7 @@
 <span style="color:#8f8a88">}</span></pre>
       </div>
       <div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:20px;margin:0 0 16px">Ports &amp; adapters</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:20px;margin:0 0 16px">Ports &amp; adapters</h3>
         <p style="font-size:15.5px;line-height:1.65;margin:0 0 20px;color:color-mix(in srgb, var(--color-text) 78%, transparent)">The core is pure and fully unit-tested — it never touches a PTY, socket, or the filesystem. Real I/O lives at the edges, behind trait boundaries.</p>
         <div style="border:2px solid var(--color-text);font-family:var(--font-mono);font-size:13px">
           <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>core/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">pure domain</span></div>
@@ -440,95 +543,100 @@
   </section>
 
   <section id="keys" style="padding:clamp(40px,5vw,72px) 0;border-top:2px solid var(--color-divider)">
-    <span class="kicker">Keys</span>
-    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 8px;max-width:20ch">One flat modifier layer.</h2>
+    <span class="kicker kicker-red">Keys</span>
+    <h2 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(24px,3vw,38px);letter-spacing:-0.01em;margin:0 0 8px;max-width:20ch">One flat modifier layer.</h2>
     <p style="font-size:16px;line-height:1.65;margin:0 0 20px;max-width:52ch;color:color-mix(in srgb, var(--color-text) 78%, transparent)">Everything's on <code style="font-family:var(--font-mono);font-size:0.9em">Alt</code>, so it never fights the agents' own <code style="font-family:var(--font-mono);font-size:0.9em">Ctrl</code> bindings. Everything else passes straight through to the focused pane.</p>
     <p style="font-size:16px;line-height:1.65;margin:0 0 36px;max-width:56ch;color:color-mix(in srgb, var(--color-text) 78%, transparent)"><strong style="color:var(--color-text)">Mouse selection needs no chord.</strong> Drag to select — it copies on release. Double-click a word, triple-click a line, Shift+click extends. It goes straight to the system clipboard, over SSH too (OSC 52). <code style="font-family:var(--font-mono);font-size:0.9em">Alt+c</code> is only for scrollback, or panes where the app underneath already owns the mouse.</p>
     <div class="keys-grid">
       <div class="keycell"><kbd>Alt+n</kbd><span>new pane</span></div>
       <div class="keycell"><kbd>Alt+Enter</kbd><span>quick-launch picker</span></div>
-      <div class="keycell"><kbd>Alt+←↓↑→ / hjkl</kbd><span>move focus, ←→ crosses tabs at an edge</span></div>
-      <div class="keycell"><kbd>Alt+Shift+arrow</kbd><span>resize pane</span></div>
+      <div class="keycell"><kbd>Alt+←↓↑→</kbd><span>move focus, crosses tabs at an edge</span></div>
       <div class="keycell"><kbd>Alt+s</kbd><span>stack ⇄ explode</span></div>
-      <div class="keycell"><kbd>Alt+o</kbd><span>flip orientation</span></div>
-      <div class="keycell"><kbd>Alt+g</kbd><span>cycle layouts</span></div>
+      <div class="keycell"><kbd>Alt+a</kbd><span>jump to needs-input</span></div>
       <div class="keycell"><kbd>Alt+z</kbd><span>zoom pane</span></div>
-      <div class="keycell"><kbd>Alt+f</kbd><span>float scratch pane</span></div>
-      <div class="keycell"><kbd>Alt+a</kbd><span>jump to needs-input, else next waiting</span></div>
-      <div class="keycell"><kbd>Alt+Shift+a</kbd><span>fleet roster</span></div>
-      <div class="keycell"><kbd>Alt+e</kbd><span>activity feed</span></div>
-      <div class="keycell"><kbd>Alt+r</kbd><span>rename pane</span></div>
-      <div class="keycell"><kbd>Alt+Shift+r</kbd><span>rename tab</span></div>
-      <div class="keycell"><kbd>Alt+t</kbd><span>new tab</span></div>
-      <div class="keycell"><kbd>Alt+1..9 / Alt+0</kbd><span>go to tab / last tab</span></div>
-      <div class="keycell"><kbd>Alt+i / Alt+m</kbd><span>previous / next tab</span></div>
-      <div class="keycell"><kbd>Alt+Shift+i / +m</kbd><span>move pane to that tab</span></div>
-      <div class="keycell"><kbd>Alt+w</kbd><span>close pane</span></div>
       <div class="keycell"><kbd>Alt+u</kbd><span>undo — reopen last closed</span></div>
-      <div class="keycell"><kbd>Alt+c</kbd><span>copy mode</span></div>
-      <div class="keycell"><kbd>Alt+PgUp</kbd><span>scroll mode</span></div>
-      <div class="keycell"><kbd>Alt+Shift+p</kbd><span>raw pass-through</span></div>
-      <div class="keycell"><kbd>Alt+/</kbd><span>toggle hint bar</span></div>
-      <div class="keycell"><kbd>Alt+?</kbd><span>full keymap</span></div>
       <div class="keycell"><kbd>Alt+q</kbd><span>quit — sessions live</span></div>
+      <details style="grid-column:1/-1">
+        <summary class="keycell" style="font-family:var(--font-mono);font-weight:700;letter-spacing:0.04em;text-transform:uppercase;justify-content:center;cursor:pointer">+ 18 more keys</summary>
+        <div class="keys-grid">
+          <div class="keycell"><kbd>Alt+Shift+arrow</kbd><span>resize pane</span></div>
+          <div class="keycell"><kbd>Alt+o</kbd><span>flip orientation</span></div>
+          <div class="keycell"><kbd>Alt+g</kbd><span>cycle layouts</span></div>
+          <div class="keycell"><kbd>Alt+f</kbd><span>float scratch pane</span></div>
+          <div class="keycell"><kbd>Alt+Shift+a</kbd><span>fleet roster</span></div>
+          <div class="keycell"><kbd>Alt+e</kbd><span>activity feed</span></div>
+          <div class="keycell"><kbd>Alt+r</kbd><span>rename pane</span></div>
+          <div class="keycell"><kbd>Alt+Shift+r</kbd><span>rename tab</span></div>
+          <div class="keycell"><kbd>Alt+t</kbd><span>new tab</span></div>
+          <div class="keycell"><kbd>Alt+1..9 / Alt+0</kbd><span>go to tab / last tab</span></div>
+          <div class="keycell"><kbd>Alt+i / Alt+m</kbd><span>previous / next tab</span></div>
+          <div class="keycell"><kbd>Alt+Shift+i / +m</kbd><span>move pane to that tab</span></div>
+          <div class="keycell"><kbd>Alt+w</kbd><span>close pane</span></div>
+          <div class="keycell"><kbd>Alt+c</kbd><span>copy mode</span></div>
+          <div class="keycell"><kbd>Alt+PgUp</kbd><span>scroll mode</span></div>
+          <div class="keycell"><kbd>Alt+Shift+p</kbd><span>raw pass-through</span></div>
+          <div class="keycell"><kbd>Alt+/</kbd><span>toggle hint bar</span></div>
+          <div class="keycell"><kbd>Alt+?</kbd><span>full keymap</span></div>
+        </div>
+      </details>
     </div>
   </section>
 
   <section id="agents" style="padding:clamp(40px,5vw,72px) 0;border-top:2px solid var(--color-divider)">
-    <span class="kicker">Supported agents</span>
-    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 40px;max-width:24ch">An adapter per CLI. Eight small methods.</h2>
+    <span class="kicker kicker-blue">Supported agents</span>
+    <h2 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(24px,3vw,38px);letter-spacing:-0.01em;margin:0 0 40px;max-width:24ch">An adapter per CLI. Eight small methods.</h2>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:0;border-top:2px solid var(--color-text);border-left:2px solid var(--color-text)">
-      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+      <div class="adapter-card" style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
           <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 8h14"/><path d="M9 8v10"/><path d="M15 8v7c0 2 1 3 3 3"/></svg>
           <span class="tag tag-accent">Flagship</span>
         </div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">pi</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">pi</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">A shipped extension reports session ids and exact status over roost's unix socket — no spinner-parsing. roost installs and updates it automatically at startup (opt out with <code style="font-family:var(--font-mono);font-size:0.9em">ROOST_NO_EXT_INSTALL</code>).</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">pi</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">pi --session &lt;id&gt;</span></div>
       </div>
-      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+      <div class="adapter-card" style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
           <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4v8.5a4.5 4.5 0 0 0 9 0V9"/></svg>
           <span class="tag tag-neutral">Hooks</span>
         </div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">Claude Code</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">Claude Code</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Hook snippets point Notification / Stop / PreToolUse at the same socket. Session detection falls back to diffing the project's <code style="font-family:var(--font-mono);font-size:0.9em">.jsonl</code> dir.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">claude</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">claude --resume &lt;id&gt;</span></div>
       </div>
-      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+      <div class="adapter-card" style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
           <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7l5 5-5 5"/><path d="M13 17h6"/></svg>
           <span class="tag tag-outline">Generic</span>
         </div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">shell</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">shell</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Any <code style="font-family:var(--font-mono);font-size:0.9em">$SHELL</code>, relaunched in its saved cwd. Status comes from PTY-output heuristics — bytes flowing means working, the bell means needs-you.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">$SHELL</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">relaunch in cwd</span></div>
       </div>
-      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+      <div class="adapter-card" style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
           <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="15"/><path d="M4 9.5h16"/><path d="M8 3v4M16 3v4"/></svg>
           <span class="tag tag-outline">File-based</span>
         </div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">codex</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">codex</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Sessions are filed by date, not by project — <code style="font-family:var(--font-mono);font-size:0.9em">~/.codex/sessions/YYYY/MM/DD/</code> — so detection can't be scoped to a working directory the way claude's is. Newest file wins.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">codex</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">codex resume &lt;id&gt;</span></div>
       </div>
-      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+      <div class="adapter-card" style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
           <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></svg>
           <span class="tag tag-outline">File-based</span>
         </div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">gemini</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">gemini</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Scoped per project: a slug from <code style="font-family:var(--font-mono);font-size:0.9em">~/.gemini/projects.json</code> points at that project's chat history, and the session id is read straight out of the newest record.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">gemini</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">gemini --resume &lt;uuid&gt;</span></div>
       </div>
-      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+      <div class="adapter-card" style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
           <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7" ry="2.5"/><path d="M5 5.5v13c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-13"/><path d="M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg>
           <span class="tag tag-outline">DB-only</span>
         </div>
-        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">opencode</h3>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">opencode</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Every session lives in one global SQLite database, not separate files — so there's no filesystem detection at all. roost resumes only by the session id it already has on record.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">opencode</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">opencode --session &lt;id&gt;</span></div>
       </div>
@@ -536,31 +644,31 @@
   </section>
 
   <section id="install" style="padding:clamp(48px,6vw,88px) 0 clamp(40px,5vw,72px);border-top:2px solid var(--color-divider)">
-    <span class="kicker">Get started</span>
-    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 32px;max-width:18ch">Two lines and a reboot you'll never fear.</h2>
+    <span class="kicker kicker-hi">Get started</span>
+    <h2 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(24px,3vw,38px);letter-spacing:-0.01em;margin:0 0 32px;max-width:18ch">Two lines and a reboot you'll never fear.</h2>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:22px 28px;margin-bottom:32px">
-      <div style="display:flex;gap:14px;align-items:flex-start">
+      <div class="install-card" style="display:flex;gap:14px;align-items:flex-start">
         <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M6 8h10v11a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2z"/><path d="M16 11h2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-2"/><path d="M8 8V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v3"/></svg>
         <div>
           <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">Homebrew</p>
           <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Same binaries, checksum-verified by brew.</p>
         </div>
       </div>
-      <div style="display:flex;gap:14px;align-items:flex-start">
+      <div class="install-card" style="display:flex;gap:14px;align-items:flex-start">
         <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>
         <div>
           <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">mise</p>
           <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Prebuilt binary, no Rust toolchain. Works today.</p>
         </div>
       </div>
-      <div style="display:flex;gap:14px;align-items:flex-start">
+      <div class="install-card" style="display:flex;gap:14px;align-items:flex-start">
         <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M4 17v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
         <div>
           <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">Releases</p>
           <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">v0.1.0, four targets, checked against <code style="font-family:var(--font-mono);font-size:0.95em">SHA256SUMS.txt</code>.</p>
         </div>
       </div>
-      <div style="display:flex;gap:14px;align-items:flex-start">
+      <div class="install-card" style="display:flex;gap:14px;align-items:flex-start">
         <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M12 3 4 7v10l8 4 8-4V7z"/><path d="M4 7l8 4 8-4M12 11v10"/></svg>
         <div>
           <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">Source</p>
@@ -569,16 +677,13 @@
       </div>
     </div>
     <div style="border:2px solid var(--color-text);background:#181615;font-family:var(--font-mono);font-size:14.5px;line-height:2;color:#d7d3d3;padding:22px 24px;overflow-x:auto">
-      <div><span style="color:#8f8a88"># macOS / Linux, prebuilt — no Rust toolchain</span></div>
-      <div><span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost</div>
-      <div><span style="color:var(--color-accent)">$</span> roost</div>
+      <div><span style="color:#8f8a88"># mise — prebuilt binary, no Rust toolchain</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost</span><button type="button" class="js-copy" data-copy-text="mise use -g github:navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> roost</span><button type="button" class="js-copy" data-copy-text="roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
       <div style="margin-top:14px"><span style="color:#8f8a88"># or with Homebrew</span></div>
-      <div><span style="color:var(--color-accent)">$</span> brew install navbytes/roost/roost</div>
-      <div style="margin-top:14px"><span style="color:#8f8a88"># or a binary from Releases (v0.1.0, four targets + SHA256SUMS.txt)</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> brew install navbytes/roost/roost</span><button type="button" class="js-copy" data-copy-text="brew install navbytes/roost/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
       <div style="margin-top:14px"><span style="color:#8f8a88"># or from source</span></div>
-      <div><span style="color:var(--color-accent)">$</span> cargo install --git https://github.com/navbytes/roost</div>
-      <div style="margin-top:14px"><span style="color:#8f8a88"># or an isolated workspace</span></div>
-      <div><span style="color:var(--color-accent)">$</span> ROOST_STATE=/some/dir roost</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> cargo install --git https://github.com/navbytes/roost</span><button type="button" class="js-copy" data-copy-text="cargo install --git https://github.com/navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
     </div>
     <p style="font-size:14px;line-height:1.65;margin:18px 0 0;max-width:64ch;color:color-mix(in srgb, var(--color-text) 66%, transparent)"><strong style="color:var(--color-text)">macOS note:</strong> roost's shortcuts live on <code style="font-family:var(--font-mono);font-size:0.9em">Alt</code>. Tell your terminal to treat <strong style="color:var(--color-text)">Option</strong> as Meta — Terminal.app and iTerm2 need a one-time setting; Ghostty, WezTerm, and kitty already do.</p>
   </section>
@@ -587,22 +692,26 @@
 
 <section style="background:var(--color-accent);color:var(--color-bg)">
   <div style="max-width:1200px;margin:0 auto;padding:clamp(56px,7vw,96px) var(--edge)">
-    <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(38px,5.5vw,72px);line-height:1.02;letter-spacing:-0.03em;margin:0;margin-left:-0.04em">
-      <span style="display:block">Bring your agents home.</span>
-    </h2>
+    <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+      <svg width="56" height="44" viewBox="0 0 28 22" style="color:var(--color-bg);flex-shrink:0" aria-hidden="true"><use href="#bird"></use></svg>
+      <h2 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(32px,4.6vw,60px);line-height:1.05;letter-spacing:-0.01em;margin:0">
+        <span style="display:block">Bring your agents home.</span>
+      </h2>
+    </div>
     <p style="font-size:clamp(16px,1.4vw,19px);line-height:1.55;max-width:46ch;margin:24px 0 0;color:color-mix(in srgb, var(--color-bg) 88%, transparent)">Free and open source. Your agents come home to roost after every reboot.</p>
     <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
       <div style="display:flex;align-items:center;gap:12px;padding:13px 18px;font-family:var(--font-mono);font-size:15px;background:color-mix(in srgb, var(--color-bg) 12%, transparent);border:2px solid var(--color-bg);max-width:100%;overflow-x:auto;white-space:nowrap">
         <span>mise use -g github:navbytes/roost</span>
+        <button type="button" class="js-copy" data-copy-text="mise use -g github:navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:0;background:var(--color-bg);color:var(--color-accent);font-family:var(--font-mono);font-weight:700;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 10px;cursor:pointer">Copy</button>
       </div>
-      <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" class="btn" style="text-decoration:none;color:var(--color-bg);border:2px solid var(--color-bg);padding:12px 22px;font-size:15px">View on GitHub ↗</a>
+      <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" class="btn" style="text-decoration:none;color:var(--color-bg);border:2px solid var(--color-bg);padding:12px 22px;font-size:15px;--btn-shadow:var(--color-bg)">View on GitHub ↗</a>
     </div>
   </div>
 </section>
 
 <footer style="border-top:2px solid var(--color-divider)">
   <div style="max-width:1200px;margin:0 auto;padding:36px var(--edge);display:flex;flex-wrap:wrap;gap:24px;align-items:center;justify-content:space-between">
-    <span style="display:flex;align-items:center;gap:10px;font-family:var(--font-heading);font-weight:800;font-size:16px"><span style="display:inline-block;width:11px;height:11px;background:var(--color-accent)"></span>roost</span>
+    <span style="display:flex;align-items:center;gap:10px;font-family:var(--font-heading);font-weight:800;font-size:16px"><svg width="20" height="16" viewBox="0 0 28 22" style="color:var(--color-accent);flex-shrink:0" aria-hidden="true"><use href="#bird"></use></svg>roost</span>
     <div style="display:flex;flex-wrap:wrap;gap:24px;font-family:var(--font-mono);font-size:13px">
       <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">GitHub</a>
       <a href="https://github.com/navbytes/roost/blob/main/DESIGN.md" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">DESIGN.md</a>
@@ -611,19 +720,28 @@
       <a href="#features" style="color:inherit;text-decoration:none">Features</a>
       <a href="#install" style="color:inherit;text-decoration:none">Install</a>
     </div>
-    <span style="font-family:var(--font-mono);font-size:12px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">Rust · portable-pty · vt100 · ratatui</span>
+    <span style="font-family:var(--font-mono);font-size:12px;color:color-mix(in srgb, var(--color-text) 55%, transparent)">Rust · portable-pty · vt100 · ratatui — 0 daemons were harmed</span>
   </div>
 </footer>
 
 <script>
 (function () {
-  var btn = document.getElementById('copy');
-  var ct;
-  btn.addEventListener('click', function () {
-    try { navigator.clipboard.writeText('mise use -g github:navbytes/roost').catch(function () {}); } catch (e) {}
-    btn.textContent = 'Copied ✓';
-    clearTimeout(ct);
-    ct = setTimeout(function () { btn.textContent = 'Copy'; }, 1400);
+  document.querySelectorAll('.js-copy').forEach(function (btn) {
+    var original = btn.textContent;
+    var ct;
+    var show = function (label) {
+      btn.textContent = label;
+      clearTimeout(ct);
+      ct = setTimeout(function () { btn.textContent = original; }, 1400);
+    };
+    btn.addEventListener('click', function () {
+      var text = btn.getAttribute('data-copy-text') || '';
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { show('Copied ✓'); }, function () { show('Select + ⌘C'); });
+      } else {
+        show('Select + ⌘C');
+      }
+    });
   });
 })();
 </script>
