@@ -4,14 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>roost — session-native terminal multiplexer</title>
-<meta name="description" content="roost is a session-native terminal multiplexer for AI agent CLIs — pi, Claude Code, your shell. Quit, reboot, run roost — every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon.">
+<meta name="description" content="roost is a session-native terminal multiplexer for six AI agent CLIs — pi, Claude Code, Codex, Gemini, opencode, your shell. Quit, reboot, run roost — every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="roost — session-native terminal multiplexer">
-<meta property="og:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for AI agent CLIs, with no daemon.">
+<meta property="og:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for six AI agent CLIs, with no daemon.">
+<meta property="og:image" content="https://navbytes.github.io/roost/roost-hero.png">
+<meta property="og:url" content="https://navbytes.github.io/roost/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="roost — session-native terminal multiplexer">
+<meta name="twitter:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for six AI agent CLIs, with no daemon.">
+<meta name="twitter:image" content="https://navbytes.github.io/roost/roost-hero.png">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%23ec3013'/></svg>">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
   /* ── modernist design-system tokens (verbatim subset) ─────────────── */
   :root {
@@ -30,10 +33,12 @@
     --color-accent-700: #ae1800;
     --color-accent-800: #7c1405;
 
-    --font-heading: "Archivo", system-ui, sans-serif;
+    /* System stacks only — no @font-face, no CDN, so the page makes zero
+       external requests (see the self-contained hard constraint). */
+    --font-heading: -apple-system, "Segoe UI", system-ui, "Helvetica Neue", Arial, sans-serif;
     --font-heading-weight: 800;
-    --font-body: "Archivo", system-ui, sans-serif;
-    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --font-body: var(--font-heading);
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Segoe UI Mono", Menlo, Consolas, monospace;
 
     --space-1: 4px;
     --space-2: 8px;
