@@ -147,13 +147,16 @@
 
   .frow {
     display: grid; grid-template-columns: minmax(56px,120px) minmax(0,360px) minmax(0,1fr);
-    gap: 24px clamp(24px,4vw,64px); align-items: baseline;
+    gap: 24px clamp(24px,4vw,64px); align-items: start;
     padding: 32px 0; border-top: 2px solid var(--color-divider);
   }
   .frow:last-child { border-bottom: 2px solid var(--color-divider); }
+  .frow-mark { display: flex; flex-direction: column; gap: 12px; }
   .frow-num { font-family: var(--font-heading); font-weight: 800; font-size: 15px; margin: 0; font-feature-settings: 'tnum' 1; }
   .frow h3 { font-family: var(--font-heading); font-weight: 800; font-size: clamp(22px,2vw,26px); letter-spacing: -0.01em; margin: 0; }
   .frow-body { font-size: 16px; line-height: 1.65; margin: 0; color: color-mix(in srgb, var(--color-text) 78%, transparent); max-width: 56ch; }
+
+  .icon { color: color-mix(in srgb, var(--color-text) 55%, transparent); flex-shrink: 0; }
 
   .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: 2px solid var(--color-text); }
   .compare-left { padding: 28px; border-right: 2px solid var(--color-text); }
@@ -175,13 +178,13 @@
   .keycell span { font-size: 14.5px; }
 
   @media (max-width: 760px) {
-    .nav a:not(.btn) { display: none; }
+    .nav a:not(.btn):not(.tag) { display: none; }
     .demo-grid { grid-template-columns: 1fr; }
     .stats { grid-template-columns: repeat(2,1fr); }
     .frow { grid-template-columns: 1fr; gap: 10px; }
     .compare { grid-template-columns: 1fr; }
     .compare-left { border-right: 0; border-bottom: 2px solid var(--color-text); }
-    .how-grid { grid-template-columns: 1fr; }
+    .how-grid { grid-template-columns: minmax(0,1fr); }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -195,12 +198,14 @@
 <nav class="nav" style="position:sticky;top:0;z-index:20;background:var(--color-bg);padding-inline:max(var(--space-4),calc((100% - 1200px) / 2 + var(--edge)))">
   <span class="nav-brand" style="display:flex;align-items:center;gap:10px">
     <span style="display:inline-block;width:13px;height:13px;background:var(--color-accent)"></span>roost
+    <a class="tag tag-outline" href="https://github.com/navbytes/roost/releases/tag/v0.1.0" target="_blank" rel="noopener" style="text-decoration:none">v0.1.0</a>
   </span>
   <a href="#features">Features</a>
   <a href="#how">How it works</a>
   <a href="#keys">Keys</a>
   <a href="#agents">Agents</a>
   <a href="#install">Install</a>
+  <a href="https://github.com/navbytes/roost/releases" target="_blank" rel="noopener">Releases</a>
   <a class="btn btn-primary" href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="text-decoration:none">GitHub ↗</a>
 </nav>
 
@@ -213,14 +218,14 @@
       <span style="display:block;color:var(--color-accent)">Sessions are precious.</span>
     </h1>
     <p style="font-size:clamp(17px,1.5vw,20px);line-height:1.6;max-width:60ch;margin:32px 0 0;color:color-mix(in srgb, var(--color-text) 82%, transparent)">
-      roost is a terminal multiplexer built for AI agent CLIs — pi, Claude Code, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — and every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon. No detach. No lost context.
+      roost is a terminal multiplexer built for AI agent CLIs — pi, Claude Code, Codex, Gemini, opencode, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — and every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon. No detach. Everything comes back except the turn in flight when you quit — roost resurrects the desk, not the sentence being typed on it.
     </p>
     <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
-      <div style="display:flex;align-items:stretch;border:2px solid var(--color-text);font-family:var(--font-mono)">
-        <span style="display:flex;align-items:center;gap:10px;padding:12px 16px;font-size:15px;white-space:nowrap">
-          <span style="color:var(--color-accent)">$</span>cargo install --path .
+      <div style="display:flex;align-items:stretch;border:2px solid var(--color-text);font-family:var(--font-mono);max-width:100%">
+        <span style="display:flex;align-items:center;gap:10px;padding:12px 16px;font-size:15px;white-space:nowrap;overflow-x:auto;min-width:0">
+          <span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost
         </span>
-        <button type="button" id="copy" style="border:0;border-left:2px solid var(--color-text);background:var(--color-text);color:var(--color-bg);font-family:var(--font-mono);font-weight:500;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;padding:0 16px;cursor:pointer;min-width:88px">Copy</button>
+        <button type="button" id="copy" style="flex-shrink:0;border:0;border-left:2px solid var(--color-text);background:var(--color-text);color:var(--color-bg);font-family:var(--font-mono);font-weight:500;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;padding:0 16px;cursor:pointer;min-width:88px">Copy</button>
       </div>
       <a class="btn btn-secondary" href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="text-decoration:none;padding:12px 20px;font-size:15px">Star on GitHub ↗</a>
     </div>
@@ -238,7 +243,7 @@
       </div>
 
       <!-- tab bar: ▎ marker + "N name" + status glyph + │ separator, per tab -->
-      <div style="display:flex;align-items:stretch;background:var(--tui-strip);font-size:12.5px">
+      <div style="display:flex;flex-wrap:wrap;align-items:stretch;background:var(--tui-strip);font-size:12.5px">
         <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-fg);background:var(--tui-bg)"><span style="color:var(--tui-accent)">▎</span>1 main<span style="color:var(--tui-accent)">◆</span></span>
         <span style="color:var(--tui-rule);align-self:center">│</span>
         <span style="display:flex;align-items:center;gap:7px;padding:9px 16px;color:var(--tui-mut)"><span style="color:transparent">▎</span>2 api</span>
@@ -308,7 +313,7 @@
         <span><span style="color:var(--tui-accent)">Alt+r</span> rename</span>
         <span><span style="color:var(--tui-accent)">Alt+w</span> close</span>
         <span><span style="color:var(--tui-accent)">Alt+?</span> keys</span>
-        <span style="margin-left:auto;display:flex;align-items:center;gap:16px"><span style="color:var(--tui-accent)">◆ 1 needs you</span><span style="color:var(--tui-dim);letter-spacing:0.06em">NORMAL</span></span>
+        <span style="margin-left:auto;display:flex;align-items:center;gap:16px"><span style="color:var(--tui-accent)">◆ 1 needs you · Alt+a</span><span style="color:var(--tui-dim);letter-spacing:0.06em">NORMAL</span></span>
       </div>
     </div>
 
@@ -329,7 +334,7 @@
       <div><p class="stat-num">0</p><p class="stat-label">Daemons to run</p></div>
       <div><p class="stat-num">6</p><p class="stat-label">Adapters — pi, Claude Code, shell, codex, gemini, opencode</p></div>
       <div><p class="stat-num">8</p><p class="stat-label">Control-CLI verbs</p></div>
-      <div><p class="stat-num">553</p><p class="stat-label">Unit tests</p></div>
+      <div><p class="stat-num">742</p><p class="stat-label">Unit tests, plus 26 integration binaries</p></div>
     </div>
   </section>
 
