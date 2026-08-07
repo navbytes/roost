@@ -3396,6 +3396,7 @@ mod tests {
 
     fn mk_app(size: ratatui::layout::Size) -> App<crate::ports::fakes::FakePane> {
         use crate::agents;
+        use crate::core::control::TokenTable;
         use crate::core::workspace::Workspace;
         use crate::ports::fakes::MemStore;
         use std::path::PathBuf;
@@ -3404,8 +3405,17 @@ mod tests {
         let store = MemStore::default();
         let (tx, _rx) = mpsc::sync_channel(64);
         let ws = Workspace::default_in(PathBuf::from("/tmp"));
-        App::<crate::ports::fakes::FakePane>::new(ws, agents::registry(), Box::new(store), tx, size, (0, 0), None)
-            .unwrap()
+        App::<crate::ports::fakes::FakePane>::new(
+            ws,
+            agents::registry(),
+            Box::new(store),
+            tx,
+            size,
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap()
     }
 
     /// Every chrome surface that has a drawn state, rendered through the
@@ -3552,6 +3562,7 @@ mod tests {
         // too large to trigger the early return.
         {
             use crate::agents;
+            use crate::core::control::TokenTable;
             use crate::core::workspace::Workspace;
             use crate::ports::fakes::MemStore;
             use std::path::PathBuf;
@@ -3568,6 +3579,7 @@ mod tests {
                 Size::new(80, 1),
                 (0, 0),
                 None,
+                TokenTable::new().unwrap(),
             )
             .unwrap();
             let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
@@ -4136,6 +4148,7 @@ mod tests {
     #[test]
     fn a_restored_tab_that_has_never_spawned_reads_not_started_not_exited() {
         use crate::agents;
+        use crate::core::control::TokenTable;
         use crate::ports::fakes::{FakePane, MemStore};
         use crate::ui::input::Action;
         use ratatui::backend::TestBackend;
@@ -4160,6 +4173,7 @@ mod tests {
             size,
             (0, 0),
             None,
+            TokenTable::new().unwrap(),
         )
         .unwrap();
 

@@ -11,7 +11,7 @@ use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::agents::Registry;
-use crate::core::control::{Actor, Method, ReadMode, Reply, Request};
+use crate::core::control::{Actor, Method, ReadMode, Reply, Request, TokenTable, UNAUTHORIZED_MSG};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::session_resolver::SessionResolver;
@@ -452,11 +452,16 @@ pub struct App<B: PaneBackend> {
     /// confirming second Alt+q. Separate from `confirm_close` so an armed
     /// close can never confirm a quit (or vice versa).
     confirm_quit: Option<Instant>,
-    /// Per-spawn secret handed to each pane's child via `ROOST_TOKEN`. A
-    /// socket message is only honored if its token matches the one issued to
-    /// the pane it claims to be — so a process in one pane can't spoof another
-    /// pane's status/session (they share the socket path via `ROOST_SOCK`).
-    tokens: HashMap<PaneId, String>,
+    /// The one storage for both the fleet control token and every pane's own
+    /// `ROOST_TOKEN` (promotion-auth-gate) — replaces the former separate
+    /// `tokens: HashMap<PaneId, String>` and `control_token: String` fields.
+    /// `App` is the sole writer (mint on spawn, remove on close); sock.rs's
+    /// accept-loop threads hold a `TokenReader` onto the same underlying
+    /// snapshot so the door can judge a token synchronously without a
+    /// main-loop round trip. A pane's own token authenticates its
+    /// status/session reports — so a process in one pane can't spoof
+    /// another's (they share the socket path via `ROOST_SOCK`).
+    tokens: TokenTable,
     /// [F1] Open status-socket links per pane, refcounted rather than a bare
     /// bool: a pane can have more than one open reporting connection at
     /// once — a nested `claude` inside a pi pane inherits the same
@@ -471,10 +476,6 @@ pub struct App<B: PaneBackend> {
     /// open. `StatusTracker::ext_link` stays the simple bool `count > 0`
     /// collapses to.
     ext_link_counts: HashMap<PaneId, u32>,
-    /// The fleet control-interface token. Written to `<state>/control.token`
-    /// (0600) and NEVER placed in any pane's environment, so only a deliberately
-    /// authorized external client can drive panes it doesn't own.
-    control_token: String,
     /// Parked `wait` requests, polled each event-loop iteration.
     waiters: Vec<Waiter>,
     /// `initial_input` from a control `spawn`, buffered until the pane's
@@ -572,6 +573,12 @@ impl<B: PaneBackend> App<B> {
     /// every pane via its adapter — resume when a session id is known,
     /// fresh launch otherwise. A failed spawn degrades to a dead pane, it
     /// never aborts restore.
+    // This was already at clippy's default threshold (7) before
+    // promotion-auth-gate's `tokens: TokenTable` became the 8th — a
+    // constructor wiring up every port/adapter this type is generic over is
+    // exactly the shape the lint tends to overfire on, and a
+    // builder/args-struct split is out of scope for this change.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ws: Workspace,
         registry: Registry,
@@ -580,16 +587,17 @@ impl<B: PaneBackend> App<B> {
         term_size: Size,
         host_pixels: (u16, u16),
         sock_path: Option<PathBuf>,
+        tokens: TokenTable,
     ) -> Result<Self> {
         // A loaded workspace.json may be hand-edited, partially migrated, or
         // otherwise inconsistent — repair layout ↔ panes before spawning.
         let mut ws = ws;
         ws.validate_and_repair();
-        // The fleet control token authorizes driving the whole workspace, so it
-        // must be genuinely unpredictable — refuse to start rather than fall
-        // back to a weak (time-seeded) secret if the CSPRNG is unavailable.
-        let control_token = gen_secret()
-            .ok_or_else(|| anyhow::anyhow!("cannot read /dev/urandom for the control token"))?;
+        // The fleet control token's CSPRNG refusal now happens in main.rs,
+        // before `TokenTable::new` is even called (promotion-auth-gate
+        // decision 9) — `spawn_listener` needs a `TokenReader` built from
+        // this same table before `App::new` runs at all, so the table (and
+        // its fatal-if-unavailable mint) has to exist first.
         let mut app = Self {
             focused: 0,
             host_focused: true,
@@ -621,9 +629,8 @@ impl<B: PaneBackend> App<B> {
             undo: Vec::new(),
             confirm_close: None,
             confirm_quit: None,
-            tokens: HashMap::new(),
+            tokens,
             ext_link_counts: HashMap::new(),
-            control_token,
             waiters: Vec::new(),
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
@@ -1019,9 +1026,9 @@ impl<B: PaneBackend> App<B> {
             cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
             // Fresh per-spawn token: the pane authenticates its socket messages
             // with it, and no other pane knows it. Reissued on every (re)spawn.
-            let token = gen_token();
+            let token = crate::core::control::gen_token();
             cmd.env.push(("ROOST_TOKEN".into(), token.clone()));
-            self.tokens.insert(id, token);
+            self.tokens.set_pane_token(id, token);
             // [F1 residual] A respawn's old connections (if any survive the
             // kill) can only ever carry the OLD token from here on, so
             // their eventual link-down is unauthenticated by construction
@@ -1409,27 +1416,28 @@ impl<B: PaneBackend> App<B> {
     /// Is a socket message claiming to be `id` carrying that pane's token?
     /// Guards session/status updates against cross-pane spoofing over the
     /// shared socket. Fails closed: unknown pane or missing token → rejected.
+    /// Delegates to the snapshot so this and sock.rs's door check (which
+    /// consults the exact same `TokenSnapshot::pane_authorized`) can never
+    /// drift apart.
     pub fn socket_authorized(&self, id: PaneId, token: &str) -> bool {
-        !token.is_empty() && self.tokens.get(&id).map(|t| t == token).unwrap_or(false)
+        self.tokens.load().pane_authorized(id, token)
     }
 
     // -- control interface -------------------------------------------------
 
-    /// The fleet control token (written to `<state>/control.token` by startup).
-    pub fn control_token(&self) -> &str {
-        &self.control_token
+    /// The fleet control token (written to `<state>/control.token` by
+    /// startup). Owned `String` (not `&str`): it now reads through a
+    /// snapshot `Arc`, not a field living directly on `self`.
+    pub fn control_token(&self) -> String {
+        self.tokens.load().control().to_string()
     }
 
     /// Resolve a token to the caller it represents: the fleet control token, or
     /// a pane acting via its own `ROOST_TOKEN`. Fails closed on empty/unknown.
+    /// Delegates to the snapshot — the same `TokenSnapshot::resolve_actor`
+    /// sock.rs's door uses for a control request's admission check.
     fn resolve_actor(&self, token: &str) -> Option<Actor> {
-        if token.is_empty() {
-            return None;
-        }
-        if token == self.control_token {
-            return Some(Actor::Fleet);
-        }
-        self.tokens.iter().find(|(_, t)| t.as_str() == token).map(|(id, _)| Actor::Pane(*id))
+        self.tokens.load().resolve_actor(token)
     }
 
     /// Is `node` `ancestor`, or somewhere in `ancestor`'s spawned subtree?
@@ -1529,7 +1537,7 @@ impl<B: PaneBackend> App<B> {
     pub fn handle_control(&mut self, req: Request) -> Reply {
         match self.resolve_actor(&req.token) {
             Some(actor) => self.dispatch(actor, req.method),
-            None => Reply::err("unauthorized: unknown or missing token"),
+            None => Reply::err(UNAUTHORIZED_MSG),
         }
     }
 
@@ -1559,7 +1567,7 @@ impl<B: PaneBackend> App<B> {
         match (actor, req.method) {
             (None, _) => {
                 self.audit(None, &summary, false, "unauthorized");
-                let _ = reply.send(Reply::err("unauthorized: unknown or missing token"));
+                let _ = reply.send(Reply::err(UNAUTHORIZED_MSG));
             }
             (Some(actor), Method::Wait { panes, until, timeout_ms }) => {
                 // Audit the real outcome, not an assumed "parked" — a
@@ -2069,21 +2077,26 @@ impl<B: PaneBackend> App<B> {
         if let Some(mut rt) = self.runtimes.remove(&id) {
             rt.kill();
         }
-        self.tokens.remove(&id);
-        // [F1] Same bound-map hygiene as `tokens` — ids aren't reused, so an
-        // unremoved entry would just sit there for the rest of the session.
+        self.tokens.remove_pane_token(id);
+        // [F1] Same bound-map hygiene as `tokens` — pane ids are recycled
+        // (see the C23 comment a few lines below), so an unremoved entry
+        // isn't just inert growth: it could be misread as a fresh pane's
+        // own refcount the moment this id is reused.
         self.ext_link_counts.remove(&id);
         // Drop any spawn-error record for this pane too; otherwise a pane that
         // failed to spawn and is then closed leaves a stale `dead` entry that
-        // never gets cleaned (pane ids are not reused for it).
+        // a later pane reusing this id would inherit.
         self.dead.remove(&id);
         // A pane closed before its first output never got to flush its
         // buffered initial_input (see on_pty_output) — drop it too, rather
         // than leaking an entry keyed on an id that's gone for good.
         self.pending_input.remove(&id);
-        // C23: pane ids are never reused, so a stale raw-membership entry is
-        // harmless — but cheap to clean up alongside every other per-pane
-        // side table above.
+        // C23: pane ids ARE recycled (`next_pane_id` is max(current ids)+1,
+        // not a monotonic counter — see U11's comment below, and
+        // `wait_does_not_leak_a_recycled_pane_ids_status_cross_subtree`),
+        // so this isn't just cheap hygiene: an unremoved entry could
+        // otherwise be inherited by an unrelated later pane that reuses
+        // this id, silently switching it into raw mode.
         self.raw.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
@@ -4551,7 +4564,7 @@ impl<B: PaneBackend> App<B> {
         if let Some(mut rt) = self.runtimes.remove(&f.id) {
             rt.kill();
         }
-        self.tokens.remove(&f.id);
+        self.tokens.remove_pane_token(f.id);
         self.ext_link_counts.remove(&f.id); // [F1]
         self.dead.remove(&f.id);
         self.pending_input.remove(&f.id);
@@ -5280,33 +5293,6 @@ fn sanitize(s: &str) -> String {
     out
 }
 
-/// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is
-/// unreadable — the caller decides whether that's fatal.
-fn gen_secret() -> Option<String> {
-    use std::io::Read;
-    let mut buf = [0u8; 16];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).ok()?;
-    let mut s = String::with_capacity(32);
-    for b in buf {
-        s.push_str(&format!("{b:02x}"));
-    }
-    Some(s)
-}
-
-/// A per-pane status token. Unlike the fleet control token, a weak fallback is
-/// tolerable here: it only authenticates a pane's *own* status/session reports
-/// and sits behind the 0600 socket. The control token, which can drive the
-/// whole fleet, hard-fails instead (see `App::new`).
-fn gen_token() -> String {
-    gen_secret().unwrap_or_else(|| {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("{n:032x}")
-    })
-}
-
 /// B1 (PR #46 review): the char index the grid CELL column `cell` falls
 /// inside. `row_text`/`grab_text` (P15) drop wide glyphs' continuation
 /// cells, so the extracted string's char positions and the row's cell
@@ -5994,6 +5980,7 @@ mod tests {
             Size::new(100, 30),
             (0, 0),
             None,
+            TokenTable::new().unwrap(),
         )
         .unwrap();
         (app, store)
@@ -6088,6 +6075,7 @@ mod tests {
             Size::new(100, 30),
             (1000, 600),
             None,
+            TokenTable::new().unwrap(),
         )
         .unwrap();
         let id = app.pane_order()[0];
@@ -7210,6 +7198,7 @@ mod tests {
             Size::new(100, 30),
             (0, 0),
             None,
+            TokenTable::new().unwrap(),
         )
         .unwrap();
         let ct = app.control_token().to_string();
@@ -7359,7 +7348,7 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         let ct = app.control_token().to_string();
         // Pane 1 acts via its own token.
-        app.tokens.insert(1, "tok1".into());
+        app.tokens.set_pane_token(1, "tok1".into());
         // Pane 1 spawns a child → child.spawned_by == 1.
         let child = match app.handle_control(Request {
             token: "tok1".into(),
@@ -7429,7 +7418,7 @@ mod tests {
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
         let ct = app.control_token().to_string();
-        app.tokens.insert(1, "tok1".into());
+        app.tokens.set_pane_token(1, "tok1".into());
         // Pane 1 spawns a child → the child is in its subtree.
         let child = match app.handle_control(Request {
             token: "tok1".into(),
@@ -7611,6 +7600,7 @@ mod tests {
             Size::new(100, 30),
             (0, 0),
             Some(dir.join("roost.sock")),
+            TokenTable::new().unwrap(),
         )
         .unwrap();
         let ct = app.control_token().to_string();
@@ -7704,6 +7694,7 @@ mod tests {
             Size::new(100, 30),
             (0, 0),
             Some(dir.join("roost.sock")),
+            TokenTable::new().unwrap(),
         )
         .unwrap();
         let ct = app.control_token().to_string();
@@ -7932,7 +7923,7 @@ mod tests {
         // matches.
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
-        app.tokens.insert(1, "tok1".into());
+        app.tokens.set_pane_token(1, "tok1".into());
         let ct = app.control_token().to_string();
 
         // Pane 1 spawns its own child (pane 2, in its subtree) and waits on it.
@@ -7988,8 +7979,8 @@ mod tests {
     #[test]
     fn socket_auth_requires_matching_pane_token() {
         let (mut app, _) = mk_app(shell_ws());
-        app.tokens.insert(1, "secret-1".into());
-        app.tokens.insert(2, "secret-2".into());
+        app.tokens.set_pane_token(1, "secret-1".into());
+        app.tokens.set_pane_token(2, "secret-2".into());
         // Correct pane+token pair is authorized.
         assert!(app.socket_authorized(1, "secret-1"));
         // Pane 2's process presenting pane 1's id with its own token is
@@ -7999,6 +7990,115 @@ mod tests {
         assert!(!app.socket_authorized(1, "wrong"));
         assert!(!app.socket_authorized(1, ""));
         assert!(!app.socket_authorized(99, "secret-1"));
+    }
+
+    // -- MC-ordering (I2: mint-before-child) --------------------------------
+    //
+    // `B::spawn` is a plain associated function — it gets no `&App`, so the
+    // only way to observe "was this pane's token already published when I
+    // was called" from inside it is a channel set up before the call. A
+    // thread-local is exactly that: this test drives everything (App::new,
+    // spawn_active_tab, B::spawn) synchronously on its own thread, so
+    // there's no cross-thread visibility question to worry about.
+    use crate::core::control::TokenReader;
+    thread_local! {
+        static ORDERING_READER: std::cell::RefCell<Option<TokenReader>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// A minimal `PaneBackend` whose only interesting behavior is `spawn`:
+    /// it asserts the pane's `ROOST_TOKEN` (read off the real `CommandSpec`
+    /// `spawn_pane` built, same as a real child process would receive it)
+    /// already authorizes that pane in the table `ORDERING_READER` points
+    /// at. Every other method is an inert stand-in — this fixture exists to
+    /// pin one invariant, not to run a session.
+    struct OrderingCheckPane;
+
+    impl PaneBackend for OrderingCheckPane {
+        fn spawn(
+            id: PaneId,
+            cmd: &crate::agents::CommandSpec,
+            _rows: u16,
+            _cols: u16,
+            _pixels: (u16, u16),
+            _tx: SyncSender<AppEvent>,
+        ) -> Result<Self> {
+            if let Some((_, token)) = cmd.env.iter().find(|(k, _)| k == "ROOST_TOKEN") {
+                ORDERING_READER.with(|cell| {
+                    if let Some(reader) = cell.borrow().as_ref() {
+                        assert!(
+                            reader.load().pane_authorized(id, token),
+                            "I2 violated: pane {id}'s token must be published in the \
+                             TokenTable strictly before B::spawn runs — the mint \
+                             (spawn_pane) must never be reordered after the spawn, \
+                             or deferred"
+                        );
+                    }
+                });
+            }
+            Ok(OrderingCheckPane)
+        }
+        fn process_output(&mut self, _bytes: &[u8]) {}
+        fn write_input(&mut self, _bytes: &[u8]) -> bool {
+            true
+        }
+        fn write_input_raw(&mut self, _bytes: &[u8]) -> bool {
+            true
+        }
+        fn resize(&mut self, _rows: u16, _cols: u16, _pixels: (u16, u16)) {}
+        fn kill(&mut self) {}
+        fn status(&self) -> AgentStatus {
+            AgentStatus::Idle
+        }
+        fn set_extension_status(&mut self, _s: AgentStatus) {}
+        fn on_exit(&mut self) {}
+        fn screen(&self) -> Option<&vt100::Screen> {
+            None
+        }
+        fn set_scrollback(&mut self, _lines: usize) {}
+        fn scroll_by(&mut self, _delta: i32) {}
+        fn scroll_offset(&self) -> usize {
+            0
+        }
+        fn scroll_total(&self) -> usize {
+            0
+        }
+        fn mouse_proto(&self) -> crate::ports::MouseProto {
+            crate::ports::MouseProto::None
+        }
+    }
+
+    /// MC-ordering: reds if anyone reorders the mint (app.rs's `spawn_pane`,
+    /// currently before `B::spawn`) to run after it, or adds a deferred
+    /// publish — `OrderingCheckPane::spawn`'s assertion would then fire on
+    /// the very first pane `App::new` spawns.
+    #[test]
+    fn mc_ordering_pane_token_is_published_in_the_table_before_the_child_spawns() {
+        let table = TokenTable::new().unwrap();
+        ORDERING_READER.with(|cell| *cell.borrow_mut() = Some(table.reader()));
+
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        // Token-minting is gated on a real control socket (`sock_path`) —
+        // see `spawn_pane` — so this must be `Some` for the mint (the
+        // invariant under test) to run at all.
+        let app = App::<OrderingCheckPane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            Some(std::path::PathBuf::from("/tmp/roost-mc-ordering-test.sock")),
+            table,
+        )
+        .unwrap();
+        // If execution reaches here, `OrderingCheckPane::spawn`'s assertion
+        // never fired for any pane `App::new` spawned — the real proof this
+        // test exists for. This just confirms the setup actually exercised
+        // that path at all.
+        assert!(!app.runtimes.is_empty(), "setup: at least one pane must have spawned");
+
+        ORDERING_READER.with(|cell| *cell.borrow_mut() = None);
     }
 
     #[test]
@@ -8091,13 +8191,27 @@ mod tests {
         // token-reissue path (the one under test) actually runs on respawn.
         app.sock_path = Some(std::path::PathBuf::from("/tmp/roost-test.sock"));
         let old_token = "old-token".to_string();
-        app.tokens.insert(id, old_token.clone());
+        app.tokens.set_pane_token(id, old_token.clone());
 
         app.on_status_link(id, true); // the pane's extension connects
         assert!(app.runtimes.get(&id).unwrap().ext_link);
 
         app.respawn_focused(false); // kills the old process, mints a new token
-        let new_token = app.tokens.get(&id).unwrap().clone();
+        // TokenTable exposes no by-id getter (sock.rs's door only ever needs
+        // "does this token authorize this pane", never "what is pane N's
+        // token") — read the freshly minted one the same way a real child
+        // process would receive it: off the spawned command's own env.
+        let new_token = app
+            .runtimes
+            .get(&id)
+            .unwrap()
+            .cmd
+            .env
+            .iter()
+            .find(|(k, _)| k == "ROOST_TOKEN")
+            .expect("respawn must reissue ROOST_TOKEN")
+            .1
+            .clone();
         assert_ne!(old_token, new_token, "setup: respawn must rotate the token");
 
         // The old connection's Drop link-down finally arrives, carrying the
@@ -8228,6 +8342,7 @@ mod tests {
             Size::new(100, 30),
             (0, 0),
             None,
+            TokenTable::new().unwrap(),
         )
         .unwrap();
         (app, store)
@@ -9428,6 +9543,7 @@ mod tests {
             Size::new(100, 30),
             (0, 0),
             None,
+            TokenTable::new().unwrap(),
         )
         .unwrap();
 
@@ -9609,9 +9725,17 @@ mod tests {
         registry.insert("detect", Box::new(DetectAdapter));
         let store = MemStore::default();
         let (tx, _rx) = mpsc::sync_channel(64);
-        let mut app =
-            App::<FakePane>::new(ws, registry, Box::new(store), tx, Size::new(100, 30), (0, 0), None)
-                .unwrap();
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
 
         // Pane 1 "spawned" before either file existed (widest window); pane 2
         // "spawned" after file_a but before file_b — the precise ordering
@@ -9671,9 +9795,17 @@ mod tests {
         registry.insert("detect", Box::new(DetectAdapter));
         let store = MemStore::default();
         let (tx, _rx) = mpsc::sync_channel(64);
-        let mut app =
-            App::<FakePane>::new(ws, registry, Box::new(store), tx, Size::new(100, 30), (0, 0), None)
-                .unwrap();
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
 
         // Pane 1 resumed cleanly at spawn (its "b" file exists), so only
         // pane 2 is left pending; `since` predates both files.
@@ -10118,6 +10250,7 @@ mod tests {
             Size::new(100, 30),
             (0, 0),
             None,
+            TokenTable::new().unwrap(),
         )
         .unwrap();
         assert!(app.last_save_ok()); // startup counts as saved (we just loaded)

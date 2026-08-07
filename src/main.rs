@@ -27,6 +27,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::core::app::{App, Mode};
+use crate::core::control::TokenTable;
 use crate::core::event::AppEvent;
 use crate::core::layout::PaneRect;
 use crate::infra::notify::TermNotifier;
@@ -285,6 +286,15 @@ fn run(
             std::env::current_dir().unwrap_or_else(|_| "/".into()),
         )
     });
+    // promotion-auth-gate decision 9: built before the listener (ordering
+    // that stays correct once sock.rs's door consults a reader onto this
+    // same table) and passed into `App::new` below instead of `App::new`
+    // minting its own. Same fatal refusal `App::new` used to make on its own
+    // (a weak, time-seeded fleet token is not an acceptable fallback — it
+    // authorizes driving the whole workspace) — just relocated to where the
+    // table it's now part of is actually built.
+    let tokens = TokenTable::new()
+        .ok_or_else(|| anyhow::anyhow!("cannot read /dev/urandom for the control token"))?;
     // `.ok()` here used to swallow three very different failures — the state
     // dir being uncreatable, `dir_is_private_and_ours` refusing (a *security*
     // bail: someone else's directory sitting where our socket goes), and
@@ -295,7 +305,7 @@ fn run(
     // every `roost <verb>` fails. Surface it instead. The security refusal
     // stays fatal: degrading "someone may be intercepting the control socket"
     // into "quietly no socket" is the wrong default.
-    let (sock_path, sock_err) = match infra::sock::spawn_listener(tx.clone()) {
+    let (sock_path, sock_err) = match infra::sock::spawn_listener(tx.clone(), tokens.reader()) {
         Ok(p) => (Some(p), None),
         Err(e) if is_unsafe_socket_dir(&e) => return Err(e),
         Err(e) => (None, Some(format!("no control plane: {e:#}"))),
@@ -303,8 +313,16 @@ fn run(
     let sock_cleanup = sock_path.clone();
     let mut notifier = TermNotifier;
     let size = terminal.size()?;
-    let mut app: App<PtyPane> =
-        App::new(ws, agents::registry(), Box::new(store), tx, size, host_pixels(), sock_path)?;
+    let mut app: App<PtyPane> = App::new(
+        ws,
+        agents::registry(),
+        Box::new(store),
+        tx,
+        size,
+        host_pixels(),
+        sock_path,
+        tokens,
+    )?;
     app.relayout();
     if let Some(msg) = sock_err {
         app.set_flash(msg);
@@ -330,7 +348,7 @@ fn run(
     // env — that's the boundary between "a pane reports itself" and "a client
     // drives the fleet". Cleaned up on exit.
     let control_token_path = FsStore::default_path().with_file_name("control.token");
-    write_control_token(&control_token_path, app.control_token());
+    write_control_token(&control_token_path, &app.control_token());
 
     // P7: the cursor shape currently applied to the host terminal, so the
     // mirror only writes on a real change.
@@ -935,7 +953,17 @@ mod tests {
         let store = MemStore::default();
         let (tx, _rx) = std::sync::mpsc::sync_channel(64);
         let ws = Workspace::default_in(PathBuf::from("/tmp"));
-        App::<FakePane>::new(ws, agents::registry(), Box::new(store), tx, Size::new(100, 30), (0, 0), None).unwrap()
+        App::<FakePane>::new(
+            ws,
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap()
     }
 
     fn alt(code: KeyCode) -> KeyEvent {
