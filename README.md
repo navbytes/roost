@@ -4,7 +4,7 @@
 
 **Processes are disposable. Sessions are precious.**
 
-A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, shell) — no daemon, ever.
+A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, codex, gemini, opencode, shell) — no daemon, ever.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
@@ -117,7 +117,7 @@ you're in.
 | Key | Action |
 |---|---|
 | `Alt+n` | new shell pane (auto split direction) |
-| `Alt+Enter` | quick-launch picker: pi / claude / shell |
+| `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
 | `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
 | `Alt+Shift+arrow` | resize along that axis |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
@@ -327,7 +327,7 @@ Status arrives two ways:
 
 Each pane also carries a faint **corner badge**, top-right (iTerm2-style):
 `name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
-(`pi` / `claude` / `shell`) when unnamed, and the glyph is the pane's live
+(pi, claude, codex, gemini, opencode, or shell) when unnamed, and the glyph is the pane's live
 status. A cell TUI can't do true translucency, so it's rendered dim rather
 than see-through; the inner app's content still draws underneath it.
 
@@ -358,6 +358,9 @@ truecolor included. Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 | `pi` | `pi` | `pi --session <id>` | socket handshake, or newest file under `~/.pi/agent/sessions/` |
 | `claude` | `claude` | `claude --resume <id>` | newest `*.jsonl` under `~/.claude/projects/<encoded-cwd>/` |
 | `shell` | `$SHELL` | relaunch in saved cwd | — |
+| `codex` | `codex` | `codex resume <SESSION_ID>` | newest `*.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` (date-bucketed, not cwd-bucketed — detection cannot be scoped to a working directory) |
+| `gemini` | `gemini` | `gemini --resume <uuid>` | per-project history under `~/.gemini/tmp/<slug>/chats/`, slug read from `~/.gemini/projects.json`; session id extracted from file's first JSONL record |
+| `opencode` | `opencode` | `opencode --session <id>` | global SQLite database at `$XDG_DATA_HOME/opencode/opencode.db` (no filesystem detection — resume only by stored id) |
 
 New adapters implement the `AgentAdapter` trait in `src/agents/` (eight
 methods, most with defaults).
@@ -380,6 +383,8 @@ roost close 5 [--force]
 ```
 
 (`roost --help` prints the same verb set, in a different order.)
+
+**Exit codes:** `0` ok · `1` runtime error · `2` usage error · `3` `wait` timed out. The `wait` timeout is a distinct code so scripts can branch on it — `wait && read` needs to know the difference between a timeout and success.
 
 `wait` is what turns "spawn then poll" into "spawn → await → read": block until a
 pane hits a status (or a timeout), so an orchestrator doesn't sleep-and-grep.
@@ -466,7 +471,6 @@ now). Full detail: [ROADMAP.md](ROADMAP.md).
 
 <p align="center">
 <a href="DESIGN-ui.md">DESIGN-ui.md</a> (design spec) ·
-<a href="https://navbytes.github.io/roost/tui-design.html">tui-design.html</a> (design reference) ·
 <a href="ROADMAP.md">ROADMAP.md</a> ·
 <a href="LICENSE">LICENSE</a>
 </p>
