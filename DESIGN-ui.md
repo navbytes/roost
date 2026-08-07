@@ -2832,10 +2832,22 @@ lands somewhere surprising is worse than one that predictably does nothing.
   about them advertises. `h`/`l` inherit the behavior for free (§8 row 3:
   they dispatch the identical `Action::Focus(Dir::Left/Right)`); `j`/`k` do
   not, for the same reason `Up`/`Down` don't.
-- **Trigger: `layout::neighbor` returns `None`.** `App::focus_dir` tries the
-  in-tab move first and falls through to C31 (`focus_dir_cross_tab`) only
-  when that comes back empty — within-tab behavior, stack tie-breaks
-  included, is untouched byte-for-byte.
+- **Trigger: `layout::neighbor` returns `None`, *and* the focused pane is
+  genuinely at that edge.** `App::focus_dir` tries the in-tab move first
+  and falls through to C31 (`focus_dir_cross_tab`) only when that comes
+  back empty — within-tab behavior, stack tie-breaks included, is
+  untouched byte-for-byte. `neighbor == None` alone is **not** sufficient:
+  a pane spanning the tab's full width (a row sitting above or below a
+  split row) has no Left *or* Right neighbour either — `neighbor`'s gap
+  check excludes every other pane on both sides at once, since nothing can
+  sit beside a full-width rect, regardless of row — but such a pane is not
+  meaningfully "the last or first pane" the client asked about; it's
+  reachable from a single pane as `Alt+n`, `Alt+o`, `Alt+n`. C31
+  additionally requires the focused pane's rect to **not** span the tab
+  body's full width, unless it is the tab's only pane (`rects.len() == 1`)
+  — which necessarily spans the full width *and* height, and is
+  unambiguously both ends at once: the ordinary single-pane-tab case every
+  other test here relies on.
 - **Motion continues in the same direction.** `Right` at the right edge
   switches to the **next** tab and focuses its **leftmost** pane; `Left` at
   the left edge switches to the **previous** tab and focuses its
@@ -2848,13 +2860,19 @@ lands somewhere surprising is worse than one that predictably does nothing.
   and the current `body_area()` — pure, and correct for a tab that has
   never been active, the same fact C28's own destination-geometry check
   already relies on) — never pane-id order, never tree/DFS order.
-  **Tie-break: smallest x, then smallest y, then smallest pane id** for
-  leftmost; **largest x**, same secondary and tertiary keys, for rightmost
-  (`edge_pane`, `app.rs`). The x/y pair is `layout::neighbor`'s own
-  tie-break vocabulary, and id-as-last-resort borrows that same function's
-  own rule, for the case position alone can't decide: every member of a
-  stack sits at the same x, so a jump landing on a stack's column always
-  resolves to its topmost member, not an arbitrary one.
+  **Tie-break: smallest x, then `collapsed == false`, then smallest y, then
+  smallest pane id** for leftmost; **largest x**, same remaining keys, for
+  rightmost (`edge_pane`, `app.rs`). Every member of a stack sits at the
+  same x, so the collapsed-vs-expanded key is what decides there: the jump
+  lands on the member the stack already had **expanded**, never a
+  collapsed 1-row title bar — a navigation key must not rearrange a tab
+  you haven't looked at yet, so `expand_in_stacks` (below) comes back a
+  no-op instead of silently collapsing whatever was open. The x/y pair is
+  `layout::neighbor`'s own tie-break vocabulary, and id-as-last-resort
+  borrows that same function's own rule, for whatever residual tie
+  position still can't break — a real tab never produces one (two panes at
+  the same x, collapsed-state, *and* y), but the guard costs one field and
+  keeps the pick total rather than order-dependent.
 - **Wraps at both ends**, exactly like `Alt+i`/`Alt+m` (`step_tab`):
   `next = (active_tab + delta).rem_euclid(tab_count)`. Two ways to move
   between tabs disagreeing about hitting an end would be its own bug.
@@ -2873,10 +2891,18 @@ lands somewhere surprising is worse than one that predictably does nothing.
   by rule 1 ("shown ⇒ focused") the float cannot be shown while unfocused,
   so C31 can never observe it shown. No float-handling code was added for
   this contract; the existing guard is the whole story.
-- **Expands a collapsed stack member at the destination**, exactly as the
-  within-tab path already does via `expand_in_stacks` — landing on a 1-row
-  collapsed title bar would be precisely the "surprising" outcome the
-  brief's caveat rules out.
+- **`expand_in_stacks` still runs at the destination**, exactly as the
+  within-tab path already does. Typically a no-op now that the tie-break
+  above lands on the expanded member itself; it remains the fallback that
+  guarantees the landing pane is visible — never a collapsed 1-row title
+  bar, the "surprising" outcome the brief's caveat rules out — in whatever
+  case isn't a clean x-tie.
+- **Chrome:** §8's key table row 3 and C15's matching overlay row both gain
+  the same parenthetical (`←`/`→` continue at an edge) so the in-app keymap
+  doesn't fall out of step with the canonical table —
+  `every_bound_chord_is_documented_in_the_keymap` is chord-level and would
+  have passed either way, the same class of gap the 2026-08-06 C15
+  amendment closed for mouse verbs.
 - **Persistence and PTY sizing are unremarkable.** The switch runs inside
   `App::apply`, whose trailing `relayout()`/`save()` (unconditional, after
   every action) is exactly what `Alt+i`/`Alt+m`/`Alt+1..9` already rely on;
@@ -2899,7 +2925,10 @@ lands somewhere surprising is worse than one that predictably does nothing.
 `cross_tab_focus_wraps_at_both_ends` ·
 `cross_tab_focus_is_a_no_op_with_only_one_tab` ·
 `cross_tab_focus_never_fires_for_up_or_down` ·
-`cross_tab_focus_expands_a_collapsed_stack_member_at_the_destination` ·
+`cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane`
+(the `Alt+n`, `Alt+o`, `Alt+n` repro, both directions, plus a same-layout
+sanity check that a genuine edge still crosses) ·
+`cross_tab_focus_lands_on_the_already_expanded_stack_member_at_the_destination` ·
 `cross_tab_focus_exits_zoom_like_any_other_tab_change` ·
 `float_rule2_focus_dir_does_not_cross_tabs_even_with_more_than_one`.
 
