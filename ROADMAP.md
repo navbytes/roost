@@ -233,10 +233,53 @@ Pure restructures, no behavior change; do only if roost keeps growing, and each
 as its own isolated, well-reviewed change (they touch roost's trickiest code).
 
 - **[health] Dependency inversion.** `core` imports `ui` (`Action`) and raw
-  `crossterm` key types; the arrow should point `ui → core`.
-- **[health] Extract `SessionResolver`.** The filesystem session-detection logic
-  is the real coordination leak of the daemonless model and is spread through
-  `app.rs` as private methods; extract it so it's testable in isolation.
+  `crossterm` key types; the arrow should point `ui → core`. **Assessed
+  2026-08-07, deferred — not attempted.** Measured rather than guessed: in
+  `app.rs`'s *production* code (excluding its own test module, which accounts
+  for most of the 502 `Action::` references there) the coupling is the
+  ~30-arm `Action` dispatch in `apply()`, one call into `ui::input::
+  {InputResult, translate}` (the Alt-toggle-off check in `handle_mode_key`),
+  a `ui::mouse::Seam` struct field, three `ui::mouse`/`ui::render` hit-test
+  helper calls, and — the real weight — two `pub fn`s that take raw
+  `crossterm::event::{KeyEvent, MouseEvent}` directly as their parameter
+  type (`handle_mode_key`, ~580 lines; `handle_modal_mouse`, ~100 lines),
+  with `KeyCode`/`KeyModifiers` matched throughout for text editing, cursor
+  movement, and mode toggling. About a third of that — the `Seam` field, two
+  pure hit-test helpers, and `state_word` (already a pure `AgentStatus ->
+  &str` map with no rendering concern) — could move to `core` cheaply, and
+  `Action` itself could follow with a re-export left behind in `ui::input`
+  so its ~200 other references (main.rs, ui/render.rs, ui/mouse.rs,
+  ui/input.rs) never need touching. The rest has no mechanical fix: `core`
+  accepting crossterm's own event types as its public API means a real
+  inversion needs `core` to define its own key/mouse vocabulary and have
+  `ui`/`main.rs` translate at the boundary — a design decision, not a move —
+  threaded through the two largest, highest-traffic input-handling methods
+  in the app, exactly where "watch for a moved method quietly changing when
+  it's called" bites hardest. That's the "large mechanical churn late in an
+  engagement" this entry already warned about, for a payoff that's purely
+  structural. Left for its own engagement; if picked up, split the cheap
+  slice (types/field/helpers) from the crossterm-vocabulary redesign — they
+  are different risk classes and don't need to land together.
+- ~~**[health] Extract `SessionResolver`.**~~ **DONE 2026-08-07.** The
+  filesystem session-detection logic previously spread through `app.rs` as
+  private methods — `spawn_pane`'s stored-session resume/stale decision and
+  `tick`'s claimed-session exclusion — is now `core::session_resolver::
+  SessionResolver`: three methods (`resolve`, `detect`, `claimed_sessions`)
+  over an `&dyn AgentAdapter` and a `Workspace`, none of it needing a
+  running `App` to construct or exercise (proved by 8 new unit tests against
+  the resolver alone). `App` still owns the bookkeeping this leans on —
+  `pending_detect`, `last_detect`, persistence — since that's tied to its
+  own runtime lifecycle, not the decision logic. Landed as two commits:
+  characterisation tests against the *pre-extraction* code first (pinning
+  Exists/Gone/Unknown, no session root, a root that exists but can't be
+  read, and a session id already claimed by another pane — that last one
+  wasn't previously pinned in isolation, and a mutation check confirmed all
+  the new tests, old and new, actually fail without the fix they pin), then
+  the extraction, which changes none of `App`'s public surface. Full suite
+  green twice (722 unit tests, up from 714), `cargo clippy --all-targets`
+  unchanged (the same 4 pre-existing warnings, none in the new code).
+  `agents/pi.rs`'s narrowed-then-full-scan-fallback detection was left
+  untouched, as was every other adapter.
 
 ## Performance — deferred
 

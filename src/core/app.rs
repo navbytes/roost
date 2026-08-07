@@ -14,6 +14,7 @@ use crate::agents::Registry;
 use crate::core::control::{Actor, Method, ReadMode, Reply, Request};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
+use crate::core::session_resolver::SessionResolver;
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
 use crate::ports::{ClipboardOutcome, Observation, PaneBackend, StateStore};
@@ -919,23 +920,12 @@ impl<B: PaneBackend> App<B> {
     fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
         let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
 
-        // Validate a stored session id: only launch fresh + clear it when the
-        // session is *definitively* gone. If we can't tell (root momentarily
-        // unreadable), attempt resume and keep the id — a transient error must
-        // not discard a still-valid resume pointer. All adapter queries happen
-        // here, before we borrow self mut.
-        let (session, stale) = match &spec.session {
-            None => (None, false),
-            // A malformed/hostile id (tampered workspace.json, poisoned socket)
-            // never reaches the resume command — treat it as gone and launch
-            // fresh, clearing it from disk.
-            Some(s) if !crate::agents::valid_session_id(s) => (None, true),
-            Some(s) => match adapter.session_state(&spec.cwd, s) {
-                crate::agents::SessionState::Gone => (None, true),
-                _ => (Some(s.clone()), false), // Exists or Unknown → try resume
-            },
-        };
-        let mut cmd = match &session {
+        // Validate a stored session id via SessionResolver (design doc
+        // §6.1): only launch fresh + clear it when the session is
+        // *definitively* gone. All adapter queries happen here, before we
+        // borrow self mut.
+        let resolution = SessionResolver.resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref());
+        let mut cmd = match &resolution.session {
             Some(s) => adapter.resume(&spec.cwd, s),
             None => adapter.launch(&spec.cwd),
         };
@@ -947,10 +937,9 @@ impl<B: PaneBackend> App<B> {
             cmd.env.push(("ROOST_TOKEN".into(), token.clone()));
             self.tokens.insert(id, token);
         }
-        let wants_detect = session.is_none() && adapter.session_root(&spec.cwd).is_some();
         // adapter / registry borrow ends here.
 
-        if stale {
+        if resolution.stale {
             // Persist the correction so the dead id isn't retried next launch.
             if let Some(s) = self.find_spec_mut(id) {
                 s.session = None;
@@ -966,7 +955,7 @@ impl<B: PaneBackend> App<B> {
                 self.dead.remove(&id);
                 // Owe this pane a session id? Watch for one (socket reports
                 // it exactly; the filesystem scan in tick() is the fallback).
-                if wants_detect {
+                if resolution.wants_detect {
                     self.pending_detect.insert(id, SystemTime::now());
                 }
                 // C20: spawn owns the pane's "birth" line — diff_statuses
@@ -1033,8 +1022,8 @@ impl<B: PaneBackend> App<B> {
             };
             // Session ids already owned by other panes — never re-assign one
             // (concurrent same-cwd launches otherwise cross-wire onto it).
-            let taken = self.claimed_sessions();
-            if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
+            let taken = SessionResolver.claimed_sessions(&self.ws);
+            if let Some(session) = SessionResolver.detect(adapter.as_ref(), &spec.cwd, since, &taken) {
                 self.set_session(id, session);
             }
         }
@@ -1149,16 +1138,6 @@ impl<B: PaneBackend> App<B> {
         if dirty {
             self.save();
         }
-    }
-
-    /// Session ids currently assigned to any pane.
-    fn claimed_sessions(&self) -> std::collections::HashSet<String> {
-        self.ws
-            .tabs
-            .iter()
-            .flat_map(|t| t.panes.values())
-            .filter_map(|s| s.session.clone())
-            .collect()
     }
 
     /// U2 (amended, P6): the one display name for pane `id`, used by every
