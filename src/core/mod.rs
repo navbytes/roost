@@ -6,5 +6,6 @@ pub mod app;
 pub mod control;
 pub mod event;
 pub mod layout;
+pub mod session_resolver;
 pub mod status;
 pub mod workspace;

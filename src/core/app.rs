@@ -14,6 +14,7 @@ use crate::agents::Registry;
 use crate::core::control::{Actor, Method, ReadMode, Reply, Request};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
+use crate::core::session_resolver::SessionResolver;
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
 use crate::ports::{ClipboardOutcome, Observation, PaneBackend, StateStore};
@@ -919,23 +920,12 @@ impl<B: PaneBackend> App<B> {
     fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
         let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
 
-        // Validate a stored session id: only launch fresh + clear it when the
-        // session is *definitively* gone. If we can't tell (root momentarily
-        // unreadable), attempt resume and keep the id — a transient error must
-        // not discard a still-valid resume pointer. All adapter queries happen
-        // here, before we borrow self mut.
-        let (session, stale) = match &spec.session {
-            None => (None, false),
-            // A malformed/hostile id (tampered workspace.json, poisoned socket)
-            // never reaches the resume command — treat it as gone and launch
-            // fresh, clearing it from disk.
-            Some(s) if !crate::agents::valid_session_id(s) => (None, true),
-            Some(s) => match adapter.session_state(&spec.cwd, s) {
-                crate::agents::SessionState::Gone => (None, true),
-                _ => (Some(s.clone()), false), // Exists or Unknown → try resume
-            },
-        };
-        let mut cmd = match &session {
+        // Validate a stored session id via SessionResolver (design doc
+        // §6.1): only launch fresh + clear it when the session is
+        // *definitively* gone. All adapter queries happen here, before we
+        // borrow self mut.
+        let resolution = SessionResolver.resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref());
+        let mut cmd = match &resolution.session {
             Some(s) => adapter.resume(&spec.cwd, s),
             None => adapter.launch(&spec.cwd),
         };
@@ -947,10 +937,9 @@ impl<B: PaneBackend> App<B> {
             cmd.env.push(("ROOST_TOKEN".into(), token.clone()));
             self.tokens.insert(id, token);
         }
-        let wants_detect = session.is_none() && adapter.session_root(&spec.cwd).is_some();
         // adapter / registry borrow ends here.
 
-        if stale {
+        if resolution.stale {
             // Persist the correction so the dead id isn't retried next launch.
             if let Some(s) = self.find_spec_mut(id) {
                 s.session = None;
@@ -966,7 +955,7 @@ impl<B: PaneBackend> App<B> {
                 self.dead.remove(&id);
                 // Owe this pane a session id? Watch for one (socket reports
                 // it exactly; the filesystem scan in tick() is the fallback).
-                if wants_detect {
+                if resolution.wants_detect {
                     self.pending_detect.insert(id, SystemTime::now());
                 }
                 // C20: spawn owns the pane's "birth" line — diff_statuses
@@ -1033,8 +1022,8 @@ impl<B: PaneBackend> App<B> {
             };
             // Session ids already owned by other panes — never re-assign one
             // (concurrent same-cwd launches otherwise cross-wire onto it).
-            let taken = self.claimed_sessions();
-            if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
+            let taken = SessionResolver.claimed_sessions(&self.ws);
+            if let Some(session) = SessionResolver.detect(adapter.as_ref(), &spec.cwd, since, &taken) {
                 self.set_session(id, session);
             }
         }
@@ -1149,16 +1138,6 @@ impl<B: PaneBackend> App<B> {
         if dirty {
             self.save();
         }
-    }
-
-    /// Session ids currently assigned to any pane.
-    fn claimed_sessions(&self) -> std::collections::HashSet<String> {
-        self.ws
-            .tabs
-            .iter()
-            .flat_map(|t| t.panes.values())
-            .filter_map(|s| s.session.clone())
-            .collect()
     }
 
     /// U2 (amended, P6): the one display name for pane `id`, used by every
@@ -7820,6 +7799,130 @@ mod tests {
         assert!(saved.tabs[0].panes[&1].session.is_none());
     }
 
+    // -- characterisation: spawn_pane's session-state decision table -------
+    // Pins the private logic ROADMAP's "[health] Extract SessionResolver"
+    // targets, across every branch it can take, BEFORE that logic moves.
+    // `stale_session_falls_back_to_fresh_launch` above already covers Gone
+    // end-to-end through the real pi adapter; these use a lighter, fully
+    // hermetic fixture to cover the rest (and restate Gone for symmetry).
+
+    /// Test-only adapter whose session root is caller-controlled: `None` (no
+    /// root at all) or any path, readable or not — so `spawn_pane`'s
+    /// resume/stale/detect branches can be driven deterministically without
+    /// touching a real `~/.pi`/`~/.claude`. Mirrors `agents::tests::RootAdapter`,
+    /// which app.rs's tests can't reach (private to that module).
+    struct RootedAdapter(Option<PathBuf>);
+    impl crate::agents::AgentAdapter for RootedAdapter {
+        fn id(&self) -> &'static str {
+            "rooted"
+        }
+        fn launch(&self, cwd: &Path) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd)
+        }
+        fn resume(&self, cwd: &Path, session: &str) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd).arg(session)
+        }
+        fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
+            self.0.clone()
+        }
+    }
+
+    /// A single shell-shaped pane running `RootedAdapter(root)`, starting
+    /// with `stored` as its persisted session id.
+    fn mk_rooted_app(root: Option<PathBuf>, stored: Option<&str>) -> (App<FakePane>, MemStore) {
+        let mut ws = shell_ws();
+        let spec = ws.tabs[0].panes.get_mut(&1).unwrap();
+        spec.adapter = "rooted".into();
+        spec.session = stored.map(String::from);
+        let mut registry = agents::registry();
+        registry.insert("rooted", Box::new(RootedAdapter(root)));
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(store.clone()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+        )
+        .unwrap();
+        (app, store)
+    }
+
+    #[test]
+    fn spawn_with_no_session_root_and_nothing_stored_never_queues_detection() {
+        // The common shell-pane shape: an adapter with nowhere to look for a
+        // session file must never arm the fs-scan fallback.
+        let (app, _) = mk_rooted_app(None, None);
+        assert!(app.pending_detect.is_empty());
+        assert!(app.runtimes.get(&1).unwrap().cmd.args.is_empty(), "expected a fresh launch");
+    }
+
+    #[test]
+    fn spawn_with_no_session_root_but_a_stored_id_still_attempts_resume() {
+        // No root to check ⇒ SessionState::Unknown, not Gone: resume is
+        // attempted and the stored id is left alone, not cleared.
+        let (app, _) = mk_rooted_app(None, Some("kept"));
+        assert_eq!(app.runtimes.get(&1).unwrap().cmd.args, vec!["kept"]);
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn spawn_with_an_unreadable_session_root_also_attempts_resume_and_keeps_the_id() {
+        // A root that exists but can't be read (permission denied) must be
+        // treated exactly like a missing one: Unknown, not Gone — same
+        // reasoning `stale_session_falls_back_to_fresh_launch` documents for
+        // the missing-root case.
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("roost-resolve-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (app, _) = mk_rooted_app(Some(dir.clone()), Some("kept"));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap(); // restore for cleanup
+        assert_eq!(app.runtimes.get(&1).unwrap().cmd.args, vec!["kept"]);
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("kept"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_with_an_existing_session_file_resumes_without_clearing_it() {
+        let dir = std::env::temp_dir().join(format!("roost-resolve-exists-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kept-id.txt"), "").unwrap(); // default session_id_from_path = file stem
+
+        let (app, _) = mk_rooted_app(Some(dir.clone()), Some("kept-id"));
+
+        assert_eq!(app.runtimes.get(&1).unwrap().cmd.args, vec!["kept-id"]);
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("kept-id"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_with_a_gone_session_clears_it_and_launches_fresh_via_a_hermetic_fixture() {
+        // Same Gone contract as `stale_session_falls_back_to_fresh_launch`,
+        // through a fixture root instead of a redirected $HOME: a readable,
+        // empty root is "definitely gone" — launch fresh AND persist the
+        // correction so it isn't retried.
+        let dir = std::env::temp_dir().join(format!("roost-resolve-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (app, store) = mk_rooted_app(Some(dir.clone()), Some("ghost"));
+
+        assert!(app.runtimes.get(&1).unwrap().cmd.args.is_empty(), "expected a fresh launch");
+        assert!(app.find_spec(1).unwrap().session.is_none());
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        assert!(saved.tabs[0].panes[&1].session.is_none(), "the dead id must be persisted as cleared");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn notification_only_for_unfocused_working_to_waiting() {
         let (mut app, _) = mk_app(shell_ws());
@@ -9074,6 +9177,66 @@ mod tests {
 
         assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("a"));
         assert_eq!(app.find_spec(2).unwrap().session.as_deref(), Some("b"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Characterisation: pane 1 already owns "b" (the newer of two session
+    /// files); pane 2 is mid-detection in the same cwd and must not steal
+    /// it — even though "b" is the newest candidate — falling through to
+    /// the older, still-unclaimed file instead. A session id must never be
+    /// handed to two panes at once.
+    #[test]
+    fn tick_skips_a_session_id_already_claimed_by_another_pane() {
+        let dir = std::env::temp_dir().join(format!("roost-detect-taken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = SystemTime::now();
+        let file_a = dir.join("a.jsonl");
+        let file_b = dir.join("b.jsonl");
+        std::fs::write(&file_a, "").unwrap();
+        std::fs::write(&file_b, "").unwrap();
+        std::fs::File::open(&file_a).unwrap().set_modified(base + Duration::from_millis(10)).unwrap();
+        std::fs::File::open(&file_b).unwrap().set_modified(base + Duration::from_millis(20)).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "detect".into(),
+                cwd: dir.clone(),
+                session: Some("b".into()), // already claimed before this tick
+                title: None,
+                spawned_by: None,
+            },
+        );
+        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
+        let layout = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        let ws = Workspace { version: 1, active_tab: 0, tabs: vec![Tab { name: "main".into(), layout, panes }] };
+
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app =
+            App::<FakePane>::new(ws, registry, Box::new(store), tx, Size::new(100, 30), (0, 0), None)
+                .unwrap();
+
+        // Pane 1 resumed cleanly at spawn (its "b" file exists), so only
+        // pane 2 is left pending; `since` predates both files.
+        assert!(!app.pending_detect.contains_key(&1));
+        app.pending_detect.insert(2, base);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+
+        app.tick();
+
+        assert_eq!(app.find_spec(2).unwrap().session.as_deref(), Some("a"));
+        assert!(!app.pending_detect.contains_key(&2));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
