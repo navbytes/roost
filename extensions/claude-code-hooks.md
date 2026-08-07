@@ -17,8 +17,21 @@ them in place if this build changed, e.g. the binary moved. If
 configs — roost writes through it to the real file and leaves the link
 itself alone.
 
-Opt out with `ROOST_NO_EXT_INSTALL=1` (the same variable that disables the pi
-extension install) and manage the hooks yourself — see below.
+Two environment variables suppress this install (both also disable the pi
+extension install, identically):
+
+- `ROOST_NO_EXT_INSTALL=1` — the variable to reach for by hand: "I manage
+  this myself." See [By hand](#by-hand) below.
+- `ROOST_TEST_NO_HOST_IO=1` — for a test harness or orchestrator: "this run
+  must not touch anything outside itself." Note that `ROOST_STATE` (roost's
+  per-instance state-directory override, used to run an isolated workspace)
+  does **not**, by itself, suppress this — an isolated *workspace* still
+  targets the machine's one real `~/.claude`, so it still gets the hooks
+  installed/updated unless `ROOST_TEST_NO_HOST_IO` or `ROOST_NO_EXT_INSTALL`
+  is also set. `ROOST_TEST_NO_HOST_IO` is exactly the switch for "isolated
+  and must not mutate my global config" — set it alongside `ROOST_STATE`
+  when that's what you want (roost's own test harness does both on every
+  spawn).
 
 ## What it writes
 
