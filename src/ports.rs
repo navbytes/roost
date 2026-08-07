@@ -100,12 +100,17 @@ pub trait PaneBackend: Sized {
     fn process_output(&mut self, bytes: &[u8]);
     /// User keystrokes → process stdin. Implementations should snap
     /// scrollback to the live tail (typing means "I'm back"). Returns
-    /// whether the bytes actually reached the process — a caller that
-    /// reports a delivery count (`ctl_send`/`ctl_broadcast`) must not
-    /// count a failed write as sent.
+    /// whether the bytes were accepted for delivery — not (since the write
+    /// moved off the event loop onto a per-pane writer thread, PR #67) that
+    /// they have actually reached the process yet. The production backend
+    /// queues accepted bytes there, bounded at 1 MiB of pending writes;
+    /// past that bound — or once the pipe is known dead — this reports
+    /// `false`, the same refusal either way. A caller that reports a
+    /// delivery count (`ctl_send`/`ctl_broadcast`) must not count a refusal
+    /// as sent.
     fn write_input(&mut self, bytes: &[u8]) -> bool;
     /// Bytes → process stdin without touching scrollback (forwarded mouse
-    /// events must not yank the view to the live tail). Same success
+    /// events must not yank the view to the live tail). Same acceptance
     /// semantics as `write_input`.
     fn write_input_raw(&mut self, bytes: &[u8]) -> bool;
     /// `pixels` as in `spawn` — the pane's derived pixel geometry, refreshed
