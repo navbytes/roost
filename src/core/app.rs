@@ -5149,10 +5149,29 @@ fn method_summary(m: &Method) -> String {
 /// take a length of time the rate limiter can then make impractical; the
 /// buckets alone never could, because they bound calls and the log bounds
 /// bytes. 512 is far past any legitimate adapter name or status word.
+///
+/// [Amended, code review, exit UX audit 2026-08-07] This is a **byte**
+/// budget — `sanitize` used to cap by `.chars().take(512)`, so 512
+/// 4-byte codepoints (an adapter-name field stuffed with astral-plane
+/// characters) bought ~2 KiB, not the ~1 KiB "far past any legitimate
+/// name" reads as. Every number in this comment is about bytes on disk
+/// against `AUDIT_LOG_MAX`, so bytes is what the cap now counts.
 const AUDIT_FIELD_CAP: usize = 512;
 
+/// Cleans control chars, then caps at `AUDIT_FIELD_CAP` **bytes** (not
+/// chars — see the amendment above), never splitting a multi-byte
+/// character: each candidate char is checked against the byte budget
+/// before it's pushed, so truncation always lands on a char boundary.
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_control() { ' ' } else { c }).take(AUDIT_FIELD_CAP).collect()
+    let mut out = String::new();
+    for c in s.chars() {
+        let c = if c.is_ascii_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > AUDIT_FIELD_CAP {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is
@@ -5813,6 +5832,23 @@ mod tests {
         assert!(!ctrl.chars().any(|c| c.is_ascii_control()), "control bytes still neutralised");
         let ordinary = "adapter=claude until=needs_input";
         assert_eq!(super::sanitize(ordinary), ordinary, "a legitimate field is untouched");
+    }
+
+    /// Code review (exit UX audit 2026-08-07): the cap bounds bytes written
+    /// to the byte-bounded log (`AUDIT_LOG_MAX`), not chars — capping by
+    /// `.chars().take(512)` let 512 4-byte codepoints buy ~2 KiB, ~4x what
+    /// the comment on `AUDIT_FIELD_CAP` reasons in, making the
+    /// rotation-attack arithmetic that far optimistic. The test above uses
+    /// pure ASCII, where chars and bytes coincide and can't catch this.
+    #[test]
+    fn an_audit_field_caps_bytes_not_chars_and_never_splits_one() {
+        // U+1F600, 4 bytes in UTF-8: 512 / 4 = 128 whole emoji exactly fill
+        // the byte budget; capping by chars would have let all 1000 through
+        // at 4000 bytes.
+        let hostile = "😀".repeat(1000);
+        let out = super::sanitize(&hostile);
+        assert_eq!(out, "😀".repeat(128), "must cap bytes (512 / 4), not chars (1000)");
+        assert_eq!(out.len(), super::AUDIT_FIELD_CAP);
     }
     use super::*;
     use crate::agents;
