@@ -1534,6 +1534,37 @@ tab takes Alt+{digit} then Alt+arrows.
 - Unit tests: ring order across two tabs; wrap; focused-not-in-ring; empty
   ring flash; count == ring size.
 
+**[Amended 2026-08-07, ux P1-5 — the Waiting fallback]** "Nothing else is in
+the ring — not Exited, not Working: worst-first across roost's statuses means
+◆ is the only actionable severity, and the ring must match the advertised
+count" is withdrawn as an absolute: a ◆-only ring keeps `Alt+a`'s "one key
+jumps there" promise only for extension-instrumented panes, since without a
+hook `NeedsInput` is reachable solely via the BEL heuristic and a quiet
+turn-end lands on `Waiting` instead — which the ring used to ignore outright,
+leaving an uninstrumented agent's finished turn unreachable by the chord built
+to reach it.
+
+- **The ring now has two passes.** Pass one is unchanged (◆, the predicate
+  above, verbatim). **Only when pass one is empty** does a second pass run,
+  over every pane whose status is `Waiting` — same shape (tab order, that
+  tab's `pane_order()`, the float last). An instrumented fleet is untouched
+  by construction: the fallback is reachable only once the ◆ pass comes back
+  empty, so a real ◆ is never skipped for a ○, and the ring/count invariant
+  above still holds exactly whenever N > 0. It no longer holds when N = 0 and
+  the fallback ring is non-empty — deliberately: the hint bar's `◆ N needs
+  you` segment is already omitted at N = 0 (C9), so nothing visible asserts
+  the old equality in that case.
+- **The predicate is `display_status`, not the raw runtime status** (P2-10):
+  a plain shell reading heuristic `Waiting` is presented as `Idle` (it has no
+  turn to hand back), so it can never pull either ring pass. Only a pane
+  whose `Waiting` means something — a real agent — does. The roster (C27)
+  reads the identical two-pass ring for its opening cursor, so the two
+  surfaces cannot disagree about what a fleet with zero ◆s should jump to.
+- Unit tests added: fallback fires only with an empty ◆ pass; a real ◆
+  anywhere suppresses it outright; the fallback excludes a quiet shell (and
+  the scratch float, which is always a shell); the roster/ring agreement
+  test below covers the three-way interaction.
+
 ### C20 — Activity feed (Alt+e) — [Added 2026-07-22, fleet features]
 
 **Current:** no surface. The data exists but scattered: control actions are

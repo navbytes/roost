@@ -3649,17 +3649,40 @@ impl<B: PaneBackend> App<B> {
     /// ascending, position within that tab's `pane_order()`); the float
     /// (C22), if needy, is last — `needs_input_count` counts `runtimes`
     /// directly (float included), so it must be too.
+    ///
+    /// [Amended, ux P1-5] `Alt+a` promises "one key jumps there", but a ◆-only
+    /// ring keeps that promise only for extension-instrumented panes: without
+    /// a hook, `NeedsInput` is reachable solely via the BEL heuristic, so a
+    /// quiet turn-end lands on `Waiting` — which this ring used to ignore
+    /// outright. When the ◆ pass comes back **empty** (nothing anywhere needs
+    /// input), the ring falls through to every pane reading `Waiting` instead
+    /// — same tab/pane_order/float shape, so nothing else about a jump
+    /// changes. An instrumented fleet is untouched by construction: the
+    /// fallback only runs once the ◆ pass is empty, so a real ◆ is never
+    /// skipped in favor of a ○. The predicate is `display_status`, not the
+    /// raw runtime status, so a plain shell sitting at its prompt (P2-10: it
+    /// has no turn to hand back) can never pull the ring — only a pane whose
+    /// `Waiting` actually means something does.
     fn attention_ring(&self) -> Vec<PaneId> {
+        let needy = self.status_ring(AgentStatus::NeedsInput);
+        if !needy.is_empty() {
+            return needy;
+        }
+        self.status_ring(AgentStatus::Waiting)
+    }
+
+    /// Every pane — tab order, then that tab's `pane_order()`, the float
+    /// (C22) last — whose `display_status` is exactly `status`. The shared
+    /// shape behind `attention_ring`'s two passes (◆, then the ○ fallback).
+    fn status_ring(&self, status: AgentStatus) -> Vec<PaneId> {
         let mut ring = Vec::new();
         for tab in &self.ws.tabs {
             let mut order = Vec::new();
             layout::pane_order(&tab.layout, &mut order);
-            ring.extend(order.into_iter().filter(|id| {
-                self.runtimes.get(id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false)
-            }));
+            ring.extend(order.into_iter().filter(|&id| self.display_status(id) == Some(status)));
         }
         if let Some(f) = &self.float {
-            if self.runtimes.get(&f.id).map(|rt| rt.status() == AgentStatus::NeedsInput).unwrap_or(false) {
+            if self.display_status(f.id) == Some(status) {
                 ring.push(f.id);
             }
         }
@@ -9221,6 +9244,59 @@ mod tests {
         assert_eq!(app.needs_input_count(), expected.len());
     }
 
+    /// [Amended, ux P1-5] With **no** ◆ anywhere, the ring falls through to
+    /// every `Waiting` pane — the fallback that makes an uninstrumented
+    /// agent's finished turn reachable by `Alt+a` at all, not just extension
+    /// panes' explicit `NeedsInput`.
+    #[test]
+    fn attention_ring_falls_through_to_waiting_when_nothing_needs_input() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_ring(), vec![1]);
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 1, "Alt+a reaches a finished, uninstrumented turn");
+    }
+
+    /// A real ◆ anywhere in the fleet wins outright — the fallback only ever
+    /// runs once the ◆ pass comes back empty, so an instrumented fleet's ring
+    /// behaves exactly as it did before this amendment: no ◆ is ever skipped
+    /// in favor of a ○.
+    #[test]
+    fn attention_ring_never_skips_a_real_needs_input_for_the_waiting_fallback() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // panes 1, 2, 3
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.runtimes.get_mut(&3).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.attention_ring(), vec![3], "the one real ◆ wins outright, no ○ mixed in");
+    }
+
+    /// Interaction (items 1 + 4): a quiet shell's `Waiting` reads `Idle`
+    /// (P2-10) through `display_status`, so it must not pull the fallback
+    /// ring — only a pane whose `Waiting` means something (a real agent)
+    /// does. The case that matters: a fleet mixing instrumented/uninstrumented
+    /// agents with plain shells, and only the agent counts.
+    #[test]
+    fn attention_ring_waiting_fallback_excludes_quiet_shells() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1 (shell), 2 (shell, promoted below)
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting); // shell: no turn
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting); // agent: your turn
+        assert_eq!(app.attention_ring(), vec![2], "the shell's Waiting never pulls the ring");
+
+        // A fleet of shells only, none of them ever needing a jump.
+        app.find_spec_mut(2).unwrap().adapter = "shell".into();
+        assert!(app.attention_ring().is_empty(), "an all-shell fleet has nothing to jump to");
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
     // -- C27 fleet roster -----------------------------------------------------
 
     /// A two-tab fixture with a needy pane parked in the *second* tab — the
@@ -11028,6 +11104,22 @@ mod tests {
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         assert_eq!(app.attention_ring(), vec![1, float_id]);
         assert_eq!(app.attention_ring().len(), app.needs_input_count());
+    }
+
+    /// Interaction (items 1 + 4): the float (C22) is always spawned as a
+    /// `shell` pane (`spawn_float`) — roost's own scratch shell, never an
+    /// agent — so its heuristic `Waiting` reads `Idle` (P2-10) the same as
+    /// any other shell, and it can never join the Waiting fallback ring. A
+    /// needy float still rings (NeedsInput is untouched by the P2-10
+    /// downgrade); a merely-quiet one does not.
+    #[test]
+    fn attention_ring_waiting_fallback_never_includes_the_scratch_float() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide it, focus back to pane 1
+        app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert!(app.attention_ring().is_empty(), "a quiet scratch shell never rings");
     }
 
     #[test]
