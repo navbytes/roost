@@ -107,17 +107,35 @@ user's first action (a shell prompt) — inside the very window meant to catch
 a broken one. Confirmed by the exit UX audit (2026-08-07, F1): reproduced on
 a correctly-configured terminal, first keystroke.
 
-**Re-fixed (exit UX audit 2026-08-07, F1):** the accent-signature half is
-back, and is now the *only* evidence — `wants_alt_hint(alt_seen,
-alt_swallow_seen)`, no elapsed gate. `alt_swallow_seen` is set only when an
-unmodified key's character is one a macOS layout emits for
-`Option+<letter>` with Option-as-Meta off (`is_alt_swallow_char`, `app.rs`)
-— narrow enough that the elapsed-time gate that used to bound the false-fire
-window is no longer needed, which is also what lets a read-first user's
-first Alt press land arbitrarily late and still raise the bar. Wording is
-unchanged: per terminal from roost's own (host) `TERM_PROGRAM`, real menu
-paths for `Apple_Terminal` and `iTerm.app`, terminal-agnostic otherwise (C9
-and C11 amended 2026-08-07).
+**Re-fixed (exit UX audit 2026-08-07, F1), then corrected again same day
+(design audit SG1/SG2/SG3):** the accent-signature half is back, scoped
+explicitly to the **US** macOS keyboard layout (SG2 — a non-US layout's own
+Option+letter table is a different 26 characters, and this makes no claim
+to cover them) — `is_alt_swallow_char`'s `matches!` arm list is the complete
+26-character definition, one per `a..=z`, not an abbreviated "`˜`, `∑`, …"
+(SG3: a contract should be checkable without reading the source it defers
+to). It relies on terminals not composing dead keys (`Option+n` arriving
+immediately as `˜`), which is believed true here but **is not verified by
+anything in this suite** (SG3) — no test drives a real terminal against a
+real OS keyboard driver.
+
+The F1 fix initially shipped with the elapsed-time gate dropped entirely,
+reasoning the evidence was narrow enough not to need one. SG1 caught the
+flaw: every character in the table is *also* a directly-typed letter on
+some non-US layout (`ç`, `å`, `ø`, `ß`, `µ`, `´`, `¨`, …), so a user typing
+their own language could trip it — and with the gate gone, `alt_seen ==
+false` latched the red bar for the rest of the session, worse than the bug
+being fixed (which at least expired after 8s). `ALT_HINT_WINDOW` is back,
+re-keyed to the evidence's own timestamp (`App::alt_swallow_at`) rather
+than to launch — `wants_alt_hint(alt_seen, since_evidence)` — so a false
+positive clears itself in a few seconds instead of a session, fresh
+evidence re-arms the window for a genuinely broken Alt layer, a real Alt
+chord still ends it for the session outright, and a read-first user's late
+first Alt press still raises the bar the moment it lands (the window keys
+off the evidence, never launch, so lateness was never the issue the elapsed
+gate's removal fixed). Wording is unchanged: per terminal from roost's own
+(host) `TERM_PROGRAM`, real menu paths for `Apple_Terminal` and
+`iTerm.app`, terminal-agnostic otherwise (C9 and C11 amended 2026-08-07).
 
 ### U5 · High · FIXED (this branch) — unbound Alt chords are swallowed, not forwarded
 *Fixed with SPEC-parity P13 (one change): `translate()`'s unmatched-Alt arm

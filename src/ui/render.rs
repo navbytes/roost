@@ -3443,6 +3443,27 @@ mod tests {
         assert!(app.show_alt_hint());
         out.push(("alt-trap warning bar", snap(&mut app)));
 
+        // [design-supervisor, SG4, exit UX audit 2026-08-07] No fixture here
+        // ever set a Waiting pane with nothing needing input anywhere, so
+        // the C9 ○ fallback segment (F2) was invisible to the §2 gates
+        // below — its style was pinned only by a unit test, the exact
+        // vacuous-gate pattern PR #61 was meant to close. A shell's Waiting
+        // downgrades to Idle (P2-10) and never pulls the fallback, so this
+        // promotes one pane to a real adapter first.
+        {
+            use crate::core::status::AgentStatus;
+            use crate::ports::PaneBackend;
+            let mut app = three_panes();
+            let id = app.pane_order()[0];
+            app.ws.tabs[0].panes.get_mut(&id).unwrap().adapter = "pi".into();
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+            // Self-verifying: if a future change quietly routes this back to
+            // the ◆ path (or to nothing), this fixture must not go on
+            // silently exercising the wrong state.
+            assert_eq!(app.attention_segment(), Some((1, false)), "fixture must actually hit the ○ fallback");
+            out.push(("hint bar ○ fallback (waiting, nothing needs input)", snap(&mut app)));
+        }
+
         for (name, action) in [
             ("help overlay", Action::Help),
             ("picker", Action::QuickLaunch),

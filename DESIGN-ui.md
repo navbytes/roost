@@ -1072,27 +1072,77 @@ companion C9 amendment), so a copy performed in that window showed no
 confirmation either.
 - **Evidence, corrected.** SPEC-ux U4's originally proposed "Option-accent
   signature", dropped in the 2026-07-27 amendment as "unnecessary", turns out
-  to be exactly what was missing: the character a macOS layout emits for
-  `Option+<letter>` with Option-as-Meta off (`Alt+n` → `˜`, `Alt+w` → `∑`, …)
-  arriving with **no Alt modifier at all** is what actually distinguishes a
-  swallowed chord from ordinary typing — "some key arrived" does not.
-  `App::note_key_seen` now takes the `KeyEvent` itself and only records
-  evidence (`alt_swallow_seen`) when the unmodified key matches
-  `is_alt_swallow_char`'s table (`app.rs`). `note_alt_seen` (a real Alt key
-  getting through, ending the warning for the session) is unchanged.
-- **`ALT_HINT_WINDOW` and the elapsed-time gate are gone**, not widened. They
-  existed only to bound a trigger that fired on ordinary typing; evidence
-  this specific needs no clock to stay accurate. Dropping the gate is also
-  the fix for the read-first user the old window missed entirely: their
-  first (and only) Alt attempt may land well after any fixed window, and the
-  warning must still catch it.
-- Trigger function: `wants_alt_hint(alt_seen, alt_swallow_seen)` — no
-  `elapsed` parameter. Wording (previous amendment) is untouched.
-- Both hard requirements are pinned by `App`-level tests: a healthy terminal
-  typing an ordinary shell prompt never sets `alt_swallow_seen`
-  (`healthy_terminal_typing_a_shell_prompt_never_fires_the_alt_hint`); a
-  read-first user whose first Alt press lands at t=40s still gets the bar
+  to be exactly what was missing: the character the **standard US** macOS
+  keyboard layout emits for `Option+<letter>` with Option-as-Meta off,
+  arriving with **no Alt modifier at all**, is what actually distinguishes a
+  swallowed chord from ordinary typing — "some key arrived" does not. The
+  full set is 26 characters, one per `a..=z` (`Alt+n` → `˜`, `Alt+w` → `∑`,
+  and 24 more — `is_alt_swallow_char`'s `matches!` arm list in `app.rs` is
+  itself the complete definition, nothing abbreviated). Scoped to the US
+  layout only: a non-US layout's own Option+letter table is a different 26
+  characters, and this does not attempt to cover them (see the false
+  positive this creates, next amendment). `App::note_key_seen` now takes the
+  `KeyEvent` itself and only records evidence when the unmodified key
+  matches that table. `note_alt_seen` (a real Alt key getting through,
+  ending the warning for the session) is unchanged.
+- **The elapsed-time gate is re-keyed to the evidence, not dropped** —
+  corrected the same day by the design-audit amendment immediately below
+  (SG1): dropping it outright was wrong. See there for why and for what
+  still holds from the reasoning here (the read-first user's requirement).
+- Trigger function: `wants_alt_hint(alt_seen, since_evidence)` — see SG1
+  below for the current signature; wording (previous amendment) is
+  untouched.
+- Both hard requirements from the original finding are pinned by `App`-level
+  tests: a healthy terminal typing an ordinary shell prompt never sets
+  `alt_swallow_at` (`healthy_terminal_typing_a_shell_prompt_never_fires_the_alt_hint`);
+  a read-first user whose first Alt press lands at t=40s still gets the bar
   (`read_first_user_still_gets_the_hint_however_late_the_first_alt_press_is`).
+
+**[Amended 2026-08-07, design audit SG1 — the evidence is real but not
+unambiguous, so it must not latch]** The amendment above dropped
+`ALT_HINT_WINDOW` on the reasoning that evidence this specific "needs no
+clock to stay accurate". That reasoning was wrong: every character in
+`is_alt_swallow_char`'s table is *also* a directly-typed letter on some
+non-US macOS layout — `ç` (Portuguese, French, Turkish), `å`/`ø` (Nordic),
+`ß` (German), `µ`, `´`, `¨` among them. A user typing their own language can
+produce the identical evidence with Alt never involved, and with no window
+at all, `alt_seen == false` latched the red `attention_problem` bar over the
+hint row **for the rest of the session** — worse than the false positive
+this contract set out to fix, which at least expired after 8s. This is the
+tradeoff being deliberately acknowledged, not a gap that went unnoticed: the
+evidence narrows the *rate* of false positives a great deal (ordinary
+English-language shell use essentially never produces these 26 characters)
+but cannot eliminate them, so the design has to bound their *cost* instead.
+- **`ALT_HINT_WINDOW` returns, keyed to the evidence's own timestamp
+  (`App::alt_swallow_at: Option<Instant>`), not to launch.**
+  `wants_alt_hint(alt_seen, since_evidence: Option<Duration>)` shows the bar
+  only while `since_evidence < ALT_HINT_WINDOW` — a false positive clears
+  itself in a few seconds instead of owning the row for the session. The
+  read-first-user requirement the original elapsed-gate removal was for
+  survives intact: the window starts at the *evidence's* timestamp, still
+  never at launch, so a first Alt attempt at t=40s (or any t) still raises
+  the bar the moment it lands.
+- **Fresh evidence re-arms the window.** Each matching keystroke overwrites
+  `alt_swallow_at` with the current time, so a genuinely broken Alt layer —
+  the user keeps trying Alt chords, keeps producing the evidence — keeps
+  being told, not just once.
+- **A real Alt chord dismisses the warning permanently, for the rest of the
+  session, regardless of any evidence that arrives afterward** — `alt_seen`
+  is checked first in `wants_alt_hint` and never reset. This is what
+  protects a multilingual user who *does* use Alt chords: the first real one
+  ends it for good, the same guarantee the original fix always made.
+- Pinned by
+  `a_non_us_layouts_own_letter_self_clears_instead_of_latching_for_the_session`
+  (the false positive named above, and its bound),
+  `fresh_evidence_re_arms_the_window`, and the unchanged
+  `the_alt_warning_appears_on_swallowed_alt_evidence_and_dies_on_the_first_real_alt`
+  (evidence after `alt_seen` stays suppressed).
+- The "no dead-key composition" assumption `is_alt_swallow_char` relies on
+  (a terminal emits `Option+n` as `˜` immediately, not composed with a
+  following vowel) is believed true of every terminal this project targets
+  but is **not verified by anything in this suite** — it would need a real
+  terminal and a real OS keyboard driver. Said plainly here rather than
+  implied as tested (design audit SG3).
 
 ### C12 — Modal system (shared)
 

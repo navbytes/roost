@@ -23,6 +23,15 @@ use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// F1 (design audit SG1, exit UX audit 2026-08-07): how long the "Alt keys
+/// aren't reaching roost" hint stays up after its most recent evidence
+/// (`App::alt_swallow_at`) — not since launch. `is_alt_swallow_char`'s
+/// evidence is real but not unambiguous (every character in it is also a
+/// directly-typed letter on some non-US macOS layout), so this bounds a
+/// false positive to a few seconds instead of latching for the session; a
+/// user who keeps producing the evidence keeps re-arming the window.
+const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
+
 /// P6: how much of a pane's live OSC 0/2 title is adopted as its display
 /// name. Claude Code publishes `spinner + task` continuously, and a task
 /// line can be a paragraph; every fleet surface that shows a display name
@@ -389,15 +398,26 @@ pub struct App<B: PaneBackend> {
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
     /// they are.
     alt_seen: bool,
-    /// F1 (exit UX audit 2026-08-07): set the first time a key arrives that
-    /// looks like a *swallowed* Alt chord — the character a macOS layout
-    /// emits for `Option+<letter>` with Option-as-Meta off (`˜` for
-    /// Option+n, `∑` for Option+w, …), carrying no Alt modifier at all. Not
-    /// "any key arrives": that was the old (wrong) evidence — true of nearly
-    /// every keystroke, including the shell prompt a healthy user types
-    /// first, so it false-fired on correctly-configured terminals. See
-    /// `is_alt_swallow_char`.
-    alt_swallow_seen: bool,
+    /// F1 (exit UX audit 2026-08-07): when a key last arrived that looks
+    /// like a *swallowed* Alt chord — the character the standard US macOS
+    /// keyboard layout emits for `Option+<letter>` with Option-as-Meta off
+    /// (`˜` for Option+n, `∑` for Option+w, …), carrying no Alt modifier at
+    /// all. Not "any key arrives": that was the old (wrong) evidence — true
+    /// of nearly every keystroke, including the shell prompt a healthy user
+    /// types first. See `is_alt_swallow_char`.
+    ///
+    /// [Amended, design audit SG1, 2026-08-07] Even this narrower evidence
+    /// has a real false-positive: every one of `is_alt_swallow_char`'s
+    /// characters is a directly-typed letter on some non-US macOS layout
+    /// (`ç` on Portuguese/French/Turkish, `å`/`ø` on Nordic, `ß` on German,
+    /// …), so a user typing their own language can trip it with Alt never
+    /// involved. A `bool` latch made that permanent for the rest of the
+    /// session — worse than the bug this fix replaced, which at least
+    /// expired after 8s. Timestamped instead: `show_alt_hint` only reads
+    /// this within `ALT_HINT_WINDOW` of the *most recent* match, so a false
+    /// positive is bounded to a few seconds, not a session, while a user who
+    /// keeps hitting real Alt-swallow evidence keeps re-arming it.
+    alt_swallow_at: Option<Instant>,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
     /// P21: the live scrollback search, if one is running. Outlives the
@@ -579,7 +599,7 @@ impl<B: PaneBackend> App<B> {
             home: dirs::home_dir(),
             started: Instant::now(),
             alt_seen: false,
-            alt_swallow_seen: false,
+            alt_swallow_at: None,
             selection: None,
             search: None,
             recent_cwds: Vec::new(),
@@ -678,18 +698,25 @@ impl<B: PaneBackend> App<B> {
 
     /// F1 (exit UX audit 2026-08-07): record a key event as possible
     /// evidence the Alt layer isn't reaching roost. Only counts when the key
-    /// carries no Alt modifier AND its character is one a macOS layout
-    /// produces for `Option+<letter>` with Option-as-Meta off — "a key
-    /// arrived" is not evidence (nearly all typing satisfies that,
+    /// carries no Alt modifier AND its character is one the standard US
+    /// macOS layout produces for `Option+<letter>` with Option-as-Meta off —
+    /// "a key arrived" is not evidence (nearly all typing satisfies that,
     /// including the shell prompt a healthy user types first); "the
     /// specific character a swallowed Option chord produces" is.
+    ///
+    /// [Amended, design audit SG1, 2026-08-07] Stamps the time rather than
+    /// latching a bool — every fresh match re-arms `ALT_HINT_WINDOW` (see
+    /// `show_alt_hint`), so a user who keeps producing the evidence (a
+    /// genuinely broken Alt layer) keeps being told, while one unlucky
+    /// keystroke (a non-US layout's own letter, see `alt_swallow_at`) only
+    /// costs a few seconds, not the session.
     pub fn note_key_seen(&mut self, key: crossterm::event::KeyEvent) {
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
             return;
         }
         if let crossterm::event::KeyCode::Char(c) = key.code {
             if is_alt_swallow_char(c) {
-                self.alt_swallow_seen = true;
+                self.alt_swallow_at = Some(Instant::now());
             }
         }
     }
@@ -701,12 +728,20 @@ impl<B: PaneBackend> App<B> {
     /// nothing and there is no other signal saying why. Gating this on
     /// `TERM_PROGRAM == "Apple_Terminal"` only meant the README's own
     /// recommended terminal (iTerm2) never warned; the trigger is the
-    /// evidence itself, on any terminal (see `wants_alt_hint`). No elapsed
-    /// gate (F1, 2026-08-07): a read-first user's only Alt attempt may land
-    /// well after any fixed window, and evidence this specific doesn't need
-    /// one to stay accurate.
+    /// evidence itself, on any terminal (see `wants_alt_hint`).
+    ///
+    /// [Amended, design audit SG1, 2026-08-07] The evidence is real but not
+    /// unambiguous — deliberately, and not merely unnoticed (see
+    /// `alt_swallow_at`'s doc): every `is_alt_swallow_char` match is also a
+    /// directly-typed letter on some non-US macOS layout, so this *can*
+    /// false-fire on ordinary typing in those languages. What bounds the
+    /// cost is `ALT_HINT_WINDOW`, checked against the *most recent* match,
+    /// not against launch — a false positive clears itself within the
+    /// window instead of owning the hint row for the rest of the session,
+    /// and a real Alt chord (`alt_seen`) dismisses it outright, for good,
+    /// regardless of any evidence that arrives after.
     pub fn show_alt_hint(&self) -> bool {
-        wants_alt_hint(self.alt_seen, self.alt_swallow_seen)
+        wants_alt_hint(self.alt_seen, self.alt_swallow_at.map(|t| t.elapsed()))
     }
 
     /// C11/U4: the warning's text, with the real menu path for terminals
@@ -5681,21 +5716,41 @@ fn edge_pane(rects: &[PaneRect], rightmost: bool) -> Option<PaneId> {
 /// was the *evidence*: "keys are arriving and not one of them has carried
 /// Alt" is true of nearly all typing, so it fired on a healthy terminal the
 /// moment the user typed a shell prompt. The real signature of a swallowed
-/// Option chord is narrower — `alt_swallow_seen` (see
-/// `App::note_key_seen`/`is_alt_swallow_char`) — and specific enough that it
-/// needs no startup window: it stays accurate whenever it fires, so it's
-/// checked with no elapsed-time gate. One Alt key ever ends it.
-fn wants_alt_hint(alt_seen: bool, alt_swallow_seen: bool) -> bool {
-    !alt_seen && alt_swallow_seen
+/// Option chord is narrower — `is_alt_swallow_char` — but, per the design
+/// audit (SG1), still not unambiguous: every character in that set is also
+/// a directly-typed letter on some non-US macOS layout. `since_evidence` is
+/// time elapsed since the *most recent* match (`App::alt_swallow_at`), not
+/// since launch — checked against `ALT_HINT_WINDOW` so a false positive
+/// clears itself in a few seconds rather than latching for the session,
+/// while fresh evidence keeps re-arming the window for a genuinely broken
+/// Alt layer. One real Alt key ever ends it outright, for the rest of the
+/// session, regardless of any evidence timestamp.
+fn wants_alt_hint(alt_seen: bool, since_evidence: Option<Duration>) -> bool {
+    !alt_seen && since_evidence.is_some_and(|d| d < ALT_HINT_WINDOW)
 }
 
-/// F1 (exit UX audit 2026-08-07): the characters a standard macOS (US)
-/// keyboard layout emits for `Option+<letter>` when Option isn't configured
-/// as Meta — terminals apply the OS layout without dead-key composition, so
-/// e.g. `Option+n` arrives immediately as `˜`, not held for a following
-/// vowel. One of these arriving with no Alt modifier at all is direct
-/// evidence that *some* Alt chord was just swallowed, unlike "a key
-/// arrived" (true of nearly every keystroke).
+/// F1 (exit UX audit 2026-08-07): the complete set of characters the
+/// standard **US** macOS keyboard layout emits for `Option+<letter>`,
+/// `letter` in `a..=z`, when Option isn't configured as Meta — one entry
+/// per letter, 26 total (this `matches!` arm list *is* the definition; nothing
+/// is abbreviated or approximated here). One of these arriving with no Alt
+/// modifier at all is evidence that *some* Alt chord was just swallowed,
+/// unlike "a key arrived" (true of nearly every keystroke) — see the design
+/// audit's SG1 for the false-positive this still carries on non-US layouts,
+/// and `wants_alt_hint` for how that's bounded.
+///
+/// Scoped to the US layout only (SG2): a non-US layout's own Option+letter
+/// table is a different 26 characters (mostly overlapping, not identical),
+/// and this does not attempt to cover them.
+///
+/// Assumes terminals apply the OS keyboard layout without dead-key
+/// composition — i.e. `Option+n` arrives immediately as `˜` rather than
+/// held pending a following vowel. That assumption is believed true of
+/// Terminal.app/iTerm2/Ghostty/kitty (none composes dead keys itself; a
+/// pty is not the `NSTextInputClient` a composing app would need) but is
+/// **not verified by anything in this suite** (SG3) — it would need a real
+/// terminal emulator and a real OS keyboard driver, neither of which a unit
+/// or integration test here drives.
 fn is_alt_swallow_char(c: char) -> bool {
     matches!(
         c,
@@ -9611,18 +9666,24 @@ mod tests {
     }
 
     #[test]
-    fn alt_hint_gates_on_swallowed_alt_evidence_not_elapsed_time() {
-        // F1 (exit UX audit 2026-08-07): evidence, not "a key arrived" — and
-        // no elapsed-time gate at all, since the evidence is specific enough
-        // not to need one (see the two App-level tests below for what that
-        // buys: a healthy terminal never fires, a read-first user always
-        // still gets it, however late their first Alt press is).
-        assert!(wants_alt_hint(false, true));
-        // One Alt key ever ends it, and it never fires with no evidence: an
-        // untouched roost — or one that's only seen ordinary keys — has
-        // nothing to warn about.
-        assert!(!wants_alt_hint(true, true));
-        assert!(!wants_alt_hint(false, false));
+    fn alt_hint_gates_on_evidence_within_the_window_since_it_arrived() {
+        // F1 (exit UX audit 2026-08-07): evidence, not "a key arrived".
+        //
+        // [Amended, design audit SG1] The window is back, but keyed to the
+        // evidence's own timestamp, not launch: is_alt_swallow_char's
+        // evidence is real but not unambiguous (every character is also a
+        // directly-typed letter on some non-US layout — see its own doc),
+        // so it must not latch for the whole session. Bounded to
+        // ALT_HINT_WINDOW since the *most recent* match instead.
+        assert!(wants_alt_hint(false, Some(Duration::from_secs(1))));
+        assert!(wants_alt_hint(false, Some(ALT_HINT_WINDOW - Duration::from_millis(1))));
+        assert!(!wants_alt_hint(false, Some(ALT_HINT_WINDOW)), "at the boundary, already expired");
+        assert!(!wants_alt_hint(false, Some(ALT_HINT_WINDOW + Duration::from_secs(60))), "long expired");
+        // One Alt key ever ends it, and it never fires with no evidence at
+        // all: an untouched roost — or one that's only seen ordinary keys —
+        // has nothing to warn about.
+        assert!(!wants_alt_hint(true, Some(Duration::from_secs(1))));
+        assert!(!wants_alt_hint(false, None));
     }
 
     #[test]
@@ -9691,8 +9752,9 @@ mod tests {
     /// F1 hard requirement 2 (exit UX audit 2026-08-07): a read-first user
     /// who studies the screen for 40s before ever touching Alt must still
     /// get the warning the moment their first (swallowed) Alt press arrives
-    /// — well past the old 8s startup window, which is why that gate is
-    /// gone rather than merely widened.
+    /// — the window (`ALT_HINT_WINDOW`, design audit SG1) is keyed to that
+    /// press's own timestamp, not to launch, so `started` plays no part in
+    /// this decision at all, however long it's been.
     #[test]
     fn read_first_user_still_gets_the_hint_however_late_the_first_alt_press_is() {
         let (mut app, _) = mk_app(shell_ws());
@@ -9700,6 +9762,34 @@ mod tests {
         assert!(!app.show_alt_hint(), "no evidence yet, however long it's been");
         app.note_key_seen(key('˜')); // their first Alt press: Option+n, swallowed
         assert!(app.show_alt_hint());
+    }
+
+    /// Design audit SG1's own repro: every `is_alt_swallow_char` character
+    /// is also a directly-typed letter on some non-US macOS layout (`ç` on
+    /// Portuguese/French/Turkish, among others) — a user typing their own
+    /// language must not get a bar that owns the hint row for the rest of
+    /// the session. It still fires (that's the acknowledged tradeoff,
+    /// `is_alt_swallow_char`'s own doc), but it must self-clear.
+    #[test]
+    fn a_non_us_layouts_own_letter_self_clears_instead_of_latching_for_the_session() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.note_key_seen(key('ç')); // e.g. Portuguese "ação", typed directly, no Alt involved
+        assert!(app.show_alt_hint(), "the char alone still reads as evidence — the known tradeoff");
+        app.alt_swallow_at = app.alt_swallow_at.map(|t| t - ALT_HINT_WINDOW);
+        assert!(!app.show_alt_hint(), "must self-clear, not own the row for the rest of the session");
+    }
+
+    /// The other half of SG1's fix: a still-broken Alt layer must keep being
+    /// reported, not just once. Each fresh match resets the window rather
+    /// than merely extending the first one's original deadline.
+    #[test]
+    fn fresh_evidence_re_arms_the_window() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.note_key_seen(key('˜'));
+        app.alt_swallow_at = app.alt_swallow_at.map(|t| t - ALT_HINT_WINDOW);
+        assert!(!app.show_alt_hint(), "sanity: the first match alone has expired");
+        app.note_key_seen(key('∑')); // tried Alt again — still broken
+        assert!(app.show_alt_hint(), "a fresh match re-arms the window");
     }
 
     #[test]
