@@ -148,6 +148,35 @@ fn parse_line(line: &str) -> Option<AppEvent> {
     }
 }
 
+/// Connection accounting shared by the listener's accept loop and every
+/// per-connection thread it spawns. Split out (rather than a bare
+/// `AtomicUsize`) because §5.6/M3 (see DESIGN-control.md) grows this into
+/// per-principal accounting next; for now it's just the global cap, made
+/// race-free.
+struct Limits {
+    global: AtomicUsize,
+}
+
+impl Limits {
+    fn new() -> Self {
+        Limits { global: AtomicUsize::new(0) }
+    }
+
+    /// Atomically check-and-increment the global connection cap in one step.
+    /// Was load-then-add (audit Info (a)): two threads could both observe
+    /// `< MAX_CONN` and both add, landing a few over. `fetch_update` makes
+    /// the check and the increment one atomic step — no window between them.
+    fn try_reserve_global(&self) -> bool {
+        self.global
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c < MAX_CONN).then_some(c + 1))
+            .is_ok()
+    }
+
+    fn release_global(&self) {
+        self.global.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Bind the socket and pump parsed events into the main loop. Returns the
 /// bound path (exported to panes as ROOST_SOCK).
 pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
@@ -169,13 +198,23 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
     // poison session ids / spoof status.
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
 
-    let conns = Arc::new(AtomicUsize::new(0));
+    spawn_accept_loop(listener, tx);
+    Ok(path)
+}
+
+/// The accept loop, split out from `spawn_listener` so tests can drive it
+/// against a scratch `UnixListener` bound at a throwaway path instead of the
+/// real one (which is only reachable via the process-global `ROOST_STATE`/
+/// `XDG_RUNTIME_DIR` env vars — racy to poke from tests that run in
+/// parallel in the same process).
+fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
+    let limits = Arc::new(Limits::new());
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             // Shed load past the connection cap rather than spawning threads
             // without bound.
-            if conns.load(Ordering::Relaxed) >= MAX_CONN {
+            if !limits.try_reserve_global() {
                 drop(stream);
                 // A wedged control plane (all 64 slots stuck) used to be
                 // silent right here too — log the shed so it's diagnosable
@@ -183,8 +222,7 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
                 log_debug("shed a connection: MAX_CONN (64) already open");
                 continue;
             }
-            conns.fetch_add(1, Ordering::Relaxed);
-            let conns = conns.clone();
+            let limits = limits.clone();
             let tx = tx.clone();
             std::thread::spawn(move || {
                 // No connection may hold its slot forever (see `READ_TIMEOUT`).
@@ -244,11 +282,10 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
                         None => log_dropped(line),
                     }
                 }
-                conns.fetch_sub(1, Ordering::Relaxed);
+                limits.release_global();
             });
         }
     });
-    Ok(path)
 }
 
 /// Append `line` to `<state>/roost.log` when ROOST_DEBUG is set. No-op
@@ -352,5 +389,25 @@ mod tests {
         assert!(matches!(req.method, crate::core::control::Method::List));
         assert!(parse_control("not json").is_none());
         assert!(parse_control(r#"{"pane":"1","event":"status","status":"working"}"#).is_none());
+    }
+
+    #[test]
+    fn global_connection_cap_reservation_is_race_free() {
+        // Info (a): the old load-then-add could let two threads both pass
+        // the check before either incremented. Hammer the same `Limits` from
+        // far more threads than MAX_CONN, concurrently, and require the
+        // count of successful reservations to land exactly on MAX_CONN —
+        // never more (a race letting extra through) and never fewer (a bug
+        // serializing when it shouldn't).
+        let limits = Arc::new(Limits::new());
+        let handles: Vec<_> = (0..MAX_CONN * 4)
+            .map(|_| {
+                let limits = limits.clone();
+                std::thread::spawn(move || limits.try_reserve_global())
+            })
+            .collect();
+        let successes = handles.into_iter().map(|h| h.join().unwrap()).filter(|&ok| ok).count();
+        assert_eq!(successes, MAX_CONN, "exactly MAX_CONN reservations should win under contention");
+        assert_eq!(limits.global.load(Ordering::Relaxed), MAX_CONN, "counter must not exceed MAX_CONN");
     }
 }
