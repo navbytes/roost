@@ -23,10 +23,10 @@
 //!   never carry text (`render.rs`'s `structure_colour_never_carries_text`).
 //! * **Attention surfaces use `Modifier::REVERSED`, never a colour fill** —
 //!   reversing the terminal's own fg/bg is guaranteed contrasty everywhere.
-//! * **The one red is the user's red**: ANSI 1, with ANSI 9 for the bright
-//!   half of the pulse. The pulse must never lean on DIM: a terminal that
-//!   ignores DIM would kill the animation outright, so the two phases are two
-//!   guaranteed-visible reds.
+//! * **The one red is the user's red**: ANSI 1, unmodulated. Animation lives
+//!   in the *glyph* now, not the colour — the Working spinner (C5) swaps
+//!   braille frames on a shared clock, so `accent()` never needs a second red
+//!   to survive a terminal that ignores DIM the way the old colour-pulse did.
 //!
 //! Consequence, intended: the old `MUTED`/`DIM` pair collapses into one quiet
 //! rung. Text gets two levels (`ink`, `quiet`); structure gets its own slot.
@@ -64,8 +64,7 @@ pub fn rule() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-/// The one red (ANSI 1): focus, needs-input, key hints, the working pulse's
-/// quiet half.
+/// The one red (ANSI 1): focus, needs-input, key hints, the working spinner.
 pub fn accent() -> Style {
     Style::default().fg(Color::Red)
 }
@@ -74,13 +73,6 @@ pub fn accent() -> Style {
 /// tokens.
 pub fn accent_quiet() -> Style {
     Style::default().fg(Color::Red).add_modifier(Modifier::DIM)
-}
-
-/// The working pulse's bright half (ANSI 9). Deliberately a *second red*
-/// rather than `accent()` plus a modifier: a terminal that ignores DIM would
-/// otherwise flatten the pulse into a steady dot.
-pub fn pulse_bright() -> Style {
-    Style::default().fg(Color::LightRed)
 }
 
 /// A neutral attention surface (the transient flash): reverse the terminal's
@@ -118,7 +110,19 @@ pub fn active_tab_label() -> Style {
 // ---- Chrome glyphs (§2 glyph inventory; all single-width) ----
 
 // Status glyphs (C5 table).
-pub const GLYPH_WORKING: char = '●'; // U+25CF
+//
+// Working is animated (C5): `SPINNER_FRAMES` verbatim from pi-tui's
+// `loader.js` `DEFAULT_FRAMES` (pi 0.81.1) — so a pi pane's own badge agrees
+// with what pi draws inside the pane. Terminals without braille glyphs
+// render tofu; accepted deliberately — pi itself (the flagship adapter)
+// already requires braille support, and per-terminal fallback detection
+// isn't knowable from inside a PTY.
+pub const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// The Working glyph's steady frame — shown wherever animation is
+/// suppressed (a scrolled pane's frozen corner badge, N1) or not wanted (the
+/// roster's status-filter tag). Always `SPINNER_FRAMES[0]`, the one frame
+/// with no time dependency.
+pub const GLYPH_WORKING: char = SPINNER_FRAMES[0];
 pub const GLYPH_NEEDS_INPUT: char = '◆'; // U+25C6
 pub const GLYPH_WAITING: char = '○'; // U+25CB
 pub const GLYPH_IDLE: char = '·'; // U+00B7
@@ -143,10 +147,12 @@ pub const TAB_OVERFLOW: char = '…'; // U+2026
 /// hint's `↑N/M` position whenever a pane's view is frozen in history.
 pub const SCROLLED: char = '↑'; // U+2191
 
-/// `AgentStatus` → (glyph, style, pulses) — C5's table verbatim. `pulses` is
+/// `AgentStatus` → (glyph, style, spins) — C5's table verbatim. `spins` is
 /// true only for `Working`; every other state is steady (in particular,
-/// `NeedsInput` never pulses — steady red means "waiting on you", pulsing red
-/// means "alive").
+/// `NeedsInput` never spins — steady red means "waiting on you", an
+/// animating glyph means "alive"). The `char` returned is the steady frame
+/// (`GLYPH_WORKING`); a caller that finds `spins` true substitutes
+/// `spinner_frame(elapsed)` for it instead — `style` never varies with time.
 pub fn status_style(status: AgentStatus) -> (char, Style, bool) {
     match status {
         AgentStatus::Working => (GLYPH_WORKING, accent(), true),
@@ -172,17 +178,22 @@ pub fn tab_summary_style(summary: TabSummary) -> (char, Style) {
     }
 }
 
-/// Pulse phase for the `Working` glyph (C5): period 1100ms, 50% duty —
-/// `[0, 550)` → `pulse_bright()` (ANSI 9), `[550, 1100)` → `accent()`
-/// (ANSI 1), repeating. `elapsed` is time since app start: one shared clock
-/// so every pulsing glyph flips in unison (no per-glyph timers, no extra
-/// redraw scheduling — re-evaluated each draw tick).
-pub fn pulse_phase(elapsed: Duration) -> Style {
-    if elapsed.as_millis() % 1100 < 550 {
-        pulse_bright()
-    } else {
-        accent()
-    }
+/// One spinner frame's on-screen time (C5). pi's own loader runs this
+/// nominal (80ms/frame, 800ms full rotation); roost's render loop redraws
+/// roughly every 33ms even with nothing to read (`main.rs`'s crossterm poll
+/// timeout is the effective tick), which is finer than 80ms, so the frame
+/// length is used as-is rather than quantized up to match a coarser tick.
+const SPINNER_FRAME_MS: u128 = 80;
+
+/// `elapsed` (the shared clock — `App::elapsed`, time since app start) → the
+/// `SPINNER_FRAMES` index on screen right now, wrapping every 800ms (10
+/// frames × `SPINNER_FRAME_MS`). One shared clock so every Working glyph
+/// advances in unison (no per-glyph timers, no extra redraw scheduling —
+/// re-evaluated once per frame, C5/D3) — the same rationale the old colour
+/// pulse used.
+pub fn spinner_frame(elapsed: Duration) -> char {
+    let i = (elapsed.as_millis() / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[i]
 }
 
 #[cfg(test)]
@@ -247,13 +258,12 @@ mod tests {
     /// sentinel. Attention surfaces reverse instead (`attention`).
     #[test]
     fn no_chrome_token_pairs_two_theme_variant_colours() {
-        let tokens: [(&str, Style); 8] = [
+        let tokens: [(&str, Style); 7] = [
             ("ink", ink()),
             ("quiet", quiet()),
             ("rule", rule()),
             ("accent", accent()),
             ("accent_quiet", accent_quiet()),
-            ("pulse_bright", pulse_bright()),
             ("attention", attention()),
             ("active_tab_label", active_tab_label()),
         ];
@@ -308,24 +318,27 @@ mod tests {
         assert!(!ink().add_modifier.contains(Modifier::DIM));
     }
 
-    /// The pulse leans on two real reds, never on DIM: a terminal that
-    /// ignores the modifier must still see the dot flip.
+    /// (a) Working never shows the retired dot — every frame is a member of
+    /// pi's braille set.
     #[test]
-    fn pulse_phases_are_two_visible_reds_not_a_modifier() {
-        let a = pulse_phase(Duration::from_millis(0));
-        let b = pulse_phase(Duration::from_millis(600));
-        assert_ne!(a.fg, b.fg, "the phases must differ by colour, not by attribute");
-        assert!(!a.add_modifier.contains(Modifier::DIM));
-        assert!(!b.add_modifier.contains(Modifier::DIM));
+    fn working_status_glyph_is_a_braille_spinner_frame_never_the_old_dot() {
+        let (glyph, ..) = status_style(AgentStatus::Working);
+        assert!(SPINNER_FRAMES.contains(&glyph), "{glyph:?} must be a spinner frame");
+        assert_ne!(glyph, '●');
+        let (tab_glyph, _) = tab_summary_style(TabSummary::Working);
+        assert!(SPINNER_FRAMES.contains(&tab_glyph));
+        assert_ne!(tab_glyph, '●');
     }
 
+    /// (b) the frame index advances with elapsed and wraps at 10 (one full
+    /// rotation, `SPINNER_FRAME_MS * SPINNER_FRAMES.len()` = 800ms).
     #[test]
-    fn pulse_phase_boundaries() {
-        assert_eq!(pulse_phase(Duration::from_millis(0)), pulse_bright());
-        assert_eq!(pulse_phase(Duration::from_millis(549)), pulse_bright());
-        assert_eq!(pulse_phase(Duration::from_millis(550)), accent());
-        assert_eq!(pulse_phase(Duration::from_millis(1099)), accent());
-        assert_eq!(pulse_phase(Duration::from_millis(1100)), pulse_bright()); // wraps
+    fn spinner_frame_advances_and_wraps_at_ten() {
+        assert_eq!(spinner_frame(Duration::from_millis(0)), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(Duration::from_millis(79)), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(Duration::from_millis(80)), SPINNER_FRAMES[1]);
+        assert_eq!(spinner_frame(Duration::from_millis(795)), SPINNER_FRAMES[9]);
+        assert_eq!(spinner_frame(Duration::from_millis(800)), SPINNER_FRAMES[0]); // wraps
     }
 
     #[test]
@@ -338,9 +351,9 @@ mod tests {
     }
 
     #[test]
-    fn only_working_pulses() {
+    fn only_working_spins() {
         for s in [AgentStatus::NeedsInput, AgentStatus::Waiting, AgentStatus::Idle, AgentStatus::Exited] {
-            assert!(!status_style(s).2, "{s:?} must not pulse");
+            assert!(!status_style(s).2, "{s:?} must not animate");
         }
     }
 
@@ -357,12 +370,12 @@ mod tests {
     /// U13: the tab-bar Exited variant is the same glyph *and* the same quiet
     /// red as the per-pane `AgentStatus::Exited` — C5 is one table, so a
     /// tab of corpses can't read differently from a pane corpse. And it
-    /// stays steady: only Working ever pulses.
+    /// stays steady: only Working ever animates.
     #[test]
-    fn tab_exited_matches_the_pane_exited_row_and_never_pulses() {
-        let (pane_glyph, pane_style, pulses) = status_style(AgentStatus::Exited);
+    fn tab_exited_matches_the_pane_exited_row_and_never_spins() {
+        let (pane_glyph, pane_style, spins) = status_style(AgentStatus::Exited);
         assert_eq!(tab_summary_style(TabSummary::Exited), (pane_glyph, pane_style));
-        assert!(!pulses);
+        assert!(!spins);
     }
 
     /// Every summary but Quiet draws a real glyph — Quiet's blank is the

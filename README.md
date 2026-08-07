@@ -298,7 +298,7 @@ Tab bar, corner badges, and collapsed stack rows all show the same states:
 
 | Glyph | Meaning |
 |---|---|
-| `●` | working — pulses |
+| `⠋⠙⠹…` | working — spins (pi's own loader frames; animation always means busy, never "look at me") |
 | `◆` | needs input |
 | `○` | waiting for you |
 | `·` | idle |
@@ -311,7 +311,7 @@ notification on macOS).
 
 A tab's glyph summarizes its panes (worst first), and carries a **count**
 when more than one pane is in that state — `◆3` is three agents waiting on
-you in that tab, `●2` two working. Ten or more shows `+`. The count cell is
+you in that tab, `⠋2` two working. Ten or more shows `+`. The count cell is
 always reserved (blank below two), so tab widths never shift as statuses
 change. For the names behind the number, `Alt+Shift+a` lists every pane.
 

@@ -86,8 +86,10 @@ Everything roost draws itself (tab bar, borders, badges, stack chrome, hint
 bar, modals) is built from the terminal's own palette — one accent hue plus
 the ink the user's shell prompt already uses. Everything a program draws
 inside a pane passes through the vt100 blit byte-faithfully and keeps its own
-palette. Red is never decoration: it means either *focus* or *roost wants your
-attention* (live keys, needs-input, working pulse, failure).
+palette. Red is never decoration: it means *focus*, *roost wants your
+attention* (live keys, needs-input, failure), or *the agent is alive and busy*
+(Working — animated; steady red everywhere else means attention, C5 amended
+2026-08-07).
 
 **[Amended 2026-07-27 — the thesis line used to read "ink · paper · one red"
 with fixed hues.]** See §2.
@@ -106,17 +108,20 @@ SPEC-GAP-4. The stance is now reversed, and the tokens are styles rather than
 colours. Names below are the accessors in `src/ui/theme.rs`; the old
 `SCREAMING_CASE` names are gone. Rename map for reading older text in this
 document: `FG`→`ink`, `MUTED`/`DIM`→`quiet` (they collapse), `RULE`→`rule`,
-`ACCENT`→`accent`, `ACCENT_DIM`→`accent_quiet`, pulse phase A→`pulse_bright`,
-pulse phase B→`accent`; `BG`, `TAB_STRIP` and `BAR` are **deleted**.
+`ACCENT`→`accent`, `ACCENT_DIM`→`accent_quiet`; `BG`, `TAB_STRIP` and `BAR`
+are **deleted**. **[Amended 2026-08-07, C5]** `pulse phase A`/`pulse phase B`
+are retired concepts, not renamed ones — `pulse_bright()` no longer exists,
+and the two-phase idea it named has no successor (animation is a ten-frame
+glyph cycle now, not a two-value colour flip). Older text using either term
+should be read against C5's spinner amendment, not looked up as an accessor.
 
 | Token | ratatui expression | Where used in chrome |
 |---|---|---|
 | `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text |
 | `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…` |
 | `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders, tab separators `│`. Never text (see the legibility principle). |
-| `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, ● working (pulse phase B), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
+| `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, the Working spinner (C5, amended 2026-08-07 — one steady red, no second phase), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
 | `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, `raw` badge token (C23), `↑N` badge token (U3) |
-| `pulse_bright()` | `Color::LightRed` (ANSI 9) | ● working, pulse phase A — and nothing else |
 | `attention()` | `Modifier::REVERSED`, no colour | the **neutral** attention surface: the transient flash (C10) |
 | `attention_problem()` | `Color::Red` + `Modifier::REVERSED` | the **problem** bars: alt-warning (C11), dead-pane action bar (C16) |
 | `ACTIVE_TAB_BG` | `Color::Reset` | the only `bg` chrome sets anywhere, and it sets it to *nothing* (C2) |
@@ -146,10 +151,12 @@ allowed **only where degradation is graceful**:
   theme makes it faint you lose a hairline, not a word.
 - **Attention surfaces use `Modifier::REVERSED`, never a colour fill.**
   Reversing the terminal's own fg/bg is guaranteed contrasty in any theme.
-- **The one red is the user's red**: ANSI 1, with ANSI 9 for the bright half
-  of the pulse. The pulse may **not** lean on DIM — a terminal that ignores
-  the modifier would kill the animation outright — so its two phases are two
-  guaranteed-visible reds (C5).
+- **The one red is the user's red**: ANSI 1, unmodulated. **[Amended
+  2026-08-07, C5]** Animation used to live in the colour (a second red,
+  ANSI 9, so a terminal ignoring `DIM` couldn't flatten the pulse into a
+  steady dot) — it now lives in the *glyph*: the Working status swaps
+  braille spinner frames on a shared clock instead, so `accent()` is spent
+  once, never modulated, and needs no second red to stay visible.
 
 ### Theme-inherited stance
 
@@ -212,12 +219,20 @@ Program output keeps whatever attributes it sent.
 
 ### Glyph inventory (chrome)
 
-`●` U+25CF · `◆` U+25C6 · `○` U+25CB · `·` U+00B7 · `✕` U+2715 · `▎` U+258E
-(active-tab / focused-row marker) · `▌` U+258C (expanded-stack edge) · `│`
-U+2502 (tab separator) · `▏` U+258F (rename cursor, existing) · `❯` U+276F
-(picker selection) · `✓` U+2713 (saved) · `…` U+2026 (tab overflow). All are
-single-width. The double-width `🪶` is removed with the brand block (C2),
-eliminating the wide-glyph offset hazard in mouse math.
+**[Amended 2026-08-07, C5 — the Working dot retires]** the Working spinner
+(`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, the Braille Patterns block U+2800, `theme::SPINNER_FRAMES` —
+pi-tui's own default loader frames, verbatim) · `◆` U+25C6 · `○` U+25CB · `·`
+U+00B7 · `✕` U+2715 · `▎` U+258E (active-tab / focused-row marker) · `▌`
+U+258C (expanded-stack edge) · `│` U+2502 (tab separator) · `▏` U+258F
+(rename cursor, existing) · `❯` U+276F (picker selection) · `✓` U+2713
+(saved) · `…` U+2026 (tab overflow). All are single-width — including every
+spinner frame, so the swap costs no badge-column or tab-strip width anywhere.
+The double-width `🪶` is removed with the brand block (C2), eliminating the
+wide-glyph offset hazard in mouse math.
+
+Terminals without braille glyph support render the spinner frames as tofu;
+accepted deliberately (see C5) rather than adding per-terminal fallback
+detection, which is not knowable from inside a PTY.
 
 **[Amended 2026-07-22, fleet features]: the fleet features add NO new
 glyphs.** The feed (C20) reuses `◆` with its C5 meaning; zoom/raw are word
@@ -254,8 +269,8 @@ is ALIGNED iff all its bullets hold in the rendered output / code.
 
 **Target:**
 - `src/ui/theme.rs` exists, exporting: the chrome style tokens from the §2
-  table; the status-glyph mapping (C5); the pulse phase function (C5); and the
-  chrome glyph consts listed above.
+  table; the status-glyph mapping (C5); the spinner frame function (C5); and
+  the chrome glyph consts listed above.
 - `grep -n 'Color::' src/ui/render.rs` matches only inside the vt100 blit
   section (`conv_color` / `cell_style`) — all chrome styles are built from
   `theme::` items.
@@ -263,12 +278,16 @@ is ALIGNED iff all its bullets hold in the rendered output / code.
 
 **[Amended 2026-07-27, theme inheritance]** The token table is now styles, not
 colours, so the exports are **accessor fns** (`ink`, `quiet`, `rule`,
-`accent`, `accent_quiet`, `pulse_bright`, `attention`) plus the
-`ACTIVE_TAB_BG` sentinel const — a token carries a modifier as well as a
-colour and `Style`'s builders are not `const fn`. theme.rs remains the single
-source of chrome styling, which is what this contract has always been about;
-the "tokens only from theme.rs" gate is unchanged in force. Three new
-mechanical gates ride with it, and their failure is a C1 DEVIATED:
+`accent`, `accent_quiet`, `attention`) plus the `ACTIVE_TAB_BG` sentinel const
+— a token carries a modifier as well as a colour and `Style`'s builders are
+not `const fn`. **[Amended 2026-08-07, C5]** `pulse_bright` is retired along
+with the colour pulse it existed for — the accessor list above already
+reflects its removal — and `theme::spinner_frame(elapsed) -> char` joins the
+exports beside `status_style`/`tab_summary_style` as the Working glyph's frame
+selector. theme.rs remains the single source of chrome styling, which is what
+this contract has always been about; the "tokens only from theme.rs" gate is
+unchanged in force. Three new mechanical gates ride with the 2026-07-27
+amendment, and their failure is a C1 DEVIATED:
 - `theme::tests::no_truecolor_or_indexed_colour_is_constructed_in_src` —
   chrome inherits or it doesn't ship (§2 stance), with the marked
   program-output exemption in `conv_color`/`cell_style`.
@@ -301,8 +320,9 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
   - label + number: fg `FG` for active, fg `MUTED` for inactive; active cell
     bg = `Color::Reset`, inactive bg = `TAB_STRIP`. No BOLD.
   - glyph (aggregate `TabSummary`, semantics unchanged from `app.rs:448–476`):
-    NeedsInput `◆` `ACCENT` · Working `●` `ACCENT` + pulse (C5) · Unknown `·`
-    `DIM` · Waiting `○` `FG` · Quiet = single space.
+    NeedsInput `◆` `ACCENT` · Working the C5 spinner frame `ACCENT` (amended
+    2026-08-07 — animates, no longer a pulsed colour) · Unknown `·` `DIM` ·
+    Waiting `○` `FG` · Quiet = single space.
   - separator `│` fg `RULE`, drawn after every tab (including the last), with
     a trailing gutter space on `TAB_STRIP` after it.
   - **[Amended 2026-07-23, herdr-inspired tab breathing room]** The trailing
@@ -436,10 +456,13 @@ C27 closes from the other side (the tribunal's provenance is recorded there).
   `App::tab_summary` returns it alongside the summary — one call, so the
   ranking (U13's, verbatim) and the number can never disagree about which
   state won. It is never a pane total: the glyph says what the tab is
-  reporting and the count says how much of it there is. `◆3`, `●2`, `✕2`.
-- **Style.** The count carries the **glyph's own style**, pulse included, so
-  `●3` flips as one token rather than as a dot with a number attached — the
-  count is part of the signal, not a remark about it.
+  reporting and the count says how much of it there is. `◆3`, `⠹2`, `✕2`.
+- **Style.** The count carries the **glyph's own style**. **[Amended
+  2026-08-07, C5]** the style itself no longer flips — the *glyph* does (the
+  Working spinner) — so the count still rides in lockstep with it: `⠋3`→`⠙3`→…
+  reads as one animating token rather than a static digit stuck to a spinning
+  dot, the same "count is part of the signal" guarantee the pulse used to
+  carry.
 - **Geometry rule — stability over saving a column.** The cell is **always
   reserved**: a space below 2, the digit for `2`–`9`, `+` for 10 or more —
   always exactly one column (`render::tab_count_cell`). Tab widths therefore
@@ -592,7 +615,9 @@ with tests `:530–555`.
   (throttled to at most one update per 200 ms), and reset to a plain `roost`
   on exit and in the panic hook — roost's chrome and the outer tab now agree
   on what a pane is called.
-- Style: text fg `MUTED`; glyph fg per C5 status colors, pulsing when Working.
+- Style: text fg `MUTED`; glyph fg per C5 status colors. **[Amended
+  2026-08-07]** Working no longer pulses the colour — the glyph itself
+  animates (the C5 spinner) while its colour stays the steady one red.
 - Geometry: top row of the pane's inner area, right-aligned, one column of
   right breathing room — `corner_badge()` clipping behavior and its tests
   stay (helper may evolve to return spans for the two-tone styling).
@@ -604,31 +629,35 @@ with tests `:530–555`.
   `raw` when both): `"{id} {name} · ↑N {glyph}"`, raw
   `"{id} {name} · raw · ↑N {glyph}"`. N is the *view's* offset read back from
   the grid (`PaneBackend::scroll_offset`), never a caller's unclamped
-  counter. While the token shows, the Working glyph's C5 pulse is suppressed
-  (steady base color): pulsing red means "alive right now", which a frozen
-  view must not assert (N1) — the glyph itself keeps reporting the true
-  status, and any path that resets the offset removes the token and resumes
-  the pulse. Collapsed rows and the tab bar keep pulsing — they show no
-  grid, so there is no frozen view to lie about.
+  counter. While the token shows, the Working glyph's C5 animation is
+  suppressed (frozen at its steady frame, amended 2026-08-07 — was "steady
+  base color" under the retired colour pulse): an animating glyph asserts
+  "alive right now", which a frozen view must not do (N1) — the glyph itself
+  keeps reporting the true status, and any path that resets the offset
+  removes the token and resumes the animation. Collapsed rows and the tab bar
+  keep animating — they show no grid, so there is no frozen view to lie
+  about.
 
 **[Amended 2026-07-27, theme inheritance]** Badge text `quiet()`; glyph per
-C5 as amended (pulsing when Working and the view is live); the `raw` and `↑N`
-tokens both `accent_quiet()`, still their own spans and never folded into the
-text. No bg — the badge is a watermark over the pane's own last output, and
-`quiet()` is exactly the right shape for that: the user's ink, one rung back.
+C5 as amended (animating when Working and the view is live, 2026-08-07); the
+`raw` and `↑N` tokens both `accent_quiet()`, still their own spans and never
+folded into the text. No bg — the badge is a watermark over the pane's own
+last output, and `quiet()` is exactly the right shape for that: the user's
+ink, one rung back.
 
-### C5 — Status glyph system + pulse
+### C5 — Status glyph system + spinner
 
 **Current:** glyphs from `status.rs:34–42`; colors `render.rs:282–290`
 (Working Green, NeedsInput Magenta, Waiting Yellow, Idle DarkGray, Exited
 Red); tab variant `:271–280`; no animation.
 
 **Target — one table, used by every chrome surface that shows status
-(tab bar, corner badge, collapsed rows):**
+(tab bar, corner badge, collapsed rows). [Amended 2026-08-07, C5 — see the
+spinner amendment below for the full rule]:**
 
-| AgentStatus | Glyph | Color | Pulse |
+| AgentStatus | Glyph | Color | Animated |
 |---|---|---|---|
-| Working | `●` | `ACCENT` | **yes** |
+| Working | `SPINNER_FRAMES` — `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, 80ms/frame, shared elapsed clock | `ACCENT` | **yes** — steady `⠋` only in the three sanctioned cases below (N1 frozen view, C15 legend, C27 filter tag) |
 | NeedsInput | `◆` | `ACCENT` | no (steady) |
 | Waiting | `○` | `FG` | no |
 | Idle | `·` | `DIM` | no |
@@ -650,20 +679,24 @@ one transient bell, then a tab that looked idle forever (§7 SPEC-GAP-2).
 Quiet keeps the blank cell — it is now the only summary that draws nothing,
 and it means what it says.
 
-**Pulse spec:** period **1100 ms**, 50% duty, two phases: elapsed-ms in
-`[0, 550) → ACCENT`, `[550, 1100) → ACCENT_DIM`, repeating. Phase is computed
-from one shared clock (elapsed since app start), so **all pulsing glyphs flip
-in unison**; it is re-evaluated every frame and the ~33 ms draw tick
-(`main.rs:164–173`) bounds phase-edge error to one frame. No new timers, no
-extra redraw scheduling. Only Working `●` pulses — never `◆` (steady red =
-"waiting on you", pulsing red = "alive"). Pure function
+**Pulse spec [retired 2026-08-07 — kept for the historical record; the live
+rule is the spinner amendment at the end of this contract]:** period
+**1100 ms**, 50% duty, two phases: elapsed-ms in `[0, 550) → ACCENT`,
+`[550, 1100) → ACCENT_DIM`, repeating. Phase is computed from one shared
+clock (elapsed since app start), so **all pulsing glyphs flip in unison**;
+it is re-evaluated every frame and the ~33 ms draw tick (`main.rs:164–173`)
+bounds phase-edge error to one frame. No new timers, no extra redraw
+scheduling. Only Working `●` pulses — never `◆` (steady red = "waiting on
+you", pulsing red = "alive"). Pure function
 (`theme::pulse_phase(elapsed) -> Color` or equivalent) with unit tests at the
 boundaries: 0 → ACCENT, 549 → ACCENT, 550 → ACCENT_DIM, 1100 → ACCENT.
 
 [Amended 2026-07-27: one sanctioned exception to "pulse: yes" — a scrolled
 pane's corner badge shows Working steady (no pulse) while its view is frozen
 in history, per C4's N1 carve-out. The table above describes live views; C4
-owns the frozen-view composition.]
+owns the frozen-view composition. The exception itself survives 2026-08-07
+unchanged in shape — see the spinner amendment below, which respells it as
+"no animation" rather than "no pulse".]
 
 **[Amended 2026-07-27, SPEC-parity P7]** The same frozen-view rule governs
 the *host cursor*, which is the loudest liveness assertion roost makes.
@@ -680,17 +713,66 @@ like a bar; a pane that asks for no shape — including the pane focus moves
 **[Amended 2026-07-27, theme inheritance — the table and the pulse]** Read
 the table above through §2's rename map: Working/NeedsInput `accent()`,
 Waiting `ink()`, Idle `quiet()`, Exited `accent_quiet()`; TabSummary Unknown
-`quiet()`, Exited `accent_quiet()`, Quiet a blank.
+`quiet()`, Exited `accent_quiet()`, Quiet a blank. (The rename map still
+holds — Working still reads `accent()`. The paragraph that used to follow
+this one, describing a two-phase colour flip between `pulse_bright()` and
+`accent()`, is superseded whole by the amendment immediately below: it
+described a mechanism that no longer exists rather than a renaming of one
+that does.)
 
-The **pulse phases change substance, not timing**: period 1100 ms and 50% duty
-are untouched, but the phases are now `[0, 550) → pulse_bright()` (ANSI 9) and
-`[550, 1100) → accent()` (ANSI 1) — two guaranteed-visible reds. The old phase
-B was a dimmer hue; expressing it as `accent()` + `DIM` would have let a
-terminal that ignores DIM flatten the pulse into a steady dot, so the pulse is
-the one place chrome spends a second colour rather than a modifier. Unit
-boundaries restated: 0 → `pulse_bright`, 549 → `pulse_bright`, 550 →
-`accent`, 1100 → `pulse_bright`. Every other rule here (one shared clock, only
-Working pulses, the frozen-view carve-out, `should_place_cursor`) stands.
+**[Amended 2026-08-07, C5 — the pi spinner replaces the colour pulse]** The
+client reported that the pulsing dot read as "waiting for your attention" —
+backwards, since Working is precisely the status that should *not* pull the
+eye the way NeedsInput's steady ◆ does. The fix swaps which axis carries
+"busy": **animation now means busy; steady red means attention**, so ◆
+becomes the only glyph that ever asks the user to look. Concretely:
+
+- **Glyph.** Working's `●` retires. In its place, `theme::SPINNER_FRAMES` —
+  `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` — pi-tui's own `loader.js` `DEFAULT_FRAMES` (pi 0.81.1),
+  copied verbatim, so a pi pane's own badge agrees with what pi draws inside
+  the pane. Colour is unchanged: `accent()`, the one red, never modulated —
+  every frame is the same red the old steady phase was.
+- **Clock.** `theme::spinner_frame(elapsed) -> char` replaces
+  `theme::pulse_phase`, reading the same shared clock (`App::elapsed`, one
+  read per frame, C5/D3) so every Working glyph on screen — badge, collapsed
+  row, tab strip, tab count cell — shows the *same* frame in the same draw,
+  exactly as every pulsing glyph used to flip in unison. Frame length is
+  80ms (pi's own nominal rate), a full ten-frame rotation every 800ms —
+  finer than roost's own render tick (`main.rs`'s ~33ms crossterm poll
+  timeout, which redraws every iteration even with nothing to read, so a
+  silent Working pane still animates), so no quantizing against a coarser
+  tick is needed. Unit boundaries: 0ms →
+  frame 0, 79ms → frame 0, 80ms → frame 1, 795ms → frame 9, 800ms →
+  frame 0 (wraps).
+- **Three sanctioned steady-frame cases — everywhere else, Working animates.**
+  All three show `theme::GLYPH_WORKING` (`SPINNER_FRAMES[0]`, `⠋`) instead of
+  the live spinner, and all three exist for the same reason: an animating
+  glyph asserts "alive right now", which none of the three may claim.
+  1. **N1 frozen view (C4).** A scrolled pane's corner badge — the frozen-view
+     exception carried over unchanged in shape from the colour-pulse era. The
+     `↑N` token already says the view is history; an animating glyph beside
+     it would contradict that.
+  2. **C15 help legend.** The status legend row in the help overlay is static
+     text and cannot itself animate, so it prints Working's representative
+     frame rather than a live one.
+  3. **C27 status-filter tag.** The roster's title tag names *which tier* is
+     filtered — it is a label for the tier, not a live report on any one
+     pane's animation, so it stays steady the same way the legend does.
+
+  Collapsed rows and the tab bar carry none of these three carve-outs (no
+  grid to freeze, no static label to be) — they always animate, exactly as
+  they always pulsed.
+- **Terminals without braille glyph support** render the spinner frames as
+  tofu. Accepted deliberately: pi itself (the flagship adapter) already
+  requires braille support to draw its own spinner, and per-terminal
+  fallback detection is not knowable from inside a PTY.
+- **`pulse_bright()` and `theme::pulse_phase` are removed outright** — no
+  remaining callers, and the property they existed for (a second
+  guaranteed-visible red so a terminal ignoring `DIM` couldn't flatten the
+  pulse into a steady dot) has no equivalent need once animation is carried
+  by glyph shape rather than colour.
+- Every other rule here — one shared clock, only Working animates, the
+  frozen-view carve-out, `should_place_cursor` — stands unamended.
 
 ### C6 — Stack header row
 
@@ -752,7 +834,8 @@ focused = Black on status-color bg, unfocused = status-color fg.
   **[Amended 2026-07-27, SPEC-ux U2]:** the pane id rides ahead of the name
   (same placement as the C4 badge), styled with the name.
   - marker: `▎` fg `ACCENT` when the row is the focused pane, else `" "`.
-  - glyph: per C5 (color + Working pulse).
+  - glyph: per C5 (Working animates, the spinner frame; every other status
+    is a steady glyph in its own colour).
   - id + name fg by state: Working/NeedsInput → `FG`; Waiting/Idle → `MUTED`;
     Exited → `DIM`.
   - right segment fg `DIM`; adapter = `PaneSpec.adapter`.
@@ -1360,14 +1443,18 @@ explain-itself surface, and it explained only the chords. It now ends with
 
 | key column | description |
 |---|---|
-| `status` | `● working ◆ needs you ○ waiting · idle ✕ exited` |
+| `status` | `⠋ working ◆ needs you ○ waiting · idle ✕ exited` |
 | `mouse` | `wheel scrolls · click focuses · drag selects` |
 | `Alt+click` | `open the URL under the pointer` |
 
-- **Why a legend at all:** `●◆○·✕` is the product's core language (C5) —
-  every badge, tab summary and feed line speaks it — and nothing anywhere
-  said what the symbols mean. The row's text is the C5 table itself, pinned
-  against the `theme::GLYPH_*` constants by
+- **Why a legend at all:** the glyph set (the Working spinner plus `◆○·✕`) is
+  the product's core language (C5) — every badge, tab summary and feed line
+  speaks it — and nothing anywhere said what the symbols mean.
+  **[Amended 2026-08-07, C5]** the `status` row shows `SPINNER_FRAMES[0]`
+  (`⠋`) as Working's representative frame — the legend is static text and
+  cannot itself animate, so it prints the same steady frame the badge falls
+  back to whenever animation is suppressed. The row's text is the C5 table
+  itself, pinned against the `theme::GLYPH_*` constants by
   `help_legend_row_matches_the_theme_glyph_table`, so retheming a glyph
   breaks a test instead of quietly leaving the overlay teaching a symbol
   roost no longer draws.
@@ -2370,9 +2457,12 @@ you.**
     severity, matching C19's ring, which also pins it last regardless of
     urgency — one placement rule for both surfaces.
   - **[Amended 2026-08-07, ux P2-11 — status filter]** `Tab` cycles a status
-    filter forward through six stops (every tier, then ◆, ○, ●, ·, exited —
-    `roster_rank`'s own order, so the filter and the sort agree on what
-    "worse" means); `Shift+Tab` steps back; both wrap. It composes with the
+    filter forward through six stops (every tier, then ◆, ○, ⠋ (steady frame),
+    ·, exited — `roster_rank`'s own order, so the filter and the sort agree on
+    what "worse" means); `Shift+Tab` steps back; both wrap. The Working stop
+    is one of C5's three sanctioned steady-frame cases (with N1 and the C15
+    legend): the tag names *which tier* is filtered, not a live per-pane
+    report, so it never substitutes the live spinner. It composes with the
     type-ahead **by AND** — a row must satisfy both, the ordinary multi-facet-
     search reading and the simplest rule that doesn't special-case either
     filter. A group whose panes all fail *either* filter drops its header
@@ -3192,7 +3282,7 @@ Every px-only construct in the mockup, and its cell-level fate:
 | letterspacing (0.02–0.11em) | **dropped** — no letterspacing in a cell grid; spacing out characters by hand is a gimmick that breaks widths. |
 | tab strip `border-bottom` / hint bar `border-top` (1px rules) | **dropped** — no spare rows. [Amended 2026-07-27] the `TAB_STRIP`/`BAR` bg steps that used to carry the separation are gone too (§2 background policy): the bars are set off by the ink weight of what is on them, and the panes' own top/bottom borders are the rules that survive. |
 | stack header `border-bottom` (`:659`) | `Modifier::UNDERLINED` across the header row (C6) — the one place a rule translates to an attribute instead of a row. |
-| `tui-pulse` opacity animation (1 → 0.28) | two-phase colour flip, 1100 ms period (C5). [Amended 2026-07-27] the phases are ANSI 9 ↔ ANSI 1 — two real reds rather than one red at two opacities, because an opacity dip has no theme-safe cell equivalent: spelling the quiet phase with `DIM` would let a terminal that ignores the modifier kill the animation. |
+| `tui-pulse` opacity animation (1 → 0.28) | [Amended 2026-08-07, C5] a ten-frame braille spinner cycling in the glyph's own steady colour (`accent()`), not an opacity or colour flip — an opacity dip has no theme-safe cell equivalent, and a two-colour flip (the 2026-07-27 ANSI 9 ↔ ANSI 1 answer this row used to give) reads as "wants attention" rather than "busy"; a shape change carries "busy" without touching colour at all. |
 | `tui-blink` block cursor (`:673`) | out of scope — the real cursor belongs to the inner program; roost already positions the hardware cursor (`render.rs:355–362`). |
 | emulator chrome row (traffic lights, `:617–624`) | out of scope — OS terminal window chrome. |
 | JetBrains Mono font | out of scope — user's terminal font. |
@@ -3296,23 +3386,31 @@ position.
 **Complications:** (1) statuses are time/heuristic-driven — freshly spawned
 quiet shells are deterministically `Idle`→`Waiting`; `Working` needs scripted
 output (`while sleep …; do echo; done`); `NeedsInput` is hard to script
-without the socket — keep it out of golden frames. (2) Pulse phase is
-wall-clock — assert pulsing cells ∈ {`pulse_bright`, `accent`} (ANSI 9/1
-  since 2026-07-27), never an exact
-phase. (3) Needs a PTY-capable CI runner (fine on macOS/Linux). (4) Frame
-settling — poll-parse until stable rather than sleep.
+without the socket — keep it out of golden frames. (2) **[Amended
+2026-08-07, C5]** the Working glyph is wall-clock — assert its cell's symbol
+∈ `theme::SPINNER_FRAMES` and its colour is exactly `accent()` (never a
+second hue, since the colour pulse this bullet used to describe —
+`pulsing cells ∈ {pulse_bright, accent}`, ANSI 9/1 — is retired), never an
+exact frame. (3) Needs a PTY-capable CI runner (fine on macOS/Linux). (4)
+Frame settling — poll-parse until stable rather than sleep, though a live
+Working glyph never truly "settles" (`vt100::Screen::contents()` changes
+every animation frame); scenarios that deliberately drive Working sample the
+glyph directly rather than waiting on `settle()`.
 
 **Effort:** ~1–2 days for the harness plus 3–4 golden scenarios.
 
 **Verdict: feasible, but a follow-up — not a package in this build.**
 Rationale: after C1 centralizes tokens, chrome correctness is dominated by
 pure span/geometry construction, which the required inline unit tests (mouse
-offsets, layout rects, pulse phase, corner-badge clipping) pin far more
-cheaply and less flakily. The harness's real payoff is regression armor for
-*future* chrome churn; building it now would serialize behind the restyle it
-is meant to verify. It is recorded as its own decision item in the plan
-(PLAN.md P6) with a revisit trigger: first post-restyle chrome regression, or
-the next engagement that touches `src/ui/render.rs`.
+offsets, layout rects, the spinner frame function, corner-badge clipping) pin
+far more cheaply and less flakily. The harness's real payoff is regression
+armor for *future* chrome churn; building it now would serialize behind the
+restyle it is meant to verify. It is recorded as its own decision item in the
+plan (PLAN.md P6) with a revisit trigger: first post-restyle chrome
+regression, or the next engagement that touches `src/ui/render.rs`.
+**[Note, 2026-08-07]** a lighter-weight version of this harness has since
+landed as `tests/chrome_theme.rs`, including the Working-spinner scenario
+described in (2) above.
 
 ### Firehose input-latency gate — the harness's first concrete test
 **[Added 2026-07-22, fleet features — item 10]**

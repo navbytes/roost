@@ -622,7 +622,7 @@ fn ux_navigation_session() {
     h.write_bytes(&alt(b'?'));
     let s = frame(&mut h, "F3: help overlay");
     qa.check(
-        s.contains('●') && s.contains('✕'),
+        s.contains('⠋') && s.contains('✕'),
         "help overlay includes a status-glyph legend",
     );
     qa.check(s.to_lowercase().contains("mouse") || s.contains("wheel"), "help overlay documents mouse behavior");
