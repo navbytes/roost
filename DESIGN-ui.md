@@ -970,6 +970,22 @@ alt-warning (which now persists until resolved, not for a fixed window)
 reclaims the bar the moment the flash expires. Pinned by
 `flash_wins_the_hint_bar_over_the_alt_warning`.
 
+**[Amended 2026-08-07, exit UX audit F2 — right segment gains the ○
+fallback]** `"◆ {N} needs you · Alt+a"` is no longer the segment's only
+shape. It now renders `App::attention_segment()`: unchanged text/style when
+a real ◆ exists (`Some((n, true))`), `"○ {n} your turn · Alt+a"` fg `ink()`
+when the ◆ pass is empty but `attention_ring`'s Waiting fallback isn't
+(`Some((n, false))`), omitted only when `Alt+a` truly has nothing to do
+(`None`). `ink()`, not `accent()`, is deliberate: it's the same style
+`theme::status_style` already gives the Waiting glyph everywhere else, one
+visual step back from the accent-red ◆ case so a real ◆ still reads as more
+urgent. This closes C19's 2026-08-07 "known gap" amendment — see there for
+the full rationale — and means the segment now matches what `Alt+a` will
+actually do in every case, not only N > 0. Pinned by
+`attention_segment_matches_the_ring_in_every_case` (app.rs) and
+`hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input`
+(render.rs).
+
 ### C10 — Flash message
 
 **Current:** `render.rs:56–64` — Black on Green BOLD.
@@ -1632,6 +1648,21 @@ to reach it.
   the fallback exists. Left alone rather than inventing a new hint-bar
   surface in an audit-response pass; a Normal-mode pair (dropping the
   N > 0-only rule) is the fix if this needs to be discoverable cold.
+
+**[Amended 2026-08-07, exit UX audit F2 — the gap above is closed]** The
+right segment itself now carries the fallback, rather than growing a
+Normal-mode pair: `hint_bar_right_spans` takes `App::attention_segment()` —
+`Some((n, true))` for the real ◆ count (unchanged text/style), `Some((n,
+false))` rendering `"○ {n} your turn · Alt+a"` in `ink()` when the ◆ pass is
+empty but the Waiting pass isn't, `None` when `Alt+a` has nothing to do at
+all (C9 amended alongside). This was chosen over the Normal-mode pair the
+prior amendment named as the alternative: a static pair would cost columns
+at every N (colliding with C9's "the Normal-mode seven gain nothing"
+100-column budget) and can't say *how many* panes are waiting the way the
+existing aggregate slot already does for free. The segment now matches
+`attention_ring` in every case, not only N > 0 — closing this gap and
+making the ring/count invariant this contract opened with fully true again,
+not just true when N > 0.
 
 ### C20 — Activity feed (Alt+e) — [Added 2026-07-22, fleet features]
 

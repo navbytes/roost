@@ -246,13 +246,22 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
     }
 }
 
-/// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" —
-/// omitted at `n == 0` rather than shown as a hollow "0 needs you" — then
+/// C9's right-aligned segment: the aggregate "◆ N needs you · Alt+a" — then
 /// (P21) the search prompt, then (Scroll/Search, U3) the dim position, then
 /// the uppercase mode word, then one trailing space. Everything rides inside
 /// the segment so C9's fit/yield machinery covers it for free: pairs drop
 /// whole before any of it clips. Pure so the omission rules are
 /// unit-testable without a `Frame`.
+///
+/// F2 (exit UX audit 2026-08-07): `attention` is `App::attention_segment()`
+/// verbatim — `None` omits the aggregate entirely (rather than a hollow "0
+/// needs you"); `Some((n, true))` is the real ◆ count, unchanged wording and
+/// `accent()`; `Some((n, false))` is `attention_ring`'s ○ fallback count,
+/// `"○ {n} your turn · Alt+a"` in `ink()` (one visual step back from the
+/// accent-red ◆ case — the same style `theme::status_style` already gives
+/// the Waiting glyph everywhere else). Passing the tuple straight through
+/// rather than re-deciding "real vs fallback" here is what keeps this
+/// function unable to show anything `Alt+a` wouldn't actually do.
 ///
 /// [P21] `query` is the live search prompt (`/foo`) and is the one token on
 /// this bar drawn in `ink`: it is text the user is typing right now, and
@@ -260,17 +269,19 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
 /// Scroll mode and the `i/n` hit counter while searching — both `quiet`, both
 /// the same "where am I" role.
 fn hint_bar_right_spans(
-    n: usize,
+    attention: Option<(usize, bool)>,
     query: Option<String>,
     position: Option<String>,
     word: &str,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if n > 0 {
-        spans.push(Span::styled(
-            format!("◆ {n} needs you · Alt+a"),
-            theme::accent(),
-        ));
+    if let Some((n, needs_input)) = attention {
+        let (text, style) = if needs_input {
+            (format!("◆ {n} needs you · Alt+a"), theme::accent())
+        } else {
+            (format!("○ {n} your turn · Alt+a"), theme::ink())
+        };
+        spans.push(Span::styled(text, style));
         spans.push(Span::raw("  "));
     }
     if let Some(q) = query {
@@ -374,7 +385,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         _ => (None, None),
     };
     let right = hint_bar_right_spans(
-        app.needs_input_count(),
+        app.attention_segment(),
         query,
         position,
         mode_word(&app.mode, app.zoomed(), focused_raw),
@@ -2262,14 +2273,31 @@ mod tests {
     fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
         // U3: `↑N/M` rides inside the right segment (quiet), so C9's yield
         // machinery covers it — and it only exists when a position is given.
-        let spans = hint_bar_right_spans(0, None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(None, None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "↑12/300 SCROLL ");
         assert_eq!(spans[0].style, theme::quiet());
 
-        let spans = hint_bar_right_spans(2, None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(Some((2, true)), None, Some("↑12/300".into()), "SCROLL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
+    }
+
+    /// F2 (exit UX audit 2026-08-07): the ○ fallback renders in the same
+    /// slot as a real ◆, with its own wording and one visual step back
+    /// (`ink()` rather than `accent()`) so a real ◆ still reads as more
+    /// urgent.
+    #[test]
+    fn hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input() {
+        let spans = hint_bar_right_spans(Some((3, false)), None, None, "NORMAL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "○ 3 your turn · Alt+a  NORMAL ");
+        assert_eq!(spans[0].style, theme::ink());
+
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
+        assert_eq!(spans[0].style, theme::accent());
     }
 
     /// P21: the search prompt lives in C9's right segment — `/query▏` in
@@ -2283,7 +2311,7 @@ mod tests {
         let lines: Vec<String> = ["alpha beta", "beta beta"].map(String::from).to_vec();
         let mut s = Search::over(lines, "beta", 1);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/beta{} 2/3 SEARCH ", theme::RENAME_CURSOR));
         assert_eq!(spans[0].style, theme::ink(), "the typed query is legible, not dim");
@@ -2293,7 +2321,7 @@ mod tests {
         // empty result is the answer, not the absence of one.
         s = Search::over(vec!["alpha beta".into()], "gamma", 0);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(0, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/gamma{} 0/0 SEARCH ", theme::RENAME_CURSOR));
 
@@ -2531,7 +2559,7 @@ mod tests {
             ],
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        let right_w = super::hint_bar_right_spans(0, None, None, "COPY")
+        let right_w = super::hint_bar_right_spans(None, None, None, "COPY")
             .iter()
             .map(|s| mouse::display_width(&s.content))
             .sum::<u16>();
@@ -2561,7 +2589,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_omits_needs_segment_at_zero() {
-        let spans = hint_bar_right_spans(0, None, None, "NORMAL");
+        let spans = hint_bar_right_spans(None, None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "NORMAL ");
         assert!(!text.contains('◆'));
@@ -2569,7 +2597,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
-        let spans = hint_bar_right_spans(3, None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::accent());

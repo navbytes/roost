@@ -3735,10 +3735,10 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// C19: every pane whose runtime status is `NeedsInput` — the exact
-    /// predicate `needs_input_count` uses, so the ring's size can never
-    /// disagree with the hint bar's advertised N. Ordered by (tab index
-    /// ascending, position within that tab's `pane_order()`); the float
-    /// (C22), if needy, is last — `needs_input_count` counts `runtimes`
+    /// predicate `needs_input_count` uses, so the ring's ◆ pass can never
+    /// disagree with the hint bar's advertised N whenever N > 0. Ordered by
+    /// (tab index ascending, position within that tab's `pane_order()`); the
+    /// float (C22), if needy, is last — `needs_input_count` counts `runtimes`
     /// directly (float included), so it must be too.
     ///
     /// [Amended, ux P1-5] `Alt+a` promises "one key jumps there", but a ◆-only
@@ -3754,12 +3754,35 @@ impl<B: PaneBackend> App<B> {
     /// raw runtime status, so a plain shell sitting at its prompt (P2-10: it
     /// has no turn to hand back) can never pull the ring — only a pane whose
     /// `Waiting` actually means something does.
+    ///
+    /// [Amended F2, exit UX audit 2026-08-07] At N = 0 this ring's fallback
+    /// pass used to run with **no on-screen affordance saying so**: the hint
+    /// bar omitted its segment outright (`n > 0` in `render.rs`), so `Alt+a`
+    /// visibly promised nothing yet still jumped somewhere — the best half
+    /// of the P1-5 work above was invisible. `attention_segment` (below) now
+    /// reads this same ring, so the hint bar's right segment matches what
+    /// `Alt+a` will actually do in *every* case, not just N > 0.
     fn attention_ring(&self) -> Vec<PaneId> {
         let needy = self.status_ring(AgentStatus::NeedsInput);
         if !needy.is_empty() {
             return needy;
         }
         self.status_ring(AgentStatus::Waiting)
+    }
+
+    /// C9/F2 (exit UX audit 2026-08-07): what the hint bar's right segment
+    /// should announce about `Alt+a` — `Some((n, true))` for a real ◆ count
+    /// (`needs_input_count`, unchanged wording/style), `Some((n, false))`
+    /// for `attention_ring`'s ○ fallback count once none do, `None` only
+    /// when `Alt+a` has nowhere to go at all. Reads `attention_ring` itself
+    /// rather than recomputing the two passes, so the segment is
+    /// structurally the ring's size — the two can never drift apart.
+    pub fn attention_segment(&self) -> Option<(usize, bool)> {
+        let ring = self.attention_ring();
+        if ring.is_empty() {
+            return None;
+        }
+        Some((ring.len(), self.needs_input_count() > 0))
     }
 
     /// Every pane — tab order, then that tab's `pane_order()`, the float
@@ -9792,6 +9815,23 @@ mod tests {
         app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
         app.runtimes.get_mut(&3).unwrap().set_extension_status(AgentStatus::NeedsInput);
         assert_eq!(app.attention_ring(), vec![3], "the one real ◆ wins outright, no ○ mixed in");
+    }
+
+    /// F2 (exit UX audit 2026-08-07): the hint bar's right segment must
+    /// match what `Alt+a` actually does in every case — nothing, a real ◆,
+    /// or the ○ fallback — not just when a ◆ exists.
+    #[test]
+    fn attention_segment_matches_the_ring_in_every_case() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert_eq!(app.attention_segment(), None, "a fresh shell pane pulls neither pass");
+
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_segment(), Some((1, false)), "○ fallback: real, but not a ◆");
+
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        assert_eq!(app.attention_segment(), Some((1, true)), "a real ◆ takes over");
     }
 
     /// Interaction (items 1 + 4): a quiet shell's `Waiting` reads `Idle`

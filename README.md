@@ -212,9 +212,12 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
 
 - **Jump to attention (`Alt+a`).** Jumps to the next pane whose status is
   ◆ needs-input, across tabs, wrapping back to the first; press again for
-  the next one. Nothing needs you? A flash says so and nothing else
-  changes — the hint bar's `◆ N needs you · Alt+a` segment always matches
-  the count it will actually cycle through.
+  the next one. If nothing needs input, it falls back to any pane that's
+  simply finished its turn (○ waiting) instead — the hint bar's right
+  segment always matches what the key will actually do: `◆ N needs you ·
+  Alt+a` when a real ◆ exists, `○ N your turn · Alt+a` for the fallback,
+  omitted only when there's truly nothing to jump to. Nothing needs you?
+  A flash says so and nothing else changes.
 - **Fleet roster (`Alt+Shift+a`).** The shifted sibling of the chord above:
   `Alt+a` takes you to the next pane that needs you, `Alt+Shift+a` shows you
   all of them and lets you choose. A modal list of every pane in the
