@@ -323,16 +323,17 @@ Status arrives two ways:
    - pi: [`extensions/roost.ts`](extensions/roost.ts) — roost installs/updates
      it into `~/.pi/agent/extensions/` automatically at startup when pi is
      present (set `ROOST_NO_EXT_INSTALL` to manage it yourself). Uses pi's
-     `agent_start`/`agent_end`/`session_start`/ask-tool events, and reports
-     session ids instantly.
+     `agent_start`/`agent_end`/`session_start`/`project_trust`/ask-tool
+     events, and reports session ids instantly.
    - Claude Code: roost installs/updates three hooks into
      `~/.claude/settings.json` automatically at startup when Claude Code is
      present (same `ROOST_NO_EXT_INSTALL` opt-out). Details:
      [`extensions/claude-code-hooks.md`](extensions/claude-code-hooks.md).
 2. **Heuristic fallback** — recent PTY output ⇒ working; silence ⇒ waiting; a
-   terminal bell (`0x07`) ⇒ needs-you (tmux-style). The bell also supplements
-   the pi extension for pi's built-in permission prompts, which pi exposes no
-   event for.
+   terminal bell (`0x07`) ⇒ needs-you (tmux-style), for an adapter/TUI with no
+   exact extension/hook channel of its own. pi needs none of this for its own
+   needs-you signal: its one blocking prompt (the project-trust dialog) is
+   reported directly via the `project_trust` event above.
 
 Each pane also carries a faint **corner badge**, top-right (iTerm2-style):
 `name · adapter glyph` — the name is its `Alt+r` title, or the adapter name

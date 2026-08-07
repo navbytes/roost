@@ -135,6 +135,10 @@ pub trait PaneBackend: Sized {
         false
     }
     fn set_extension_status(&mut self, s: AgentStatus);
+    /// The pane's status-socket connection went up or down (D2) — see
+    /// `StatusTracker::set_ext_link`. Default no-op: a backend with no
+    /// notion of a reporting connection has nothing to gate on it.
+    fn set_ext_link(&mut self, _up: bool) {}
     fn on_exit(&mut self);
 
     /// Has the pane negotiated the kitty "disambiguate" keyboard flag? When
@@ -314,6 +318,11 @@ pub mod fakes {
         pub effects: PaneEffects,
         /// Test knob (P7): the DECSCUSR shape this pane reports.
         pub cursor_shape: Option<u8>,
+        /// [F1] Test-observable: the last value `set_ext_link` was called
+        /// with, so an `App`-level test can assert on the *collapsed* bool
+        /// `App::ext_link_counts`'s refcount produces without needing a real
+        /// `StatusTracker`.
+        pub ext_link: bool,
     }
 
     impl PaneBackend for FakePane {
@@ -350,6 +359,7 @@ pub mod fakes {
                 pixels,
                 effects: PaneEffects::default(),
                 cursor_shape: None,
+                ext_link: false,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -392,6 +402,9 @@ pub mod fakes {
         fn set_extension_status(&mut self, s: AgentStatus) {
             let s = if s == AgentStatus::Exited { AgentStatus::Waiting } else { s };
             self.ext = Some(s);
+        }
+        fn set_ext_link(&mut self, up: bool) {
+            self.ext_link = up;
         }
         fn on_exit(&mut self) {
             self.exited = true;

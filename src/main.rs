@@ -471,6 +471,15 @@ fn run(
                         }
                     }
                 }
+                // D2: same auth gate as Status/Session above — a link-down
+                // must only be honored for the pane its connection actually
+                // authenticated for, never let an unrelated connection's
+                // close clear another pane's link.
+                AppEvent::ExtLink(id, token, up) => {
+                    if app.socket_authorized(id, &token) {
+                        app.on_status_link(id, up);
+                    }
+                }
             }
         }
 

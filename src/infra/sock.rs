@@ -13,6 +13,13 @@
 //! has exactly one ground truth (the pane's PTY EOF): the pane's env is
 //! inherited by every descendant, so a nested pi finishing its work would
 //! otherwise report *its* shutdown as the pane's death.
+//!
+//! D2: no new wire message — this file also tracks, per connection, which
+//! pane(s) it has reported a status/session line for, and turns that into
+//! `AppEvent::ExtLink` up/down events for `StatusTracker::set_ext_link`
+//! (`ConnGuard`, `link_pane_token`). A connection *is* the liveness signal:
+//! the pi extension holds one open for a pane's whole process lifetime, so
+//! whether it's still open is itself evidence the reporting hook isn't dead.
 
 use anyhow::{bail, Result};
 use serde::Deserialize;
@@ -301,6 +308,15 @@ fn parse_line(line: &str) -> Option<AppEvent> {
     };
     // Missing token → empty string, which App rejects (fails closed).
     let token = msg.token.unwrap_or_default();
+    // [F2] `parse_control` has enforced this on the control-request token
+    // since M1; status/session lines never did. Same reasoning applies here
+    // now that a token also becomes a `link_panes`/`AppEvent::ExtLink` key
+    // (D2) — an oversized one is dropped exactly like any other malformed
+    // line (`None` → the caller's `log_dropped`), before it can reach that
+    // bookkeeping at all.
+    if token.len() > MAX_TOKEN_LEN {
+        return None;
+    }
     match msg.event.as_str() {
         "session" => Some(AppEvent::Session(pane, token, msg.session?)),
         "status" => {
@@ -530,6 +546,18 @@ fn evict_one(map: &mut HashMap<String, Bucket>) {
     }
 }
 
+/// [F2] Cap on distinct panes one connection's `link_panes` will track. A
+/// real reporter — the pi extension, a Claude Code hook — serves exactly
+/// one pane for its whole life; this is a defensive bound against a
+/// buggy/malicious connection claiming to report for an unbounded number of
+/// panes (each entry is small — a `PaneId` and a token — but nothing else
+/// here caps how many distinct ones a single connection could otherwise
+/// mint). Past the cap, a line for a *new* pane on that connection still
+/// forwards its underlying status/session event exactly as before (App's
+/// own token check is what actually judges it) — only this connection's own
+/// link-liveness bookkeeping for that extra pane is skipped.
+const MAX_LINK_PANES_PER_CONN: usize = 4;
+
 /// RAII: releases whatever connection-accounting slots this connection holds
 /// when dropped — including during a panic unwind (audit finding L1).
 /// Without this, a panic partway through the read loop (e.g. a
@@ -539,9 +567,34 @@ fn evict_one(map: &mut HashMap<String, Bucket>) {
 /// connection is admitted under a real principal (see the `Limits` doc
 /// comment — before that, a connection is bounded by time, not a shared
 /// slot, so there's nothing else here to release).
+///
+/// D2: also the one place that emits link-down. `link_panes` accumulates the
+/// panes (and the token last seen for each) this connection has reported a
+/// status/session line for — see the `promoted` doc comment in
+/// `spawn_accept_loop` for where entries are added and link-up emitted.
+/// Draining it here, in `Drop`, means every exit from the connection's read
+/// loop — a clean EOF, a real read error, an oversized line, hitting a rate
+/// limit and hanging up, *or* a panic mid-read — reaches the same one place,
+/// instead of every `break`/`return` needing its own copy of "and tell App
+/// this pane's link just went down". The benign `READ_TIMEOUT` retry for a
+/// status-only connection (P1, `spawn_accept_loop`) is a `continue`, not a
+/// `break`, so it never reaches here at all — no flap from that path.
+///
+/// [F1] `link_panes` being a map (keyed on pane, entry inserted at most once
+/// per connection — see the `Entry::Vacant` guard below) is exactly what
+/// makes `App::ext_link_counts` a sound refcount rather than a bool: this
+/// connection contributes at most one link-up and, here, at most one
+/// matching link-down *per pane*, no matter how many status/session lines
+/// it actually sent. A pane with two open connections (e.g. a nested
+/// claude's one-shot `roost __status` hooks alongside the pane's own
+/// long-lived pi extension link) nets to +1/-1 per connection, never more —
+/// so App's count always equals the number of connections genuinely still
+/// open for that pane.
 struct ConnGuard<'a> {
     limits: &'a Limits,
     principal: Option<String>,
+    tx: SyncSender<AppEvent>,
+    link_panes: HashMap<PaneId, String>,
 }
 
 impl Drop for ConnGuard<'_> {
@@ -550,6 +603,24 @@ impl Drop for ConnGuard<'_> {
         if let Some(token) = &self.principal {
             self.limits.release_principal(token);
         }
+        for (pane, token) in self.link_panes.drain() {
+            // Best-effort: if the main loop is already gone the process is
+            // shutting down anyway, and there is nothing left to tell.
+            let _ = self.tx.send(AppEvent::ExtLink(pane, token, false));
+        }
+    }
+}
+
+/// `ev`'s pane/token, if it's a status or session report — the two event
+/// kinds `parse_line` can produce that identify a pane the way D2's link
+/// tracking keys on. Shared by the link-up and link-down (via `ConnGuard`)
+/// paths so they agree on exactly what "this connection reports for pane P"
+/// means.
+fn link_pane_token(ev: &AppEvent) -> Option<(PaneId, String)> {
+    match ev {
+        AppEvent::Status(pane, token, _) => Some((*pane, token.clone())),
+        AppEvent::Session(pane, token, _) => Some((*pane, token.clone())),
+        _ => None,
     }
 }
 
@@ -729,7 +800,12 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                 // From here on, `guard` owns releasing every slot this
                 // connection holds — including on an early return or a
                 // panic unwind (audit finding L1).
-                let mut guard = ConnGuard { limits: &limits, principal: None };
+                let mut guard = ConnGuard {
+                    limits: &limits,
+                    principal: None,
+                    tx: tx.clone(),
+                    link_panes: HashMap::new(),
+                };
 
                 // Short until promoted (audit finding C1): an idle or
                 // slow-to-identify connection is recycled in seconds rather
@@ -983,6 +1059,33 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                                 promoted = true;
                                 let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
                             }
+                            // D2: the first accepted status/session line for
+                            // a given pane on this connection makes it that
+                            // pane's live reporting link — tell App (link-up)
+                            // and remember it so `ConnGuard`'s `Drop` can
+                            // tell App again (link-down) whenever this
+                            // connection ends, however it ends. A later line
+                            // for a pane already in the map doesn't re-emit;
+                            // the connection's liveness hasn't changed, only
+                            // its status has (that's the `ev` send below).
+                            //
+                            // [F2] Past MAX_LINK_PANES_PER_CONN distinct
+                            // panes, a *new* one is skipped here — no entry,
+                            // no link-up — while `ev` itself still forwards
+                            // below exactly as it would for any other pane.
+                            // Plain contains_key+insert rather than the
+                            // Entry API: the cap check needs the *whole
+                            // map's* length, which can't be read while an
+                            // `Entry` (a mutable borrow of the same map)
+                            // is still live.
+                            if let Some((pane, token)) = link_pane_token(&ev) {
+                                if !guard.link_panes.contains_key(&pane)
+                                    && guard.link_panes.len() < MAX_LINK_PANES_PER_CONN
+                                {
+                                    guard.link_panes.insert(pane, token.clone());
+                                    let _ = tx.send(AppEvent::ExtLink(pane, token, true));
+                                }
+                            }
                             if tx.send(ev).is_err() {
                                 break;
                             }
@@ -1151,8 +1254,9 @@ mod tests {
         assert!(limits.try_reserve_global());
 
         let l = limits.clone();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         let result = std::thread::spawn(move || {
-            let _guard = ConnGuard { limits: &l, principal: None };
+            let _guard = ConnGuard { limits: &l, principal: None, tx, link_panes: HashMap::new() };
             panic!("simulated poisoned-mutex unwind mid-connection");
         })
         .join();
@@ -1206,6 +1310,29 @@ mod tests {
             }
         });
         tx
+    }
+
+    /// Like `fake_app`, but also forwards every non-`Command` event (D2's
+    /// `ExtLink`, `Status`, `Session`, …) onto a second channel the test can
+    /// inspect — `fake_app` itself silently drops those, which is fine for
+    /// the connection-cap/rate-limit tests above but not for D2's link
+    /// tests below, which assert on exactly what reaches "the main loop".
+    fn capturing_app() -> (SyncSender<AppEvent>, std::sync::mpsc::Receiver<AppEvent>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(256);
+        let (cap_tx, cap_rx) = std::sync::mpsc::channel::<AppEvent>();
+        std::thread::spawn(move || {
+            while let Ok(ev) = rx.recv() {
+                match ev {
+                    AppEvent::Command(_req, reply) => {
+                        let _ = reply.send(Reply::ok(serde_json::json!({})));
+                    }
+                    other => {
+                        let _ = cap_tx.send(other);
+                    }
+                }
+            }
+        });
+        (tx, cap_rx)
     }
 
     /// Connect with a client-side read timeout — a real hang (the old P0 bug
@@ -1484,23 +1611,347 @@ mod tests {
     /// report for that pane is dropped for the rest of its life. Sleeps past
     /// the real constant on purpose — this is the timescale that matters,
     /// not a shortened stand-in for it.
+    ///
+    /// D2 rides the same 30s wait to pin its own requirement for free rather
+    /// than pay for a second sleep elsewhere: the retry that lets this
+    /// connection survive must be a `continue`, never a `break` that
+    /// `ConnGuard::drop` would see — so no link-down for pane 1 may appear
+    /// at any point across that whole idle gap, only the link-up the initial
+    /// status line earns.
     #[test]
     fn a_status_only_connection_survives_an_idle_gap_past_read_timeout() {
         let (path, listener) = scratch_listener("status-survives-read-timeout");
-        spawn_accept_loop(listener, fake_app());
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
         let mut c = connect(&path);
 
-        c.get_mut().write_all(br#"{"pane":"1","token":"t","event":"status","status":"working"}"#).unwrap();
+        c.get_mut()
+            .write_all(br#"{"pane":"1","token":"t","event":"status","status":"working"}"#)
+            .unwrap();
         c.get_mut().write_all(b"\n").unwrap();
 
+        // Setup: the one line above earns exactly one link-up and one status
+        // report, and nothing past that — drained before the idle gap so
+        // they can't be mistaken for a spurious link-down during it.
+        let mut got_link_up = false;
+        for _ in 0..2 {
+            match rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("setup: link-up/status never arrived")
+            {
+                AppEvent::ExtLink(1, ref t, true) if t == "t" => got_link_up = true,
+                AppEvent::Status(1, ref t, AgentStatus::Working) if t == "t" => {}
+                _ => panic!("unexpected setup event (wanted exactly one link-up and one status)"),
+            }
+        }
+        assert!(
+            got_link_up,
+            "setup: the status line must have earned a link-up"
+        );
+
         // The gap size the P1 finding is actually about — past READ_TIMEOUT
-        // itself, not just the pre-auth deadline.
+        // itself, not just the pre-auth deadline. The retry clause that
+        // keeps this connection alive across it must never fire a link-down
+        // (D2): confirmed by there being nothing at all to receive here.
         std::thread::sleep(READ_TIMEOUT + Duration::from_secs(1));
+        assert!(
+            rx.try_recv().is_err(),
+            "the READ_TIMEOUT retry must not emit a link-down — the connection never really closed"
+        );
 
         let reply = roundtrip(&mut c, r#"{"token":"t","method":"list"}"#);
         assert!(
             reply.get("ok").is_some(),
             "a status-only connection must survive an idle gap past READ_TIMEOUT: {reply}"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- D2: per-connection pane liveness (link-up/link-down) --------------
+    //
+    // The pi extension holds one long-lived connection per pane; whether
+    // that connection is currently open is itself a liveness signal
+    // `StatusTracker` uses to decide how much to trust a resting/Working
+    // report over PTY output (see core::status). These tests drive that
+    // accounting through the real `spawn_accept_loop`, same harness as
+    // above, but via `capturing_app` so the `AppEvent::ExtLink` events
+    // themselves (not just control replies) are observable.
+
+    /// The first accepted status line for a pane on a connection associates
+    /// that connection with the pane and emits link-up — *before* the status
+    /// event itself, so a consumer sees "the link is live" and then "here's
+    /// what it reported", never the other way around.
+    #[test]
+    fn accepted_status_line_associates_conn_to_pane_and_emits_link_up() {
+        let (path, listener) = scratch_listener("link-up");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+        let mut c = connect(&path);
+        c.get_mut()
+            .write_all(br#"{"pane":"1","token":"tok","event":"status","status":"working"}"#)
+            .unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no event within the deadline");
+        assert!(
+            matches!(first, AppEvent::ExtLink(1, ref t, true) if t == "tok"),
+            "expected link-up first"
+        );
+        let second = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no second event within the deadline");
+        assert!(
+            matches!(second, AppEvent::Status(1, ref t, AgentStatus::Working) if t == "tok"),
+            "expected the status report itself second"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A connection's close (EOF) emits link-down for exactly the pane(s) it
+    /// reported for — never a different pane's, even one reporting over a
+    /// separate connection that stays open.
+    #[test]
+    fn connection_eof_emits_link_down_for_that_pane_only() {
+        let (path, listener) = scratch_listener("link-down-isolated");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+
+        let mut a = connect(&path);
+        a.get_mut()
+            .write_all(br#"{"pane":"1","token":"tok-a","event":"status","status":"working"}"#)
+            .unwrap();
+        a.get_mut().write_all(b"\n").unwrap();
+        let mut b = connect(&path);
+        b.get_mut()
+            .write_all(br#"{"pane":"2","token":"tok-b","event":"status","status":"working"}"#)
+            .unwrap();
+        b.get_mut().write_all(b"\n").unwrap();
+
+        // Drain the setup: one link-up + one status per connection, in
+        // whatever order the two threads happen to land in — only the
+        // count is deterministic here, so wait for exactly that many before
+        // touching either connection further.
+        for _ in 0..4 {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("setup: link-up/status never arrived");
+        }
+
+        drop(a); // pane 1's connection closes; pane 2's (`b`) stays open
+
+        let ev = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("link-down for pane 1 never arrived");
+        assert!(
+            matches!(ev, AppEvent::ExtLink(1, ref t, false) if t == "tok-a"),
+            "expected link-down for pane 1"
+        );
+
+        // Nothing else shows up — in particular no link-down for pane 2,
+        // whose connection is untouched.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "pane 2's link must not be touched by pane 1's connection closing"
+        );
+
+        drop(b);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A line that never resolves to a pane at all (garbage JSON, an
+    /// unparseable pane id — anything `parse_line` returns `None` for, see
+    /// `ignores_garbage`) never gets associated with anything at the sock.rs
+    /// layer in the first place, so its connection's close has nothing to
+    /// report: no link-down (or link-up) for any pane.
+    ///
+    /// This is the sock.rs-native half of "an unauthenticated/garbage-token
+    /// line's close must not emit a link-down for the pane it claimed": this
+    /// file has no way to judge a *token*'s legitimacy (only App does, via
+    /// `socket_authorized` — see the `Limits` doc comment on why that's
+    /// deliberate), so the other, already-tested half of that property is
+    /// `socket_authorized` itself gating `on_status_link` in main.rs exactly
+    /// like it gates `on_status`/`on_session`.
+    #[test]
+    fn a_line_that_never_resolves_to_a_pane_emits_no_link_event_on_close() {
+        let (path, listener) = scratch_listener("garbage-link");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+        let mut c = connect(&path);
+        c.get_mut()
+            .write_all(br#"{"pane":"not-a-number","event":"status","status":"working"}"#)
+            .unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+        // Give the server a moment to (fail to) process the line before the
+        // close under test.
+        std::thread::sleep(Duration::from_millis(200));
+        drop(c);
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a line that never parsed to a pane must never produce a link event, up or down"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The Claude Code hooks shape (`cli.rs`'s `__status`, one connection per
+    /// report — see `status_hook`/`write_line`): connect, send exactly one
+    /// status line, disconnect. Two of those back to back must each flick
+    /// the pane's link up then immediately back down, leaving it exactly
+    /// where it always ends up — down — so `current()`'s D1 gate falls back
+    /// to output promotion for Claude precisely as it did before D2 existed.
+    #[test]
+    fn claude_one_shot_connections_flick_the_link_up_then_back_down() {
+        let (path, listener) = scratch_listener("claude-one-shot");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+
+        // Fully process one one-shot connection (link-up, its status report,
+        // then link-down on EOF) before starting the next. Those three
+        // arrive in exactly that order because they're all sent from that
+        // one connection's own thread — but *across* two separate
+        // connections' threads there is no such guarantee, so this
+        // synchronizes on each round's link-down before moving on rather
+        // than assuming a cross-connection interleaving.
+        for round in 0..2 {
+            let mut c = UnixStream::connect(&path).expect("connect");
+            c.write_all(br#"{"pane":"1","token":"t","event":"status","status":"working"}"#)
+                .unwrap();
+            c.write_all(b"\n").unwrap();
+            // Exactly `status_hook`'s shape: fire-and-forget, dropped the
+            // instant the write is queued, no reply ever read.
+            drop(c);
+
+            let up = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("link-up never arrived");
+            assert!(
+                matches!(up, AppEvent::ExtLink(1, ref t, true) if t == "t"),
+                "round {round}: expected link-up"
+            );
+            let status = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("status report never arrived");
+            assert!(
+                matches!(status, AppEvent::Status(1, ref t, AgentStatus::Working) if t == "t"),
+                "round {round}: expected the status report"
+            );
+            let down = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("link-down never arrived");
+            assert!(
+                matches!(down, AppEvent::ExtLink(1, ref t, false) if t == "t"),
+                "round {round}: expected link-down right after the connection closed"
+            );
+        }
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// [F2] A connection claiming to report for more than
+    /// `MAX_LINK_PANES_PER_CONN` distinct panes gets no further link
+    /// tracking past the cap — no entry, no link-up. The underlying
+    /// status report itself is unaffected (App's own token check judges
+    /// it, not this cap), and closing the connection proves the extra pane
+    /// really was never tracked: only the capped panes get a link-down.
+    #[test]
+    fn a_connections_link_tracking_is_capped_per_connection() {
+        let (path, listener) = scratch_listener("link-cap");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+        let mut c = connect(&path);
+
+        // Fill the cap: MAX_LINK_PANES_PER_CONN distinct panes, each earning
+        // a link-up + its status report.
+        for pane in 1..=MAX_LINK_PANES_PER_CONN as u64 {
+            c.get_mut()
+                .write_all(
+                    format!(
+                        r#"{{"pane":"{pane}","token":"t","event":"status","status":"working"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            c.get_mut().write_all(b"\n").unwrap();
+        }
+        for _ in 0..(MAX_LINK_PANES_PER_CONN * 2) {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("setup: link-up/status never arrived");
+        }
+
+        // One more pane, past the cap: the underlying report still forwards...
+        let extra_pane = MAX_LINK_PANES_PER_CONN as u64 + 1;
+        c.get_mut()
+            .write_all(
+                format!(
+                    r#"{{"pane":"{extra_pane}","token":"t","event":"status","status":"working"}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+        let ev = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the underlying status report must still forward past the cap");
+        assert!(matches!(ev, AppEvent::Status(p, ..) if p == extra_pane));
+        // ...but no link-up for it.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "past the cap, a new pane must not get link tracking"
+        );
+
+        // Closing proves it was never inserted: exactly the capped panes'
+        // link-downs arrive, never a 6th for the pane past the cap.
+        drop(c);
+        let mut downs = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while downs.len() < MAX_LINK_PANES_PER_CONN && Instant::now() < deadline {
+            if let Ok(AppEvent::ExtLink(p, _, false)) = rx.recv_timeout(Duration::from_millis(500))
+            {
+                downs.push(p);
+            }
+        }
+        downs.sort();
+        assert_eq!(
+            downs,
+            (1..=MAX_LINK_PANES_PER_CONN as u64).collect::<Vec<_>>()
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "no link-down for the pane past the cap — it was never tracked"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// [F2] A status/session line with a token past `MAX_TOKEN_LEN` is
+    /// dropped by `parse_line` itself, same as any other malformed line —
+    /// it never reaches `link_panes`, and its underlying report never
+    /// forwards either.
+    #[test]
+    fn an_oversized_token_status_line_is_dropped_before_touching_link_panes() {
+        let (path, listener) = scratch_listener("link-token-cap");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx);
+        let mut c = connect(&path);
+
+        let long_token = "a".repeat(MAX_TOKEN_LEN + 1);
+        c.get_mut()
+            .write_all(
+                format!(
+                    r#"{{"pane":"1","token":"{long_token}","event":"status","status":"working"}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "an oversized-token status line must produce no event at all"
         );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());

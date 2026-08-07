@@ -22,4 +22,11 @@ pub enum AppEvent {
     /// Session id reported by an agent-side extension (status socket). Middle
     /// field is the pane's `ROOST_TOKEN` (verified before use).
     Session(PaneId, String, String),
+    /// A status-socket connection reporting for this pane went up (accepted
+    /// its first status/session line) or down (closed) — see
+    /// `infra::sock`'s `ConnGuard`. Middle field is the pane's `ROOST_TOKEN`
+    /// as last seen on that connection, verified before use exactly like
+    /// `Status`/`Session`; a link-down for a connection that never
+    /// authenticated for this pane must not clear a different pane's link.
+    ExtLink(PaneId, String, bool),
 }
