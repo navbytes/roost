@@ -108,8 +108,12 @@ SPEC-GAP-4. The stance is now reversed, and the tokens are styles rather than
 colours. Names below are the accessors in `src/ui/theme.rs`; the old
 `SCREAMING_CASE` names are gone. Rename map for reading older text in this
 document: `FG`→`ink`, `MUTED`/`DIM`→`quiet` (they collapse), `RULE`→`rule`,
-`ACCENT`→`accent`, `ACCENT_DIM`→`accent_quiet`, pulse phase A→`pulse_bright`,
-pulse phase B→`accent`; `BG`, `TAB_STRIP` and `BAR` are **deleted**.
+`ACCENT`→`accent`, `ACCENT_DIM`→`accent_quiet`; `BG`, `TAB_STRIP` and `BAR`
+are **deleted**. **[Amended 2026-08-07, C5]** `pulse phase A`/`pulse phase B`
+are retired concepts, not renamed ones — `pulse_bright()` no longer exists,
+and the two-phase idea it named has no successor (animation is a ten-frame
+glyph cycle now, not a two-value colour flip). Older text using either term
+should be read against C5's spinner amendment, not looked up as an accessor.
 
 | Token | ratatui expression | Where used in chrome |
 |---|---|---|
@@ -648,16 +652,12 @@ ink, one rung back.
 Red); tab variant `:271–280`; no animation.
 
 **Target — one table, used by every chrome surface that shows status
-(tab bar, corner badge, collapsed rows):**
+(tab bar, corner badge, collapsed rows). [Amended 2026-08-07, C5 — see the
+spinner amendment below for the full rule]:**
 
-**[Amended 2026-08-07, C5 — see the spinner amendment below]** The `Pulse`
-column and the `●` glyph in the row below are the pre-2026-08-07 shape,
-kept for the historical record; the live rule is "Working glyph, Animated"
-in the amendment at the end of this contract.
-
-| AgentStatus | Glyph | Color | Pulse |
+| AgentStatus | Glyph | Color | Animated |
 |---|---|---|---|
-| Working | `●` | `ACCENT` | **yes** |
+| Working | `SPINNER_FRAMES` — `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, 80ms/frame, shared elapsed clock | `ACCENT` | **yes** — steady `⠋` only in the three sanctioned cases below (N1 frozen view, C15 legend, C27 filter tag) |
 | NeedsInput | `◆` | `ACCENT` | no (steady) |
 | Waiting | `○` | `FG` | no |
 | Idle | `·` | `DIM` | no |
@@ -744,13 +744,24 @@ becomes the only glyph that ever asks the user to look. Concretely:
   tick is needed. Unit boundaries: 0ms →
   frame 0, 79ms → frame 0, 80ms → frame 1, 795ms → frame 9, 800ms →
   frame 0 (wraps).
-- **The frozen-view exception (N1, C4) carries over unchanged in shape:** a
-  scrolled pane's corner badge shows Working's steady frame
-  (`theme::GLYPH_WORKING`, `SPINNER_FRAMES[0]`) instead of the live spinner —
-  an animating glyph still asserts "alive right now", which a frozen view
-  still must not claim. Collapsed rows and the tab bar have no frozen-view
-  concept (no grid to freeze), so they always animate, exactly as they
-  always pulsed.
+- **Three sanctioned steady-frame cases — everywhere else, Working animates.**
+  All three show `theme::GLYPH_WORKING` (`SPINNER_FRAMES[0]`, `⠋`) instead of
+  the live spinner, and all three exist for the same reason: an animating
+  glyph asserts "alive right now", which none of the three may claim.
+  1. **N1 frozen view (C4).** A scrolled pane's corner badge — the frozen-view
+     exception carried over unchanged in shape from the colour-pulse era. The
+     `↑N` token already says the view is history; an animating glyph beside
+     it would contradict that.
+  2. **C15 help legend.** The status legend row in the help overlay is static
+     text and cannot itself animate, so it prints Working's representative
+     frame rather than a live one.
+  3. **C27 status-filter tag.** The roster's title tag names *which tier* is
+     filtered — it is a label for the tier, not a live report on any one
+     pane's animation, so it stays steady the same way the legend does.
+
+  Collapsed rows and the tab bar carry none of these three carve-outs (no
+  grid to freeze, no static label to be) — they always animate, exactly as
+  they always pulsed.
 - **Terminals without braille glyph support** render the spinner frames as
   tofu. Accepted deliberately: pi itself (the flagship adapter) already
   requires braille support to draw its own spinner, and per-terminal
@@ -2446,9 +2457,12 @@ you.**
     severity, matching C19's ring, which also pins it last regardless of
     urgency — one placement rule for both surfaces.
   - **[Amended 2026-08-07, ux P2-11 — status filter]** `Tab` cycles a status
-    filter forward through six stops (every tier, then ◆, ○, ●, ·, exited —
-    `roster_rank`'s own order, so the filter and the sort agree on what
-    "worse" means); `Shift+Tab` steps back; both wrap. It composes with the
+    filter forward through six stops (every tier, then ◆, ○, ⠋ (steady frame),
+    ·, exited — `roster_rank`'s own order, so the filter and the sort agree on
+    what "worse" means); `Shift+Tab` steps back; both wrap. The Working stop
+    is one of C5's three sanctioned steady-frame cases (with N1 and the C15
+    legend): the tag names *which tier* is filtered, not a live per-pane
+    report, so it never substitutes the live spinner. It composes with the
     type-ahead **by AND** — a row must satisfy both, the ordinary multi-facet-
     search reading and the simplest rule that doesn't special-case either
     filter. A group whose panes all fail *either* filter drops its header

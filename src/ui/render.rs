@@ -3795,9 +3795,13 @@ mod tests {
     /// pair the user has already validated — optionally one rung quieter.
     /// A chrome cell carrying a *letter* may therefore only be `Reset`, the
     /// accent red, or unstyled; never a colour the theme is free to swallow.
+    /// [Amended 2026-08-07, C5] `LightRed` (the retired colour pulse's
+    /// bright phase) is gone from the allow-list — animation lives in the
+    /// glyph now, not a second red, and `LightRed` has no live constructor
+    /// left anywhere under `src/`.
     #[test]
     fn every_chrome_word_is_drawn_in_ink_the_user_already_reads() {
-        let legible = [Color::Reset, Color::Red, Color::LightRed];
+        let legible = [Color::Reset, Color::Red];
         for (name, buf) in chrome_buffers() {
             let area = *buf.area();
             for y in area.y..area.y + area.height {

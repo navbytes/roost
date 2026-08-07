@@ -4061,7 +4061,8 @@ impl<B: PaneBackend> App<B> {
     /// exactly as a ring jump does.
     ///
     /// [Amended, ux P2-11] Tab order is no longer the sort key. Both tiers
-    /// sort worst-first (`roster_rank`, C5's severity order: ◆→○→●→·→exited):
+    /// sort worst-first (`roster_rank`, C5's severity order: ◆→○→⠋→·→exited —
+    /// ⠋ standing for the Working spinner, C5 amended 2026-08-07):
     /// panes within a tab's group, and then the groups themselves by their
     /// own worst pane — so the tab holding the one ◆ in a twenty-pane fleet
     /// is the *first* group, and that pane is its *first* row, not something
@@ -5613,7 +5614,8 @@ pub enum RosterRow {
 }
 
 /// [ux P2-11] Worst-first severity rank for `roster_rows`' sort — lower
-/// sorts earlier, mirroring C5's glyph-severity order (◆→○→●→·→exited) and
+/// sorts earlier, mirroring C5's glyph-severity order (◆→○→⠋→·→exited, ⠋
+/// standing for the Working spinner) and
 /// the roster's own status-filter cycle (`ROSTER_STATUS_CYCLE`) below it. A
 /// never-started pane (`None` — C27's own "not started" rung, `display_status`
 /// returns it for a lazy tab's pane) ranks with `Idle`: the tab bar already
@@ -10282,7 +10284,7 @@ mod tests {
         assert_eq!(roster_panes(&app), app.attention_ring());
     }
 
-    /// [ux P2-11] Sort worst-first (◆→○→●→·→exited), both within a tab's
+    /// [ux P2-11] Sort worst-first (◆→○→⠋→·→exited, ⠋ = Working spinner), both within a tab's
     /// group and across groups by their own worst pane — the fix for
     /// "past one screenful you scroll hunting for the ◆s": the tab holding
     /// the one ◆ becomes the *first* group, and that pane its *first* row,
@@ -10531,7 +10533,7 @@ mod tests {
         app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
         assert!(roster_panes(&app).is_empty(), "○ only — nothing is Waiting");
         app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(roster_panes(&app), vec![tab0[1]], "● only");
+        assert_eq!(roster_panes(&app), vec![tab0[1]], "⠋ (working) only");
         app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(roster_panes(&app), vec![tab1[0]], "· only");
         app.handle_mode_key(KeyEvent::from(KeyCode::Tab));
