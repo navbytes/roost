@@ -1564,6 +1564,16 @@ to reach it.
   anywhere suppresses it outright; the fallback excludes a quiet shell (and
   the scratch float, which is always a shell); the roster/ring agreement
   test below covers the three-way interaction.
+- **Known gap, accepted rather than closed:** at N = 0 the hint bar's
+  `◆ N needs you · Alt+a` segment is omitted (C9), so the fallback this
+  amendment adds has *no* advertised surface — the one case it exists for
+  is the one where nothing on screen says `Alt+a` still does anything. This
+  is the same trade-off the original C9 amendment already made for `Alt+a`
+  generally (no Normal-mode hint pair at any N), just visible at a new edge:
+  a user who has never pressed `Alt+a` while N > 0 has no way to discover
+  the fallback exists. Left alone rather than inventing a new hint-bar
+  surface in an audit-response pass; a Normal-mode pair (dropping the
+  N > 0-only rule) is the fix if this needs to be discoverable cold.
 
 ### C20 — Activity feed (Alt+e) — [Added 2026-07-22, fleet features]
 
@@ -2213,6 +2223,9 @@ you.**
     `no pane matches` line in `quiet()` at the inner area's middle row —
     C20's empty-feed shape verbatim, for the same reason: a modal that
     explains its own emptiness beats one that just goes blank.
+    **[Amended 2026-08-07, ux P2-11]** No longer the *only* way: the status
+    filter can empty it too (a tier nothing is in). Same row, same reason —
+    the emptiness has one shape regardless of which filter caused it.
   - **Two marks, two meanings.** The row's leading column is the *cursor*
     (`❯`, `accent()` — the C14/C20 idiom), and C8's own `▎` still marks the
     *focused* pane inside the row. "What will Enter act on" and "where am I
