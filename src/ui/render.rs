@@ -32,13 +32,14 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // Body comes from the app so pane rects, PTY sizing, and rendering all
     // agree on where the hint bar's reserved row is.
     let body = app.body_area();
-    // C5/D3: one shared clock read for the whole frame. The pulse contract
-    // requires every Working glyph to flip in unison; sampling `app.elapsed()`
-    // separately per glyph left a real (if tiny) window for the clock to tick
-    // past the 550ms edge mid-draw and split a frame across both phases.
-    let pulse: Style = theme::pulse_phase(app.elapsed());
+    // C5/D3: one shared clock read for the whole frame. The spinner contract
+    // requires every Working glyph to show the same frame; sampling
+    // `app.elapsed()` separately per glyph left a real (if tiny) window for
+    // the clock to tick past a frame boundary mid-draw and split a frame
+    // across two different spinner glyphs.
+    let spinner: char = theme::spinner_frame(app.elapsed());
 
-    draw_tab_bar(f, app, tab_bar, pulse);
+    draw_tab_bar(f, app, tab_bar, spinner);
 
     // C6: header row above each stack tall enough to spare one — a separate
     // walk over the same tree `app.rects()` reads, since the header isn't a
@@ -65,7 +66,7 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // singleton, or disjoint tiled rects that never overlap each other).
     let rects = app.display_rects();
     for pr in rects.iter().rev() {
-        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), pulse);
+        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), spinner);
     }
 
     if app.hints_shown() {
@@ -76,7 +77,7 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // Anchor floating dialogs near the focused pane rather than dead-center
     // of the whole screen, so it's visually obvious which pane they affect.
     let anchor = rects.iter().find(|pr| pr.id == app.focused).map(|pr| pr.rect).unwrap_or(body);
-    draw_mode_overlay(f, app, body, anchor, pulse);
+    draw_mode_overlay(f, app, body, anchor, spinner);
 }
 
 /// ux P3-16: what `draw` shows instead of nothing when the terminal is
@@ -799,7 +800,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "READING THE SCREEN",
         rows: &[
-            ("status", "● working ◆ needs you ○ waiting · idle ✕ exited"),
+            ("status", "⠋ working ◆ needs you ○ waiting · idle ✕ exited"),
             // D2 (PR #46 design audit, C29 amendment): widened for native
             // selection — a chord (Shift+click) gets a row here by C15's
             // own stated rule ("Alt+click gets its own row because it is a
@@ -898,15 +899,15 @@ fn dialog_rect(
     }
 }
 
-/// `pulse` is the frame's one shared C5 phase read (see `draw`) — the roster
-/// draws status glyphs, and a second `app.elapsed()` sample here could split a
-/// frame across both phases.
+/// `spinner` is the frame's one shared C5 clock read (see `draw`) — the
+/// roster draws status glyphs, and a second `app.elapsed()` sample here could
+/// split a frame across two different spinner glyphs.
 fn draw_mode_overlay<B: PaneBackend>(
     f: &mut Frame,
     app: &App<B>,
     body: Rect,
     anchor: Rect,
-    pulse: Style,
+    spinner: char,
 ) {
     let Some(rect) =
         dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
@@ -1064,7 +1065,7 @@ fn draw_mode_overlay<B: PaneBackend>(
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            draw_roster_rows(f, app, *cursor, inner, pulse);
+            draw_roster_rows(f, app, *cursor, inner, spinner);
         }
     }
 }
@@ -1078,7 +1079,7 @@ fn draw_roster_rows<B: PaneBackend>(
     app: &App<B>,
     cursor: layout::PaneId,
     inner: Rect,
-    pulse: Style,
+    spinner: char,
 ) {
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -1100,7 +1101,7 @@ fn draw_roster_rows<B: PaneBackend>(
         .iter()
         .skip(top)
         .take(inner.height as usize)
-        .map(|row| Line::from(roster_row_spans(app, row, inner.width, cursor, pulse)))
+        .map(|row| Line::from(roster_row_spans(app, row, inner.width, cursor, spinner)))
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -1121,7 +1122,7 @@ fn roster_row_spans<B: PaneBackend>(
     row: &RosterRow,
     width: u16,
     cursor: layout::PaneId,
-    pulse: Style,
+    spinner: char,
 ) -> Vec<Span<'static>> {
     match row {
         RosterRow::Group { label } => {
@@ -1144,8 +1145,6 @@ fn roster_row_spans<B: PaneBackend>(
             let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
             let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
             let name = if spec.is_some() { app.display_name(id) } else { "?".into() };
-            let (_, base, pulses) = row_status_style(status);
-            let glyph_style = if pulses { pulse } else { base };
             let marker = if id == cursor {
                 Span::styled(theme::PICKER_SELECTED.to_string(), theme::accent())
             } else {
@@ -1161,7 +1160,7 @@ fn roster_row_spans<B: PaneBackend>(
                 &adapter,
                 has_title,
                 app.is_raw(id),
-                glyph_style,
+                spinner,
             ));
             spans
         }
@@ -1284,7 +1283,7 @@ pub fn tab_status_word<B: PaneBackend>(app: &App<B>) -> Option<&'static str> {
     (word != "NORMAL").then_some(word)
 }
 
-fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: Style) {
+fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner: char) {
     let cwd = app.focused_cwd();
     let saved = app.last_save_ok();
     let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
@@ -1311,8 +1310,7 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
         // [Amended 2026-07-28] ...and how many panes are in that state, so a
         // tab of three needy agents stops reading like a tab of one.
         let (summary, count) = app.tab_summary(i);
-        let (glyph, base_style) = tab_summary_badge(summary);
-        let glyph_style = if summary == TabSummary::Working { pulse } else { base_style };
+        let (glyph, glyph_style) = tab_summary_badge(summary, spinner);
         push_tab_spans(&mut spans, i, &tab.name, active, glyph, glyph_style, count);
         used += mouse::tab_width(i, &tab.name);
     }
@@ -1357,10 +1355,11 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, pulse: 
 /// matches `mouse::tab_width` (`display_width(label) + 8`) exactly.
 ///
 /// [Amended 2026-07-28] `count` is how many of the tab's panes are in the
-/// summarized state (the second half of `App::tab_summary`). It renders in the glyph's
-/// own style — pulse included, so `●3` flips as one token rather than as a
-/// dot with a number stuck to it: the count is part of the signal, not a
-/// separate remark about it.
+/// summarized state (the second half of `App::tab_summary`). It renders in
+/// the glyph's own style. [Amended 2026-08-07, spinner] the style itself no
+/// longer flips — the *glyph* does (C5's spinner), and the count rides right
+/// beside it, so `⠋3`→`⠙3`→… still reads as one animating token rather than a
+/// static digit stuck to a spinning dot.
 fn push_tab_spans(
     spans: &mut Vec<Span<'static>>,
     index: usize,
@@ -1431,9 +1430,13 @@ pub fn tab_count_cell_cols(n: usize) -> u16 {
 /// Map a tab's aggregate summary to a tab-bar glyph + style (theme::C5).
 /// `Quiet` renders as a blank (no clutter for tabs with nothing to report);
 /// `Unknown` is a quiet dot so a not-yet-spawned background tab reads as
-/// "unknown", not idle.
-fn tab_summary_badge(s: crate::core::app::TabSummary) -> (char, Style) {
-    theme::tab_summary_style(s)
+/// "unknown", not idle. `spinner` substitutes in for `Working`'s glyph — the
+/// tab strip shows no grid (unlike a pane's own corner badge), so there is no
+/// frozen view to preserve and it always animates.
+fn tab_summary_badge(s: crate::core::app::TabSummary, spinner: char) -> (char, Style) {
+    let (glyph, style) = theme::tab_summary_style(s);
+    let glyph = if s == TabSummary::Working { spinner } else { glyph };
+    (glyph, style)
 }
 
 /// C8's state-word table: the collapsed row's right-segment word for each
@@ -1560,7 +1563,7 @@ fn draw_pane<B: PaneBackend>(
     app: &mut App<B>,
     pr: PaneRect,
     stack_expanded: bool,
-    pulse: Style,
+    spinner: char,
 ) {
     let focused = app.focused == pr.id;
     let raw = app.is_raw(pr.id);
@@ -1590,7 +1593,7 @@ fn draw_pane<B: PaneBackend>(
 
     if pr.collapsed {
         // C8: collapsed stack member — a single-row fleet-view bar.
-        draw_collapsed_row(f, pr.rect, focused, status, pr.id, &name, &adapter, has_title, raw, pulse);
+        draw_collapsed_row(f, pr.rect, focused, status, pr.id, &name, &adapter, has_title, raw, spinner);
         return;
     }
 
@@ -1656,10 +1659,10 @@ fn draw_pane<B: PaneBackend>(
     // focused included: occlusion of the inner app's own top-right cells is
     // accepted by design now that identity lives here, not a border title.
     // U3: a scrolled pane's badge gains the dim ↑N token; N1: its Working
-    // glyph stops pulsing while the view is frozen (badge_glyph_color).
-    let (glyph, glyph_base, pulses) = theme::status_style(status);
+    // glyph stops animating while the view is frozen (badge_glyph).
+    let (base_glyph, glyph_style, spins) = theme::status_style(status);
     let scrolled = app.scroll_offset(pr.id);
-    let glyph_style = badge_glyph_style(pulses, scrolled, pulse, glyph_base);
+    let glyph = badge_glyph(spins, scrolled, spinner, base_glyph);
     let text = badge_text(pr.id, &name, &adapter, has_title);
     if let Some((rect, spans)) = corner_badge(inner, &text, raw, scrolled, glyph, glyph_style) {
         f.render_widget(Paragraph::new(Line::from(spans)), rect);
@@ -1721,6 +1724,10 @@ fn paint_stack_edge(f: &mut Frame, rect: Rect) {
 /// [Amended, C27] `status` is optional because the roster reuses this row
 /// for panes in tabs the lazy spawn has not started: `None` is "not started"
 /// (`row_word`/`row_status_style`), not a corpse.
+/// [Amended 2026-08-07, spinner] `spinner` replaces the old resolved
+/// `glyph_style: Style` — the glyph now animates (Working substitutes the
+/// current spinner frame) while its style stays constant, so both are
+/// resolved from `status` in here rather than by every caller.
 #[allow(clippy::too_many_arguments)]
 fn collapsed_row_spans(
     width: u16,
@@ -1731,9 +1738,12 @@ fn collapsed_row_spans(
     adapter: &str,
     has_title: bool,
     raw: bool,
-    glyph_style: Style,
+    spinner: char,
 ) -> Vec<Span<'static>> {
-    let (glyph, ..) = row_status_style(status);
+    let (base_glyph, glyph_style, spins) = row_status_style(status);
+    // Collapsed rows show no live grid (unlike a pane's own corner badge),
+    // so there is no frozen view to preserve — Working always animates here.
+    let glyph = if spins { spinner } else { base_glyph };
     let marker = if focused {
         (theme::MARKER_ACTIVE.to_string(), theme::accent())
     } else {
@@ -1779,10 +1789,8 @@ fn draw_collapsed_row(
     adapter: &str,
     has_title: bool,
     raw: bool,
-    pulse: Style,
+    spinner: char,
 ) {
-    let (_, base, pulses) = theme::status_style(status);
-    let glyph_style = if pulses { pulse } else { base };
     // `Some`, always: a drawn row belongs to the active tab (or the float),
     // and those are spawned by construction — only C27's roster reaches
     // across into tabs that aren't.
@@ -1795,7 +1803,7 @@ fn draw_collapsed_row(
         adapter,
         has_title,
         raw,
-        glyph_style,
+        spinner,
     );
     f.render_widget(Paragraph::new(Line::from(spans)), rect);
 }
@@ -1869,16 +1877,16 @@ fn corner_badge(
     Some((Rect::new(x, inner.y, w, 1), spans))
 }
 
-/// N1: the badge glyph's style — the C5 pulse only while the pane's view is
-/// at the live tail. A pulsing `●` asserts "alive right now", which a frozen
-/// (scrolled) view must not do; the glyph keeps its steady base style (the
-/// status itself stays truthful — the agent IS working) while the C4 `↑N`
-/// token carries the frozen-view signal. Any path that resets the offset
-/// resumes the pulse. Collapsed rows and the tab bar keep pulsing: they
-/// show no grid, so there is no frozen view to lie about.
-fn badge_glyph_style(pulses: bool, scrolled: usize, pulse: Style, base: Style) -> Style {
-    if pulses && scrolled == 0 {
-        pulse
+/// N1: the badge glyph shown — the C5 spinner only while the pane's view is
+/// at the live tail. An animating glyph asserts "alive right now", which a
+/// frozen (scrolled) view must not do; the glyph freezes at its steady frame
+/// (the status itself stays truthful — the agent IS working) while the C4
+/// `↑N` token carries the frozen-view signal. Any path that resets the
+/// offset resumes the animation. Collapsed rows and the tab bar keep
+/// animating: they show no grid, so there is no frozen view to lie about.
+fn badge_glyph(spins: bool, scrolled: usize, spinner: char, base: char) -> char {
+    if spins && scrolled == 0 {
+        spinner
     } else {
         base
     }
@@ -2266,15 +2274,15 @@ mod tests {
     }
 
     #[test]
-    fn badge_glyph_pulse_yields_while_the_view_is_frozen() {
-        // N1: pulsing red means "alive right now" — a scrolled pane's glyph
-        // holds the steady base color instead; the tail resumes the pulse.
-        let phase = theme::pulse_bright(); // pretend mid-pulse phase A
-        assert_eq!(super::badge_glyph_style(true, 0, phase, theme::accent()), phase);
-        assert_eq!(super::badge_glyph_style(true, 12, phase, theme::accent()), theme::accent());
-        // Non-pulsing statuses are steady either way.
-        assert_eq!(super::badge_glyph_style(false, 0, phase, theme::ink()), theme::ink());
-        assert_eq!(super::badge_glyph_style(false, 12, phase, theme::ink()), theme::ink());
+    fn badge_glyph_yields_to_the_steady_frame_while_the_view_is_frozen() {
+        // N1: an animating glyph means "alive right now" — a scrolled pane's
+        // glyph freezes at its steady frame instead; the tail resumes it.
+        let frame = theme::SPINNER_FRAMES[3]; // pretend mid-spin frame
+        assert_eq!(super::badge_glyph(true, 0, frame, theme::GLYPH_WORKING), frame);
+        assert_eq!(super::badge_glyph(true, 12, frame, theme::GLYPH_WORKING), theme::GLYPH_WORKING);
+        // Non-spinning statuses are steady either way.
+        assert_eq!(super::badge_glyph(false, 0, frame, theme::GLYPH_IDLE), theme::GLYPH_IDLE);
+        assert_eq!(super::badge_glyph(false, 12, frame, theme::GLYPH_IDLE), theme::GLYPH_IDLE);
     }
 
     #[test]
@@ -2427,7 +2435,7 @@ mod tests {
     #[test]
     fn collapsed_row_shows_right_segment_when_it_fits() {
         let spans =
-            collapsed_row_spans(40, false, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::accent());
+            collapsed_row_spans(40, false, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("pi · working "));
     }
@@ -2439,7 +2447,7 @@ mod tests {
         // right segment is the bare state word — "your turn", not
         // "shell · your turn". [DESIGN-ui.md amended 2026-07-22, ux #3.]
         let spans =
-            collapsed_row_spans(40, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, false, theme::ink());
+            collapsed_row_spans(40, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("your turn "));
         assert!(!text.contains("shell ·"));
@@ -2452,7 +2460,7 @@ mod tests {
         // nothing more (U2: the id rides with the name on the left).
         let left_w = 5 + name.chars().count() as u16;
         let spans =
-            collapsed_row_spans(left_w, false, Some(AgentStatus::Idle), 2, name, "shell", true, false, theme::quiet());
+            collapsed_row_spans(left_w, false, Some(AgentStatus::Idle), 2, name, "shell", true, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" · 2 {name}"));
         assert!(!text.contains("shell"));
@@ -2469,7 +2477,7 @@ mod tests {
             "shell",
             true,
             false,
-            theme::ink(),
+            theme::GLYPH_WORKING,
         );
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text.chars().count(), 4);
@@ -2479,19 +2487,19 @@ mod tests {
     #[test]
     fn collapsed_row_focused_marker_is_accent() {
         let spans =
-            collapsed_row_spans(40, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::accent());
+            collapsed_row_spans(40, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style, theme::accent());
     }
 
     #[test]
     fn collapsed_row_raw_gains_the_prefix_ahead_of_the_usual_right_segment() {
-        let titled = collapsed_row_spans(60, false, Some(AgentStatus::Working), 2, "pi", "pi", true, true, theme::accent());
+        let titled = collapsed_row_spans(60, false, Some(AgentStatus::Working), 2, "pi", "pi", true, true, theme::GLYPH_WORKING);
         let text: String = titled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · pi · working "), "{text}");
 
         let untitled =
-            collapsed_row_spans(60, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, true, theme::ink());
+            collapsed_row_spans(60, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, true, theme::GLYPH_WORKING);
         let text: String = untitled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · your turn "), "{text}");
     }
@@ -2826,7 +2834,7 @@ mod tests {
         assert_eq!(spans[2].style.bg, Some(theme::ACTIVE_TAB_BG));
         assert_eq!(spans[4].content.as_ref(), theme::GLYPH_WORKING.to_string());
         assert_eq!(spans[4].style, theme::accent());
-        // ...then the count, in the glyph's own style so `●3` is one token.
+        // ...then the count, in the glyph's own style so `⠋3` is one token.
         assert_eq!(spans[5].content.as_ref(), "3");
         assert_eq!(spans[5].style, theme::accent());
         assert_eq!(spans[7].content.as_ref(), theme::TAB_SEPARATOR.to_string());
@@ -2934,7 +2942,7 @@ mod tests {
     #[test]
     fn collapsed_row_spans_at_zero_width_is_empty_not_panicking() {
         let spans =
-            collapsed_row_spans(0, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::accent());
+            collapsed_row_spans(0, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
         assert!(spans.is_empty());
     }
 
@@ -4187,7 +4195,7 @@ mod tests {
             &RosterRow::Pane { id: unspawned[0] },
             50,
             app.focused,
-            theme::accent(),
+            theme::GLYPH_WORKING,
         )
         .iter()
         .map(|s| s.content.to_string())
@@ -4203,7 +4211,7 @@ mod tests {
         let row = RosterRow::Group { label: " 1 MAIN · 2 PANES".to_string() };
         let mut app = mk_app(ratatui::layout::Size::new(100, 30));
         app.apply(crate::ui::input::Action::ToggleRoster);
-        let spans = super::roster_row_spans(&app, &row, 40, 1, theme::accent());
+        let spans = super::roster_row_spans(&app, &row, 40, 1, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(mouse::display_width(&text), 40, "the label is padded to the row width");
         for s in &spans {
@@ -4227,7 +4235,7 @@ mod tests {
         let other = app.pane_order().into_iter().find(|id| *id != focused).expect("two panes");
 
         let render = |app: &App<crate::ports::fakes::FakePane>, id, cursor| -> String {
-            super::roster_row_spans(app, &RosterRow::Pane { id }, 50, cursor, theme::accent())
+            super::roster_row_spans(app, &RosterRow::Pane { id }, 50, cursor, theme::GLYPH_WORKING)
                 .iter()
                 .map(|s| s.content.to_string())
                 .collect()
@@ -4249,7 +4257,7 @@ mod tests {
             "shell",
             false,
             false,
-            theme::quiet(),
+            theme::GLYPH_WORKING,
         )
         .iter()
         .map(|s| s.content.to_string())

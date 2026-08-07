@@ -754,8 +754,8 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// Time since app start — the shared clock chrome uses for the
-    /// Working-glyph pulse (`theme::pulse_phase`, C5), so every pulsing
-    /// glyph on screen flips in unison.
+    /// Working-glyph spinner (`theme::spinner_frame`, C5), so every animating
+    /// glyph on screen shows the same frame.
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
@@ -2891,7 +2891,7 @@ impl<B: PaneBackend> App<B> {
 
     /// U3: pane `id`'s grid-clamped view offset — > 0 means its on-screen
     /// grid is frozen history, which the corner badge must mark (`↑N`) and
-    /// the Working pulse must stop asserting liveness over (N1). 0 for a
+    /// the Working spinner must stop asserting liveness over (N1). 0 for a
     /// pane with no runtime.
     pub fn scroll_offset(&self, id: PaneId) -> usize {
         self.runtimes.get(&id).map(|rt| rt.scroll_offset()).unwrap_or(0)

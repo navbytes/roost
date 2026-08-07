@@ -28,9 +28,11 @@ use harness::{Harness, COLS, ROWS};
 const RED: vt100::Color = vt100::Color::Idx(1);
 /// ANSI 8 — the structure slot: borders, separators, rules. Never text.
 const STRUCTURE: vt100::Color = vt100::Color::Idx(8);
-/// ANSI 9 — `pulse_bright()`, the working pulse's other guaranteed-visible
-/// red (C5). A Working glyph may be `RED` or `LIGHT_RED` and nothing else.
-const LIGHT_RED: vt100::Color = vt100::Color::Idx(9);
+
+/// `theme::SPINNER_FRAMES` (C5), verbatim — kept as a literal here since this
+/// binary has no library target for an integration test to import the const
+/// from. The Working glyph is always one of these ten, never `●`.
+const SPINNER_FRAMES: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
 /// Alt+c: `Action::CopyMode`, ESC + `c` (not an escape introducer, so no
 /// DCS-style ambiguity — same family as `ALT_SHIFT_A` below).
@@ -220,9 +222,10 @@ fn borders_are_structure_and_the_badge_is_quiet_ink() {
     // — readable as a watermark in any theme, because it is the user's own
     // ink dimmed — and the status glyph rightmost of it carries its own C5
     // style, which is only sometimes dim (`·` idle, `✕` exited; `○` waiting
-    // is full-strength `ink()` per §2, and `●`/`◆` are the accent). So the
-    // scan has to step over the glyph by *position* before it starts reading
-    // weight, or a waiting pane breaks the walk on its own badge.
+    // is full-strength `ink()` per §2, and the Working spinner/`◆` are the
+    // accent). So the scan has to step over the glyph by *position* before it
+    // starts reading weight, or a waiting pane breaks the walk on its own
+    // badge.
     let badge_row = 2;
     let inner_right = corners[1] - 2; // last inner column of the focused pane
     let cell = |c: u16| screen.cell(badge_row, c).expect("cell inside the grid").contents();
@@ -233,10 +236,10 @@ fn borders_are_structure_and_the_badge_is_quiet_ink() {
         .rev()
         .find(|c| !cell(*c).trim().is_empty())
         .expect("the badge's status glyph");
+    let glyph = cell(glyph_col);
     assert!(
-        "●◆○·✕".contains(&cell(glyph_col)),
-        "badge col {glyph_col} should be a C5 status glyph, found {:?}",
-        cell(glyph_col),
+        "◆○·✕".contains(&glyph) || SPINNER_FRAMES.contains(&glyph),
+        "badge col {glyph_col} should be a C5 status glyph, found {glyph:?}",
     );
 
     // Everything left of the glyph is the quiet run, up to the point the walk
@@ -287,18 +290,42 @@ fn the_flash_reverses_the_terminals_own_pair_instead_of_filling() {
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
 }
 
-/// C5, end to end: the Working glyph (`●`) pulses between exactly two
-/// guaranteed-visible reds and never leans on DIM. Deliberately timing-
-/// independent — the harness already carries one host-timing flake
-/// (`firehose_latency_starvation_and_clean_exit`) and this suite must not
-/// gain a second one. Rather than racing the 1100ms/50%-duty clock to catch
-/// both phases, this samples whichever phase the frame happens to land on
-/// and asserts it is a **member of the two-colour set** the spec allows —
-/// true regardless of when the sample lands, and still false the moment a
-/// third hue (or a DIM-leaning pulse) is reintroduced.
+/// The first cell on screen whose contents is one of `SPINNER_FRAMES`, if
+/// any — `(row, col, glyph)`. Any single match is enough: C5 requires every
+/// Working glyph on screen to show the same frame in the same draw (one
+/// shared clock), and this scenario's fixture has exactly one Working pane.
+fn find_spinner_cell(screen: &vt100::Screen) -> Option<(u16, u16, String)> {
+    (0..ROWS).find_map(|r| {
+        (0..COLS).find_map(|c| {
+            let s = screen.cell(r, c)?.contents();
+            // `str::contains("")` is vacuously true, and a blank cell's
+            // `contents()` is empty — guard it explicitly, or this matches
+            // the first blank cell on screen instead of a real glyph.
+            (!s.is_empty() && SPINNER_FRAMES.contains(&s)).then_some((r, c, s))
+        })
+    })
+}
+
+/// C5, end to end (amended 2026-08-07 — the colour pulse is retired): the
+/// Working glyph is one of pi's ten braille spinner frames, never the
+/// retired `●`, and is always the one plain red — no second hue, and never
+/// DIM, now that the animation lives in the glyph's *shape* rather than a
+/// colour flip.
+///
+/// This also proves the property the redesign exists to guarantee: a
+/// Working pane that is completely **output-silent** still visibly animates,
+/// because roost's own render loop drives the clock, not the pane. The
+/// status hook line below types a command into the pane's shell — so there
+/// is a brief burst of real PTY bytes (the echo, the instant-silent
+/// subcommand, the prompt reappearing) — but nothing further is ever sent to
+/// the pane after that; the repeated sampling below spans roughly one full
+/// rotation (800ms nominal) with the pane sitting completely quiet
+/// throughout, so a spinner driven by the pane's own output would never
+/// move, while one driven by roost's own render tick (`main.rs`'s ~33ms
+/// crossterm poll) does.
 #[test]
-fn the_working_pulse_never_leaves_the_two_guaranteed_visible_reds() {
-    let Some(mut h) = spawn("chrome pulse gate") else { return };
+fn the_working_spinner_is_the_one_red_braille_set_and_animates_while_the_pane_is_silent() {
+    let Some(mut h) = spawn("chrome spinner gate") else { return };
 
     // A real status report over the real control socket — the same call a
     // Claude Code hook or the pi extension makes (status_hook.rs) — flips
@@ -307,26 +334,29 @@ fn the_working_pulse_never_leaves_the_two_guaranteed_visible_reds() {
     let bin = env!("CARGO_BIN_EXE_roost");
     h.write_bytes(format!("{bin} __status working\r").as_bytes());
     assert!(
-        h.wait_for(Duration::from_secs(5), |s| (0..ROWS)
-            .any(|r| (0..COLS).any(|c| s.cell(r, c).is_some_and(|x| x.contents() == "●"))))
-        .is_some(),
-        "the working glyph never appeared after the status hook",
+        h.wait_for(Duration::from_secs(5), |s| find_spinner_cell(s).is_some()).is_some(),
+        "no spinner frame ever appeared after the status hook",
     );
 
-    let screen = h.screen();
-    let mut found = 0;
-    for r in 0..ROWS {
-        for c in cols_of(&row_cols(screen, r), '●') {
-            let (fg, dim, ..) = attrs(screen, r, c);
-            assert!(
-                fg == RED || fg == LIGHT_RED,
-                "working glyph at ({r},{c}) is {fg:?} — the pulse allows only the two guaranteed reds",
-            );
-            assert!(!dim, "the pulse must never lean on DIM ({r},{c})");
-            found += 1;
-        }
+    // Sample several times over roughly one full rotation with nothing sent
+    // to the pane in between — every sample must be a valid frame in the one
+    // red, and at least two distinct frames must appear, or the glyph never
+    // actually animated.
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..10 {
+        let screen = h.screen();
+        let (r, c, glyph) = find_spinner_cell(screen).expect("the spinner is still on screen");
+        let (fg, dim, ..) = attrs(screen, r, c);
+        assert_eq!(fg, RED, "spinner glyph at ({r},{c}) is {fg:?} — must be the one red, not a second hue");
+        assert!(!dim, "the spinner must never lean on DIM ({r},{c})");
+        seen.insert(glyph);
+        std::thread::sleep(Duration::from_millis(90));
     }
-    assert!(found > 0, "no working glyph survived onto the parsed screen");
+    assert!(!seen.contains("●"), "the retired dot must never appear: {seen:?}");
+    assert!(
+        seen.len() > 1,
+        "the spinner never advanced while the pane sat silent — saw only {seen:?}",
+    );
 
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
 }
