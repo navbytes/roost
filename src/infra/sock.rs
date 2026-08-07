@@ -512,6 +512,14 @@ struct Limits {
     buckets: Mutex<HashMap<String, Bucket>>,
     /// Aggregate command-rate backstop — see `GLOBAL_BUCKET_CAPACITY`.
     global_bucket: Mutex<Bucket>,
+    /// promotion-auth-gate: open *authenticated reporter* connections per
+    /// pane — `REPORTER_MAX_CONN_PER_PANE` (8), a separate pool from
+    /// `per_principal` (decision 8: a pane's own status links must not be
+    /// able to starve its control budget, or vice versa). Entries removed
+    /// at 0, same convention as `per_principal`. Reserved iff a
+    /// `link_panes` entry is actually inserted — see `ConnGuard`'s doc
+    /// comment for why that pairing is load-bearing.
+    reporters: Mutex<HashMap<PaneId, usize>>,
 }
 
 impl Limits {
@@ -521,6 +529,7 @@ impl Limits {
             per_principal: Mutex::new(HashMap::new()),
             buckets: Mutex::new(HashMap::new()),
             global_bucket: Mutex::new(Bucket::new(GLOBAL_BUCKET_CAPACITY, GLOBAL_REFILL_PER_SEC)),
+            reporters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -581,6 +590,32 @@ impl Limits {
             .or_insert_with(|| Bucket::new(PRINCIPAL_BUCKET_CAPACITY, PRINCIPAL_REFILL_PER_SEC))
             .take()
     }
+
+    /// Admit one more authenticated reporter connection for `pane`, or
+    /// refuse at `REPORTER_MAX_CONN_PER_PANE`. Mirrors `try_reserve_principal`
+    /// exactly. Callers MUST only call this exactly once per eventual
+    /// `link_panes` entry — see the "slot ⟺ entry" doc on the door's status/
+    /// session handling for why (`MC-overflow-no-strand`).
+    fn try_reserve_reporter(&self, pane: PaneId) -> bool {
+        let mut map = lock(&self.reporters);
+        let count = map.entry(pane).or_insert(0);
+        if *count >= REPORTER_MAX_CONN_PER_PANE {
+            false
+        } else {
+            *count += 1;
+            true
+        }
+    }
+
+    fn release_reporter(&self, pane: PaneId) {
+        let mut map = lock(&self.reporters);
+        if let Some(count) = map.get_mut(&pane) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&pane);
+            }
+        }
+    }
 }
 
 /// Free one slot in `map` for a new token, at `MAX_TRACKED_TOKENS`. Picks the
@@ -625,6 +660,19 @@ fn evict_one(map: &mut HashMap<String, Bucket>) {
 /// link-liveness bookkeeping for that extra pane is skipped.
 const MAX_LINK_PANES_PER_CONN: usize = 4;
 
+/// promotion-auth-gate: cap on concurrent *authenticated reporter*
+/// connections one pane will admit, enforced in `Limits.reporters` at the
+/// same site as `link_panes` insertion (one mechanism, so the cap count,
+/// `link_panes`, and App's `ext_link_counts` all count the same thing by
+/// construction — no double-counting). Sizing: legit worst case is one
+/// long-lived pi connection + one dying old-generation connection
+/// mid-respawn + a burst of transient claude-hook one-shots (`roost
+/// __status`, each lives milliseconds) — 8 is ~2x that. Reporter
+/// connections do NOT share `PRINCIPAL_MAX_CONN`: that pool is sized
+/// against control traffic (`MAX_WAITS` in app.rs), and charging reporters
+/// there would let a pane's own status links starve its control budget.
+const REPORTER_MAX_CONN_PER_PANE: usize = 8;
+
 /// RAII: releases whatever connection-accounting slots this connection holds
 /// when dropped — including during a panic unwind (audit finding L1).
 /// Without this, a panic partway through the read loop (e.g. a
@@ -657,6 +705,13 @@ const MAX_LINK_PANES_PER_CONN: usize = 4;
 /// long-lived pi extension link) nets to +1/-1 per connection, never more —
 /// so App's count always equals the number of connections genuinely still
 /// open for that pane.
+///
+/// promotion-auth-gate: `link_panes` is ALSO now exactly the set of panes
+/// this connection holds a `Limits.reporters` slot for — one is reserved
+/// iff an entry is inserted (the door's status/session handling), so
+/// draining the map here and releasing a reporter slot per entry keeps
+/// slot and entry 1:1 by construction, the same way this struct already
+/// keeps link-up and link-down 1:1 (`MC-overflow-no-strand`).
 struct ConnGuard<'a> {
     limits: &'a Limits,
     principal: Option<String>,
@@ -671,6 +726,12 @@ impl Drop for ConnGuard<'_> {
             self.limits.release_principal(token);
         }
         for (pane, token) in self.link_panes.drain() {
+            // Slot ⟺ entry: every `link_panes` entry was inserted alongside
+            // a successful `try_reserve_reporter` (never on the
+            // MAX_LINK_PANES_PER_CONN overflow-skip path — that path never
+            // reserves in the first place), so releasing one per entry here
+            // is exactly right, no more no less.
+            self.limits.release_reporter(pane);
             // Best-effort: if the main loop is already gone the process is
             // shutting down anyway, and there is nothing left to tell.
             let _ = self.tx.send(AppEvent::ExtLink(pane, token, false));
@@ -1181,38 +1242,80 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                                 log_dropped(line);
                                 continue;
                             }
+                            // D2 + promotion-auth-gate reporter cap: the
+                            // first accepted status/session line for a given
+                            // pane on this connection makes it that pane's
+                            // live reporting link — tell App (link-up) and
+                            // remember it so `ConnGuard`'s `Drop` can tell
+                            // App again (link-down) whenever this connection
+                            // ends, however it ends. A later line for a pane
+                            // already in the map doesn't re-emit or re-check
+                            // any cap; the connection's liveness hasn't
+                            // changed, only its status has (the `ev` send
+                            // below).
+                            //
+                            // Slot ⟺ entry, pinned (MC-overflow-no-strand): a
+                            // `Limits.reporters` slot is reserved iff a
+                            // `link_panes` insert is about to happen — the
+                            // two calls are adjacent, on purpose, so there is
+                            // no window where one could succeed without the
+                            // other. [F2]'s existing MAX_LINK_PANES_PER_CONN
+                            // (this CONNECTION's own cap on distinct panes)
+                            // is checked *first*: when IT is what's full, the
+                            // reserve is never even attempted — reserving
+                            // there would strand a slot with no entry to ever
+                            // release it, slowly eating the pane's cap. Both
+                            // checks are one `&&`-condition (not nested
+                            // `if`s), so there is no separate branch that
+                            // could reach the reserve while the CONN cap
+                            // check is what's failing.
+                            if !guard.link_panes.contains_key(&pane)
+                                && guard.link_panes.len() < MAX_LINK_PANES_PER_CONN
+                            {
+                                if limits.try_reserve_reporter(pane) {
+                                    guard.link_panes.insert(pane, token.clone());
+                                    let _ = tx.send(AppEvent::ExtLink(pane, token, true));
+                                } else if !promoted {
+                                    // This pane is this connection's first
+                                    // successful authentication, and it's
+                                    // already at REPORTER_MAX_CONN_PER_PANE:
+                                    // there is nothing this connection is
+                                    // authenticated to report on, so there's
+                                    // no reason to hold it open. No reply —
+                                    // same as every other status/session-path
+                                    // refusal, this wire shape has none;
+                                    // roost.ts's retry covers the transient
+                                    // case.
+                                    log_debug(&format!(
+                                        "shed a reporter: pane {pane} already at \
+                                         REPORTER_MAX_CONN_PER_PANE ({REPORTER_MAX_CONN_PER_PANE})"
+                                    ));
+                                    break;
+                                }
+                                // else: already promoted via an earlier pane
+                                // on this same connection — don't kill it for
+                                // a second pane's cap. Skip link tracking for
+                                // `pane` only; `ev` still forwards below,
+                                // same as the MAX_LINK_PANES_PER_CONN
+                                // overflow case.
+                            }
+                            // else (either guard above false): a pane already
+                            // tracked needs no new reserve/insert, and the
+                            // MAX_LINK_PANES_PER_CONN overflow case ([F2],
+                            // unchanged) never attempts one — either way `ev`
+                            // still forwards below.
                             // A well-formed, authenticated status/session
                             // report promotes this connection exactly like a
                             // control request does, above — see the
                             // `promoted` doc comment at its declaration.
+                            // Unaffected by the cap branches above: a pane
+                            // past its own cap on an already-promoted
+                            // connection must not un-promote it, and the
+                            // close-on-cap-at-first-pane path already `break`s
+                            // before reaching here.
                             if !promoted {
                                 promoted = true;
                                 let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
-                            }
-                            // D2: the first accepted status/session line for
-                            // a given pane on this connection makes it that
-                            // pane's live reporting link — tell App (link-up)
-                            // and remember it so `ConnGuard`'s `Drop` can
-                            // tell App again (link-down) whenever this
-                            // connection ends, however it ends. A later line
-                            // for a pane already in the map doesn't re-emit;
-                            // the connection's liveness hasn't changed, only
-                            // its status has (that's the `ev` send below).
-                            //
-                            // [F2] Past MAX_LINK_PANES_PER_CONN distinct
-                            // panes, a *new* one is skipped here — no entry,
-                            // no link-up — while `ev` itself still forwards
-                            // below exactly as it would for any other pane.
-                            // Plain contains_key+insert rather than the
-                            // Entry API: the cap check needs the *whole
-                            // map's* length, which can't be read while an
-                            // `Entry` (a mutable borrow of the same map)
-                            // is still live.
-                            if !guard.link_panes.contains_key(&pane)
-                                && guard.link_panes.len() < MAX_LINK_PANES_PER_CONN
-                            {
-                                guard.link_panes.insert(pane, token.clone());
-                                let _ = tx.send(AppEvent::ExtLink(pane, token, true));
                             }
                             if tx.send(ev).is_err() {
                                 break;
@@ -1485,6 +1588,194 @@ mod tests {
         let mut discard = String::new();
         let n = c.read_line(&mut discard).expect("must be closed at the pre-auth deadline, not hang");
         assert_eq!(n, 0, "an unauthenticated-but-parseable status connection must die at the 2s deadline: {discard:?}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- promotion-auth-gate: the per-pane reporter cap ---------------------
+
+    /// MC-pane-cap: `REPORTER_MAX_CONN_PER_PANE` (8) valid reporter
+    /// connections for one pane are all admitted (each earns a link-up); a
+    /// 9th is refused promptly — no link-up, connection closed well before
+    /// `READ_TIMEOUT` — and closing one of the eight then frees a slot for a
+    /// fresh one, proving the release actually happens at `ConnGuard` drop,
+    /// not just that the reserve works. *Reds if the cap or its release is
+    /// removed.*
+    #[test]
+    fn mc_pane_cap_admits_exactly_eight_reporters_then_recycles_on_close() {
+        let (path, listener) = scratch_listener("mc-pane-cap");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx, seeded_reader(&[(1, "t")]));
+
+        let line = br#"{"pane":1,"token":"t","event":"status","status":"working"}"#;
+        let mut conns = Vec::new();
+        for i in 0..REPORTER_MAX_CONN_PER_PANE {
+            let mut c = connect(&path);
+            c.get_mut().write_all(line).unwrap();
+            c.get_mut().write_all(b"\n").unwrap();
+            let up = rx.recv_timeout(Duration::from_secs(2)).expect("setup: link-up never arrived");
+            assert!(
+                matches!(up, AppEvent::ExtLink(1, ref t, true) if t == "t"),
+                "reporter {i} (of {REPORTER_MAX_CONN_PER_PANE}) should be admitted"
+            );
+            rx.recv_timeout(Duration::from_secs(2)).expect("setup: status report never arrived");
+            conns.push(c);
+        }
+
+        // The 9th is refused: no link-up ever, and the connection closes
+        // promptly — the door's cap-full/close path, well before
+        // `READ_TIMEOUT` (this is its FIRST line, so it was never promoted).
+        let mut over = connect(&path);
+        over.get_ref().set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3))).unwrap();
+        over.get_mut().write_all(line).unwrap();
+        over.get_mut().write_all(b"\n").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the 9th reporter for one pane must never get a link-up"
+        );
+        let mut discard = String::new();
+        let n = over.read_line(&mut discard).expect("the 9th reporter must be closed, not hang");
+        assert_eq!(n, 0, "the 9th reporter must be closed promptly, not held open: {discard:?}");
+
+        // Closing one of the eight frees a slot for a fresh reporter.
+        conns.pop();
+        let down = rx.recv_timeout(Duration::from_secs(5)).expect("link-down for the closed reporter never arrived");
+        assert!(matches!(down, AppEvent::ExtLink(1, ref t, false) if t == "t"));
+
+        let mut fresh = connect(&path);
+        fresh.get_mut().write_all(line).unwrap();
+        fresh.get_mut().write_all(b"\n").unwrap();
+        let up = rx.recv_timeout(Duration::from_secs(2)).expect("a fresh reporter after a close must be admitted");
+        assert!(matches!(up, AppEvent::ExtLink(1, ref t, true) if t == "t"), "the freed slot must be usable");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// MC-overflow-no-strand: a connection already tracking
+    /// `MAX_LINK_PANES_PER_CONN` distinct panes (its own, unrelated,
+    /// per-CONNECTION cap) sends a further pane's line — [F2]'s existing
+    /// behavior (the report still forwards, no link tracking) is unchanged,
+    /// but the pinned addition is that NO reporter slot is consumed for it
+    /// either: the reserve must never even be attempted on that overflow-skip
+    /// path. Repeating well past `REPORTER_MAX_CONN_PER_PANE` must never
+    /// erode the pane's real cap — a fresh, independent connection for it is
+    /// still admitted afterward. *Reds if the overflow-skip path reserves
+    /// (strands) a slot — the silent cap-erosion bug slot⟺entry pinning
+    /// exists to prevent.*
+    #[test]
+    fn mc_overflow_no_strand_the_conn_cap_overflow_path_never_reserves_a_reporter_slot() {
+        let (path, listener) = scratch_listener("mc-overflow-no-strand");
+        let (tx, rx) = capturing_app();
+        let extra_pane = MAX_LINK_PANES_PER_CONN as u64 + 1;
+        let mut panes: Vec<(PaneId, &str)> =
+            (1..=MAX_LINK_PANES_PER_CONN as u64).map(|p| (p, "t")).collect();
+        panes.push((extra_pane, "t"));
+        let limits = spawn_accept_loop(listener, tx, seeded_reader(&panes));
+
+        // Fill this ONE connection's own MAX_LINK_PANES_PER_CONN cap first.
+        let mut c = connect(&path);
+        for pane in 1..=MAX_LINK_PANES_PER_CONN as u64 {
+            c.get_mut()
+                .write_all(format!(r#"{{"pane":{pane},"token":"t","event":"status","status":"working"}}"#).as_bytes())
+                .unwrap();
+            c.get_mut().write_all(b"\n").unwrap();
+        }
+        for _ in 0..(MAX_LINK_PANES_PER_CONN * 2) {
+            rx.recv_timeout(Duration::from_secs(2)).expect("setup: link-up/status never arrived");
+        }
+
+        // Send the same OVERFLOW pane's line repeatedly, well past
+        // REPORTER_MAX_CONN_PER_PANE attempts on this one connection alone —
+        // if the overflow path reserved even once per call, this would
+        // already have exhausted (and kept exhausting) pane P's real cap.
+        for _ in 0..(REPORTER_MAX_CONN_PER_PANE * 2) {
+            c.get_mut()
+                .write_all(format!(r#"{{"pane":{extra_pane},"token":"t","event":"status","status":"working"}}"#).as_bytes())
+                .unwrap();
+            c.get_mut().write_all(b"\n").unwrap();
+            let ev = rx.recv_timeout(Duration::from_secs(2)).expect("the overflow pane's report must still forward");
+            assert!(matches!(ev, AppEvent::Status(p, ..) if p == extra_pane));
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "past MAX_LINK_PANES_PER_CONN, no link tracking must ever happen — no link-up, ever"
+        );
+
+        // Direct proof: `Limits.reporters` has no entry for the overflow
+        // pane at all — not even a lingering zero-then-removed one.
+        assert!(
+            !limits.reporters.lock().unwrap().contains_key(&extra_pane),
+            "the overflow path must never reserve a slot for the pane it skips tracking"
+        );
+
+        // The property that actually matters operationally: a FRESH,
+        // independent connection for that same pane is still admitted.
+        let mut fresh = connect(&path);
+        fresh
+            .get_mut()
+            .write_all(format!(r#"{{"pane":{extra_pane},"token":"t","event":"status","status":"working"}}"#).as_bytes())
+            .unwrap();
+        fresh.get_mut().write_all(b"\n").unwrap();
+        let up = rx.recv_timeout(Duration::from_secs(2)).expect("a fresh connection for the overflow pane must still be admitted");
+        assert!(matches!(up, AppEvent::ExtLink(p, ref t, true) if p == extra_pane && t == "t"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// No-false-rejection, nested claude inside a pi pane: the pane's own
+    /// long-lived pi connection stays open throughout while a one-shot
+    /// claude-hook-shaped connection (same pane, same token — both inherit
+    /// the one `ROOST_TOKEN`) reports and disconnects alongside it. Both are
+    /// admitted (well under `REPORTER_MAX_CONN_PER_PANE`), each gets its own
+    /// independent link-up, and the one-shot's own close flicks only ITS
+    /// link back down — the live pi connection is untouched. sock.rs's half
+    /// of the property; the refcount arithmetic itself
+    /// (`ext_link_counts` 2 -> 1 -> keeps `ext_link` true) is app.rs's
+    /// `two_overlapping_links_for_one_pane_the_first_to_close_leaves_it_live`
+    /// / `a_one_shot_link_during_a_live_connection_never_reverts_it_down`
+    /// (F1) — unchanged, still green.
+    #[test]
+    fn nested_claude_hook_alongside_a_live_pi_connection_are_both_admitted() {
+        let (path, listener) = scratch_listener("nested-claude");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx, seeded_reader(&[(1, "t")]));
+
+        // The pane's own long-lived pi extension connection.
+        let mut pi = connect(&path);
+        pi.get_mut()
+            .write_all(br#"{"pane":1,"token":"t","event":"status","status":"working"}"#)
+            .unwrap();
+        pi.get_mut().write_all(b"\n").unwrap();
+        let up1 = rx.recv_timeout(Duration::from_secs(2)).expect("pi's link-up never arrived");
+        assert!(matches!(up1, AppEvent::ExtLink(1, ref t, true) if t == "t"));
+        rx.recv_timeout(Duration::from_secs(2)).expect("pi's status report never arrived");
+
+        // A nested claude's one-shot hook: connect, one line, disconnect —
+        // exactly `status_hook`'s shape (cli.rs).
+        let mut claude = UnixStream::connect(&path).expect("connect");
+        claude
+            .write_all(br#"{"pane":1,"token":"t","event":"status","status":"needs_input"}"#)
+            .unwrap();
+        claude.write_all(b"\n").unwrap();
+        drop(claude);
+        let up2 = rx.recv_timeout(Duration::from_secs(2)).expect("claude's link-up never arrived");
+        assert!(
+            matches!(up2, AppEvent::ExtLink(1, ref t, true) if t == "t"),
+            "the nested one-shot must ALSO be admitted — 2 reporters is well under the cap of 8"
+        );
+        rx.recv_timeout(Duration::from_secs(2)).expect("claude's status report never arrived");
+        let down1 = rx.recv_timeout(Duration::from_secs(2)).expect("claude's own link-down never arrived");
+        assert!(matches!(down1, AppEvent::ExtLink(1, ref t, false) if t == "t"));
+
+        // The live pi connection is completely unaffected by the nested
+        // one-shot's close.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the live pi connection's link must not be touched by the nested one-shot closing"
+        );
+        drop(pi);
+        let down2 = rx.recv_timeout(Duration::from_secs(2)).expect("pi's own eventual close must still emit its link-down");
+        assert!(matches!(down2, AppEvent::ExtLink(1, ref t, false) if t == "t"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
