@@ -122,7 +122,6 @@
   .nav a.btn-primary:hover { color: var(--color-bg); }
 
   /* ── page ─────────────────────────────────────────────────────────── */
-  @keyframes roost-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
   .kicker {
     display: block; font-family: var(--font-mono); font-weight: 700; font-size: 13px;

@@ -1,4 +1,17 @@
 (function () {
+  // Demo-mock working glyphs cycle pi's real spinner frames at the released
+  // 80ms cadence. Under prefers-reduced-motion the markup's static ⠋ stands
+  // (the chrome's own sanctioned steady frame) — the interval never starts.
+  var frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  var spinners = document.querySelectorAll('.spin-glyph');
+  if (spinners.length && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    var fi = 0;
+    setInterval(function () {
+      fi = (fi + 1) % frames.length;
+      spinners.forEach(function (el) { el.textContent = frames[fi]; });
+    }, 80);
+  }
+
   document.querySelectorAll('.js-copy').forEach(function (btn) {
     var original = btn.textContent;
     var ct;
