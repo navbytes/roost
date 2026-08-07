@@ -224,10 +224,10 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             let pos = positional(rest);
             let adapter = pos.first().ok_or("spawn needs an ADAPTER")?;
             m.insert("adapter".into(), adapter.as_str().into());
-            if let Some(cwd) = flag_value(rest, "--cwd") {
+            if let Some(cwd) = flag_value(rest, "--cwd")? {
                 m.insert("cwd".into(), cwd.into());
             }
-            if let Some(input) = flag_value(rest, "--input") {
+            if let Some(input) = flag_value(rest, "--input")? {
                 m.insert("initial_input".into(), input.into());
             }
         }
@@ -265,7 +265,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             let pos = positional(rest);
             let pane = pos.first().ok_or("read needs a PANE")?;
             m.insert("pane".into(), parse_pane(pane)?.into());
-            let mode = if let Some(n) = flag_value(rest, "--tail") {
+            let mode = if let Some(n) = flag_value(rest, "--tail")? {
                 let n: usize = n.parse().map_err(|_| "--tail needs a number")?;
                 serde_json::json!({ "tail": n })
             } else if has_flag(rest, "--full") {
@@ -291,8 +291,8 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             let panes: Result<Vec<serde_json::Value>, String> =
                 pos.iter().map(|p| parse_pane(p).map(Into::into)).collect();
             m.insert("panes".into(), serde_json::Value::Array(panes?));
-            m.insert("until".into(), flag_value(rest, "--until").unwrap_or_else(|| "waiting".into()).into());
-            if let Some(secs) = flag_value(rest, "--timeout") {
+            m.insert("until".into(), flag_value(rest, "--until")?.unwrap_or_else(|| "waiting".into()).into());
+            if let Some(secs) = flag_value(rest, "--timeout")? {
                 let secs: u64 = secs.parse().map_err(|_| "--timeout needs a number (seconds)")?;
                 m.insert("timeout_ms".into(), (secs * 1000).into());
             }
@@ -363,9 +363,27 @@ fn positional(args: &[String]) -> Vec<String> {
 /// The value following `flag` — only if `flag` appears before `--`, so a
 /// flag *name* typed as literal data past the end-of-options marker (e.g.
 /// `send 5 -- --cwd`) is never mistaken for the real flag.
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
+///
+/// F6 (exit UX audit 2026-08-07): `Err` when `flag` is present but nothing
+/// valid follows it — the value slot is missing (`roost read 5 --tail`, the
+/// flag as the last token) or belongs to the far side of `--`
+/// (`roost read 5 --tail --`, where reading past `end` used to return the
+/// `--` marker itself as the "value"). Previously this silently degraded to
+/// `None`, indistinguishable from the flag never having been typed at all —
+/// so `read 5 --tail` returned the *screen*, `wait 5 --timeout` silently
+/// took the 5-minute default, `spawn pi --cwd` silently used the inherited
+/// cwd, all replying ok. `--tail $N` with an unset shell variable is exactly
+/// how a script hits this. Same silent-wrong-answer class `reject_unknown_flags`
+/// already closed for unknown flags; a known flag with a missing value gets
+/// the same treatment.
+fn flag_value(args: &[String], flag: &str) -> Result<Option<String>, String> {
     let end = end_of_options(args);
-    args[..end].iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    let Some(i) = args[..end].iter().position(|a| a == flag) else { return Ok(None) };
+    if i + 1 < end {
+        Ok(Some(args[i + 1].clone()))
+    } else {
+        Err(format!("{flag} needs a value"))
+    }
 }
 
 /// Same `--`-boundary rule as `flag_value`, for a boolean flag.
@@ -492,6 +510,37 @@ mod tests {
             Method::Wait { panes, .. } => assert_eq!(panes, vec![5]),
             _ => panic!(),
         }
+    }
+
+    /// F6 (exit UX audit 2026-08-07) repros: a known flag with no value
+    /// after it used to be indistinguishable from the flag never being
+    /// typed, so each of these silently fell back to a default and replied
+    /// ok. `--tail $N` with an unset shell variable is exactly how a script
+    /// hits this — the flag is there, its value just evaporated.
+    #[test]
+    fn cli_rejects_a_known_flag_missing_its_value() {
+        let read = ["read", "5", "--tail"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let err = build_request(&read, "T".into()).unwrap_err();
+        assert!(err.contains("--tail"), "must name the flag: {err}");
+
+        let wait = ["wait", "5", "--timeout"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let err = build_request(&wait, "T".into()).unwrap_err();
+        assert!(err.contains("--timeout"), "must name the flag: {err}");
+
+        let spawn = ["spawn", "pi", "--cwd"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let err = build_request(&spawn, "T".into()).unwrap_err();
+        assert!(err.contains("--cwd"), "must name the flag: {err}");
+    }
+
+    /// The value must come from strictly before `--`, not leak the `--`
+    /// marker itself in as a "value" when the flag is its immediate
+    /// predecessor.
+    #[test]
+    fn cli_flag_missing_its_value_is_still_an_error_right_before_the_end_of_options_marker() {
+        let owned: Vec<String> =
+            ["read", "5", "--tail", "--", "ignored"].iter().map(|s| s.to_string()).collect();
+        let err = build_request(&owned, "T".into()).unwrap_err();
+        assert!(err.contains("--tail"), "must name the flag: {err}");
     }
 
     /// Every verb needs its own, real help text — not the generic usage
