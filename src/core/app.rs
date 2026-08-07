@@ -2235,6 +2235,17 @@ impl<B: PaneBackend> App<B> {
         self.set_session(id, session);
     }
 
+    /// The pane's status-socket connection went up or down (D2) — see
+    /// `infra::sock`'s per-connection pane tracking and `StatusTracker::
+    /// set_ext_link`. No notification: link state alone never means "needs
+    /// you", only how much roost trusts a resting/Working report over PTY
+    /// output while deciding what does.
+    pub fn on_status_link(&mut self, id: PaneId, up: bool) {
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.set_ext_link(up);
+        }
+    }
+
     /// Exact status from an agent-side extension. Returns a notification
     /// message when a *non-focused* pane starts needing the user.
     pub fn on_status(&mut self, id: PaneId, status: AgentStatus) -> Option<String> {

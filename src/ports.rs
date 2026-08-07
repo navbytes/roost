@@ -135,6 +135,10 @@ pub trait PaneBackend: Sized {
         false
     }
     fn set_extension_status(&mut self, s: AgentStatus);
+    /// The pane's status-socket connection went up or down (D2) — see
+    /// `StatusTracker::set_ext_link`. Default no-op: a backend with no
+    /// notion of a reporting connection has nothing to gate on it.
+    fn set_ext_link(&mut self, _up: bool) {}
     fn on_exit(&mut self);
 
     /// Has the pane negotiated the kitty "disambiguate" keyboard flag? When

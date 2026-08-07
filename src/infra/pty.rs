@@ -688,8 +688,10 @@ impl PaneBackend for PtyPane {
             // ux P1-6: relay only the case the bell heuristic exists to
             // serve — no *live* extension report is covering this pane
             // (`reported()`: none installed, or a resting report a bell
-            // promotes, e.g. pi's built-in permission prompt, which its
-            // hook can't see). Checked here rather than against
+            // promotes — an adapter/TUI genuinely ringing for a "needs you"
+            // its own hook can't see; NOT pi, which never emits an audible
+            // bell at all — see `StatusTracker::bell_after_ext`). Checked
+            // here rather than against
             // `current()`: `current()`'s own quiet-window grace (badges
             // don't flip to ◆ until output settles) would mask almost every
             // real case — a bell riding the same burst as its own dialog
@@ -906,6 +908,10 @@ impl PaneBackend for PtyPane {
 
     fn set_extension_status(&mut self, s: AgentStatus) {
         self.status.set_extension_status(s);
+    }
+
+    fn set_ext_link(&mut self, up: bool) {
+        self.status.set_ext_link(up);
     }
 
     fn on_exit(&mut self) {

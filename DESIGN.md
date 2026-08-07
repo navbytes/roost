@@ -186,6 +186,18 @@ When no extension/hook channel exists:
 
 Heuristics are per-adapter tunable (regexes in config). They'll be wrong sometimes; that's acceptable for fallback, and the extension path is the real answer for tools we care about.
 
+**Link-liveness gates how much the fallback may override the extension path.**
+An extension/hook channel isn't just present-or-absent — its socket
+connection is itself either up or down right now, and roost tracks that per
+pane (`StatusTracker::ext_link`, fed by the socket listener's own
+connection→pane accounting). While it's up: a resting report (Waiting/Idle)
+is trusted over PTY byte noise almost unconditionally — an extension's
+`agent_start` is exact and arrives within ms of a real turn, so bytes alone
+(composer echo, a resize repaint) must not repaint a phantom `●`. Once the
+link is down — the hook died, or was never persistent (Claude Code's hooks
+are one-shot connections that report and disconnect) — the heuristic is
+exactly this section's fallback again.
+
 ### 6.4 Status model
 
 ```rust
@@ -193,6 +205,17 @@ enum AgentStatus { Working, NeedsInput, Waiting, Idle, Exited(ExitKind) }
 ```
 
 Surfaced in three places: pane border color, stack title-bar badge (`● working  ◆ needs you  ○ idle`), and tab title aggregation (a tab shows ◆ if *any* pane inside needs input). `NeedsInput` panes also get a terminal bell / macOS notification (config-gated) — the "not knowing who needs me" pain, solved.
+
+A reported `Working` that goes silent past a generous timeout (45s) decays
+rather than sticking forever — but not always to the same place. With the
+extension/hook link still up, the silence reads as the hook being alive and
+merely quiet (a slow local model's prefill routinely runs longer than that),
+so it settles to **Idle** — calmer than an eternal `●`, and honest that
+roost genuinely doesn't know if it's still your turn. With the link down,
+there's no evidence the hook is still around at all, so it settles to
+**Waiting** as before. `NeedsInput`'s own decay stays purely time-based
+either way: self-healing beats a `◆` that can pull the user to the pane
+forever.
 
 ## 7. Keybindings (v1)
 

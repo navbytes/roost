@@ -136,3 +136,95 @@ fn socket_exited_on_a_live_pane_is_advisory_not_death() {
 
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }
+
+/// D1/D2 end to end, real binary + real PTY + real socket: while an
+/// extension's status-socket connection stays open, PTY byte noise must not
+/// repaint a resting report to "working" (the phantom-pulse bug); once that
+/// connection closes, the fallback promotion is restored. Cheap on purpose —
+/// no 45s `STUCK_WORKING` wait needed, just `ACTIVE_WINDOW` (2s) either side
+/// of the connection closing.
+#[test]
+fn output_does_not_promote_a_resting_report_while_the_link_is_live_but_does_once_it_drops() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP socket status gate: {reason}");
+            return;
+        }
+    };
+    assert!(
+        h.settle(Duration::from_secs(5)),
+        "initial frame never settled"
+    );
+
+    let tok_path = h.state_dir().join("tok");
+    h.write_bytes(format!("printf '%s' \"$ROOST_TOKEN\" > {}\r", tok_path.display()).as_bytes());
+    let token = wait_for_file(&tok_path, Duration::from_secs(5))
+        .expect("pane shell never wrote its ROOST_TOKEN");
+
+    // A "live" extension link for pane 1: one connection, held open, that
+    // already reported a resting status — exactly the pi extension's shape.
+    let sock_path = h.state_dir().join("roost.sock");
+    let mut sock = UnixStream::connect(&sock_path).expect("connect to roost.sock");
+    sock.write_all(
+        format!(
+            r#"{{"pane":"1","token":"{token}","event":"status","status":"waiting"}}{}"#,
+            '\n'
+        )
+        .as_bytes(),
+    )
+    .expect("send waiting status");
+    sock.flush().expect("flush");
+
+    // Round-trip through the event loop (same barrier as the test above) so
+    // the link-up + status have definitely both landed before we look.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let s = cli_status(h.state_dir());
+        if s.contains("\"waiting\"") || Instant::now() >= deadline {
+            break s;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.contains("\"waiting\""),
+        "setup: extension report never took: {status}"
+    );
+
+    // Byte noise while the link is live: composer echo from typing. Must
+    // stay "waiting" throughout — never a phantom "working".
+    h.write_bytes(b"echo phantom_pulse_check\r");
+    let watch_until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < watch_until {
+        let s = cli_status(h.state_dir());
+        assert!(
+            !s.contains("\"working\""),
+            "byte noise repainted a phantom ● while the link is live: {s}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Drop the connection: link-down for pane 1.
+    drop(sock);
+
+    // Give the close a moment to reach the event loop, then produce fresh
+    // output — with the link down, this is the fallback D1 preserves.
+    std::thread::sleep(Duration::from_millis(500));
+    h.write_bytes(b"echo fallback_restored\r");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let s = cli_status(h.state_dir());
+        if s.contains("\"working\"") || Instant::now() >= deadline {
+            break s;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.contains("\"working\""),
+        "output must promote a resting report once the link is down: {status}"
+    );
+
+    let _ = h.quit_and_wait(Duration::from_secs(5));
+}

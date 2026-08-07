@@ -16,7 +16,7 @@
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
   const pane = process.env.ROOST_PANE;
@@ -66,15 +66,36 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", async () => send({ event: "status", status: "working" }));
   pi.on("agent_end", async () => send({ event: "status", status: "waiting" }));
 
-  // "Needs input" — the agent is explicitly blocked on *you*, mid-turn. pi has
-  // no generic permission-prompt event (its built-in tool-approval UI isn't
-  // surfaced to extensions), and `tool_call` fires for every tool — so we can't
-  // key off it directly without flagging routine read/grep/bash as "needs you".
-  // Instead we watch for an explicit "ask the human" tool by name: an allowlist
-  // that captures the elicitation tools shipped by MCP servers and custom
-  // extensions. Anything not on the list stays "working" — never a false ◆.
-  // When the ask resolves (tool_result) we drop back to "working"; agent_end
-  // will settle it to "waiting" at the true end of the turn.
+  // "Needs input" — the agent is explicitly blocked on *you*, mid-turn. pi
+  // ships no generic per-tool permission/approval prompt at all (verified
+  // against installed pi 0.81.1's dist/core/extensions/runner.js — there is
+  // no "approval dialog" event of any kind to hook here), so there are
+  // exactly two real carriers:
+  //
+  // 1. project_trust — pi's one built-in *blocking* prompt: whether to trust
+  // this project directory, shown before a session can really do anything.
+  // Handlers run in registration order; the first to return "yes"/"no" wins
+  // and the dialog never shows at all, "undecided" falls through to the next
+  // handler and, if none decide, to the interactive dialog itself (see
+  // emitProjectTrustEvent in runner.js). We are a status reporter, not a
+  // trust policy, so we always report "undecided" — the human's own dialog
+  // must still show and decide it. The ◆ this reports needs no explicit
+  // clear: once the dialog resolves, the run proceeds and agent_start/
+  // tool_call send "working" same as any other turn; agent_end settles
+  // "waiting" at the end of it. The NeedsInput time-decay (roost-side,
+  // STUCK_WORKING) also backstops a dialog nobody ever answers.
+  pi.on("project_trust", async () => {
+    send({ event: "status", status: "needs_input" });
+    return { trusted: "undecided" };
+  });
+  //
+  // 2. `tool_call` fires for every tool, so we can't key off it directly
+  // without flagging routine read/grep/bash as "needs you". Instead we watch
+  // for an explicit "ask the human" tool by name: an allowlist that captures
+  // the elicitation tools shipped by MCP servers and custom extensions.
+  // Anything not on the list stays "working" — never a false ◆. When the ask
+  // resolves (tool_result) we drop back to "working"; agent_end will settle
+  // it to "waiting" at the true end of the turn.
   const ASK_TOOLS = new Set([
     "ask",
     "ask_user",
