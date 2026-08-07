@@ -305,7 +305,7 @@ fn run(
     // every `roost <verb>` fails. Surface it instead. The security refusal
     // stays fatal: degrading "someone may be intercepting the control socket"
     // into "quietly no socket" is the wrong default.
-    let (sock_path, sock_err) = match infra::sock::spawn_listener(tx.clone()) {
+    let (sock_path, sock_err) = match infra::sock::spawn_listener(tx.clone(), tokens.reader()) {
         Ok(p) => (Some(p), None),
         Err(e) if is_unsafe_socket_dir(&e) => return Err(e),
         Err(e) => (None, Some(format!("no control plane: {e:#}"))),

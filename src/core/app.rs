@@ -7987,6 +7987,115 @@ mod tests {
         assert!(!app.socket_authorized(99, "secret-1"));
     }
 
+    // -- MC-ordering (I2: mint-before-child) --------------------------------
+    //
+    // `B::spawn` is a plain associated function — it gets no `&App`, so the
+    // only way to observe "was this pane's token already published when I
+    // was called" from inside it is a channel set up before the call. A
+    // thread-local is exactly that: this test drives everything (App::new,
+    // spawn_active_tab, B::spawn) synchronously on its own thread, so
+    // there's no cross-thread visibility question to worry about.
+    use crate::core::control::TokenReader;
+    thread_local! {
+        static ORDERING_READER: std::cell::RefCell<Option<TokenReader>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// A minimal `PaneBackend` whose only interesting behavior is `spawn`:
+    /// it asserts the pane's `ROOST_TOKEN` (read off the real `CommandSpec`
+    /// `spawn_pane` built, same as a real child process would receive it)
+    /// already authorizes that pane in the table `ORDERING_READER` points
+    /// at. Every other method is an inert stand-in — this fixture exists to
+    /// pin one invariant, not to run a session.
+    struct OrderingCheckPane;
+
+    impl PaneBackend for OrderingCheckPane {
+        fn spawn(
+            id: PaneId,
+            cmd: &crate::agents::CommandSpec,
+            _rows: u16,
+            _cols: u16,
+            _pixels: (u16, u16),
+            _tx: SyncSender<AppEvent>,
+        ) -> Result<Self> {
+            if let Some((_, token)) = cmd.env.iter().find(|(k, _)| k == "ROOST_TOKEN") {
+                ORDERING_READER.with(|cell| {
+                    if let Some(reader) = cell.borrow().as_ref() {
+                        assert!(
+                            reader.load().pane_authorized(id, token),
+                            "I2 violated: pane {id}'s token must be published in the \
+                             TokenTable strictly before B::spawn runs — the mint \
+                             (spawn_pane) must never be reordered after the spawn, \
+                             or deferred"
+                        );
+                    }
+                });
+            }
+            Ok(OrderingCheckPane)
+        }
+        fn process_output(&mut self, _bytes: &[u8]) {}
+        fn write_input(&mut self, _bytes: &[u8]) -> bool {
+            true
+        }
+        fn write_input_raw(&mut self, _bytes: &[u8]) -> bool {
+            true
+        }
+        fn resize(&mut self, _rows: u16, _cols: u16, _pixels: (u16, u16)) {}
+        fn kill(&mut self) {}
+        fn status(&self) -> AgentStatus {
+            AgentStatus::Idle
+        }
+        fn set_extension_status(&mut self, _s: AgentStatus) {}
+        fn on_exit(&mut self) {}
+        fn screen(&self) -> Option<&vt100::Screen> {
+            None
+        }
+        fn set_scrollback(&mut self, _lines: usize) {}
+        fn scroll_by(&mut self, _delta: i32) {}
+        fn scroll_offset(&self) -> usize {
+            0
+        }
+        fn scroll_total(&self) -> usize {
+            0
+        }
+        fn mouse_proto(&self) -> crate::ports::MouseProto {
+            crate::ports::MouseProto::None
+        }
+    }
+
+    /// MC-ordering: reds if anyone reorders the mint (app.rs's `spawn_pane`,
+    /// currently before `B::spawn`) to run after it, or adds a deferred
+    /// publish — `OrderingCheckPane::spawn`'s assertion would then fire on
+    /// the very first pane `App::new` spawns.
+    #[test]
+    fn mc_ordering_pane_token_is_published_in_the_table_before_the_child_spawns() {
+        let table = TokenTable::new().unwrap();
+        ORDERING_READER.with(|cell| *cell.borrow_mut() = Some(table.reader()));
+
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        // Token-minting is gated on a real control socket (`sock_path`) —
+        // see `spawn_pane` — so this must be `Some` for the mint (the
+        // invariant under test) to run at all.
+        let app = App::<OrderingCheckPane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            Some(std::path::PathBuf::from("/tmp/roost-mc-ordering-test.sock")),
+            table,
+        )
+        .unwrap();
+        // If execution reaches here, `OrderingCheckPane::spawn`'s assertion
+        // never fired for any pane `App::new` spawned — the real proof this
+        // test exists for. This just confirms the setup actually exercised
+        // that path at all.
+        assert!(!app.runtimes.is_empty(), "setup: at least one pane must have spawned");
+
+        ORDERING_READER.with(|cell| *cell.borrow_mut() = None);
+    }
+
     #[test]
     fn close_last_pane_confirms_then_quits() {
         let (mut app, _) = mk_app(shell_ws());

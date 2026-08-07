@@ -34,7 +34,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::core::control::{Reply, Request};
+use crate::core::control::{Reply, Request, TokenReader, UNAUTHORIZED_MSG};
 
 /// Wall-clock deadline for a connection that has *not yet* sent a
 /// well-formed control request (audit finding C1 — a second review pass on
@@ -814,8 +814,11 @@ fn drain_until_quiet(reader: &mut BufReader<UnixStream>, deadline: Instant) {
 }
 
 /// Bind the socket and pump parsed events into the main loop. Returns the
-/// bound path (exported to panes as ROOST_SOCK).
-pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
+/// bound path (exported to panes as ROOST_SOCK). `tokens` is a read-only
+/// handle onto App's `TokenTable` (promotion-auth-gate) — the accept loop's
+/// per-connection threads consult it synchronously, before promoting a
+/// connection past the pre-auth guillotine, and never write it.
+pub fn spawn_listener(tx: SyncSender<AppEvent>, tokens: TokenReader) -> Result<PathBuf> {
     let path = socket_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -834,7 +837,7 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
     // poison session ids / spoof status.
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
 
-    spawn_accept_loop(listener, tx);
+    spawn_accept_loop(listener, tx, tokens);
     Ok(path)
 }
 
@@ -844,7 +847,7 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
 /// `XDG_RUNTIME_DIR` env vars — racy to poke from tests that run in parallel
 /// in the same process). Returns the shared `Limits` so tests can also
 /// inspect accounting state directly instead of only through the wire.
-fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Limits> {
+fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: TokenReader) -> Arc<Limits> {
     let limits = Arc::new(Limits::new());
     let accept_limits = limits.clone();
     std::thread::spawn(move || {
@@ -863,6 +866,7 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
             }
             let limits = limits.clone();
             let tx = tx.clone();
+            let tokens = tokens.clone();
             std::thread::spawn(move || {
                 // From here on, `guard` owns releasing every slot this
                 // connection holds — including on an early return or a
@@ -900,22 +904,27 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                 // measured from here, independent of the per-read
                 // `SO_RCVTIMEO` set above.
                 let start = Instant::now();
-                // Promoted the instant this connection sends *any* well-formed
-                // line — a control request (below) or a one-way status/session
-                // report (`parse_line`), not only the former. A status-only
-                // connection (the pi extension: connects once, holds the
-                // socket for the pane's process lifetime, sends nothing but
-                // status/session lines) never sets `guard.principal` — it
-                // isn't a "principal" for connection-cap/rate-limit purposes —
-                // so gating promotion on that alone left every such connection
-                // permanently pre-auth: `pre_auth_start` never cleared, so it
-                // was killed ~`PRE_AUTH_READ_TIMEOUT` after connecting and
-                // never reconnects (the extension dials once, on load).
-                // Promoting it here is no new exposure: an attacker sending
-                // one *shape*-valid status/session line (nothing here
-                // validates its token — `parse_line` doesn't, App does) to
-                // earn promotion is the same already-open, already-documented
-                // path 2 as a garbage-token control request.
+                // promotion-auth-gate: promoted on *authentication*, not
+                // grammar. A control request needs `tokens.load().is_principal`
+                // (fleet token or some pane's own); a status/session line
+                // needs `tokens.load().pane_authorized` for the exact pane it
+                // claims — see the two door checks below, right after
+                // `parse_control`/`parse_line`. A connection that never sends
+                // an authenticated line stays pre-auth and dies at
+                // `PRE_AUTH_READ_TIMEOUT`, however many well-formed-but-wrong-
+                // token lines it sends.
+                //
+                // A status-only connection (the pi extension: connects once,
+                // holds the socket for the pane's process lifetime, sends
+                // nothing but status/session lines) never sets
+                // `guard.principal` — it isn't a "principal" for
+                // connection-cap/rate-limit purposes — so gating promotion on
+                // that alone would leave every such connection permanently
+                // pre-auth: killed ~`PRE_AUTH_READ_TIMEOUT` after connecting
+                // and never reconnecting (the extension dials once, on load).
+                // `promoted` tracks "authenticated by *either* door", so this
+                // shape is promoted on its first correctly-authenticated
+                // status/session line same as a control request would be.
                 let mut promoted = false;
                 'conn: loop {
                     buf.clear();
@@ -1036,15 +1045,36 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                     // being dropped — see `parse_control`.
                     match control {
                         Some(Ok(req)) => {
-                            // First well-formed request on this connection:
-                            // charge it against `req.token`'s per-principal
-                            // connection cap and, if admitted, promote this
-                            // connection out of the pre-auth timeout. A later
-                            // request on this same connection that claims a
-                            // *different* token is never re-attributed —
-                            // every charge below uses `guard.principal`, the
-                            // identity this connection was actually admitted
-                            // under (audit finding H2).
+                            // promotion-auth-gate door: is `req.token` the
+                            // fleet token or some pane's own — *some*
+                            // legitimate identity, not yet which one (App's
+                            // `resolve_actor`, at dispatch below, resolves
+                            // that and is what actually authorizes the verb).
+                            // Checked on *every* control request on this
+                            // connection, not only its first: a connection
+                            // already promoted by an earlier valid request
+                            // gets no free pass for a later one that claims a
+                            // different, invalid token. Refuse here — reply,
+                            // never dispatch, never reserve a principal slot,
+                            // never promote — and let the pre-auth wall clock
+                            // (measured from `start`, independent of this
+                            // check) close it at `PRE_AUTH_READ_TIMEOUT` if
+                            // this was its only line. Not dispatching also
+                            // means an unauthenticated flood can no longer
+                            // cost the audit log a single line (I4/§ H3).
+                            if !tokens.load().is_principal(&req.token) {
+                                let _ = write_reply(&mut reader, &Reply::err(UNAUTHORIZED_MSG));
+                                continue;
+                            }
+                            // First well-formed *authenticated* request on
+                            // this connection: charge it against `req.token`'s
+                            // per-principal connection cap and, if admitted,
+                            // promote this connection out of the pre-auth
+                            // timeout. A later request on this same connection
+                            // that claims a *different* token is never
+                            // re-attributed — every charge below uses
+                            // `guard.principal`, the identity this connection
+                            // was actually admitted under (audit finding H2).
                             if guard.principal.is_none() {
                                 if !limits.try_reserve_principal(&req.token) {
                                     let msg = format!(
@@ -1125,11 +1155,36 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                     }
                     match parse_line(line) {
                         Some(ev) => {
-                            // A well-formed status/session report promotes
-                            // this connection exactly like a control request
-                            // does, above — see the `promoted` doc comment at
-                            // its declaration. Nothing here validates the
-                            // token; App does, on every event this forwards.
+                            // `parse_line` only ever produces `Status`/
+                            // `Session` (see its match on `msg.event`), both
+                            // of which `link_pane_token` matches — this is
+                            // the single place both the door check and the
+                            // link-tracking below get `(pane, token)` from,
+                            // so they can never read it two different ways.
+                            let Some((pane, token)) = link_pane_token(&ev) else {
+                                log_dropped(line);
+                                continue;
+                            };
+                            // promotion-auth-gate door: does `token`
+                            // authenticate *this exact pane* — the same
+                            // predicate (`TokenSnapshot::pane_authorized`)
+                            // App's own `socket_authorized` re-checks at
+                            // dispatch (main.rs), so the two can't drift.
+                            // Unlike the control door above, a failure here
+                            // doesn't even reply: a status/session line has
+                            // no request/reply shape on the wire, so there is
+                            // nothing this caller reads back either way —
+                            // App would reject it downstream regardless
+                            // (I4), so dropping here just saves that hop and
+                            // leaves the connection unpromoted.
+                            if !tokens.load().pane_authorized(pane, &token) {
+                                log_dropped(line);
+                                continue;
+                            }
+                            // A well-formed, authenticated status/session
+                            // report promotes this connection exactly like a
+                            // control request does, above — see the
+                            // `promoted` doc comment at its declaration.
                             if !promoted {
                                 promoted = true;
                                 let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
@@ -1153,13 +1208,11 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                             // map's* length, which can't be read while an
                             // `Entry` (a mutable borrow of the same map)
                             // is still live.
-                            if let Some((pane, token)) = link_pane_token(&ev) {
-                                if !guard.link_panes.contains_key(&pane)
-                                    && guard.link_panes.len() < MAX_LINK_PANES_PER_CONN
-                                {
-                                    guard.link_panes.insert(pane, token.clone());
-                                    let _ = tx.send(AppEvent::ExtLink(pane, token, true));
-                                }
+                            if !guard.link_panes.contains_key(&pane)
+                                && guard.link_panes.len() < MAX_LINK_PANES_PER_CONN
+                            {
+                                guard.link_panes.insert(pane, token.clone());
+                                let _ = tx.send(AppEvent::ExtLink(pane, token, true));
                             }
                             if tx.send(ev).is_err() {
                                 break;
@@ -1203,6 +1256,7 @@ fn log_dropped(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::control::TokenTable;
     use std::io::Read;
 
     #[test]
@@ -1355,6 +1409,86 @@ mod tests {
         assert_eq!(*lock(&m), 5, "lock() must still recover the (structurally valid) inner value");
     }
 
+    // --- promotion-auth-gate: the door itself -------------------------------
+    //
+    // MC-gate-control and MC-gate-status: named mutation checks (design doc
+    // "Test plan with mutation checks"). Both use a pane/token that's
+    // genuinely REGISTERED (not merely well-formed) so a passing run proves
+    // the door judges identity, not grammar — reverting either door check
+    // (restoring grammar-only promotion) must turn the matching test red.
+
+    /// MC-gate-control: a control request whose token matches nobody (fleet
+    /// or any pane) gets back the exact shared `UNAUTHORIZED_MSG` — never an
+    /// `ok`, which is what `fake_app`/`capturing_app` would have replied had
+    /// this actually been dispatched, so the reply's own shape is already
+    /// the proof of "never dispatched". `per_principal` staying empty and
+    /// nothing landing on `rx` are the same claim from two more angles:
+    /// no admission bookkeeping, no stray event. The connection then dies at
+    /// the pre-auth deadline, exactly like one that sent nothing at all.
+    /// *Reds if the door check on the control path is removed, or if the
+    /// door starts dispatching to App regardless.*
+    #[test]
+    fn mc_gate_control_junk_token_is_refused_at_the_door_not_dispatched() {
+        let (path, listener) = scratch_listener("mc-gate-control");
+        let (tx, rx) = capturing_app();
+        let limits = spawn_accept_loop(listener, tx, seeded_reader(&[(1, "real-token")]));
+        let mut c = connect(&path);
+
+        let reply = roundtrip(&mut c, r#"{"token":"junk","method":"list"}"#);
+        let err = reply.get("err").and_then(|v| v.as_str()).expect("junk token must error");
+        assert_eq!(err, UNAUTHORIZED_MSG, "must be the exact shared unauthorized string");
+
+        assert!(
+            limits.per_principal.lock().unwrap().is_empty(),
+            "an unauthenticated control request must never reserve a principal slot"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "an unauthenticated control request must never emit anything to the main loop"
+        );
+
+        // Never promoted: dies at the pre-auth wall clock, not the generous
+        // post-promotion READ_TIMEOUT.
+        c.get_ref().set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3))).unwrap();
+        let mut discard = String::new();
+        let n = c.read_line(&mut discard).expect("must be closed at the pre-auth deadline, not hang");
+        assert_eq!(n, 0, "an unauthenticated control connection must die at the 2s deadline: {discard:?}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// MC-gate-status: pane 1 has a real, seeded token — but this line
+    /// presents a different (`"junk"`) one, the parseable-but-wrong-token
+    /// case decision 6 says must drop silently: no reply (status lines have
+    /// none to give), no promotion, no forward, no link-up. *Reds if the
+    /// door check on the status path is removed* (grammar-promotion
+    /// restored) — a merely-parseable line would then promote and forward
+    /// exactly as it used to.
+    #[test]
+    fn mc_gate_status_wrong_token_for_a_real_pane_never_promotes() {
+        let (path, listener) = scratch_listener("mc-gate-status");
+        let (tx, rx) = capturing_app();
+        spawn_accept_loop(listener, tx, seeded_reader(&[(1, "T")]));
+        let mut c = connect(&path);
+        c.get_mut()
+            .write_all(br#"{"pane":1,"token":"junk","event":"status","status":"working"}"#)
+            .unwrap();
+        c.get_mut().write_all(b"\n").unwrap();
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "an unauthenticated status line must never emit anything to the main loop — no link-up, no status"
+        );
+
+        // Never promoted: dies at the pre-auth wall clock.
+        c.get_ref().set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3))).unwrap();
+        let mut discard = String::new();
+        let n = c.read_line(&mut discard).expect("must be closed at the pre-auth deadline, not hang");
+        assert_eq!(n, 0, "an unauthenticated-but-parseable status connection must die at the 2s deadline: {discard:?}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     // --- §5.6 / M3: per-principal connection cap ---------------------------
     //
     // These drive the real `spawn_accept_loop` over a scratch socket (never
@@ -1409,6 +1543,24 @@ mod tests {
             }
         });
         (tx, cap_rx)
+    }
+
+    /// promotion-auth-gate: a `TokenReader` for `spawn_accept_loop`'s door,
+    /// seeded with `pane_tokens` (pane id -> that pane's real token) — what
+    /// every test below that wants a request/line to actually authenticate
+    /// now has to build instead of handing the door an arbitrary string.
+    /// `is_principal` accepts the fleet token *or* any pane's, so a test
+    /// exercising only the control-request door can seed any pane id it
+    /// likes; a status/session test must match the exact pane id its line
+    /// claims. Deliberately NOT used to seed a flood/squat test's attacking
+    /// connections — staying unauthenticated is the property those tests
+    /// assert; only their fresh-caller probe needs a seeded token.
+    fn seeded_reader(pane_tokens: &[(PaneId, &str)]) -> TokenReader {
+        let table = TokenTable::new().expect("urandom must be available in tests");
+        for &(id, tok) in pane_tokens {
+            table.set_pane_token(id, tok.to_string());
+        }
+        table.reader()
     }
 
     /// Connect with a client-side read timeout — a real hang (the old P0 bug
@@ -1499,7 +1651,7 @@ mod tests {
     #[test]
     fn one_principal_cannot_exceed_its_connection_cap_while_another_still_connects() {
         let (path, listener) = scratch_listener("conncap");
-        spawn_accept_loop(listener, fake_app());
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "tok-a"), (2, "tok-b")]));
 
         // Principal A opens exactly its cap's worth of connections, kept
         // open (held in `_a_conns`) so they still count.
@@ -1540,7 +1692,12 @@ mod tests {
     #[test]
     fn squatting_connections_cannot_lock_out_a_fresh_caller() {
         let (path, listener) = scratch_listener("squat");
-        let limits = spawn_accept_loop(listener, fake_app());
+        // promotion-auth-gate: the squatters below send nothing at all, so
+        // whether they'd authenticate is moot — only the fresh-caller probe
+        // needs a seeded, valid token; this is now the *stronger* property
+        // the design calls for: an authenticated newcomer still gets through
+        // while the pool is squatted by an unauthenticated flood.
+        let limits = spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "newcomer")]));
 
         // A full MAX_CONN worth of connections that never send anything —
         // M3's original attack shape. There is no shared pre-auth counter
@@ -1551,10 +1708,10 @@ mod tests {
         }
         poll_until_admitted(&limits, MAX_CONN);
 
-        // A fresh, well-formed caller must still connect and get a reply —
-        // squatters recycle on the pre-auth deadline rather than holding
-        // the cap forever, so this must succeed well within a couple of
-        // `PRE_AUTH_READ_TIMEOUT` cycles, not eventually.
+        // A fresh, well-formed, AUTHENTICATED caller must still connect and
+        // get a reply — squatters recycle on the pre-auth deadline rather
+        // than holding the cap forever, so this must succeed well within a
+        // couple of `PRE_AUTH_READ_TIMEOUT` cycles, not eventually.
         let deadline = Instant::now() + Duration::from_secs(10);
         let reply = try_request(&path, r#"{"token":"newcomer","method":"list"}"#, deadline);
         assert!(reply.get("ok").is_some(), "squatters must never lock out a fresh caller: {reply}");
@@ -1574,7 +1731,10 @@ mod tests {
     #[test]
     fn dripping_connections_cannot_lock_out_a_fresh_caller() {
         let (path, listener) = scratch_listener("drip");
-        let limits = spawn_accept_loop(listener, fake_app());
+        // Same split as the squat test above: drippers never complete a
+        // line, so they never reach the door either way — only the probe
+        // needs a seeded, valid token.
+        let limits = spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "newcomer")]));
 
         spawn_drippers(&path, MAX_CONN);
         poll_until_admitted(&limits, MAX_CONN);
@@ -1629,7 +1789,7 @@ mod tests {
     #[test]
     fn a_connection_whose_peer_never_reads_the_reply_still_frees_its_slot() {
         let (path, listener) = scratch_listener("noread");
-        let limits = spawn_accept_loop(listener, fat_app());
+        let limits = spawn_accept_loop(listener, fat_app(), seeded_reader(&[(1, "noread")]));
 
         let mut stuck = UnixStream::connect(&path).expect("connect to scratch socket");
         stuck.write_all(br#"{"token":"noread","method":"list"}"#).unwrap();
@@ -1668,7 +1828,7 @@ mod tests {
     #[test]
     fn a_peer_that_drip_reads_its_reply_cannot_stretch_the_write_bound() {
         let (path, listener) = scratch_listener("dripread");
-        let limits = spawn_accept_loop(listener, fat_app());
+        let limits = spawn_accept_loop(listener, fat_app(), seeded_reader(&[(1, "dripread")]));
 
         let mut stuck = UnixStream::connect(&path).expect("connect to scratch socket");
         stuck.write_all(br#"{"token":"dripread","method":"list"}"#).unwrap();
@@ -1701,7 +1861,9 @@ mod tests {
     #[test]
     fn an_idle_pre_auth_connection_is_recycled_well_under_read_timeout() {
         let (path, listener) = scratch_listener("recycle");
-        spawn_accept_loop(listener, fake_app());
+        // This connection never sends a line at all — genuinely unaffected
+        // by the door; no token needs seeding.
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[]));
 
         let mut squatter = connect(&path);
         // Override the shared helper's 2s client timeout — it must not race
@@ -1726,7 +1888,7 @@ mod tests {
     #[test]
     fn an_authenticated_connection_gone_silent_is_still_reaped_after_read_timeout() {
         let (path, listener) = scratch_listener("control-still-reaped");
-        spawn_accept_loop(listener, fake_app());
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "t")]));
         let mut c = connect(&path);
         c.get_ref().set_read_timeout(Some(READ_TIMEOUT + Duration::from_secs(10))).unwrap();
 
@@ -1763,7 +1925,7 @@ mod tests {
     #[test]
     fn a_status_only_connection_survives_past_the_pre_auth_deadline() {
         let (path, listener) = scratch_listener("status-survives");
-        spawn_accept_loop(listener, fake_app());
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "t")]));
         let mut c = connect(&path);
 
         // One status line — exactly what the extension sends. No `method`
@@ -1806,11 +1968,16 @@ mod tests {
     /// `ConnGuard::drop` would see — so no link-down for pane 1 may appear
     /// at any point across that whole idle gap, only the link-up the initial
     /// status line earns.
+    /// MC-survives-silence: the E2E-shaped proof that a VALID reporter
+    /// outlives 30s+ of silence — reds if promotion or the P1 retry clause
+    /// breaks for authenticated reporters (e.g. the door check moved to the
+    /// wrong side of the `promoted`/retry logic, or pane 1's seeded token
+    /// stops matching).
     #[test]
     fn a_status_only_connection_survives_an_idle_gap_past_read_timeout() {
         let (path, listener) = scratch_listener("status-survives-read-timeout");
         let (tx, rx) = capturing_app();
-        spawn_accept_loop(listener, tx);
+        spawn_accept_loop(listener, tx, seeded_reader(&[(1, "t")]));
         let mut c = connect(&path);
 
         c.get_mut()
@@ -1874,7 +2041,7 @@ mod tests {
     fn accepted_status_line_associates_conn_to_pane_and_emits_link_up() {
         let (path, listener) = scratch_listener("link-up");
         let (tx, rx) = capturing_app();
-        spawn_accept_loop(listener, tx);
+        spawn_accept_loop(listener, tx, seeded_reader(&[(1, "tok")]));
         let mut c = connect(&path);
         c.get_mut()
             .write_all(br#"{"pane":"1","token":"tok","event":"status","status":"working"}"#)
@@ -1906,7 +2073,7 @@ mod tests {
     fn connection_eof_emits_link_down_for_that_pane_only() {
         let (path, listener) = scratch_listener("link-down-isolated");
         let (tx, rx) = capturing_app();
-        spawn_accept_loop(listener, tx);
+        spawn_accept_loop(listener, tx, seeded_reader(&[(1, "tok-a"), (2, "tok-b")]));
 
         let mut a = connect(&path);
         a.get_mut()
@@ -1966,7 +2133,10 @@ mod tests {
     fn a_line_that_never_resolves_to_a_pane_emits_no_link_event_on_close() {
         let (path, listener) = scratch_listener("garbage-link");
         let (tx, rx) = capturing_app();
-        spawn_accept_loop(listener, tx);
+        // `parse_line` returns `None` before the door is ever consulted
+        // (the pane id itself fails to parse) — genuinely unaffected; no
+        // token needs seeding.
+        spawn_accept_loop(listener, tx, seeded_reader(&[]));
         let mut c = connect(&path);
         c.get_mut()
             .write_all(br#"{"pane":"not-a-number","event":"status","status":"working"}"#)
@@ -1995,7 +2165,7 @@ mod tests {
     fn claude_one_shot_connections_flick_the_link_up_then_back_down() {
         let (path, listener) = scratch_listener("claude-one-shot");
         let (tx, rx) = capturing_app();
-        spawn_accept_loop(listener, tx);
+        spawn_accept_loop(listener, tx, seeded_reader(&[(1, "t")]));
 
         // Fully process one one-shot connection (link-up, its status report,
         // then link-down on EOF) before starting the next. Those three
@@ -2049,7 +2219,13 @@ mod tests {
     fn a_connections_link_tracking_is_capped_per_connection() {
         let (path, listener) = scratch_listener("link-cap");
         let (tx, rx) = capturing_app();
-        spawn_accept_loop(listener, tx);
+        // One seeded pane per id this test will claim, 1..=MAX_LINK_PANES_PER_CONN
+        // plus the one past the cap — all sharing the literal token "t" is
+        // fine here (this test is about DISTINCT-PANE tracking, not token
+        // uniqueness).
+        let panes: Vec<(PaneId, &str)> =
+            (1..=MAX_LINK_PANES_PER_CONN as u64 + 1).map(|p| (p, "t")).collect();
+        spawn_accept_loop(listener, tx, seeded_reader(&panes));
         let mut c = connect(&path);
 
         // Fill the cap: MAX_LINK_PANES_PER_CONN distinct panes, each earning
@@ -2123,7 +2299,9 @@ mod tests {
     fn an_oversized_token_status_line_is_dropped_before_touching_link_panes() {
         let (path, listener) = scratch_listener("link-token-cap");
         let (tx, rx) = capturing_app();
-        spawn_accept_loop(listener, tx);
+        // `parse_line` drops an oversized token itself, before the door —
+        // genuinely unaffected; no token needs seeding.
+        spawn_accept_loop(listener, tx, seeded_reader(&[]));
         let mut c = connect(&path);
 
         let long_token = "a".repeat(MAX_TOKEN_LEN + 1);
@@ -2150,7 +2328,7 @@ mod tests {
     #[test]
     fn a_flood_is_throttled_not_dropped_or_hung() {
         let (path, listener) = scratch_listener("flood");
-        spawn_accept_loop(listener, fake_app());
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "flooder")]));
         let mut c = connect(&path);
 
         let total = PRINCIPAL_BUCKET_CAPACITY as usize + 20;
@@ -2187,7 +2365,7 @@ mod tests {
     #[test]
     fn a_legitimate_bursty_sequence_is_not_throttled() {
         let (path, listener) = scratch_listener("burst");
-        spawn_accept_loop(listener, fake_app());
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "orch")]));
         let mut c = connect(&path);
 
         for i in 0..20 {
@@ -2206,16 +2384,28 @@ mod tests {
     /// already-open connection must not mint an endless supply of fresh
     /// per-principal buckets — only the identity the connection was
     /// actually admitted under (its first request's token) is ever charged.
+    ///
+    /// promotion-auth-gate correction: an unauthenticated "rotated-N" body
+    /// token would now be refused at the door on every single request
+    /// (never reaching `take_principal` at all), which would make this test
+    /// pass for the wrong reason — it wouldn't be proving H2's attribution
+    /// property anymore, just that the door rejects junk. So the rotation is
+    /// between exactly TWO real, seeded identities: "admitted" (this
+    /// connection's real admission — the first request) and "rotated" (a
+    /// different, equally valid principal). Both pass the door and reach
+    /// dispatch; H2 is that only "admitted" is ever charged, never
+    /// "rotated", regardless of which one a later request's body claims.
     #[test]
     fn rotating_the_bodys_token_does_not_mint_a_fresh_bucket_on_one_connection() {
         let (path, listener) = scratch_listener("rotate");
-        let limits = spawn_accept_loop(listener, fake_app());
+        let reader = seeded_reader(&[(1, "admitted"), (2, "rotated")]);
+        let limits = spawn_accept_loop(listener, fake_app(), reader);
         let mut c = connect(&path);
 
         let total = PRINCIPAL_BUCKET_CAPACITY as usize + 20;
         let mut throttled = 0;
         for i in 0..total {
-            let token = if i == 0 { "admitted".to_string() } else { format!("rotated-{i}") };
+            let token = if i == 0 || i % 2 == 0 { "admitted" } else { "rotated" };
             let reply = roundtrip(&mut c, &format!(r#"{{"token":"{token}","method":"list"}}"#));
             if reply.get("err").and_then(|v| v.as_str()).is_some() {
                 throttled += 1;
@@ -2224,13 +2414,15 @@ mod tests {
         assert!(throttled > 0, "varying the token per request must still get throttled eventually");
 
         // The only thing ever charged is the connection's real admission
-        // identity — none of the "rotated" in-body tokens minted their own.
+        // identity — "rotated" is a genuinely valid principal (it passes
+        // the door on its own) and still never mints its own bucket.
         let map = limits.buckets.lock().unwrap();
         assert!(map.contains_key("admitted"), "the connection's admitted identity should have a bucket");
         assert_eq!(
             map.len(),
             1,
-            "an in-body token that never admitted this connection must not get its own bucket: {:?}",
+            "an in-body token that never admitted this connection must not get its own bucket, \
+             even though it's independently a valid principal: {:?}",
             map.keys().collect::<Vec<_>>()
         );
 
@@ -2249,7 +2441,7 @@ mod tests {
     #[test]
     fn a_line_flood_on_one_connection_cannot_deny_a_different_connection() {
         let (path, listener) = scratch_listener("lineflood");
-        spawn_accept_loop(listener, fake_app());
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "other")]));
 
         // Flood one connection with blank lines well past any reasonable
         // per-connection budget. Nothing here is control-shaped, so none of
@@ -2278,7 +2470,10 @@ mod tests {
     #[test]
     fn a_line_flood_still_throttles_its_own_connection_eventually() {
         let (path, listener) = scratch_listener("selfthrottle");
-        spawn_accept_loop(listener, fake_app());
+        // Every request here is missing its token field entirely — always a
+        // `Some(Err(_))` parse failure, never reaching the door (or a
+        // per-principal bucket); genuinely unaffected, no seeding needed.
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[]));
         let mut c = connect(&path);
 
         let total = LINE_BUCKET_CAPACITY as usize + 20;
@@ -2327,13 +2522,18 @@ mod tests {
 
     #[test]
     fn throttle_and_cap_replies_are_distinguishable_from_unauthorized_and_malformed() {
-        // app.rs's actual wording (core/app.rs `handle_control_msg`), out of
-        // scope here to touch or invoke directly — this pins that sock.rs's
-        // own strings never collide with it.
-        const UNAUTHORIZED: &str = "unauthorized: unknown or missing token";
+        // promotion-auth-gate: `UNAUTHORIZED_MSG` is now sock.rs's OWN door
+        // reply too, not just App's (both a `pub const` shared by the two,
+        // precisely so they can't fork) — this pins that sock.rs's other
+        // self-generated strings (malformed/cap/rate-limit) never collide
+        // with it, using the real constant rather than a hand-typed copy.
 
         let (path, listener) = scratch_listener("distinguish");
-        spawn_accept_loop(listener, fake_app());
+        // Both identities under test here must be genuinely valid — this
+        // test is about telling sock.rs's OWN cap/rate-limit replies apart
+        // from the door's UNAUTHORIZED_MSG, which requires actually
+        // reaching that logic (past the door) in the first place.
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "cap-x"), (2, "rate-y")]));
 
         // Malformed: no token to even evaluate.
         let mut m = connect(&path);
@@ -2365,7 +2565,7 @@ mod tests {
 
         for (name, s) in [("malformed", &malformed), ("connection-limit", &cap_err), ("rate-limit", &throttled)] {
             assert!(!s.contains("unauthorized"), "{name} reply reads as unauthorized: {s}");
-            assert_ne!(s.as_str(), UNAUTHORIZED, "{name} reply must not equal app.rs's unauthorized text");
+            assert_ne!(s.as_str(), UNAUTHORIZED_MSG, "{name} reply must not equal the shared unauthorized text");
         }
         assert_ne!(malformed, cap_err, "malformed and connection-limit must read differently");
         assert_ne!(malformed, throttled, "malformed and rate-limit must read differently");
@@ -2416,7 +2616,9 @@ mod tests {
     #[test]
     fn an_oversized_line_gets_a_true_diagnosis_reply_before_closing() {
         let (path, listener) = scratch_listener("oversize");
-        spawn_accept_loop(listener, fake_app());
+        // The oversize check runs before parse_control/parse_line even see
+        // the line — genuinely unaffected; no token needs seeding.
+        spawn_accept_loop(listener, fake_app(), seeded_reader(&[]));
         let mut c = connect(&path);
 
         let payload = "A".repeat(OVERSIZED_PAYLOAD);
@@ -2440,7 +2642,7 @@ mod tests {
     #[test]
     fn an_oversized_line_does_not_take_the_instance_down_with_it() {
         let (path, listener) = scratch_listener("oversize-survives");
-        let limits = spawn_accept_loop(listener, fake_app());
+        let limits = spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "newcomer")]));
         let mut c = connect(&path);
 
         let payload = "A".repeat(OVERSIZED_PAYLOAD);
