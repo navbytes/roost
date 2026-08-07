@@ -260,11 +260,22 @@ fn wait_timeout_exits_nonzero_and_distinct_from_runtime_and_usage_errors() {
 /// 64 KiB line cap used to drop the connection with no reply — the client's
 /// own write EPIPEd mid-payload, and `cli.rs` reported that as "cannot reach
 /// a running roost", exactly the wrong diagnosis for an instance that was
-/// alive the whole time. Well past both the cap and a local socket's default
-/// kernel buffer (as little as 8 KiB each way on macOS), so this only passes
-/// if the server actually drains the rest of the client's still-in-flight
-/// write rather than merely replying to a payload that happened to fit in
-/// one write() call.
+/// alive the whole time.
+///
+/// This is the CLI *contract* end to end (message, exit code, instance still
+/// answering) — not a stress test of the drain that unblocks a still-writing
+/// client, which `infra::sock::tests` covers directly against a raw socket
+/// (`OVERSIZED_PAYLOAD`, well past either platform's kernel buffer). It
+/// can't do that stress test itself: the payload has to travel as one argv
+/// element, and PR #68's CI (green on macOS, red on ubuntu-latest — the
+/// first version of this test used 200_000) is why that matters — Linux
+/// caps a single argv/environment string at `MAX_ARG_STRLEN`, 32 pages
+/// (128 KiB on a 4 KiB-page kernel), independent of and *tighter than*
+/// total ARG_MAX; go over it and `execve` fails with E2BIG before roost
+/// ever sees the request. Confirmed directly (Docker `rust:1-bookworm`):
+/// 200_000 bytes as one argument reproduces that exact `ArgumentListTooLong`
+/// there. 100_000 clears the 64 KiB cap this test needs to trip with room to
+/// spare on both sides — comfortably under 128 KiB, comfortably over 64 KiB.
 #[test]
 fn oversized_request_gets_a_true_diagnosis_and_leaves_the_instance_alive() {
     let cwd = std::env::temp_dir();
@@ -289,7 +300,7 @@ fn oversized_request_gets_a_true_diagnosis_and_leaves_the_instance_alive() {
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
     wait_until_reachable(h.state_dir(), Duration::from_secs(5));
 
-    let payload = "A".repeat(200_000);
+    let payload = "A".repeat(100_000);
     let o = cli_in(h.state_dir(), &["send", "1", &payload]);
 
     assert_eq!(o.status.code(), Some(2), "must be a usage error, not a runtime one: {o:?}");

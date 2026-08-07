@@ -1738,6 +1738,27 @@ mod tests {
     }
 
     // --- oversize-line follow-up: a true diagnosis, not a silent EPIPE -----
+    //
+    // Platform note (CI found this the hard way — PR #68, ubuntu-latest red,
+    // macOS green): a local socket's kernel buffer is NOT the same size on
+    // the two platforms roost ships for, and the gap is large. Measured
+    // directly (Docker `rust:1-bookworm`, same reproduction used to debug
+    // the CI failure) rather than assumed:
+    //   - macOS: `net.local.stream.{recvspace,sendspace}` default to 8 KiB
+    //     each way.
+    //   - Linux: `net.core.{rmem,wmem}_default` default to 208 KiB, and a
+    //     one-shot send/recv pair on top of that absorbed a payload up to
+    //     ~290 KiB without the writer ever blocking (measured with a Python
+    //     socket harness mirroring this exact accept/reply/drain shape).
+    // `OVERSIZED_PAYLOAD` is chosen well past both, so a still-blocked
+    // writer is what these tests exercise on *either* platform, not just
+    // macOS's tighter one — not a bigger guess, a measured margin. That
+    // said, every assertion below is about the observable contract (the
+    // exact reply, the clean close, the instance staying alive) — none of
+    // them assert anything about *whether* the write actually blocked, so
+    // they hold even if some future platform's default buffer swallows this
+    // whole.
+    const OVERSIZED_PAYLOAD: usize = 1_000_000;
 
     /// `OVERSIZE_LINE_MSG` must actually name the cap `MAX_LINE` enforces —
     /// a guard against the two silently drifting apart if either is ever
@@ -1759,12 +1780,7 @@ mod tests {
         spawn_accept_loop(listener, fake_app());
         let mut c = connect(&path);
 
-        // Far past MAX_LINE (64 KiB) and past any local socket's default
-        // kernel buffer too (8 KiB each way on macOS) — this exercises the
-        // drain that lets a still-writing client ever reach the read() that
-        // sees this reply, not merely a payload that happens to fit
-        // untouched in one write().
-        let payload = "A".repeat(200_000);
+        let payload = "A".repeat(OVERSIZED_PAYLOAD);
         let reply = roundtrip(&mut c, &payload);
         let err = reply.get("err").and_then(|v| v.as_str()).expect("oversized line must error, not hang or drop silently");
         assert_eq!(err, OVERSIZE_LINE_MSG, "must be the exact shared message cli.rs matches on");
@@ -1788,7 +1804,7 @@ mod tests {
         let limits = spawn_accept_loop(listener, fake_app());
         let mut c = connect(&path);
 
-        let payload = "A".repeat(200_000);
+        let payload = "A".repeat(OVERSIZED_PAYLOAD);
         let reply = roundtrip(&mut c, &payload);
         assert!(reply.get("err").is_some(), "setup: must be the oversize reply");
         drop(c);
