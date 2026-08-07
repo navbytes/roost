@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::core::control::{Reply, Request};
 
@@ -54,6 +54,35 @@ const MAX_CONN: usize = 64;
 /// 64-connection pool for everyone else — a single flooding principal can
 /// never fill more than 8/64 of it by itself.
 const PRINCIPAL_MAX_CONN: usize = 8;
+
+/// Token-bucket capacity for control *commands* (not connections) from one
+/// principal — see `Bucket`/`Limits::take_command`. DESIGN-control.md §7's
+/// hello-world fans out as `spawn` x N then `wait` x N; 32 comfortably covers
+/// the documented "spawn x10 then wait x10" burst (20) plus room for a few
+/// interleaved `list`/`status` calls, without being anywhere near the ~200k
+/// calls M2 needs to force two log rotations.
+const PRINCIPAL_BUCKET_CAPACITY: f64 = 32.0;
+
+/// Steady-state refill for one principal once its burst is spent. Real
+/// control actions (spawn/send/read/close) are issued one at a time by a
+/// human or an orchestrator reacting to a `wait` reply — `wait` exists
+/// precisely so a caller never has to poll in a tight loop. At 5/s, M2's
+/// ~200k-call flood takes on the order of 11 hours of sustained traffic from
+/// a single principal: a real deterrent, while an order of magnitude above
+/// any legitimate command cadence.
+const PRINCIPAL_REFILL_PER_SEC: f64 = 5.0;
+
+/// Aggregate backstop across *all* principals, keyed on nothing (one bucket).
+/// sock.rs cannot tell a valid-but-unfamiliar token from a garbage one (that
+/// needs `App::resolve_actor`, which lives in core/app.rs) — so a caller that
+/// varies the `token` field per request gets a fresh per-principal bucket
+/// every time and would otherwise dodge `PRINCIPAL_BUCKET_CAPACITY` entirely.
+/// This bucket bounds total command throughput regardless of how many
+/// identities a flood claims. 4x the per-principal numbers: generous enough
+/// for a few distinct legitimate principals (fleet + a couple of panes) to
+/// burst at once, still only ~2.8h to reach M2's 200k calls.
+const GLOBAL_BUCKET_CAPACITY: f64 = 128.0;
+const GLOBAL_REFILL_PER_SEC: f64 = 20.0;
 
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
 /// an attacker who pre-created the runtime dir from hosting our control socket
@@ -159,8 +188,38 @@ fn parse_line(line: &str) -> Option<AppEvent> {
     }
 }
 
-/// Connection accounting shared by the listener's accept loop and every
-/// per-connection thread it spawns (DESIGN-control.md §5.6).
+/// A token bucket: refills continuously at `refill_per_sec`, capped at
+/// `capacity`; each command costs one token. `Instant`-based so it needs no
+/// background timer thread — refill is computed lazily on each `take`.
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+    capacity: f64,
+    refill_per_sec: f64,
+}
+
+impl Bucket {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Bucket { tokens: capacity, last: Instant::now(), capacity, refill_per_sec }
+    }
+
+    /// Refill for elapsed wall-clock time, then take one token if available.
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Connection and command accounting shared by the listener's accept loop
+/// and every per-connection thread it spawns (DESIGN-control.md §5.6).
 ///
 /// The per-principal cap is keyed on the caller's raw wire `token` string,
 /// not a resolved `Actor` — sock.rs has no access to `App::resolve_actor`
@@ -184,11 +243,28 @@ struct Limits {
     /// `MAX_CONN` pool. Entries are removed at 0, so this can never hold
     /// more entries than there are currently-open connections.
     per_principal: Mutex<HashMap<String, usize>>,
+    /// Command-rate bucket per token. Unlike `per_principal`, entries persist
+    /// for the life of the listener — a flood-by-reconnect must not reset its
+    /// budget.
+    // ponytail: unbounded map keyed by a client-supplied string. sock.rs
+    // can't validate tokens (needs App), so a caller minting a fresh garbage
+    // token per request grows this forever; `global_bucket` below bounds the
+    // resulting throughput regardless, but not this map's memory. Add LRU
+    // eviction if that ever gets exploited on its own.
+    buckets: Mutex<HashMap<String, Bucket>>,
+    /// Aggregate command-rate backstop, independent of principal identity —
+    /// see the const doc comment above.
+    global_bucket: Mutex<Bucket>,
 }
 
 impl Limits {
     fn new() -> Self {
-        Limits { global: AtomicUsize::new(0), per_principal: Mutex::new(HashMap::new()) }
+        Limits {
+            global: AtomicUsize::new(0),
+            per_principal: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(HashMap::new()),
+            global_bucket: Mutex::new(Bucket::new(GLOBAL_BUCKET_CAPACITY, GLOBAL_REFILL_PER_SEC)),
+        }
     }
 
     /// Atomically check-and-increment the global connection cap in one step.
@@ -227,6 +303,19 @@ impl Limits {
                 map.remove(token);
             }
         }
+    }
+
+    /// One command from `token`: true if under both its own rate limit and
+    /// the aggregate backstop (and a token is consumed from each); false if
+    /// it should be throttled.
+    fn take_command(&self, token: &str) -> bool {
+        let principal_ok = {
+            let mut map = self.buckets.lock().unwrap();
+            map.entry(token.to_string())
+                .or_insert_with(|| Bucket::new(PRINCIPAL_BUCKET_CAPACITY, PRINCIPAL_REFILL_PER_SEC))
+                .take()
+        };
+        principal_ok && self.global_bucket.lock().unwrap().take()
     }
 }
 
@@ -325,6 +414,21 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
                                     break; // over cap: free the slot now
                                 }
                                 principal = Some(req.token.clone());
+                            }
+                            // Rate limit: a command this connection is
+                            // otherwise allowed to make can still be
+                            // throttled if it's coming too fast. Checked
+                            // (and charged) before the request ever reaches
+                            // the main loop / audit log — a throttled
+                            // request must cost nothing there (M2).
+                            if !limits.take_command(&req.token) {
+                                let msg = "rate limited: too many commands too fast; \
+                                           slow down and retry"
+                                    .to_string();
+                                if !write_reply(&mut reader, &Reply::err(msg)) {
+                                    break; // client hung up
+                                }
+                                continue; // stay connected; this is not a ban
                             }
                             let (rtx, rrx) = std::sync::mpsc::channel();
                             if tx.send(AppEvent::Command(req, rtx)).is_err() {
@@ -565,6 +669,113 @@ mod tests {
         let mut b = connect(&path);
         let reply = roundtrip(&mut b, r#"{"token":"tok-b","method":"list"}"#);
         assert!(reply.get("ok").is_some(), "a different principal must still connect: {reply}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- §5.6 / M3: token-bucket command rate limit ------------------------
+
+    #[test]
+    fn a_flood_is_throttled_not_dropped_or_hung() {
+        let (path, listener) = scratch_listener("flood");
+        spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        let total = PRINCIPAL_BUCKET_CAPACITY as usize + 20;
+        let mut ok = 0;
+        let mut throttled = 0;
+        for _ in 0..total {
+            let reply = roundtrip(&mut c, r#"{"token":"flooder","method":"list"}"#);
+            match reply.get("err").and_then(|v| v.as_str()) {
+                Some(err) => {
+                    assert!(err.contains("rate limited"), "throttle reply must name itself: {err}");
+                    throttled += 1;
+                }
+                None => {
+                    assert!(reply.get("ok").is_some(), "unexpected reply shape: {reply}");
+                    ok += 1;
+                }
+            }
+        }
+        assert_eq!(ok + throttled, total, "every one of {total} requests got exactly one reply");
+        assert!(throttled > 0, "a flood past the bucket capacity must be throttled at least once");
+
+        // Throttled, not banned: the connection is still alive and usable.
+        let reply = roundtrip(&mut c, r#"{"token":"flooder","method":"list"}"#);
+        assert!(reply.get("ok").is_some() || reply.get("err").is_some());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_legitimate_bursty_sequence_is_not_throttled() {
+        let (path, listener) = scratch_listener("burst");
+        spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        // DESIGN-control.md §7's documented pattern: spawn x10 then wait x10,
+        // fired back-to-back exactly as a real fan-out/fan-in would.
+        // Regressing this (the burst getting throttled) would make the fix
+        // worse than the bug it closes.
+        for i in 0..10 {
+            let reply = roundtrip(&mut c, r#"{"token":"orch","method":"spawn","adapter":"shell"}"#);
+            assert!(reply.get("ok").is_some(), "spawn #{i} of the burst was throttled: {reply}");
+        }
+        for i in 0..10 {
+            let reply = roundtrip(&mut c, r#"{"token":"orch","method":"list"}"#);
+            assert!(reply.get("ok").is_some(), "op #{i} of the burst was throttled: {reply}");
+        }
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn throttle_and_cap_replies_are_distinguishable_from_unauthorized_and_malformed() {
+        // app.rs's actual wording (core/app.rs `handle_control_msg`), out of
+        // scope here to touch or invoke directly — this pins that sock.rs's
+        // own strings never collide with it.
+        const UNAUTHORIZED: &str = "unauthorized: unknown or missing token";
+
+        let (path, listener) = scratch_listener("distinguish");
+        spawn_accept_loop(listener, fake_app());
+
+        // Malformed: no token to even evaluate.
+        let mut m = connect(&path);
+        let reply = roundtrip(&mut m, r#"{"method":"list"}"#);
+        let malformed = reply.get("err").and_then(|v| v.as_str()).expect("malformed must error").to_string();
+
+        // Connection limit: fill one principal's cap, then go one over.
+        let mut _held = Vec::new();
+        for _ in 0..PRINCIPAL_MAX_CONN {
+            let mut c = connect(&path);
+            roundtrip(&mut c, r#"{"token":"cap-x","method":"list"}"#);
+            _held.push(c);
+        }
+        let mut over = connect(&path);
+        let reply = roundtrip(&mut over, r#"{"token":"cap-x","method":"list"}"#);
+        let cap_err = reply.get("err").and_then(|v| v.as_str()).expect("over cap must error").to_string();
+
+        // Rate limit: exhaust a fresh principal's bucket.
+        let mut r = connect(&path);
+        let mut throttled = None;
+        for _ in 0..(PRINCIPAL_BUCKET_CAPACITY as usize + 5) {
+            let reply = roundtrip(&mut r, r#"{"token":"rate-y","method":"list"}"#);
+            if let Some(e) = reply.get("err").and_then(|v| v.as_str()) {
+                throttled = Some(e.to_string());
+                break;
+            }
+        }
+        let throttled = throttled.expect("flood must throttle within the loop above");
+
+        for (name, s) in [("malformed", &malformed), ("connection-limit", &cap_err), ("rate-limit", &throttled)] {
+            assert!(!s.contains("unauthorized"), "{name} reply reads as unauthorized: {s}");
+            assert_ne!(s.as_str(), UNAUTHORIZED, "{name} reply must not equal app.rs's unauthorized text");
+        }
+        assert_ne!(malformed, cap_err, "malformed and connection-limit must read differently");
+        assert_ne!(malformed, throttled, "malformed and rate-limit must read differently");
+        assert_ne!(cap_err, throttled, "connection-limit and rate-limit must read differently");
+        assert!(cap_err.contains("connection limit"));
+        assert!(throttled.contains("rate limited"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
