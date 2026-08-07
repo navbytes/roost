@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use crate::infra::sock::socket_path;
+use crate::infra::sock::{socket_path, OVERSIZE_LINE_MSG};
 use crate::infra::store::FsStore;
 
 const VERBS: &[&str] = &["list", "status", "spawn", "fork", "send", "read", "close", "wait"];
@@ -178,7 +178,11 @@ fn run(args: &[String]) -> i32 {
             } else {
                 let err = reply.get("err").and_then(|e| e.as_str()).unwrap_or("unknown error");
                 eprintln!("roost: {err}");
-                1
+                // An oversized request is the caller's own invalid input —
+                // the usage-error family (2, see USAGE), not a runtime
+                // failure of the instance (1) every other `err` reply here
+                // gets.
+                if err == OVERSIZE_LINE_MSG { 2 } else { 1 }
             }
         }
         Err(e) => {

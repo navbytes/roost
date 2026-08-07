@@ -79,9 +79,25 @@ const PRE_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max bytes accepted for one status line. A well-formed message is well under
-/// this; a client that streams without a newline is dropped instead of being
-/// allowed to grow an unbounded buffer (local DoS).
+/// this; a client that streams without a newline past the cap gets
+/// `OVERSIZE_LINE_MSG` back instead of being allowed to grow an unbounded
+/// buffer (local DoS) — then the connection is closed regardless, since
+/// there is no newline left in it to resynchronise a next request on. Before
+/// that reply existed the caller just saw the connection vanish (EPIPE),
+/// which `cli.rs` reported as "cannot reach a running roost" — exactly the
+/// wrong diagnosis, and the neighbouring size to the one that used to freeze
+/// the whole process (PR #67), so it's exactly where someone lands right
+/// after hitting that.
 const MAX_LINE: u64 = 64 * 1024;
+
+/// The exact reply for a line that hits `MAX_LINE`. `cli.rs` matches this
+/// verbatim to choose the usage-error exit code (2) instead of the generic
+/// runtime one (1) every other `err` reply here gets — this is the caller's
+/// own oversized input, not a roost failure. A `pub const` shared by both
+/// sides rather than hand-typed twice, same reasoning as
+/// `UNSAFE_SOCKET_DIR_MSG` above: two copies would let a reword here quietly
+/// stop matching what `cli.rs` checks.
+pub const OVERSIZE_LINE_MSG: &str = "message too large (max 64 KiB); split it or use a file";
 
 /// Cap concurrent client connections so a buggy/looping extension that
 /// reconnects rapidly can't spawn unbounded threads/FDs.
@@ -615,6 +631,50 @@ fn read_line_deadlined(
     }
 }
 
+/// After the oversized-line reply below, discard whatever this connection
+/// sends next until it goes quiet (or `deadline` passes) — otherwise a
+/// client still mid-`write()` of the oversized payload (this connection
+/// stopped reading at `MAX_LINE`) is blocked on its own kernel send buffer
+/// filling up, never reaches the `read()` that would see our reply, and gets
+/// the same misleading EPIPE the reply exists to replace. A local socket's
+/// default kernel buffer is small enough for this to matter well before
+/// megabyte-sized payloads: 8 KiB each way is the macOS default. Draining
+/// unblocks that write the same way the client finishing it naturally would.
+/// Nothing here is buffered or parsed — this connection is already
+/// committed to closing (no newline left to resynchronise a next request
+/// on) — so a sender that never goes quiet just holds this one thread until
+/// `deadline`, the same bound every other unproven connection gets, not
+/// forever.
+///
+/// Each individual read is capped at `IDLE_GAP`, not the full remaining
+/// budget — a first cut used `remaining` directly and blocked for nearly the
+/// whole `deadline` on the *last*, data-free read before returning, since a
+/// client that finishes writing and moves straight to its own read (the
+/// common case, not an attack) never sends EOF here. That made every
+/// oversized reply take ~`deadline` to close for no reason and, under a
+/// loaded host, raced a test's own client-side read timeout of the same
+/// order. `IDLE_GAP` only has to clear real scheduling jitter on a local
+/// socket, not a network RTT, so it can stay far below `deadline` while
+/// `deadline` still bounds a sender that never stops.
+fn drain_until_quiet(reader: &mut BufReader<UnixStream>, deadline: Instant) {
+    const IDLE_GAP: Duration = Duration::from_millis(200);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let _ = reader.get_ref().set_read_timeout(Some(remaining.min(IDLE_GAP)));
+        match reader.fill_buf() {
+            Ok([]) => return, // EOF: peer fully done
+            Ok(chunk) => {
+                let n = chunk.len();
+                reader.consume(n);
+            }
+            Err(_) => return, // quiet for IDLE_GAP (or past `deadline`), or a real error
+        }
+    }
+}
+
 /// Bind the socket and pump parsed events into the main loop. Returns the
 /// bound path (exported to panes as ROOST_SOCK).
 pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
@@ -764,9 +824,28 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                             Err(_) => break 'conn, // read error, or the pre-auth deadline
                         }
                     };
-                    // Hit the cap without terminating — oversized line; drop the
-                    // connection rather than trying to resync.
+                    // Hit the cap without terminating — oversized line. Reply
+                    // with the true diagnosis (see `OVERSIZE_LINE_MSG`), then
+                    // close regardless: there is no newline left in this
+                    // connection to resynchronise a next request on, so
+                    // trying to keep parsing it would corrupt the framing.
+                    // This sits ahead of `line_bucket`/principal/global —
+                    // deliberately: an oversized line is never parsed, let
+                    // alone dispatched, and it costs the sender their entire
+                    // connection (one of only MAX_CONN) for a single
+                    // attempt, a harsher toll than any of those buckets
+                    // charge a well-formed line, so there is no cheaper flood
+                    // to be had by skipping them here.
                     if buf.last() != Some(&b'\n') && n as u64 == MAX_LINE {
+                        if write_reply(&mut reader, &Reply::err(OVERSIZE_LINE_MSG)) {
+                            // The client may still be mid-write of the
+                            // oversized payload itself — drain what's left,
+                            // bounded like any other unproven connection, so
+                            // that write can finish and the client actually
+                            // reaches the read() that sees this reply (see
+                            // `drain_until_quiet`).
+                            drain_until_quiet(&mut reader, Instant::now() + PRE_AUTH_READ_TIMEOUT);
+                        }
                         break;
                     }
                     let Ok(line) = std::str::from_utf8(&buf) else { continue };
@@ -1654,6 +1733,78 @@ mod tests {
         assert_ne!(cap_err, throttled, "connection-limit and rate-limit must read differently");
         assert!(cap_err.contains("connection limit"));
         assert!(throttled.contains("rate limited"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- oversize-line follow-up: a true diagnosis, not a silent EPIPE -----
+
+    /// `OVERSIZE_LINE_MSG` must actually name the cap `MAX_LINE` enforces —
+    /// a guard against the two silently drifting apart if either is ever
+    /// changed without the other.
+    #[test]
+    fn oversize_reply_names_the_actual_cap() {
+        assert!(
+            OVERSIZE_LINE_MSG.contains(&(MAX_LINE / 1024).to_string()),
+            "OVERSIZE_LINE_MSG must name MAX_LINE's real KiB value: {OVERSIZE_LINE_MSG}"
+        );
+    }
+
+    /// A line past `MAX_LINE` must get a true diagnosis, not the silent drop
+    /// that used to EPIPE the client mid-write and print "cannot reach a
+    /// running roost" — an alive instance misdiagnosed as unreachable.
+    #[test]
+    fn an_oversized_line_gets_a_true_diagnosis_reply_before_closing() {
+        let (path, listener) = scratch_listener("oversize");
+        spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        // Far past MAX_LINE (64 KiB) and past any local socket's default
+        // kernel buffer too (8 KiB each way on macOS) — this exercises the
+        // drain that lets a still-writing client ever reach the read() that
+        // sees this reply, not merely a payload that happens to fit
+        // untouched in one write().
+        let payload = "A".repeat(200_000);
+        let reply = roundtrip(&mut c, &payload);
+        let err = reply.get("err").and_then(|v| v.as_str()).expect("oversized line must error, not hang or drop silently");
+        assert_eq!(err, OVERSIZE_LINE_MSG, "must be the exact shared message cli.rs matches on");
+
+        // Still closes afterward: no newline left in this connection to
+        // resynchronise a next request on.
+        let mut discard = String::new();
+        let n = c.read_line(&mut discard).expect("must close cleanly, not hang");
+        assert_eq!(n, 0, "connection must be closed after the oversize reply: {discard:?}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The actual regression risk: an oversized line on one connection must
+    /// not take the listener down with it, or leak the slot it held. A
+    /// fresh connection right after must still connect and be served
+    /// normally, on a brand new connection.
+    #[test]
+    fn an_oversized_line_does_not_take_the_instance_down_with_it() {
+        let (path, listener) = scratch_listener("oversize-survives");
+        let limits = spawn_accept_loop(listener, fake_app());
+        let mut c = connect(&path);
+
+        let payload = "A".repeat(200_000);
+        let reply = roundtrip(&mut c, &payload);
+        assert!(reply.get("err").is_some(), "setup: must be the oversize reply");
+        drop(c);
+
+        // The global slot the oversized connection held must be released,
+        // not leaked — the same `ConnGuard::drop` accounting path every
+        // other early `break` in the loop already goes through.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limits.global.load(Ordering::Relaxed) != 0 {
+            assert!(Instant::now() < deadline, "oversized connection's slot was never released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut fresh = connect(&path);
+        let reply = roundtrip(&mut fresh, r#"{"token":"newcomer","method":"list"}"#);
+        assert!(reply.get("ok").is_some(), "a fresh connection after an oversized one must still be served: {reply}");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

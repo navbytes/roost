@@ -6,6 +6,8 @@
 //! (or an explicit `--help`) is settled before the socket is ever opened.
 //! `wait`'s timeout is the one exception that needs a real pane, so it's
 //! driven through the PTY harness like `socket_status.rs`/`status_hook.rs`.
+//! An oversized request is a second: the socket has to actually be open to
+//! reject it.
 
 // The shared harness is compiled per test binary; helpers other tenants use
 // are dead code from this binary's view — not real rot.
@@ -250,6 +252,58 @@ fn wait_timeout_exits_nonzero_and_distinct_from_runtime_and_usage_errors() {
     assert_ne!(o.status.code(), Some(1), "must differ from a runtime error");
     assert_ne!(o.status.code(), Some(2), "must differ from a usage error");
     assert!(out(&o).contains("timed_out"), "stdout: {:?}", out(&o));
+
+    let _ = h.quit_and_wait(Duration::from_secs(5));
+}
+
+/// PR #67 follow-up, driven end to end: a request over the control plane's
+/// 64 KiB line cap used to drop the connection with no reply — the client's
+/// own write EPIPEd mid-payload, and `cli.rs` reported that as "cannot reach
+/// a running roost", exactly the wrong diagnosis for an instance that was
+/// alive the whole time. Well past both the cap and a local socket's default
+/// kernel buffer (as little as 8 KiB each way on macOS), so this only passes
+/// if the server actually drains the rest of the client's still-in-flight
+/// write rather than merely replying to a payload that happened to fit in
+/// one write() call.
+#[test]
+fn oversized_request_gets_a_true_diagnosis_and_leaves_the_instance_alive() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let workspace = serde_json::json!({
+        "version": 1,
+        "active_tab": 0,
+        "tabs": [{
+            "name": "main",
+            "layout": { "pane": 1 },
+            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
+        }]
+    })
+    .to_string();
+    let mut h = match Harness::try_spawn(&workspace) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP oversized-request gate: {reason}");
+            return;
+        }
+    };
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+    wait_until_reachable(h.state_dir(), Duration::from_secs(5));
+
+    let payload = "A".repeat(200_000);
+    let o = cli_in(h.state_dir(), &["send", "1", &payload]);
+
+    assert_eq!(o.status.code(), Some(2), "must be a usage error, not a runtime one: {o:?}");
+    let stderr = err(&o);
+    assert!(stderr.contains("message too large"), "stderr must name the real problem: {stderr:?}");
+    assert!(
+        !stderr.contains("cannot reach a running roost"),
+        "must not misdiagnose a live instance as unreachable: {stderr:?}"
+    );
+
+    // The actual regression risk: the instance must still be fully alive —
+    // a subsequent `list`, on a brand new connection, must still succeed.
+    let after = cli_in(h.state_dir(), &["list"]);
+    assert!(after.status.success(), "control plane stopped answering after the oversized request: {after:?}");
 
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }
