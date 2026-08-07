@@ -84,6 +84,16 @@ const PRINCIPAL_REFILL_PER_SEC: f64 = 5.0;
 const GLOBAL_BUCKET_CAPACITY: f64 = 128.0;
 const GLOBAL_REFILL_PER_SEC: f64 = 20.0;
 
+/// Cap on distinct tokens tracked in `Limits::buckets` at once (see
+/// `evict_one`). A same-uid attacker fully controls the wire `token` field,
+/// so nothing stops it minting a fresh one per request; without a bound the
+/// map — and with it, roost's memory — grows without limit. Real principal
+/// counts here are tiny (the fleet token plus however many panes exist,
+/// itself accidentally bounded by terminal size — MIN_SPLIT_COLS, per the
+/// audit); 512 is generous headroom above that, so eviction only ever
+/// engages under actual token-rotation abuse, never legitimate use.
+const MAX_TRACKED_TOKENS: usize = 512;
+
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
 /// an attacker who pre-created the runtime dir from hosting our control socket
 /// (tmux does the same for its socket dir).
@@ -203,18 +213,30 @@ impl Bucket {
         Bucket { tokens: capacity, last: Instant::now(), capacity, refill_per_sec }
     }
 
-    /// Refill for elapsed wall-clock time, then take one token if available.
-    fn take(&mut self) -> bool {
+    /// Refill for elapsed wall-clock time since the last touch.
+    fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = now;
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+    }
+
+    /// Refill, then take one token if available.
+    fn take(&mut self) -> bool {
+        self.refill();
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
         } else {
             false
         }
+    }
+
+    /// Refill, then report the resulting token count without consuming one —
+    /// used by eviction (`evict_one`) to find the cheapest entry to drop.
+    fn refill_and_peek(&mut self) -> f64 {
+        self.refill();
+        self.tokens
     }
 }
 
@@ -245,12 +267,11 @@ struct Limits {
     per_principal: Mutex<HashMap<String, usize>>,
     /// Command-rate bucket per token. Unlike `per_principal`, entries persist
     /// for the life of the listener — a flood-by-reconnect must not reset its
-    /// budget.
-    // ponytail: unbounded map keyed by a client-supplied string. sock.rs
-    // can't validate tokens (needs App), so a caller minting a fresh garbage
-    // token per request grows this forever; `global_bucket` below bounds the
-    // resulting throughput regardless, but not this map's memory. Add LRU
-    // eviction if that ever gets exploited on its own.
+    /// budget. Bounded at `MAX_TRACKED_TOKENS` (see `evict_one`): sock.rs
+    /// can't validate tokens, so leaving this unbounded would let the same
+    /// attacker this map exists to throttle instead exhaust memory by
+    /// minting a fresh token per request — a security fix that opens a
+    /// (smaller) security hole is not a deferral worth taking here.
     buckets: Mutex<HashMap<String, Bucket>>,
     /// Aggregate command-rate backstop, independent of principal identity —
     /// see the const doc comment above.
@@ -311,11 +332,37 @@ impl Limits {
     fn take_command(&self, token: &str) -> bool {
         let principal_ok = {
             let mut map = self.buckets.lock().unwrap();
+            if map.len() >= MAX_TRACKED_TOKENS && !map.contains_key(token) {
+                evict_one(&mut map);
+            }
             map.entry(token.to_string())
                 .or_insert_with(|| Bucket::new(PRINCIPAL_BUCKET_CAPACITY, PRINCIPAL_REFILL_PER_SEC))
                 .take()
         };
         principal_ok && self.global_bucket.lock().unwrap().take()
+    }
+}
+
+/// Free one slot in `map` for a new token, at `MAX_TRACKED_TOKENS`. Picks the
+/// entry with the most tokens *after* refilling it for elapsed idle time.
+///
+/// That single comparison covers both cases the policy cares about: a bucket
+/// idle long enough to have fully refilled (tokens == capacity) carries no
+/// enforcement state, so dropping it is free — and since every entry here
+/// shares the same capacity, "full" is simply the maximum possible token
+/// count, so it's always chosen first when one exists. If nothing is full
+/// (an active flood of single-use tokens, none idle yet), the same
+/// comparison falls back to "evict the fullest", exactly as it should. A
+/// principal still being actively throttled sits at the *low* end of this
+/// ordering, so it's the last one picked, not the first.
+fn evict_one(map: &mut HashMap<String, Bucket>) {
+    let victim = map
+        .iter_mut()
+        .map(|(token, bucket)| (bucket.refill_and_peek(), token.clone()))
+        .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, token)| token);
+    if let Some(token) = victim {
+        map.remove(&token);
     }
 }
 
@@ -727,6 +774,36 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn bucket_map_stays_bounded_and_never_evicts_an_actively_throttled_principal() {
+        // Unit-level against `Limits` directly — deterministic and fast,
+        // no need to round-trip real elapsed time through a socket.
+        let limits = Limits::new();
+
+        // "active" is genuinely being enforced: drain its bucket to exactly
+        // its limit. This is the state that must survive eviction — if it's
+        // evicted, the next call gets a *fresh* bucket and silently succeeds
+        // instead of being throttled, handing the attacker a bypass (worse
+        // than the memory leak this test is otherwise guarding against).
+        for _ in 0..(PRINCIPAL_BUCKET_CAPACITY as usize) {
+            assert!(limits.take_command("active"));
+        }
+        assert!(!limits.take_command("active"), "setup bug: active should be at its limit");
+
+        // Rotate far more distinct, single-use tokens than MAX_TRACKED_TOKENS
+        // — exactly the "mint a fresh token per request" evasion. Each is
+        // used once then abandoned, so it carries no ongoing enforcement
+        // state (unlike "active", which keeps getting checked below).
+        for i in 0..(MAX_TRACKED_TOKENS * 3) {
+            limits.take_command(&format!("flood-{i}"));
+        }
+
+        let map = limits.buckets.lock().unwrap();
+        assert!(map.len() <= MAX_TRACKED_TOKENS, "bucket map grew past its bound: {}", map.len());
+        let active = map.get("active").expect("an actively-throttled principal was evicted");
+        assert!(active.tokens < 1.0, "active's drained state was reset by eviction: {} tokens", active.tokens);
     }
 
     #[test]
