@@ -85,6 +85,48 @@ const PRE_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// unaffected: it's still reaped here, unchanged.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wall-clock budget for handing one whole reply to the client, enforced by
+/// `write_reply`'s own loop. The write-side twin of `READ_TIMEOUT`, and the
+/// only thing that bounds a connection parked in `write_reply`: P0 above says
+/// no client *read* may block forever, nothing said the same about the reply,
+/// and a blocking `write_all` on a peer that has stopped reading is reached
+/// by none of the reaping paths here — `PRE_AUTH_READ_TIMEOUT` and
+/// `READ_TIMEOUT` only ever fire on a thread that is in a `read()`. Repro:
+/// `MAX_CONN` connections that each send one request and never read the
+/// answer (pipelining more replies than their receive buffer holds does it
+/// too); every connection thread wedges in `write_all`, the global pool sits
+/// at `MAX_CONN` for as long as those peers live, and the accept loop sheds
+/// every new client with nothing left that can ever free a slot — a black
+/// hole only a restart clears. The identical flood with a *readable* peer is
+/// reaped on `READ_TIMEOUT` and recovers, which is what isolates the write.
+///
+/// Wall-clock, not `SO_SNDTIMEO`, for exactly the reason `PRE_AUTH_READ_
+/// TIMEOUT` is: a socket option bounds one `write()` syscall, not the reply.
+/// A first cut used only `set_write_timeout` and `write_all`, and a peer that
+/// accepts a few bytes per timeout window — `write_all` loops with no
+/// wall-clock check of its own — simply stretched one reply across as many
+/// windows as the payload has chunks. That is the same drip the C1 fix closed
+/// on the read side, pointed the other way, and it showed up first as this
+/// file's own regression test taking 10s alone but blowing a 30s deadline
+/// under a loaded parallel suite run: with the bound proportional to the
+/// payload rather than fixed, there was no honest number to assert.
+///
+/// Five seconds is enormous for a *local* socket, where any live client
+/// drains a multi-megabyte `read` in milliseconds; a peer that cannot take
+/// 256 KiB in five seconds is suspended, hung, or hostile, not slow. A reply
+/// cut off here is truncated on the wire, which is why the connection ends
+/// immediately after: like the oversize path, there is no framing left to
+/// resynchronise a next request on.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `SO_SNDTIMEO` for a client socket. Not a budget of its own — it exists so
+/// a write to a peer that has stopped reading *returns* instead of blocking
+/// forever, letting `write_reply` get back around to its `WRITE_TIMEOUT`
+/// check. Exactly the role `set_read_timeout` plays for
+/// `read_line_deadlined`. Short, so the enforced bound is `WRITE_TIMEOUT`
+/// plus at most one tick rather than plus a whole second timeout window.
+const WRITE_TICK: Duration = Duration::from_millis(250);
+
 /// Max bytes accepted for one status line. A well-formed message is well under
 /// this; a client that streams without a newline past the cap gets
 /// `OVERSIZE_LINE_MSG` back instead of being allowed to grow an unbounded
@@ -296,7 +338,32 @@ fn parse_control(line: &str) -> Option<Result<Request, String>> {
 fn write_reply(reader: &mut BufReader<UnixStream>, reply: &Reply) -> bool {
     let Ok(mut json) = serde_json::to_string(reply) else { return true };
     json.push('\n');
-    reader.get_mut().write_all(json.as_bytes()).is_ok()
+    let mut buf = json.as_bytes();
+    let deadline = Instant::now() + WRITE_TIMEOUT;
+    // `write_all` by hand so the wall-clock deadline is checked between
+    // syscalls (see `WRITE_TIMEOUT`) — `write_all`'s own loop has no notion of
+    // one, so a peer taking a few bytes per `WRITE_TICK` would otherwise
+    // stretch a single reply for as long as the payload is large.
+    while !buf.is_empty() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        match reader.get_mut().write(buf) {
+            Ok(0) => return false,
+            Ok(n) => buf = &buf[n..],
+            // A tick elapsed with the peer's buffer full, or a signal: both
+            // just mean "come back and re-check the deadline".
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return false, // client hung up, or a real error
+        }
+    }
+    true
 }
 
 fn parse_line(line: &str) -> Option<AppEvent> {
@@ -813,6 +880,14 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                 // Extended once this connection proves itself with a
                 // well-formed request, below.
                 let _ = stream.set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT));
+                // Never extended on promotion, unlike the read timeout: this
+                // is not a trust budget, just the tick that lets
+                // `write_reply` re-check its wall-clock deadline (see
+                // `WRITE_TICK`) instead of blocking forever on a peer that
+                // stopped reading. Every reply on this connection —
+                // dispatched, rate-limited, over-cap, oversize — goes through
+                // that one function, so this covers all of them.
+                let _ = stream.set_write_timeout(Some(WRITE_TICK));
                 let mut reader = BufReader::new(stream);
                 let mut buf = Vec::new();
                 // Per-connection, unlocked (audit finding C2): every line
@@ -1128,6 +1203,7 @@ fn log_dropped(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn parses_string_and_numeric_pane_ids() {
@@ -1506,6 +1582,118 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let reply = try_request(&path, r#"{"token":"newcomer","method":"list"}"#, deadline);
         assert!(reply.get("ok").is_some(), "a drip flood must never lock out a fresh caller: {reply}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Like `fake_app`, but its reply is far larger than a local socket's
+    /// buffers (macOS defaults to 8 KiB each way) — enough that handing one
+    /// back to a client that never reads parks the connection thread in
+    /// `write_all`. That's `roost read` of a real scrollback, not a synthetic
+    /// size: the point is a reply that cannot be dumped into the peer's
+    /// buffer and forgotten.
+    fn fat_app() -> SyncSender<AppEvent> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(256);
+        std::thread::spawn(move || {
+            let blob = "x".repeat(256 * 1024);
+            while let Ok(ev) = rx.recv() {
+                if let AppEvent::Command(_req, reply) = ev {
+                    let _ = reply.send(Reply::ok(serde_json::json!({ "out": blob })));
+                }
+            }
+        });
+        tx
+    }
+
+    /// The write-side twin of the two floods above, and the one shape that
+    /// was a permanent black hole rather than a recoverable shed: a client
+    /// that asks for something big and then stops reading. Both read
+    /// deadlines only ever fire on a thread sitting in `read()`, so a
+    /// connection parked in `write_all` was reached by neither and held its
+    /// global slot for as long as the peer stayed alive. `MAX_CONN` of them
+    /// (trivially: one `roost read` per pane from a client that stopped
+    /// reading, or any pipelining caller) therefore locked the control plane
+    /// out permanently — the accept loop shedding every new connection with
+    /// nothing left that could ever free a slot.
+    ///
+    /// Asserts on the slot itself rather than staging the full lockout: it is
+    /// the same defect 64 times over, and one connection keeps this test off
+    /// the fd/thread contention that a `MAX_CONN` version of it collides with
+    /// under a full parallel suite run. Without `WRITE_TIMEOUT` the count
+    /// never returns to zero.
+    ///
+    /// One request (not a pipelined burst) keeps the test's own `write_all`
+    /// far inside the *server's* receive buffer: a client flooding requests
+    /// while the server has stopped reading would deadlock the test itself
+    /// rather than assert anything.
+    #[test]
+    fn a_connection_whose_peer_never_reads_the_reply_still_frees_its_slot() {
+        let (path, listener) = scratch_listener("noread");
+        let limits = spawn_accept_loop(listener, fat_app());
+
+        let mut stuck = UnixStream::connect(&path).expect("connect to scratch socket");
+        stuck.write_all(br#"{"token":"noread","method":"list"}"#).unwrap();
+        stuck.write_all(b"\n").unwrap();
+        // ...and never read a byte of the reply: the server is now blocked in
+        // `write_all` with a payload far larger than either socket buffer.
+        poll_until_admitted(&limits, 1);
+
+        // Doubled to absorb scheduling under a loaded parallel run, and no
+        // more: the bound is wall-clock and payload-independent, so anything
+        // beyond it is the bug, not a slow host. (With `SO_SNDTIMEO` alone it
+        // was proportional to the reply size — 10s here alone, past 30s under
+        // the full suite — which is why that isn't the fix.)
+        let deadline = Instant::now() + WRITE_TIMEOUT * 2;
+        while limits.global.load(Ordering::Relaxed) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a peer that never reads its reply must not hold a connection slot indefinitely"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        drop(stuck);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The write-side `dripping_connections_...`: a peer that *does* read,
+    /// just slower than the reply is long. `SO_SNDTIMEO` alone can never
+    /// catch this — every individual `write()` makes progress and completes
+    /// well inside its own window, so `write_all` keeps looping and the bound
+    /// becomes "payload size ÷ drip rate", i.e. unbounded from an attacker's
+    /// side and merely unpredictable from a test's. Exactly the C1 lesson
+    /// pointed the other way, which is why `write_reply` enforces an
+    /// `Instant` deadline of its own and this asserts the same fixed bound as
+    /// the not-reading-at-all case above.
+    #[test]
+    fn a_peer_that_drip_reads_its_reply_cannot_stretch_the_write_bound() {
+        let (path, listener) = scratch_listener("dripread");
+        let limits = spawn_accept_loop(listener, fat_app());
+
+        let mut stuck = UnixStream::connect(&path).expect("connect to scratch socket");
+        stuck.write_all(br#"{"token":"dripread","method":"list"}"#).unwrap();
+        stuck.write_all(b"\n").unwrap();
+        poll_until_admitted(&limits, 1);
+        // One byte per WRITE_TICK-ish, forever: enough that the server's
+        // writes keep succeeding, nowhere near enough to finish the reply.
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                std::thread::sleep(WRITE_TICK);
+                if !matches!(stuck.read(&mut byte), Ok(1)) {
+                    return; // server gave up and closed, as it must
+                }
+            }
+        });
+
+        let deadline = Instant::now() + WRITE_TIMEOUT * 2;
+        while limits.global.load(Ordering::Relaxed) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a drip-reading peer must not stretch one reply past WRITE_TIMEOUT"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
