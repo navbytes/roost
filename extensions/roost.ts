@@ -12,6 +12,15 @@
  * the pane it claims to be, so one pane can't spoof another's status/session:
  *   { pane, token, event: "session"  , session: "<uuid>" }
  *   { pane, token, event: "status"   , status: "working" | "waiting" | "needs_input" }
+ *
+ * promotion-auth-gate: reconnects with backoff on `error`/`close` (up to 5
+ * attempts, 250ms doubling to 4s, ±25% jitter; the budget refills once a
+ * connection has stayed up 30s) and replays the last known session/status on
+ * reconnect, so a transient drop — including a new roost's auth gate closing
+ * an old connection that was never authenticated (see the door in
+ * `src/infra/sock.rs`) — costs at most one stale status for seconds, not the
+ * rest of the session. See `send()` for why a disconnected send must itself
+ * kick a reconnect rather than silently drop.
  */
 import * as net from "node:net";
 import * as os from "node:os";
@@ -40,19 +49,110 @@ export default function (pi: ExtensionAPI) {
       ? path.join(process.env.XDG_RUNTIME_DIR, "roost.sock")
       : path.join(os.homedir(), ".local", "state", "roost", "roost.sock"));
 
+  // Retry policy (design decision, criterion 6): 5 attempts per burst,
+  // 250ms * 2^(n-1) capped at 4s — 250, 500, 1000, 2000, 4000 — ±25% jitter
+  // so a dozen panes reconnecting after the same roost restart don't thunder
+  // in lockstep. A burst's budget only refills after a connection survives
+  // `HEALTHY_AFTER_MS`: a connection that drops again quickly must not get a
+  // fresh 5 attempts immediately, or a persistently-broken socket retries
+  // forever at full speed.
+  const MAX_RETRY_ATTEMPTS = 5;
+  const BASE_DELAY_MS = 250;
+  const MAX_DELAY_MS = 4000;
+  const JITTER_FRACTION = 0.25;
+  const HEALTHY_AFTER_MS = 30_000;
+
   let sock: net.Socket | null = null;
+  let attempt = 0; // attempts already spent in the current burst
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let healthyTimer: ReturnType<typeof setTimeout> | null = null;
+  let shuttingDown = false; // session_shutdown initiated the close — no retry
+  // Last known session/status, kept up to date by every send() (even while
+  // disconnected) so a reconnect can replay it — see the "connect" handler.
+  const last: { session?: string; status?: string } = {};
+
+  const clearHealthyTimer = () => {
+    if (healthyTimer) {
+      clearTimeout(healthyTimer);
+      healthyTimer = null;
+    }
+  };
+
+  // Schedule the next attempt in the current burst, or do nothing once one
+  // is already pending or the burst is spent — `close` and `error` both fire
+  // for the same failure (Node emits `close` after `error`), so this must be
+  // idempotent per failure, not just per call.
+  const scheduleReconnect = () => {
+    if (shuttingDown || reconnectTimer || attempt >= MAX_RETRY_ATTEMPTS) return;
+    const backoff = Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+    attempt += 1;
+    const jitter = backoff * JITTER_FRACTION * (Math.random() * 2 - 1); // ±25%
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, Math.max(0, Math.round(backoff + jitter)));
+  };
+
   const connect = () => {
-    sock = net.connect(sockPath);
-    sock.on("error", () => (sock = null)); // roost gone → silent no-op
+    clearHealthyTimer();
+    const s = net.connect(sockPath);
+    sock = s;
+    s.on("connect", () => {
+      if (sock !== s) return; // superseded by a newer attempt
+      // Re-establish App's link refcount (a link-up requires a line) and
+      // hand back the exact status a false rejection would otherwise have
+      // cost — every reconnected socket's first line also authenticates it,
+      // so it's never idle-killed by the pre-auth gate again either.
+      if (last.session !== undefined) send({ event: "session", session: last.session });
+      if (last.status !== undefined) send({ event: "status", status: last.status });
+      clearHealthyTimer();
+      healthyTimer = setTimeout(() => {
+        attempt = 0;
+        healthyTimer = null;
+      }, HEALTHY_AFTER_MS);
+    });
+    s.on("error", () => {
+      if (sock !== s) return;
+      sock = null;
+      clearHealthyTimer();
+      scheduleReconnect();
+    });
+    s.on("close", () => {
+      if (sock !== s) return;
+      sock = null;
+      clearHealthyTimer();
+      if (!shuttingDown) scheduleReconnect();
+    });
   };
   connect();
 
+  // A disconnected gap with nothing pending must not just sit there: a
+  // >15s pi cold start would otherwise burn all five retries on idle
+  // connections (five pre-auth 2s kills, since nothing is sent before
+  // session_start fires) before session_start ever calls send() for real,
+  // leaving the session permanently silent. A real send() matters more than
+  // an idle burst's history, so it starts a fresh one; it does NOT kick if a
+  // reconnect is already in flight (`connect()` itself sets `sock`
+  // synchronously, so "no socket and nothing scheduled" only happens once a
+  // burst has genuinely run out).
+  const kickReconnect = () => {
+    if (sock || reconnectTimer) return;
+    attempt = 0;
+    connect();
+  };
+
   const send = (msg: Record<string, unknown>) => {
-    if (!sock) return;
+    if (msg.event === "session" && typeof msg.session === "string") last.session = msg.session;
+    if (msg.event === "status" && typeof msg.status === "string") last.status = msg.status;
+    if (!sock) {
+      kickReconnect(); // must not silently no-op — see the comment above
+      return;
+    }
     try {
       sock.write(JSON.stringify({ pane, token, ...msg }) + "\n");
     } catch {
       sock = null;
+      scheduleReconnect();
     }
   };
 
@@ -178,6 +278,9 @@ export default function (pi: ExtensionAPI) {
   // while the pane's real process is alive. Roost demotes any "exited" a
   // stale extension still sends to "waiting" for the same reason.
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    clearHealthyTimer();
     sock?.end();
   });
 }

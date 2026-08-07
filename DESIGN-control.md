@@ -271,36 +271,33 @@ protect.
    hang (both were real bugs in this file; see `parse_control`), worded not
    to collide with `"unauthorized: ..."` or a malformed-request error.
 
-   **Residual gap, unchanged by the revision — plainly open, not bounded:**
-   sock.rs still can't validate a token before promoting a connection past
-   pre-auth (that needs `Actor` resolution, core/app.rs's lane, not reached
-   into here). One well-formed request under *any* garbage token is
-   sufficient to promote — nothing checks whether it resolves to a real
-   principal — so an attacker can open up to `MAX_CONN` connections, each
-   earning the full 30s `READ_TIMEOUT` the instant it's promoted; as each
-   eventually closes it can simply reconnect and repeat. There are **two**
-   promotion doors, and a closing fix must gate both: a control request
-   under any garbage token, and a well-formed *status* line, which needs no
-   token at all. The status door also sidesteps `PRINCIPAL_MAX_CONN`
-   entirely — a status-promoted connection never calls
-   `try_reserve_principal`, because a status-only connection is not a
-   principal — so it does not even require the distinct per-connection
-   tokens the control-request door does. Cost and outcome are identical
-   either way, so this is one gap with two entrances, not two gaps. This is a connection-*count*/
-   connection-*duration* problem, not a command-rate one, so it is **not**
-   "bounded by the global connection cap" the way an earlier draft of this
-   section put it and the aggregate command bucket does not help either —
-   the global cap is exactly the resource this starves, and a connection
-   sitting on one promoted, unvalidated identity need not send more than
-   the single request that got it promoted to hold its slot for the full
-   30s. Each such connection *is* individually per-principal-capped and
-   command-rate-limited once admitted (so it can't itself flood commands —
-   that part is the aggregate bucket's load-bearing job, described above),
-   but that is beside the point here: the attack is holding the connection
-   open, not what it sends afterward. Closing this needs the token
-   validated against `App::resolve_actor` before (or as part of) promotion
-   — access this file does not have; tracked as an open follow-up, not
-   fixed here.
+   **Closed (promotion-auth-gate):** the gap described above — sock.rs
+   promoting a connection past pre-auth on grammar alone, at either of the
+   two doors — is fixed. sock.rs now holds a `TokenReader` (a read-only
+   handle onto App's token table, `core/control.rs`'s `TokenTable`/
+   `TokenSnapshot`; App remains the sole writer) and consults it
+   synchronously, before promotion, at both doors: a control request
+   promotes only if its token is the fleet token or some pane's own
+   (`TokenSnapshot::is_principal`); a status/session line promotes only if
+   its token matches *that exact pane's* own token
+   (`TokenSnapshot::pane_authorized` — the same predicate App's
+   `socket_authorized` uses at dispatch, so the two can't drift). Either
+   door's failure means no promotion, no dispatch: a garbage-token control
+   request gets the exact reply App would have given
+   (`UNAUTHORIZED_MSG`, a shared `pub const`) and dies at the 2s pre-auth
+   deadline instead of holding a slot for 30s; a garbage-token status line
+   is dropped silently (no reply — the wire shape has none) with no link-up
+   and no forward. Authenticated reporter connections additionally take a
+   new **per-pane cap of 8** (`Limits.reporters` in sock.rs, mirroring
+   `try_reserve_principal`'s accounting, released 1:1 with `link_panes`
+   entries at `ConnGuard` drop) — a separate pool from `PRINCIPAL_MAX_CONN`,
+   so a pane's own status links can't starve its control budget or vice
+   versa. What this does *not* fix, by design: an **authenticated** hostile
+   pane still gets its own capped share (8 reporter + 20 control
+   connections) — the gate bounds squatting to authenticated, capped
+   identities, it does not make a compromised pane harmless. Any same-user
+   process that can read `<state>/control.token` remains fully trusted — the
+   0600 file/dir is the boundary, unchanged.
 
    **Audit finding H3 correction (the arithmetic, not the cap numbers):**
    `app.rs`'s audit-log write is bounded by *bytes* attacker-controlled
