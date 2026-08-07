@@ -11,6 +11,8 @@
 
 use crate::core::workspace::PaneId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// How much of a pane to read back.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +149,188 @@ impl Reply {
     }
 }
 
+// -- promotion-auth-gate: the token table -----------------------------------
+//
+// sock.rs's accept-loop threads judge a caller's token synchronously, on
+// their own thread, before promoting a connection out of the pre-auth
+// guillotine (`PRE_AUTH_READ_TIMEOUT`) — see infra::sock's module doc and
+// the promotion-auth-gate design doc. They have no access to `App` (a
+// different owner, and reachable only via the main-loop channel, which is
+// exactly the round trip a synchronous door check can't afford), so the
+// token table itself is published here as a read-only snapshot sock.rs can
+// load without ever touching `App`.
+//
+// `TokenTable` (below) replaces both of `App`'s old `tokens`/`control_token`
+// fields with one storage: every mutator clone-mutates a NEW snapshot and
+// swaps it into the shared `Arc` (RCU) — the write IS the publish, so there
+// is exactly one storage and no second copy for a write site to forget to
+// update. `App` holds the only `TokenTable` (the only writer); sock.rs holds
+// a `TokenReader`, which has no mutators at all — structurally unable to
+// write, not merely disciplined not to.
+
+/// Reply text for a request whose token authenticates nobody — neither the
+/// fleet token nor any pane's own. Shared by `App::handle_control`/
+/// `handle_control_msg` (the dispatch-time check) and sock.rs's door (the
+/// pre-dispatch admission check) so the two can never say something
+/// different for the same failure — same pattern as `sock::OVERSIZE_LINE_MSG`.
+pub const UNAUTHORIZED_MSG: &str = "unauthorized: unknown or missing token";
+
+/// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is
+/// unreadable — the caller decides whether that's fatal (`TokenTable::new`
+/// does, for the fleet token; `gen_token` below tolerates it for a pane's).
+pub(crate) fn gen_secret() -> Option<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).ok()?;
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        s.push_str(&format!("{b:02x}"));
+    }
+    Some(s)
+}
+
+/// A per-pane status token. Unlike the fleet control token, a weak fallback is
+/// tolerable here: it only authenticates a pane's *own* status/session reports
+/// and sits behind the 0600 socket. The control token, which can drive the
+/// whole fleet, hard-fails instead (see `TokenTable::new`).
+pub(crate) fn gen_token() -> String {
+    gen_secret().unwrap_or_else(|| {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{n:032x}")
+    })
+}
+
+/// Immutable, cheap-to-clone (`Arc`) view of every live token: the one
+/// fleet/control token plus each pane's own `ROOST_TOKEN`. What `TokenTable`
+/// publishes on every mutation and what a `TokenReader` loads.
+pub struct TokenSnapshot {
+    control: String,
+    panes: HashMap<PaneId, String>,
+}
+
+impl TokenSnapshot {
+    /// Does `token` authenticate pane `id`'s own status/session reports?
+    /// Fails closed: unknown pane or empty token never match (former
+    /// `App::socket_authorized`'s logic).
+    pub fn pane_authorized(&self, id: PaneId, token: &str) -> bool {
+        !token.is_empty() && self.panes.get(&id).map(|t| t == token).unwrap_or(false)
+    }
+
+    /// Is `token` *some* legitimate identity — the fleet token, or any
+    /// pane's own — without resolving *which*? Exactly what a control
+    /// request's door check needs: at that point sock.rs doesn't know, and
+    /// doesn't need to know, which pane (if any) the caller claims to be.
+    pub fn is_principal(&self, token: &str) -> bool {
+        !token.is_empty() && (token == self.control || self.panes.values().any(|t| t == token))
+    }
+
+    /// Resolve a token to the caller it represents: the fleet control token,
+    /// or a pane acting via its own `ROOST_TOKEN`. Fails closed on
+    /// empty/unknown (former `App::resolve_actor`'s logic).
+    pub fn resolve_actor(&self, token: &str) -> Option<Actor> {
+        if token.is_empty() {
+            return None;
+        }
+        if token == self.control {
+            return Some(Actor::Fleet);
+        }
+        self.panes.iter().find(|(_, t)| t.as_str() == token).map(|(id, _)| Actor::Pane(*id))
+    }
+
+    /// The fleet control token (written to `<state>/control.token` by startup).
+    pub fn control(&self) -> &str {
+        &self.control
+    }
+}
+
+/// Sole owner of token state — the fleet control token plus every live
+/// pane's own. NOT `Clone`; held by value in `App`, the only writer.
+/// Internals: `Arc<RwLock<Arc<TokenSnapshot>>>`. A reader clones the inner
+/// `Arc` under a read lock held for nanoseconds (see the free `load` fn
+/// below); a writer builds the *next* snapshot entirely outside any lock
+/// (`publish`) and holds the write lock only for the pointer store — so the
+/// lock a door thread might contend on is never held across an allocation.
+pub struct TokenTable {
+    inner: Arc<RwLock<Arc<TokenSnapshot>>>,
+}
+
+impl TokenTable {
+    /// Mints the fleet token from the OS CSPRNG. `None` means `/dev/urandom`
+    /// is unreadable — the caller (`main.rs`, before any UI exists) decides
+    /// that's fatal, the same refusal `App::new` used to make on its own.
+    pub fn new() -> Option<TokenTable> {
+        let control = gen_secret()?;
+        let snapshot = TokenSnapshot { control, panes: HashMap::new() };
+        Some(TokenTable { inner: Arc::new(RwLock::new(Arc::new(snapshot))) })
+    }
+
+    /// A load-only handle for sock.rs: `Clone`, no mutators — sock.rs is
+    /// structurally unable to write the table it reads.
+    pub fn reader(&self) -> TokenReader {
+        TokenReader { inner: self.inner.clone() }
+    }
+
+    pub fn load(&self) -> Arc<TokenSnapshot> {
+        load(&self.inner)
+    }
+
+    /// (Re)issue pane `id`'s token — the mint, on every (re)spawn. I2: the
+    /// caller publishes this *before* starting the pane's child process, so
+    /// no legitimate connection can ever race the snapshot.
+    pub fn set_pane_token(&self, id: PaneId, token: String) {
+        self.publish(|panes| {
+            panes.insert(id, token);
+        });
+    }
+
+    /// Forget pane `id`'s token — on close, so a stale connection's later
+    /// (e.g. link-down) message carrying the old token can never
+    /// authenticate again.
+    pub fn remove_pane_token(&self, id: PaneId) {
+        self.publish(|panes| {
+            panes.remove(&id);
+        });
+    }
+
+    /// Clone-mutate-store (RCU): build the next generation's pane map by
+    /// applying `edit` to a clone of the current one — entirely outside any
+    /// lock — then swap it into the shared `Arc` under the write lock, held
+    /// only for that one pointer store.
+    fn publish(&self, edit: impl FnOnce(&mut HashMap<PaneId, String>)) {
+        let cur = self.load();
+        let mut panes = cur.panes.clone();
+        edit(&mut panes);
+        let next = Arc::new(TokenSnapshot { control: cur.control.clone(), panes });
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+}
+
+/// Load-only view handed to sock.rs. `Clone`; no mutators exist on this type
+/// at all — App's main loop is the sole writer, so single-writer RCU is
+/// sound by type design, not by convention.
+#[derive(Clone)]
+pub struct TokenReader {
+    inner: Arc<RwLock<Arc<TokenSnapshot>>>,
+}
+
+impl TokenReader {
+    pub fn load(&self) -> Arc<TokenSnapshot> {
+        load(&self.inner)
+    }
+}
+
+/// Shared by `TokenTable::load`/`TokenReader::load`: read-lock, clone the
+/// inner `Arc` (cheap — a pointer + refcount bump), drop the lock. Recovers
+/// from poisoning the same way `sock.rs`'s own `lock` helper does
+/// (sock.rs:384-386) — with exactly one writer (I3), a panicked reader can't
+/// leave the state torn.
+fn load(inner: &RwLock<Arc<TokenSnapshot>>) -> Arc<TokenSnapshot> {
+    inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +377,83 @@ mod tests {
         assert_eq!(s, r#"{"ok":{"pane":5}}"#);
         let s = serde_json::to_string(&Reply::err("nope")).unwrap();
         assert_eq!(s, r#"{"err":"nope"}"#);
+    }
+
+    // -- promotion-auth-gate: TokenTable/TokenSnapshot/TokenReader ----------
+
+    #[test]
+    fn snapshot_pane_authorized_matches_exactly_and_fails_closed() {
+        let table = TokenTable::new().unwrap();
+        table.set_pane_token(1, "secret-1".into());
+        let snap = table.load();
+        assert!(snap.pane_authorized(1, "secret-1"));
+        assert!(!snap.pane_authorized(1, "wrong"));
+        assert!(!snap.pane_authorized(1, ""));
+        assert!(!snap.pane_authorized(99, "secret-1"), "unknown pane fails closed");
+    }
+
+    #[test]
+    fn snapshot_is_principal_accepts_fleet_or_any_pane_token_only() {
+        let table = TokenTable::new().unwrap();
+        table.set_pane_token(1, "pane-1".into());
+        let snap = table.load();
+        assert!(snap.is_principal(snap.control()));
+        assert!(snap.is_principal("pane-1"));
+        assert!(!snap.is_principal("junk"));
+        assert!(!snap.is_principal(""));
+    }
+
+    #[test]
+    fn snapshot_resolve_actor_maps_fleet_and_pane_tokens_and_fails_closed() {
+        let table = TokenTable::new().unwrap();
+        table.set_pane_token(3, "pane-3".into());
+        let snap = table.load();
+        assert_eq!(snap.resolve_actor(snap.control()), Some(Actor::Fleet));
+        assert_eq!(snap.resolve_actor("pane-3"), Some(Actor::Pane(3)));
+        assert_eq!(snap.resolve_actor("nope"), None);
+        assert_eq!(snap.resolve_actor(""), None);
+    }
+
+    /// The RCU contract: a snapshot already `load()`ed is a frozen,
+    /// immutable view — a later mutation publishes a NEW snapshot; it never
+    /// mutates the one a reader is still holding.
+    #[test]
+    fn mutating_the_table_never_changes_a_snapshot_already_loaded() {
+        let table = TokenTable::new().unwrap();
+        table.set_pane_token(1, "v1".into());
+        let old = table.load();
+        assert!(old.pane_authorized(1, "v1"));
+
+        table.set_pane_token(1, "v2".into());
+        assert!(old.pane_authorized(1, "v1"), "the old snapshot must not mutate in place");
+        assert!(!old.pane_authorized(1, "v2"));
+
+        let new = table.load();
+        assert!(new.pane_authorized(1, "v2"));
+        assert!(!new.pane_authorized(1, "v1"));
+    }
+
+    #[test]
+    fn remove_pane_token_revokes_it_without_touching_other_panes() {
+        let table = TokenTable::new().unwrap();
+        table.set_pane_token(1, "v1".into());
+        table.set_pane_token(2, "v2".into());
+        table.remove_pane_token(1);
+        let snap = table.load();
+        assert!(!snap.pane_authorized(1, "v1"));
+        assert!(snap.pane_authorized(2, "v2"));
+    }
+
+    /// The write/read split's whole point: a `TokenReader` is `Clone` and
+    /// sees every publish made through the table, but has no mutator at all
+    /// — sock.rs is structurally unable to write, not merely disciplined
+    /// not to.
+    #[test]
+    fn reader_observes_writes_made_through_the_table() {
+        let table = TokenTable::new().unwrap();
+        let reader = table.reader();
+        assert!(!reader.load().pane_authorized(1, "v1"));
+        table.set_pane_token(1, "v1".into());
+        assert!(reader.load().pane_authorized(1, "v1"));
     }
 }
