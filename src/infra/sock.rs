@@ -1847,7 +1847,7 @@ mod tests {
     /// connections — staying unauthenticated is the property those tests
     /// assert; only their fresh-caller probe needs a seeded token.
     fn seeded_reader(pane_tokens: &[(PaneId, &str)]) -> TokenReader {
-        let table = TokenTable::new().expect("urandom must be available in tests");
+        let mut table = TokenTable::new().expect("urandom must be available in tests");
         for &(id, tok) in pane_tokens {
             table.set_pane_token(id, tok.to_string());
         }

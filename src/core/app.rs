@@ -7973,7 +7973,7 @@ mod tests {
 
     #[test]
     fn socket_auth_requires_matching_pane_token() {
-        let (app, _) = mk_app(shell_ws());
+        let (mut app, _) = mk_app(shell_ws());
         app.tokens.set_pane_token(1, "secret-1".into());
         app.tokens.set_pane_token(2, "secret-2".into());
         // Correct pane+token pair is authorized.

@@ -253,6 +253,15 @@ impl TokenSnapshot {
 /// below); a writer builds the *next* snapshot entirely outside any lock
 /// (`publish`) and holds the write lock only for the pointer store — so the
 /// lock a door thread might contend on is never held across an allocation.
+///
+/// I3 (single writer) is enforced by the compiler, not by convention: the
+/// three mutators (`set_pane_token`, `remove_pane_token`, `publish`) take
+/// `&mut self`, so calling one requires exclusive access to this whole
+/// value — and since `TokenTable` is owned by `App`, not `Arc`-shared, the
+/// only way to get that is through `App`'s own `&mut self`. Two overlapping
+/// `publish` calls (load → clone → mutate → write, not atomic as a whole)
+/// can therefore never interleave; the borrow checker rejects it at compile
+/// time, before the question of runtime locking even arises.
 pub struct TokenTable {
     inner: Arc<RwLock<Arc<TokenSnapshot>>>,
 }
@@ -280,7 +289,7 @@ impl TokenTable {
     /// (Re)issue pane `id`'s token — the mint, on every (re)spawn. I2: the
     /// caller publishes this *before* starting the pane's child process, so
     /// no legitimate connection can ever race the snapshot.
-    pub fn set_pane_token(&self, id: PaneId, token: String) {
+    pub fn set_pane_token(&mut self, id: PaneId, token: String) {
         self.publish(|panes| {
             panes.insert(id, token);
         });
@@ -289,7 +298,7 @@ impl TokenTable {
     /// Forget pane `id`'s token — on close, so a stale connection's later
     /// (e.g. link-down) message carrying the old token can never
     /// authenticate again.
-    pub fn remove_pane_token(&self, id: PaneId) {
+    pub fn remove_pane_token(&mut self, id: PaneId) {
         self.publish(|panes| {
             panes.remove(&id);
         });
@@ -298,8 +307,10 @@ impl TokenTable {
     /// Clone-mutate-store (RCU): build the next generation's pane map by
     /// applying `edit` to a clone of the current one — entirely outside any
     /// lock — then swap it into the shared `Arc` under the write lock, held
-    /// only for that one pointer store.
-    fn publish(&self, edit: impl FnOnce(&mut HashMap<PaneId, String>)) {
+    /// only for that one pointer store. `&mut self`, not `&self`: see the
+    /// I3 note on the struct doc above — this is what makes the sequence
+    /// (load, clone, mutate, swap) safe despite not being atomic as a whole.
+    fn publish(&mut self, edit: impl FnOnce(&mut HashMap<PaneId, String>)) {
         let cur = self.load();
         let mut panes = cur.panes.clone();
         edit(&mut panes);
@@ -383,7 +394,7 @@ mod tests {
 
     #[test]
     fn snapshot_pane_authorized_matches_exactly_and_fails_closed() {
-        let table = TokenTable::new().unwrap();
+        let mut table = TokenTable::new().unwrap();
         table.set_pane_token(1, "secret-1".into());
         let snap = table.load();
         assert!(snap.pane_authorized(1, "secret-1"));
@@ -394,7 +405,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_principal_accepts_fleet_or_any_pane_token_only() {
-        let table = TokenTable::new().unwrap();
+        let mut table = TokenTable::new().unwrap();
         table.set_pane_token(1, "pane-1".into());
         let snap = table.load();
         assert!(snap.is_principal(snap.control()));
@@ -405,7 +416,7 @@ mod tests {
 
     #[test]
     fn snapshot_resolve_actor_maps_fleet_and_pane_tokens_and_fails_closed() {
-        let table = TokenTable::new().unwrap();
+        let mut table = TokenTable::new().unwrap();
         table.set_pane_token(3, "pane-3".into());
         let snap = table.load();
         assert_eq!(snap.resolve_actor(snap.control()), Some(Actor::Fleet));
@@ -419,7 +430,7 @@ mod tests {
     /// mutates the one a reader is still holding.
     #[test]
     fn mutating_the_table_never_changes_a_snapshot_already_loaded() {
-        let table = TokenTable::new().unwrap();
+        let mut table = TokenTable::new().unwrap();
         table.set_pane_token(1, "v1".into());
         let old = table.load();
         assert!(old.pane_authorized(1, "v1"));
@@ -435,7 +446,7 @@ mod tests {
 
     #[test]
     fn remove_pane_token_revokes_it_without_touching_other_panes() {
-        let table = TokenTable::new().unwrap();
+        let mut table = TokenTable::new().unwrap();
         table.set_pane_token(1, "v1".into());
         table.set_pane_token(2, "v2".into());
         table.remove_pane_token(1);
@@ -450,7 +461,7 @@ mod tests {
     /// not to.
     #[test]
     fn reader_observes_writes_made_through_the_table() {
-        let table = TokenTable::new().unwrap();
+        let mut table = TokenTable::new().unwrap();
         let reader = table.reader();
         assert!(!reader.load().pane_authorized(1, "v1"));
         table.set_pane_token(1, "v1".into());
