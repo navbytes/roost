@@ -2078,20 +2078,25 @@ impl<B: PaneBackend> App<B> {
             rt.kill();
         }
         self.tokens.remove_pane_token(id);
-        // [F1] Same bound-map hygiene as `tokens` — ids aren't reused, so an
-        // unremoved entry would just sit there for the rest of the session.
+        // [F1] Same bound-map hygiene as `tokens` — pane ids are recycled
+        // (see the C23 comment a few lines below), so an unremoved entry
+        // isn't just inert growth: it could be misread as a fresh pane's
+        // own refcount the moment this id is reused.
         self.ext_link_counts.remove(&id);
         // Drop any spawn-error record for this pane too; otherwise a pane that
         // failed to spawn and is then closed leaves a stale `dead` entry that
-        // never gets cleaned (pane ids are not reused for it).
+        // a later pane reusing this id would inherit.
         self.dead.remove(&id);
         // A pane closed before its first output never got to flush its
         // buffered initial_input (see on_pty_output) — drop it too, rather
         // than leaking an entry keyed on an id that's gone for good.
         self.pending_input.remove(&id);
-        // C23: pane ids are never reused, so a stale raw-membership entry is
-        // harmless — but cheap to clean up alongside every other per-pane
-        // side table above.
+        // C23: pane ids ARE recycled (`next_pane_id` is max(current ids)+1,
+        // not a monotonic counter — see U11's comment below, and
+        // `wait_does_not_leak_a_recycled_pane_ids_status_cross_subtree`),
+        // so this isn't just cheap hygiene: an unremoved entry could
+        // otherwise be inherited by an unrelated later pane that reuses
+        // this id, silently switching it into raw mode.
         self.raw.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);

@@ -149,6 +149,11 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     try {
+      // ponytail: accepted race — a sub-millisecond window where the server
+      // already closed `sock` but the "error"/"close" event hasn't reached
+      // this callback yet can silently lose this one write. `last` (above)
+      // already recorded it, and the next lifecycle event's send() retries;
+      // not worth a write-then-confirm round trip for a one-shot report.
       sock.write(JSON.stringify({ pane, token, ...msg }) + "\n");
     } catch {
       sock = null;

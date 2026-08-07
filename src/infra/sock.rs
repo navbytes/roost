@@ -671,6 +671,13 @@ const MAX_LINK_PANES_PER_CONN: usize = 4;
 /// connections do NOT share `PRINCIPAL_MAX_CONN`: that pool is sized
 /// against control traffic (`MAX_WAITS` in app.rs), and charging reporters
 /// there would let a pane's own status links starve its control budget.
+///
+/// ponytail: accepted edge — a >8-wide parallel claude PreToolUse hook
+/// batch can exceed this. Zero operational cost: every parallel hook in
+/// one batch reports the same `working`, the refused one-shot exits 0
+/// (cli.rs's `status_hook` is silent-by-contract either way), and it's
+/// refused before any `link_panes` insert (no strand, no false negative
+/// on a real status change). Keep the cap at 8.
 const REPORTER_MAX_CONN_PER_PANE: usize = 8;
 
 /// RAII: releases whatever connection-accounting slots this connection holds
