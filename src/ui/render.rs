@@ -3500,7 +3500,96 @@ mod tests {
             out.push(("sub-two-row floor notice (80×1)", term.backend().buffer().clone()));
         }
 
+        // P21/C17 amendment: a running scrollback search paints its hits
+        // REVERSED (current hit also UNDERLINED) directly on the pane grid
+        // — `highlight_matches` is unit-tested in isolation (see
+        // `search_hits_are_reversed_with_the_current_one_underlined` below),
+        // but no `chrome_buffers()` state ever populated `app.search`, so
+        // the full `draw()` path — and therefore the three §2 mechanical
+        // gates that scan this fixture — never looked at a frame containing
+        // one. `Search::over` is the sanctioned test seam for rendering a
+        // search without driving a whole app; its `pane` field defaults to
+        // 1, so it's retargeted at whichever pane `three_panes()` left
+        // focused. Lines span far enough (0..40) that a hit lands inside
+        // the pane's inner height regardless of the fresh `FakePane`'s
+        // (0, 0) scroll position.
+        {
+            use crate::core::app::Search;
+            let mut app = three_panes();
+            let focused = app.focused;
+            let lines: Vec<String> = (0..40).map(|i| format!("mark line {i}")).collect();
+            let mut search = Search::over(lines, "mark", 3);
+            search.pane = focused;
+            app.search = Some(search);
+            out.push(("scrollback search hits", snap(&mut app)));
+        }
+
         out
+    }
+
+    /// [design-supervisor pattern, SG-2's own shape] The three §2 gates below
+    /// only audit whatever `chrome_buffers()` happens to produce — a drawn
+    /// state the fixture never visits is checked vacuously, which is exactly
+    /// how the too-small notice, a lit selection and the filtered roster
+    /// each shipped uncovered until someone noticed and patched the fixture
+    /// by hand. `chrome_buffers()` has no way to notice *itself* that a new
+    /// drawn surface exists; only a human remembering does.
+    ///
+    /// This closes that gap for exactly one axis: `Mode` gates every modal
+    /// chrome surface (C12-C16, C20, C22, C24, C27), and the match below has
+    /// **no wildcard arm** — the compiler refuses to build the moment a new
+    /// `Mode` variant is added without a decision here, which is "fails
+    /// until covered" rather than "silently passes" (the brief's own ask).
+    /// It is not a general solution: screen-size variants (C30), status
+    /// combinations (the roster filter), and focus permutations (C7's
+    /// unfocused expanded-stack edge — see the audit) are not enum-shaped,
+    /// so nothing here catches a gap in those axes. That remainder is a
+    /// human-must-remember list, recorded in the audit rather than faked
+    /// into a check that only looks exhaustive.
+    #[test]
+    fn every_mode_variant_has_a_chrome_buffers_fixture() {
+        // Exhaustive by construction: a new `Mode` variant is a compile
+        // error here until this match is taught the fixture-name substring
+        // that proves it. Add the `chrome_buffers()` case first, then the
+        // label below — in that order, so the assertion loop actually
+        // proves the fixture exists rather than describing one that doesn't.
+        fn required_fixture_substring(m: &Mode) -> Option<&'static str> {
+            match m {
+                // The baseline: every fixture is Normal-mode chrome.
+                Mode::Normal => None,
+                Mode::Rename { .. } => Some("rename dialog"),
+                Mode::Picker { .. } => Some("picker"),
+                Mode::Scroll => Some("scroll mode"),
+                Mode::Copy { .. } => Some("copy mode"),
+                Mode::Help { .. } => Some("help overlay"),
+                Mode::Feed { .. } => Some("activity feed"),
+                Mode::Roster { .. } => Some("fleet roster"),
+                Mode::Search { .. } => Some("scrollback search"),
+            }
+        }
+        // One representative value per variant, purely to drive the
+        // exhaustive match above — never rendered, so field values are
+        // arbitrary placeholders.
+        let samples = [
+            Mode::Normal,
+            Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane },
+            Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
+            Mode::Scroll,
+            Mode::Copy { cursor: (0, 0) },
+            Mode::Help { top: 0 },
+            Mode::Feed { offset: 0 },
+            Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None },
+            Mode::Search { copy_cursor: None },
+        ];
+        let names: Vec<&str> = chrome_buffers().iter().map(|(n, _)| *n).collect();
+        for m in &samples {
+            if let Some(needle) = required_fixture_substring(m) {
+                assert!(
+                    names.iter().any(|n| n.contains(needle)),
+                    "a Mode variant has no chrome_buffers() fixture containing {needle:?}: {names:?}",
+                );
+            }
+        }
     }
 
     /// C16 regression: the dead-pane action bar reverses its **whole inner

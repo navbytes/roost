@@ -81,10 +81,40 @@ change · **[descoped]** decided against unless a use-case demands it.
   parses its output with `vt100`; `tests/firehose.rs` uses it to assert
   input stays responsive under sustained output (every echo visible within
   250 ms, the firehose region still visibly moving every 500 ms sample, a
-  clean `Alt+q` exit within 2 s with no orphaned children). **Golden-frame
-  *color* scenarios are still deferred** — same trigger as before (first
-  chrome regression, or the next engagement leaning on `src/ui/render.rs`);
-  this gate is a perf smoke test, not a visual regression suite.
+  clean `Alt+q` exit within 2 s with no orphaned children). This gate is a
+  perf smoke test, not a visual regression suite — see the next entry for
+  the color scenarios once deferred here.
+
+- **[done] Golden-frame *color* scenarios.** The deferred trigger fired
+  (this engagement leaned on `src/ui/render.rs` heavily — see
+  `openspec/changes/best-in-class/PLAN.md` Phase 5). Audit first: of
+  C1-C30, the in-process `chrome_buffers()` fixture (render.rs) already
+  covered nearly every contract — four prior reactive patches (the
+  too-small notice, a lit selection, the filtered/reordered roster, the
+  dead-pane bar) had each closed a gap the hard way. This pass found and
+  closed one more before it became a fifth reactive patch (scrollback
+  search hits, P21/C17: unit-tested in isolation but never exercised
+  through the real `draw()` path), and named one it left open —
+  C7's *unfocused* expanded-stack-member edge marker, reachable only by
+  moving keyboard focus onto a collapsed row while a stack's expanded
+  member stays put elsewhere — still no fixture exercises it. `tests/chrome_theme.rs`
+  gained five PTY-level scenarios asserting on the real emitted SGR (not
+  just the in-process buffer): the Working pulse (both guaranteed reds,
+  never a third hue, never DIM), the dead-pane bar (red-reversed across
+  its whole row, not just its text — the C16/D1 regression shape),
+  a lit copy-mode selection (reversed, no forced color, no fill), the
+  roster's status filter (title tag in the tier's own C5 color — new as
+  of this same week, P2-11), and the C30 sub-two-row notice at its real
+  80×1 geometry (`Harness::try_spawn_sized` is new). Each was confirmed to
+  fail — reintroducing a fixed RGB in `accent()`/`pulse_bright()`, then a
+  background fill in `attention_problem()` and separately in
+  `highlight_selection()`, every time reverted after. Self-extension:
+  `render::tests::every_mode_variant_has_a_chrome_buffers_fixture`
+  exhaustively matches `Mode` with no wildcard arm, so a new modal surface
+  is a compile error until it earns a fixture — genuinely self-enforcing
+  for that one axis (C12-C16/C20/C22/C24/C27). Screen-size, status-
+  combination and focus-permutation axes (C30, the roster filter, C7)
+  aren't enum-shaped and stay a human-must-remember list.
 
 ## Control interface — remaining
 

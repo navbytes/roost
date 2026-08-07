@@ -28,6 +28,16 @@ use harness::{Harness, COLS, ROWS};
 const RED: vt100::Color = vt100::Color::Idx(1);
 /// ANSI 8 — the structure slot: borders, separators, rules. Never text.
 const STRUCTURE: vt100::Color = vt100::Color::Idx(8);
+/// ANSI 9 — `pulse_bright()`, the working pulse's other guaranteed-visible
+/// red (C5). A Working glyph may be `RED` or `LIGHT_RED` and nothing else.
+const LIGHT_RED: vt100::Color = vt100::Color::Idx(9);
+
+/// Alt+c: `Action::CopyMode`, ESC + `c` (not an escape introducer, so no
+/// DCS-style ambiguity — same family as `ALT_SHIFT_A` below).
+const ALT_C: &[u8] = b"\x1bc";
+/// Alt+Shift+a: `Action::ToggleRoster`, as a terminal delivers it without
+/// the kitty disambiguation (ESC + uppercase `A` — see `roster_overlay.rs`).
+const ALT_SHIFT_A: &[u8] = b"\x1bA";
 
 /// Two tabs (so the bar has an active label, an inactive one and separators)
 /// and two panes side by side (so one border is focused and one is not).
@@ -273,6 +283,292 @@ fn the_flash_reverses_the_terminals_own_pair_instead_of_filling() {
         assert!(inverse, "flash col {i} must be REVERSED, not filled");
         assert_eq!(fg, vt100::Color::Default, "flash col {i} must reverse the user's own ink");
     }
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// C5, end to end: the Working glyph (`●`) pulses between exactly two
+/// guaranteed-visible reds and never leans on DIM. Deliberately timing-
+/// independent — the harness already carries one host-timing flake
+/// (`firehose_latency_starvation_and_clean_exit`) and this suite must not
+/// gain a second one. Rather than racing the 1100ms/50%-duty clock to catch
+/// both phases, this samples whichever phase the frame happens to land on
+/// and asserts it is a **member of the two-colour set** the spec allows —
+/// true regardless of when the sample lands, and still false the moment a
+/// third hue (or a DIM-leaning pulse) is reintroduced.
+#[test]
+fn the_working_pulse_never_leaves_the_two_guaranteed_visible_reds() {
+    let Some(mut h) = spawn("chrome pulse gate") else { return };
+
+    // A real status report over the real control socket — the same call a
+    // Claude Code hook or the pi extension makes (status_hook.rs) — flips
+    // the focused pane to Working deterministically. No output heuristic,
+    // no sleep-and-hope.
+    let bin = env!("CARGO_BIN_EXE_roost");
+    h.write_bytes(format!("{bin} __status working\r").as_bytes());
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| (0..ROWS)
+            .any(|r| (0..COLS).any(|c| s.cell(r, c).is_some_and(|x| x.contents() == "●"))))
+        .is_some(),
+        "the working glyph never appeared after the status hook",
+    );
+
+    let screen = h.screen();
+    let mut found = 0;
+    for r in 0..ROWS {
+        for c in cols_of(&row_cols(screen, r), '●') {
+            let (fg, dim, ..) = attrs(screen, r, c);
+            assert!(
+                fg == RED || fg == LIGHT_RED,
+                "working glyph at ({r},{c}) is {fg:?} — the pulse allows only the two guaranteed reds",
+            );
+            assert!(!dim, "the pulse must never lean on DIM ({r},{c})");
+            found += 1;
+        }
+    }
+    assert!(found > 0, "no working glyph survived onto the parsed screen");
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// C16, end to end: a real child exit (not a poked internal) must draw the
+/// dead-pane bar reversed in the one red, across its **whole** row — the
+/// historical D1 bug was styling the span instead of the widget, which
+/// reversed only the message's own columns and left the dead program's last
+/// output showing through the rest of the row at normal video. The buffer-
+/// level `render::tests::the_dead_pane_bar_reverses_its_whole_row` pins the
+/// same shape in-process; this is the same regression class at the layer
+/// that actually reaches a user's terminal.
+#[test]
+fn the_dead_pane_bar_is_the_one_red_reversed_across_its_whole_row() {
+    let Some(mut h) = spawn("chrome dead-pane gate") else { return };
+
+    // A real hangup: the shell exits, the PTY closes, roost's own
+    // `on_pty_exit` fires — nothing poked, just what happens when an agent
+    // dies.
+    h.write_bytes(b"exit\r");
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("exited — Enter")).is_some(),
+        "the dead-pane bar never appeared",
+    );
+
+    let screen = h.screen();
+    let row = (0..ROWS)
+        .find(|&r| row_text(&row_cols(screen, r)).contains("exited — Enter"))
+        .expect("the bar's row");
+    let cols = row_cols(screen, row);
+
+    let reversed: Vec<u16> = (0..COLS).filter(|&c| attrs(screen, row, c).2).collect();
+    assert!(!reversed.is_empty(), "the bar is not reversed at all:\n{}", row_text(&cols));
+    let (first, last) = (reversed[0], *reversed.last().unwrap());
+    assert_eq!(
+        reversed.len() as u16,
+        last - first + 1,
+        "the reversal is not contiguous across the row: {:?}",
+        row_text(&cols),
+    );
+    let text_cols = (first..=last).filter(|&c| cols[c as usize] != " ").count();
+    assert!(
+        (last - first + 1) as usize > text_cols,
+        "the bar covers only its own glyphs, not the row — the C16/D1 regression shape",
+    );
+    for c in first..=last {
+        let (fg, _, inverse, _) = attrs(screen, row, c);
+        assert!(inverse, "col {c} of the dead-pane bar should be reversed");
+        assert_eq!(fg, RED, "col {c}: the problem bar is the one red, reversed (attention_problem)");
+    }
+    // Same §2 background policy as every other attention surface: the
+    // reversal is a modifier, not a fill.
+    assert_no_fill(screen, row, "dead-pane bar");
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// C17/C24/C29, end to end: a copy-mode selection reverses whatever is
+/// already there and paints no colour of its own — "sits on top of
+/// arbitrary program colours" is the whole point of the contract, so this
+/// asserts the selected cells stay the terminal's own default fg/bg with
+/// only REVERSED added, never a forced hue and never a fill. `V` (line
+/// select) is used deliberately over `v` + motions: it is absolute, so the
+/// scenario needs no clamping arithmetic to reproduce.
+#[test]
+fn a_lit_selection_reverses_without_forcing_any_colour() {
+    let Some(mut h) = spawn("chrome selection gate") else { return };
+
+    h.write_bytes(ALT_C);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("COPY")).is_some(),
+        "Alt+c never entered copy mode",
+    );
+    h.write_bytes(b"V");
+    assert!(h.settle(Duration::from_secs(3)), "the selection frame never settled");
+
+    let screen = h.screen();
+    // Find the selected row: the one with a long contiguous reversed run
+    // (the whole pane's inner width) rather than assuming exact geometry.
+    let selected_row = (1..ROWS - 1).find(|&r| {
+        (0..COLS).filter(|&c| attrs(screen, r, c).2).count() >= 10
+    });
+    let Some(selected_row) = selected_row else {
+        panic!("no fully-reversed selection row found:\n{}", screen.contents());
+    };
+    let mut checked = 0;
+    for c in 0..COLS {
+        let (fg, _, inverse, bg) = attrs(screen, selected_row, c);
+        if !inverse {
+            continue;
+        }
+        assert_eq!(bg, vt100::Color::Default, "col {c}: selection may not paint a fill (C17)");
+        assert_eq!(fg, vt100::Color::Default, "col {c}: selection may not force a palette colour (C17)");
+        checked += 1;
+    }
+    assert!(checked >= 10, "expected a wide reversed run, only checked {checked} cells");
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// One pane per tab, the second never spawned (lazy spawn only starts the
+/// active tab) — so a status-filtered-away group has no live corner badge
+/// anywhere on screen to bleed through the modal's dimmed backdrop and
+/// falsely satisfy a substring check. Named distinctly from the shared
+/// `fixture_workspace`'s tabs so an absence assertion can't collide with
+/// either.
+fn roster_fixture_workspace(cwd: &str) -> String {
+    serde_json::json!({
+        "version": 1,
+        "active_tab": 0,
+        "tabs": [
+            {
+                "name": "main",
+                "layout": { "pane": 1 },
+                "panes": { "1": {"adapter": "shell", "cwd": cwd} }
+            },
+            {
+                "name": "side",
+                "layout": { "pane": 2 },
+                "panes": { "2": {"adapter": "shell", "cwd": cwd} }
+            }
+        ]
+    })
+    .to_string()
+}
+
+/// C27 (ux P2-11, amended 2026-08-07 — the same day as this harness work):
+/// the roster's status-filter tag carries the tier's own C5 colour on the
+/// glyph alone, everything else in the title staying plain ink
+/// (design-supervisor D4: a bare `ink()` glyph would read as no filter at
+/// all). This is the newest colour-relevant surface in the contract set,
+/// and until now had zero coverage above the in-process buffer gates.
+#[test]
+fn the_roster_status_filter_tags_its_title_in_the_tiers_own_colour() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let mut h = match Harness::try_spawn(&roster_fixture_workspace(cwd)) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP chrome roster-filter gate: {reason}");
+            return;
+        }
+    };
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("1 main")).is_some(),
+        "the tab bar never appeared",
+    );
+    assert!(h.settle(Duration::from_secs(5)), "the first frame never settled");
+
+    // Deterministically mark the focused (tab 1) pane NeedsInput, same
+    // real-socket technique as the pulse gate above.
+    let bin = env!("CARGO_BIN_EXE_roost");
+    h.write_bytes(format!("{bin} __status needs_input\r").as_bytes());
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("◆")).is_some(),
+        "the needs-input glyph never appeared after the status hook",
+    );
+
+    h.write_bytes(ALT_SHIFT_A);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("fleet")).is_some(),
+        "Alt+Shift+a never opened the roster",
+    );
+    // One `Tab`: `ROSTER_STATUS_CYCLE`'s first stop past "every tier" is
+    // NeedsInput (worst-first order, ux P2-11).
+    h.write_bytes(b"\t");
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("only")).is_some(),
+        "Tab never tagged the roster title with a status filter",
+    );
+    assert!(h.settle(Duration::from_secs(2)), "the filtered roster never settled");
+
+    let screen = h.screen();
+    let title_row = (0..ROWS)
+        .find(|&r| row_text(&row_cols(screen, r)).contains("fleet"))
+        .expect("the roster dialog's titled border row");
+    let cols = row_cols(screen, title_row);
+
+    let glyph_col = col_of(&cols, "◆").expect("the NeedsInput tag glyph on the title");
+    let (fg, dim, ..) = attrs(screen, title_row, glyph_col);
+    assert_eq!(fg, RED, "the status-filter tag glyph must be the one red");
+    assert!(!dim, "the tag glyph is full-strength accent, not the quiet rung");
+
+    let word_col = col_of(&cols, "fleet").expect("the title word");
+    let (fg, dim, ..) = attrs(screen, title_row, word_col);
+    assert_eq!(fg, vt100::Color::Default, "the title text is the user's own ink");
+    assert!(!dim, "the title word is full-strength ink, not the tag's colour");
+
+    // The filter actually took effect: the "side" tab's only pane never
+    // spawned (so it has no live badge anywhere to bleed through the
+    // dimmed backdrop) and fails the NeedsInput tier, dropping its whole
+    // group — including the header.
+    let frame = screen.contents();
+    assert!(frame.contains("1 shell"), "the matching pane must still be listed:\n{frame}");
+    assert!(!frame.contains("2 SIDE"), "the non-matching tab's group must vanish whole:\n{frame}");
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// C30, end to end, at the exact geometry the render.rs unit fixture uses
+/// (80×1) — `draw()` pre-empts every other chrome surface below the 2-row
+/// floor, so this is the one scenario that needs its own PTY size rather
+/// than the shared 120×40. Deliberately its own `Harness::try_spawn_sized`
+/// call instead of the shared `spawn()` helper, which waits on the tab bar
+/// — a surface this state never draws.
+#[test]
+fn below_the_two_row_floor_the_notice_is_plain_ink_with_no_fill() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let mut h = match Harness::try_spawn_sized(&fixture_workspace(cwd), &[], 1, 80) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP chrome sub-two-row gate: {reason}");
+            return;
+        }
+    };
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("too small")).is_some(),
+        "the sub-two-row notice never appeared",
+    );
+    assert!(h.settle(Duration::from_secs(5)), "the notice frame never settled");
+
+    let screen = h.screen();
+    let mut found_text = false;
+    for c in 0..80u16 {
+        let cell = screen.cell(0, c).expect("cell inside the 80x1 grid");
+        let (fg, dim, inverse, bg) =
+            (cell.fgcolor(), cell.dim(), cell.inverse(), cell.bgcolor());
+        assert_eq!(bg, vt100::Color::Default, "col {c}: the notice paints no fill");
+        if !cell.contents().trim().is_empty() {
+            found_text = true;
+            assert_eq!(fg, vt100::Color::Default, "col {c}: the notice is the user's own ink");
+            assert!(!dim, "col {c}: the notice is full-strength ink, not the quiet rung");
+            assert!(!inverse, "col {c}: no attention treatment on a plain notice");
+        }
+    }
+    assert!(found_text, "no visible text on the 80x1 screen:\n{:?}", screen.contents());
+    assert!(
+        screen.contents().contains("too small — resize"),
+        "exact message: {:?}",
+        screen.contents(),
+    );
 
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
 }
