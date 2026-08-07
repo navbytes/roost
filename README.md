@@ -117,7 +117,7 @@ you're in.
 | Key | Action |
 |---|---|
 | `Alt+n` | new shell pane (auto split direction) |
-| `Alt+Enter` | quick-launch picker: pi / claude / shell |
+| `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
 | `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
 | `Alt+Shift+arrow` | resize along that axis |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
