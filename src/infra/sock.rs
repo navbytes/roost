@@ -18,7 +18,7 @@ use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -29,18 +29,34 @@ use std::time::{Duration, Instant};
 
 use crate::core::control::{Reply, Request};
 
-/// Read timeout for a connection that has *not yet* sent a well-formed
-/// control request (audit finding C1 — a second review pass on the H1 fix).
-/// A separate, smaller *shared* pre-auth pool made this cheaper to attack
-/// than the bug it replaced: 16 idle connections (one keepalive byte each
-/// per <30s, no valid token needed) permanently shed every *new*
+/// Wall-clock deadline for a connection that has *not yet* sent a
+/// well-formed control request (audit finding C1 — a second review pass on
+/// the H1 fix). A separate, smaller *shared* pre-auth pool made this cheaper
+/// to attack than the bug it replaced: 16 idle connections (one keepalive
+/// byte each per <30s, no valid token needed) permanently shed every *new*
 /// connection, including the human's CLI. The lesson: any shared pool sized
 /// to bound an attacker also bounds the victim, because sock.rs can't tell
 /// them apart — per-connection resources are the only ones an attacker
 /// can't share with someone else. Bounding pre-auth connections by *time*
 /// instead means a pile of squatters recycles on its own; nobody else is
-/// ever blocked from getting in. `READ_TIMEOUT` (the generous ceiling) only
-/// applies once a connection is promoted past this.
+/// ever blocked from getting in.
+///
+/// This must be enforced as real elapsed time since the connection was
+/// accepted, not merely as `SO_RCVTIMEO` (`set_read_timeout`, below) — a
+/// first cut of this fix used only the socket-level read timeout and
+/// `read_until`, and that bounds a single `read()` *syscall*, not the
+/// connection: a client drip-feeding one byte slower than a full line but
+/// faster than the timeout (repro: one byte every 1.2s against a 2s
+/// timeout) never trips it, and `read_until` loops internally with no
+/// wall-clock check of its own, so it just kept accumulating — charged
+/// nothing, never promoted, never timed out. `read_line_deadlined` drives
+/// `fill_buf`/`consume` by hand instead and checks an `Instant` recorded at
+/// connection start against this constant on every iteration, independent
+/// of the socket timeout. The socket timeout is still set (it's what makes
+/// that loop tick on a truly silent connection rather than block forever on
+/// one `read()`), but it's no longer what *bounds* pre-auth admission.
+/// `READ_TIMEOUT` (the generous ceiling) only applies once a connection is
+/// promoted past this.
 const PRE_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// P0: no client read may block forever. Applies once a connection is
@@ -497,6 +513,81 @@ impl Drop for ConnGuard<'_> {
     }
 }
 
+/// Read one line (through the trailing `\n`, or up to EOF) into `buf`
+/// (already cleared by the caller), capped at `MAX_LINE` bytes — same
+/// return shape as `BufRead::read_until` (`Ok(0)` is EOF, `Ok(n)` is `n`
+/// bytes appended). Drives `fill_buf`/`consume` by hand instead of calling
+/// `read_until` so a wall-clock deadline can be enforced independently of
+/// `set_read_timeout` (audit finding C1): `SO_RCVTIMEO` bounds a single
+/// `read()` syscall, not the connection, and `read_until` loops internally
+/// with no wall-clock check of its own, so a client drip-feeding one byte
+/// slower than a full line but faster than the per-read timeout never trips
+/// it and never returns. `pre_auth_start` — the `Instant` the connection was
+/// accepted, or `None` once it's been promoted past pre-auth — is checked on
+/// every iteration instead, closing that regardless of how the drip is
+/// paced.
+///
+/// The per-read timeout set via `set_read_timeout` is still required
+/// alongside this: without it, `fill_buf` would block on a silent
+/// connection's `read()` syscall forever and this loop would never get back
+/// around to checking the deadline at all. Once `pre_auth_start` is `None`
+/// (promoted), a read-timeout error propagates immediately instead of being
+/// retried — same as `read_until` always did, and still the mechanism that
+/// bounds a fully idle *promoted* connection (P0, `READ_TIMEOUT`).
+fn read_line_deadlined(
+    reader: &mut BufReader<UnixStream>,
+    buf: &mut Vec<u8>,
+    pre_auth_start: Option<Instant>,
+) -> std::io::Result<usize> {
+    loop {
+        if let Some(start) = pre_auth_start {
+            if start.elapsed() > PRE_AUTH_READ_TIMEOUT {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "pre-auth read deadline exceeded",
+                ));
+            }
+        }
+        let (done, used) = {
+            let available = match reader.fill_buf() {
+                Ok(chunk) => chunk,
+                // Only retry past a per-read timeout while still pre-auth —
+                // that's what lets the loop come back and re-check the
+                // deadline above on a silent connection. Once promoted, any
+                // read error (including a genuine idle READ_TIMEOUT) is
+                // reported immediately, exactly as `read_until` always did.
+                Err(e)
+                    if pre_auth_start.is_some()
+                        && matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                return Ok(buf.len()); // EOF
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    buf.extend_from_slice(&available[..=pos]);
+                    (true, pos + 1)
+                }
+                None => {
+                    // Cap bytes accepted for this line so a newline-less
+                    // flood can't grow the buffer without bound.
+                    let take = available.len().min((MAX_LINE as usize).saturating_sub(buf.len()));
+                    buf.extend_from_slice(&available[..take]);
+                    (false, take)
+                }
+            }
+        };
+        reader.consume(used);
+        if done || buf.len() as u64 >= MAX_LINE {
+            return Ok(buf.len());
+        }
+    }
+}
+
 /// Bind the socket and pump parsed events into the main loop. Returns the
 /// bound path (exported to panes as ROOST_SOCK).
 pub fn spawn_listener(tx: SyncSender<AppEvent>) -> Result<PathBuf> {
@@ -566,14 +657,20 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                 // shared aggregate is ever touched, so a flood's cost lands
                 // on the connection that sent it, never on anyone else's.
                 let mut line_bucket = Bucket::new(LINE_BUCKET_CAPACITY, LINE_REFILL_PER_SEC);
+                // Wall-clock start of this connection (audit finding C1): the
+                // deadline `read_line_deadlined` enforces while unpromoted is
+                // measured from here, independent of the per-read
+                // `SO_RCVTIMEO` set above.
+                let start = Instant::now();
                 loop {
                     buf.clear();
-                    // Cap the bytes read per line so a newline-less flood can't
-                    // grow the buffer without bound.
-                    let n = match reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut buf) {
+                    // `None` once promoted (`guard.principal` set, below) —
+                    // from then on only the per-read timeout applies.
+                    let pre_auth_start = guard.principal.is_none().then_some(start);
+                    let n = match read_line_deadlined(&mut reader, &mut buf, pre_auth_start) {
                         Ok(0) => break,       // EOF
                         Ok(n) => n,
-                        Err(_) => break,
+                        Err(_) => break,      // read error, or the pre-auth deadline
                     };
                     // Hit the cap without terminating — oversized line; drop the
                     // connection rather than trying to resync.
@@ -648,6 +745,18 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) -> Arc<Li
                             // (and charged) before the request ever reaches
                             // the main loop / audit log — a throttled
                             // request must cost nothing there (M2).
+                            //
+                            // NOTE (low-severity ordering inversion, not
+                            // fixed here): this per-principal gate runs
+                            // *before* the shared `take_global` one below,
+                            // so a request that's ultimately refused by the
+                            // global backstop still burns one of the
+                            // caller's own principal tokens first — a
+                            // victim sharing the aggregate with a genuine
+                            // flood pays for requests it never got to make.
+                            // Checking the shared gate first would avoid
+                            // that, but reordering is a behavior change and
+                            // out of scope for this pass.
                             if !limits.take_principal(&principal) {
                                 let msg = "rate limited: too many commands too fast; \
                                            slow down and retry"
@@ -931,6 +1040,74 @@ mod tests {
         serde_json::from_str(&resp).unwrap_or_else(|e| panic!("reply {resp:?} not JSON: {e}"))
     }
 
+    /// Poll until `limits.global` reads at least `want`, so a test that
+    /// fills the connection cap doesn't race the accept loop: each
+    /// squatter's `connect()` returning on the test side doesn't mean the
+    /// server has accepted *and counted* it yet — that happens on a
+    /// separately spawned thread per connection.
+    fn poll_until_admitted(limits: &Limits, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limits.global.load(Ordering::Relaxed) < want {
+            assert!(Instant::now() < deadline, "accept loop never reached {want} admitted connections");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Like `roundtrip`, but retries the connect-and-request from scratch
+    /// until it succeeds or `deadline` passes (panicking then, same as
+    /// `roundtrip`'s `.expect`), instead of panicking on the very first
+    /// failure. A caller landing exactly while the global cap is full (the
+    /// scenario the tests below deliberately create) is *expected* to be
+    /// shed at least once by `try_reserve_global` — the property under test
+    /// is that a slot frees up and a retry succeeds well within `deadline`,
+    /// not that the very first attempt does. Every fallible step here
+    /// (including `set_read_timeout`, which can transiently error under a
+    /// full-suite run's fd/thread churn — unrelated to the property under
+    /// test) is tolerated the same way: fall through to the retry rather
+    /// than panic.
+    fn try_request(path: &Path, line: &str, deadline: Instant) -> serde_json::Value {
+        loop {
+            if let Ok(stream) = UnixStream::connect(path) {
+                if stream.set_read_timeout(Some(Duration::from_secs(1))).is_ok() {
+                    let mut r = BufReader::new(stream);
+                    let sent =
+                        r.get_mut().write_all(line.as_bytes()).and_then(|_| r.get_mut().write_all(b"\n"));
+                    if sent.is_ok() {
+                        let mut resp = String::new();
+                        if r.read_line(&mut resp).is_ok() && !resp.is_empty() {
+                            if let Ok(v) = serde_json::from_str(&resp) {
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "fresh caller never got a reply before the deadline — locked out");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Spawn `n` connections that each write one byte every
+    /// `PRE_AUTH_READ_TIMEOUT / 2` forever, never a newline — the actual C1
+    /// exploit shape: every individual `read()` the server does completes
+    /// well inside its own `SO_RCVTIMEO`, but the connection as a whole
+    /// never completes a line. Each thread exits on its first write error,
+    /// which happens naturally once the server recycles it.
+    fn spawn_drippers(path: &Path, n: usize) {
+        for _ in 0..n {
+            let path = path.to_path_buf();
+            std::thread::spawn(move || {
+                let Ok(mut stream) = UnixStream::connect(&path) else { return };
+                loop {
+                    std::thread::sleep(PRE_AUTH_READ_TIMEOUT / 2);
+                    if stream.write_all(b"x").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
     #[test]
     fn one_principal_cannot_exceed_its_connection_cap_while_another_still_connects() {
         let (path, listener) = scratch_listener("conncap");
@@ -967,26 +1144,56 @@ mod tests {
     // A second review pass found the original H1 fix (a small *shared*
     // pre-auth pool) was a *cheaper* lockout than the bug it replaced — see
     // the `Limits` doc comment. These assert the property that fix was
-    // supposed to provide: squatters can never lock out someone else.
+    // supposed to provide: squatters can never lock out someone else. Both
+    // tests fill the *actual* `MAX_CONN` (a prior version of the idle test
+    // only opened half of it, so the global cap was never full and the test
+    // could not have caught either bug below).
 
     #[test]
     fn squatting_connections_cannot_lock_out_a_fresh_caller() {
         let (path, listener) = scratch_listener("squat");
-        spawn_accept_loop(listener, fake_app());
+        let limits = spawn_accept_loop(listener, fake_app());
 
-        // A pile of connections that never send anything — M3's original
-        // attack shape. There is no shared pre-auth counter for these to
-        // fill any more.
+        // A full MAX_CONN worth of connections that never send anything —
+        // M3's original attack shape. There is no shared pre-auth counter
+        // for these to fill any more.
         let mut silent = Vec::new();
-        for _ in 0..32 {
+        for _ in 0..MAX_CONN {
             silent.push(connect(&path));
         }
+        poll_until_admitted(&limits, MAX_CONN);
 
-        // A fresh, well-formed caller must connect and get a reply
-        // immediately regardless — the property this cap exists to provide.
-        let mut newcomer = connect(&path);
-        let reply = roundtrip(&mut newcomer, r#"{"token":"newcomer","method":"list"}"#);
+        // A fresh, well-formed caller must still connect and get a reply —
+        // squatters recycle on the pre-auth deadline rather than holding
+        // the cap forever, so this must succeed well within a couple of
+        // `PRE_AUTH_READ_TIMEOUT` cycles, not eventually.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reply = try_request(&path, r#"{"token":"newcomer","method":"list"}"#, deadline);
         assert!(reply.get("ok").is_some(), "squatters must never lock out a fresh caller: {reply}");
+
+        drop(silent);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The actual C1 (second-pass) exploit shape: idle connections above
+    /// already trip `SO_RCVTIMEO` on their own and were never the gap — a
+    /// connection that drip-feeds one byte slower than a full line but
+    /// faster than the per-read timeout never triggers a read error at all,
+    /// so `read_until` (pre-fix) just kept accumulating forever: charged
+    /// nothing, never promoted, never timed out. This fills `MAX_CONN` with
+    /// exactly that and asserts the wall-clock deadline (not the per-read
+    /// timeout) still recycles them.
+    #[test]
+    fn dripping_connections_cannot_lock_out_a_fresh_caller() {
+        let (path, listener) = scratch_listener("drip");
+        let limits = spawn_accept_loop(listener, fake_app());
+
+        spawn_drippers(&path, MAX_CONN);
+        poll_until_admitted(&limits, MAX_CONN);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reply = try_request(&path, r#"{"token":"newcomer","method":"list"}"#, deadline);
+        assert!(reply.get("ok").is_some(), "a drip flood must never lock out a fresh caller: {reply}");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
