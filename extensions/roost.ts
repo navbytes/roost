@@ -67,9 +67,24 @@ export default function (pi: ExtensionAPI) {
   // already-trusted project fired a spurious "waiting for you" notification.
   // Fix: schedule the send instead of firing it, and cancel the timer the
   // moment any other lifecycle event proves the run is already moving.
-  // Remembered trust ⇒ session_start lands within ms ⇒ cancelled, nothing
-  // sent. A real blocking dialog ⇒ nothing else arrives in that window ⇒
-  // needs_input fires, correctly.
+  // Remembered trust ⇒ session_start lands eventually ⇒ cancelled, nothing
+  // sent. A real blocking dialog ⇒ nothing else arrives ⇒ needs_input
+  // fires, correctly.
+  //
+  // [F3 residual] session_start is the *earliest* cancellable checkpoint —
+  // traced end to end through the installed dist (project-trust.js →
+  // resource-loader.js's reload() → main.js's resolveModelScope →
+  // createAgentSessionFromServices → agent-session.js's bindExtensions,
+  // which is what actually fires session_start): every one of those steps
+  // runs between project_trust and session_start, none of them touches the
+  // extension runner, so there is no earlier event to hook. On a cold
+  // launch that chain (package/resource resolution, model scope
+  // resolution) can genuinely run past 400ms, so 400ms was still firing a
+  // spurious ◆ on a slow-but-remembered-trust cold start. 1200ms is
+  // generous headroom above that while still landing well inside "a human
+  // would notice something's wrong" for a real blocking dialog — accept
+  // the residual race for a cold start slower than that; nothing shorter
+  // of adding a new pi-side event (out of scope here) closes it further.
   let projectTrustTimer: ReturnType<typeof setTimeout> | null = null;
   const cancelProjectTrustNeedsInput = () => {
     if (projectTrustTimer) {
@@ -120,7 +135,7 @@ export default function (pi: ExtensionAPI) {
       projectTrustTimer = setTimeout(() => {
         projectTrustTimer = null;
         send({ event: "status", status: "needs_input" });
-      }, 400);
+      }, 1200);
     }
     return { trusted: "undecided" };
   });

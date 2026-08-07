@@ -1022,6 +1022,16 @@ impl<B: PaneBackend> App<B> {
             let token = gen_token();
             cmd.env.push(("ROOST_TOKEN".into(), token.clone()));
             self.tokens.insert(id, token);
+            // [F1 residual] A respawn's old connections (if any survive the
+            // kill) can only ever carry the OLD token from here on, so
+            // their eventual link-down is unauthenticated by construction
+            // (`socket_authorized` rejects it) and the refcount would never
+            // see the matching decrement — stranding `ext_link_counts` at
+            // whatever it was mid-respawn, permanently, for this pane.
+            // Token-mint already means "fresh world for this pane" for
+            // `tokens` itself; zero the link count here too rather than
+            // trust connections that can no longer prove themselves.
+            self.ext_link_counts.remove(&id);
         }
         // adapter / registry borrow ends here.
 
@@ -8058,6 +8068,58 @@ mod tests {
             app.runtimes.get(&id).unwrap().ext_link,
             "a one-shot's up/down must not revert the long-lived connection's link to down"
         );
+    }
+
+    /// [F1 residual, probe-confirmed] A respawn re-mints the pane's token
+    /// synchronously (`spawn_pane`), so an old connection's eventual
+    /// link-down — arriving after the respawn, carrying the OLD token —
+    /// can never authenticate again: `socket_authorized` rejects it exactly
+    /// like `main.rs`'s real event-loop gate does, so `on_status_link`
+    /// never even sees it and the decrement never lands. Without clearing
+    /// `ext_link_counts` in `spawn_pane` itself, that stranded count (and
+    /// so `ext_link`) stays stuck on for the rest of the pane's life —
+    /// byte-promotion permanently disabled, and the destructive-close guard
+    /// (`vouched_live`) permanently trusting a report nothing backs anymore.
+    #[test]
+    fn respawn_clears_a_refcount_the_old_tokens_link_down_can_no_longer_reach() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        // Token-minting is gated on a real control socket (`sock_path`),
+        // which `mk_app` leaves `None` — set one so `spawn_pane`'s real
+        // token-reissue path (the one under test) actually runs on respawn.
+        app.sock_path = Some(std::path::PathBuf::from("/tmp/roost-test.sock"));
+        let old_token = "old-token".to_string();
+        app.tokens.insert(id, old_token.clone());
+
+        app.on_status_link(id, true); // the pane's extension connects
+        assert!(app.runtimes.get(&id).unwrap().ext_link);
+
+        app.respawn_focused(false); // kills the old process, mints a new token
+        let new_token = app.tokens.get(&id).unwrap().clone();
+        assert_ne!(old_token, new_token, "setup: respawn must rotate the token");
+
+        // The old connection's Drop link-down finally arrives, carrying the
+        // token it was actually admitted under — rejected exactly like
+        // main.rs's real gate would reject it.
+        assert!(
+            !app.socket_authorized(id, &old_token),
+            "the old token must not survive a respawn"
+        );
+
+        assert!(
+            !app.ext_link_counts.contains_key(&id),
+            "the refcount must not be stranded by the respawn: {:?}",
+            app.ext_link_counts.get(&id)
+        );
+        assert!(
+            !app.runtimes.get(&id).unwrap().ext_link,
+            "must not be stuck live with zero connections actually able to prove themselves"
+        );
+
+        // A fresh connection under the NEW token still works normally.
+        assert!(app.socket_authorized(id, &new_token));
+        app.on_status_link(id, true);
+        assert!(app.runtimes.get(&id).unwrap().ext_link);
     }
 
     #[test]
