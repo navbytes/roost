@@ -195,12 +195,15 @@ fn hint_pairs(
         // [Added, C27] The roster's own key set — 68 columns, inside the
         // 100-col floor beside the right segment. `q` is deliberately absent
         // where the feed has it: this list filters as you type, so a letter
-        // is filter text (U20's rule), and `Esc` is the way out.
+        // is filter text (U20's rule), and `Esc` is the way out. [Amended,
+        // ux P2-11] `Tab status` joins it (81 columns, still inside the
+        // floor) — the one narrowing key that isn't filter text.
         Mode::Roster { .. } => vec![
             ("↑↓", "select"),
             ("PgUp/Dn", "page"),
             ("↵", "go to pane"),
             ("type", "filter"),
+            ("Tab", "status"),
             ("Esc", "close"),
         ],
         Mode::Normal if focused_dead => {
@@ -998,16 +1001,22 @@ fn draw_mode_overlay<B: PaneBackend>(
             f.render_widget(block, rect);
             draw_feed_entries(f, app.feed(), *offset, inner);
         }
-        Mode::Roster { cursor, filter, .. } => {
+        Mode::Roster { cursor, filter, status_filter, .. } => {
             dim_backdrop(f, body, rect);
             f.render_widget(Clear, rect);
             // The live query rides in the title, exactly as the picker's
             // does (U20): a list narrowed to two rows with an ordinary title
-            // reads as a fleet that lost its panes.
-            let heading = if filter.is_empty() {
-                " fleet ".to_string()
-            } else {
-                format!(" fleet — {filter}{} ", theme::RENAME_CURSOR)
+            // reads as a fleet that lost its panes. [Amended, ux P2-11] The
+            // status filter joins it as a glyph tag — the same one the
+            // narrowed rows themselves draw (`theme::status_style`), so a
+            // narrowed list always says *why* it is narrow, same as the type-
+            // ahead already did.
+            let tag = status_filter.map(|s| format!("{} ", theme::status_style(s).0));
+            let heading = match (tag, filter.is_empty()) {
+                (None, true) => " fleet ".to_string(),
+                (None, false) => format!(" fleet — {filter}{} ", theme::RENAME_CURSOR),
+                (Some(tag), true) => format!(" fleet — {tag}only "),
+                (Some(tag), false) => format!(" fleet — {tag}{filter}{} ", theme::RENAME_CURSOR),
             };
             let block = Block::bordered()
                 .title(Line::from(Span::styled(heading, theme::ink())))
@@ -2690,7 +2699,8 @@ mod tests {
     /// typing, `q` is filter text (U20's rule).
     #[test]
     fn hint_pairs_roster_mode_is_the_c27_list_and_fits_the_floor() {
-        let pairs = hint_pairs(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, false, false, false);
+        let mode = Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None };
+        let pairs = hint_pairs(&mode, false, false, false);
         assert_eq!(
             pairs,
             vec![
@@ -2698,11 +2708,12 @@ mod tests {
                 ("PgUp/Dn", "page"),
                 ("↵", "go to pane"),
                 ("type", "filter"),
+                ("Tab", "status"),
                 ("Esc", "close"),
             ],
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        assert_eq!(cols, 68, "C27 quotes 68 columns");
+        assert_eq!(cols, 81, "C27 quotes 81 columns");
         assert!(cols < 100, "and it must fit beside the right segment at the floor");
         assert!(!pairs.iter().any(|(k, _)| k.contains('q')), "`q` filters, it does not close");
     }
@@ -2723,10 +2734,8 @@ mod tests {
 
     #[test]
     fn mode_word_roster_wins_regardless_of_zoom() {
-        assert_eq!(
-            mode_word(&Mode::Roster { cursor: 1, filter: String::new(), top: 0 }, true, false),
-            "ROSTER"
-        );
+        let mode = Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None };
+        assert_eq!(mode_word(&mode, true, false), "ROSTER");
     }
 
     #[test]
@@ -3748,6 +3757,45 @@ mod tests {
         assert!(frame.contains(&format!("fleet — 3{}", theme::RENAME_CURSOR)), "query:\n{frame}");
         assert!(frame.contains("2 TAB2 · 1 PANE"), "pane 3 lives in tab 2:\n{frame}");
         assert!(!frame.contains("1 MAIN · 2 PANES"), "tab 1 filtered away whole:\n{frame}");
+    }
+
+    /// [ux P2-11], end to end through the real `draw()`: `Tab` narrows the
+    /// drawn rows to one severity tier and tags the frame title with that
+    /// tier's own glyph — the same discoverability idiom the type-ahead
+    /// query already has.
+    #[test]
+    fn the_roster_status_filter_narrows_rows_and_tags_the_title() {
+        use crate::core::status::AgentStatus;
+        use crate::ports::PaneBackend;
+        use crate::ui::input::Action;
+        use crossterm::event::{KeyCode, KeyEvent};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane); // panes 1 (needy below), 2 (stays idle)
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
+        app.apply(Action::ToggleRoster);
+        app.handle_mode_key(KeyEvent::from(KeyCode::Tab)); // cycle to NeedsInput
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let frame: String = (0..30)
+            .map(|y| {
+                (0..100)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            frame.contains(&format!("fleet — {} only", theme::GLYPH_NEEDS_INPUT)),
+            "the title tags the active tier:\n{frame}"
+        );
+        assert!(frame.contains("needs you"), "the ◆ row survives:\n{frame}");
+        assert!(!frame.contains("idle"), "the idle pane is filtered out:\n{frame}");
     }
 
     /// [ux P2-10], end to end through the real `draw()`: a quiet shell's
