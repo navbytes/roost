@@ -518,12 +518,20 @@ fn picker_cwd_label(path: &std::path::Path) -> String {
     }
 }
 
-/// C14 (U20): the picker dialog's width — the adapter column (a fixed 16,
-/// as before the cwd column existed) plus the widest cwd label, plus the
-/// gap and the two border columns. `centered_near` still clamps it to the
-/// screen. Pure so the sizing and the drawing can't drift.
+/// C14 (U20): the picker dialog's width — the adapter column (a fixed
+/// width, as before the cwd column existed) plus the widest cwd label, plus
+/// the gap and the two border columns. `centered_near` still clamps it to
+/// the screen. Pure so the sizing and the drawing can't drift.
+///
+/// [Amended F8, exit UX audit 2026-08-07] `ADAPTER_COL` was 16, sized for
+/// the registry's then-longest id (`claude`/`gemini`, 6 chars) plus
+/// `App::picker_filtered`'s old `" gone"` suffix (5 chars) plus the 3-char
+/// row prefix (`picker_row_body`'s `" {digit} "`) — 14, plus 2 columns of
+/// slack. The registry has since grown a longer id (`opencode`, 8 chars),
+/// and the suffix is now `" not found"` (10 chars, replacing "gone" — see
+/// `picker_filtered`): 3 + 8 + 10 = 21, plus the same 2 columns of slack.
 fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
-    const ADAPTER_COL: u16 = 16;
+    const ADAPTER_COL: u16 = 23;
     let widest = cwds
         .iter()
         .map(|p| mouse::display_width(&picker_cwd_label(p)))
@@ -3211,16 +3219,20 @@ mod tests {
 
     /// C14 (U20): the dialog grows to fit the widest cwd label, and stays
     /// the pre-U20 32 columns when there is no cwd column to show.
+    ///
+    /// [Amended F8, exit UX audit 2026-08-07] `ADAPTER_COL` grew from 16 to
+    /// 23 (see its own doc comment) — the "src/roost" case used to land
+    /// under the 32-column floor and no longer does.
     #[test]
     fn picker_dialog_width_covers_the_cwd_column() {
         use std::path::PathBuf;
         assert_eq!(super::picker_dialog_width(&[]), 32, "no cwds ⇒ the old dialog");
         let cwds = vec![PathBuf::from("/home/me/src/roost"), PathBuf::from("/tmp")];
-        // widest label = "src/roost" (9) ⇒ 16 + 2 + 9 + 2 = 29, floored at
-        // 32: the picker must never be narrower than the one it replaced.
-        assert_eq!(super::picker_dialog_width(&cwds), 32);
+        // widest label = "src/roost" (9) ⇒ 23 + 2 + 9 + 2 = 36, past the
+        // pre-U20 32-column floor.
+        assert_eq!(super::picker_dialog_width(&cwds), 23 + 2 + 9 + 2);
         let long = vec![PathBuf::from("/home/me/a-rather-long/checkout-name")];
-        assert_eq!(super::picker_dialog_width(&long), 16 + 2 + 27 + 2, "label = a-rather-long/checkout-name");
+        assert_eq!(super::picker_dialog_width(&long), 23 + 2 + 27 + 2, "label = a-rather-long/checkout-name");
     }
 
     /// U20: the accelerator is on the hint bar too — a key you can only

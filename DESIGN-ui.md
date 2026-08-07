@@ -1263,6 +1263,26 @@ is fully superseded.
 bg highlight**" was already the right instinct and is now the house rule (§2);
 the two-column selection idiom is untouched.
 
+**[Amended 2026-08-07, exit UX audit F8 — not-installed wording and the
+adapter column's width]** Two things this contract never wrote down (both
+lived only as `app.rs`/`render.rs` doc comments, P2-13) drifted stale
+together:
+- **`App::picker_filtered` annotates a not-installed adapter's row with a
+  `"not found"` suffix, not `"gone"`.** "Gone" implies the adapter *was*
+  reachable and disappeared; it never was, on this machine, so every fresh
+  install would show the identical "gone" the moment after setup. "Not
+  found" — the familiar shell idiom for "no such program on `$PATH`" —
+  claims nothing about history.
+- **The fixed adapter column (this contract's "16-column adapter column")
+  is now 23, not 16.** It was sized for the registry's then-longest id
+  (`claude`/`gemini`, 6 chars) and the old 5-char `"gone"` suffix. The
+  registry has grown since (six adapters now, not five —
+  `agents::adapter_specs`) and its longest id is now `opencode` (8 chars,
+  longer than `claude`/`gemini`); the new suffix is 5 columns longer
+  besides. `picker_dialog_width`'s formula (adapter column, plus a gap,
+  plus the widest cwd label, plus another gap) is otherwise untouched —
+  same 2-column gaps, same pre-U20 32-column floor.
+
 ### C15 — Help overlay
 
 **Current:** `render.rs:194–237` — Double/Cyan; keys Yellow BOLD, desc Gray.

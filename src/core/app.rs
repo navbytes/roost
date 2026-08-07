@@ -4278,8 +4278,8 @@ impl<B: PaneBackend> App<B> {
         //
         // P2-13: addressed through the *raw* ids, not `picker_filtered`'s
         // annotated display text — a not-installed row still reads as
-        // "codex gone" in the list, and launching has to spawn `codex`, not
-        // a string with a marker glued onto it.
+        // "codex not found" in the list, and launching has to spawn `codex`,
+        // not a string with a marker glued onto it.
         let ids = self.picker_filtered_ids();
         let Some(&adapter) = ids.get(index) else { return };
         let cwd = self.picker_cwd();
@@ -4321,15 +4321,25 @@ impl<B: PaneBackend> App<B> {
     /// each annotated when its launch program isn't actually on `$PATH` (a
     /// Claude-only user's first `Alt+Enter` → `pi` used to be a dead pane
     /// with no warning at all). Annotated rather than hidden: this registry
-    /// has five adapters, and on a single-agent machine hiding the other
-    /// four would leave one or two rows under a title that still reads "pick
+    /// has six adapters, and on a single-agent machine hiding the other five
+    /// would leave one or two rows under a title that still reads "pick
     /// agent" — confusingly short, and indistinguishable from a picker that
     /// lost its adapters (the exact failure U20's own type-ahead title
-    /// already guards against). `" gone"` echoes this file's own voice for
-    /// "not here" (`roster_jump`'s "that pane is gone") and — checked against
-    /// the fixed 16-column adapter field `picker_row_body` budgets — is the
-    /// longest suffix that never crowds the cwd column even for the longest
-    /// ids (`claude`/`gemini`).
+    /// already guards against).
+    ///
+    /// [Amended F8, exit UX audit 2026-08-07] The suffix used to be `"
+    /// gone"`, echoing this file's own voice for "not here" (`roster_jump`'s
+    /// "that pane is gone") — but "gone" implies something that *was* here
+    /// and disappeared, which is false for an adapter that was never
+    /// installed on this machine at all; every other roost picker session
+    /// would show it exactly the same "gone" the moment after a fresh
+    /// install too. Reworded to `" not found"` (the familiar shell idiom for
+    /// "no such program on `$PATH`"), which makes no claim about history.
+    /// Checked against `render.rs`'s `ADAPTER_COL` (widened alongside this
+    /// change, same reasoning there) for the longest id: `opencode` (8
+    /// chars, longer than `claude`/`gemini` since this registry grew to six
+    /// — the comment this amendment replaces was already stale on that
+    /// count too).
     pub fn picker_filtered(&self) -> Vec<String> {
         self.picker_filtered_ids()
             .into_iter()
@@ -4337,7 +4347,7 @@ impl<B: PaneBackend> App<B> {
                 if adapter_installed(id, &self.registry) {
                     id.to_string()
                 } else {
-                    format!("{id} gone")
+                    format!("{id} not found")
                 }
             })
             .collect()
@@ -9194,10 +9204,10 @@ mod tests {
     }
 
     /// P2-13 end-to-end: a not-installed adapter's picker row is annotated
-    /// (not hidden — five adapters is short enough that hiding four would
+    /// (not hidden — six adapters is short enough that hiding five would
     /// read as a picker that lost its list), and — the property that
     /// actually matters — launching that row still spawns the RAW id, never
-    /// the annotated display text. `picker_items()` is the static, always-5
+    /// the annotated display text. `picker_items()` is the static, always-6
     /// registry list (`agents::adapter_specs()`), so the substitution has to
     /// happen in `App::registry` (what `adapter_installed` actually
     /// consults), not in what rows get drawn.
@@ -9222,7 +9232,7 @@ mod tests {
         app.handle_mode_key(key('1')); // row 1 = index 0 = "pi" (picker_items() order)
         let spawned = app.find_spec(app.focused).map(|s| s.adapter.clone());
 
-        assert_eq!(rows[0], "pi gone", "pi's substituted launch program can never resolve");
+        assert_eq!(rows[0], "pi not found", "pi's substituted launch program can never resolve");
         // ShellAdapter resolves an absolute $SHELL (or /bin/bash fallback)
         // path directly, not via a $PATH scan — real, unmodified, and
         // guaranteed to exist on any machine this suite already assumes one
