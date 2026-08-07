@@ -477,24 +477,60 @@
   <section id="agents" style="padding:clamp(40px,5vw,72px) 0;border-top:2px solid var(--color-divider)">
     <span class="kicker">Supported agents</span>
     <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 40px;max-width:24ch">An adapter per CLI. Eight small methods.</h2>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:0;border-top:2px solid var(--color-text);border-left:2px solid var(--color-text)">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:0;border-top:2px solid var(--color-text);border-left:2px solid var(--color-text)">
       <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><span class="tag tag-accent">Flagship</span></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 8h14"/><path d="M9 8v10"/><path d="M15 8v7c0 2 1 3 3 3"/></svg>
+          <span class="tag tag-accent">Flagship</span>
+        </div>
         <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">pi</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">A shipped extension reports session ids and exact status over roost's unix socket — no spinner-parsing. roost installs and updates it automatically at startup (opt out with <code style="font-family:var(--font-mono);font-size:0.9em">ROOST_NO_EXT_INSTALL</code>).</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">pi</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">pi --session &lt;id&gt;</span></div>
       </div>
       <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><span class="tag tag-neutral">Hooks</span></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4v8.5a4.5 4.5 0 0 0 9 0V9"/></svg>
+          <span class="tag tag-neutral">Hooks</span>
+        </div>
         <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">Claude Code</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Hook snippets point Notification / Stop / PreToolUse at the same socket. Session detection falls back to diffing the project's <code style="font-family:var(--font-mono);font-size:0.9em">.jsonl</code> dir.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">claude</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">claude --resume &lt;id&gt;</span></div>
       </div>
       <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><span class="tag tag-outline">Generic</span></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7l5 5-5 5"/><path d="M13 17h6"/></svg>
+          <span class="tag tag-outline">Generic</span>
+        </div>
         <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">shell</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Any <code style="font-family:var(--font-mono);font-size:0.9em">$SHELL</code>, relaunched in its saved cwd. Status comes from PTY-output heuristics — bytes flowing means working, the bell means needs-you.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">$SHELL</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">relaunch in cwd</span></div>
+      </div>
+      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="15"/><path d="M4 9.5h16"/><path d="M8 3v4M16 3v4"/></svg>
+          <span class="tag tag-outline">File-based</span>
+        </div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">codex</h3>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Sessions are filed by date, not by project — <code style="font-family:var(--font-mono);font-size:0.9em">~/.codex/sessions/YYYY/MM/DD/</code> — so detection can't be scoped to a working directory the way claude's is. Newest file wins.</p>
+        <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">codex</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">codex resume &lt;id&gt;</span></div>
+      </div>
+      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></svg>
+          <span class="tag tag-outline">File-based</span>
+        </div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">gemini</h3>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Scoped per project: a slug from <code style="font-family:var(--font-mono);font-size:0.9em">~/.gemini/projects.json</code> points at that project's chat history, and the session id is read straight out of the newest record.</p>
+        <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">gemini</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">gemini --resume &lt;uuid&gt;</span></div>
+      </div>
+      <div style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7" ry="2.5"/><path d="M5 5.5v13c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-13"/><path d="M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg>
+          <span class="tag tag-outline">DB-only</span>
+        </div>
+        <h3 style="font-family:var(--font-heading);font-weight:800;font-size:24px;margin:0 0 12px">opencode</h3>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Every session lives in one global SQLite database, not separate files — so there's no filesystem detection at all. roost resumes only by the session id it already has on record.</p>
+        <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">opencode</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">opencode --session &lt;id&gt;</span></div>
       </div>
     </div>
   </section>
@@ -502,10 +538,36 @@
   <section id="install" style="padding:clamp(48px,6vw,88px) 0 clamp(40px,5vw,72px);border-top:2px solid var(--color-divider)">
     <span class="kicker">Get started</span>
     <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 32px;max-width:18ch">Two lines and a reboot you'll never fear.</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:22px 28px;margin-bottom:32px">
+      <div style="display:flex;gap:14px;align-items:flex-start">
+        <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>
+        <div>
+          <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">mise</p>
+          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Prebuilt binary, no Rust toolchain. Works today.</p>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;align-items:flex-start">
+        <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M4 17v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <div>
+          <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">Releases</p>
+          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">v0.1.0, four targets, checked against <code style="font-family:var(--font-mono);font-size:0.95em">SHA256SUMS.txt</code>.</p>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;align-items:flex-start">
+        <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M12 3 4 7v10l8 4 8-4V7z"/><path d="M4 7l8 4 8-4M12 11v10"/></svg>
+        <div>
+          <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">Source</p>
+          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)"><code style="font-family:var(--font-mono);font-size:0.95em">cargo install --git</code>, no clone needed.</p>
+        </div>
+      </div>
+    </div>
     <div style="border:2px solid var(--color-text);background:#181615;font-family:var(--font-mono);font-size:14.5px;line-height:2;color:#d7d3d3;padding:22px 24px;overflow-x:auto">
-      <div><span style="color:#8f8a88"># build &amp; install</span></div>
-      <div><span style="color:var(--color-accent)">$</span> cargo install --path .</div>
+      <div><span style="color:#8f8a88"># macOS / Linux, prebuilt — no Rust toolchain</span></div>
+      <div><span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost</div>
       <div><span style="color:var(--color-accent)">$</span> roost</div>
+      <div style="margin-top:14px"><span style="color:#8f8a88"># or a binary from Releases (v0.1.0, four targets + SHA256SUMS.txt)</span></div>
+      <div style="margin-top:14px"><span style="color:#8f8a88"># or from source</span></div>
+      <div><span style="color:var(--color-accent)">$</span> cargo install --git https://github.com/navbytes/roost</div>
       <div style="margin-top:14px"><span style="color:#8f8a88"># or an isolated workspace</span></div>
       <div><span style="color:var(--color-accent)">$</span> ROOST_STATE=/some/dir roost</div>
     </div>
@@ -521,8 +583,8 @@
     </h2>
     <p style="font-size:clamp(16px,1.4vw,19px);line-height:1.55;max-width:46ch;margin:24px 0 0;color:color-mix(in srgb, var(--color-bg) 88%, transparent)">Free and open source. Your agents come home to roost after every reboot.</p>
     <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
-      <div style="display:flex;align-items:center;gap:12px;padding:13px 18px;font-family:var(--font-mono);font-size:15px;background:color-mix(in srgb, var(--color-bg) 12%, transparent);border:2px solid var(--color-bg)">
-        <span>cargo install --path .</span>
+      <div style="display:flex;align-items:center;gap:12px;padding:13px 18px;font-family:var(--font-mono);font-size:15px;background:color-mix(in srgb, var(--color-bg) 12%, transparent);border:2px solid var(--color-bg);max-width:100%;overflow-x:auto;white-space:nowrap">
+        <span>mise use -g github:navbytes/roost</span>
       </div>
       <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" class="btn" style="text-decoration:none;color:var(--color-bg);border:2px solid var(--color-bg);padding:12px 22px;font-size:15px">View on GitHub ↗</a>
     </div>
@@ -549,7 +611,7 @@
   var btn = document.getElementById('copy');
   var ct;
   btn.addEventListener('click', function () {
-    try { navigator.clipboard.writeText('cargo install --path .').catch(function () {}); } catch (e) {}
+    try { navigator.clipboard.writeText('mise use -g github:navbytes/roost').catch(function () {}); } catch (e) {}
     btn.textContent = 'Copied ✓';
     clearTimeout(ct);
     ct = setTimeout(function () { btn.textContent = 'Copy'; }, 1400);
