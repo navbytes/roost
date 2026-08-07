@@ -2868,6 +2868,47 @@ matters, not rewritten wholesale.]**
   and `a_third_click_cancels_the_staged_double_click_copy`; end to end,
   `main.rs::tests::double_click_selects_the_word_and_stages_the_copy_on_release`
   asserts the release does *not* flash immediately.
+
+**[Amended 2026-08-07, exit UX audit F5 + code review — what "still
+matches" meant was wrong twice over]** "`due_copy` reports the staged text
+once that window passes **and** `self.selection` still matches what was
+staged … any other clear silently cancels the stage" is withdrawn. That one
+check conflated two unrelated things, both bugs:
+- **Grid staleness (code review).** `self.pending_copy` staged coordinates
+  (`pane, anchor, cursor`), and `due_copy` re-extracted the text from the
+  **live** grid when the deadline passed. A streaming pane can scroll or
+  overwrite those cells inside the 500ms window, so the clipboard could
+  silently get whatever now occupies them — not the word actually
+  double-clicked, and no error, no wrong-looking flash, nothing.
+- **Silent drop on an unrelated keypress (F5).** "Any other clear" included
+  a keypress clearing `self.selection` (C29's own "any click or keypress
+  clears" rule, above) — so double-click a word, then type anything at all
+  within the window, and the clipboard silently didn't update. A keypress
+  has nothing to do with whether the word that was actually double-clicked
+  should still land; the check couldn't tell a keypress from a real
+  supersession (a 3rd click) because it never looked at *why*
+  `self.selection` had changed, only *that* it had.
+
+**Fixed by moving both jobs to where they actually belong.** `PendingCopy`
+is now `(text, fire-at)` — `App::release_native_selection`'s double-click
+branch grabs the text immediately via `finish_native_selection` and stages
+*that*, so there is nothing left to re-derive from the grid later.
+Supersession is detected at the only place a real one can originate — a
+new mouse release — not at fire time: every call to
+`release_native_selection` clears `self.pending_copy` unconditionally
+before doing anything else, so a 3rd click's own release (which commits
+its wider selection immediately, per the bullet above) cancels the
+narrower stage as a direct side effect of *being* a new release, the same
+way a plain click or drag elsewhere would. `due_copy` no longer reads
+`self.selection` at all — once the deadline passes, the staged text fires,
+full stop. Pinned by
+`an_unrelated_keypress_does_not_cancel_the_staged_double_click_copy` (F5)
+and `the_staged_copy_is_fixed_at_release_time_not_re_read_from_a_later_grid`
+(review); `a_third_click_cancels_the_staged_double_click_copy` now drives
+the 3rd click's own release for real rather than only mutating
+`self.selection` by hand, so it continues to pin the supersession case
+under the new mechanism.
+
 - **B2 — the test suite no longer touches the operator's real clipboard or
   browser.** `infra::clipboard::copy` and `infra::open::open_url` are both
   reached by this contract's own `handle_mouse`-driven tests (that's the

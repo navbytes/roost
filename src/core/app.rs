@@ -183,9 +183,16 @@ impl Search {
     }
 }
 
-/// S4: (pane, anchor, cursor, fire-at) for a copy staged from a
-/// double-click's own release — see `App::release_native_selection`.
-type PendingCopy = (PaneId, (u16, u16), (u16, u16), Instant);
+/// S4: (text, fire-at) for a copy staged from a double-click's own release
+/// — see `App::release_native_selection`.
+///
+/// [Amended, code review, exit UX audit 2026-08-07] Used to be `(pane,
+/// anchor, cursor, fire-at)`, re-extracted from the *live* grid when the
+/// deadline passed. A streaming pane can scroll or overwrite those cells in
+/// the meantime, so that re-read could silently copy whatever now occupies
+/// them instead of the word actually double-clicked. The text is grabbed
+/// once, at release time, and staged as itself — nothing left to re-derive.
+type PendingCopy = (String, Instant);
 
 /// An in-progress / completed text selection within one pane. Coordinates are
 /// (row, col) in the pane's inner (border-excluded) cell space, 0-based.
@@ -504,13 +511,13 @@ pub struct App<B: PaneBackend> {
     /// click count — see `click_count`.
     last_click: Option<(PaneId, u16, u16, u8, Instant)>,
     /// S4 (PR #46 review): a copy staged from a double-click's own release
-    /// — (pane, anchor, cursor, fire-at). Firing it immediately made every
-    /// triple-click copy the word (2nd click's release) and then the line
-    /// (3rd click's) a heartbeat later: two clipboard writes, two flashes,
-    /// for one gesture. A double-click's release is the only one that has
-    /// to wait, since it is the only one a further click can still
-    /// supersede within the same window — see `release_native_selection`
-    /// and `due_copy`.
+    /// — (text, fire-at), grabbed once at release time (see `PendingCopy`).
+    /// Firing it immediately made every triple-click copy the word (2nd
+    /// click's release) and then the line (3rd click's) a heartbeat later:
+    /// two clipboard writes, two flashes, for one gesture. A double-click's
+    /// release is the only one that has to wait, since it is the only one a
+    /// further click can still supersede within the same window — see
+    /// `release_native_selection` and `due_copy`.
     pending_copy: Option<PendingCopy>,
     /// W3: bytes roost owes its OWN terminal — pane OSC 9 notifications
     /// (P2) and OSC 52 clipboard writes (P3) forwarded on a pane's behalf.
@@ -2543,17 +2550,36 @@ impl<B: PaneBackend> App<B> {
     /// triple-click's own release, which has nothing left to wait for)
     /// commits straight through `finish_native_selection`.
     ///
+    /// [Amended, code review + F5, exit UX audit 2026-08-07] Every release
+    /// — staged or immediate — now starts by clearing any earlier stage
+    /// outright: a real mouse release always supersedes one, most commonly
+    /// the 3rd click of a triple-click, whose own (wider) selection is the
+    /// one that should win. What no longer cancels a stage is anything
+    /// *other* than a mouse release — a keypress clearing `self.selection`
+    /// (C29's "any click or keypress clears" rule) used to read as
+    /// "superseded" too, silently dropping a double-click's copy if the
+    /// user so much as typed within the window, with nothing telling them
+    /// (F5). A keypress has nothing to do with whether the word actually
+    /// double-clicked should still land on the clipboard, so it no longer
+    /// touches the stage at all — `due_copy` fires it regardless.
+    ///
     /// Returns the text to copy *now*, if any — `None` covers "nothing was
     /// selected", "staged for later" (see `due_copy`) and "nothing
     /// extractable" alike; the caller doesn't need to tell them apart.
     pub fn release_native_selection(&mut self) -> Option<String> {
+        self.pending_copy = None;
         let sel = self.selection?;
         if sel.dragging && sel.anchor == sel.cursor {
             self.selection = None;
             return None;
         }
         if self.last_click.is_some_and(|(.., n, _)| n == 2) {
-            self.pending_copy = Some((sel.pane, sel.anchor, sel.cursor, Instant::now() + DOUBLE_CLICK_INTERVAL));
+            // Grab the text now — not a promise to re-read the grid later,
+            // which a streaming pane could scroll or overwrite by the time
+            // the deadline passes (see `PendingCopy`).
+            if let Some(text) = self.finish_native_selection() {
+                self.pending_copy = Some((text, Instant::now() + DOUBLE_CLICK_INTERVAL));
+            }
             return None;
         }
         let text = self.finish_native_selection();
@@ -2565,24 +2591,24 @@ impl<B: PaneBackend> App<B> {
 
     /// S4: the staged double-click copy's text, once its deadline has
     /// passed — `None` otherwise, whether because it's still waiting on a
-    /// possible 3rd click, or because there was never one staged. Consumes
-    /// the stage the moment the deadline passes either way, so a
-    /// superseded one (a 3rd click replaced `self.selection` with the
-    /// whole line, or a click/keypress cleared it) is silently dropped
-    /// exactly once rather than checked forever. The composition root
-    /// calls this once per event-loop tick and performs the actual
-    /// clipboard write when it answers (core has no I/O of its own).
+    /// possible 3rd click, or because there was never one staged.
+    ///
+    /// [Amended, code review + F5, exit UX audit 2026-08-07] Used to
+    /// re-check `self.selection` against the staged coordinates and drop
+    /// the copy on any mismatch — which conflated two different things: a
+    /// real supersession (now handled at stage-time, see
+    /// `release_native_selection`) and an unrelated keypress clearing the
+    /// highlight, which used to cancel the copy too, silently. The text is
+    /// already fixed at release time, so once the deadline passes there is
+    /// nothing left to check — it fires. The composition root calls this
+    /// once per event-loop tick and performs the actual clipboard write
+    /// when it answers (core has no I/O of its own).
     pub fn due_copy(&mut self) -> Option<String> {
-        let (pane, anchor, cursor, at) = self.pending_copy?;
+        let at = self.pending_copy.as_ref()?.1;
         if Instant::now() < at {
             return None;
         }
-        self.pending_copy = None;
-        let still_current = self.selection.is_some_and(|s| (s.pane, s.anchor, s.cursor) == (pane, anchor, cursor));
-        if !still_current {
-            return None;
-        }
-        self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).filter(|t| !t.is_empty())
+        self.pending_copy.take().map(|(text, _)| text)
     }
 
     /// Set a transient hint-bar message (e.g. a startup notice).
@@ -8644,9 +8670,8 @@ mod tests {
     /// S4 (PR #46 code review): a double-click's own release is *staged*,
     /// not committed immediately — it's the one release a still-possible
     /// 3rd click can supersede within the same double-click window.
-    /// `due_copy` reports the staged text once the deadline passes,
-    /// provided nothing changed `self.selection` since — backdated here
-    /// rather than slept for, so the test costs nothing.
+    /// `due_copy` reports the staged text once the deadline passes —
+    /// backdated here rather than slept for, so the test costs nothing.
     #[test]
     fn release_native_selection_stages_a_double_click_and_due_copy_fires_it_later() {
         let (mut app, _) = mk_app(shell_ws());
@@ -8661,7 +8686,7 @@ mod tests {
         assert_eq!(app.due_copy(), None, "the window hasn't passed yet");
 
         app.pending_copy =
-            app.pending_copy.map(|(p, a, c, _)| (p, a, c, Instant::now() - Duration::from_millis(1)));
+            app.pending_copy.map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
         assert_eq!(app.due_copy().as_deref(), Some("world"));
         assert_eq!(app.due_copy(), None, "consumed exactly once");
     }
@@ -8670,6 +8695,14 @@ mod tests {
     /// entirely — the word is never copied, only the line the 3rd click
     /// selects instead. Before S4's fix, the word copied on the 2nd
     /// click's own release regardless, so a triple-click copied twice.
+    ///
+    /// [Amended, code review, exit UX audit 2026-08-07] Supersession used
+    /// to be detected at `due_copy` time, by comparing the live
+    /// `self.selection` against the staged coordinates. It's now the 3rd
+    /// click's own release that cancels the stage directly (every release
+    /// clears `pending_copy` unconditionally — see
+    /// `release_native_selection`), so this test now drives that release
+    /// for real instead of only mutating `self.selection` by hand.
     #[test]
     fn a_third_click_cancels_the_staged_double_click_copy() {
         let (mut app, _) = mk_app(shell_ws());
@@ -8679,13 +8712,72 @@ mod tests {
         assert_eq!(app.click_count(id, 0, 8), 2);
         app.select_word_at(id, 0, 8);
         assert_eq!(app.release_native_selection(), None, "the word's release stages, doesn't commit");
+        assert!(app.pending_copy.is_some());
 
         assert_eq!(app.click_count(id, 0, 8), 3, "the 3rd click");
         app.select_line_at(id, 0); // overwrites self.selection with the line
+        assert_eq!(
+            app.release_native_selection().as_deref(),
+            Some("hello world"),
+            "the 3rd click's own release commits the line immediately"
+        );
+        assert!(app.pending_copy.is_none(), "the word's stage was cancelled outright, not just outrun");
+        assert_eq!(app.due_copy(), None, "nothing left to fire, staged or otherwise");
+    }
+
+    /// F5 (exit UX audit 2026-08-07): a keypress clearing the highlight
+    /// (C29's "any click or keypress clears" rule) used to read exactly
+    /// like a supersession at `due_copy` time — `self.selection` no longer
+    /// matched the staged coordinates either way — so double-click, then
+    /// type anything within the window, and the clipboard silently didn't
+    /// update; no flash, no error, nothing. A keypress has nothing to do
+    /// with whether the word actually double-clicked should still be
+    /// copied, so it no longer touches the stage at all.
+    #[test]
+    fn an_unrelated_keypress_does_not_cancel_the_staged_double_click_copy() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["hello world".into()];
+        app.click_count(id, 0, 8);
+        app.click_count(id, 0, 8);
+        app.select_word_at(id, 0, 8);
+        app.release_native_selection();
+        assert!(app.pending_copy.is_some());
+
+        // Not a click: e.g. the pane forwarding a typed key, which clears
+        // the native-selection highlight per C29.
+        app.selection = None;
 
         app.pending_copy =
-            app.pending_copy.map(|(p, a, c, _)| (p, a, c, Instant::now() - Duration::from_millis(1)));
-        assert_eq!(app.due_copy(), None, "superseded by the 3rd click's own selection");
+            app.pending_copy.map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
+        assert_eq!(app.due_copy().as_deref(), Some("world"), "the copy still lands");
+    }
+
+    /// Code review (exit UX audit 2026-08-07): the staged copy is the
+    /// string grabbed at release time (`PendingCopy`), not a promise to
+    /// re-read the grid later. Before this, `due_copy` re-extracted the
+    /// text from the *live* grid at fire time — so double-click a word in a
+    /// streaming pane, let the grid scroll or the row get overwritten
+    /// before the 500ms window closes, and the clipboard would silently get
+    /// whatever now occupies those cells instead of the word actually
+    /// double-clicked.
+    #[test]
+    fn the_staged_copy_is_fixed_at_release_time_not_re_read_from_a_later_grid() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["hello world".into()];
+        app.click_count(id, 0, 8);
+        app.click_count(id, 0, 8);
+        app.select_word_at(id, 0, 8);
+        app.release_native_selection();
+
+        // The pane's content changes before the deadline — a streaming
+        // agent printing new output, or the view scrolling.
+        app.runtimes.get_mut(&id).unwrap().rows = vec!["totally different text".into()];
+
+        app.pending_copy =
+            app.pending_copy.map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
+        assert_eq!(app.due_copy().as_deref(), Some("world"), "must copy what was actually double-clicked");
     }
 
     /// `on_click` drops a lingering native selection when the click lands on
