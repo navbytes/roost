@@ -56,6 +56,9 @@ Or skip the build step with `cargo run`.
 
 - **[mise](https://mise.jdx.dev)** — `mise use -g github:navbytes/roost`.
   Prebuilt binary, no Rust toolchain. See below.
+- **`brew install navbytes/roost/roost`** — from the
+  [`navbytes/homebrew-roost`](https://github.com/navbytes/homebrew-roost) tap.
+  Same prebuilt binaries, checksum-verified by Homebrew.
 - **Prebuilt binaries** from
   [GitHub Releases](https://github.com/navbytes/roost/releases) — macOS and
   Linux, arm64 and x86_64, with `SHA256SUMS.txt` to check them against.
@@ -66,9 +69,6 @@ Or skip the build step with `cargo run`.
   `cargo binstall roost` installs something else entirely.
 - **`cargo install --git https://github.com/navbytes/roost`** — build from
   source onto your `$PATH`, no clone needed.
-- **Homebrew tap** (`navbytes/homebrew-roost`) — the formula is written and
-  carries v0.1.0's real checksums, but the tap repo doesn't exist yet, so
-  there is nothing to `brew install` today.
 
 #### With mise
 

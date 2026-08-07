@@ -540,6 +540,13 @@
     <h2 style="font-family:var(--font-heading);font-weight:800;font-size:clamp(30px,3.6vw,46px);letter-spacing:-0.02em;margin:0 0 32px;max-width:18ch">Two lines and a reboot you'll never fear.</h2>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:22px 28px;margin-bottom:32px">
       <div style="display:flex;gap:14px;align-items:flex-start">
+        <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M6 8h10v11a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2z"/><path d="M16 11h2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-2"/><path d="M8 8V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v3"/></svg>
+        <div>
+          <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">Homebrew</p>
+          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Same binaries, checksum-verified by brew.</p>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;align-items:flex-start">
         <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>
         <div>
           <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">mise</p>
@@ -565,6 +572,8 @@
       <div><span style="color:#8f8a88"># macOS / Linux, prebuilt — no Rust toolchain</span></div>
       <div><span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost</div>
       <div><span style="color:var(--color-accent)">$</span> roost</div>
+      <div style="margin-top:14px"><span style="color:#8f8a88"># or with Homebrew</span></div>
+      <div><span style="color:var(--color-accent)">$</span> brew install navbytes/roost/roost</div>
       <div style="margin-top:14px"><span style="color:#8f8a88"># or a binary from Releases (v0.1.0, four targets + SHA256SUMS.txt)</span></div>
       <div style="margin-top:14px"><span style="color:#8f8a88"># or from source</span></div>
       <div><span style="color:var(--color-accent)">$</span> cargo install --git https://github.com/navbytes/roost</div>
