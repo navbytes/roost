@@ -358,6 +358,9 @@ truecolor included. Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 | `pi` | `pi` | `pi --session <id>` | socket handshake, or newest file under `~/.pi/agent/sessions/` |
 | `claude` | `claude` | `claude --resume <id>` | newest `*.jsonl` under `~/.claude/projects/<encoded-cwd>/` |
 | `shell` | `$SHELL` | relaunch in saved cwd | — |
+| `codex` | `codex` | `codex resume <SESSION_ID>` | newest `*.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` (date-bucketed, not cwd-bucketed — detection cannot be scoped to a working directory) |
+| `gemini` | `gemini` | `gemini --resume <uuid>` | per-project history under `~/.gemini/tmp/<slug>/chats/`, slug read from `~/.gemini/projects.json`; session id extracted from file's first JSONL record |
+| `opencode` | `opencode` | `opencode --session <id>` | global SQLite database at `$XDG_DATA_HOME/opencode/opencode.db` (no filesystem detection — resume only by stored id) |
 
 New adapters implement the `AgentAdapter` trait in `src/agents/` (eight
 methods, most with defaults).
@@ -380,6 +383,8 @@ roost close 5 [--force]
 ```
 
 (`roost --help` prints the same verb set, in a different order.)
+
+**Exit codes:** `0` ok · `1` runtime error · `2` usage error · `3` `wait` timed out. The `wait` timeout is a distinct code so scripts can branch on it — `wait && read` needs to know the difference between a timeout and success.
 
 `wait` is what turns "spawn then poll" into "spawn → await → read": block until a
 pane hits a status (or a timeout), so an orchestrator doesn't sleep-and-grep.
@@ -466,7 +471,6 @@ now). Full detail: [ROADMAP.md](ROADMAP.md).
 
 <p align="center">
 <a href="DESIGN-ui.md">DESIGN-ui.md</a> (design spec) ·
-<a href="https://navbytes.github.io/roost/tui-design.html">tui-design.html</a> (design reference) ·
 <a href="ROADMAP.md">ROADMAP.md</a> ·
 <a href="LICENSE">LICENSE</a>
 </p>
