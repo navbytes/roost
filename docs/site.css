@@ -217,13 +217,23 @@
   #r-quit:checked ~ .resurrect-window .resurrect-body-quit { display: block; }
 
   /* ── hero mascot ──────────────────────────────────────────────────── */
-  .hero-grid { display: grid; grid-template-columns: 1fr; align-items: start; }
-  .hero-art { margin: 40px auto 0; max-width: 320px; }
+  .hero-grid {
+    display: grid; grid-template-columns: 1fr;
+    grid-template-areas: "kicker" "h1" "lede" "note" "art" "cta";
+    align-items: start;
+  }
+  .hero-grid > .kicker { grid-area: kicker; }
+  .hero-grid > h1 { grid-area: h1; }
+  .hero-lede { grid-area: lede; }
+  .hero-note { grid-area: note; }
+  .hero-cta { grid-area: cta; }
+  .hero-art { grid-area: art; margin: 40px auto 0; max-width: 300px; }
   .hero-art svg { display: block; width: 100%; height: auto; }
 
+  /* resting pose is already slightly settled (0.985); breathing dips further (0.955) */
   @keyframes bird-breathe {
-    0%, 100% { transform: scaleY(1); }
-    50% { transform: scaleY(0.97); }
+    0%, 100% { transform: scaleY(0.985); }
+    50% { transform: scaleY(0.955); }
   }
   @keyframes bird-blink {
     0%, 94%, 100% { transform: scaleY(1); }
@@ -233,8 +243,17 @@
   .bird-eyes { transform-box: fill-box; transform-origin: 50% 50%; animation: bird-blink 4s ease-in-out infinite; }
 
   @media (min-width: 960px) {
-    .hero-grid { grid-template-columns: 1fr 380px; gap: clamp(24px,4vw,64px); }
-    .hero-art { margin: 44px 0 0; max-width: none; }
+    .hero-grid {
+      grid-template-columns: 1fr 440px;
+      grid-template-areas:
+        "kicker art"
+        "h1     art"
+        "lede   art"
+        "note   art"
+        "cta    art";
+      column-gap: clamp(40px,4vw,64px);
+    }
+    .hero-art { margin: 0; max-width: none; align-self: center; }
   }
 
   @media (max-width: 760px) {
