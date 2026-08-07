@@ -1045,9 +1045,21 @@ impl<B: PaneBackend> App<B> {
     /// observation of a pane is silently baselined (`spawn_pane` owns
     /// birth); a transition landing on `Exited` is suppressed (`on_pty_exit`
     /// owns that line) — one source per transition, no double-reporting.
+    ///
+    /// [Amended, ux P2-10, design-supervisor D5] Reads `display_status`, not
+    /// the raw runtime status — same reasoning as D1's `tab_summary` fix:
+    /// the feed is chrome the user reads at a glance, and every other
+    /// surface (badge, roster, collapsed rows, tab bar) already reads a
+    /// quiet shell's `Waiting` as `Idle`. Left alone, the feed was logging
+    /// `1 shell: working → your turn` on every command any shell pane ran —
+    /// "your turn" false in exactly the case P2-10 named — while the rest
+    /// of the chrome, in the same frame, said `idle`.
     fn diff_statuses(&mut self) {
-        let current: Vec<(PaneId, AgentStatus)> =
-            self.runtimes.iter().map(|(id, rt)| (*id, rt.status())).collect();
+        let ids: Vec<PaneId> = self.runtimes.keys().copied().collect();
+        let current: Vec<(PaneId, AgentStatus)> = ids
+            .into_iter()
+            .map(|id| (id, self.display_status(id).unwrap_or(AgentStatus::Exited)))
+            .collect();
         for (id, status) in current {
             let prev = self.last_status.insert(id, status);
             match prev {
@@ -7398,6 +7410,35 @@ mod tests {
 
         // The broadcast's one ctl line must still be exactly one — untouched by the tick.
         assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
+    }
+
+    /// [design-supervisor D5] The feed reads `display_status`, not the raw
+    /// runtime status — the same fix D1 gave `tab_summary`. Left alone, a
+    /// shell's heuristic `Waiting` logged `{name}: working → your turn`
+    /// (P2-10's wrongness, on the one chrome surface the original pass
+    /// didn't reach) while every other surface, same frame, said `idle`.
+    #[test]
+    fn diff_statuses_logs_a_quiet_shells_waiting_as_idle_not_your_turn() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        let is_transition = |e: &&FeedEntry| e.text.contains('→') && !e.text.starts_with("ctl ");
+
+        // Baseline tick: first observation is silently seeded.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.feed().iter().filter(is_transition).count(), 0);
+
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Working);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
+        let last = transitions.last().expect("a transition line");
+        assert_eq!(last.text, format!("{}: working → idle", app.feed_label(id)), "not \"your turn\"");
     }
 
     #[test]
