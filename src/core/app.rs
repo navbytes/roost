@@ -444,6 +444,19 @@ pub struct App<B: PaneBackend> {
     /// a feed transition line (`diff_statuses`). Pruned to just the
     /// currently-running panes on the same cadence.
     last_status: HashMap<PaneId, AgentStatus>,
+    /// F3 (exit UX audit 2026-08-07): panes `attention_ring`'s ○ fallback
+    /// must skip because focus already landed on them *during their current
+    /// Waiting spell* — unlike ◆, which self-clears the moment you act on a
+    /// pane (its status itself moves on), a finished-and-quiet agent's
+    /// `Waiting` doesn't change just because you looked at it, so without
+    /// this `Alt+a` round-robins the same panes forever and "nothing else
+    /// needs you" only ever fires with exactly one waiting. Added by
+    /// `set_focus` (every focus move funnels through there — Alt+a, a
+    /// click, arrows, the roster all count); removed by `diff_statuses` the
+    /// moment a pane's status leaves `Waiting`, so a *new* finished turn is
+    /// never silently swallowed by a mark the previous turn left behind.
+    /// Pruned alongside `last_status` on the same cadence.
+    visited_waiting: HashSet<PaneId>,
     /// C20: activity-feed ring buffer (status/spawn/close/exit/ctl),
     /// capacity `FEED_CAP`, oldest evicted first. Session-only — never
     /// persisted.
@@ -572,6 +585,7 @@ impl<B: PaneBackend> App<B> {
             waiters: Vec::new(),
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
+            visited_waiting: HashSet::new(),
             feed: VecDeque::new(),
             float: None,
             raw: HashSet::new(),
@@ -1070,6 +1084,13 @@ impl<B: PaneBackend> App<B> {
                 None => {} // first observation: spawn owns birth, no line
                 Some(old) if old == status || status == AgentStatus::Exited => {}
                 Some(old) => {
+                    // F3: leaving `Waiting` starts a fresh attention cycle —
+                    // any "you already looked at this" mark belongs to the
+                    // turn that just ended, not the one that just started,
+                    // so it must not silently swallow a real new ○.
+                    if old == AgentStatus::Waiting {
+                        self.visited_waiting.remove(&id);
+                    }
                     // U2: `{id} {display_name}`, so four identical shells'
                     // transitions stop being indistinguishable in the feed.
                     let text = format!(
@@ -1084,8 +1105,10 @@ impl<B: PaneBackend> App<B> {
         }
         // Drop entries for panes that no longer have a runtime (closed) —
         // ids are never reused, so without this the map would grow by one
-        // stale entry per pane ever spawned over a long session.
+        // stale entry per pane ever spawned over a long session. F3's
+        // visited-set is pruned on the same cadence, same reason.
         self.last_status.retain(|id, _| self.runtimes.contains_key(id));
+        self.visited_waiting.retain(|id| self.runtimes.contains_key(id));
     }
 
     /// Persist what each pane is *actually* running — its live working
@@ -3204,6 +3227,14 @@ impl<B: PaneBackend> App<B> {
     fn set_focus(&mut self, id: PaneId) {
         let old = self.focused;
         self.focused = id;
+        // F3: landing focus on a pane that's currently in the ○ fallback
+        // takes it out of `attention_ring`'s rotation — see
+        // `visited_waiting`. Every focus move funnels through here, so
+        // Alt+a, a click, arrow-focus and the roster all count the same way
+        // (the finding named "visiting", not "Alt+a specifically").
+        if self.display_status(id) == Some(AgentStatus::Waiting) {
+            self.visited_waiting.insert(id);
+        }
         // Nothing inside roost is focused while roost isn't: the old pane
         // was already told it lost focus when the window blurred, and the
         // new one collects its `CSI I` when the window comes back.
@@ -3762,12 +3793,26 @@ impl<B: PaneBackend> App<B> {
     /// of the P1-5 work above was invisible. `attention_segment` (below) now
     /// reads this same ring, so the hint bar's right segment matches what
     /// `Alt+a` will actually do in *every* case, not just N > 0.
+    ///
+    /// [Amended F3, exit UX audit 2026-08-07] The fallback pass also drops
+    /// any pane in `visited_waiting` — panes focus has already landed on
+    /// during their current `Waiting` spell. Without this, the fallback
+    /// never empties: a real ◆ clears itself the moment you act on it (its
+    /// own status moves on), but a quiet `Waiting` pane's status doesn't
+    /// change just because you looked at it, so a six-pane fleet with
+    /// nothing but finished turns turned `Alt+a` into an endless
+    /// round-robin, and "nothing else needs you" only ever fired with
+    /// exactly one pane waiting. The ◆ pass is untouched — a real ◆ must
+    /// never be hidden by a stale visit.
     fn attention_ring(&self) -> Vec<PaneId> {
         let needy = self.status_ring(AgentStatus::NeedsInput);
         if !needy.is_empty() {
             return needy;
         }
         self.status_ring(AgentStatus::Waiting)
+            .into_iter()
+            .filter(|id| !self.visited_waiting.contains(id))
+            .collect()
     }
 
     /// C9/F2 (exit UX audit 2026-08-07): what the hint bar's right segment
@@ -9853,6 +9898,92 @@ mod tests {
         assert!(app.attention_ring().is_empty(), "an all-shell fleet has nothing to jump to");
         app.apply(Action::JumpAttention);
         assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
+    /// F3 (exit UX audit 2026-08-07): unlike a real ◆, which clears itself
+    /// the moment you act on it, a quiet `Waiting` pane's status never
+    /// changes just because you looked at it — so before this fix, three
+    /// finished agents made `Alt+a` an endless 1→2→3→1→2→3… round-robin and
+    /// "nothing else needs you" never fired at all (it only ever fired with
+    /// exactly one pane waiting). Each visit must permanently retire that
+    /// pane from the rotation, so the ring shrinks to empty exactly once
+    /// every pane has been seen.
+    #[test]
+    fn jump_attention_waiting_fallback_shrinks_as_each_pane_is_visited() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // panes 1, 2, 3 — all real agents below
+        for id in [1u64, 2, 3] {
+            app.find_spec_mut(id).unwrap().adapter = "pi".into();
+            app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
+        }
+        assert_eq!(app.attention_ring(), vec![1, 2, 3]);
+
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.attention_ring(), vec![2, 3], "visiting 1 retires it");
+
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.attention_ring(), vec![3], "visiting 2 retires it too");
+
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 3);
+        assert!(app.attention_ring().is_empty(), "all three visited — the tier is finally empty");
+
+        // A fourth press must say so, not silently wrap back to pane 1.
+        app.apply(Action::JumpAttention);
+        assert_eq!(app.focused, 3, "nothing to jump to — focus does not move");
+        assert_eq!(app.flash(), Some("nothing needs you"));
+    }
+
+    /// The finding named "visiting a waiting pane", not "Alt+a-ing to it" —
+    /// `set_focus` is the one funnel every focus move shares (P10), so a
+    /// plain spatial focus move must retire a pane exactly as a jump does.
+    #[test]
+    fn any_focus_move_not_just_alt_a_retires_a_visited_waiting_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_ring(), vec![1, 2]);
+
+        app.apply(Action::Focus(layout::Dir::Left)); // 2 -> 1, no Alt+a involved
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.attention_ring(), vec![2], "a plain focus move counts as a visit too");
+    }
+
+    /// The other half of the fix, and the one that makes it safe: a pane
+    /// that starts a genuinely new turn after being visited must not stay
+    /// silently excluded forever — the stale mark belongs to the finished
+    /// turn that was already seen, not the fresh one.
+    #[test]
+    fn a_revisited_pane_re_enters_the_fallback_after_a_fresh_finished_turn() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(1).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+
+        app.apply(Action::JumpAttention); // visits and retires pane 1
+        assert_eq!(app.focused, 1);
+        assert!(app.attention_ring().is_empty());
+
+        // Baseline tick: `last_status[1]` learns it's Waiting (first
+        // observation — no transition yet).
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        // A new turn starts — `diff_statuses` must see the pane leave
+        // Waiting and clear its stale visited mark right then, not later.
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Working);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        // ...and finishes again: this is a brand new ○, not the one already seen.
+        app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert_eq!(app.attention_ring(), vec![1], "a fresh finished turn must not be swallowed");
     }
 
     // -- C27 fleet roster -----------------------------------------------------

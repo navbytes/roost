@@ -1664,6 +1664,41 @@ existing aggregate slot already does for free. The segment now matches
 making the ring/count invariant this contract opened with fully true again,
 not just true when N > 0.
 
+**[Amended 2026-08-07, exit UX audit F3 — the Waiting fallback now empties]**
+The two-pass ring above never removed a pane from its fallback pass once
+that pane had been visited: a real ◆ clears itself the moment you act on it
+(its own status moves on), but a quiet `Waiting` pane's status doesn't
+change just because focus landed on it, so `Alt+a` over an all-Waiting fleet
+round-robinned forever and "nothing else needs you" (the empty-ring flash)
+only ever fired with exactly one pane in the fallback. Bit hardest at the
+fleet size this feature exists for.
+- **Fix: a visited-set, cleared per-pane the moment that pane leaves
+  `Waiting`.** `App::visited_waiting: HashSet<PaneId>` — `set_focus` (P10's
+  single funnel for every focus move: `Alt+a`, a click, arrow-focus, the
+  roster) adds a pane the instant focus lands on it while its
+  `display_status` is `Waiting`; `attention_ring`'s fallback pass filters
+  the id out. Chosen over "clear the whole set whenever the fleet changes"
+  (the mechanism this amendment's originating finding suggested as one
+  option): a spawn/close elsewhere in the fleet has nothing to do with
+  whether *this* pane's finished turn was already seen, and clearing
+  per-pane on close would still leave a revisit-without-a-new-turn
+  underspecified — the real invariant needed is per-pane, not fleet-wide.
+- **Cleared on the transition that matters, not a timer.** `diff_statuses`
+  (already the one place that diffs every pane's status once per tick, C20)
+  removes a pane from `visited_waiting` the instant its status is observed
+  leaving `Waiting` — so a pane that starts a new turn and finishes it again
+  is never silently swallowed by a mark the *previous* turn left behind.
+  Pruned on pane close alongside `last_status`, same cadence, same reason.
+  The ◆ pass is entirely untouched — a real ◆ can never be hidden by a
+  stale visit.
+- Unit tests added: the fallback ring shrinks by one with each visit and
+  the fourth press over a three-pane all-Waiting fleet flashes `nothing
+  needs you` rather than wrapping (`jump_attention_waiting_fallback_shrinks_as_each_pane_is_visited`);
+  a plain spatial focus move retires a pane exactly as a jump does
+  (`any_focus_move_not_just_alt_a_retires_a_visited_waiting_pane`); a pane
+  that leaves and re-enters `Waiting` is eligible again, not stuck excluded
+  (`a_revisited_pane_re_enters_the_fallback_after_a_fresh_finished_turn`).
+
 ### C20 — Activity feed (Alt+e) — [Added 2026-07-22, fleet features]
 
 **Current:** no surface. The data exists but scattered: control actions are
