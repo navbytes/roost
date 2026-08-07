@@ -85,7 +85,13 @@ per-project in that directory's `mise.toml` instead of globally.
 
 Only one roost runs per workspace at a time — a second instance on the same
 state dir refuses to start (they'd race and corrupt `workspace.json`). Run an
-isolated one with `ROOST_STATE=/some/dir roost`.
+isolated one with `ROOST_STATE=/some/dir roost`. This isolates workspace
+state only — it still installs and updates the pi extension and the Claude
+Code hooks in your real `~/.pi` and `~/.claude` (below). Add
+`ROOST_NO_EXT_INSTALL=1` if you don't want that too. Deliberate:
+`ROOST_STATE` doesn't imply "don't touch my global config" because two
+concurrent real roost fleets, each in its own state dir, both legitimately
+want the one real `~/.claude` wired up.
 
 State lives in `~/.local/state/roost/workspace.json` on Linux and
 `~/Library/Application Support/roost/workspace.json` on macOS (auto-saved on
