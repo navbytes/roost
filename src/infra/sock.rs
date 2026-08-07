@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -23,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::core::control::{Reply, Request};
@@ -43,6 +44,16 @@ const MAX_LINE: u64 = 64 * 1024;
 /// Cap concurrent client connections so a buggy/looping extension that
 /// reconnects rapidly can't spawn unbounded threads/FDs.
 const MAX_CONN: usize = 64;
+
+/// Per-principal share of `MAX_CONN` (DESIGN-control.md §5.6 / audit M3). The
+/// threat this closes: one pane (or the fleet token — same-uid-readable off
+/// `<state>/control.token`, see the design doc's §5.2 correction) opening
+/// enough connections/parked `wait`s to starve the human's CLI and any real
+/// orchestrator. 8 is the audit's own number: generous for one caller (a
+/// handful of concurrent `wait`s on a small fleet) while leaving most of the
+/// 64-connection pool for everyone else — a single flooding principal can
+/// never fill more than 8/64 of it by itself.
+const PRINCIPAL_MAX_CONN: usize = 8;
 
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
 /// an attacker who pre-created the runtime dir from hosting our control socket
@@ -149,17 +160,35 @@ fn parse_line(line: &str) -> Option<AppEvent> {
 }
 
 /// Connection accounting shared by the listener's accept loop and every
-/// per-connection thread it spawns. Split out (rather than a bare
-/// `AtomicUsize`) because §5.6/M3 (see DESIGN-control.md) grows this into
-/// per-principal accounting next; for now it's just the global cap, made
-/// race-free.
+/// per-connection thread it spawns (DESIGN-control.md §5.6).
+///
+/// The per-principal cap is keyed on the caller's raw wire `token` string,
+/// not a resolved `Actor` — sock.rs has no access to `App::resolve_actor`
+/// (that's core/app.rs, a different owner) and doesn't need it:
+/// `resolve_actor` itself is exact-string-match against the fleet token or
+/// one pane token per pane, so distinct token strings already mean distinct
+/// principals. Peer credentials (`SO_PEERCRED`/`getpeereid`) were considered
+/// instead and rejected: in this same-uid threat model the uid is always the
+/// operator's own, and the pid is the *client* process on the other end of
+/// one connection — for the one-shot `roost <verb>` CLI that's a fresh pid
+/// every single invocation, so a `for i in (seq 200000); roost list; end`
+/// flood would never repeat a pid and a pid-keyed cap would never trip. The
+/// token is the one thing that *is* stable across exactly that loop (one
+/// `ROOST_TOKEN` env var, inherited by every re-exec), so it is not merely
+/// "all we have" — it's the only stable handle on the actual attack shape.
 struct Limits {
+    /// Race-free global connection count (replaces the old load-then-add —
+    /// audit Info (a)).
     global: AtomicUsize,
+    /// Open connections per token, so one principal can't eat the whole
+    /// `MAX_CONN` pool. Entries are removed at 0, so this can never hold
+    /// more entries than there are currently-open connections.
+    per_principal: Mutex<HashMap<String, usize>>,
 }
 
 impl Limits {
     fn new() -> Self {
-        Limits { global: AtomicUsize::new(0) }
+        Limits { global: AtomicUsize::new(0), per_principal: Mutex::new(HashMap::new()) }
     }
 
     /// Atomically check-and-increment the global connection cap in one step.
@@ -174,6 +203,30 @@ impl Limits {
 
     fn release_global(&self) {
         self.global.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Called once, for the first control request seen on a connection: admit
+    /// it under `token`'s per-principal connection cap, or refuse. Every
+    /// `true` must be matched by exactly one later `release_principal` call.
+    fn try_reserve_principal(&self, token: &str) -> bool {
+        let mut map = self.per_principal.lock().unwrap();
+        let count = map.entry(token.to_string()).or_insert(0);
+        if *count >= PRINCIPAL_MAX_CONN {
+            false
+        } else {
+            *count += 1;
+            true
+        }
+    }
+
+    fn release_principal(&self, token: &str) {
+        let mut map = self.per_principal.lock().unwrap();
+        if let Some(count) = map.get_mut(token) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(token);
+            }
+        }
     }
 }
 
@@ -229,6 +282,10 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
                 let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
                 let mut reader = BufReader::new(stream);
                 let mut buf = Vec::new();
+                // The token this connection reserved a per-principal
+                // connection slot under (first control request only) —
+                // remembered so cleanup releases exactly what was reserved.
+                let mut principal: Option<String> = None;
                 loop {
                     buf.clear();
                     // Cap the bytes read per line so a newline-less flood can't
@@ -252,6 +309,23 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
                     // being dropped — see `parse_control`.
                     match parse_control(line) {
                         Some(Ok(req)) => {
+                            // First control request on this connection:
+                            // charge it against `req.token`'s per-principal
+                            // connection cap. A connection that later sends a
+                            // *different* token isn't re-attributed — not a
+                            // pattern either the CLI or an orchestrator uses,
+                            // and not worth the bookkeeping (ponytail).
+                            if principal.is_none() {
+                                if !limits.try_reserve_principal(&req.token) {
+                                    let msg = format!(
+                                        "connection limit: this token already has \
+                                         {PRINCIPAL_MAX_CONN} open connections; close one and retry"
+                                    );
+                                    let _ = write_reply(&mut reader, &Reply::err(msg));
+                                    break; // over cap: free the slot now
+                                }
+                                principal = Some(req.token.clone());
+                            }
                             let (rtx, rrx) = std::sync::mpsc::channel();
                             if tx.send(AppEvent::Command(req, rtx)).is_err() {
                                 break; // main gone
@@ -283,6 +357,9 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>) {
                     }
                 }
                 limits.release_global();
+                if let Some(token) = principal {
+                    limits.release_principal(&token);
+                }
             });
         }
     });
@@ -409,5 +486,86 @@ mod tests {
         let successes = handles.into_iter().map(|h| h.join().unwrap()).filter(|&ok| ok).count();
         assert_eq!(successes, MAX_CONN, "exactly MAX_CONN reservations should win under contention");
         assert_eq!(limits.global.load(Ordering::Relaxed), MAX_CONN, "counter must not exceed MAX_CONN");
+    }
+
+    // --- §5.6 / M3: per-principal connection cap --------------------------
+    //
+    // These drive the real `spawn_accept_loop` over a scratch socket (never
+    // the process-global `ROOST_STATE` path — racy across tests running in
+    // parallel in one process) against a fake "App" that acks every command
+    // instantly, so the caps under test are sock.rs's alone.
+
+    /// A scratch socket path + bound listener, unique per test.
+    fn scratch_listener(tag: &str) -> (PathBuf, UnixListener) {
+        let dir = std::env::temp_dir().join(format!("roost-sock-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sock");
+        let listener = UnixListener::bind(&path).expect("bind scratch socket");
+        (path, listener)
+    }
+
+    /// Stands in for the main loop: replies `ok` to every `Command`
+    /// immediately, mirroring a trivial verb like `list` (the one M2's flood
+    /// used) — sock.rs's caps must not depend on what App does with a
+    /// request, only on how many/how fast they arrive.
+    fn fake_app() -> SyncSender<AppEvent> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(256);
+        std::thread::spawn(move || {
+            while let Ok(ev) = rx.recv() {
+                if let AppEvent::Command(_req, reply) = ev {
+                    let _ = reply.send(Reply::ok(serde_json::json!({})));
+                }
+            }
+        });
+        tx
+    }
+
+    /// Connect with a client-side read timeout — a real hang (the old P0 bug
+    /// class) fails the test fast instead of wedging `cargo test`.
+    fn connect(path: &Path) -> BufReader<UnixStream> {
+        let stream = UnixStream::connect(path).expect("connect to scratch socket");
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        BufReader::new(stream)
+    }
+
+    /// Send one line, read exactly one reply line back.
+    fn roundtrip(r: &mut BufReader<UnixStream>, line: &str) -> serde_json::Value {
+        r.get_mut().write_all(line.as_bytes()).unwrap();
+        r.get_mut().write_all(b"\n").unwrap();
+        let mut resp = String::new();
+        r.read_line(&mut resp).expect("no reply within the client timeout — dropped or hung");
+        serde_json::from_str(&resp).unwrap_or_else(|e| panic!("reply {resp:?} not JSON: {e}"))
+    }
+
+    #[test]
+    fn one_principal_cannot_exceed_its_connection_cap_while_another_still_connects() {
+        let (path, listener) = scratch_listener("conncap");
+        spawn_accept_loop(listener, fake_app());
+
+        // Principal A opens exactly its cap's worth of connections, kept
+        // open (held in `_a_conns`) so they still count.
+        let mut _a_conns = Vec::new();
+        for i in 0..PRINCIPAL_MAX_CONN {
+            let mut c = connect(&path);
+            let reply = roundtrip(&mut c, r#"{"token":"tok-a","method":"list"}"#);
+            assert!(reply.get("ok").is_some(), "connection {i} under cap must succeed: {reply}");
+            _a_conns.push(c);
+        }
+
+        // One more from the SAME token: refused with a clear, actionable
+        // reply — not a silent drop, not a hang (the `connect`/`roundtrip`
+        // timeout would catch either).
+        let mut over = connect(&path);
+        let reply = roundtrip(&mut over, r#"{"token":"tok-a","method":"list"}"#);
+        let err = reply.get("err").and_then(|v| v.as_str()).expect("over cap must error, not ok");
+        assert!(err.contains("connection limit"), "must name the connection cap: {err}");
+
+        // A different principal is unaffected — the whole point of the cap.
+        let mut b = connect(&path);
+        let reply = roundtrip(&mut b, r#"{"token":"tok-b","method":"list"}"#);
+        assert!(reply.get("ok").is_some(), "a different principal must still connect: {reply}");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
