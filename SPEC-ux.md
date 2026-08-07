@@ -95,14 +95,29 @@ no warning — every advertised chord silently no-ops in the first minute.
 **Proposed contract:** warn on any terminal when keys are arriving but zero Alt
 has ever been seen (or on the Option-accent signature `ñƒå∂…`), with a
 per-terminal instruction line.
-**Fixed:** the trigger is the evidence — `wants_alt_hint(alt_seen,
-keys_seen, elapsed)`, no terminal allowlist — so any terminal with the
-setting off warns inside the same 8 s window, and one Alt key ever ends it.
-The accent-signature half proved unnecessary: those accents *are* keys with
-no Alt on them, so the failed chord that produced `∫` is itself what raises
-the bar. Wording is per terminal from roost's own (host) `TERM_PROGRAM`:
-real menu paths for `Apple_Terminal` and `iTerm.app`, a terminal-agnostic
-line otherwise — never a wrong path (C11 amended 2026-07-27).
+**Fixed (2026-07-27), then regressed:** the trigger shipped as
+`wants_alt_hint(alt_seen, keys_seen, elapsed)`, no terminal allowlist — any
+terminal with the setting off warns inside the same 8s window, one Alt key
+ever ends it. The accent-signature half was dropped as "unnecessary", on the
+reasoning that any Alt-less key is equally good evidence since a swallowed
+chord is itself "a key with no Alt on it". That reasoning doesn't hold:
+*every* keystroke is "a key with no Alt on it" except the rare one that
+isn't, so `keys_seen` fired on ordinary typing — a healthy Ghostty/iTerm2
+user's first action (a shell prompt) — inside the very window meant to catch
+a broken one. Confirmed by the exit UX audit (2026-08-07, F1): reproduced on
+a correctly-configured terminal, first keystroke.
+
+**Re-fixed (exit UX audit 2026-08-07, F1):** the accent-signature half is
+back, and is now the *only* evidence — `wants_alt_hint(alt_seen,
+alt_swallow_seen)`, no elapsed gate. `alt_swallow_seen` is set only when an
+unmodified key's character is one a macOS layout emits for
+`Option+<letter>` with Option-as-Meta off (`is_alt_swallow_char`, `app.rs`)
+— narrow enough that the elapsed-time gate that used to bound the false-fire
+window is no longer needed, which is also what lets a read-first user's
+first Alt press land arbitrarily late and still raise the bar. Wording is
+unchanged: per terminal from roost's own (host) `TERM_PROGRAM`, real menu
+paths for `Apple_Terminal` and `iTerm.app`, terminal-agnostic otherwise (C9
+and C11 amended 2026-08-07).
 
 ### U5 · High · FIXED (this branch) — unbound Alt chords are swallowed, not forwarded
 *Fixed with SPEC-parity P13 (one change): `translate()`'s unmatched-Alt arm

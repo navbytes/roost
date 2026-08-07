@@ -957,6 +957,19 @@ seven gain nothing** — the 100-column argument in this contract's 2026-07-22
 amendment is unchanged, and `Alt+Shift+a` is discoverable through `Alt+?`
 (C15) beside the `Alt+a` it pairs with.
 
+**[Amended 2026-08-07, exit UX audit F1 — precedence flips]** "Precedence
+unchanged: alt-warning (C11) takes the bar over flash (C10), which takes it
+over hints" is reversed: **flash now wins over the alt-warning**; hints stay
+last. The old order let the alt-warning pre-empt `draw_hint_bar`'s flash
+branch outright, so a copy performed while the warning wanted the bar showed
+no confirmation at all — and since C11's elapsed gate is also gone this same
+date, an unresolved alt-trap would otherwise have swallowed every flash for
+the rest of the session, not just a startup window. With flash checked
+first, a transient confirmation always gets its `FLASH_WINDOW`; the
+alt-warning (which now persists until resolved, not for a fixed window)
+reclaims the bar the moment the flash expires. Pinned by
+`flash_wins_the_hint_bar_over_the_alt_warning`.
+
 ### C10 — Flash message
 
 **Current:** `render.rs:56–64` — Black on Green BOLD.
@@ -1030,6 +1043,40 @@ primitives that survive any palette — reversing `accent()` paints the row in
 the user's red with their background as the ink, so a problem still reads as a
 problem, while the flash keeps the plain reversal.
 Trigger and wording are untouched.
+
+**[Amended 2026-08-07, exit UX audit F1 — trigger re-anchored to the accent
+signature, elapsed gate dropped]** The 2026-07-27 amendment's "self-timing"
+reasoning does not hold up: "keys are arriving and not one of them has
+carried Alt" is true of nearly all typing, not only a swallowed chord — a
+healthy Ghostty/iTerm2 user's first action (typing a shell prompt) satisfies
+it inside the 8s window, so the bar fired on a correctly-configured
+terminal, and it fired *before* the user had pressed anything roost cares
+about. Worse, it pre-empted `draw_hint_bar`'s flash branch outright (see the
+companion C9 amendment), so a copy performed in that window showed no
+confirmation either.
+- **Evidence, corrected.** SPEC-ux U4's originally proposed "Option-accent
+  signature", dropped in the 2026-07-27 amendment as "unnecessary", turns out
+  to be exactly what was missing: the character a macOS layout emits for
+  `Option+<letter>` with Option-as-Meta off (`Alt+n` → `˜`, `Alt+w` → `∑`, …)
+  arriving with **no Alt modifier at all** is what actually distinguishes a
+  swallowed chord from ordinary typing — "some key arrived" does not.
+  `App::note_key_seen` now takes the `KeyEvent` itself and only records
+  evidence (`alt_swallow_seen`) when the unmodified key matches
+  `is_alt_swallow_char`'s table (`app.rs`). `note_alt_seen` (a real Alt key
+  getting through, ending the warning for the session) is unchanged.
+- **`ALT_HINT_WINDOW` and the elapsed-time gate are gone**, not widened. They
+  existed only to bound a trigger that fired on ordinary typing; evidence
+  this specific needs no clock to stay accurate. Dropping the gate is also
+  the fix for the read-first user the old window missed entirely: their
+  first (and only) Alt attempt may land well after any fixed window, and the
+  warning must still catch it.
+- Trigger function: `wants_alt_hint(alt_seen, alt_swallow_seen)` — no
+  `elapsed` parameter. Wording (previous amendment) is untouched.
+- Both hard requirements are pinned by `App`-level tests: a healthy terminal
+  typing an ordinary shell prompt never sets `alt_swallow_seen`
+  (`healthy_terminal_typing_a_shell_prompt_never_fires_the_alt_hint`); a
+  read-first user whose first Alt press lands at t=40s still gets the bar
+  (`read_first_user_still_gets_the_hint_however_late_the_first_alt_press_is`).
 
 ### C12 — Modal system (shared)
 

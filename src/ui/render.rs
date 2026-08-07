@@ -299,8 +299,9 @@ fn search_segment(search: Option<&Search>) -> (Option<String>, Option<String>) {
 }
 
 /// Zellij-style shortcut bar. Mode-aware: the keys shown match what you can
-/// actually press right now. Precedence (C9): alt-warning, then flash, then
-/// the hint pairs — each takes over the whole bar from the next.
+/// actually press right now. Precedence (C9, reordered F1 2026-08-07):
+/// flash, then alt-warning, then the hint pairs — each takes over the whole
+/// bar from the next.
 /// Rendered column width of one hint pair. THE single source both the fit
 /// calculation and the actual draw use, so they can never drift (a +3/+4
 /// mismatch once dropped the whole right segment at widths 111–116).
@@ -326,21 +327,24 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
 }
 
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
+    // F1 (exit UX audit 2026-08-07, C9 amended): flash now wins the bar over
+    // the alt-warning — the reverse order let a persistent problem bar
+    // swallow a just-performed copy's confirmation for its entire window.
+    // A transient action result (e.g. "copied") takes over the bar briefly.
+    if let Some(msg) = app.flash() {
+        f.render_widget(
+            Paragraph::new(format!(" {msg} ")).style(theme::attention()),
+            area,
+        );
+        return;
+    }
+
     if app.show_alt_hint() {
         // C11/U4: same bar, per-terminal wording — the app knows the host's
         // TERM_PROGRAM and picks the real menu path where there is one. A
         // problem bar, so the red-tinted reversal, not the neutral one.
         f.render_widget(
             Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()),
-            area,
-        );
-        return;
-    }
-
-    // A transient action result (e.g. "copied") takes over the bar briefly.
-    if let Some(msg) = app.flash() {
-        f.render_widget(
-            Paragraph::new(format!(" {msg} ")).style(theme::attention()),
             area,
         );
         return;
@@ -3393,7 +3397,9 @@ mod tests {
         out.push(("flash", snap(&mut app)));
 
         let mut app = three_panes();
-        app.note_key_seen(); // U4's evidence: keys arriving, none with Alt
+        // F1's evidence: a swallowed Option chord (Option+n -> '˜' with no
+        // Alt modifier), not just any key.
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
         assert!(app.show_alt_hint());
         out.push(("alt-trap warning bar", snap(&mut app)));
 
@@ -3525,6 +3531,30 @@ mod tests {
         }
 
         out
+    }
+
+    /// F1 (exit UX audit 2026-08-07, C9 reordered): the alt-warning used to
+    /// pre-empt `draw_hint_bar`'s flash branch outright, so a copy performed
+    /// while the warning wanted to be up showed no confirmation at all. Both
+    /// conditions true at once, flash must still win the row.
+    #[test]
+    fn flash_wins_the_hint_bar_over_the_alt_warning() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.set_flash("copied 12 chars");
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
+        assert!(app.show_alt_hint(), "evidence is present — the warning wants the bar too");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let row: String = (0..100)
+            .filter_map(|x| term.backend().buffer().cell((x, 29)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(row.contains("copied 12 chars"), "flash must win the bar: {row:?}");
+        assert!(!row.contains("Alt keys"), "the alt-warning must not pre-empt the flash: {row:?}");
     }
 
     /// [design-supervisor pattern, SG-2's own shape] The three §2 gates below

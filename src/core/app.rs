@@ -35,10 +35,6 @@ const LIVE_TITLE_CAP: usize = 48;
 /// roost repaint the host's title bar ~30x a second.
 const HOST_TITLE_INTERVAL: Duration = Duration::from_millis(200);
 
-/// How long the "Alt keys aren't reaching roost" hint stays up on a fresh
-/// launch before we assume the user isn't going to press one / already saw it.
-const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
-
 /// P0-3: how much of a spawn failure's full cause chain (`dead_reason`) is
 /// kept for the dead-pane bar (`spawn failed: {reason}`, C16) and the feed —
 /// one line, bounded so a pathological program path or a long chain can't
@@ -384,12 +380,17 @@ pub struct App<B: PaneBackend> {
     started: Instant,
     /// Set the first time an Alt-modified key event arrives, so the
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
-    /// they are (or the window has simply run out).
+    /// they are.
     alt_seen: bool,
-    /// U4: set the first time ANY key event arrives. Keys flowing with no
-    /// Alt among them is the evidence the alt-trap warning now triggers on,
-    /// instead of an allowlist of terminals known to eat Option.
-    keys_seen: bool,
+    /// F1 (exit UX audit 2026-08-07): set the first time a key arrives that
+    /// looks like a *swallowed* Alt chord — the character a macOS layout
+    /// emits for `Option+<letter>` with Option-as-Meta off (`˜` for
+    /// Option+n, `∑` for Option+w, …), carrying no Alt modifier at all. Not
+    /// "any key arrives": that was the old (wrong) evidence — true of nearly
+    /// every keystroke, including the shell prompt a healthy user types
+    /// first, so it false-fired on correctly-configured terminals. See
+    /// `is_alt_swallow_char`.
+    alt_swallow_seen: bool,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
     /// P21: the live scrollback search, if one is running. Outlives the
@@ -558,7 +559,7 @@ impl<B: PaneBackend> App<B> {
             home: dirs::home_dir(),
             started: Instant::now(),
             alt_seen: false,
-            keys_seen: false,
+            alt_swallow_seen: false,
             selection: None,
             search: None,
             recent_cwds: Vec::new(),
@@ -654,11 +655,22 @@ impl<B: PaneBackend> App<B> {
         self.alt_seen = true;
     }
 
-    /// U4: record that *some* key arrived — the evidence half of the
-    /// alt-trap trigger. Keys flowing with no Alt among them is what
-    /// "the terminal is eating the Alt layer" looks like from in here.
-    pub fn note_key_seen(&mut self) {
-        self.keys_seen = true;
+    /// F1 (exit UX audit 2026-08-07): record a key event as possible
+    /// evidence the Alt layer isn't reaching roost. Only counts when the key
+    /// carries no Alt modifier AND its character is one a macOS layout
+    /// produces for `Option+<letter>` with Option-as-Meta off — "a key
+    /// arrived" is not evidence (nearly all typing satisfies that,
+    /// including the shell prompt a healthy user types first); "the
+    /// specific character a swallowed Option chord produces" is.
+    pub fn note_key_seen(&mut self, key: crossterm::event::KeyEvent) {
+        if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            return;
+        }
+        if let crossterm::event::KeyCode::Char(c) = key.code {
+            if is_alt_swallow_char(c) {
+                self.alt_swallow_seen = true;
+            }
+        }
     }
 
     /// C11/U4: should the "Alt keys aren't reaching roost" bar be up? Many
@@ -667,10 +679,13 @@ impl<B: PaneBackend> App<B> {
     /// `Esc+`) — with it off, every Alt chord roost relies on silently does
     /// nothing and there is no other signal saying why. Gating this on
     /// `TERM_PROGRAM == "Apple_Terminal"` only meant the README's own
-    /// recommended terminal (iTerm2) never warned; the trigger is now the
-    /// evidence itself, on any terminal (see `wants_alt_hint`).
+    /// recommended terminal (iTerm2) never warned; the trigger is the
+    /// evidence itself, on any terminal (see `wants_alt_hint`). No elapsed
+    /// gate (F1, 2026-08-07): a read-first user's only Alt attempt may land
+    /// well after any fixed window, and evidence this specific doesn't need
+    /// one to stay accurate.
     pub fn show_alt_hint(&self) -> bool {
-        wants_alt_hint(self.alt_seen, self.keys_seen, self.started.elapsed())
+        wants_alt_hint(self.alt_seen, self.alt_swallow_seen)
     }
 
     /// C11/U4: the warning's text, with the real menu path for terminals
@@ -5531,16 +5546,32 @@ fn edge_pane(rects: &[PaneRect], rightmost: bool) -> Option<PaneId> {
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
 /// without depending on process env vars or wall-clock time.
 ///
-/// U4: the trigger is evidence, not an allowlist — keys are arriving and
-/// not one of them has carried Alt, inside the startup window. That covers
-/// every terminal with the setting off (the old `TERM_PROGRAM ==
-/// "Apple_Terminal"` test left iTerm2, the README's recommendation, silent),
-/// and it fires at exactly the right moment: when Option-as-Meta is off, the
-/// chord you just tried arrives as an unmodified key (Option+b → `∫`), so
-/// the failed chord is itself the evidence. One Alt key ever, or the window
-/// running out, ends it for the session.
-fn wants_alt_hint(alt_seen: bool, keys_seen: bool, elapsed: Duration) -> bool {
-    !alt_seen && keys_seen && elapsed < ALT_HINT_WINDOW
+/// U4/F1 (exit UX audit 2026-08-07): the trigger is evidence, not an
+/// allowlist — that part of the original U4 fix was right. What was wrong
+/// was the *evidence*: "keys are arriving and not one of them has carried
+/// Alt" is true of nearly all typing, so it fired on a healthy terminal the
+/// moment the user typed a shell prompt. The real signature of a swallowed
+/// Option chord is narrower — `alt_swallow_seen` (see
+/// `App::note_key_seen`/`is_alt_swallow_char`) — and specific enough that it
+/// needs no startup window: it stays accurate whenever it fires, so it's
+/// checked with no elapsed-time gate. One Alt key ever ends it.
+fn wants_alt_hint(alt_seen: bool, alt_swallow_seen: bool) -> bool {
+    !alt_seen && alt_swallow_seen
+}
+
+/// F1 (exit UX audit 2026-08-07): the characters a standard macOS (US)
+/// keyboard layout emits for `Option+<letter>` when Option isn't configured
+/// as Meta — terminals apply the OS layout without dead-key composition, so
+/// e.g. `Option+n` arrives immediately as `˜`, not held for a following
+/// vowel. One of these arriving with no Alt modifier at all is direct
+/// evidence that *some* Alt chord was just swallowed, unlike "a key
+/// arrived" (true of nearly every keystroke).
+fn is_alt_swallow_char(c: char) -> bool {
+    matches!(
+        c,
+        'å' | '∫' | 'ç' | '∂' | '´' | 'ƒ' | '©' | '˙' | 'ˆ' | '∆' | '˚' | '¬' | 'µ' | '˜' | 'ø'
+            | 'π' | 'œ' | '®' | 'ß' | '†' | '¨' | '√' | '∑' | '≈' | '¥' | 'Ω'
+    )
 }
 
 /// C11/U4: the warning line for a given host `TERM_PROGRAM` — the real menu
@@ -9367,19 +9398,30 @@ mod tests {
     }
 
     #[test]
-    fn alt_hint_gates_on_seen_time_and_terminal() {
-        // U4: keys arriving with no Alt among them fires it — on ANY
-        // terminal, since that IS the symptom (the old Apple_Terminal-only
-        // test left iTerm2, the README's recommendation, silent).
-        assert!(wants_alt_hint(false, true, Duration::from_secs(1)));
-        // One Alt key ever ends it, and it never fires before any key: an
-        // untouched roost has no evidence of anything.
-        assert!(!wants_alt_hint(true, true, Duration::from_secs(1)));
-        assert!(!wants_alt_hint(false, false, Duration::from_secs(1)));
-        // The startup window still bounds it, at the boundary and past it.
-        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW));
-        assert!(!wants_alt_hint(false, true, ALT_HINT_WINDOW + Duration::from_secs(60)));
-        assert!(wants_alt_hint(false, true, ALT_HINT_WINDOW - Duration::from_millis(1)));
+    fn alt_hint_gates_on_swallowed_alt_evidence_not_elapsed_time() {
+        // F1 (exit UX audit 2026-08-07): evidence, not "a key arrived" — and
+        // no elapsed-time gate at all, since the evidence is specific enough
+        // not to need one (see the two App-level tests below for what that
+        // buys: a healthy terminal never fires, a read-first user always
+        // still gets it, however late their first Alt press is).
+        assert!(wants_alt_hint(false, true));
+        // One Alt key ever ends it, and it never fires with no evidence: an
+        // untouched roost — or one that's only seen ordinary keys — has
+        // nothing to warn about.
+        assert!(!wants_alt_hint(true, true));
+        assert!(!wants_alt_hint(false, false));
+    }
+
+    #[test]
+    fn is_alt_swallow_char_matches_the_examples_the_audit_named() {
+        assert!(is_alt_swallow_char('˜')); // Option+n with Option-as-Meta off
+        assert!(is_alt_swallow_char('∑')); // Option+w
+        // Plain letters — what a healthy terminal sends when Alt DOES get
+        // through (roost sees the ALT modifier bit instead) and what an
+        // unrelated keystroke looks like either way — are not evidence.
+        for c in 'a'..='z' {
+            assert!(!is_alt_swallow_char(c), "{c:?} is not swallowed-Alt evidence");
+        }
     }
 
     /// C11/U4: the bar names the real setting for terminals we know, and
@@ -9403,18 +9445,48 @@ mod tests {
         }
     }
 
-    /// The trigger end-to-end on a real `App`: silent until a key arrives,
-    /// up while keys flow without Alt, gone for good once one carries Alt.
+    /// The trigger end-to-end on a real `App`: silent until a swallowed-Alt
+    /// key arrives, unmoved by an ordinary keystroke, gone for good once a
+    /// real Alt chord gets through.
     #[test]
-    fn the_alt_warning_appears_on_the_first_alt_less_key_and_dies_on_the_first_alt() {
+    fn the_alt_warning_appears_on_swallowed_alt_evidence_and_dies_on_the_first_real_alt() {
         let (mut app, _) = mk_app(shell_ws());
         assert!(!app.show_alt_hint(), "nothing typed yet — nothing to warn about");
-        app.note_key_seen();
+        app.note_key_seen(key('n')); // plain 'n' — Alt was never involved
+        assert!(!app.show_alt_hint(), "an ordinary key is not evidence");
+        app.note_key_seen(key('˜')); // Option+n, swallowed — this is evidence
         assert!(app.show_alt_hint());
         app.note_alt_seen();
         assert!(!app.show_alt_hint(), "Alt got through — the warning is wrong now");
-        app.note_key_seen();
+        app.note_key_seen(key('˜'));
         assert!(!app.show_alt_hint(), "and it stays gone for the session");
+    }
+
+    /// F1 hard requirement 1 (exit UX audit 2026-08-07): a correctly
+    /// configured terminal must never see the warning just because the user
+    /// typed something — typing a shell prompt is the single most likely
+    /// first action on a fresh launch.
+    #[test]
+    fn healthy_terminal_typing_a_shell_prompt_never_fires_the_alt_hint() {
+        let (mut app, _) = mk_app(shell_ws());
+        for c in "ls -la && git status\r".chars() {
+            app.note_key_seen(key(c));
+        }
+        assert!(!app.show_alt_hint(), "ordinary typing must never look like a swallowed Alt chord");
+    }
+
+    /// F1 hard requirement 2 (exit UX audit 2026-08-07): a read-first user
+    /// who studies the screen for 40s before ever touching Alt must still
+    /// get the warning the moment their first (swallowed) Alt press arrives
+    /// — well past the old 8s startup window, which is why that gate is
+    /// gone rather than merely widened.
+    #[test]
+    fn read_first_user_still_gets_the_hint_however_late_the_first_alt_press_is() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.started -= Duration::from_secs(40);
+        assert!(!app.show_alt_hint(), "no evidence yet, however long it's been");
+        app.note_key_seen(key('˜')); // their first Alt press: Option+n, swallowed
+        assert!(app.show_alt_hint());
     }
 
     #[test]

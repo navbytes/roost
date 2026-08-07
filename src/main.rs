@@ -367,10 +367,10 @@ fn run(
             loop {
                 match crossterm::event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        // U4: every key is evidence roost is being typed at;
-                        // an Alt-modified one is evidence the Alt layer
-                        // survives the terminal. The warning bar needs both.
-                        app.note_key_seen();
+                        // F1 (exit UX audit 2026-08-07): note_key_seen looks
+                        // at the key itself now — evidence is a specific
+                        // swallowed-Alt character, not "a key arrived".
+                        app.note_key_seen(key);
                         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
                             app.note_alt_seen();
                         }
