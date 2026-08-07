@@ -2160,9 +2160,12 @@ you.**
     search reading and the simplest rule that doesn't special-case either
     filter. A group whose panes all fail *either* filter drops its header
     too, same as type-ahead-only always did. The active tier tags the frame
-    title with its own C5 glyph (`fleet — ◆ only`, or `fleet — ◆ clau▏` with
-    a query too) — the type-ahead's own "a narrowed list always says why"
-    idiom, extended to the second filter rather than given a competing one.
+    title with its own C5 glyph **and color** (`fleet — ◆ only`, or
+    `fleet — ◆ clau▏` with a query too — the `◆` alone carries `accent()`,
+    the rest of the title stays `ink()` [design-supervisor D4: a bare `ink()`
+    glyph reads as no tier at all, which defeats the tag]) — the type-ahead's
+    own "a narrowed list always says why" idiom, extended to the second
+    filter rather than given a competing one.
     `Tab`/`Shift+Tab` are not `Char`, so neither collides with type-ahead
     text (U20's rule: a list you filter by typing cannot reserve letters) —
     they are the two keys that were left over once every printable was
@@ -2254,6 +2257,12 @@ you.**
     `k` and `q` are filter text like every other letter, and `Esc` (plus the
     entry chord) is the way out. The hint bar advertises exactly that set, so
     nothing advertised is lost.
+    **[Amended 2026-08-07, ux P2-11, design-supervisor D3]** The set gains
+    `Tab`/`Shift+Tab`, the status filter's cycle (above) — not `Char`, so
+    they cost the type-ahead nothing (same reasoning U16/U20/U25/P21 each
+    recorded when their own mode grew a key: an unadvertised key is an
+    absent one). The hint bar's `Tab status` pair and the C15 overlay's
+    `FLEET` row both say so; nothing here is silent.
 - **Jump goes through `focus_attention_target`** — the helper C19's ring and
   C20's `Enter` already share — so tab-switching (`go_to_tab` semantics, lazy
   spawn, C21's zoom rule), collapsed-stack expansion and float-reveal all come
@@ -3013,7 +3022,7 @@ shows only the C9-curated subsets.
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
 | 9 | `Alt+f` | **floating scratch shell (toggle)** | C22 |
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
-| 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one** | C27 |
+| 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one. `Tab`/`Shift+Tab` inside it cycle a status filter** | C27 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
 | 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |

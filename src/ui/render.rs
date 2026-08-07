@@ -754,7 +754,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "FLEET",
         rows: &[
             ("Alt+a", "jump to the next pane that needs you"),
-            ("Alt+Shift+a", "roster: every pane, grouped by tab"),
+            ("Alt+Shift+a", "roster: every pane, grouped by tab · Tab filters by status"),
             ("Alt+e", "activity feed (status / spawns / exits / control)"),
         ],
     },
@@ -1007,19 +1007,36 @@ fn draw_mode_overlay<B: PaneBackend>(
             // The live query rides in the title, exactly as the picker's
             // does (U20): a list narrowed to two rows with an ordinary title
             // reads as a fleet that lost its panes. [Amended, ux P2-11] The
-            // status filter joins it as a glyph tag — the same one the
-            // narrowed rows themselves draw (`theme::status_style`), so a
-            // narrowed list always says *why* it is narrow, same as the type-
-            // ahead already did.
-            let tag = status_filter.map(|s| format!("{} ", theme::status_style(s).0));
-            let heading = match (tag, filter.is_empty()) {
-                (None, true) => " fleet ".to_string(),
-                (None, false) => format!(" fleet — {filter}{} ", theme::RENAME_CURSOR),
-                (Some(tag), true) => format!(" fleet — {tag}only "),
-                (Some(tag), false) => format!(" fleet — {tag}{filter}{} ", theme::RENAME_CURSOR),
-            };
+            // status filter joins it as a glyph tag, in that status's own C5
+            // glyph *and* color (design-supervisor D4: a bare `ink()` glyph
+            // read as no tier at all) — the same pairing the narrowed rows
+            // themselves draw (`theme::status_style`) — so a narrowed list
+            // always says *why* it is narrow, same as the type-ahead already
+            // did. `ink()` everywhere else: the tag is the one thing this
+            // title borrows color for.
+            let glyph_span = status_filter.map(|s| {
+                let (glyph, style, _) = theme::status_style(s);
+                Span::styled(glyph.to_string(), style)
+            });
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            match (glyph_span, filter.is_empty()) {
+                (None, true) => spans.push(Span::styled(" fleet ".to_string(), theme::ink())),
+                (None, false) => {
+                    spans.push(Span::styled(format!(" fleet — {filter}{} ", theme::RENAME_CURSOR), theme::ink()));
+                }
+                (Some(glyph), true) => {
+                    spans.push(Span::styled(" fleet — ".to_string(), theme::ink()));
+                    spans.push(glyph);
+                    spans.push(Span::styled(" only ".to_string(), theme::ink()));
+                }
+                (Some(glyph), false) => {
+                    spans.push(Span::styled(" fleet — ".to_string(), theme::ink()));
+                    spans.push(glyph);
+                    spans.push(Span::styled(format!(" {filter}{} ", theme::RENAME_CURSOR), theme::ink()));
+                }
+            }
             let block = Block::bordered()
-                .title(Line::from(Span::styled(heading, theme::ink())))
+                .title(Line::from(spans))
                 .border_type(BorderType::Plain)
                 .border_style(dialog_border_style());
             let inner = block.inner(rect);
@@ -3395,6 +3412,23 @@ mod tests {
             let mut app = three_panes();
             app.apply(action);
             out.push((name, snap(&mut app)));
+        }
+
+        // [design-supervisor, vacuous-gate] The "fleet roster" fixture above
+        // is unfiltered and all-tied (fresh three_panes()), so the §2 gates
+        // below never looked at a filtered title tag or a worst-first
+        // reorder — the two things ux P2-11 added. A mixed fleet with a
+        // status filter active exercises both: the ◆ pane (last in tab
+        // order) sorts first, and the title carries its own colored glyph.
+        {
+            use crate::core::status::AgentStatus;
+            use crate::ports::PaneBackend;
+            let mut app = three_panes();
+            let needy = app.pane_order()[2];
+            app.runtimes.get_mut(&needy).unwrap().set_extension_status(AgentStatus::NeedsInput);
+            app.apply(Action::ToggleRoster);
+            app.handle_mode_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab));
+            out.push(("fleet roster, filtered and reordered", snap(&mut app)));
         }
 
         let mut app = three_panes();
