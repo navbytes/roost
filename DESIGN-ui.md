@@ -2853,6 +2853,11 @@ the two share machinery it is called out below rather than duplicated —
   all. A content-tracking alternative would need the selection to pin a
   *snapshot* of the grid rather than read the live one, which nothing else
   in roost's selection model does and no part of this brief asked for.
+  **[Superseded 2026-08-08 — see the selection-freeze amendment below: "If
+  the pane's program prints new output while a drag is in progress" and "no
+  part of this brief asked for [a snapshot]" no longer hold for the gesture
+  window itself; everything else in this bullet (coordinates, not content;
+  the between-release-and-next-interaction case) still does.]**
 - **Mouse-capture cost.** The pre-existing blanket `EnableMouseCapture`
   requested five DEC private modes; roost now asks for exactly the three it
   uses — `mouse::MOUSE_CAPTURE_ENABLE`/`_DISABLE` (`mouse.rs:49–55`) drop
@@ -3153,42 +3158,106 @@ no freeze applies there, so a lingering post-release highlight can still
 visually drift if the pane prints before the next click or keypress,
 exactly as before.
 
+**[Amended 2026-08-08, design audit D1/D2 — the paragraph below originally
+described release as living entirely inside `handle_native_selection`
+(`Up` unfreezes unconditionally, a wheel tick drops it, the stale cap
+covers the rest). That was wrong: `handle_mouse` only ever calls
+`handle_native_selection` under several gates — `!collapsed`,
+`MouseProto::None`, `Mode::Normal`, the latched pane still resolving in
+`rects` — and copy mode or a modal owns the mouse outright before any of
+those gates are even reached. Five real paths (entering copy mode or a
+modal mid-drag; entering Scroll/Search mode; a tab switch or C31 cross-tab
+focus move; the pane collapsing; the pane's app enabling SGR mouse) each
+let the `Up` arrive without `handle_native_selection` ever running again,
+leaving the pane frozen with nothing to release it short of the 30s cap —
+a worse failure than the bug this contract fixes. Restated below.]**
+
 **Held and released, precisely:** `App::mouse_latch` (P20) is the
-gesture's lifetime — no second "gesture in progress" flag is introduced.
-Every `Down` inside `handle_native_selection` (`main.rs:817`) freezes the
-latched pane (`PaneBackend::freeze_view`) before touching `Selection`;
-every `Up` unfreezes it (`unfreeze_view`) unconditionally, whether or not a
-selection survived to be copied. Two things bound the freeze past an
-ordinary Down/Up bracket, both inside the same function: a wheel tick
-routed through the gesture's pane drops it immediately (scrolling and
-freezing disagree about whether the view may move — scrolling wins), and
-the frozen frame's own age is capped (`GESTURE_FREEZE_STALE_CAP`, checked
-lazily inside `presented()` exactly the way `SYNC_STALE_CAP` already is,
-generously past any real drag) so a lost `Up` — focus left the window, the
-terminal dropped the event — cannot freeze a pane forever. Torn beats
-frozen here too. A pane already scrolled into its own history when the
-gesture starts is left live, not frozen, for the identical reason
-`sync_presented` already defers to live there: `Screen::snapshot` always
-resets to the live tail (`vendor/vt100/src/grid.rs:49-53`), so freezing it
-would silently yank a history-reading user to the tail rather than protect
-anything — and banked rows are already immutable, so there is nothing
-moving under a scrolled-back drag to protect against in the first place.
+gesture's lifetime — no second "gesture in progress" flag is introduced,
+and release is tied to *that* lifetime everywhere it ends, not to
+`handle_native_selection` running again. Every `Down` inside
+`handle_native_selection` (`main.rs:882`) still freezes the latched pane
+(`PaneBackend::freeze_view`) before touching `Selection`. Release has
+exactly three sites, each covering a distinct way the latch's own life
+ends, funneling through `App::release_mouse_gesture` (clears the latch and
+unfreezes together) or the narrower `unfreeze_view` alone where the latch
+is already clear or unfreezing any earlier would race an in-flight
+extraction:
+- **The ordinary `Up`, resolved to a pane** — `handle_mouse` unfreezes it
+  unconditionally right after `handle_native_selection` returns, whether or
+  not that call actually ran. *After*, not before: a completing gesture's
+  own `grab_text` still has to read the frame it started on. This one call
+  is what covers Scroll/Search mode, an SGR flip and the pane collapsing —
+  none of those stop the pane from being *found*, only from being
+  *selected from*, so the release still runs even when the selection logic
+  doesn't.
+- **An orphan `Up`**, whose latched pane no longer resolves in
+  `rects`/`display_rects` (a tab switch, or C31 cross-tab focus, mid-drag —
+  both are active-tab-only): `release_mouse_gesture` fires the moment
+  `pane` comes back `None`, before anything downstream ever gets a chance
+  to try.
+- **Copy mode or a modal taking the mouse mid-drag**: both are early
+  returns at the very top of `handle_mouse`, ahead of the P20 latch code
+  entirely, so neither of the other two sites can ever run for that
+  gesture again. `release_mouse_gesture` fires there instead, on the first
+  mouse event `handle_mouse` processes once the mode changed — bounded by
+  the gesture's own eventual `Up` (the button is still physically held),
+  not by some later, unrelated event.
+
+`GESTURE_FREEZE_STALE_CAP` (checked lazily inside `presented()`, exactly
+the way `SYNC_STALE_CAP` already is) is now what it was always meant to be:
+a backstop for whatever none of the three sites above catches — a
+genuinely stuck `Up` — not the mechanism that makes release happen in the
+ordinary case. A resize mid-gesture (design audit D2) doesn't release
+cleanly, it invalidates: the frame is wrong at the OLD size, not merely
+stale, so `PtyPane::resize` clears `gesture_freeze` itself rather than
+waiting for any of the three sites above. And a pane already scrolled into
+its own history when the gesture starts is left live, not frozen, for the
+identical reason `sync_presented` already defers to live there:
+`Screen::snapshot` always resets to the live tail
+(`vendor/vt100/src/grid.rs:49-53`), so freezing it would silently yank a
+history-reading user to the tail rather than protect anything — and banked
+rows are already immutable, so there is nothing moving under a
+scrolled-back drag to protect against in the first place.
+
+**`roost read` sees live content, deliberately** (SPEC-parity P1 gap,
+closed in the same design audit): a control client polling a pane is not
+the human the freeze protects. `ReadMode::Screen` (`core::app::ctl_read`)
+now calls the new `PaneBackend::read_screen_text` instead of `grab_text` —
+identical coordinates, and it still honors the P1 sync-output veneer (a
+torn mid-redraw frame is wrong for both consumers), but it reads
+`PtyPane::presented_live` — `presented()`'s `sync_presented` half, minus
+the gesture-freeze check — rather than `presented`. `grab_text` itself is
+untouched: copy-mode and native-selection extraction still go through the
+frozen `presented()`, exactly as the rest of this contract requires.
 
 **Must-not-break, reconfirmed:** an SGR pane never reaches
-`handle_native_selection`, so it is never frozen — the freeze calls live
-nowhere else. Copy mode's `handle_copy_mouse`, the seam-drag path, and
-wheel routing for every *other* pane are untouched (this amendment adds no
-call outside `handle_native_selection`). Double-click word, triple-click
-line and shift-click-extend all read through the same frozen
-`grab_text`/`row_text` path a plain drag does, since the freeze arms before
-any of them run — one freeze, not a special case per gesture shape. Pinned
-by `main.rs::tests::output_banked_mid_drag_does_not_change_what_release_copies`
-(the mutation pin — fails without the freeze, by construction) and
-`a_wheel_tick_mid_drag_drops_the_freeze`; the staleness cap by
-`infra::pty::tests::a_lost_mouse_up_does_not_freeze_the_pane_forever`. Every
-pre-existing C29 and `PendingCopy` test passes unmodified — none of them
-mutate a pane's content mid-gesture, so a frozen read and a live one were
-already indistinguishable to them.
+`handle_native_selection`, so it is never frozen. Copy mode's
+`handle_copy_mouse`, the seam-drag path, and wheel routing for every
+*other* pane are untouched — `release_mouse_gesture`'s two extra call
+sites sit in `handle_mouse` itself, immediately ahead of
+`handle_copy_mouse`/`handle_modal_mouse`, and touch neither function's own
+body. Double-click word, triple-click line and shift-click-extend all read
+through the same frozen `grab_text`/`row_text` path a plain drag does,
+since the freeze arms before any of them run — one freeze, not a special
+case per gesture shape.
+
+**Tests, current as of the design audit:** the mutation pin,
+`main.rs::tests::output_banked_mid_drag_does_not_change_what_release_copies`
+(fails without the freeze, by construction); the wheel-drop,
+`a_wheel_tick_mid_drag_drops_the_freeze`; the staleness cap,
+`infra::pty::tests::a_lost_mouse_up_does_not_freeze_the_pane_forever`; the
+five D1 abandonment paths, each mutation-checked against the specific
+release site it pins — `main.rs::tests::entering_copy_mode_mid_drag_releases_the_freeze`,
+`entering_scroll_mode_mid_drag_releases_the_freeze`,
+`a_tab_switch_mid_drag_releases_the_freeze`,
+`a_pane_collapsing_mid_drag_releases_the_freeze`,
+`an_sgr_flip_mid_drag_releases_the_freeze`; D2's
+`infra::pty::tests::a_resize_mid_gesture_drops_the_freeze`; and the read
+bypass, `main.rs::tests::roost_read_screen_mode_bypasses_the_gesture_freeze`.
+Every pre-existing C29 and `PendingCopy` test passes unmodified — none of
+them mutate a pane's content mid-gesture, so a frozen read and a live one
+were already indistinguishable to them.
 
 ---
 

@@ -440,16 +440,27 @@ pub struct PtyPane {
     /// 2026) open, the last frame it declared complete — captured by the
     /// parser at the exact stream position of the `?2026h` — plus when the
     /// bracket opened (for `SYNC_STALE_CAP`). This is what `screen()` and
-    /// `grab_text` present: the app asked for its in-progress redraw not to
-    /// be shown, and a half-drawn grid is exactly what P1 measured leaking
-    /// into both the TUI and `roost read`.
+    /// `grab_text` present by default: the app asked for its in-progress
+    /// redraw not to be shown, and a half-drawn grid is exactly what P1
+    /// measured leaking into both the TUI and `roost read`.
     ///
     /// Deliberately NOT consulted by scroll state (`scroll_offset`/
     /// `scroll_total`/`set_scrollback`/`scroll_by`), full-history reads
     /// (`grab_all_text`), or the input-mode accessors: those answer for the
-    /// live grid, which stays the single source of truth. The snapshot is a
+    /// live grid, which stays the single source of truth.
+    ///
+    /// **[Amended, C29 selection-freeze amendment]** "The snapshot is a
     /// ≤150 ms presentation veneer over the visible frame, not a second
-    /// terminal state.
+    /// terminal state" no longer describes the whole picture: `presented()`
+    /// now has a second tenant, `gesture_freeze`, which wins ahead of this
+    /// one and can legitimately outlive it by 200× (`GESTURE_FREEZE_STALE_CAP`
+    /// vs `SYNC_STALE_CAP`) — see that field's own doc. Still true of *this*
+    /// field alone: still ≤150 ms, still not a second terminal state, still
+    /// what `screen()`/`grab_text` present absent a gesture. What's no
+    /// longer true: `roost read`'s screen mode is **not** a `grab_text`
+    /// consumer any more — `read_screen_text` reads through this veneer
+    /// (unchanged) but deliberately skips `gesture_freeze` (a control
+    /// client polling a pane is not the human dragging a mouse over it).
     sync_view: Option<(vt100::Screen, Instant)>,
     /// C29 (selection-freeze amendment): the frame `presented()` was
     /// showing at a native-selection gesture's `Down`, held through `Up` —
@@ -489,21 +500,35 @@ impl PtyPane {
     /// frame while a synchronized-output bracket is open (and fresh), else
     /// the live grid. Every surface that shows the user what the pane looks
     /// like right now goes through here: `screen()` (blit + host cursor) and
-    /// `grab_text` (copy-mode selection, `roost read`'s screen mode — the
-    /// surface P1 measured 31/50 torn samples on). History and state
-    /// surfaces deliberately do not; see `sync_view`.
+    /// `grab_text` (copy-mode selection, native selection — the surface P1
+    /// measured 31/50 torn samples on). History and state surfaces
+    /// deliberately do not; see `sync_view`.
     ///
     /// C29 (selection-freeze amendment): a native-selection gesture's own
     /// frozen frame (`gesture_freeze`) takes priority over the sync-output
     /// veneer — one presentation path, checked in one place, so `screen()`
     /// and `grab_text` can never disagree about what the user is looking
-    /// at. Falls through to the unchanged `sync_presented` rule the instant
-    /// there is no gesture, or it has gone stale, or the pane is scrolled
-    /// into history (`gesture_presented`'s own doc).
+    /// at. Falls through to `presented_live` (the unchanged `sync_presented`
+    /// rule) the instant there is no gesture, or it has gone stale, or the
+    /// pane is scrolled into history (`gesture_presented`'s own doc).
     fn presented(&self) -> &vt100::Screen {
         let live = self.parser.screen();
         gesture_presented(live, self.gesture_freeze.as_ref(), GESTURE_FREEZE_STALE_CAP)
-            .unwrap_or_else(|| sync_presented(live, self.sync_view.as_ref(), sync_stale_cap()))
+            .unwrap_or_else(|| self.presented_live())
+    }
+
+    /// SPEC-parity P1 gap (selection-freeze amendment): `presented()` minus
+    /// the gesture freeze — the sync-output veneer still applies (a torn
+    /// mid-redraw frame is wrong for every consumer), but a native-selection
+    /// gesture's frozen frame never does. Backs `read_screen_text`: `roost
+    /// read` is a control client, not the human whose mouse drag this is
+    /// protecting, and must see live content while one is in progress.
+    fn presented_live(&self) -> &vt100::Screen {
+        sync_presented(
+            self.parser.screen(),
+            self.sync_view.as_ref(),
+            sync_stale_cap(),
+        )
     }
 
     /// W3: turn one parser effect into roost-side consequences — attention
@@ -882,6 +907,14 @@ impl PaneBackend for PtyPane {
         // [P14] Nothing to re-read: every reader of the offset asks the grid,
         // so the reflowed value is already the answer they get.
         self.parser.set_size(rows, cols);
+        // D2 (selection-freeze design audit): a resize mid-gesture leaves
+        // the frozen frame at the OLD size while `grab_text` would go on
+        // extracting from it against the NEW grid's rect/coordinates for
+        // the rest of the gesture — wrong cells, silently. There is no
+        // correct way to keep the freeze through a resize (the frame itself
+        // is invalidated, not just stale), so drop it; `presented()` falls
+        // back to live, exactly like a gesture that never started.
+        self.gesture_freeze = None;
     }
 
     fn hangup(&mut self) {
@@ -1061,10 +1094,20 @@ impl PaneBackend for PtyPane {
     }
 
     /// P1: reads the *presented* frame, not the live grid — this is what the
-    /// user sees (copy-mode selection) and what `roost read` reports for the
-    /// visible screen, the exact surface P1 measured mid-bracket tearing on.
+    /// user sees, the exact surface P1 measured mid-bracket tearing on.
+    /// Copy-mode and native-selection extraction only; `roost read`'s
+    /// screen mode uses `read_screen_text` instead (SPEC-parity P1 gap,
+    /// selection-freeze amendment) so a control client is never handed a
+    /// mouse gesture's frozen frame.
     fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
         extract_selection(self.presented(), start, end)
+    }
+
+    /// SPEC-parity P1 gap (selection-freeze amendment): `roost read`'s
+    /// screen mode — `presented_live`, not `presented`, so a native-
+    /// selection gesture in progress never reaches a control client.
+    fn read_screen_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        extract_selection(self.presented_live(), start, end)
     }
 
     /// P1 (the other side of the split): the full history read stays on the
@@ -1635,5 +1678,36 @@ mod tests {
             full.len() > outer.len() && full.starts_with(&outer),
             "{{:#}} must carry the real cause {{}} drops on the floor: {full:?}"
         );
+    }
+
+    /// D2 (selection-freeze design audit): a resize mid-gesture must drop
+    /// the freeze outright — the frozen frame is invalidated at the OLD
+    /// size, and `grab_text` would go on extracting from it against the
+    /// NEW grid's coordinates for the rest of the gesture. There is no
+    /// correct way to keep a frame through a resize, so `resize` clears it,
+    /// same as a gesture that never started.
+    #[test]
+    fn a_resize_mid_gesture_drops_the_freeze() {
+        use crate::agents::CommandSpec;
+        use crate::core::event::AppEvent;
+        use crate::ports::PaneBackend;
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<AppEvent>(8);
+        let spec = CommandSpec::new("sh", &std::env::temp_dir());
+        let mut pt = super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx).expect("sh must spawn");
+
+        pt.freeze_view();
+        assert!(
+            pt.gesture_freeze.is_some(),
+            "setup: the freeze must be armed"
+        );
+
+        pt.resize(30, 100, (0, 0));
+        assert!(
+            pt.gesture_freeze.is_none(),
+            "a resize mid-gesture must drop the freeze"
+        );
+
+        pt.kill();
     }
 }

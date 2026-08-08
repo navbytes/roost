@@ -636,6 +636,13 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
 
     // Copy mode owns the mouse: drag selects text, release copies.
     if app.in_copy_mode() {
+        // Selection-freeze design audit D1: copy mode can be entered
+        // mid-drag (a keypress interleaves with the still-held button) and
+        // this early return means a Normal-mode gesture's Up never reaches
+        // the P20 latch code below at all — nothing else will ever release
+        // it. `release_mouse_gesture` is a no-op when nothing is latched,
+        // so this costs nothing on every other copy-mode mouse event.
+        app.release_mouse_gesture();
         handle_copy_mouse(app, me);
         return;
     }
@@ -646,6 +653,11 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
     // under an overlay. `modal_rect` hands over the dialog's *drawn* rect
     // so the hit-test matches what's on screen.
     if app.modal_active() {
+        // Selection-freeze design audit D1: same reasoning as copy mode
+        // above — a modal opened mid-drag (RenamePane, QuickLaunch, Help,
+        // ToggleFeed, ToggleRoster) swallows every further mouse event for
+        // this pane too.
+        app.release_mouse_gesture();
         let dialog = ui::render::modal_rect(app);
         app.handle_modal_mouse(me, dialog);
         return;
@@ -728,10 +740,22 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         // Wheel and bare motion aren't part of a button gesture.
         _ => mouse::hit_test(&rects, me.column, me.row),
     };
+    let Some(pane) = pane else {
+        // Selection-freeze design audit D1: an Up whose latched pane no
+        // longer resolves in `rects` — a tab switch or C31 cross-tab focus
+        // move mid-drag, `rects`/`display_rects` are active-tab-only — is
+        // an orphan release. Nothing past this point will ever see it, so
+        // release here: there is no extraction to protect (that only
+        // happens once `pane` resolves below), so it's safe to clear the
+        // latch and unfreeze together.
+        if matches!(me.kind, MouseEventKind::Up(_)) {
+            app.release_mouse_gesture();
+        }
+        return;
+    };
     if matches!(me.kind, MouseEventKind::Up(_)) {
         app.set_mouse_latch(None); // the gesture ends here, whatever it hit
     }
-    let Some(pane) = pane else { return };
 
     // Alt+click a URL to open it in the browser (roost owns the Alt layer).
     if matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
@@ -795,6 +819,18 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         handle_native_selection(app, &pane, &me);
     }
 
+    // Selection-freeze design audit D1: `pane` unfreezes on every Up that
+    // reaches this point, whether or not the gate above let
+    // `handle_native_selection` run — Scroll/Search mode, an SGR flip, or
+    // the pane collapsing mid-drag all fail it but must not leave the pane
+    // frozen just because none of those conditions held any more. Runs
+    // *after* `handle_native_selection`'s own Up arm, so a completing
+    // gesture's `grab_text` still read the frozen frame it started on
+    // before this drops it — extraction, then release, never the other way.
+    if matches!(me.kind, MouseEventKind::Up(_)) {
+        unfreeze_native_selection(app, pane.id);
+    }
+
     match mouse::route_mouse(state, &pane, &me) {
         MouseAction::Forward(bytes) => app.forward_mouse(pane.id, &bytes),
         MouseAction::Scroll(delta) => app.wheel_scroll(pane.id, delta),
@@ -821,13 +857,28 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
 /// touching `Selection`, so double/triple-click's own word/line lookups
 /// and every later `Drag`/`Up` in this gesture read the identical still
 /// frame — one freeze, armed once, not a special case per gesture shape.
-/// `Up` unfreezes unconditionally (the gesture is over whether or not a
-/// selection survived to be copied); a wheel tick mid-drag drops it too,
-/// since scrolling and freezing disagree about whether the view may move.
-/// The P20 latch (`handle_mouse`) is the freeze's lifetime — `pane` here is
-/// always the latch-resolved pane for `Down`/`Drag`/`Up` — and
-/// `GESTURE_FREEZE_STALE_CAP` (`infra::pty`) bounds a lost `Up` so a
-/// vanished gesture can never freeze a pane forever.
+/// A wheel tick mid-drag drops it immediately (handled below), since
+/// scrolling and freezing disagree about whether the view may move.
+///
+/// **[Amended, design audit D1]** Release is deliberately NOT this
+/// function's job for the ordinary Up (see that arm's own doc) — the
+/// freeze's lifetime is the P20 latch's lifetime (`App::mouse_latch`), and
+/// the latch is cleared in exactly one place regardless of mode, protocol
+/// or collapse state (`handle_mouse`), so that's also where the unfreeze
+/// lives: an unconditional call right after this function returns for a
+/// resolved `pane`, plus two more call sites in `handle_mouse` for the
+/// gestures this function never even gets a chance to see the Up of —
+/// copy mode or a modal taking the mouse mid-drag (`App::release_mouse_gesture`,
+/// which also covers an orphan Up whose latched pane no longer resolves in
+/// `rects`: a tab switch or C31 cross-tab focus move). Before this, the
+/// freeze only ever released from *inside* this function, which
+/// `handle_mouse` only reaches under several gates (`!collapsed`,
+/// `MouseProto::None`, `Mode::Normal`, the pane found in `rects`) — every
+/// one of them a way to leave a pane frozen with no release in sight.
+/// `GESTURE_FREEZE_STALE_CAP` (`infra::pty`) remains a pure backstop for a
+/// gesture that is neither released nor abandoned through any of those
+/// paths — a genuinely stuck `Up` — not the mechanism that makes release
+/// happen in the first place.
 fn handle_native_selection<B: PaneBackend>(
     app: &mut App<B>,
     pane: &PaneRect,
@@ -867,16 +918,22 @@ fn handle_native_selection<B: PaneBackend>(
             // doc. Highlight intentionally left showing on a commit: the
             // contract says it stays lit until the next click
             // (`App::on_click`) or keypress (`App::handle_mode_key`).
+            //
+            // Selection-freeze design audit D1: the freeze is deliberately
+            // NOT dropped here — `handle_mouse`'s own unconditional
+            // post-dispatch unfreeze (right after this function returns)
+            // is the one release site for a resolved `pane`'s Up, so every
+            // abandonment path (Scroll mode, an SGR flip, a collapse) that
+            // skips this whole function still releases it the same way a
+            // clean release does. Extraction above still reads the frozen
+            // frame either way — that unfreeze can only run after this
+            // function has already returned.
             if app.selection.is_some_and(|s| s.pane == pane.id) {
                 if let Some(text) = app.release_native_selection() {
                     let outcome = infra::clipboard::copy(&text); // U14
                     app.flash_copy(text.chars().count(), outcome);
                 }
             }
-            // Selection-freeze amendment: the gesture ends here regardless
-            // of whether a selection survived to be copied — `pane` is the
-            // P20-latched pane this `Up` belongs to (`handle_mouse`).
-            unfreeze_native_selection(app, pane.id);
         }
         // Selection-freeze amendment: a wheel tick mid-drag means the view
         // is about to move on purpose — drop the freeze rather than define
@@ -1628,6 +1685,186 @@ mod tests {
             app.flash(),
             Some("copied 12 chars"),
             "the wheel tick dropped the freeze, so release reads the pane live again"
+        );
+    }
+
+    // ---- Selection-freeze design audit D1: release must not depend on --
+    // ---- handle_native_selection ever running again ---------------------
+    //
+    // Each of the five tests below drives a real Down/Drag, changes
+    // something that stops `handle_native_selection` from ever seeing this
+    // gesture's `Up` again, mutates the pane's content, and asserts a
+    // *direct* `grab_text` read is already live — proving the freeze
+    // released at the abandonment point, not merely that some later event
+    // happened to clean it up.
+
+    /// D1: copy mode can be entered mid-drag (a keypress interleaves with
+    /// the still-held button) — its early return in `handle_mouse` means a
+    /// Normal-mode gesture's `Up` never reaches the P20 latch code again.
+    #[test]
+    fn entering_copy_mode_mid_drag_releases_the_freeze() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+
+        app.apply(Action::CopyMode);
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+        // The button is still physically held — further events keep
+        // arriving, now swallowed by copy mode's own mouse handling.
+        handle_mouse(&mut app, drag(r.x + 8, r.y + 1));
+
+        assert_eq!(
+            app.runtimes.get(&id).unwrap().grab_text((0, 0), (0, 0)),
+            "mutated text",
+            "entering copy mode mid-drag must release the freeze"
+        );
+    }
+
+    /// D1: Scroll mode fails `handle_native_selection`'s own `Mode::Normal`
+    /// gate (D1/PR #46), so the pane's `Up` reaches `handle_mouse` but never
+    /// reaches that function again.
+    #[test]
+    fn entering_scroll_mode_mid_drag_releases_the_freeze() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+
+        app.apply(Action::ScrollMode);
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+
+        assert_eq!(
+            app.runtimes.get(&id).unwrap().grab_text((0, 0), (0, 0)),
+            "mutated text",
+            "entering scroll mode mid-drag must release the freeze"
+        );
+    }
+
+    /// D1: `rects`/`display_rects` are active-tab-only, so a tab switch
+    /// mid-drag makes the latched pane an orphan — the `Up` arrives but
+    /// `pane` resolves to `None` before `handle_native_selection` ever runs.
+    #[test]
+    fn a_tab_switch_mid_drag_releases_the_freeze() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+
+        app.apply(Action::NewTab); // switches to a fresh tab; `id` is left behind
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+
+        assert_eq!(
+            app.runtimes.get(&id).unwrap().grab_text((0, 0), (0, 0)),
+            "mutated text",
+            "a tab switch mid-drag must release the freeze on the pane left behind"
+        );
+    }
+
+    /// D1: a pane collapsing mid-drag (its stack-mate gets expanded instead)
+    /// fails `handle_native_selection`'s `!collapsed` gate on release.
+    #[test]
+    fn a_pane_collapsing_mid_drag_releases_the_freeze() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        app.apply(Action::ToggleStack); // stacks them: focused (2) expands, 1 collapses
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app
+            .display_rects()
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+
+        let other = app.pane_order().into_iter().find(|&p| p != id).unwrap();
+        app.on_click(other); // expands `other`, collapsing `id` mid-drag
+        assert!(
+            app.display_rects()
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .collapsed,
+            "setup: id must now be the collapsed member"
+        );
+
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+
+        assert_eq!(
+            app.runtimes.get(&id).unwrap().grab_text((0, 0), (0, 0)),
+            "mutated text",
+            "a pane collapsing mid-drag must release the freeze"
+        );
+    }
+
+    /// D1: the pane's own app enabling SGR mouse reporting mid-gesture fails
+    /// `handle_native_selection`'s `MouseProto::None` gate on release.
+    #[test]
+    fn an_sgr_flip_mid_drag_releases_the_freeze() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+
+        app.runtimes.get_mut(&id).unwrap().proto = ports::MouseProto::Sgr;
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+
+        assert_eq!(
+            app.runtimes.get(&id).unwrap().grab_text((0, 0), (0, 0)),
+            "mutated text",
+            "an SGR flip mid-drag must release the freeze"
+        );
+    }
+
+    /// SPEC-parity P1 gap (selection-freeze amendment): `roost read`'s
+    /// screen mode is a different consumer than the human whose drag the
+    /// freeze protects — it must see live content even mid-gesture.
+    #[test]
+    fn roost_read_screen_mode_bypasses_the_gesture_freeze() {
+        use crate::core::control::{Method, ReadMode, Reply, Request};
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1)); // freeze armed, gesture still open
+
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+        let token = app.control_token();
+        let reply = app.handle_control(Request {
+            token,
+            method: Method::Read {
+                pane: id,
+                mode: ReadMode::Screen,
+            },
+        });
+        let text = match reply {
+            Reply::Ok { ok } => ok["text"].as_str().unwrap().to_string(),
+            Reply::Err { err } => panic!("expected ok, got err: {err}"),
+        };
+        assert_eq!(
+            text, "mutated text",
+            "roost read must see live content, not the drag's frozen frame"
         );
     }
 

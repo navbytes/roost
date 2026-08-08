@@ -261,6 +261,20 @@ pub trait PaneBackend: Sized {
     /// on a stale gesture, and on a wheel tick mid-drag (see
     /// `handle_native_selection`). Default no-op, paired with `freeze_view`.
     fn unfreeze_view(&mut self) {}
+
+    /// Selection-freeze amendment (SPEC-parity P1 gap): the visible screen
+    /// for `roost read`'s screen mode — same coordinates as `grab_text`,
+    /// but deliberately LIVE even mid-gesture. A control client polling a
+    /// pane is a different consumer than the human dragging a mouse over
+    /// it; freezing the TUI's own view must not also freeze what an
+    /// orchestrating agent reads. Bypasses only the gesture freeze — the
+    /// P1 sync-output veneer still applies, exactly as it does for
+    /// `grab_text` (a torn mid-redraw frame is wrong for both consumers).
+    /// Default: same as `grab_text`, for backends with no gesture freeze to
+    /// bypass in the first place.
+    fn read_screen_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        self.grab_text(start, end)
+    }
 }
 
 /// Workspace persistence. Implemented by `infra::store::FsStore`.
@@ -502,6 +516,17 @@ pub mod fakes {
         }
         fn unfreeze_view(&mut self) {
             self.frozen = None;
+        }
+        /// Deliberately reads the LIVE `grab`/`rows` fields, bypassing
+        /// `self.frozen` — mirrors the real backend's `read_screen_text`
+        /// (`roost read`'s screen mode must never see a mouse-drag's
+        /// frozen frame).
+        fn read_screen_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+            if !self.rows.is_empty() && start.0 == end.0 {
+                let row = self.rows.get(start.0 as usize).cloned().unwrap_or_default();
+                return slice_cells(&row, start.1 as usize, end.1 as usize);
+            }
+            self.grab.clone()
         }
     }
 

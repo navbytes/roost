@@ -922,6 +922,28 @@ impl<B: PaneBackend> App<B> {
         self.mouse_latch = id;
     }
 
+    /// Selection-freeze amendment (C29, design-audit D1): clear the latch
+    /// AND drop whatever pane it held frozen, atomically — the freeze's
+    /// lifetime is the latch's lifetime, so releasing one without the other
+    /// is exactly the leak this closes. A no-op when nothing is latched, so
+    /// it is safe to call from anywhere a gesture might be ending, whether
+    /// or not one is actually in flight: copy mode or a modal taking over
+    /// the mouse mid-drag (`handle_mouse`'s two early returns), or an
+    /// orphan release whose latched pane no longer resolves in `rects`
+    /// (tab switch, C31 cross-tab focus). Deliberately NOT used for the
+    /// ordinary in-pane release — that one must unfreeze *after*
+    /// `release_native_selection` has extracted the selection through the
+    /// still-frozen view, not before (`handle_native_selection`'s own Up
+    /// arm, and `handle_mouse`'s unconditional post-dispatch unfreeze,
+    /// cover that ordering).
+    pub fn release_mouse_gesture(&mut self) {
+        if let Some(id) = self.mouse_latch.take() {
+            if let Some(rt) = self.runtimes.get_mut(&id) {
+                rt.unfreeze_view();
+            }
+        }
+    }
+
     /// U21: a left press landed on the seam between two panes — start a
     /// resize gesture instead of the usual focus-and-forward. Returns
     /// whether one started, so the caller can stop routing this press.
@@ -2022,7 +2044,13 @@ impl<B: PaneBackend> App<B> {
         let text = match mode {
             // grab_text clamps to the screen, so (0,0)..MAX is the whole
             // visible grid — deliberately bounded, unlike Full/Tail below.
-            ReadMode::Screen => rt.grab_text((0, 0), (u16::MAX, u16::MAX)),
+            // Selection-freeze amendment (SPEC-parity P1 gap): `read_screen_text`,
+            // not `grab_text` — a control client is a different consumer
+            // than the human dragging a mouse over the TUI, and must not
+            // see that human's frozen frame. Still honors the P1
+            // sync-output veneer (a torn mid-redraw frame is wrong for
+            // both consumers alike); it bypasses only the gesture freeze.
+            ReadMode::Screen => rt.read_screen_text((0, 0), (u16::MAX, u16::MAX)),
             ReadMode::Full => rt.grab_all_text(),
             ReadMode::Tail(n) => {
                 let full = rt.grab_all_text();
