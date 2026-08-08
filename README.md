@@ -347,7 +347,10 @@ Status arrives two ways:
      `agent_start`/`agent_settled`/`session_start`/`project_trust`/ask-tool
      events (pi ≥ 0.80.4), reports session ids instantly — and when an
      ask-tool fires, sends the question itself, so the feed line and
-     notification say what's being asked.
+     notification say what's being asked. A turn that *ends* on a prose
+     question ("Which database should I use?") is reported as needs-you
+     too, question attached — heuristic (trailing `?` on the final line),
+     self-healing, and self-explanatory since the text rides along.
    - Claude Code: roost installs/updates three hooks into
      `~/.claude/settings.json` automatically at startup when Claude Code is
      present (same `ROOST_NO_EXT_INSTALL` opt-out). The needs-you hook
