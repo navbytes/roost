@@ -85,6 +85,17 @@ modes, and `read --full`/`--tail` stay on the live grid: the snapshot is a
 carries no scrollback at all, which is also why a scrolled-back pane ignores
 it — U3's frozen view wins).
 
+*Amended 2026-08-08 (C29 selection freeze):* the presentation view now has a
+second tenant. A native-selection drag holds its own snapshot for the length
+of the gesture — far longer than 150 ms, and it wins ahead of this veneer —
+so that the highlight and the copied text agree on a pane whose output is
+still moving. It carries no scrollback either, and the same U3 rule applies.
+One consumer is deliberately exempted: `roost read`'s screen mode reads
+through the gesture freeze to the live frame, because a control client
+polling a pane must not receive a stale one because a human is dragging a
+mouse. The full rule, its three release sites, and the resize invalidation
+live in DESIGN-ui.md C29.
+
 ### P2 · FIXED (this branch) · High — OSC 9 / 9;4 / 777 notifications vanish (and don't count as attention)
 *Fixed: the vendored parser turns OSC 9 (`9;body`) and OSC 777
 (`777;notify;title;body`) into `Effect::Notify`; `PtyPane` puts each one on
