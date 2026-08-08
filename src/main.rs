@@ -30,6 +30,7 @@ use crate::core::app::{App, Mode};
 use crate::core::control::TokenTable;
 use crate::core::event::AppEvent;
 use crate::core::layout::PaneRect;
+use crate::core::workspace::PaneId;
 use crate::infra::notify::TermNotifier;
 use crate::infra::pty::PtyPane;
 use crate::infra::store::FsStore;
@@ -814,6 +815,19 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
 /// standard 500ms double-click window, `DOUBLE_CLICK_INTERVAL`) and a
 /// 1-cell position tolerance (`CLICK_TOLERANCE`) — a real press drifts a
 /// pixel even when the user means the same character.
+///
+/// Selection-freeze amendment (C29, DESIGN-ui.md): every `Down` below
+/// freezes the pane's presented view (`PaneBackend::freeze_view`) *before*
+/// touching `Selection`, so double/triple-click's own word/line lookups
+/// and every later `Drag`/`Up` in this gesture read the identical still
+/// frame — one freeze, armed once, not a special case per gesture shape.
+/// `Up` unfreezes unconditionally (the gesture is over whether or not a
+/// selection survived to be copied); a wheel tick mid-drag drops it too,
+/// since scrolling and freezing disagree about whether the view may move.
+/// The P20 latch (`handle_mouse`) is the freeze's lifetime — `pane` here is
+/// always the latch-resolved pane for `Down`/`Drag`/`Up` — and
+/// `GESTURE_FREEZE_STALE_CAP` (`infra::pty`) bounds a lost `Up` so a
+/// vanished gesture can never freeze a pane forever.
 fn handle_native_selection<B: PaneBackend>(
     app: &mut App<B>,
     pane: &PaneRect,
@@ -823,13 +837,17 @@ fn handle_native_selection<B: PaneBackend>(
     let (r, c) = inner_cell(pane.rect, me.column, me.row);
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) if me.modifiers.contains(KeyModifiers::SHIFT) => {
+            freeze_native_selection(app, pane.id);
             app.extend_selection_to(pane.id, r, c);
         }
-        MouseEventKind::Down(MouseButton::Left) => match app.click_count(pane.id, r, c) {
-            2 => app.select_word_at(pane.id, r, c),
-            3 => app.select_line_at(pane.id, r),
-            _ => app.begin_selection(pane.id, r, c),
-        },
+        MouseEventKind::Down(MouseButton::Left) => {
+            freeze_native_selection(app, pane.id);
+            match app.click_count(pane.id, r, c) {
+                2 => app.select_word_at(pane.id, r, c),
+                3 => app.select_line_at(pane.id, r),
+                _ => app.begin_selection(pane.id, r, c),
+            }
+        }
         // S3 (PR #46 code review): only ever touch a selection that
         // belongs to *this* gesture's pane. The Alt+click-URL branch above
         // latches a new pane and can `return` before `on_click` gets a
@@ -842,21 +860,48 @@ fn handle_native_selection<B: PaneBackend>(
         {
             app.extend_selection(r, c);
         }
-        MouseEventKind::Up(MouseButton::Left)
-            if app.selection.is_some_and(|s| s.pane == pane.id) =>
-        {
+        MouseEventKind::Up(MouseButton::Left) => {
             // release_native_selection (D3/S4, PR #46) owns the "did this
             // gesture actually select anything" and "should this commit
             // now or wait for a possible 3rd click" decisions — see its
             // doc. Highlight intentionally left showing on a commit: the
             // contract says it stays lit until the next click
             // (`App::on_click`) or keypress (`App::handle_mode_key`).
-            if let Some(text) = app.release_native_selection() {
-                let outcome = infra::clipboard::copy(&text); // U14
-                app.flash_copy(text.chars().count(), outcome);
+            if app.selection.is_some_and(|s| s.pane == pane.id) {
+                if let Some(text) = app.release_native_selection() {
+                    let outcome = infra::clipboard::copy(&text); // U14
+                    app.flash_copy(text.chars().count(), outcome);
+                }
             }
+            // Selection-freeze amendment: the gesture ends here regardless
+            // of whether a selection survived to be copied — `pane` is the
+            // P20-latched pane this `Up` belongs to (`handle_mouse`).
+            unfreeze_native_selection(app, pane.id);
+        }
+        // Selection-freeze amendment: a wheel tick mid-drag means the view
+        // is about to move on purpose — drop the freeze rather than define
+        // what a frozen pane scrolling would even mean.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            unfreeze_native_selection(app, pane.id);
         }
         _ => {}
+    }
+}
+
+/// Selection-freeze amendment (C29): arm the presentation freeze for `id`
+/// at the start of a native-selection gesture. A no-op if the pane has
+/// since exited.
+fn freeze_native_selection<B: PaneBackend>(app: &mut App<B>, id: PaneId) {
+    if let Some(rt) = app.runtimes.get_mut(&id) {
+        rt.freeze_view();
+    }
+}
+
+/// Selection-freeze amendment (C29): release it — the gesture's `Up`, a
+/// wheel tick mid-drag, or (lazily, inside `presented()`) staleness.
+fn unfreeze_native_selection<B: PaneBackend>(app: &mut App<B>, id: PaneId) {
+    if let Some(rt) = app.runtimes.get_mut(&id) {
+        rt.unfreeze_view();
     }
 }
 
@@ -1528,6 +1573,62 @@ mod tests {
         assert!(app.selection.is_some(), "the highlight stays lit after release");
         assert_eq!(app.flash(), Some("copied 12 chars"));
         assert_eq!(app.mouse_latch(), None, "the release still ends the P20 gesture");
+    }
+
+    /// Selection-freeze amendment (C29, DESIGN-ui.md): the pin. Output
+    /// banked mid-drag — a shell, a build, `tail -f`, exactly the class the
+    /// freeze exists for — must not change what release copies. Without
+    /// `freeze_view`/`unfreeze_view` wired into the Down/Up arms of
+    /// `handle_native_selection`, this fails: `FakePane::grab_text` reads
+    /// `self.grab` live, so the release would copy "mutated text" (12
+    /// chars) instead of the "original text" (13 chars) the drag actually
+    /// highlighted — confirmed by mutating this test (commenting out the
+    /// two `freeze`/`unfreeze` calls) and re-running it, which reproduces
+    /// exactly that failure.
+    #[test]
+    fn output_banked_mid_drag_does_not_change_what_release_copies() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+        // The pane prints while the gesture is still in flight — banked
+        // mid-drag, same as a shell scrolling under an in-progress select.
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+        assert_eq!(
+            app.flash(),
+            Some("copied 13 chars"),
+            "release must copy what was highlighted at drag time (\"original text\"), \
+             not what the pane now shows"
+        );
+    }
+
+    /// Selection-freeze amendment: a wheel tick mid-drag drops the freeze —
+    /// scrolling and freezing disagree about whether the view may move, so
+    /// the freeze loses. Proven the same way as the mutation pin above, but
+    /// inverted: a mutation *after* the wheel tick must now reach the copy.
+    #[test]
+    fn a_wheel_tick_mid_drag_drops_the_freeze() {
+        let mut app = mk_app();
+        let id = app.focused;
+        app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
+        let r = app.display_rects()[0].rect;
+
+        handle_mouse(&mut app, click(r.x + 2, r.y + 1));
+        handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
+        handle_mouse(&mut app, wheel_up(r.x + 2, r.y + 1));
+        app.runtimes.get_mut(&id).unwrap().grab = "mutated text".into();
+
+        handle_mouse(&mut app, release(r.x + 6, r.y + 1));
+        assert_eq!(
+            app.flash(),
+            Some("copied 12 chars"),
+            "the wheel tick dropped the freeze, so release reads the pane live again"
+        );
     }
 
     /// D1 (PR #46 design audit): the scope clause — native selection is

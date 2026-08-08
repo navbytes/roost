@@ -179,8 +179,16 @@ impl Screen {
     /// application opens a synchronized-output bracket, i.e. once per redraw
     /// on a spinner. Every field is spelled out so that a new one added to
     /// `Screen` fails to compile here rather than being silently dropped.
-    // roost: added for SPEC-parity P1.
-    fn snapshot(&self) -> Self {
+    ///
+    /// Public since roost's C29 selection-freeze amendment: a native-
+    /// selection gesture (`infra::pty::PtyPane::freeze_view`) uses this same
+    /// cheap, scrollback-free copy to hold the presented frame steady for
+    /// the gesture's duration, exactly the way the sync-output bracket below
+    /// already does — one snapshot mechanism, two callers.
+    // roost: added for SPEC-parity P1; made `pub` for DESIGN-ui.md C29's
+    // selection-freeze amendment.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
         Self {
             grid: self.grid.snapshot(),
             alternate_grid: self.alternate_grid.snapshot(),

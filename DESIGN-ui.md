@@ -3117,6 +3117,79 @@ under the new mechanism.
   The mouse-capture subset:
   `ui::mouse::tests::mouse_capture_sequences_are_the_1000_1002_1006_subset_symmetric_in_reverse`.
 
+**[Amended 2026-08-08, selection-freeze — presentation pins for the gesture,
+content still doesn't]** The "Contracted: tracks grid coordinates, not
+content" bullet's own closing claims are withdrawn for exactly the gesture
+window; everything else about coordinate-based selection stands unchanged.
+Restated: **`Selection` still tracks grid coordinates, not content** —
+`(pane, anchor, cursor)`, untouched — and this is still not content
+anchoring, which was assessed for this amendment too and rejected on the
+same grounds as before: the vendored parser's scrollback
+(`vendor/vt100/src/grid.rs:13-15`) carries no row identity, and a resize
+mid-drag would leave a content anchor nothing to reattach to. What changes
+is *what `presented()` those coordinates are read against* while a
+native-selection gesture (mouse-Down to mouse-Up) is in flight: the pane
+holds the frame it was presenting at the gesture's `Down`, the same way P1
+already holds one for an open synchronized-output bracket —
+`PtyPane::presented` (`infra/pty.rs`) now checks a per-gesture snapshot
+ahead of the sync-view veneer, so `screen()` (the blit) and `grab_text`
+(the copy) read the *identical still frame* for the whole gesture. The
+highlight the user aimed at is provably the text that lands on the
+clipboard — closing the same class of defect `PendingCopy` (app.rs:195-204)
+already closed for a ≤500ms grid re-read; a drag runs longer than that.
+
+"A content-tracking alternative would need the selection to pin a snapshot
+of the grid rather than read the live one, which nothing else in roost's
+selection model does" no longer holds — something now does, but it is not
+content tracking: the snapshot is keyed to the *gesture*, carries no row
+identity, is dropped the moment the gesture ends, and `Selection` itself
+never gained a content pin. The withdrawn sentence was the argument for
+*why not build this*; it is gone because the brief changed, not because the
+argument was wrong at the time.
+
+**Between release and the next interaction** (the highlight-stays-lit
+window this contract already documents) is untouched by this amendment —
+no freeze applies there, so a lingering post-release highlight can still
+visually drift if the pane prints before the next click or keypress,
+exactly as before.
+
+**Held and released, precisely:** `App::mouse_latch` (P20) is the
+gesture's lifetime — no second "gesture in progress" flag is introduced.
+Every `Down` inside `handle_native_selection` (`main.rs:817`) freezes the
+latched pane (`PaneBackend::freeze_view`) before touching `Selection`;
+every `Up` unfreezes it (`unfreeze_view`) unconditionally, whether or not a
+selection survived to be copied. Two things bound the freeze past an
+ordinary Down/Up bracket, both inside the same function: a wheel tick
+routed through the gesture's pane drops it immediately (scrolling and
+freezing disagree about whether the view may move — scrolling wins), and
+the frozen frame's own age is capped (`GESTURE_FREEZE_STALE_CAP`, checked
+lazily inside `presented()` exactly the way `SYNC_STALE_CAP` already is,
+generously past any real drag) so a lost `Up` — focus left the window, the
+terminal dropped the event — cannot freeze a pane forever. Torn beats
+frozen here too. A pane already scrolled into its own history when the
+gesture starts is left live, not frozen, for the identical reason
+`sync_presented` already defers to live there: `Screen::snapshot` always
+resets to the live tail (`vendor/vt100/src/grid.rs:49-53`), so freezing it
+would silently yank a history-reading user to the tail rather than protect
+anything — and banked rows are already immutable, so there is nothing
+moving under a scrolled-back drag to protect against in the first place.
+
+**Must-not-break, reconfirmed:** an SGR pane never reaches
+`handle_native_selection`, so it is never frozen — the freeze calls live
+nowhere else. Copy mode's `handle_copy_mouse`, the seam-drag path, and
+wheel routing for every *other* pane are untouched (this amendment adds no
+call outside `handle_native_selection`). Double-click word, triple-click
+line and shift-click-extend all read through the same frozen
+`grab_text`/`row_text` path a plain drag does, since the freeze arms before
+any of them run — one freeze, not a special case per gesture shape. Pinned
+by `main.rs::tests::output_banked_mid_drag_does_not_change_what_release_copies`
+(the mutation pin — fails without the freeze, by construction) and
+`a_wheel_tick_mid_drag_drops_the_freeze`; the staleness cap by
+`infra::pty::tests::a_lost_mouse_up_does_not_freeze_the_pane_forever`. Every
+pre-existing C29 and `PendingCopy` test passes unmodified — none of them
+mutate a pane's content mid-gesture, so a frozen read and a live one were
+already indistinguishable to them.
+
 ---
 
 ### C31 — Cross-tab directional focus at a tab's edge (`Alt+←/→`) — [Added 2026-08-07, client request]
