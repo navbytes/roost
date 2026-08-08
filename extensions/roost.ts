@@ -224,43 +224,17 @@ export default function (pi: ExtensionAPI) {
     send({ event: "status", status: "waiting" });
   });
 
-  pi.on("agent_start", async () => {
-    cancelProjectTrustNeedsInput();
-    lastQuestion = undefined; // a new run supersedes the previous parting words
-    send({ event: "status", status: "working" });
-  });
-  // agent_settled (pi ≥ 0.80.4) is the true turn-end: agent_end also fires
-  // between an agent run and its automatic follow-ups (retry after a
-  // provider error, compaction, a queued continuation), so reporting there
-  // flapped the pane ○ waiting → ● working on every recovery. Verified
-  // against installed pi 0.84.1's docs/extensions.md: "ctx.isIdle() is
-  // false while Pi is processing an agent run, automatic retry,
-  // auto-compaction retry, or queued continuation" — and the same doc
-  // recommends agent_settled "for status integrations" outright.
-  //
-  // agent_end stays registered as the fallback for a pi old enough (<
-  // 0.80.4) to lack agent_settled — latched off the moment agent_settled
-  // proves it exists, NOT isIdle-guarded: ctx.isIdle dates back to 0.31.0,
-  // and across 0.31–0.80.3 nothing documents whether it is already false
-  // when the *final* agent_end fires. If it were, an isIdle guard would
-  // suppress the only turn-end report those versions ever get, pinning ●
-  // until roost's stuck-working decay — strictly worse than the flap it
-  // prevents. The latch needs no such archaeology: before the first
-  // settled, agent_end reports unconditionally (exactly the old behavior,
-  // worst case one flappy first turn on modern pi); after it, settled owns
-  // turn-ends alone. A duplicate "waiting" on that first turn is harmless —
-  // roost's tracker is idempotent on repeated resting reports.
   // Prose-question heuristic: a turn whose final assistant line ends with a
   // question mark is (almost always) the agent waiting on *you* — but pi
   // emits no event for it, so it's structurally identical to "finished".
   // agent_end carries the run's messages (agent_settled carries nothing),
-  // so the candidate is captured there and consumed by whichever handler
-  // reports the turn-end. Deliberately a heuristic and deliberately cheap:
-  // a borderline ◆ ("Done — want me to add tests?") still shows the
-  // question itself in roost's feed/notification, so the reader can judge
-  // it at a glance, and roost's needs-input decay self-heals a wrong ◆
-  // regardless. Only the LAST assistant message counts — an earlier
-  // question in the turn was already superseded by whatever followed it.
+  // so the candidate is captured there and reported at settle. Deliberately
+  // a heuristic and deliberately cheap: a borderline ◆ ("Done — want me to
+  // add tests?") still shows the question itself in roost's
+  // feed/notification, so the reader can judge it at a glance, and roost's
+  // needs-input decay self-heals a wrong ◆ regardless. Only the LAST
+  // assistant message counts — an earlier question in the turn was already
+  // superseded by whatever followed it.
   //
   // clip: shared normalization for every human-facing message this
   // extension sends — whitespace-collapsed, truncated by code points (a
@@ -294,14 +268,44 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   };
 
-  const reportTurnEnd = () => {
-    if (lastQuestion) {
-      send({ event: "status", status: "needs_input", message: lastQuestion });
-    } else {
-      send({ event: "status", status: "waiting" });
-    }
-  };
-
+  pi.on("agent_start", async () => {
+    cancelProjectTrustNeedsInput();
+    lastQuestion = undefined; // a new run supersedes the previous parting words
+    send({ event: "status", status: "working" });
+  });
+  // agent_settled (pi ≥ 0.80.4) is the true turn-end: agent_end also fires
+  // between an agent run and its automatic follow-ups (retry after a
+  // provider error, compaction, a queued continuation), so reporting there
+  // flapped the pane ○ waiting → ● working on every recovery. Verified
+  // against installed pi 0.84.1's docs/extensions.md: "ctx.isIdle() is
+  // false while Pi is processing an agent run, automatic retry,
+  // auto-compaction retry, or queued continuation" — and the same doc
+  // recommends agent_settled "for status integrations" outright.
+  //
+  // agent_end stays registered as the fallback for a pi old enough (<
+  // 0.80.4) to lack agent_settled — latched off the moment agent_settled
+  // proves it exists, NOT isIdle-guarded: ctx.isIdle dates back to 0.31.0,
+  // and across 0.31–0.80.3 nothing documents whether it is already false
+  // when the *final* agent_end fires. If it were, an isIdle guard would
+  // suppress the only turn-end report those versions ever get, pinning ●
+  // until roost's stuck-working decay — strictly worse than the flap it
+  // prevents. The latch needs no such archaeology: before the first
+  // settled, agent_end reports unconditionally (exactly the old behavior,
+  // worst case one flappy first turn on modern pi); after it, settled owns
+  // turn-ends alone. A duplicate "waiting" on that first turn is harmless —
+  // roost's tracker is idempotent on repeated resting reports.
+  //
+  // The question is reported at settle ONLY — never from the unlatched
+  // agent_end: agent_end can fire mid-recovery with a half-answered
+  // question in its messages, and pi 0.84.1's extension-side AgentEndEvent
+  // carries no willRetry/finality field to tell a final run from a retrying
+  // one (docs list one; the shipped types don't — the types win). A false ○
+  // costs a glance; a false ◆ rings a desktop notification. Old pi (no
+  // settled) therefore never gets the prose-◆ — it keeps exactly its
+  // pre-heuristic behavior — while ask-tool and project-trust ◆ still work
+  // everywhere. One-shot on send: a settle with no run in between must not
+  // re-ring the same question; the isIdle-suppressed path deliberately
+  // keeps it for the settle that does report.
   let settledSupported = false;
   pi.on("agent_settled", async (_event, ctx) => {
     settledSupported = true;
@@ -309,12 +313,17 @@ export default function (pi: ExtensionAPI) {
     // started (pi's own docs: true here "unless another extension started
     // a new run").
     if (ctx.isIdle?.() === false) return;
-    reportTurnEnd();
+    if (lastQuestion) {
+      send({ event: "status", status: "needs_input", message: lastQuestion });
+      lastQuestion = undefined;
+    } else {
+      send({ event: "status", status: "waiting" });
+    }
   });
   pi.on("agent_end", async (event) => {
     lastQuestion = trailingQuestion(event.messages ?? []);
     if (settledSupported) return; // settled owns turn-ends on this pi
-    reportTurnEnd();
+    send({ event: "status", status: "waiting" });
   });
   pi.on("input", async () => cancelProjectTrustNeedsInput());
 

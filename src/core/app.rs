@@ -2411,6 +2411,7 @@ impl<B: PaneBackend> App<B> {
         detail: Option<String>,
     ) -> Option<String> {
         let prev = self.runtimes.get(&id).map(|rt| rt.status());
+        let prev_msg = self.needy_msgs.get(&id).cloned();
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.set_extension_status(status);
         }
@@ -2432,11 +2433,20 @@ impl<B: PaneBackend> App<B> {
                 self.needy_msgs.remove(&id);
             }
         }
-        // NeedsInput is an explicit "I need you" and always pulls attention;
-        // Waiting is softer (turn ended) — only notify when it follows active
-        // work, so a resume that lands straight on Waiting doesn't nag.
+        // NeedsInput is an explicit "I need you" and always pulls attention
+        // — but only once per ask: an extension's reconnect replay re-sends
+        // its last needs_input verbatim (same status, same question), and a
+        // ◆ can now rest for minutes on a question-ending turn, so a roost
+        // restart or a transient socket drop in that window would re-ring
+        // the desktop for an ask the user has already been told about. A
+        // repeat is silent unless the question itself changed (a genuinely
+        // new ask while already ◆ still notifies). Waiting is softer (turn
+        // ended) — only notify when it follows active work, so a resume
+        // that lands straight on Waiting doesn't nag.
         let became_needy = match status {
-            AgentStatus::NeedsInput => true,
+            AgentStatus::NeedsInput => {
+                prev != Some(AgentStatus::NeedsInput) || detail != prev_msg
+            }
             AgentStatus::Waiting => prev == Some(AgentStatus::Working),
             _ => false,
         };
@@ -12266,6 +12276,26 @@ mod tests {
         app.apply(Action::NewPane); // focus = 2, so pane 1 is unfocused
         let msg = app.on_status(1, AgentStatus::NeedsInput, None);
         assert_eq!(msg.as_deref(), Some("shell · tmp is waiting for you"));
+    }
+
+    /// A replayed needs_input (same status, same question — what an
+    /// extension's reconnect replay sends after a roost restart or a
+    /// transient drop) must not re-ring the desktop; a genuinely new
+    /// question while already ◆ still must.
+    #[test]
+    fn repeated_needs_input_notifies_once_unless_the_question_changes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // focus = 2, pane 1 unfocused
+        assert!(app.on_status(1, AgentStatus::NeedsInput, Some("pick a db".into())).is_some());
+        // Verbatim replay: silent.
+        assert!(app.on_status(1, AgentStatus::NeedsInput, Some("pick a db".into())).is_none());
+        // Same status, new ask: notifies.
+        assert!(app.on_status(1, AgentStatus::NeedsInput, Some("deploy too?".into())).is_some());
+        // Messageless repeat while ◆ (message cleared = changed): notifies —
+        // and a fresh ◆ after working always does.
+        app.on_status(1, AgentStatus::Working, None);
+        assert!(app.on_status(1, AgentStatus::NeedsInput, None).is_some());
+        assert!(app.on_status(1, AgentStatus::NeedsInput, None).is_none(), "bare replay is silent");
     }
 
     #[test]

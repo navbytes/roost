@@ -1,9 +1,16 @@
 // End-to-end check of extensions/roost.ts against a fake roost socket:
 // exercises the real module (no copy-paste of logic) — turn-end reporting,
-// the prose-question heuristic, ask-tool messages, and the agent_end latch.
+// the prose-question heuristic (settle-only), question one-shot/clearing,
+// the agent_end latch, ask-tool messages, and the isIdle race guard.
 //
 // Run: node extensions/roost.test.mjs   (node ≥ 23 — imports the .ts via
 // native type stripping; not wired into CI, which is cargo-only today).
+//
+// Assertions are RAW wire sequences — deliberately no de-duplication, so a
+// regression that double-sends needs_input (each one costs a desktop
+// notification roost-side) fails loudly. The one nondeterministic burst —
+// the initial connect's session/status replay — is drained after
+// session_start instead of masked in the assertions.
 import assert from "node:assert/strict";
 import net from "node:net";
 import os from "node:os";
@@ -37,61 +44,65 @@ const mod = await import(path.resolve("extensions/roost.ts"));
 mod.default(pi);
 const fire = (ev, event = {}, ctx = {}) => handlers.get(ev)?.(event, ctx);
 const settle = () => new Promise((r) => setTimeout(r, 150)); // let socket writes land
-// Semantic transitions: reconnect replays legitimately duplicate the last
-// status on the wire (roost's tracker is idempotent on those), so collapse
-// consecutive identical [status, message] pairs before asserting.
 const takeStatuses = () => {
-  const raw = lines.filter((l) => l.event === "status").map((l) => [l.status, l.message]);
+  const s = lines.filter((l) => l.event === "status").map((l) => [l.status, l.message]);
   lines.length = 0;
-  return raw.filter((s, i) => i === 0 || s[0] !== raw[i - 1][0] || s[1] !== raw[i - 1][1]);
+  return s;
 };
+const question = (text) => ({
+  role: "assistant",
+  content: [{ type: "text", text }],
+});
 
-// 1. Ordinary turn: working, then settled with no question -> waiting.
-// The FIRST turn's agent_end also reports (the latch hasn't seen a settled
-// yet — deliberate: that's the old-pi fallback proving itself harmless), so
-// turn 1 carries a duplicate waiting.
+// Drain the connect-time replay burst: session_start's first sends can race
+// the socket's own connect, and the connect handler replays last
+// session/status. Everything after this runs on a stable connection, so
+// the raw assertions below are deterministic.
 await fire("session_start", {}, { sessionManager: { getSessionId: () => "abc" } });
-await fire("agent_start");
-await fire("agent_end", { messages: [
-  { role: "assistant", content: [{ type: "text", text: "All done.\nThe tests pass." }] },
-] });
-await fire("agent_settled", {}, { isIdle: () => true });
 await settle();
-assert.deepEqual(takeStatuses(), [
-  ["waiting", undefined],
-  ["working", undefined],
-  ["waiting", undefined],
-]);
+lines.length = 0;
 
-// 2. Prose question in the final assistant line -> needs_input with the line.
+// 1. UNLATCHED turn ending on a question: agent_end reports plain waiting —
+// never the question. Pre-settle, agent_end can be a mid-recovery run with
+// a half-answered question (pi's extension-side AgentEndEvent has no
+// finality field), and a false ◆ rings the desktop. The question is only
+// captured here, for settle to report.
 await fire("agent_start");
-await fire("agent_end", { messages: [
-  { role: "user", content: "which db?" },
-  { role: "assistant", content: [{ type: "text", text: "Two options exist.\nWhich database should I use?" }] },
-] });
-await fire("agent_settled", {}, { isIdle: () => true });
-await settle();
-assert.deepEqual(takeStatuses(), [["working", undefined], ["needs_input", "Which database should I use?"]]);
-
-// 3. A new run clears the stale question; a non-question end -> waiting.
-await fire("agent_start");
-await fire("agent_end", { messages: [
-  { role: "assistant", content: [{ type: "text", text: "Committed." }] },
-] });
-await fire("agent_settled", {}, { isIdle: () => true });
+await fire("agent_end", { messages: [question("Setup done.\nWhich database should I use?")] });
 await settle();
 assert.deepEqual(takeStatuses(), [["working", undefined], ["waiting", undefined]]);
 
-// 4. Latch: settled has fired, so a mid-recovery agent_end reports nothing.
-await fire("agent_start");
-await fire("agent_end", { messages: [] });
+// 2. The first settled reports the captured question — and latches.
+await fire("agent_settled", {}, { isIdle: () => true });
 await settle();
-assert.deepEqual(takeStatuses(), [["working", undefined]], "latched agent_end must stay silent");
+assert.deepEqual(takeStatuses(), [["needs_input", "Which database should I use?"]]);
+
+// 3. One-shot: a second settled with no run in between must not re-ring.
 await fire("agent_settled", {}, { isIdle: () => true });
 await settle();
 assert.deepEqual(takeStatuses(), [["waiting", undefined]]);
 
-// 5. Ask-tool question rides needs_input; result returns to working.
+// 4. Latched turn, no question: agent_end is silent, settled reports.
+await fire("agent_start");
+await fire("agent_end", { messages: [question("Committed.")] });
+await fire("agent_settled", {}, { isIdle: () => true });
+await settle();
+assert.deepEqual(takeStatuses(), [["working", undefined], ["waiting", undefined]]);
+
+// 5. Latched turn with a question: exactly one needs_input, at settle.
+await fire("agent_start");
+await fire("agent_end", { messages: [
+  { role: "user", content: "which db?" },
+  question("Two options exist.\nPostgres or SQLite?"),
+] });
+await fire("agent_settled", {}, { isIdle: () => true });
+await settle();
+assert.deepEqual(takeStatuses(), [
+  ["working", undefined],
+  ["needs_input", "Postgres or SQLite?"],
+]);
+
+// 6. Ask-tool question rides needs_input; result returns to working.
 await fire("agent_start");
 await fire("tool_call", { toolName: "ask_user", input: { question: "Deploy to prod?" } });
 await fire("tool_result", { toolName: "ask_user" });
@@ -102,12 +113,16 @@ assert.deepEqual(takeStatuses(), [
   ["working", undefined],
 ]);
 
-// 6. isIdle false at settled (new turn racing) -> no report.
-await fire("agent_end", { messages: [] });
+// 7. isIdle false at settled (new turn racing): no report, and the kept
+// question lands on the settle that does report.
+await fire("agent_end", { messages: [question("Merge it?")] });
 await fire("agent_settled", {}, { isIdle: () => false });
 await settle();
 assert.deepEqual(takeStatuses(), []);
+await fire("agent_settled", {}, { isIdle: () => true });
+await settle();
+assert.deepEqual(takeStatuses(), [["needs_input", "Merge it?"]]);
 
 server.close();
-console.log("ext-e2e: all 6 scenarios pass");
+console.log("ext-e2e: all 7 scenarios pass");
 process.exit(0);
