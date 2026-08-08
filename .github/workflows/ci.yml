@@ -1,9 +1,33 @@
 name: CI
 
 on:
+  # Docs-only changes can't affect the binary or the tests — no .md is
+  # compiled in (only extensions/roost.ts is), so they skip the two-OS matrix
+  # entirely. This list stays restricted to paths that provably can't change
+  # build or test behaviour: markdown, the docs/ site, LICENSE, and the
+  # Homebrew packaging template. A PR that touches code *and* docs still runs,
+  # because paths-ignore only skips when *every* changed path matches.
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'packaging/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'packaging/**'
+
+# Supersede a still-running check when a newer commit lands on the same PR
+# branch — a force-push during iteration is the common case, and the older
+# run's result is already stale. main is exempt (cancel-in-progress is false
+# there): every merge is verified to completion, even two landing back-to-back.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
