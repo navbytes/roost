@@ -226,6 +226,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", async () => {
     cancelProjectTrustNeedsInput();
+    lastQuestion = undefined; // a new run supersedes the previous parting words
     send({ event: "status", status: "working" });
   });
   // agent_settled (pi ≥ 0.80.4) is the true turn-end: agent_end also fires
@@ -249,6 +250,58 @@ export default function (pi: ExtensionAPI) {
   // worst case one flappy first turn on modern pi); after it, settled owns
   // turn-ends alone. A duplicate "waiting" on that first turn is harmless —
   // roost's tracker is idempotent on repeated resting reports.
+  // Prose-question heuristic: a turn whose final assistant line ends with a
+  // question mark is (almost always) the agent waiting on *you* — but pi
+  // emits no event for it, so it's structurally identical to "finished".
+  // agent_end carries the run's messages (agent_settled carries nothing),
+  // so the candidate is captured there and consumed by whichever handler
+  // reports the turn-end. Deliberately a heuristic and deliberately cheap:
+  // a borderline ◆ ("Done — want me to add tests?") still shows the
+  // question itself in roost's feed/notification, so the reader can judge
+  // it at a glance, and roost's needs-input decay self-heals a wrong ◆
+  // regardless. Only the LAST assistant message counts — an earlier
+  // question in the turn was already superseded by whatever followed it.
+  //
+  // clip: shared normalization for every human-facing message this
+  // extension sends — whitespace-collapsed, truncated by code points (a
+  // UTF-16 slice can split a surrogate pair, and the resulting lone
+  // surrogate makes the JSON line unparseable server-side, dropping the
+  // whole report).
+  const clip = (raw: string): string | undefined => {
+    const s = raw.trim().replace(/\s+/g, " ");
+    if (!s) return undefined;
+    const points = Array.from(s);
+    return points.length > 200 ? `${points.slice(0, 199).join("")}…` : s;
+  };
+
+  let lastQuestion: string | undefined;
+  const trailingQuestion = (
+    messages: { role?: string; content?: unknown }[],
+  ): string | undefined => {
+    for (let k = messages.length - 1; k >= 0; k--) {
+      const m = messages[k];
+      if (m?.role !== "assistant") continue;
+      const parts: { type?: string; text?: unknown }[] = Array.isArray(m.content)
+        ? m.content
+        : [];
+      const text = parts
+        .map((p) => (p?.type === "text" && typeof p.text === "string" ? p.text : ""))
+        .join("\n");
+      const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+      const lastLine = lines[lines.length - 1];
+      return lastLine?.endsWith("?") ? clip(lastLine) : undefined;
+    }
+    return undefined;
+  };
+
+  const reportTurnEnd = () => {
+    if (lastQuestion) {
+      send({ event: "status", status: "needs_input", message: lastQuestion });
+    } else {
+      send({ event: "status", status: "waiting" });
+    }
+  };
+
   let settledSupported = false;
   pi.on("agent_settled", async (_event, ctx) => {
     settledSupported = true;
@@ -256,11 +309,12 @@ export default function (pi: ExtensionAPI) {
     // started (pi's own docs: true here "unless another extension started
     // a new run").
     if (ctx.isIdle?.() === false) return;
-    send({ event: "status", status: "waiting" });
+    reportTurnEnd();
   });
-  pi.on("agent_end", async () => {
+  pi.on("agent_end", async (event) => {
+    lastQuestion = trailingQuestion(event.messages ?? []);
     if (settledSupported) return; // settled owns turn-ends on this pi
-    send({ event: "status", status: "waiting" });
+    reportTurnEnd();
   });
   pi.on("input", async () => cancelProjectTrustNeedsInput());
 
@@ -268,7 +322,8 @@ export default function (pi: ExtensionAPI) {
   // ships no generic per-tool permission/approval prompt at all (verified
   // against installed pi 0.81.1's dist/core/extensions/runner.js — there is
   // no "approval dialog" event of any kind to hook here), so there are
-  // exactly two real carriers:
+  // exactly two real mid-turn carriers (the trailing-question heuristic
+  // above is the third, *end-of-turn* carrier — inferred, not event-borne):
   //
   // 1. project_trust — pi's one built-in *blocking* prompt: whether to trust
   // this project directory, shown before a session can really do anything.
@@ -328,13 +383,9 @@ export default function (pi: ExtensionAPI) {
     const qs = Array.isArray(i?.questions) ? (i?.questions as unknown[]) : [];
     const first = qs.find((q) => typeof (q as any)?.question === "string") as any;
     for (const cand of [first?.question, i?.question, i?.prompt, i?.message, i?.text]) {
-      if (typeof cand === "string" && cand.trim()) {
-        const s = cand.trim().replace(/\s+/g, " ");
-        // Truncate by code points, not UTF-16 units — String.prototype.slice
-        // can split a surrogate pair, and the resulting lone surrogate makes
-        // the JSON line unparseable server-side, dropping the whole report.
-        const points = Array.from(s);
-        return points.length > 200 ? `${points.slice(0, 199).join("")}…` : s;
+      if (typeof cand === "string") {
+        const c = clip(cand);
+        if (c) return c;
       }
     }
     return undefined;
