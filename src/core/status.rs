@@ -58,6 +58,32 @@ pub struct StatusTracker {
     /// connection yet reported, there is nothing to trust over the
     /// heuristics, which is exactly today's fallback behavior.
     ext_link: bool,
+    /// Screen-derived status parsed from the pane's terminal title (D5).
+    /// Claude Code publishes its state there — a braille spinner frame
+    /// prefix while working, `✳ ` at rest — and its hook connections are
+    /// one-shot, so between hooks this is the only exact-ish signal a claude
+    /// pane has. It ranks *between* extension reports and byte heuristics:
+    /// never consulted while `ext_link` is live (a live reporting connection
+    /// outranks screen inference — same rule as output promotion), never
+    /// able to touch NeedsInput or Exited, and never consulted at all unless
+    /// `title_enabled` says an agent is actually running (see below). Pushed
+    /// from `infra::pty` on every title change; `None` for titles that match
+    /// no known agent pattern.
+    title_status: Option<AgentStatus>,
+    /// When the title string last changed. For an *animating* spinner this
+    /// refreshes every frame — it's a liveness heartbeat, not a transition
+    /// marker — so the `STUCK_WORKING` bound in `title_working_live` only
+    /// ever fires for a title that froze (a hung agent), which is exactly
+    /// the case it exists to catch.
+    title_at: Option<Instant>,
+    /// Gate on the whole title channel, pushed by the app layer (spawn +
+    /// `observe_panes`): true only while the pane's effective adapter is an
+    /// agent, false for plain shells. A vt100 title outlives the process
+    /// that set it (nothing ever clears it — not even RIS), so an agent that
+    /// ran in a shell pane and exited would otherwise leave a permanent `✳`
+    /// vetoing Working for every later command in that pane. Same gate, same
+    /// reason, as `display_name_live`'s shell-title rule.
+    title_enabled: bool,
 }
 
 impl StatusTracker {
@@ -69,6 +95,9 @@ impl StatusTracker {
             ext_at: None,
             bell_at: None,
             ext_link: false,
+            title_status: None,
+            title_at: None,
+            title_enabled: false,
         }
     }
 
@@ -110,6 +139,56 @@ impl StatusTracker {
     /// a heuristic here.
     pub fn set_ext_link(&mut self, up: bool) {
         self.ext_link = up;
+    }
+
+    /// The pane's terminal title changed and parsed to `s` (D5) — `None`
+    /// when the new title matches no known agent pattern, which clears any
+    /// previous title signal (the agent stopped publishing state there).
+    /// Called on title-string changes; an animating spinner lands here every
+    /// frame, which is what makes `title_at` a liveness heartbeat.
+    pub fn set_title_status(&mut self, s: Option<AgentStatus>) {
+        self.title_status = s;
+        self.title_at = Some(Instant::now());
+    }
+
+    /// D5's gate: the app layer's answer to "is an agent actually running in
+    /// this pane right now?" (spawn adapter, kept current by
+    /// `observe_panes`'s promote/demote). While off, the title channel is
+    /// dead weight — stored but never consulted — because a leftover title
+    /// from an exited agent is otherwise trusted forever. Disabling clears
+    /// the stored signal too: the next agent run starts from a clean slate
+    /// instead of inheriting the previous run's last title.
+    pub fn set_title_signal(&mut self, enabled: bool) {
+        self.title_enabled = enabled;
+        if !enabled {
+            self.title_status = None;
+            self.title_at = None;
+        }
+    }
+
+    /// D5: a Working title is trusted while output flows or the title itself
+    /// is fresh (`STUCK_WORKING` since it last changed — an *animating*
+    /// spinner refreshes that clock every frame, so this bound only fires
+    /// for a frozen title, i.e. a hung agent, which then decays to the
+    /// ordinary heuristics same as a dead hook's stale report). Never while
+    /// the extension link is live: a live exact source outranks screen
+    /// inference (same rule byte promotion follows).
+    fn title_working_live(&self) -> bool {
+        self.title_enabled
+            && !self.ext_link
+            && self.title_status == Some(AgentStatus::Working)
+            && (self.recent_output()
+                || self.title_at.is_some_and(|t| t.elapsed() <= STUCK_WORKING))
+    }
+
+    /// D5: the title says the agent is at rest (`✳`). No time decay — while
+    /// the gate says the agent is running, a resting claim can't pin a wrong
+    /// ● or ◆, it only suppresses byte-noise promotion, and the title flips
+    /// to a spinner the instant a real turn starts; the moment the agent
+    /// exits, the gate (not a clock) kills the signal. Same live-link
+    /// deference as `title_working_live`.
+    fn title_resting(&self) -> bool {
+        self.title_enabled && !self.ext_link && self.title_status == Some(AgentStatus::Waiting)
     }
 
     fn recent_output(&self) -> bool {
@@ -232,8 +311,21 @@ impl StatusTracker {
             // - Down: no live evidence the hook is still around at all —
             //   today's behavior, self-heal to Waiting.
             Some(AgentStatus::Working) => {
+                // D5: the title flipping to rest (`✳`) while the pane is
+                // quiet settles a Working report immediately — Claude's
+                // hooks are one-shot connections, so a lost/failed Stop hook
+                // otherwise leaves a phantom ● for the full STUCK_WORKING.
+                if self.title_resting() && !self.recent_output() {
+                    return AgentStatus::Waiting;
+                }
+                // D5, the sustaining direction: a live spinner title carries
+                // a quiet Working report past the decay — a >45 s silent
+                // tool call with the spinner still animating is exactly the
+                // "between one-shot hooks" gap the title channel closes. A
+                // *frozen* spinner doesn't qualify (`title_working_live`'s
+                // own bound), so a hung agent still decays below.
                 let stuck = self.ext_at.is_some_and(|t| t.elapsed() > STUCK_WORKING);
-                if stuck && !self.recent_output() {
+                if stuck && !self.recent_output() && !self.title_working_live() {
                     if self.ext_link {
                         AgentStatus::Idle
                     } else {
@@ -256,10 +348,20 @@ impl StatusTracker {
             // can't see (pi's permission gate) — so it promotes to
             // NeedsInput unconditionally, link or no link.
             Some(other) => {
-                if self.recent_output() && !self.ext_link {
+                // D5: a resting title (`✳`) vetoes the byte-noise promotion
+                // — Claude's one-shot hook links are down between hooks, so
+                // without it every keystroke echo on a resting claude pane
+                // painted a phantom ●. A Working title is active-work
+                // evidence too, but ranked *below* the bell: a bell is the
+                // one "needs you" signal a blocked agent can still emit
+                // while its (possibly stale, possibly still-animating)
+                // spinner title claims work — ◆ must not lose that race.
+                if self.recent_output() && !self.ext_link && !self.title_resting() {
                     AgentStatus::Working
                 } else if self.bell_after_ext() {
                     AgentStatus::NeedsInput
+                } else if self.title_working_live() {
+                    AgentStatus::Working
                 } else {
                     other
                 }
@@ -271,11 +373,17 @@ impl StatusTracker {
             // output still means Working; longer silence means Waiting.
             None => {
                 let recent_bell = self.bell_at.is_some_and(|t| t.elapsed() < STUCK_WORKING);
-                if self.recent_output() {
+                // D5: same title rules (and the same bell-over-title order)
+                // as the resting-report arm — an agent that publishes state
+                // in its title gets exact-ish status even with no
+                // extension/hook installed at all.
+                if self.recent_output() && !self.title_resting() {
                     AgentStatus::Working
                 } else if recent_bell {
                     AgentStatus::NeedsInput
-                } else if self.last_output.is_some() {
+                } else if self.title_working_live() {
+                    AgentStatus::Working
+                } else if self.last_output.is_some() || self.title_resting() {
                     AgentStatus::Waiting
                 } else {
                     AgentStatus::Idle
@@ -400,7 +508,7 @@ mod tests {
     /// keystroke's composer echo, an agent's post-turn answer still
     /// rendering, a resize repaint. This is the bug itself: byte noise used
     /// to repaint ● Working for 1-2s on every one of those, though the
-    /// extension (whose agent_start/agent_end are exact) reported nothing.
+    /// extension (whose agent_start/agent_settled are exact) reported nothing.
     #[test]
     fn fresh_output_does_not_override_resting_while_link_is_live() {
         let mut t = StatusTracker::new();
@@ -484,6 +592,155 @@ mod tests {
             AgentStatus::Waiting,
             "NeedsInput must still decay on a long silence even with the link live"
         );
+    }
+
+    /// D5: a Working title (an agent's spinner frame in the terminal title)
+    /// is active-work evidence — it promotes a resting report even with no
+    /// output at all, and decays like a report once stale AND silent, so a
+    /// hung agent's leftover spinner can't pin ● forever.
+    #[test]
+    fn title_working_promotes_a_resting_report_and_decays_when_stale() {
+        let mut t = StatusTracker::new();
+        t.set_title_signal(true);
+        t.set_extension_status(AgentStatus::Waiting);
+        t.set_title_status(Some(AgentStatus::Working));
+        assert_eq!(t.current(), AgentStatus::Working, "spinner title needs no output");
+        // Stale title + silence: fall back to the report — the same
+        // self-heal as a stale Working report from a dead hook.
+        t.title_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
+        assert_eq!(t.current(), AgentStatus::Waiting);
+        // Fresh output revives trust in the (unchanged) spinner title.
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::Working);
+    }
+
+    /// D5: the resting title (`✳`) vetoes the byte-noise promotion — with
+    /// one-shot hook links (down between hooks), every keystroke echo on a
+    /// resting claude pane painted a phantom ● before this.
+    #[test]
+    fn title_resting_vetoes_byte_noise_promotion() {
+        let mut t = StatusTracker::new();
+        t.set_title_signal(true);
+        t.set_extension_status(AgentStatus::Waiting);
+        t.set_title_status(Some(AgentStatus::Waiting));
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::Waiting);
+        // Same veto on a pane with no extension/hook at all.
+        let mut t2 = StatusTracker::new();
+        t2.set_title_signal(true);
+        t2.set_title_status(Some(AgentStatus::Waiting));
+        t2.on_output();
+        assert_eq!(t2.current(), AgentStatus::Waiting);
+    }
+
+    /// D5: a lost/failed Stop hook otherwise leaves Working dangling for the
+    /// full STUCK_WORKING — the title flipping to rest settles it the moment
+    /// the pane is quiet, while output still flowing keeps the turn alive.
+    #[test]
+    fn title_resting_settles_a_working_report_once_quiet() {
+        let mut t = StatusTracker::new();
+        t.set_title_signal(true);
+        t.set_extension_status(AgentStatus::Working);
+        t.set_title_status(Some(AgentStatus::Waiting));
+        assert_eq!(t.current(), AgentStatus::Waiting);
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::Working, "output flowing = turn still live");
+    }
+
+    /// D5: the title is screen inference — a live exact link outranks it
+    /// (same deference byte promotion shows, and the same lesson: gate a
+    /// heuristic on the exact signal's liveness, not a clock). And no title
+    /// state ever touches ◆: NeedsInput is an explicit ask only its own
+    /// clearing event (or decay) resolves.
+    #[test]
+    fn title_defers_to_a_live_ext_link_and_never_touches_needs_input() {
+        let mut t = StatusTracker::new();
+        t.set_title_signal(true);
+        t.set_ext_link(true);
+        t.set_extension_status(AgentStatus::Waiting);
+        t.set_title_status(Some(AgentStatus::Working));
+        assert_eq!(t.current(), AgentStatus::Waiting);
+
+        let mut t2 = StatusTracker::new();
+        t2.set_title_signal(true);
+        t2.set_extension_status(AgentStatus::NeedsInput);
+        t2.set_title_status(Some(AgentStatus::Working));
+        assert_eq!(t2.current(), AgentStatus::NeedsInput);
+        t2.set_title_status(Some(AgentStatus::Waiting));
+        assert_eq!(t2.current(), AgentStatus::NeedsInput);
+    }
+
+    /// D5: with no extension/hook installed at all, the title alone gives a
+    /// pane exact-ish status — and a title that stops matching any agent
+    /// pattern clears the signal rather than freezing the last reading.
+    #[test]
+    fn title_alone_reports_status_with_no_extension_installed() {
+        let mut t = StatusTracker::new();
+        t.set_title_signal(true);
+        t.set_title_status(Some(AgentStatus::Working));
+        assert_eq!(t.current(), AgentStatus::Working);
+        t.set_title_status(Some(AgentStatus::Waiting));
+        assert_eq!(t.current(), AgentStatus::Waiting, "✳ with no output yet is at rest, not Idle");
+        t.set_title_status(None);
+        assert_eq!(t.current(), AgentStatus::Idle);
+    }
+
+    /// D5's gate: the title channel is dead until the app layer says an
+    /// agent is running. A vt100 title outlives its process (nothing clears
+    /// it), so an exited claude's leftover `✳` must not veto Working for the
+    /// shell commands that follow — `printf '\e]2;✳ x\a'; yes` in a plain
+    /// shell pane must still read ● while it streams.
+    #[test]
+    fn title_is_ignored_until_enabled_and_cleared_on_disable() {
+        let mut t = StatusTracker::new();
+        t.set_title_status(Some(AgentStatus::Waiting)); // gate off (default)
+        t.on_output();
+        assert_eq!(t.current(), AgentStatus::Working, "disabled title must not veto Working");
+
+        // The agent exits, the pane demotes: disabling clears the stored
+        // signal, so a later re-promotion starts clean instead of
+        // inheriting this run's last title.
+        t.set_title_signal(true);
+        assert_eq!(t.current(), AgentStatus::Waiting, "enabled: the ✳ veto applies");
+        t.set_title_signal(false);
+        t.set_title_signal(true);
+        assert_eq!(t.current(), AgentStatus::Working, "re-enabled with no stored title");
+    }
+
+    /// D5 ranks below the bell: a blocked agent's bell is the one "needs
+    /// you" signal it can still emit while a (possibly stale, possibly
+    /// still-animating) spinner title claims work — ◆ must win that race,
+    /// in both the resting-report arm and the no-extension arm.
+    #[test]
+    fn bell_outranks_a_working_title() {
+        let mut t = StatusTracker::new();
+        t.set_title_signal(true);
+        t.set_extension_status(AgentStatus::Waiting);
+        t.set_title_status(Some(AgentStatus::Working));
+        t.on_bell();
+        assert_eq!(t.current(), AgentStatus::NeedsInput);
+
+        let mut t2 = StatusTracker::new();
+        t2.set_title_signal(true);
+        t2.set_title_status(Some(AgentStatus::Working));
+        t2.on_bell();
+        assert_eq!(t2.current(), AgentStatus::NeedsInput);
+    }
+
+    /// D5, the sustaining direction: a spinner title still updating carries
+    /// a quiet Working report past `STUCK_WORKING` (a long silent tool call
+    /// between one-shot hooks); once the title itself goes stale too — a
+    /// frozen spinner, i.e. a hung agent — the ordinary decay applies.
+    #[test]
+    fn spinner_title_sustains_a_working_report_past_decay() {
+        let mut t = StatusTracker::new();
+        t.set_title_signal(true);
+        t.set_extension_status(AgentStatus::Working);
+        t.set_title_status(Some(AgentStatus::Working));
+        t.ext_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
+        assert_eq!(t.current(), AgentStatus::Working, "fresh spinner sustains the report");
+        t.title_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
+        assert_eq!(t.current(), AgentStatus::Waiting, "frozen spinner decays as before");
     }
 
     /// [F4] `vouched_live` and `recently_reported` must disagree exactly

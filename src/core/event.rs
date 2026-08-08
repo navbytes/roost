@@ -17,8 +17,10 @@ pub enum AppEvent {
     Command(Request, Sender<Reply>),
     /// Exact status pushed by an agent-side extension/hook (status socket).
     /// The middle field is the pane's `ROOST_TOKEN`, verified before the status
-    /// is applied so one pane can't spoof another's.
-    Status(PaneId, String, AgentStatus),
+    /// is applied so one pane can't spoof another's. The last field is the
+    /// optional human-readable detail (`needs_input` only — the question the
+    /// agent is asking), surfaced in the feed line and the notification.
+    Status(PaneId, String, AgentStatus, Option<String>),
     /// Session id reported by an agent-side extension (status socket). Middle
     /// field is the pane's `ROOST_TOKEN` (verified before use).
     Session(PaneId, String, String),

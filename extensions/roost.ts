@@ -13,6 +13,12 @@
  *   { pane, token, event: "session"  , session: "<uuid>" }
  *   { pane, token, event: "status"   , status: "working" | "waiting" | "needs_input" }
  *
+ * A needs_input status may carry an optional `message` — the question the
+ * agent is asking (extracted from the ask-tool's args) — which roost surfaces
+ * in the feed line and the desktop notification. Best on pi ≥ 0.80.4
+ * (agent_settled + isIdle); an older pi falls back to agent_end reporting —
+ * see the settled handler.
+ *
  * promotion-auth-gate: reconnects with backoff on `error`/`close` (up to 5
  * attempts, 250ms doubling to 4s, ±25% jitter; the budget refills once a
  * connection has stayed up 30s) and replays the last known session/status on
@@ -67,9 +73,11 @@ export default function (pi: ExtensionAPI) {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let healthyTimer: ReturnType<typeof setTimeout> | null = null;
   let shuttingDown = false; // session_shutdown initiated the close — no retry
-  // Last known session/status, kept up to date by every send() (even while
-  // disconnected) so a reconnect can replay it — see the "connect" handler.
-  const last: { session?: string; status?: string } = {};
+  // Last known session/status (and the status's message, so a replayed
+  // needs_input keeps its question), kept up to date by every send() (even
+  // while disconnected) so a reconnect can replay it — see the "connect"
+  // handler.
+  const last: { session?: string; status?: string; message?: string } = {};
 
   const clearHealthyTimer = () => {
     if (healthyTimer) {
@@ -104,7 +112,12 @@ export default function (pi: ExtensionAPI) {
       // cost — every reconnected socket's first line also authenticates it,
       // so it's never idle-killed by the pre-auth gate again either.
       if (last.session !== undefined) send({ event: "session", session: last.session });
-      if (last.status !== undefined) send({ event: "status", status: last.status });
+      if (last.status !== undefined)
+        send({
+          event: "status",
+          status: last.status,
+          ...(last.message !== undefined ? { message: last.message } : {}),
+        });
       clearHealthyTimer();
       healthyTimer = setTimeout(() => {
         attempt = 0;
@@ -143,7 +156,12 @@ export default function (pi: ExtensionAPI) {
 
   const send = (msg: Record<string, unknown>) => {
     if (msg.event === "session" && typeof msg.session === "string") last.session = msg.session;
-    if (msg.event === "status" && typeof msg.status === "string") last.status = msg.status;
+    if (msg.event === "status" && typeof msg.status === "string") {
+      last.status = msg.status;
+      // Overwrite (not preserve) so a stale question never rides along with
+      // a later working/waiting replay.
+      last.message = typeof msg.message === "string" ? msg.message : undefined;
+    }
     if (!sock) {
       kickReconnect(); // must not silently no-op — see the comment above
       return;
@@ -210,7 +228,30 @@ export default function (pi: ExtensionAPI) {
     cancelProjectTrustNeedsInput();
     send({ event: "status", status: "working" });
   });
-  pi.on("agent_end", async () => send({ event: "status", status: "waiting" }));
+  // agent_settled (pi ≥ 0.80.4) is the true turn-end: agent_end also fires
+  // between an agent run and its automatic follow-ups (retry after a
+  // provider error, compaction, a queued continuation), so reporting there
+  // unguarded flapped the pane ○ waiting → ● working on every recovery.
+  // agent_end stays registered as the fallback for a pi old enough to lack
+  // agent_settled — same isIdle guard on both, so wherever isIdle exists a
+  // mid-recovery agent_end stays silent, and on a pi with neither
+  // refinement the fallback degrades to exactly the old behavior. Verified
+  // against installed pi 0.84.1's docs/extensions.md: "ctx.isIdle() is
+  // false while Pi is processing an agent run, automatic retry,
+  // auto-compaction retry, or queued continuation" — and the same doc
+  // recommends agent_settled "for status integrations" outright.
+  // A duplicate "waiting" (agent_end then agent_settled, both idle) is
+  // harmless — roost's tracker is idempotent on repeated resting reports.
+  // Registered inline (not one shared handler) so each ctx keeps pi's real
+  // parameter type and tsc actually checks the isIdle call.
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (ctx.isIdle?.() === false) return;
+    send({ event: "status", status: "waiting" });
+  });
+  pi.on("agent_end", async (_event, ctx) => {
+    if (ctx.isIdle?.() === false) return;
+    send({ event: "status", status: "waiting" });
+  });
   pi.on("input", async () => cancelProjectTrustNeedsInput());
 
   // "Needs input" — the agent is explicitly blocked on *you*, mid-turn. pi
@@ -228,7 +269,7 @@ export default function (pi: ExtensionAPI) {
   // trust policy, so we always report "undecided" — the human's own dialog
   // must still show and decide it. The ◆ this (maybe) reports needs no
   // explicit clear: once the dialog resolves, the run proceeds and
-  // agent_start/tool_call send "working" same as any other turn; agent_end
+  // agent_start/tool_call send "working" same as any other turn; agent_settled
   // settles "waiting" at the end of it. The NeedsInput time-decay
   // (roost-side, STUCK_WORKING) also backstops a dialog nobody ever answers.
   // `hasUI: false` means no dialog can ever show for this decision at all
@@ -239,7 +280,7 @@ export default function (pi: ExtensionAPI) {
       cancelProjectTrustNeedsInput();
       projectTrustTimer = setTimeout(() => {
         projectTrustTimer = null;
-        send({ event: "status", status: "needs_input" });
+        send({ event: "status", status: "needs_input", message: "trust this project?" });
       }, 1200);
     }
     return { trusted: "undecided" };
@@ -250,7 +291,7 @@ export default function (pi: ExtensionAPI) {
   // for an explicit "ask the human" tool by name: an allowlist that captures
   // the elicitation tools shipped by MCP servers and custom extensions.
   // Anything not on the list stays "working" — never a false ◆. When the ask
-  // resolves (tool_result) we drop back to "working"; agent_end will settle
+  // resolves (tool_result) we drop back to "working"; agent_settled will settle
   // it to "waiting" at the true end of the turn.
   const ASK_TOOLS = new Set([
     "ask",
@@ -266,9 +307,35 @@ export default function (pi: ExtensionAPI) {
   ]);
   const isAsk = (name: unknown) => typeof name === "string" && ASK_TOOLS.has(name);
 
+  // The question the ask tool is asking, pulled from its args so roost can
+  // show *what* the agent wants, not just that it wants something. Ask/elicit
+  // tools have no shared schema, so probe the common shapes (a `questions`
+  // array, then flat `question`/`prompt`/`message`/`text`) and take the first
+  // non-empty string. Whitespace-collapsed and capped — this rides a
+  // one-line socket protocol into a one-line feed entry.
+  const askMessage = (input: unknown): string | undefined => {
+    const i = input as Record<string, unknown> | null | undefined;
+    const qs = Array.isArray(i?.questions) ? (i?.questions as unknown[]) : [];
+    const first = qs.find((q) => typeof (q as any)?.question === "string") as any;
+    for (const cand of [first?.question, i?.question, i?.prompt, i?.message, i?.text]) {
+      if (typeof cand === "string" && cand.trim()) {
+        const s = cand.trim().replace(/\s+/g, " ");
+        // Truncate by code points, not UTF-16 units — String.prototype.slice
+        // can split a surrogate pair, and the resulting lone surrogate makes
+        // the JSON line unparseable server-side, dropping the whole report.
+        const points = Array.from(s);
+        return points.length > 200 ? `${points.slice(0, 199).join("")}…` : s;
+      }
+    }
+    return undefined;
+  };
+
   pi.on("tool_call", async (event) => {
     cancelProjectTrustNeedsInput();
-    if (isAsk(event.toolName)) send({ event: "status", status: "needs_input" });
+    if (isAsk(event.toolName)) {
+      const message = askMessage((event as any).input);
+      send({ event: "status", status: "needs_input", ...(message ? { message } : {}) });
+    }
   });
   pi.on("tool_result", async (event) => {
     if (isAsk(event.toolName)) send({ event: "status", status: "working" });

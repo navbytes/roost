@@ -5,7 +5,7 @@
 //! - `pi --session <path|id>` resumes an exact session (partial UUID ok)
 //! - `-c/--continue` resumes the most recent session in cwd
 //! - extensions live in `~/.pi/agent/extensions/*.ts` and get lifecycle
-//!   events (`session_start`, `agent_start`, `agent_end`, `session_shutdown`)
+//!   events (`session_start`, `agent_start`, `agent_settled`, `session_shutdown`)
 //!
 //! Status/session detection: the bundled `extensions/roost.ts` pi extension
 //! reports exact events over a unix socket ($XDG_RUNTIME_DIR/roost.sock),

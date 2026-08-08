@@ -100,6 +100,29 @@ fn sanitize_for_host(text: &str, cap: usize) -> String {
     text.chars().filter(|c| !c.is_control()).take(cap).collect()
 }
 
+/// D5: parse an agent-published terminal title into a status. Claude Code
+/// sets `⠧ <task>` (a braille spinner frame, U+2800–U+28FF) while a turn is
+/// running and `✳ <name>` once at rest — machine-readable state on a channel
+/// that already crosses the PTY, and the only exact-ish signal a claude pane
+/// has between its one-shot hook connections. Titles matching neither shape
+/// (a shell's cwd title, some other TUI's) are `None`: no signal, never
+/// "rest". The second char must be a space (or absent) so an ordinary title
+/// that merely *starts* with one of these glyphs doesn't read as state.
+fn agent_title_status(title: &str) -> Option<AgentStatus> {
+    let mut chars = title.chars();
+    let first = chars.next()?;
+    if !matches!(chars.next(), None | Some(' ')) {
+        return None;
+    }
+    if ('\u{2800}'..='\u{28FF}').contains(&first) {
+        Some(AgentStatus::Working)
+    } else if first == '✳' {
+        Some(AgentStatus::Waiting)
+    } else {
+        None
+    }
+}
+
 /// P2: the OSC 9 roost re-emits to its own terminal for a pane
 /// notification, or `None` when this one must be dropped — too soon after
 /// the last (`interval`), or nothing left after sanitizing. Pure (clock and
@@ -426,6 +449,12 @@ pub struct PtyPane {
     write_failed: Arc<AtomicBool>,
     parser: vt100::Parser,
     status: StatusTracker,
+    /// D5: the pane's terminal title as of the last processed chunk, so
+    /// `process_output` pushes `StatusTracker::set_title_status` only when
+    /// the title *string* changed — for an animating spinner that's every
+    /// frame, which is exactly what makes the tracker's `title_at` a
+    /// liveness heartbeat (a frozen spinner stops refreshing it).
+    last_title: String,
     /// The pane's child pid, for OS observation (live cwd / running agent).
     pid: Option<u32>,
     /// Answers the pane's terminal queries (DA1, DSR, DECRQM, XTWINOPS, …)
@@ -743,6 +772,7 @@ impl PaneBackend for PtyPane {
             write_failed,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
             status: StatusTracker::new(),
+            last_title: String::new(),
             pid,
             queries: QueryResponder::new(),
             pixels,
@@ -817,6 +847,16 @@ impl PaneBackend for PtyPane {
         let effects = self.parser.take_effects();
         for effect in effects {
             self.route_effect(effect);
+        }
+        // D5: the pane's terminal title doubles as a status channel — see
+        // `agent_title_status`. A &str compare per chunk; pushed on
+        // title-string change only (every frame for an animating spinner —
+        // the tracker reads that as a liveness heartbeat).
+        if self.parser.screen().title() != self.last_title {
+            let title = self.parser.screen().title().to_string();
+            let parsed = agent_title_status(&title);
+            self.last_title = title;
+            self.status.set_title_status(parsed);
         }
         self.status.on_output();
     }
@@ -1009,6 +1049,10 @@ impl PaneBackend for PtyPane {
         self.status.set_ext_link(up);
     }
 
+    fn set_title_signal(&mut self, enabled: bool) {
+        self.status.set_title_signal(enabled);
+    }
+
     fn on_exit(&mut self) {
         self.status.on_exit();
         // The PTY hit EOF because the child closed it — almost always because
@@ -1191,11 +1235,11 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_selection, gesture_presented, host_bell_bytes, host_clipboard_bytes,
-        host_notify_bytes, sanitize_for_host, scrub_control_env, scrub_host_identity,
-        sync_presented, CONTROL_ENV_VARS, GESTURE_FREEZE_STALE_CAP, HOST_IDENTITY_VARS,
-        HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL, OSC52_INTERVAL, OSC52_PAYLOAD_CAP,
-        SYNC_STALE_CAP_DEFAULT,
+        agent_title_status, extract_selection, gesture_presented, host_bell_bytes,
+        host_clipboard_bytes, host_notify_bytes, sanitize_for_host, scrub_control_env,
+        scrub_host_identity, sync_presented, AgentStatus, CONTROL_ENV_VARS,
+        GESTURE_FREEZE_STALE_CAP, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL,
+        OSC52_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -1465,6 +1509,22 @@ mod tests {
     fn sanitize_keeps_printable_text_verbatim() {
         assert_eq!(sanitize_for_host("run `ls -la`? (y/n)", 100), "run `ls -la`? (y/n)");
         assert_eq!(sanitize_for_host("a\tb\nc", 100), "abc");
+    }
+
+    /// D5: the title→status mapping — spinner frame (any braille glyph)
+    /// means working, `✳` means at rest, anything else is no signal. The
+    /// second char must be a space (or absent) so a title that merely starts
+    /// with one of these glyphs doesn't read as agent state.
+    #[test]
+    fn agent_title_status_maps_title_shapes() {
+        assert_eq!(agent_title_status("⠧ fixing tests"), Some(AgentStatus::Working));
+        assert_eq!(agent_title_status("⠧"), Some(AgentStatus::Working));
+        assert_eq!(agent_title_status("✳ Claude Code"), Some(AgentStatus::Waiting));
+        assert_eq!(agent_title_status("✳"), Some(AgentStatus::Waiting));
+        assert_eq!(agent_title_status("✳x"), None);
+        assert_eq!(agent_title_status("⠧x"), None);
+        assert_eq!(agent_title_status("bash — ~/code"), None);
+        assert_eq!(agent_title_status(""), None);
     }
 
     /// P11: every known host-identity var is removed (whether it came from

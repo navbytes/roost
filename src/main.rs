@@ -505,9 +505,9 @@ fn run(
                         app.on_session(id, s);
                     }
                 }
-                AppEvent::Status(id, token, s) => {
+                AppEvent::Status(id, token, s, detail) => {
                     if app.socket_authorized(id, &token) {
-                        if let Some(msg) = app.on_status(id, s) {
+                        if let Some(msg) = app.on_status(id, s, detail) {
                             notifier.notify(&msg);
                         }
                     }
