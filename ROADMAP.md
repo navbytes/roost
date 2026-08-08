@@ -234,6 +234,27 @@ Left:
 
 ## UX & robustness — deferred
 
+- **[choice] Leader-key / chord-sequence keybinds — assessed reliable,
+  deferred until the keyspace is actually pressured.** A prefix layer to
+  expand beyond the flat `Alt+<key>` layer. A fable reliability assessment
+  (2026-08-08) found a **single modal leader** clears the "as reliable as the
+  flat Alt layer" bar: `Alt+<leader>` enters a `Mode::Leader` pending state,
+  the next chord resolves from a flat config table (`"leader": {"c":
+  "new_pane"}`), `Esc` aborts — reusing the copy/scroll/search modal machinery
+  with **no wall-clock timer**, no state added to the pure `ui/input.rs`, and
+  no change to `main.rs` routing or the raw-passthrough path. The leader must
+  stay in the `Alt` namespace (a bare `Ctrl` prefix would steal the agent's
+  readline bytes — the P13 collision Alt-only exists to avoid). The **timed /
+  ambiguous-prefix** variant (vim-style `g` that might become `g t`) is
+  **rejected permanently**: wall-clock disambiguation is the nondeterminism
+  this project killed edge-autoscroll for. Deferred on worth-it, not on risk —
+  demand is other projects' upvotes (crush #737 ~23👍, zellij #2890 ~41👍),
+  per-chord remap already covers "move a binding", and ~6 unshifted + ~20
+  shifted `Alt` chords are still free. **Trigger to build:** a concrete feature
+  needs a chord and finds none free. Build it then, with this design — not
+  before. (General principle it confirmed: in roost, *modal* features — enter a
+  `Mode`, next keys resolve, `Esc` exits — are reliable and timer-free; any
+  feature needing a wall-clock timer to disambiguate input is the flaky path.)
 - ~~**[choice] Tab-bar overflow past 9 tabs.**~~ **ALREADY DONE — entry was
   stale.** Both halves shipped without this being ticked off: U7 (2026-07-27)
   added `Alt+0` for the last tab and `Alt+i`/`Alt+m` to step the strip with
