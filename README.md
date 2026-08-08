@@ -170,10 +170,13 @@ file — the default — and roost behaves exactly as documented above.
 
 A value is `"disable"` (the chord passes straight through to the pane, like
 an unbound key) or a snake_case `Action` name (see `src/ui/input.rs`). A
-chord listed twice keeps only its last value. Bad JSON, an unknown action, or
-an unparseable chord never blocks startup — roost starts with its defaults
-and names the bad entry (toast + activity feed). Read once at startup, not
-watched for changes.
+chord entry covers however your terminal happens to report that key (e.g.
+`alt+shift+p` and `alt+P` are the same chord), so one entry is enough
+regardless of which encoding your terminal uses. A chord listed twice keeps
+only its last value. Bad JSON, an unknown action, or an unparseable chord
+never blocks startup — roost starts with its defaults and names the bad
+entry (toast + activity feed). Read once at startup, not watched for
+changes.
 
 Everything else passes straight through to the focused pane. **Shift+Enter**
 and **Ctrl+Enter** are sent as "insert newline" rather than "submit", so you

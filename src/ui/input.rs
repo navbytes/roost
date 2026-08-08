@@ -536,7 +536,10 @@ impl Keymap {
     /// the file's path, prefixed onto each one) rather than blocking
     /// startup. A chord listed twice keeps only its last value — inherited
     /// for free from `serde_json`'s object parsing, which already collapses
-    /// a repeated JSON key the same way (documented in README).
+    /// a repeated JSON key the same way (documented in README). A chord
+    /// with more than one terminal-delivery encoding (`twins`) is disabled
+    /// or remapped on *every* encoding at once — never just the one the
+    /// entry happened to name.
     pub fn parse(raw: &str, source: &str) -> (Keymap, Vec<String>) {
         let mut diagnostics = Vec::new();
         let value: serde_json::Value = match serde_json::from_str(raw) {
@@ -564,12 +567,16 @@ impl Keymap {
                         continue;
                     };
                     if action_str == "disable" {
-                        keymap.overrides.insert(chord, Override::Disabled);
+                        for t in twins(chord.code, chord.shift) {
+                            keymap.overrides.insert(t, Override::Disabled);
+                        }
                         continue;
                     }
                     match action_by_name(action_str) {
                         Some(action) => {
-                            keymap.overrides.insert(chord, Override::Bound(action));
+                            for t in twins(chord.code, chord.shift) {
+                                keymap.overrides.insert(t, Override::Bound(action));
+                            }
                         }
                         None => diagnostics.push(format!(
                             "{source}: {chord_str:?}: unknown action {action_str:?} — skipped"
@@ -704,6 +711,44 @@ fn default_keymap() -> HashMap<Chord, Action> {
         }
     }
     map
+}
+
+/// Every `(code, shift)` the default table already treats as the *same*
+/// logical chord as `(code, shift)` itself — the terminal-delivery duality
+/// `default_chord_action` already carries for a handful of letters (p/P,
+/// r/R, a/A, i/I, m/M: some terminals send `Alt+Shift+p` as `('p', SHIFT)`,
+/// others as `('P', no SHIFT)`, and the default table binds both to
+/// `ToggleRaw` so either works). A config entry naming *one* delivery form
+/// must disable or remap *all* of them — otherwise it silently no-ops on
+/// whichever terminal happens to send the other one.
+///
+/// Derived from `default_chord_action`, not a hand-kept letter list: two
+/// `Char` chords are twins exactly when they share a case-folded letter and
+/// both already default to the same action. That reuses the one source of
+/// truth `default_keymap`/`translate` already run on, so a future letter
+/// gaining this pattern is covered automatically — see
+/// `twin_derivation_finds_every_same_letter_same_action_default_chord`.
+/// Always includes `(code, shift)` itself; non-`Char` codes and chords with
+/// no default action (nothing to be a twin of) have no other twins.
+fn twins(code: KeyCode, shift: bool) -> Vec<Chord> {
+    let (Some(action), KeyCode::Char(c)) = (default_chord_action(code, shift), code) else {
+        return vec![Chord { code, shift }];
+    };
+    let mut found = Vec::new();
+    for cased in [c.to_ascii_lowercase(), c.to_ascii_uppercase()] {
+        for s in [false, true] {
+            let candidate = Chord {
+                code: KeyCode::Char(cased),
+                shift: s,
+            };
+            if !found.contains(&candidate)
+                && default_chord_action(candidate.code, s) == Some(action)
+            {
+                found.push(candidate);
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -1500,5 +1545,92 @@ mod tests {
     fn disable_keyword_and_nonsense_names_are_not_actions() {
         assert_eq!(action_by_name("disable"), None);
         assert_eq!(action_by_name("nope"), None);
+    }
+
+    /// (a) Disabling a twinned chord disables EVERY delivery form a
+    /// terminal might use for it, not just the one the entry named. p/P is
+    /// the design doc's own example: some terminals send Alt+Shift+p as
+    /// `('p', SHIFT)`, others as `('P', no SHIFT)` — both must go dead, or
+    /// the escape hatch silently fails on whichever terminal sends the
+    /// other one.
+    #[test]
+    fn disabling_a_twinned_chord_disables_every_delivery_form() {
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+shift+p": "disable"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // Without the override, both forms are ToggleRaw (the
+        // uppercase-delivery tolerance already in the default table).
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('p'))),
+            InputResult::Action(Action::ToggleRaw)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('P'))),
+            InputResult::Action(Action::ToggleRaw)
+        ));
+        // Disabled: neither form produces an Action anymore — both forward.
+        assert!(!matches!(
+            translate_with(alt_shift(KeyCode::Char('p')), &keymap),
+            InputResult::Action(_)
+        ));
+        assert!(!matches!(
+            translate_with(alt(KeyCode::Char('P')), &keymap),
+            InputResult::Action(_)
+        ));
+    }
+
+    /// (b) Remapping a twinned chord moves EVERY delivery form to the new
+    /// action. Named via the `"alt+A"` spelling here (rather than
+    /// `"alt+shift+a"`) to prove both spellings reach the identical twin
+    /// set — they're derived from the same default binding either way.
+    #[test]
+    fn remapping_a_twinned_chord_moves_every_delivery_form() {
+        let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+A": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // Both delivery forms of the shifted chord (default: ToggleRoster)
+        // now quit instead...
+        assert!(matches!(
+            translate_with(alt_shift(KeyCode::Char('a')), &keymap),
+            InputResult::Action(Action::Quit)
+        ));
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('A')), &keymap),
+            InputResult::Action(Action::Quit)
+        ));
+        // ...and the unshifted chord (JumpAttention) is untouched: it isn't
+        // a twin of the shifted one, just another binding on the same
+        // letter — twin expansion must not overreach into it.
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('a')), &keymap),
+            InputResult::Action(Action::JumpAttention)
+        ));
+    }
+
+    /// (c) The twin derivation is mechanical, not a hand-kept letter list:
+    /// for every chord the default table binds, its twin set must contain
+    /// every OTHER default-bound chord that shares its action and its
+    /// letter (case-insensitively) — so a future letter gaining this same
+    /// delivery-duality pattern is covered automatically, with nothing here
+    /// that has to be remembered and updated by hand.
+    #[test]
+    fn twin_derivation_finds_every_same_letter_same_action_default_chord() {
+        let table = default_keymap();
+        for (&chord, &action) in &table {
+            let KeyCode::Char(c) = chord.code else {
+                continue;
+            };
+            let found = twins(chord.code, chord.shift);
+            for (&other, &other_action) in &table {
+                let KeyCode::Char(oc) = other.code else {
+                    continue;
+                };
+                if oc.eq_ignore_ascii_case(&c) && other_action == action {
+                    assert!(
+                        found.contains(&other),
+                        "{chord:?} ({action:?})'s twins must include {other:?}"
+                    );
+                }
+            }
+        }
     }
 }
