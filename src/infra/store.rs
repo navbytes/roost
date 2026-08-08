@@ -15,17 +15,26 @@ pub struct FsStore {
 }
 
 impl FsStore {
-    /// `$ROOST_STATE/workspace.json` when set (isolated profiles / parallel
-    /// instances), else the XDG state dir.
-    pub fn default_path() -> PathBuf {
+    /// The directory roost's per-instance state lives in: `$ROOST_STATE`
+    /// when set (isolated profiles / parallel instances), else the XDG
+    /// state dir's `roost` subdirectory. Shared by `default_path`
+    /// (workspace.json) and `infra::config` (config.json — the
+    /// key-bindings escape hatch), so `$ROOST_STATE` redirects both
+    /// together: an isolated fleet's config stays isolated with it.
+    pub fn state_dir() -> PathBuf {
         if let Some(dir) = std::env::var_os("ROOST_STATE") {
-            return PathBuf::from(dir).join("workspace.json");
+            return PathBuf::from(dir);
         }
         dirs::state_dir()
             .or_else(dirs::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("roost")
-            .join("workspace.json")
+    }
+
+    /// `$ROOST_STATE/workspace.json` when set (isolated profiles / parallel
+    /// instances), else the XDG state dir.
+    pub fn default_path() -> PathBuf {
+        Self::state_dir().join("workspace.json")
     }
 
     pub fn new(path: PathBuf) -> Self {
