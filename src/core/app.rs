@@ -486,6 +486,14 @@ pub struct App<B: PaneBackend> {
     /// a feed transition line (`diff_statuses`). Pruned to just the
     /// currently-running panes on the same cadence.
     last_status: HashMap<PaneId, AgentStatus>,
+    /// The question behind a pane's current NeedsInput, when its extension
+    /// reported one (the ask-tool's prompt text) — consumed by the feed's
+    /// transition line and the desktop notification so they can say *what*
+    /// the agent is asking, not just that it asks. Inserted/cleared by
+    /// `on_status` on every report (a report without a message clears it, so
+    /// a stale question never outlives the ask it belongs to); pruned
+    /// alongside `last_status` on the same cadence.
+    needy_msgs: HashMap<PaneId, String>,
     /// F3 (exit UX audit 2026-08-07): panes `attention_ring`'s ○ fallback
     /// must skip because focus already landed on them *during their current
     /// Waiting spell* — unlike ◆, which self-clears the moment you act on a
@@ -642,6 +650,7 @@ impl<B: PaneBackend> App<B> {
             waiters: Vec::new(),
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
+            needy_msgs: HashMap::new(),
             visited_waiting: HashSet::new(),
             feed: VecDeque::new(),
             float: None,
@@ -1108,7 +1117,11 @@ impl<B: PaneBackend> App<B> {
         let (rows, cols) = inner_dims(rect);
         let pixels = self.pane_pixels(rows, cols);
         match B::spawn(id, &cmd, rows, cols, pixels, self.tx.clone()) {
-            Ok(rt) => {
+            Ok(mut rt) => {
+                // D5: the title-status channel is live only while an agent
+                // runs here — on at birth for agent panes, and kept current
+                // by `observe_panes` for shells that launch one by hand.
+                rt.set_title_signal(spec.adapter != "shell");
                 self.runtimes.insert(id, rt);
                 self.dead.remove(&id);
                 // Owe this pane a session id? Watch for one (socket reports
@@ -1222,12 +1235,21 @@ impl<B: PaneBackend> App<B> {
                     }
                     // U2: `{id} {display_name}`, so four identical shells'
                     // transitions stop being indistinguishable in the feed.
-                    let text = format!(
+                    let mut text = format!(
                         "{}: {} → {}",
                         self.feed_label(id),
                         state_word(old),
                         state_word(status)
                     );
+                    // A ◆ landing with a known question says what it is —
+                    // "needs input — pick a database" reads, "needs input"
+                    // sends you to the pane to find out.
+                    if status == AgentStatus::NeedsInput {
+                        if let Some(q) = self.needy_msgs.get(&id) {
+                            text.push_str(" — ");
+                            text.push_str(q);
+                        }
+                    }
                     self.push_feed(text, status == AgentStatus::NeedsInput, Some(id));
                 }
             }
@@ -1237,6 +1259,7 @@ impl<B: PaneBackend> App<B> {
         // stale entry per pane ever spawned over a long session. F3's
         // visited-set is pruned on the same cadence, same reason.
         self.last_status.retain(|id, _| self.runtimes.contains_key(id));
+        self.needy_msgs.retain(|id, _| self.runtimes.contains_key(id));
         self.visited_waiting.retain(|id| self.runtimes.contains_key(id));
     }
 
@@ -1260,6 +1283,9 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
+        // D5: adapter flips collected here and pushed into the runtimes'
+        // title-signal gate after the loop (`find_spec_mut` holds `self`).
+        let mut retitle: Vec<(PaneId, bool)> = Vec::new();
         // U20: directories a pane has *moved into* since we last looked —
         // the user typing `cd ~/project` is the clearest possible statement
         // that it is a directory they are working in, which is exactly what
@@ -1290,7 +1316,17 @@ impl<B: PaneBackend> App<B> {
                 if !demoting {
                     promoted.push(id);
                 }
+                retitle.push((id, !demoting));
                 dirty = true;
+            }
+        }
+        // D5: promote/demote flips the title-status gate with the adapter —
+        // an exited agent's leftover `✳`/spinner title must stop counting
+        // the moment the pane is a plain shell again (demotion clears the
+        // stored signal too, so a relaunch starts clean).
+        for (id, enabled) in retitle {
+            if let Some(rt) = self.runtimes.get_mut(&id) {
+                rt.set_title_signal(enabled);
             }
         }
         // A newly-recognized agent needs its already-created session file
@@ -2363,10 +2399,38 @@ impl<B: PaneBackend> App<B> {
 
     /// Exact status from an agent-side extension. Returns a notification
     /// message when a *non-focused* pane starts needing the user.
-    pub fn on_status(&mut self, id: PaneId, status: AgentStatus) -> Option<String> {
+    ///
+    /// `detail` is the optional question text riding a `needs_input` report
+    /// (the ask-tool's prompt). Every report updates `needy_msgs` — set on a
+    /// NeedsInput that carries one, cleared otherwise — so the question can
+    /// never outlive the ask it belongs to and reappear on a later ◆.
+    pub fn on_status(
+        &mut self,
+        id: PaneId,
+        status: AgentStatus,
+        detail: Option<String>,
+    ) -> Option<String> {
         let prev = self.runtimes.get(&id).map(|rt| rt.status());
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.set_extension_status(status);
+        }
+        // Socket-sourced text crossing into UI surfaces (feed, notification):
+        // untrusted chrome-bound text — P6-class sanitization via
+        // `sanitize_needy_msg` (controls including C1 become spaces, char
+        // cap), see its doc for why neither existing sanitizer fits.
+        let detail = match status {
+            AgentStatus::NeedsInput => {
+                detail.map(|m| sanitize_needy_msg(&m)).filter(|m| !m.is_empty())
+            }
+            _ => None,
+        };
+        match &detail {
+            Some(m) => {
+                self.needy_msgs.insert(id, m.clone());
+            }
+            None => {
+                self.needy_msgs.remove(&id);
+            }
         }
         // NeedsInput is an explicit "I need you" and always pulls attention;
         // Waiting is softer (turn ended) — only notify when it follows active
@@ -2378,8 +2442,12 @@ impl<B: PaneBackend> App<B> {
         };
         if became_needy && id != self.focused {
             // U2: the shared display name — "shell · roost is waiting for
-            // you", not an anonymous "shell is waiting for you".
-            Some(format!("{} is waiting for you", self.display_name(id)))
+            // you", not an anonymous "shell is waiting for you". With a
+            // question attached, say what's actually being asked.
+            Some(match detail {
+                Some(q) => format!("{} asks: {q}", self.display_name(id)),
+                None => format!("{} is waiting for you", self.display_name(id)),
+            })
         } else {
             None
         }
@@ -5655,6 +5723,27 @@ fn sanitize_title(raw: &str, cap: usize) -> String {
     raw.chars().filter(|c| !c.is_control()).take(cap).collect::<String>().trim().to_string()
 }
 
+/// Cap for a needs-input question crossing the socket into chrome —
+/// **chars**, unlike `AUDIT_FIELD_CAP`'s bytes (that one budgets disk).
+/// Room for a real multi-sentence ask; still ~30× under the socket's
+/// per-line limit even at 4 bytes a char.
+const NEEDY_MSG_CAP: usize = 512;
+
+/// P6-class sanitize for the needs-input question (`on_status`'s `detail`).
+/// Neither existing helper fits: `sanitize` (audit log) passes C1 controls
+/// through, `sanitize_title` *drops* controls, which would glue a multi-line
+/// ask's words together ("line one\nline two" → "line oneline two"). Here
+/// every control char (C0 and C1) becomes a space, then trim + char-cap on
+/// char boundaries.
+fn sanitize_needy_msg(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(NEEDY_MSG_CAP)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// U12's busy predicate, shared by the Alt+w and Alt+q destructive guards so
 /// the two can never disagree about what "busy" means: an agent mid-turn is
 /// one actively producing (`Working`) *or* blocked on your approval
@@ -8489,13 +8578,13 @@ mod tests {
     fn notification_only_for_unfocused_working_to_waiting() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // focus = 2
-        app.on_status(1, AgentStatus::Working);
-        assert!(app.on_status(1, AgentStatus::Waiting).is_some());
+        app.on_status(1, AgentStatus::Working, None);
+        assert!(app.on_status(1, AgentStatus::Waiting, None).is_some());
         // Focused pane never notifies.
-        app.on_status(2, AgentStatus::Working);
-        assert!(app.on_status(2, AgentStatus::NeedsInput).is_none());
+        app.on_status(2, AgentStatus::Working, None);
+        assert!(app.on_status(2, AgentStatus::NeedsInput, None).is_none());
         // Idle → waiting (no working phase) doesn't notify.
-        assert!(app.on_status(1, AgentStatus::Waiting).is_none());
+        assert!(app.on_status(1, AgentStatus::Waiting, None).is_none());
     }
 
     #[test]
@@ -8504,9 +8593,9 @@ mod tests {
         // NeedsInput, no Working) must still pull attention when unfocused.
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // focus = 2, pane 1 unfocused & idle
-        assert!(app.on_status(1, AgentStatus::NeedsInput).is_some());
+        assert!(app.on_status(1, AgentStatus::NeedsInput, None).is_some());
         // ...but still never for the focused pane.
-        assert!(app.on_status(2, AgentStatus::NeedsInput).is_none());
+        assert!(app.on_status(2, AgentStatus::NeedsInput, None).is_none());
     }
 
     /// Regression: a descendant pi (a subagent, a one-shot `pi -p` tool
@@ -8521,13 +8610,13 @@ mod tests {
     fn socket_exited_from_a_nested_agent_does_not_kill_a_live_pane() {
         let (mut app, _) = mk_app(shell_ws());
         let id = app.focused;
-        app.on_status(id, AgentStatus::Working);
+        app.on_status(id, AgentStatus::Working, None);
         // The nested pi finishes its work: session_shutdown → "exited".
-        assert!(app.on_status(id, AgentStatus::Exited).is_none());
+        assert!(app.on_status(id, AgentStatus::Exited, None).is_none());
         assert!(!app.focused_dead(), "socket 'exited' must not enter the dead-pane key path");
         assert_eq!(app.runtimes.get(&id).unwrap().status(), AgentStatus::Waiting);
         // The pane's own agent keeps going — status recovers, nothing sticky.
-        app.on_status(id, AgentStatus::Working);
+        app.on_status(id, AgentStatus::Working, None);
         assert_eq!(app.runtimes.get(&id).unwrap().status(), AgentStatus::Working);
         // The real death still lands: PTY EOF is the one true exit signal.
         app.on_pty_exit(id);
@@ -9897,6 +9986,8 @@ mod tests {
     #[test]
     fn observe_promotes_shell_to_agent_and_tracks_cwd() {
         let (mut app, store) = mk_app(shell_ws());
+        // D5: a plain shell pane spawns with the title channel disarmed.
+        assert_eq!(app.runtimes[&1].title_signal, Some(false));
         // pane 1: user cd'd to /work/proj and typed `pi`
         app.runtimes.get_mut(&1).unwrap().observation = Some(Observation {
             cwd: Some(PathBuf::from("/work/proj")),
@@ -9906,6 +9997,8 @@ mod tests {
         let spec = app.find_spec(1).unwrap();
         assert_eq!(spec.adapter, "pi");
         assert_eq!(spec.cwd, PathBuf::from("/work/proj"));
+        // D5: the promotion arms the title channel for the running agent.
+        assert_eq!(app.runtimes[&1].title_signal, Some(true));
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes[&1].adapter, "pi"); // persisted
         assert!(app.pending_detect.contains_key(&1)); // queued for session detection
@@ -9916,11 +10009,16 @@ mod tests {
         let mut ws = shell_ws();
         ws.tabs[0].panes.get_mut(&1).unwrap().adapter = "pi".into();
         let (mut app, _) = mk_app(ws);
+        // D5: an agent-adapter pane's title channel is armed at spawn.
+        assert_eq!(app.runtimes[&1].title_signal, Some(true));
         // pi exited; the pane is a plain shell again
         app.runtimes.get_mut(&1).unwrap().observation =
             Some(Observation { cwd: None, agent: None });
         app.observe_panes();
         assert_eq!(app.find_spec(1).unwrap().adapter, "shell");
+        // D5: the demotion disarms the title channel — an exited agent's
+        // leftover `✳` must not veto Working for later shell commands.
+        assert_eq!(app.runtimes[&1].title_signal, Some(false));
     }
 
     #[test]
@@ -12166,8 +12264,43 @@ mod tests {
         // waiting for you" — same helper as every other fleet surface.
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // focus = 2, so pane 1 is unfocused
-        let msg = app.on_status(1, AgentStatus::NeedsInput);
+        let msg = app.on_status(1, AgentStatus::NeedsInput, None);
         assert_eq!(msg.as_deref(), Some("shell · tmp is waiting for you"));
+    }
+
+    #[test]
+    fn needs_input_question_reaches_notification_and_feed_line() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.pane_order()[0];
+        app.apply(Action::NewPane); // focus moves off pane `id`
+        // Seed the diff baseline so the ◆ below logs as a transition.
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let msg = app.on_status(id, AgentStatus::NeedsInput, Some("pick a database".into()));
+        assert_eq!(msg.as_deref(), Some("shell · tmp asks: pick a database"));
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        let line = app.feed().back().unwrap();
+        assert!(line.needs_input);
+        assert_eq!(
+            line.text,
+            format!("{}: idle → needs you — pick a database", app.feed_label(id))
+        );
+
+        // Per-ask, not sticky: the next ◆ without a question is plain again —
+        // a stale question must never resurrect on a later, unrelated ask.
+        app.on_status(id, AgentStatus::Working, None);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        let msg = app.on_status(id, AgentStatus::NeedsInput, None);
+        assert_eq!(msg.as_deref(), Some("shell · tmp is waiting for you"));
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.feed().back().unwrap().text,
+            format!("{}: working → needs you", app.feed_label(id))
+        );
     }
 
     #[test]

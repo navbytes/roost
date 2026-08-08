@@ -344,15 +344,22 @@ Status arrives two ways:
    - pi: [`extensions/roost.ts`](extensions/roost.ts) — roost installs/updates
      it into `~/.pi/agent/extensions/` automatically at startup when pi is
      present (set `ROOST_NO_EXT_INSTALL` to manage it yourself). Uses pi's
-     `agent_start`/`agent_end`/`session_start`/`project_trust`/ask-tool
-     events, and reports session ids instantly.
+     `agent_start`/`agent_settled`/`session_start`/`project_trust`/ask-tool
+     events (pi ≥ 0.80.4), reports session ids instantly — and when an
+     ask-tool fires, sends the question itself, so the feed line and
+     notification say what's being asked.
    - Claude Code: roost installs/updates three hooks into
      `~/.claude/settings.json` automatically at startup when Claude Code is
-     present (same `ROOST_NO_EXT_INSTALL` opt-out). Details:
+     present (same `ROOST_NO_EXT_INSTALL` opt-out). The needs-you hook
+     forwards Claude's own reason ("Claude needs your permission to use
+     Bash") the same way. Details:
      [`extensions/claude-code-hooks.md`](extensions/claude-code-hooks.md).
 2. **Heuristic fallback** — recent PTY output ⇒ working; silence ⇒ waiting; a
-   terminal bell (`0x07`) ⇒ needs-you (tmux-style), for an adapter/TUI with no
-   exact extension/hook channel of its own. pi needs none of this for its own
+   terminal bell (`0x07`) ⇒ needs-you (tmux-style); and for agents that
+   publish state in their terminal title (Claude Code's braille spinner while
+   working, `✳` at rest) the title itself — an exact-ish signal that fills
+   the gap between Claude's one-shot hook connections, never overriding a
+   live extension link or a needs-you. pi needs none of this for its own
    needs-you signal: its one blocking prompt (the project-trust dialog) is
    reported directly via the `project_trust` event above.
 

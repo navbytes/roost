@@ -78,12 +78,48 @@ pub fn maybe_run() -> Option<i32> {
 /// stdout/stderr or returns nonzero — a broken or unreachable socket must
 /// never surface as hook noise or an error in the user's Claude Code session.
 fn run_status_hook(args: &[String]) -> i32 {
+    let pane = std::env::var("ROOST_PANE").ok();
+    // stdin is consulted only once the no-op guard has already passed:
+    // outside roost ($ROOST_PANE unset) these hooks fire for every Claude
+    // Code session on the machine, and the contract there is "exits 0
+    // instantly without touching anything" — a stdin read that could block
+    // on a pipe nobody closes would break exactly that.
+    let message = match pane.as_deref() {
+        Some(p) if !p.is_empty() => hook_stdin_message(args.first().map(String::as_str)),
+        _ => None,
+    };
     status_hook(
-        std::env::var("ROOST_PANE").ok(),
+        pane,
         std::env::var("ROOST_TOKEN").unwrap_or_default(),
         std::env::var_os("ROOST_SOCK").map(Into::into),
         args.first().map(String::as_str),
+        message,
     )
+}
+
+/// The `message` field of the hook-input JSON Claude Code writes to a hook's
+/// stdin — for the Notification hook that's the human-readable reason
+/// ("Claude needs your permission to use Bash", "Claude is waiting for your
+/// input"), which roost surfaces with the ◆ exactly like a pi ask-tool's
+/// question. Only consulted for `needs_input` (the one status whose hook
+/// carries a reason worth showing); anything else skips the read entirely.
+/// Never blocks on a human: a TTY stdin (someone typing the verb by hand) is
+/// skipped, and a real hook's pipe is read to EOF (Claude writes the JSON
+/// and closes) with a cap well past any legitimate hook input. Any read or
+/// parse failure is just "no message" — same never-fail-loudly contract as
+/// the rest of the hook path.
+fn hook_stdin_message(status: Option<&str>) -> Option<String> {
+    use std::io::{IsTerminal, Read};
+    if status != Some("needs_input") || std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut buf = String::new();
+    std::io::stdin().take(64 * 1024).read_to_string(&mut buf).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&buf).ok()?;
+    // Cap here, not just app-side: an oversized message would push the whole
+    // status line past the socket's per-line limit and cost the report
+    // itself, not just the text.
+    v.get("message")?.as_str().map(|m| m.chars().take(512).collect())
 }
 
 /// The pure-ish core behind `run_status_hook`, taking its inputs as
@@ -95,16 +131,20 @@ fn status_hook(
     token: String,
     sock: Option<std::path::PathBuf>,
     status: Option<&str>,
+    message: Option<String>,
 ) -> i32 {
     let Some(pane) = pane.filter(|p| !p.is_empty()) else { return 0 };
     let Some(status) = status else { return 0 };
     let sock = sock.unwrap_or_else(socket_path);
-    let msg = serde_json::json!({
+    let mut msg = serde_json::json!({
         "pane": pane,
         "token": token,
         "event": "status",
         "status": status,
     });
+    if let Some(m) = message {
+        msg["message"] = serde_json::Value::String(m);
+    }
     let _ = write_line(&sock, &msg); // best-effort: a hook must never fail loudly
     0
 }
@@ -603,9 +643,12 @@ mod status_hook_tests {
         let (sock, listener) = scratch_sock("noop");
         listener.set_nonblocking(true).unwrap();
 
-        assert_eq!(status_hook(None, String::new(), Some(sock.clone()), Some("working")), 0);
-        assert_eq!(status_hook(Some(String::new()), String::new(), Some(sock.clone()), Some("working")), 0);
-        assert_eq!(status_hook(Some("3".into()), "t".into(), Some(sock.clone()), None), 0);
+        assert_eq!(status_hook(None, String::new(), Some(sock.clone()), Some("working"), None), 0);
+        assert_eq!(
+            status_hook(Some(String::new()), String::new(), Some(sock.clone()), Some("working"), None),
+            0
+        );
+        assert_eq!(status_hook(Some("3".into()), "t".into(), Some(sock.clone()), None, None), 0);
 
         assert!(
             listener.accept().is_err(),
@@ -618,7 +661,13 @@ mod status_hook_tests {
     fn writes_exactly_the_status_line_the_socket_expects() {
         let (sock, listener) = scratch_sock("wire");
 
-        let code = status_hook(Some("7".into()), "tok".into(), Some(sock.clone()), Some("needs_input"));
+        let code = status_hook(
+            Some("7".into()),
+            "tok".into(),
+            Some(sock.clone()),
+            Some("needs_input"),
+            Some("Claude needs your permission to use Bash".into()),
+        );
         assert_eq!(code, 0);
 
         let (stream, _) = listener.accept().expect("status_hook never connected");
@@ -630,7 +679,23 @@ mod status_hook_tests {
         assert_eq!(v["token"], "tok");
         assert_eq!(v["event"], "status");
         assert_eq!(v["status"], "needs_input");
+        assert_eq!(v["message"], "Claude needs your permission to use Bash");
 
+        let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+    }
+
+    /// The hook-input reason rides only when present — a plain report stays
+    /// byte-identical to the old wire shape (no `message` key at all).
+    #[test]
+    fn no_message_means_no_message_key_on_the_wire() {
+        let (sock, listener) = scratch_sock("bare");
+        assert_eq!(status_hook(Some("7".into()), "tok".into(), Some(sock.clone()), Some("working"), None), 0);
+        let (stream, _) = listener.accept().expect("status_hook never connected");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read the status line");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("valid JSON");
+        assert!(v.get("message").is_none());
         let _ = std::fs::remove_dir_all(sock.parent().unwrap());
     }
 }

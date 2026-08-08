@@ -64,6 +64,14 @@ same status line the socket has always expected, then exits. Outside roost
 `$ROOST_PANE` is unset and it exits 0 instantly without touching the socket
 — identical to the pi extension's no-op behavior.
 
+For `needs_input` it additionally reads the hook-input JSON Claude Code
+writes to the hook's stdin and forwards its `message` field — the
+human-readable reason ("Claude needs your permission to use Bash", "Claude
+is waiting for your input") — so roost's feed line and notification can say
+*why* the pane needs you, not just that it does. Reading is skipped when
+stdin is a terminal (typing the verb by hand never blocks), and any missing
+or malformed input simply means no message — the hook still reports.
+
 This replaces the old `nc -U -q0 "$ROOST_SOCK"` command an earlier version of
 this doc had you copy by hand: macOS's built-in `/usr/bin/nc` is BSD netcat
 and doesn't support `-q` at all (that's `netcat-openbsd`, not installed by

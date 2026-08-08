@@ -139,6 +139,12 @@ pub trait PaneBackend: Sized {
     /// `StatusTracker::set_ext_link`. Default no-op: a backend with no
     /// notion of a reporting connection has nothing to gate on it.
     fn set_ext_link(&mut self, _up: bool) {}
+    /// Whether an agent is currently running in this pane (D5) — the gate on
+    /// the terminal-title status channel, pushed by the app layer (spawn
+    /// adapter + `observe_panes` promote/demote). See
+    /// `StatusTracker::set_title_signal`. Default no-op: a backend with no
+    /// title parsing has nothing to gate.
+    fn set_title_signal(&mut self, _enabled: bool) {}
     fn on_exit(&mut self);
 
     /// Has the pane negotiated the kitty "disambiguate" keyboard flag? When
@@ -352,6 +358,11 @@ pub mod fakes {
         /// `App::ext_link_counts`'s refcount produces without needing a real
         /// `StatusTracker`.
         pub ext_link: bool,
+        /// D5 test-observable, `ext_link`'s pattern: the last value
+        /// `set_title_signal` was called with (`None` = never called), so
+        /// App-level tests can pin the gate's wiring — spawn and
+        /// `observe_panes`'s promote/demote — without a real `StatusTracker`.
+        pub title_signal: Option<bool>,
         /// C29 (selection-freeze amendment): the (`grab`, `rows`) pair
         /// captured by `freeze_view`, mirroring the real backend's
         /// `presented()` split without a real vt100 grid to snapshot —
@@ -396,6 +407,7 @@ pub mod fakes {
                 effects: PaneEffects::default(),
                 cursor_shape: None,
                 ext_link: false,
+                title_signal: None,
                 frozen: None,
             })
         }
@@ -442,6 +454,9 @@ pub mod fakes {
         }
         fn set_ext_link(&mut self, up: bool) {
             self.ext_link = up;
+        }
+        fn set_title_signal(&mut self, enabled: bool) {
+            self.title_signal = Some(enabled);
         }
         fn on_exit(&mut self) {
             self.exited = true;

@@ -8,6 +8,11 @@
 //!   { "pane": "3", "token": "<hex>", "event": "status",  "status": "working"
 //!                                    | "waiting" | "needs_input" | "exited" }
 //!
+//! A "needs_input" status may carry an optional "message" — the question the
+//! agent is asking (an ask-tool's prompt, a hook's notification reason).
+//! Accepted on needs_input only, dropped at parse for every other status;
+//! sanitized app-side before it reaches any UI surface.
+//!
 //! "exited" is still accepted for stale extensions but is advisory only —
 //! `StatusTracker::set_extension_status` demotes it to Waiting. Process death
 //! has exactly one ground truth (the pane's PTY EOF): the pane's env is
@@ -298,6 +303,11 @@ struct Msg {
     session: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    /// Optional human-readable detail riding a status report — the question
+    /// an ask-tool is asking on `needs_input`. Sanitized (control chars,
+    /// length) app-side before display, like every other socket string.
+    #[serde(default)]
+    message: Option<String>,
 }
 
 /// A control request is any message carrying a `method` field (status/session
@@ -394,7 +404,15 @@ fn parse_line(line: &str) -> Option<AppEvent> {
                 "exited" => AgentStatus::Exited,
                 _ => return None,
             };
-            Some(AppEvent::Status(pane, token, status))
+            // Only needs_input carries a message (the ask-tool's question);
+            // dropping it from other statuses here means no stale question
+            // can ever ride a working/waiting report into the app.
+            let message = if status == AgentStatus::NeedsInput {
+                msg.message.filter(|m| !m.trim().is_empty())
+            } else {
+                None
+            };
+            Some(AppEvent::Status(pane, token, status, message))
         }
         _ => None,
     }
@@ -753,7 +771,7 @@ impl Drop for ConnGuard<'_> {
 /// means.
 fn link_pane_token(ev: &AppEvent) -> Option<(PaneId, String)> {
     match ev {
-        AppEvent::Status(pane, token, _) => Some((*pane, token.clone())),
+        AppEvent::Status(pane, token, ..) => Some((*pane, token.clone())),
         AppEvent::Session(pane, token, _) => Some((*pane, token.clone())),
         _ => None,
     }
@@ -1372,7 +1390,7 @@ mod tests {
     #[test]
     fn parses_string_and_numeric_pane_ids() {
         let ev = parse_line(r#"{"pane":"7","event":"status","token":"tok","status":"working"}"#);
-        assert!(matches!(ev, Some(AppEvent::Status(7, ref t, AgentStatus::Working)) if t == "tok"));
+        assert!(matches!(ev, Some(AppEvent::Status(7, ref t, AgentStatus::Working, _)) if t == "tok"));
         let ev = parse_line(r#"{"pane":7,"event":"session","token":"tok","session":"abc-123"}"#);
         match ev {
             Some(AppEvent::Session(7, t, s)) => {
@@ -1388,7 +1406,7 @@ mod tests {
         // A message without a token still parses (empty token), but App's
         // socket_authorized fails closed on an empty token.
         let ev = parse_line(r#"{"pane":"7","event":"status","status":"working"}"#);
-        assert!(matches!(ev, Some(AppEvent::Status(7, ref t, _)) if t.is_empty()));
+        assert!(matches!(ev, Some(AppEvent::Status(7, ref t, _, _)) if t.is_empty()));
     }
 
     #[test]
@@ -1396,6 +1414,27 @@ mod tests {
         assert!(parse_line("not json").is_none());
         assert!(parse_line(r#"{"pane":"x","event":"status","status":"working"}"#).is_none());
         assert!(parse_line(r#"{"pane":"1","event":"status","status":"???"}"#).is_none());
+    }
+
+    /// The optional question text rides `needs_input` only — on any other
+    /// status (or as pure whitespace) it's dropped at the door, so no stale
+    /// or sneaky message can enter through a working/waiting report.
+    #[test]
+    fn status_message_rides_needs_input_only() {
+        let ev = parse_line(
+            r#"{"pane":7,"token":"tok","event":"status","status":"needs_input","message":"pick a database"}"#,
+        );
+        assert!(
+            matches!(ev, Some(AppEvent::Status(7, _, AgentStatus::NeedsInput, Some(ref m))) if m == "pick a database")
+        );
+        let ev = parse_line(
+            r#"{"pane":7,"token":"tok","event":"status","status":"working","message":"sneaky"}"#,
+        );
+        assert!(matches!(ev, Some(AppEvent::Status(7, _, AgentStatus::Working, None))));
+        let ev = parse_line(
+            r#"{"pane":7,"token":"tok","event":"status","status":"needs_input","message":"  "}"#,
+        );
+        assert!(matches!(ev, Some(AppEvent::Status(7, _, AgentStatus::NeedsInput, None))));
     }
 
     // P0: a line that carries a `method` key was addressed to the control
@@ -2250,7 +2289,7 @@ mod tests {
     /// promoted status-only connection must survive an idle gap past
     /// `READ_TIMEOUT` (30s) itself, not merely past the much smaller
     /// pre-auth deadline. Before this fix: a pi pane finishes a turn
-    /// (`agent_end` → `waiting`), the human reads the output for more than
+    /// (`agent_settled` → `waiting`), the human reads the output for more than
     /// 30s — the *normal* operating condition, not an edge case — the
     /// server silently closed the connection (`Err(_) => break` on the
     /// `READ_TIMEOUT` firing), and the extension's next write EPIPEs and
@@ -2293,7 +2332,7 @@ mod tests {
                 .expect("setup: link-up/status never arrived")
             {
                 AppEvent::ExtLink(1, ref t, true) if t == "t" => got_link_up = true,
-                AppEvent::Status(1, ref t, AgentStatus::Working) if t == "t" => {}
+                AppEvent::Status(1, ref t, AgentStatus::Working, _) if t == "t" => {}
                 _ => panic!("unexpected setup event (wanted exactly one link-up and one status)"),
             }
         }
@@ -2357,7 +2396,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("no second event within the deadline");
         assert!(
-            matches!(second, AppEvent::Status(1, ref t, AgentStatus::Working) if t == "tok"),
+            matches!(second, AppEvent::Status(1, ref t, AgentStatus::Working, _) if t == "tok"),
             "expected the status report itself second"
         );
 
@@ -2492,7 +2531,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("status report never arrived");
             assert!(
-                matches!(status, AppEvent::Status(1, ref t, AgentStatus::Working) if t == "t"),
+                matches!(status, AppEvent::Status(1, ref t, AgentStatus::Working, _) if t == "t"),
                 "round {round}: expected the status report"
             );
             let down = rx

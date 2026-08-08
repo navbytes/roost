@@ -159,8 +159,8 @@ Ground truth from pi's docs:
 |---|---|
 | `session_start` (reasons: startup/new/resume/fork) | report session ID → roost persists it |
 | `agent_start` | status = **Working** |
-| `agent_end` | status = **Waiting** (agent finished a turn; ball is in your court) |
-| `tool_call` on user-facing asks / `ctx.ui.confirm` flows | status = **Needs input** |
+| `agent_settled` (pi ≥ 0.80.4; `agent_end` kept as the guarded fallback for older pi) | status = **Waiting** (turn truly over; ball is in your court). Bare `agent_end` also fires between a run and its automatic follow-ups — retry after a provider error, compaction, a queued continuation — and flapped ○/● on every recovery; both handlers share an `isIdle` guard so a mid-recovery `agent_end` stays silent wherever pi can say so. |
+| `tool_call` on user-facing asks / `ctx.ui.confirm` flows | status = **Needs input**, with the ask's question text riding along as `message` — surfaced in the feed line and the notification so you see *what* it's asking |
 | `session_shutdown` | close the socket; no status report |
 
 `session_shutdown` deliberately reports nothing: **Exited** has exactly one ground truth — the pane's PTY hitting EOF when its child dies. The extension also runs in *nested* pi processes (a subagent, a one-shot `pi -p` tool call, a pi launched inside a `shell` pane — all inherit `ROOST_PANE`/`ROOST_TOKEN`), so a shutdown report would falsely mark the pane exited whenever a nested pi merely finished its work. Roost demotes any "exited" a stale extension still sends to **Waiting** for the same reason.
@@ -172,8 +172,9 @@ This is the "hybrid" model made concrete: where we control an extension API, sta
 ### 6.2 claude adapter (v1.1)
 
 - Sessions: `~/.claude/projects/<encoded-cwd>/*.jsonl`; resume with `claude --resume <session-id>` (or `claude --continue` for most recent in cwd).
-- Clean signals: Claude Code **hooks** (`Notification`, `Stop`, `PreToolUse`) can run a shell command — point them at the same unix socket. Same design as the pi extension, different plug.
+- Clean signals: Claude Code **hooks** (`Notification`, `Stop`, `PreToolUse`) can run a shell command — point them at the same unix socket. Same design as the pi extension, different plug. The `Notification` hook's own stdin JSON carries the human-readable reason ("Claude needs your permission to use Bash"); roost's hook shim forwards it as the status line's `message`, so the ◆ says why.
 - Session detection fallback: diff the project's session dir before/after spawn; newest new `.jsonl` is ours.
+- Title channel (D5): Claude Code also publishes its state in the terminal title — a braille spinner frame (`⠧ …`) while a turn runs, `✳ …` at rest. Roost parses title changes into a screen-derived Working/Waiting signal that ranks between hook reports and byte heuristics: never consulted while a status-socket link is live, ranked below the bell (a blocked agent's one remaining "needs you" signal must win), never able to touch NeedsInput/Exited, and a Working title decays like a report once stale *and* silent — an *animating* spinner refreshes the clock every frame, so only a frozen (hung) spinner ever decays, and conversely a live spinner sustains a quiet hook-reported Working past its usual decay (a long silent tool call between one-shot hooks). The whole channel sits behind an app-pushed gate — enabled only while an agent actually runs in the pane (spawn adapter + `observe_panes` promote/demote, which also clears the stored signal on demote): a vt100 title outlives the process that set it, so without the gate an exited agent's leftover `✳` would veto Working for every later shell command in that pane. The gate is what makes the channel safe; the ranking is what keeps claude panes honest **between** their one-shot hook connections — a keystroke echo on a resting pane no longer paints a phantom ●, and a lost `Stop` hook settles the moment the title flips to rest.
 
 ### 6.3 Heuristic fallback (any adapter, incl. plain `shell`)
 
