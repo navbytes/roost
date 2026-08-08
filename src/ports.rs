@@ -246,6 +246,35 @@ pub trait PaneBackend: Sized {
     fn row_wrapped(&self, _row: u16) -> bool {
         false
     }
+
+    /// C29 (selection-freeze amendment): hold the presented frame steady
+    /// for a native-selection gesture's duration (mouse-Down to mouse-Up)
+    /// — `screen()` and `grab_text` must keep answering with the frame the
+    /// gesture started on, not whatever the pane has since printed, so the
+    /// highlight the user aimed at is provably the text that lands on the
+    /// clipboard. See `infra::pty::PtyPane::presented`. Default no-op: a
+    /// backend with no presentation surface of its own has nothing to
+    /// freeze.
+    fn freeze_view(&mut self) {}
+
+    /// C29: resume presenting the live view — called on the gesture's `Up`,
+    /// on a stale gesture, and on a wheel tick mid-drag (see
+    /// `handle_native_selection`). Default no-op, paired with `freeze_view`.
+    fn unfreeze_view(&mut self) {}
+
+    /// Selection-freeze amendment (SPEC-parity P1 gap): the visible screen
+    /// for `roost read`'s screen mode — same coordinates as `grab_text`,
+    /// but deliberately LIVE even mid-gesture. A control client polling a
+    /// pane is a different consumer than the human dragging a mouse over
+    /// it; freezing the TUI's own view must not also freeze what an
+    /// orchestrating agent reads. Bypasses only the gesture freeze — the
+    /// P1 sync-output veneer still applies, exactly as it does for
+    /// `grab_text` (a torn mid-redraw frame is wrong for both consumers).
+    /// Default: same as `grab_text`, for backends with no gesture freeze to
+    /// bypass in the first place.
+    fn read_screen_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        self.grab_text(start, end)
+    }
 }
 
 /// Workspace persistence. Implemented by `infra::store::FsStore`.
@@ -323,6 +352,13 @@ pub mod fakes {
         /// `App::ext_link_counts`'s refcount produces without needing a real
         /// `StatusTracker`.
         pub ext_link: bool,
+        /// C29 (selection-freeze amendment): the (`grab`, `rows`) pair
+        /// captured by `freeze_view`, mirroring the real backend's
+        /// `presented()` split without a real vt100 grid to snapshot —
+        /// `grab_text` reads this instead of the live fields while it is
+        /// `Some`, so a test can mutate `grab`/`rows` mid-gesture and prove
+        /// the freeze holds.
+        frozen: Option<(String, Vec<String>)>,
     }
 
     impl PaneBackend for FakePane {
@@ -360,6 +396,7 @@ pub mod fakes {
                 effects: PaneEffects::default(),
                 cursor_shape: None,
                 ext_link: false,
+                frozen: None,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -454,18 +491,42 @@ pub mod fakes {
         fn observe(&self, _known: &[String]) -> Option<Observation> {
             self.observation.clone()
         }
+        /// C29: reads the frozen (`grab`, `rows`) pair while `freeze_view`
+        /// has one staged, exactly like the real backend's `presented()`
+        /// preferring `gesture_freeze` over the live grid.
         fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
-            if !self.rows.is_empty() && start.0 == end.0 {
-                let row = self.rows.get(start.0 as usize).cloned().unwrap_or_default();
+            let (grab, rows) = self
+                .frozen
+                .as_ref()
+                .map_or((&self.grab, &self.rows), |(g, r)| (g, r));
+            if !rows.is_empty() && start.0 == end.0 {
+                let row = rows.get(start.0 as usize).cloned().unwrap_or_default();
                 return slice_cells(&row, start.1 as usize, end.1 as usize);
             }
-            self.grab.clone()
+            grab.clone()
         }
         fn grab_all_text(&self) -> String {
             self.all_text.clone()
         }
         fn row_wrapped(&self, row: u16) -> bool {
             self.wrapped.get(row as usize).copied().unwrap_or(false)
+        }
+        fn freeze_view(&mut self) {
+            self.frozen = Some((self.grab.clone(), self.rows.clone()));
+        }
+        fn unfreeze_view(&mut self) {
+            self.frozen = None;
+        }
+        /// Deliberately reads the LIVE `grab`/`rows` fields, bypassing
+        /// `self.frozen` — mirrors the real backend's `read_screen_text`
+        /// (`roost read`'s screen mode must never see a mouse-drag's
+        /// frozen frame).
+        fn read_screen_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+            if !self.rows.is_empty() && start.0 == end.0 {
+                let row = self.rows.get(start.0 as usize).cloned().unwrap_or_default();
+                return slice_cells(&row, start.1 as usize, end.1 as usize);
+            }
+            self.grab.clone()
         }
     }
 
