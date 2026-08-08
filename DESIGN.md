@@ -159,7 +159,7 @@ Ground truth from pi's docs:
 |---|---|
 | `session_start` (reasons: startup/new/resume/fork) | report session ID → roost persists it |
 | `agent_start` | status = **Working** |
-| `agent_settled` (pi ≥ 0.80.4; `agent_end` kept as the guarded fallback for older pi) | status = **Waiting** (turn truly over; ball is in your court). Bare `agent_end` also fires between a run and its automatic follow-ups — retry after a provider error, compaction, a queued continuation — and flapped ○/● on every recovery; both handlers share an `isIdle` guard so a mid-recovery `agent_end` stays silent wherever pi can say so. |
+| `agent_settled` (pi ≥ 0.80.4; `agent_end` kept as a latched fallback for older pi) | status = **Waiting** (turn truly over; ball is in your court). Bare `agent_end` also fires between a run and its automatic follow-ups — retry after a provider error, compaction, a queued continuation — and flapped ○/● on every recovery. The fallback is latched, not `isIdle`-guarded: once `agent_settled` fires at all, it owns turn-ends and `agent_end` goes silent; before that, `agent_end` reports unconditionally (`isIdle` exists back to pi 0.31.0, but nothing documents its value at the *final* `agent_end` on pre-0.80.4 versions — a guard there could suppress the only turn-end signal old pi has). |
 | `tool_call` on user-facing asks / `ctx.ui.confirm` flows | status = **Needs input**, with the ask's question text riding along as `message` — surfaced in the feed line and the notification so you see *what* it's asking |
 | `session_shutdown` | close the socket; no status report |
 

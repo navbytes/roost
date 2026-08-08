@@ -231,25 +231,35 @@ export default function (pi: ExtensionAPI) {
   // agent_settled (pi ≥ 0.80.4) is the true turn-end: agent_end also fires
   // between an agent run and its automatic follow-ups (retry after a
   // provider error, compaction, a queued continuation), so reporting there
-  // unguarded flapped the pane ○ waiting → ● working on every recovery.
-  // agent_end stays registered as the fallback for a pi old enough to lack
-  // agent_settled — same isIdle guard on both, so wherever isIdle exists a
-  // mid-recovery agent_end stays silent, and on a pi with neither
-  // refinement the fallback degrades to exactly the old behavior. Verified
+  // flapped the pane ○ waiting → ● working on every recovery. Verified
   // against installed pi 0.84.1's docs/extensions.md: "ctx.isIdle() is
   // false while Pi is processing an agent run, automatic retry,
   // auto-compaction retry, or queued continuation" — and the same doc
   // recommends agent_settled "for status integrations" outright.
-  // A duplicate "waiting" (agent_end then agent_settled, both idle) is
-  // harmless — roost's tracker is idempotent on repeated resting reports.
-  // Registered inline (not one shared handler) so each ctx keeps pi's real
-  // parameter type and tsc actually checks the isIdle call.
+  //
+  // agent_end stays registered as the fallback for a pi old enough (<
+  // 0.80.4) to lack agent_settled — latched off the moment agent_settled
+  // proves it exists, NOT isIdle-guarded: ctx.isIdle dates back to 0.31.0,
+  // and across 0.31–0.80.3 nothing documents whether it is already false
+  // when the *final* agent_end fires. If it were, an isIdle guard would
+  // suppress the only turn-end report those versions ever get, pinning ●
+  // until roost's stuck-working decay — strictly worse than the flap it
+  // prevents. The latch needs no such archaeology: before the first
+  // settled, agent_end reports unconditionally (exactly the old behavior,
+  // worst case one flappy first turn on modern pi); after it, settled owns
+  // turn-ends alone. A duplicate "waiting" on that first turn is harmless —
+  // roost's tracker is idempotent on repeated resting reports.
+  let settledSupported = false;
   pi.on("agent_settled", async (_event, ctx) => {
+    settledSupported = true;
+    // Covers a settle report racing a brand-new turn the user already
+    // started (pi's own docs: true here "unless another extension started
+    // a new run").
     if (ctx.isIdle?.() === false) return;
     send({ event: "status", status: "waiting" });
   });
-  pi.on("agent_end", async (_event, ctx) => {
-    if (ctx.isIdle?.() === false) return;
+  pi.on("agent_end", async () => {
+    if (settledSupported) return; // settled owns turn-ends on this pi
     send({ event: "status", status: "waiting" });
   });
   pi.on("input", async () => cancelProjectTrustNeedsInput());
