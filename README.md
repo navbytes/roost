@@ -404,7 +404,8 @@ same binary in client mode:
 ```sh
 roost list                                   # panes: id, adapter, cwd, status, …
 roost spawn pi --cwd ~/api --input "run the tests, report pass/fail"
-roost read 5 --tail 20                        # a pane's recent output
+roost read 5                                  # a pane's current screen (default)
+roost read 5 --tail 20                        # its last N lines (--full for the whole scrollback)
 roost send 5 hello world --enter              # type into a pane (+ Enter)
 roost send --all "standup: reply with status" --enter  # broadcast to every reachable pane
 roost status 5                                # working | waiting | needs_input | …
