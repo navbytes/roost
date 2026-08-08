@@ -1,5 +1,11 @@
 # Design: promotion-auth-gate
 
+> **Shipped & archived 2026-08-08.** Implemented, reviewed (architect pass →
+> fable design review → adversarial review), verified black-box, and released
+> in **v0.1.2** (PR #82). This design doc is kept as the record of what was
+> built and why. See ROADMAP.md "Shipped since best-in-class" and
+> DESIGN-control.md §5.6.
+
 Verdict up front: **GO.** All eight hard acceptance criteria are satisfiable;
 the ordering invariant (criterion 4) holds in code today (`B::spawn` has
 exactly one call site, inside `spawn_pane` — all five spawn paths route

@@ -495,9 +495,11 @@ M0 render core ✓ · M1 splits/tabs ✓ · M2 persistence + session detection �
 M3 status socket + badges ✓ · M4 stacks + resize ✓ · M5 picker, rename,
 scroll, notifications ✓ · fleet features (jump, feed, zoom, float, raw mode,
 keyboard copy, layouts, broadcast) ✓ · mouse, wheel routing and link-opening ✓ ·
-native mouse selection ✓ · adapters for pi, Claude Code, shell, codex, gemini
-and opencode ✓. Deferred: config file (roost is deliberately zero-config for
-now). Full detail: [ROADMAP.md](ROADMAP.md).
+native mouse selection ✓ · a drag holds the view still so you copy what you
+highlighted ✓ · adapters for pi, Claude Code, shell, codex, gemini and
+opencode ✓ · a small `config.json` to remap or disable individual keys ✓.
+What's left is deferred scope and deliberate choices, no known-broken
+defects — full detail: [ROADMAP.md](ROADMAP.md).
 
 ---
 
