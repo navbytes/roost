@@ -234,8 +234,12 @@ export default function (pi: ExtensionAPI) {
   // unguarded flapped the pane ○ waiting → ● working on every recovery.
   // agent_end stays registered as the fallback for a pi old enough to lack
   // agent_settled — same isIdle guard on both, so wherever isIdle exists a
-  // mid-recovery agent_end stays silent (isIdle false), and on a pi with
-  // neither refinement the fallback degrades to exactly the old behavior.
+  // mid-recovery agent_end stays silent, and on a pi with neither
+  // refinement the fallback degrades to exactly the old behavior. Verified
+  // against installed pi 0.84.1's docs/extensions.md: "ctx.isIdle() is
+  // false while Pi is processing an agent run, automatic retry,
+  // auto-compaction retry, or queued continuation" — and the same doc
+  // recommends agent_settled "for status integrations" outright.
   // A duplicate "waiting" (agent_end then agent_settled, both idle) is
   // harmless — roost's tracker is idempotent on repeated resting reports.
   // Registered inline (not one shared handler) so each ctx keeps pi's real
