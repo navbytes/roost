@@ -1,13 +1,99 @@
 # roost roadmap
 
 Everything known to be outstanding, as of the current `main`. The core product
-is complete and green (553 unit tests); nothing here is a known-broken defect —
-it's deferred scope, deliberate choices, and one thing only a human can do.
+is complete, green, and released — v0.1.3, on Homebrew, mise, cargo, and GitHub
+Releases; nothing here is a known-broken defect — it's deferred scope,
+deliberate choices, and one thing only a human can do. The most recent work is
+in **Shipped since best-in-class** just below; the deferred sections beneath it
+predate that work and stay accurate for what they each cover.
 
 Legend: **[you]** needs a real terminal / human judgment · **[gap]** promised
 somewhere but not built · **[choice]** deliberately deferred · **[perf]**
 optimization, not correctness · **[health]** internal quality, no behavior
 change · **[descoped]** decided against unless a use-case demands it.
+
+---
+
+## Shipped since best-in-class (v0.1.1 → v0.1.3)
+
+Everything the archived best-in-class engagement left open is now closed or
+decided, across four patch releases. Newest work first.
+
+- **[done] Both promotion doors gated by authentication (v0.1.2).** A
+  connection is promoted out of the 2 s pre-auth timeout only once it
+  authenticates — a control request under the fleet/pane token, or a status
+  line whose pane+token pair matches — so an unauthenticated local process can
+  no longer say one well-formed line and squat a slot in the 64-connection
+  pool. Token storage is unified into one `TokenTable` the socket layer can
+  only read, single-writer enforced by the compiler (`&mut self`); a per-pane
+  reporter cap of 8; `roost.ts` reconnects with backoff instead of going
+  silent for the session after one transient error. Design → architect pass →
+  fable design review (which killed a proposed `arc-swap` dependency and caught
+  a false-rejection bug in the spec) → adversarial review (which caught the
+  mutators enforcing single-writer by convention rather than by type). Verified
+  black-box against real binaries: on v0.1.0, 0 of 40 unauthenticated squatters
+  are ever evicted; on v0.1.2, all 40 die at the deadline and authenticated
+  clients are untouched. Spec: DESIGN-control.md §5.6.
+- **[done] Unbounded control-reply write held a slot for the client's life
+  (v0.1.2).** Found while black-box-testing the auth gate: a client that sends
+  a request and never reads the reply parked a roost thread in `write_all` and
+  held its connection slot until that client died, so ~64 stuck peers wedged
+  the control plane — present in the shipped v0.1.0/v0.1.1. `write_reply` now
+  writes against a 5 s deadline, the same split `read_line_deadlined` already
+  used. (A separately-reported "42 requests wedge the control plane" turned out
+  to be a **test-harness artifact** — an undrained pty backing roost's
+  `draw()` up until the event loop blocked — not a product bug; recorded here
+  so it isn't re-chased.)
+- **[done] Status fidelity on pi (v0.1.1).** Byte noise — composer echo, the
+  answer render landing just after a turn ends, a resize repaint — no longer
+  fakes a Working status while the pi extension is live. A silent Working
+  decays to **idle** when the extension link vouches for the pane (a quiet
+  think), to **waiting** when the reporting link is down (hook presumed dead).
+  pi's project-trust dialog now reports a real ◆ over the `project_trust`
+  event — pi emits no audible bell (verified against installed 0.81.1; the old
+  bell-heuristic comment was false). Link-liveness is refcounted per pane so
+  overlapping reporters (a nested claude inside a pi pane) can't strand it.
+- **[done] The Working glyph is pi's braille spinner (v0.1.1).** Replaces the
+  pulsing ● — animation now always means *busy*, and a steady ◆ is the only
+  mark that asks for you. Frames are pi-tui's own loader set, on roost's shared
+  render clock. **This supersedes the "pulse phase" language in the chrome
+  sections below** — those entries are accurate for the era they describe, not
+  for current behavior.
+- **[done] A drag holds the view still (v0.1.3).** On a pane that is still
+  printing, a native-selection gesture presents a frozen snapshot for the
+  length of the drag, so the highlight and the copied text agree instead of
+  the text scrolling out from under the selection. It reuses the existing
+  sync-view presentation path (no second snapshot mechanism); the freeze is
+  released on every gesture end through a single chokepoint tied to the P20
+  latch — five paths that swallow the mouse-up were found and closed in
+  review — and dropped on a resize. `roost read`'s screen mode reads the live
+  frame. Content-anchoring was assessed and **rejected**: the vendored vt100
+  parser has no stable row identity and a resize rewraps the grid. Spec:
+  DESIGN-ui.md C29 amendment + SPEC-parity P1.
+- **[done] A minimal key-remap config file (v0.1.3).** `config.json`, next to
+  `workspace.json` (`ROOST_STATE` redirects both), disables or remaps
+  individual `Alt` bindings — the escape hatch for the `Alt+f`/`b`/`d` readline
+  collisions this roadmap flagged. Absent file = prior behavior byte-for-byte;
+  a malformed file never blocks startup (defaults + a toast naming the bad
+  entry). Scope is keybindings only — no theming (the chrome inherits the
+  terminal), no scripting. The zero-config stance now has its one escape hatch
+  and nothing more.
+- **[decided] Multi-page mouse selection — declined.** A single selection can't
+  span more than one page; `roost read --full` covers "many pages of output".
+  A fable reliability assessment found neither edge-autoscroll nor
+  buffer-anchoring can be made as non-flaky as the selection that ships —
+  timer nondeterminism, a direct conflict with the freeze above (which holds
+  the view still while autoscroll wants it to move), and the same
+  no-stable-row-identity wall. Declined on the reliability-first priority.
+- **[descoped] `spawn --worktree` — by the client (2026-08-08).** git owns
+  worktrees, roost owns panes; `git worktree add` + `roost spawn --cwd` already
+  composes, and the lifecycle questions (naming, cleanup, resurrection into a
+  deleted worktree) are baggage worth avoiding.
+
+Still needing 30 seconds at a real iTerm2 — **[you] `Alt`+click a URL on
+iTerm2.** Option is iTerm2's own bypass gesture, so the click may never reach
+roost. Unverified there; works on Ghostty / kitty / WezTerm, which send Alt
+by default.
 
 ---
 
