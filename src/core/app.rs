@@ -18,7 +18,7 @@ use crate::core::session_resolver::SessionResolver;
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
 use crate::ports::{ClipboardOutcome, Observation, PaneBackend, StateStore};
-use crate::ui::input::Action;
+use crate::ui::input::{Action, Keymap};
 use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
@@ -566,6 +566,14 @@ pub struct App<B: PaneBackend> {
     /// the pane's own live OSC title.
     host_title: String,
     last_host_title: Option<Instant>,
+    /// config.json's parsed overrides (the key-bindings escape hatch —
+    /// design doc), consulted by every Alt-chord translation from here on
+    /// (`handle_mode_key` below; `main.rs`'s `handle_key` via `keymap()`).
+    /// Defaults empty, i.e. today's unconfigured behavior — `new` never
+    /// touches this itself; only `main.rs` installs the real one, via
+    /// `set_keymap`, once it's actually loaded config.json. Every test
+    /// (`mk_app` helpers included) keeps the default.
+    keymap: Keymap,
 }
 
 impl<B: PaneBackend> App<B> {
@@ -648,6 +656,7 @@ impl<B: PaneBackend> App<B> {
             host_out: Vec::new(),
             host_title: String::new(),
             last_host_title: None,
+            keymap: Keymap::default(),
         };
         app.spawn_active_tab();
         // Through `set_focus` like every other focus move, so that method
@@ -670,6 +679,22 @@ impl<B: PaneBackend> App<B> {
             app.note_cwd(cwd);
         }
         Ok(app)
+    }
+
+    /// The config.json-derived keybinding overrides currently in effect —
+    /// read by `main.rs`'s `handle_key` so every Alt chord it translates
+    /// respects them, the same way `handle_mode_key` below does internally.
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// Install the config.json-derived keybinding overrides (design doc:
+    /// the key-bindings escape hatch). Called once by `main.rs`, right
+    /// where it already installs the other startup-only pieces
+    /// (`relayout`, the extension/socket flashes) — never by a test, which
+    /// keeps `new`'s empty default: today's unconfigured behavior.
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = keymap;
     }
 
     fn save(&mut self) {
@@ -710,6 +735,14 @@ impl<B: PaneBackend> App<B> {
         if self.feed.len() > FEED_CAP {
             self.feed.pop_front();
         }
+    }
+
+    /// config.json diagnostics (the key-bindings escape hatch — design
+    /// doc): a non-fatal problem found while loading it, one feed line
+    /// each so none are lost even when the startup toast (`set_flash`) only
+    /// has room to show the first. See `main.rs`'s config-loading block.
+    pub fn note_config_issue(&mut self, msg: String) {
+        self.push_feed(msg, false, None);
     }
 
     /// Record that an Alt-modified key actually arrived, so the startup hint
@@ -4621,9 +4654,13 @@ impl<B: PaneBackend> App<B> {
             // Alt+PageUp in scroll mode snapped the view to the live tail and
             // called that "scroll mode". Both read as "the chord did
             // nothing", which is worse than either exiting or staying.
-            // Generalized through `translate` rather than a second chord
-            // table, so the toggle can never drift from the binding.
-            if let crate::ui::input::InputResult::Action(a) = crate::ui::input::translate(key) {
+            // Generalized through `translate_with` (config.json-aware; see
+            // `self.keymap`) rather than a second chord table, so the
+            // toggle can never drift from the binding — including a
+            // remapped one.
+            if let crate::ui::input::InputResult::Action(a) =
+                crate::ui::input::translate_with(key, &self.keymap)
+            {
                 if Some(a) == mode_entry_action(&self.mode) {
                     self.exit_mode();
                     return true;

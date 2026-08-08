@@ -84,7 +84,31 @@ impl Harness {
         let state_dir = fresh_state_dir();
         std::fs::write(state_dir.join("workspace.json"), workspace_json)
             .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
+        Self::spawn_in(state_dir, envs, rows, cols)
+    }
 
+    /// Like `try_spawn`, but also seeds `config.json` — the key-bindings
+    /// escape hatch, `src/ui/input.rs` — into the fresh `ROOST_STATE` dir
+    /// before roost ever starts, so a scenario can prove the file was
+    /// actually read from *there* (and not, say, silently ignored, or read
+    /// from the developer's real XDG state dir instead).
+    pub fn try_spawn_with_config(workspace_json: &str, config_json: &str) -> Result<Self, String> {
+        let state_dir = fresh_state_dir();
+        std::fs::write(state_dir.join("workspace.json"), workspace_json)
+            .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
+        std::fs::write(state_dir.join("config.json"), config_json)
+            .map_err(|e| format!("writing fixture config.json: {e}"))?;
+        Self::spawn_in(state_dir, &[], ROWS, COLS)
+    }
+
+    /// Shared spawn logic once `state_dir` already holds whatever fixture
+    /// files the caller wants roost to see at startup.
+    fn spawn_in(
+        state_dir: PathBuf,
+        envs: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self, String> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })

@@ -25,6 +25,7 @@ pub(crate) fn host_io_disabled() -> bool {
 }
 
 pub mod clipboard;
+pub mod config;
 pub mod extension;
 pub mod inspect;
 pub mod notify;

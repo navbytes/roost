@@ -3,6 +3,7 @@
 
 use crate::core::layout::Dir;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -60,6 +61,7 @@ pub enum Action {
     ToggleRaw,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum InputResult {
     Action(Action),
     Forward(Vec<u8>),
@@ -86,81 +88,7 @@ pub fn translate(key: KeyEvent) -> InputResult {
             };
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let action = match key.code {
-            // Alt+Shift+arrows: resize
-            KeyCode::Right if shift => Some(Action::Resize { horizontal: true, grow: true }),
-            KeyCode::Left if shift => Some(Action::Resize { horizontal: true, grow: false }),
-            KeyCode::Down if shift => Some(Action::Resize { horizontal: false, grow: true }),
-            KeyCode::Up if shift => Some(Action::Resize { horizontal: false, grow: false }),
-            KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Char('n') => Some(Action::NewPane),
-            KeyCode::Char('w') => Some(Action::ClosePane),
-            KeyCode::Char('t') => Some(Action::NewTab),
-            KeyCode::Char('s') => Some(Action::ToggleStack),
-            KeyCode::Char('o') => Some(Action::FlipSplit), // orientation
-            // Alt+r renames the pane; Alt+Shift+r (or Alt+R) renames the tab.
-            KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::RenamePane }),
-            KeyCode::Char('R') => Some(Action::RenameTab),
-            // Alt+Shift+p toggles raw; Alt+P tolerates the uppercase-delivery
-            // quirk some terminals use for a shifted Alt+letter (same
-            // tolerance as Alt+Shift+r / Alt+R above). Lowercase Alt+p (no
-            // shift) is deliberately unmatched — it stays free (C23).
-            KeyCode::Char('p') if shift => Some(Action::ToggleRaw),
-            KeyCode::Char('P') => Some(Action::ToggleRaw),
-            KeyCode::Enter => Some(Action::QuickLaunch),
-            // `?` *is* Shift+`/`, and terminals disagree about which half of
-            // that they report: some deliver `Char('?')` with the shift
-            // already applied, others deliver `Char('/')` and leave SHIFT in
-            // the modifiers. Matching only the first meant Alt+? silently
-            // toggled the hint bar on the second kind — reported on macOS.
-            // Same shape as the Alt+Shift+r / Alt+R tolerance above.
-            KeyCode::Char('/') => Some(if shift { Action::Help } else { Action::ToggleHints }),
-            KeyCode::Char('c') => Some(Action::CopyMode),
-            KeyCode::Char('u') => Some(Action::Undo),
-            KeyCode::Char('?') => Some(Action::Help),
-            // C19/C27, the deliberate pair: Alt+a takes you to the next pane
-            // that needs you; Alt+Shift+a shows you all of them and lets you
-            // choose. Alt+'A' is the same uppercase-delivery tolerance
-            // Alt+Shift+r / Alt+Shift+p already carry.
-            KeyCode::Char('a') => {
-                Some(if shift { Action::ToggleRoster } else { Action::JumpAttention })
-            }
-            KeyCode::Char('A') => Some(Action::ToggleRoster),
-            KeyCode::Char('z') => Some(Action::ToggleZoom),
-            KeyCode::Char('g') => Some(Action::CycleLayout),
-            KeyCode::Char('e') => Some(Action::ToggleFeed),
-            KeyCode::Char('f') => Some(Action::ToggleFloat),
-            KeyCode::PageUp => Some(Action::ScrollMode),
-            KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
-            // U7: tabs 10+ had no keyboard route at all. `Alt+0` closes the
-            // digit row's own gap (last tab, the "and the rest" slot), and
-            // Alt+i/Alt+m step the strip. Both letters come from §8's free
-            // pool, and both survive U5: they were unbound, so they used to
-            // forward to the pane — now they're roost's, like every other
-            // chord in this table. See §8's amendment for why these two.
-            KeyCode::Char('0') => Some(Action::LastTab),
-            // C28: the shifted siblings carry the *pane* the way the
-            // unshifted ones carry *you* — Alt+i/Alt+m move focus between
-            // tabs, Alt+Shift+i/Alt+Shift+m move the focused pane there and
-            // follow it. `Alt+I`/`Alt+M` are the same uppercase-delivery
-            // tolerance Alt+Shift+r / Alt+Shift+a / Alt+Shift+p carry.
-            // (Alt+[ / Alt+] were the brief's suggestion and are rejected in
-            // §8: `ESC [` is the CSI introducer.)
-            KeyCode::Char('i') => {
-                Some(if shift { Action::MovePaneToTab { forward: false } } else { Action::PrevTab })
-            }
-            KeyCode::Char('I') => Some(Action::MovePaneToTab { forward: false }),
-            KeyCode::Char('m') => {
-                Some(if shift { Action::MovePaneToTab { forward: true } } else { Action::NextTab })
-            }
-            KeyCode::Char('M') => Some(Action::MovePaneToTab { forward: true }),
-            KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
-            KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
-            KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
-            KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
-            _ => None,
-        };
-        return match action {
+        return match default_chord_action(key.code, shift) {
             Some(a) => InputResult::Action(a),
             // U5 (SPEC-ux) / P13: an unbound Alt+printable is the pane's
             // vocabulary, not roost's — forward it as the meta-ESC bytes a
@@ -169,21 +97,115 @@ pub fn translate(key: KeyEvent) -> InputResult {
             // mode remains the escape hatch for those. Non-printables that
             // miss the table keep the old swallow — U5's contract is
             // printables, deliberately.
-            None => match key.code {
-                KeyCode::Char(_) => {
-                    let bytes = encode_raw(key);
-                    if bytes.is_empty() {
-                        InputResult::Ignore
-                    } else {
-                        InputResult::Forward(bytes)
-                    }
-                }
-                _ => InputResult::Ignore,
-            },
+            None => unbound_alt(key),
         };
     }
 
     encode_key(key)
+}
+
+/// The hard-coded default Alt-chord table (design doc §7), factored out of
+/// `translate` into a plain function of `(code, shift)` so config.json's
+/// overrides (`translate_with`, `Keymap`) fall back to exactly this for any
+/// chord they don't touch — the same match `translate` always ran, not a
+/// second, re-derived copy of it. `shift` is `key.modifiers.contains(SHIFT)`;
+/// several arms below don't test it at all, because the terminal delivers
+/// some shifted chords as the plain lowercase code with the modifier bit set
+/// and others as the bare uppercase codepoint with the bit unset — both are
+/// handled, arm by arm, exactly as before this was split out of `translate`.
+fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
+    match code {
+        // Alt+Shift+arrows: resize
+        KeyCode::Right if shift => Some(Action::Resize { horizontal: true, grow: true }),
+        KeyCode::Left if shift => Some(Action::Resize { horizontal: true, grow: false }),
+        KeyCode::Down if shift => Some(Action::Resize { horizontal: false, grow: true }),
+        KeyCode::Up if shift => Some(Action::Resize { horizontal: false, grow: false }),
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('n') => Some(Action::NewPane),
+        KeyCode::Char('w') => Some(Action::ClosePane),
+        KeyCode::Char('t') => Some(Action::NewTab),
+        KeyCode::Char('s') => Some(Action::ToggleStack),
+        KeyCode::Char('o') => Some(Action::FlipSplit), // orientation
+        // Alt+r renames the pane; Alt+Shift+r (or Alt+R) renames the tab.
+        KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::RenamePane }),
+        KeyCode::Char('R') => Some(Action::RenameTab),
+        // Alt+Shift+p toggles raw; Alt+P tolerates the uppercase-delivery
+        // quirk some terminals use for a shifted Alt+letter (same
+        // tolerance as Alt+Shift+r / Alt+R above). Lowercase Alt+p (no
+        // shift) is deliberately unmatched — it stays free (C23).
+        KeyCode::Char('p') if shift => Some(Action::ToggleRaw),
+        KeyCode::Char('P') => Some(Action::ToggleRaw),
+        KeyCode::Enter => Some(Action::QuickLaunch),
+        // `?` *is* Shift+`/`, and terminals disagree about which half of
+        // that they report: some deliver `Char('?')` with the shift
+        // already applied, others deliver `Char('/')` and leave SHIFT in
+        // the modifiers. Matching only the first meant Alt+? silently
+        // toggled the hint bar on the second kind — reported on macOS.
+        // Same shape as the Alt+Shift+r / Alt+R tolerance above.
+        KeyCode::Char('/') => Some(if shift { Action::Help } else { Action::ToggleHints }),
+        KeyCode::Char('c') => Some(Action::CopyMode),
+        KeyCode::Char('u') => Some(Action::Undo),
+        KeyCode::Char('?') => Some(Action::Help),
+        // C19/C27, the deliberate pair: Alt+a takes you to the next pane
+        // that needs you; Alt+Shift+a shows you all of them and lets you
+        // choose. Alt+'A' is the same uppercase-delivery tolerance
+        // Alt+Shift+r / Alt+Shift+p already carry.
+        KeyCode::Char('a') => {
+            Some(if shift { Action::ToggleRoster } else { Action::JumpAttention })
+        }
+        KeyCode::Char('A') => Some(Action::ToggleRoster),
+        KeyCode::Char('z') => Some(Action::ToggleZoom),
+        KeyCode::Char('g') => Some(Action::CycleLayout),
+        KeyCode::Char('e') => Some(Action::ToggleFeed),
+        KeyCode::Char('f') => Some(Action::ToggleFloat),
+        KeyCode::PageUp => Some(Action::ScrollMode),
+        KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
+        // U7: tabs 10+ had no keyboard route at all. `Alt+0` closes the
+        // digit row's own gap (last tab, the "and the rest" slot), and
+        // Alt+i/Alt+m step the strip. Both letters come from §8's free
+        // pool, and both survive U5: they were unbound, so they used to
+        // forward to the pane — now they're roost's, like every other
+        // chord in this table. See §8's amendment for why these two.
+        KeyCode::Char('0') => Some(Action::LastTab),
+        // C28: the shifted siblings carry the *pane* the way the
+        // unshifted ones carry *you* — Alt+i/Alt+m move focus between
+        // tabs, Alt+Shift+i/Alt+Shift+m move the focused pane there and
+        // follow it. `Alt+I`/`Alt+M` are the same uppercase-delivery
+        // tolerance Alt+Shift+r / Alt+Shift+a / Alt+Shift+p carry.
+        // (Alt+[ / Alt+] were the brief's suggestion and are rejected in
+        // §8: `ESC [` is the CSI introducer.)
+        KeyCode::Char('i') => {
+            Some(if shift { Action::MovePaneToTab { forward: false } } else { Action::PrevTab })
+        }
+        KeyCode::Char('I') => Some(Action::MovePaneToTab { forward: false }),
+        KeyCode::Char('m') => {
+            Some(if shift { Action::MovePaneToTab { forward: true } } else { Action::NextTab })
+        }
+        KeyCode::Char('M') => Some(Action::MovePaneToTab { forward: true }),
+        KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
+        KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
+        _ => None,
+    }
+}
+
+/// U5's unbound-Alt-printable fallback, factored out of `translate` so a
+/// `"disable"` entry in config.json (`translate_with`) reuses it verbatim —
+/// a disabled chord must forward exactly like a naturally unbound one, never
+/// a hand-derived approximation of it.
+fn unbound_alt(key: KeyEvent) -> InputResult {
+    match key.code {
+        KeyCode::Char(_) => {
+            let bytes = encode_raw(key);
+            if bytes.is_empty() {
+                InputResult::Ignore
+            } else {
+                InputResult::Forward(bytes)
+            }
+        }
+        _ => InputResult::Ignore,
+    }
 }
 
 /// Upgrade cursor-key bytes to the SS3 application encodings when the target
@@ -425,6 +447,263 @@ pub fn encode_raw(key: KeyEvent) -> Vec<u8> {
         }
         _ => Vec::new(),
     }
+}
+
+// -- config.json: the key-bindings escape hatch --------------------------
+//
+// roost puts every shortcut on Alt (module doc), which collides with
+// readline/shell word-motion for shell-heavy users — Alt+f/Alt+b/Alt+d most
+// visibly, and until now there was no way to disable or move a single
+// binding. `config.json`, read once at startup from the same directory as
+// `workspace.json` (`infra::config`), is that escape hatch: disable or remap
+// individual Alt chords. Nothing else — no theming, no scripting, no layout.
+//
+// Absent file = today's behavior, byte for byte: `Keymap::default()` is
+// empty, so `translate_with` always misses the override lookup below and
+// falls straight through to plain `translate`.
+
+/// One physical Alt chord, as `translate_with` sees it: a key code plus
+/// whether SHIFT was held. Every roost binding lives on Alt, so that's not
+/// part of this — a chord string always starts `alt+` (`Chord::parse`), and
+/// P13's Ctrl+Alt exclusion means the override lookup never even runs for a
+/// Ctrl+Alt key (see `translate_with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Chord {
+    code: KeyCode,
+    shift: bool,
+}
+
+impl Chord {
+    /// `alt+<key>` or `alt+shift+<key>` — config.json's chord grammar.
+    /// `<key>` is one of the named specials below or exactly one character
+    /// (`alt+f`, `alt+3`, `alt+/`, ...). `None` for anything else, which
+    /// `Keymap::parse` turns into a non-fatal diagnostic rather than a panic.
+    fn parse(s: &str) -> Option<Chord> {
+        let rest = s.strip_prefix("alt+")?;
+        let (shift, key) = match rest.strip_prefix("shift+") {
+            Some(k) => (true, k),
+            None => (false, rest),
+        };
+        Some(Chord {
+            code: named_key(key)?,
+            shift,
+        })
+    }
+}
+
+/// The non-Alt half of a chord string: a named special key, or exactly one
+/// character — covers every key any default binding actually uses.
+fn named_key(s: &str) -> Option<KeyCode> {
+    Some(match s {
+        "enter" => KeyCode::Enter,
+        "pageup" => KeyCode::PageUp,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        _ => {
+            let mut chars = s.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None; // more than one character: not a key name
+            }
+            KeyCode::Char(c)
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Override {
+    /// The chord passes straight through to the focused pane, exactly like
+    /// an unbound key does today — the readline fix this whole file is for.
+    Disabled,
+    Bound(Action),
+}
+
+/// config.json's parsed keybinding overrides, applied by `translate_with` on
+/// top of the default table. `Keymap::default()` is empty — absent
+/// config.json — and makes `translate_with` identical to `translate`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Keymap {
+    overrides: HashMap<Chord, Override>,
+}
+
+impl Keymap {
+    /// Parse config.json's contents. Never fails outright: invalid JSON,
+    /// `"keys"` not an object, an unparseable chord, a non-string value, and
+    /// an unknown action name are all non-fatal — the offending entry is
+    /// skipped and named in the returned diagnostics (`source`, typically
+    /// the file's path, prefixed onto each one) rather than blocking
+    /// startup. A chord listed twice keeps only its last value — inherited
+    /// for free from `serde_json`'s object parsing, which already collapses
+    /// a repeated JSON key the same way (documented in README).
+    pub fn parse(raw: &str, source: &str) -> (Keymap, Vec<String>) {
+        let mut diagnostics = Vec::new();
+        let value: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                diagnostics.push(format!("{source}: invalid JSON ({e}) — using defaults"));
+                return (Keymap::default(), diagnostics);
+            }
+        };
+        let mut keymap = Keymap::default();
+        match value.get("keys") {
+            None => {}
+            Some(serde_json::Value::Object(keys)) => {
+                for (chord_str, action_val) in keys {
+                    let Some(chord) = Chord::parse(chord_str) else {
+                        diagnostics.push(format!(
+                            "{source}: unrecognized chord {chord_str:?} — skipped"
+                        ));
+                        continue;
+                    };
+                    let Some(action_str) = action_val.as_str() else {
+                        diagnostics.push(format!(
+                            "{source}: {chord_str:?}: value must be a string — skipped"
+                        ));
+                        continue;
+                    };
+                    if action_str == "disable" {
+                        keymap.overrides.insert(chord, Override::Disabled);
+                        continue;
+                    }
+                    match action_by_name(action_str) {
+                        Some(action) => {
+                            keymap.overrides.insert(chord, Override::Bound(action));
+                        }
+                        None => diagnostics.push(format!(
+                            "{source}: {chord_str:?}: unknown action {action_str:?} — skipped"
+                        )),
+                    }
+                }
+            }
+            Some(_) => diagnostics.push(format!("{source}: \"keys\" must be an object — ignored")),
+        }
+        (keymap, diagnostics)
+    }
+}
+
+/// Same as `translate`, but a chord in `keymap` overrides the default table
+/// first. An empty `Keymap` makes this byte-identical to `translate`: every
+/// chord misses the lookup below and falls through to the exact same call.
+pub fn translate_with(key: KeyEvent, keymap: &Keymap) -> InputResult {
+    if key.kind != KeyEventKind::Release
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let chord = Chord {
+            code: key.code,
+            shift: key.modifiers.contains(KeyModifiers::SHIFT),
+        };
+        match keymap.overrides.get(&chord) {
+            Some(Override::Disabled) => return unbound_alt(key),
+            Some(Override::Bound(action)) => return InputResult::Action(*action),
+            None => {}
+        }
+    }
+    translate(key)
+}
+
+/// Config-facing name for an action (config.json's `"keys"` values):
+/// snake_case of the `Action` variant. **No wildcard arm** — adding an
+/// `Action` variant without a case here is a compile error, which is the
+/// point: a new variant can never be silently unnameable.
+fn action_name(action: &Action) -> String {
+    match action {
+        Action::Quit => "quit".into(),
+        Action::NewPane => "new_pane".into(),
+        Action::ClosePane => "close_pane".into(),
+        Action::Focus(dir) => format!(
+            "focus_{}",
+            match dir {
+                Dir::Left => "left",
+                Dir::Right => "right",
+                Dir::Up => "up",
+                Dir::Down => "down",
+            }
+        ),
+        Action::NewTab => "new_tab".into(),
+        Action::GoToTab(n) => format!("go_to_tab_{}", n + 1),
+        Action::NextTab => "next_tab".into(),
+        Action::PrevTab => "prev_tab".into(),
+        Action::LastTab => "last_tab".into(),
+        Action::MovePaneToTab { forward: true } => "move_pane_to_tab_next".into(),
+        Action::MovePaneToTab { forward: false } => "move_pane_to_tab_prev".into(),
+        Action::ToggleStack => "toggle_stack".into(),
+        Action::FlipSplit => "flip_split".into(),
+        Action::Resize {
+            horizontal: true,
+            grow: true,
+        } => "resize_horizontal_grow".into(),
+        Action::Resize {
+            horizontal: true,
+            grow: false,
+        } => "resize_horizontal_shrink".into(),
+        Action::Resize {
+            horizontal: false,
+            grow: true,
+        } => "resize_vertical_grow".into(),
+        Action::Resize {
+            horizontal: false,
+            grow: false,
+        } => "resize_vertical_shrink".into(),
+        Action::RenamePane => "rename_pane".into(),
+        Action::RenameTab => "rename_tab".into(),
+        Action::QuickLaunch => "quick_launch".into(),
+        Action::ScrollMode => "scroll_mode".into(),
+        Action::CopyMode => "copy_mode".into(),
+        Action::ToggleHints => "toggle_hints".into(),
+        Action::Undo => "undo".into(),
+        Action::Help => "help".into(),
+        Action::JumpAttention => "jump_attention".into(),
+        Action::ToggleRoster => "toggle_roster".into(),
+        Action::ToggleZoom => "toggle_zoom".into(),
+        Action::CycleLayout => "cycle_layout".into(),
+        Action::ToggleFeed => "toggle_feed".into(),
+        Action::ToggleFloat => "toggle_float".into(),
+        Action::ToggleRaw => "toggle_raw".into(),
+    }
+}
+
+/// Reverse of `action_name`, for parsing config.json's action strings.
+/// Derived from `default_keymap` rather than a second hand-written table:
+/// since every current `Action` variant already has a real default chord,
+/// every variant is reachable here too, in whatever concrete forms the
+/// default table actually uses (`go_to_tab_1..=9`, not arbitrary N) — and a
+/// future variant bound to a new default chord becomes nameable
+/// automatically, with no separate list to remember to update.
+fn action_by_name(name: &str) -> Option<Action> {
+    default_keymap()
+        .values()
+        .find(|a| action_name(a) == name)
+        .copied()
+}
+
+/// Every (chord → action) pair `default_chord_action` actually binds, swept
+/// across every key `Chord::parse` can name, crossed with both shift states.
+/// This *is* "the existing default map" — built by asking the same function
+/// `translate` itself calls, not by re-deriving the table by hand — so it is
+/// what tests assert absent-config behavior against, and (`action_by_name`)
+/// config.json's reverse action-name index.
+fn default_keymap() -> HashMap<Chord, Action> {
+    let mut codes: Vec<KeyCode> = (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
+    codes.extend([
+        KeyCode::Enter,
+        KeyCode::PageUp,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Left,
+        KeyCode::Right,
+    ]);
+    let mut map = HashMap::new();
+    for code in codes {
+        for shift in [false, true] {
+            if let Some(action) = default_chord_action(code, shift) {
+                map.insert(Chord { code, shift }, action);
+            }
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -1048,5 +1327,178 @@ mod tests {
         // isn't part of encode_key's match. Documented via this pin so a
         // future refactor notices if that assumption ever changes.
         assert_eq!(encode_raw(key), vec![0x1b, b'q']);
+    }
+
+    // -- config.json: the key-bindings escape hatch -------------------------
+
+    /// Absent config.json ⇒ `Keymap::default()` (empty), which must make
+    /// `translate_with` byte-identical to `translate` — asserted against
+    /// `default_keymap()` itself (the existing default map `translate`
+    /// already runs), not a hand-copied literal of what today's bindings
+    /// are, plus a sample of everything a chord table doesn't cover.
+    #[test]
+    fn absent_config_keeps_translate_byte_for_byte() {
+        let empty = Keymap::default();
+        for (chord, _) in default_keymap() {
+            let mut mods = KeyModifiers::ALT;
+            if chord.shift {
+                mods |= KeyModifiers::SHIFT;
+            }
+            let key = KeyEvent::new(chord.code, mods);
+            assert_eq!(
+                translate_with(key, &empty),
+                translate(key),
+                "chord {chord:?}"
+            );
+        }
+        let extra = [
+            alt(KeyCode::Char('b')),   // unbound Alt printable (readline M-b)
+            alt(KeyCode::Char('d')),   // unbound Alt printable (readline M-d)
+            plain(KeyCode::Char('a')), // no Alt at all
+            KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ), // P13
+        ];
+        for key in extra {
+            assert_eq!(translate_with(key, &empty), translate(key), "{key:?}");
+        }
+    }
+
+    /// `"disable"` ⇒ the chord produces no Action and forwards to the pane
+    /// exactly like an unbound key does today (the readline fix itself).
+    #[test]
+    fn disable_forwards_the_chord_instead_of_its_default_action() {
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+f": "disable"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // Without the override, alt+f is its documented default: ToggleFloat.
+        assert!(matches!(
+            translate(alt(KeyCode::Char('f'))),
+            InputResult::Action(Action::ToggleFloat)
+        ));
+        match translate_with(alt(KeyCode::Char('f')), &keymap) {
+            InputResult::Forward(b) => assert_eq!(b, vec![0x1b, b'f']),
+            other => panic!("disabled alt+f must forward to the pane, got {other:?}"),
+        }
+    }
+
+    /// Remap ⇒ the new chord triggers the action, and the old one — only
+    /// disabled here, not itself remapped — no longer does. This is the
+    /// design doc's own worked example: move ToggleFloat off alt+f (the
+    /// readline collision) onto a free chord instead.
+    #[test]
+    fn remap_moves_an_action_off_its_default_chord_onto_a_new_one() {
+        let json = r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#;
+        let (keymap, diagnostics) = Keymap::parse(json, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('v')), &keymap),
+            InputResult::Action(Action::ToggleFloat)
+        ));
+        assert!(!matches!(
+            translate_with(alt(KeyCode::Char('f')), &keymap),
+            InputResult::Action(Action::ToggleFloat)
+        ));
+    }
+
+    /// The "unless it was also remapped" half: a chord reassigned to a
+    /// *different* action (rather than disabled) naturally stops producing
+    /// its old one too — replaced, not disabled.
+    #[test]
+    fn a_chord_remapped_to_a_different_action_stops_producing_its_old_one() {
+        let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+g": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('g')), &keymap),
+            InputResult::Action(Action::Quit)
+        ));
+        assert!(!matches!(
+            translate_with(alt(KeyCode::Char('g')), &keymap),
+            InputResult::Action(Action::CycleLayout)
+        ));
+    }
+
+    /// A chord listed twice keeps only its last value (README) — inherited
+    /// for free from `serde_json`, which already collapses a repeated JSON
+    /// key to its last-written one.
+    #[test]
+    fn a_chord_listed_twice_keeps_only_the_last_value() {
+        let json = r#"{"keys": {"alt+g": "quit", "alt+g": "toggle_zoom"}}"#;
+        let (keymap, diagnostics) = Keymap::parse(json, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('g')), &keymap),
+            InputResult::Action(Action::ToggleZoom)
+        ));
+    }
+
+    /// Malformed JSON never blocks startup: defaults stay intact, and the
+    /// single diagnostic names the file.
+    #[test]
+    fn malformed_json_keeps_defaults_and_names_the_file() {
+        let (keymap, diagnostics) = Keymap::parse("{ not json", "config.json");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("config.json"), "{diagnostics:?}");
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('q')), &keymap),
+            InputResult::Action(Action::Quit)
+        ));
+    }
+
+    /// An unknown action name is skipped, not fatal, and named in the
+    /// diagnostic alongside the chord it was attached to; that chord keeps
+    /// its default.
+    #[test]
+    fn unknown_action_name_is_skipped_and_named_in_the_diagnostic() {
+        let json = r#"{"keys": {"alt+z": "not_a_real_action"}}"#;
+        let (keymap, diagnostics) = Keymap::parse(json, "config.json");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("not_a_real_action"),
+            "{diagnostics:?}"
+        );
+        assert!(diagnostics[0].contains("alt+z"), "{diagnostics:?}");
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('z')), &keymap),
+            InputResult::Action(Action::ToggleZoom)
+        ));
+    }
+
+    /// An unparseable chord (no `ctrl+` grammar at all — P13 keeps Ctrl+Alt
+    /// out of the chord table entirely) is skipped, not fatal, and named.
+    #[test]
+    fn unrecognized_chord_is_skipped_and_named_in_the_diagnostic() {
+        let json = r#"{"keys": {"ctrl+f": "quit"}}"#;
+        let (_keymap, diagnostics) = Keymap::parse(json, "config.json");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("ctrl+f"), "{diagnostics:?}");
+    }
+
+    /// The Action-name mapping is exhaustive: `action_name`'s match has no
+    /// wildcard arm (a new `Action` variant left unnamed is a compile
+    /// error), and this pins that every name it actually produces — for
+    /// every action any default chord binds — round-trips back through
+    /// `action_by_name`, so a future variant is a compile error *or* this
+    /// test failing, never a silent gap either way.
+    #[test]
+    fn every_default_bound_actions_name_round_trips() {
+        for (chord, action) in default_keymap() {
+            let name = action_name(&action);
+            assert_eq!(
+                action_by_name(&name),
+                Some(action),
+                "chord {chord:?}'s action {action:?} named {name:?} didn't round-trip"
+            );
+        }
+    }
+
+    /// The literal `"disable"` keyword is never itself a valid action name,
+    /// and a nonsense name resolves to nothing — both are how
+    /// `Keymap::parse` tells the two apart.
+    #[test]
+    fn disable_keyword_and_nonsense_names_are_not_actions() {
+        assert_eq!(action_by_name("disable"), None);
+        assert_eq!(action_by_name("nope"), None);
     }
 }

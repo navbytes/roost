@@ -157,6 +157,24 @@ picker / scroll / copy / feed / dead-pane modes each show their own keys, and
 a raw-focused pane collapses it to one pair (`Alt+Shift+p exit raw`).
 `Alt+/` hides it to reclaim the row.
 
+### Escape hatch: remap or disable a key
+
+Every shortcut above lives on `Alt`, which can collide with your shell's own
+readline bindings (`Alt+f`/`Alt+b`/`Alt+d` are the usual culprits). Fix one in
+`config.json`, next to `workspace.json` (`ROOST_STATE` redirects both). No
+file — the default — and roost behaves exactly as documented above.
+
+```json
+{ "keys": { "alt+f": "disable", "alt+v": "toggle_float" } }
+```
+
+A value is `"disable"` (the chord passes straight through to the pane, like
+an unbound key) or a snake_case `Action` name (see `src/ui/input.rs`). A
+chord listed twice keeps only its last value. Bad JSON, an unknown action, or
+an unparseable chord never blocks startup — roost starts with its defaults
+and names the bad entry (toast + activity feed). Read once at startup, not
+watched for changes.
+
 Everything else passes straight through to the focused pane. **Shift+Enter**
 and **Ctrl+Enter** are sent as "insert newline" rather than "submit", so you
 can compose multi-line prompts in agent TUIs that support it — this needs a

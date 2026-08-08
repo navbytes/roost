@@ -286,6 +286,10 @@ fn run(
             std::env::current_dir().unwrap_or_else(|_| "/".into()),
         )
     });
+    // config.json: the key-bindings escape hatch (design doc). Read once,
+    // here, alongside workspace.json — never fatal (`Keymap::parse`); any
+    // problem becomes a startup diagnostic below instead of blocking launch.
+    let (keymap, keymap_diagnostics) = infra::config::load_keymap();
     // promotion-auth-gate decision 9: built before the listener (ordering
     // that stays correct once sock.rs's door consults a reader onto this
     // same table) and passed into `App::new` below instead of `App::new`
@@ -324,6 +328,24 @@ fn run(
         tokens,
     )?;
     app.relayout();
+    app.set_keymap(keymap);
+    // Surface every config.json problem on the activity feed, so none are
+    // silently lost, and the first as a toast — same non-fatal contract as
+    // everything else here: roost already started fine, with its defaults.
+    for diag in &keymap_diagnostics {
+        app.note_config_issue(diag.clone());
+    }
+    if let Some(first) = keymap_diagnostics.first() {
+        let msg = if keymap_diagnostics.len() == 1 {
+            first.clone()
+        } else {
+            format!(
+                "{first} (+{} more — see the activity feed)",
+                keymap_diagnostics.len() - 1
+            )
+        };
+        app.set_flash(msg);
+    }
     if let Some(msg) = sock_err {
         app.set_flash(msg);
     }
@@ -589,13 +611,14 @@ fn write_control_token(path: &std::path::Path, token: &str) {
 fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent) {
     // C23: raw pass-through. `App::raw_routing_active` is the routing
     // predicate verbatim (Normal mode, focused pane raw, alive). Every key
-    // except the toggle bypasses `translate()`'s Action/swallow semantics
-    // and forwards straight to the pane as bytes instead — "the key that
-    // got you in gets you out" is the one exception, so it's still detected
-    // via `translate()` (the single source of the Alt+Shift+p / Alt+'P'
-    // tolerance rule) rather than a second, drift-prone copy of it here.
+    // except the toggle bypasses `translate_with()`'s Action/swallow
+    // semantics and forwards straight to the pane as bytes instead — "the
+    // key that got you in gets you out" is the one exception, so it's still
+    // detected via `translate_with()` (the single, config.json-aware source
+    // of the Alt+Shift+p / Alt+'P' tolerance rule) rather than a second,
+    // drift-prone copy of it here.
     if app.raw_routing_active() {
-        if let InputResult::Action(Action::ToggleRaw) = input::translate(key) {
+        if let InputResult::Action(Action::ToggleRaw) = input::translate_with(key, app.keymap()) {
             app.apply(Action::ToggleRaw);
         } else {
             let bytes = input::kitty_upgrade(key, input::encode_raw(key), app.focused_kitty());
@@ -606,7 +629,7 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
         }
         return;
     }
-    match input::translate(key) {
+    match input::translate_with(key, app.keymap()) {
         InputResult::Action(a) => app.apply(a),
         InputResult::Forward(bytes) if app.focused_dead() => match bytes.as_slice() {
             b"\r" => app.respawn_focused(false), // retry/resume
