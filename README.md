@@ -107,6 +107,14 @@ State lives in `~/.local/state/roost/workspace.json` on Linux and
 every change, atomic writes) — alongside the control socket, token and audit
 log. Delete it to start clean.
 
+On macOS roost promotes its own input threads to interactive scheduling
+priority so typing stays crisp while agent panes saturate the CPU (the
+agents themselves keep normal priority); set `ROOST_NO_QOS=1` to switch
+that off. Either way roost keeps a tiny local latency log — one aggregate
+line a minute of event-loop scheduling stalls into `<state>/perf.jsonl`
+(size-capped, timings and counters only, nothing sensitive) — so the
+promotion's real-world effect on your machine is decidable from data.
+
 ### macOS: make Option send Alt
 
 roost's shortcuts all live on `Alt`. On macOS, **Option** sends accented

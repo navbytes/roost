@@ -24,7 +24,7 @@ use crossterm::event::{
 use crossterm::execute;
 use std::io::IsTerminal;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::core::app::{App, Mode};
 use crate::core::control::TokenTable;
@@ -336,6 +336,11 @@ fn run(
     )?;
     app.relayout();
     app.set_keymap(keymap);
+    // Perf telemetry (infra::perf): the event loop's scheduling-stall
+    // histogram, one JSON line a minute into <state>/perf.jsonl — the
+    // isolated measurement behind the QoS keep-or-delete decision.
+    let mut perf =
+        infra::perf::PerfLog::new(infra::store::FsStore::state_dir(), infra::qos::enabled());
     // Surface every config.json problem on the activity feed, so none are
     // silently lost, and the first as a toast — same non-fatal contract as
     // everything else here: roost already started fine, with its defaults.
@@ -410,10 +415,22 @@ fn run(
         // and stale intermediate frames on screen. We coalesce resizes to a
         // single post-drain reconciliation.
         let mut resized = false;
-        if crossterm::event::poll(Duration::from_millis(33))? {
+        // Perf telemetry (infra::perf): how much later than the 33ms budget
+        // the poll actually returned is this thread's scheduling stall —
+        // the isolated measurement behind the QoS keep-or-delete decision.
+        // An event arriving early returns sooner than the budget; the
+        // saturating_sub reads that as zero stall, which it is.
+        let poll_started = Instant::now();
+        let had_event = crossterm::event::poll(Duration::from_millis(33))?;
+        perf.record_iteration(
+            poll_started.elapsed().saturating_sub(Duration::from_millis(33)),
+        );
+        if had_event {
+            let mut keys_drained: u64 = 0;
             loop {
                 match crossterm::event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        keys_drained += 1;
                         // F1 (exit UX audit 2026-08-07): note_key_seen looks
                         // at the key itself now — evidence is a specific
                         // swallowed-Alt character, not "a key arrived".
@@ -457,6 +474,7 @@ fn run(
                     break;
                 }
             }
+            perf.record_keys(keys_drained);
         }
         if resized {
             // Trust the terminal's current size, not a possibly-stale value
@@ -565,6 +583,7 @@ fn run(
         }
         // Periodic housekeeping (filesystem session detection).
         app.tick();
+        perf.maybe_flush();
         // Fire any parked `wait` control requests whose panes hit their target
         // status (or timed out) this iteration.
         app.poll_waiters();
