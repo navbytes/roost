@@ -31,6 +31,7 @@ pub mod inspect;
 pub mod notify;
 pub mod open;
 pub mod pty;
+pub mod qos;
 pub mod queries;
 pub mod sock;
 pub mod store;

@@ -278,6 +278,12 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     mut kbd_pending: Option<mpsc::Receiver<bool>>,
 ) -> Result<()> {
+    // This thread is the whole visible product — keyboard poll, pane
+    // parsing, drawing — so it gets macOS's user-interactive QoS: when the
+    // fleet's own agents saturate every core, the keystroke path wins the
+    // contention instead of queueing behind them (infra::qos module doc; the
+    // agents themselves are deliberately NOT demoted).
+    infra::qos::promote_input_loop_thread();
     let (tx, rx) = mpsc::sync_channel::<AppEvent>(EVENT_CHANNEL_BOUND);
 
     // Wire production adapters to the core's ports.
