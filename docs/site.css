@@ -215,19 +215,10 @@
   #r-quit:checked ~ .resurrect-window .resurrect-body-roost { display: none; }
   #r-quit:checked ~ .resurrect-window .resurrect-body-quit { display: block; }
 
-  /* ── hero mascot ──────────────────────────────────────────────────── */
-  .hero-grid {
-    display: grid; grid-template-columns: 1fr;
-    grid-template-areas: "kicker" "h1" "lede" "note" "art" "cta";
-    align-items: start;
-  }
-  .hero-grid > .kicker { grid-area: kicker; }
-  .hero-grid > h1 { grid-area: h1; }
-  .hero-lede { grid-area: lede; }
-  .hero-note { grid-area: note; }
-  .hero-cta { grid-area: cta; }
-  .hero-art { grid-area: art; margin: 40px auto 0; max-width: 300px; }
-  .hero-art svg { display: block; width: 100%; height: auto; }
+  /* ── mascot ───────────────────────────────────────────────────────── */
+  /* square 150-unit viewBox at 1:1 px, feet line 115 units below the crop top:
+     top = -(115/150 × width) puts the feet on the demo window's top edge */
+  .demo-bird { position: absolute; top: -115px; right: 36px; width: 150px; height: auto; pointer-events: none; }
 
   /* resting pose is already slightly settled (0.985); breathing dips further (0.955) */
   @keyframes bird-breathe {
@@ -241,21 +232,10 @@
   .bird-breathe { transform-box: fill-box; transform-origin: 50% 100%; animation: bird-breathe 3s ease-in-out infinite; }
   .bird-eyes { transform-box: fill-box; transform-origin: 50% 50%; animation: bird-blink 4s ease-in-out infinite; }
 
-  @media (min-width: 960px) {
-    .hero-grid {
-      grid-template-columns: 1fr 440px;
-      grid-template-areas:
-        "kicker art"
-        "h1     art"
-        "lede   art"
-        "note   art"
-        "cta    art";
-      column-gap: clamp(40px,4vw,64px);
-    }
-    .hero-art { margin: 0; max-width: none; align-self: center; }
-  }
-
   @media (max-width: 760px) {
+    .demo-bird { top: -77px; right: 16px; width: 100px; }
+    /* keep the wrapped seg-row caption out of the bird's perch lane (100px + 16px right + breath) */
+    .seg-row { padding-right: 124px; }
     .nav { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
     .nav::-webkit-scrollbar { display: none; }
     .nav-brand, .nav > a { flex-shrink: 0; }

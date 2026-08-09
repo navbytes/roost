@@ -57,43 +57,54 @@
 <div style="max-width:1200px;margin:0 auto;padding:0 var(--edge)">
 
   <section style="padding:clamp(48px,7vw,104px) 0 clamp(40px,5vw,72px)">
-    <div class="hero-grid">
+    <div>
       <span class="kicker kicker-red" style="margin-bottom:28px">Session-native terminal multiplexer</span>
       <h1 style="font-family:var(--font-mono);font-weight:800;font-size:clamp(34px,5.6vw,72px);line-height:1.05;letter-spacing:-0.01em;margin:0">
         <span style="display:block">Processes are disposable.</span>
         <span style="display:block;color:var(--color-accent)">Sessions are <span style="white-space:nowrap">precious.<span class="cursor-blink" aria-hidden="true">▍</span></span></span>
       </h1>
-      <p class="hero-lede" style="font-size:clamp(17px,1.5vw,20px);line-height:1.6;max-width:60ch;margin:32px 0 0;color:color-mix(in srgb, var(--color-text) 82%, transparent)">
+      <p style="font-size:clamp(17px,1.5vw,20px);line-height:1.6;max-width:60ch;margin:32px 0 0;color:color-mix(in srgb, var(--color-text) 82%, transparent)">
         roost is a terminal multiplexer for AI agent CLIs — pi, Claude Code, Codex, Gemini, opencode, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — every tab, split, and stacked pane comes back, each agent resumed into its exact session.
       </p>
-      <p class="hero-note" style="font-family:var(--font-mono);font-size:13px;line-height:1.6;max-width:60ch;margin:10px 0 0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">
+      <p style="font-family:var(--font-mono);font-size:13px;line-height:1.6;max-width:60ch;margin:10px 0 0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">
         No daemon. No detach. roost resurrects the desk, not the sentence being typed on it.
       </p>
-      <div class="hero-art">
-        <svg viewBox="0 0 400 360" aria-hidden="true" focusable="false">
-          <g>
-            <rect x="40" y="150" width="320" height="190" style="fill:var(--tui-bg)"/>
-            <rect x="40" y="150" width="320" height="30" style="fill:var(--tui-bar)"/>
-            <line x1="40" y1="180" x2="360" y2="180" style="stroke:rgba(255,255,255,0.07)"/>
-            <rect x="58" y="159" width="9" height="9" style="fill:#5a5550"/>
-            <rect x="76" y="159" width="9" height="9" style="fill:#5a5550"/>
-            <rect x="94" y="159" width="9" height="9" style="fill:#5a5550"/>
-            <text x="120" y="169" style="font-family:var(--font-mono);font-size:12px;letter-spacing:0.02em;fill:var(--tui-mut)">roost — ~/code</text>
-            <text x="60" y="214" style="font-family:var(--font-mono);font-size:14px"><tspan style="fill:var(--tui-accent)">$</tspan><tspan style="fill:var(--tui-fg)"> roost</tspan></text>
-            <text x="60" y="236" style="font-family:var(--font-mono);font-size:13px;fill:var(--tui-dim)">3 tabs · 7 panes · resumed ✓</text>
-            <text x="60" y="266" style="font-family:var(--font-mono);font-size:14px"><tspan style="fill:var(--tui-accent)">$</tspan><tspan class="cursor-blink" style="fill:var(--tui-accent)"> ▍</tspan></text>
-            <rect x="40" y="150" width="320" height="190" fill="none" style="stroke:var(--color-text);stroke-width:2"/>
-          </g>
-          <!-- The roost bird, verbatim from the client's concept SVG (2026-08-07),
-               translated y-95 so its feet land on this window's title bar, and
-               x+85 so the draped tail falls on the bar's empty stretch instead of
-               across the window title. The mascot palette is the client's own and
-               intentionally sits outside the site's three-hue tokens (like Ferris
-               is orange on rust-lang.org). -->
-          <!-- translate lives on this wrapper, NOT on .bird-breathe: the breathe
-               keyframes set `transform` in CSS, which would override an attribute
-               transform on the same node and snap the bird back left. -->
-          <g transform="translate(85,0)">
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
+        <div style="display:flex;align-items:stretch;border:2px solid var(--color-text);font-family:var(--font-mono);max-width:100%">
+          <span style="display:flex;align-items:center;gap:10px;padding:12px 16px;font-size:15px;white-space:nowrap;overflow-x:auto;min-width:0">
+            <span style="color:var(--color-accent)">$</span> brew install navbytes/tap/roost
+          </span>
+          <button type="button" class="js-copy" data-copy-text="brew install navbytes/tap/roost" role="status" aria-live="polite" style="flex-shrink:0;border:0;border-left:2px solid var(--color-text);background:var(--color-text);color:var(--color-bg);font-family:var(--font-mono);font-weight:500;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;padding:0 16px;cursor:pointer;min-width:88px">Copy</button>
+        </div>
+        <a class="btn btn-secondary" href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="text-decoration:none;padding:12px 20px;font-size:15px">Star on GitHub ↗</a>
+      </div>
+    </div>
+  </section>
+
+  <section aria-label="roost terminal demo" style="padding-bottom:clamp(40px,5vw,72px)">
+    <div class="resurrect">
+      <input type="radio" name="resurrect" id="r-quit" class="seg-input">
+      <input type="radio" name="resurrect" id="r-roost" class="seg-input" checked>
+
+      <div class="seg-row" style="display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin-bottom:20px">
+        <div class="seg">
+          <label for="r-quit" class="seg-label">⏻ quit &amp; reboot</label>
+          <label for="r-roost" class="seg-label">$ roost</label>
+        </div>
+        <span style="font-family:var(--font-mono);font-size:13px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">The whole pitch is this switch. Flip it.</span>
+      </div>
+
+      <div class="resurrect-window" style="position:relative;border:2px solid var(--color-text);background:var(--tui-bg);box-shadow:var(--shadow-lg);font-family:var(--font-mono);color:var(--tui-fg)">
+        <!-- The roost bird, verbatim from the client's concept SVG (2026-08-07),
+             perched on the demo window itself: viewBox crops to the bird (x 125-275,
+             y 35-185), feet line at artwork y=150 = 115 units below the crop top, so
+             .demo-bird's negative top offset lands the feet on this window's top edge
+             and the tail drapes onto the title bar's empty right stretch. The mascot
+             palette is the client's own and intentionally sits outside the site's
+             three-hue tokens (like Ferris is orange on rust-lang.org). No transform
+             wrapper needed here — the crop does the placement; keep transforms off
+             .bird-breathe, its CSS animation would override them. -->
+        <svg class="demo-bird" viewBox="125 35 150 150" aria-hidden="true" focusable="false">
           <g class="bird-breathe">
             <path d="M 200 145 Q 170 175 190 185 Q 215 175 200 145" fill="#CC3333"/>
             <path d="M 185 145 L 180 150" stroke="#FFA500" stroke-width="3" stroke-linecap="round" fill="none"/>
@@ -114,35 +125,7 @@
             </g>
             <path d="M 192 93 L 208 93 L 200 105 Z" fill="#FFA500" stroke="#FF8C00" stroke-width="1" stroke-linejoin="round"/>
           </g>
-          </g>
         </svg>
-      </div>
-      <div class="hero-cta" style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
-        <div style="display:flex;align-items:stretch;border:2px solid var(--color-text);font-family:var(--font-mono);max-width:100%">
-          <span style="display:flex;align-items:center;gap:10px;padding:12px 16px;font-size:15px;white-space:nowrap;overflow-x:auto;min-width:0">
-            <span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost
-          </span>
-          <button type="button" class="js-copy" data-copy-text="mise use -g github:navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:0;border-left:2px solid var(--color-text);background:var(--color-text);color:var(--color-bg);font-family:var(--font-mono);font-weight:500;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;padding:0 16px;cursor:pointer;min-width:88px">Copy</button>
-        </div>
-        <a class="btn btn-secondary" href="https://github.com/navbytes/roost" target="_blank" rel="noopener" style="text-decoration:none;padding:12px 20px;font-size:15px">Star on GitHub ↗</a>
-      </div>
-    </div>
-  </section>
-
-  <section aria-label="roost terminal demo" style="padding-bottom:clamp(40px,5vw,72px)">
-    <div class="resurrect">
-      <input type="radio" name="resurrect" id="r-quit" class="seg-input">
-      <input type="radio" name="resurrect" id="r-roost" class="seg-input" checked>
-
-      <div class="seg-row" style="display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin-bottom:20px">
-        <div class="seg">
-          <label for="r-quit" class="seg-label">⏻ quit &amp; reboot</label>
-          <label for="r-roost" class="seg-label">$ roost</label>
-        </div>
-        <span style="font-family:var(--font-mono);font-size:13px;color:color-mix(in srgb, var(--color-text) 62%, transparent)">The whole pitch is this switch. Flip it.</span>
-      </div>
-
-      <div class="resurrect-window" style="border:2px solid var(--color-text);background:var(--tui-bg);box-shadow:var(--shadow-lg);font-family:var(--font-mono);color:var(--tui-fg)">
         <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--tui-bar);border-bottom:1px solid rgba(255,255,255,0.07)">
           <span style="display:flex;gap:7px">
             <span style="width:11px;height:11px;background:#5a5550;display:inline-block"></span>
@@ -468,14 +451,14 @@
         <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M6 8h10v11a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2z"/><path d="M16 11h2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-2"/><path d="M8 8V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v3"/></svg>
         <div>
           <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">Homebrew</p>
-          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Same binaries, checksum-verified by brew.</p>
+          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Prebuilt binaries, checksum-verified by brew.</p>
         </div>
       </div>
       <div class="install-card" style="display:flex;gap:14px;align-items:flex-start">
         <svg class="icon" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-top:2px"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>
         <div>
           <p style="margin:0 0 4px;font-family:var(--font-heading);font-weight:800;font-size:15px">mise</p>
-          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Prebuilt binary, no Rust toolchain. Works today.</p>
+          <p style="margin:0;font-size:13.5px;line-height:1.5;color:color-mix(in srgb, var(--color-text) 70%, transparent)">Same binaries, no tap — straight from releases.</p>
         </div>
       </div>
       <div class="install-card" style="display:flex;gap:14px;align-items:flex-start">
@@ -494,11 +477,11 @@
       </div>
     </div>
     <div style="border:2px solid var(--color-text);background:#181615;font-family:var(--font-mono);font-size:14.5px;line-height:2;color:#d7d3d3;padding:22px 24px;overflow-x:auto">
-      <div><span style="color:#8f8a88"># mise — prebuilt binary, no Rust toolchain</span></div>
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost</span><button type="button" class="js-copy" data-copy-text="mise use -g github:navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
+      <div><span style="color:#8f8a88"># Homebrew — prebuilt binary, no Rust toolchain</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> brew install navbytes/tap/roost</span><button type="button" class="js-copy" data-copy-text="brew install navbytes/tap/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> roost</span><button type="button" class="js-copy" data-copy-text="roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
-      <div style="margin-top:14px"><span style="color:#8f8a88"># or with Homebrew</span></div>
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> brew install navbytes/roost/roost</span><button type="button" class="js-copy" data-copy-text="brew install navbytes/roost/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
+      <div style="margin-top:14px"><span style="color:#8f8a88"># or with mise — no tap, straight from releases</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> mise use -g github:navbytes/roost</span><button type="button" class="js-copy" data-copy-text="mise use -g github:navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
       <div style="margin-top:14px"><span style="color:#8f8a88"># or from source</span></div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:14px"><span><span style="color:var(--color-accent)">$</span> cargo install --git https://github.com/navbytes/roost</span><button type="button" class="js-copy" data-copy-text="cargo install --git https://github.com/navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:1px solid #45403c;background:transparent;color:#d7d3d3;font-family:var(--font-mono);font-weight:700;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;padding:3px 9px;cursor:pointer">Copy</button></div>
     </div>
@@ -520,8 +503,8 @@
     <p style="font-size:clamp(16px,1.4vw,19px);line-height:1.55;max-width:46ch;margin:24px 0 0;color:color-mix(in srgb, var(--color-bg) 88%, transparent)">Free and open source. Your agents come home to roost after every reboot.</p>
     <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:36px">
       <div style="display:flex;align-items:center;gap:12px;padding:13px 18px;font-family:var(--font-mono);font-size:15px;background:color-mix(in srgb, var(--color-bg) 12%, transparent);border:2px solid var(--color-bg);max-width:100%;overflow-x:auto;white-space:nowrap">
-        <span>mise use -g github:navbytes/roost</span>
-        <button type="button" class="js-copy" data-copy-text="mise use -g github:navbytes/roost" role="status" aria-live="polite" style="flex-shrink:0;border:0;background:var(--color-bg);color:var(--color-accent);font-family:var(--font-mono);font-weight:700;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 10px;cursor:pointer">Copy</button>
+        <span>brew install navbytes/tap/roost</span>
+        <button type="button" class="js-copy" data-copy-text="brew install navbytes/tap/roost" role="status" aria-live="polite" style="flex-shrink:0;border:0;background:var(--color-bg);color:var(--color-accent);font-family:var(--font-mono);font-weight:700;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 10px;cursor:pointer">Copy</button>
       </div>
       <a href="https://github.com/navbytes/roost" target="_blank" rel="noopener" class="btn" style="text-decoration:none;color:var(--color-bg);border:2px solid var(--color-bg);padding:12px 22px;font-size:15px;--btn-shadow:var(--color-bg)">View on GitHub ↗</a>
     </div>
