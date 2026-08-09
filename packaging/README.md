@@ -18,23 +18,28 @@ attached.
 
 ## Updating the Homebrew formula
 
-`packaging/homebrew/roost.rb` is a template — it isn't wired into a tap yet
-(see below), so nothing installs it automatically. After a release, a
-maintainer updates it by hand:
+`packaging/homebrew/roost.rb` is the source of truth for the tap's formula.
+After a release, a maintainer updates it by hand:
 
 1. Set `version` to the released `X.Y.Z` (no `v` prefix).
 2. Download `SHA256SUMS.txt` from the release and copy each matching line's
-   hash into the corresponding `REPLACE_ON_RELEASE` in the formula:
+   hash into the corresponding `sha256` in the formula:
    - `roost-<version>-aarch64-apple-darwin.tar.gz` → macOS arm64
    - `roost-<version>-x86_64-apple-darwin.tar.gz` → macOS x64
+   - `roost-<version>-aarch64-unknown-linux-gnu.tar.gz` → Linux arm64
    - `roost-<version>-x86_64-unknown-linux-gnu.tar.gz` → Linux x64
 
    `grep aarch64-apple-darwin SHA256SUMS.txt` (etc.) finds the right line.
+3. Copy the updated formula into
+   [`navbytes/homebrew-tap`](https://github.com/navbytes/homebrew-tap) as
+   `Formula/roost.rb`, swapping the header comment for the tap copy's
+   "copied from navbytes/roost" note.
 
 ## The tap
 
-Installing via `brew install navbytes/roost/roost` needs the formula to live
-in a `navbytes/homebrew-roost` repo — that's its eventual home, but creating
-it is deliberately deferred until there's a real release to point it at.
-Until then, this formula is a template to copy into that repo later, not
-something you can `brew install` today.
+`brew install navbytes/tap/roost` serves the formula from
+[`navbytes/homebrew-tap`](https://github.com/navbytes/homebrew-tap) — the
+general navbytes tap (this formula plus the vee and nt casks). The earlier
+dedicated `navbytes/homebrew-roost` tap holds only a `tap_migrations.json`
+redirect pointing there; leave that repo up so pre-move installs migrate
+automatically on `brew update` + `brew upgrade`.

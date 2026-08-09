@@ -1,4 +1,4 @@
-# Source of truth for the navbytes/homebrew-roost tap's Formula/roost.rb —
+# Source of truth for the navbytes/homebrew-tap tap's Formula/roost.rb —
 # update THIS file per release (version + every sha256 from that release's
 # SHA256SUMS.txt), then copy it into the tap repo. The values below are
 # v0.1.4's, verified against the published checksums.
