@@ -16,24 +16,32 @@ as `roost-<version>-<target>.tar.gz` (binary + LICENSE + README.md), and
 publishes a GitHub Release with the tarballs plus a combined `SHA256SUMS.txt`
 attached.
 
-## Updating the Homebrew formula
+## The Homebrew formula (automated)
 
-`packaging/homebrew/roost.rb` is the source of truth for the tap's formula.
-After a release, a maintainer updates it by hand:
+The release workflow keeps the tap current — no manual bump. After the
+GitHub Release is published, the `release` job runs
+[`scripts/update-homebrew-formula.sh`](../scripts/update-homebrew-formula.sh),
+which renders `Formula/roost.rb` (version + all four sha256s parsed from
+`dist/SHA256SUMS.txt`) and pushes it to
+[`navbytes/homebrew-tap`](https://github.com/navbytes/homebrew-tap). The
+script is the formula's source of truth — there is no checked-in `.rb`
+template; edit the script's heredoc to change the formula.
 
-1. Set `version` to the released `X.Y.Z` (no `v` prefix).
-2. Download `SHA256SUMS.txt` from the release and copy each matching line's
-   hash into the corresponding `sha256` in the formula:
-   - `roost-<version>-aarch64-apple-darwin.tar.gz` → macOS arm64
-   - `roost-<version>-x86_64-apple-darwin.tar.gz` → macOS x64
-   - `roost-<version>-aarch64-unknown-linux-gnu.tar.gz` → Linux arm64
-   - `roost-<version>-x86_64-unknown-linux-gnu.tar.gz` → Linux x64
+The step needs one secret in this repo's Actions settings:
 
-   `grep aarch64-apple-darwin SHA256SUMS.txt` (etc.) finds the right line.
-3. Copy the updated formula into
-   [`navbytes/homebrew-tap`](https://github.com/navbytes/homebrew-tap) as
-   `Formula/roost.rb`, swapping the header comment for the tap copy's
-   "copied from navbytes/roost" note.
+- **`HOMEBREW_TAP_TOKEN`** — a fine-grained PAT with **Contents: Read and
+  write** on **only** `navbytes/homebrew-tap` (GitHub → Settings → Developer
+  settings → Fine-grained tokens). It's the same secret name, scope, and
+  target tap that vee's release workflow uses, so the same token value works
+  for both repos. When the secret is absent the step is skipped and the
+  release still succeeds — the tap just doesn't update (fork-safe).
+
+Dry-run locally (renders to stdout, touches nothing):
+
+```sh
+RENDER_ONLY=1 RELEASE_TAG=v0.1.4 SUMS_FILE=path/to/SHA256SUMS.txt \
+  scripts/update-homebrew-formula.sh
+```
 
 ## The tap
 
