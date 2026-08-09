@@ -48,11 +48,22 @@
 //! reduction. If a future measurement isolates the roost-owned hops and
 //! still shows nothing, deleting this module is the right move.
 
+/// Is QoS promotion active for this run? macOS with no opt-out. The
+/// `ROOST_NO_QOS=1` env var is both the kill switch and the A/B lever for
+/// the telemetry-driven keep-or-delete decision (`infra::perf`): run some
+/// days with it, some without, compare stall distributions at similar load.
+pub fn enabled() -> bool {
+    cfg!(target_os = "macos") && std::env::var_os("ROOST_NO_QOS").is_none()
+}
+
 /// Mark the calling thread as user-interactive (macOS). Call once, from the
 /// main event-loop thread, before the loop starts. Best-effort: a refusal
 /// (unsupported class, sandbox) changes nothing about correctness, so the
 /// return code is deliberately ignored beyond debug builds.
 pub fn promote_input_loop_thread() {
+    if !enabled() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     // SAFETY: plain FFI with no pointers; affects only the calling thread's
     // scheduler class.
@@ -69,6 +80,9 @@ pub fn promote_input_loop_thread() {
 /// of each pane's PTY writer thread — the thread that delivers keystrokes
 /// to the child. Same best-effort contract as `promote_input_loop_thread`.
 pub fn promote_input_delivery_thread() {
+    if !enabled() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     // SAFETY: as above — no pointers, calling thread only.
     unsafe {
