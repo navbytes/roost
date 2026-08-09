@@ -112,9 +112,17 @@ fn draw_too_small(f: &mut Frame, area: Rect) {
 /// table every key really does close it; on a shorter one the arrows read on
 /// instead, and a bar still promising "any key close" would be advertising a
 /// dismissal the arrows no longer perform.
+///
+/// [Amended 2026-08-09] `resumable` — the focused dead pane has a session
+/// pointer (`App::resume_command_line` is Some) — adds `y copy resume` to the
+/// dead branch. Only there: a shell pane's `y` would copy nothing, and a hint
+/// for a key that does nothing is a lie. Placed ahead of `Alt+w`/`Alt+q` in
+/// the yield order because those two are discoverable everywhere; `y` exists
+/// only on this bar.
 fn hint_pairs(
     mode: &Mode,
     focused_dead: bool,
+    resumable: bool,
     focused_raw: bool,
     help_scrolled: bool,
 ) -> Vec<(&'static str, &'static str)> {
@@ -208,7 +216,12 @@ fn hint_pairs(
             ("Esc", "close"),
         ],
         Mode::Normal if focused_dead => {
-            vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]
+            let mut pairs = vec![("↵", "relaunch"), ("f", "fresh — drops resume")];
+            if resumable {
+                pairs.push(("y", "copy resume"));
+            }
+            pairs.extend([("Alt+w", "close"), ("Alt+q", "quit")]);
+            pairs
         }
         Mode::Normal if focused_raw => vec![("Alt+Shift+p", "exit raw")],
         // [Amended, U6] Same seven pairs, reordered: pairs drop whole from
@@ -369,8 +382,9 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // whole until the segment fits.
     let focused_raw = app.is_raw(app.focused);
     let (help_visible, help_total) = help_scroll_extent(app.body_area());
-    let hints =
-        hint_pairs(&app.mode, app.focused_dead(), focused_raw, help_visible < help_total);
+    let resumable = app.focused_dead() && app.resume_command_line(app.focused).is_some();
+    let scrolled = help_visible < help_total;
+    let hints = hint_pairs(&app.mode, app.focused_dead(), resumable, focused_raw, scrolled);
     // U3: Scroll mode's right segment shows where in history the view sits
     // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
     // can never report a phantom row the grid refused (U9's overshoot).
@@ -1675,10 +1689,8 @@ fn draw_pane<B: PaneBackend>(
         if let Some(err) = app.dead.get(&pr.id) {
             lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
         }
-        lines.push(Line::from(Span::raw(format!(
-            " {} exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close ",
-            theme::GLYPH_EXITED
-        ))));
+        let resumable = app.resume_command_line(pr.id).is_some();
+        lines.push(Line::from(Span::raw(dead_bar_text(resumable))));
         let n = lines.len() as u16;
         let y = inner.y + inner.height.saturating_sub(n);
         let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
@@ -1689,6 +1701,19 @@ fn draw_pane<B: PaneBackend>(
         // one bar, exactly as C10/C11's rows do.
         f.render_widget(Paragraph::new(lines).style(theme::attention_problem()), overlay);
     }
+}
+
+/// C16's action-bar text, pure so both variants pin without a `Frame`.
+/// [Amended 2026-08-09] `y: copy resume` rides the bar only when the pane
+/// has a session pointer — same predicate as the hint bar's `resumable`
+/// (`App::resume_command_line`), so the two surfaces can't disagree about
+/// whether `y` does anything.
+fn dead_bar_text(resumable: bool) -> String {
+    let copy_hint = if resumable { " · y: copy resume" } else { "" };
+    format!(
+        " {} exited — Enter: relaunch/resume · f: fresh (drops resume){copy_hint} · Alt+w: close ",
+        theme::GLYPH_EXITED
+    )
 }
 
 /// C7: overpaint an expanded stack member's left border column with the
@@ -2518,7 +2543,7 @@ mod tests {
         // U6 order (C9 amended 2026-07-27): `Alt+? keys` first so it yields
         // last, `Alt+r rename` last so it drops first.
         assert_eq!(
-            hint_pairs(&Mode::Normal, false, false, false),
+            hint_pairs(&Mode::Normal, false, false, false, false),
             vec![
                 ("Alt+?", "keys"),
                 ("Alt+n", "new"),
@@ -2539,7 +2564,7 @@ mod tests {
     /// one still standing is `Alt+? keys`.
     #[test]
     fn the_help_pair_is_the_last_hint_to_yield_and_rename_the_first() {
-        let pairs = hint_pairs(&Mode::Normal, false, false, false);
+        let pairs = hint_pairs(&Mode::Normal, false, false, false, false);
         let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
         let right_w = " ◆ 1 needs you · Alt+a  NORMAL ".chars().count() as u16 - 1;
 
@@ -2560,7 +2585,7 @@ mod tests {
     /// a hint bar that clips its own mode's keys is the U17 bug restated.
     #[test]
     fn hint_pairs_copy_mode_is_the_c24_list_amended_by_u17() {
-        let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false, false);
+        let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false, false, false);
         assert_eq!(
             pairs,
             vec![
@@ -2588,7 +2613,7 @@ mod tests {
     #[test]
     fn hint_pairs_focused_raw_normal_is_exactly_one_pair() {
         // C23: every other hint would be a lie — nothing else is intercepted.
-        assert_eq!(hint_pairs(&Mode::Normal, false, true, false), vec![("Alt+Shift+p", "exit raw")]);
+        assert_eq!(hint_pairs(&Mode::Normal, false, false, true, false), vec![("Alt+Shift+p", "exit raw")]);
     }
 
     #[test]
@@ -2598,7 +2623,7 @@ mod tests {
         // hint bar must show what's actually actionable (dead-pane keys),
         // not a raw-exit hint nothing would honor.
         assert_eq!(
-            hint_pairs(&Mode::Normal, true, true, false),
+            hint_pairs(&Mode::Normal, true, false, true, false),
             vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")],
         );
     }
@@ -2696,7 +2721,7 @@ mod tests {
         // right before the aggregate/mode-word segment ever yields. Measure
         // via the SAME `hint_pair_cols` the draw path uses — a +3/+4 drift
         // here once let the whole segment drop at widths 111-116 (D2).
-        let pairs = hint_pairs(&Mode::Normal, false, false, false);
+        let pairs = hint_pairs(&Mode::Normal, false, false, false, false);
         let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
         let all_w: u16 = pairs.iter().map(&pw).sum();
 
@@ -2726,7 +2751,7 @@ mod tests {
 
     #[test]
     fn hint_pairs_dead_focused_normal_offers_relaunch_not_new_pane() {
-        let dead = hint_pairs(&Mode::Normal, true, false, false);
+        let dead = hint_pairs(&Mode::Normal, true, false, false, false);
         assert_eq!(
             dead,
             vec![
@@ -2737,7 +2762,36 @@ mod tests {
             ],
         );
         // A live pane never offers "relaunch"; a dead one never offers "new".
-        assert_ne!(dead, hint_pairs(&Mode::Normal, false, false, false));
+        assert_ne!(dead, hint_pairs(&Mode::Normal, false, false, false, false));
+        // A resumable dead pane adds `y copy resume` — before close/quit in
+        // the yield order (those two are discoverable everywhere; `y` only
+        // lives on this bar). A session-less pane must NOT advertise it.
+        assert_eq!(
+            hint_pairs(&Mode::Normal, true, true, false, false),
+            vec![
+                ("↵", "relaunch"),
+                ("f", "fresh — drops resume"),
+                ("y", "copy resume"),
+                ("Alt+w", "close"),
+                ("Alt+q", "quit"),
+            ],
+        );
+    }
+
+    /// C16 [Amended 2026-08-09]: the overlay bar's two variants. The
+    /// session-less text must stay byte-identical to the unamended spec
+    /// string; the resumable one inserts `y: copy resume` before close —
+    /// mirroring the hint bar, so the two surfaces read in the same order.
+    #[test]
+    fn dead_bar_text_offers_copy_resume_only_when_resumable() {
+        assert_eq!(
+            super::dead_bar_text(false),
+            " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close "
+        );
+        assert_eq!(
+            super::dead_bar_text(true),
+            " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · y: copy resume · Alt+w: close "
+        );
     }
 
     /// C20's list as amended by U25: every key the feed actually answers to.
@@ -2747,7 +2801,7 @@ mod tests {
     #[test]
     fn hint_pairs_feed_mode_lists_every_key_the_feed_answers_to() {
         assert_eq!(
-            hint_pairs(&Mode::Feed { offset: 0 }, false, false, false),
+            hint_pairs(&Mode::Feed { offset: 0 }, false, false, false, false),
             vec![
                 ("↑↓", "select"),
                 ("PgUp/Dn", "page"),
@@ -2765,7 +2819,7 @@ mod tests {
     #[test]
     fn hint_pairs_roster_mode_is_the_c27_list_and_fits_the_floor() {
         let mode = Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None };
-        let pairs = hint_pairs(&mode, false, false, false);
+        let pairs = hint_pairs(&mode, false, false, false, false);
         assert_eq!(
             pairs,
             vec![
@@ -2789,9 +2843,9 @@ mod tests {
     /// the arrows have stopped closing it.
     #[test]
     fn the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls() {
-        let whole = hint_pairs(&Mode::Help { top: 0 }, false, false, false);
+        let whole = hint_pairs(&Mode::Help { top: 0 }, false, false, false, false);
         assert_eq!(whole, vec![("Alt+?", "all keys"), ("any key", "close")]);
-        let scrolled = hint_pairs(&Mode::Help { top: 0 }, false, false, true);
+        let scrolled = hint_pairs(&Mode::Help { top: 0 }, false, false, false, true);
         assert_eq!(scrolled, vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]);
         let cols: u16 = scrolled.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
         assert!(cols < 100, "the scrolled row still fits beside the right segment: {cols}");
@@ -2812,9 +2866,9 @@ mod tests {
     #[test]
     fn hint_pairs_rename_word_differs_pane_vs_tab() {
         let pane =
-            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false, false);
+            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false, false, false);
         let tab =
-            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false, false);
+            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false, false, false);
         assert_eq!(pane[0], ("type", "pane name"));
         assert_eq!(tab[0], ("type", "tab name"));
     }
@@ -3251,6 +3305,7 @@ mod tests {
     fn hint_pairs_picker_advertises_the_number_accelerators() {
         let pairs = hint_pairs(
             &Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
+            false,
             false,
             false,
             false,
