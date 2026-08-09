@@ -71,7 +71,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # Absent → the Homebrew-tap sync step is skipped (fork/unconfigured
+      # repos still release cleanly). A fine-grained PAT with contents:write
+      # on navbytes/homebrew-tap — the same secret vee's release workflow
+      # uses. See packaging/README.md.
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
+      # Checkout first — it wipes the workspace, and the sync step below
+      # needs scripts/ from the repo.
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -92,3 +102,12 @@ jobs:
             dist/SHA256SUMS.txt
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      # Keep navbytes/homebrew-tap tracking this release: render
+      # Formula/roost.rb from dist/SHA256SUMS.txt and push it to the tap.
+      # Skipped when HOMEBREW_TAP_TOKEN is unset (see the job env above).
+      - name: Sync Homebrew formula (navbytes/homebrew-tap)
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/update-homebrew-formula.sh
