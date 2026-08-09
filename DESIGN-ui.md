@@ -893,6 +893,12 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   moves four ways; mode-specific lists below are unchanged in content.)
 - Other modes keep their current pair lists (`:68–83`), restyled identically
   (dead-focused Normal list `:81–83` included).
+  **[Amended 2026-08-09, copy resume]** The dead-focused Normal list gains a
+  fifth pair, `y copy resume`, between `f fresh` and `Alt+w close` — present
+  only when the pane has a session pointer (same
+  `App::resume_command_line(..).is_some()` predicate as C16's bar). Ahead of
+  close/quit in the yield order because those two are discoverable
+  everywhere; `y` exists only on this bar.
 - Right-aligned segment, drawn only when it fits after the hint spans
   (hints win on narrow widths): `"◆ {N} needs you · Alt+a"` fg `ACCENT` —
   N = count of panes whose runtime status is `NeedsInput` across **all**
@@ -1086,8 +1092,19 @@ exited successfully, `copied N chars (OSC 52)` when the escape went out
 unacknowledged (the SSH/tmux channel — it may equally have vanished into a
 terminal that ignores it), and `copy failed` when neither landed, with no
 count to quote. The text comes from the pure `App::copy_flash_text`, and
-both copy paths (mouse release, keyboard `y`/`↵`) flash only *after* the
-clipboard has answered.
+all copy paths (mouse release, keyboard `y`/`↵` in copy mode, and the
+dead-pane bar's `y` copy-resume — amended 2026-08-09) flash only *after*
+the clipboard has answered.
+
+**[Amended 2026-08-09, flash-text reconciliation]** The failure variant's
+full text is `copy failed: no clipboard channel worked; check your
+terminal's clipboard support` — the code's wording (`App::copy_flash_text`'s
+`Failed` arm, pinned by its tests) supersedes the bare `copy failed` this
+section previously quoted: the trailing hint names the one thing actually
+worth checking (a missing native helper is the common half of "both channels
+lost"), and shortening the code to match the spec would have deleted
+information. Short-form `copy failed` mentions elsewhere in this doc refer
+to this full string.
 
 **[Amended 2026-07-27, SPEC-ux U22]:** "timing unchanged" is superseded for
 confirm-arm prompts only: a flash that arms a destructive second-press
@@ -1657,6 +1674,14 @@ chrome.
   (`" ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close "`),
   fg `FG` on bg `ACCENT_DIM`.
 - Placement (bottom rows over preserved last screen) unchanged.
+
+**[Amended 2026-08-09, copy resume]** A pane with a session pointer
+(`App::resume_command_line` is Some) inserts `· y: copy resume` before
+`· Alt+w: close`; `y` copies the pasteable `cd <cwd> && <resume command>`
+line and flashes the U14 copy outcome. Session-less panes (shells, agents
+dead before detection) keep the bar unchanged — `y` would copy nothing
+there, and both this bar and the C9 hint bar gate on the same predicate so
+they can't disagree.
 
 **[Amended 2026-07-27, theme inheritance]** The spawn-error line stays
 `accent()` on no bg. The action bar becomes `attention_problem()` instead
@@ -3813,9 +3838,10 @@ double-click/triple-click/shift-click now live too. Nothing here changes:
 no new Alt chord, no reassigned key, and the free-Alt-keys tally below is
 untouched.]
 
-Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh (C16);
-raw pane — **every** key passes through except `Alt+Shift+p` (C23); modes
-capture their own keys (C9 lists them).
+Contextual, non-Alt: dead pane — `Enter` relaunch/resume, `f` fresh, `y`
+copy resume command (resumable panes only — C16); raw pane — **every** key
+passes through except `Alt+Shift+p` (C23); modes capture their own keys
+(C9 lists them).
 
 Control-plane only, no key by design: `roost send --all TEXT [--enter]`
 (broadcast — PLAN F2; surfaces in chrome only as a C20 `ctl` feed line).

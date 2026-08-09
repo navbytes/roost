@@ -3246,6 +3246,27 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// The pasteable resume command for a pane — `cd <cwd> && pi --session
+    /// <id>` — the same adapter `resume()` Enter runs, rendered for a plain
+    /// terminal (the `y` key on the dead-pane bar copies it). None when the
+    /// pane has no session pointer (shell panes, agents that died before
+    /// session detection): nothing to resume, so the bars don't advertise
+    /// `y`. Deliberately skips SessionResolver's on-disk liveness check —
+    /// a copied command for a since-deleted session fails visibly when
+    /// pasted, which is honest enough for an escape hatch. What it must NOT
+    /// skip is `valid_session_id`: `set_session` stores whatever the pane's
+    /// token-authenticated socket sent, and this is the one consumer that
+    /// renders the id into a *shell* line — a flag-shaped id
+    /// (`--config=/tmp/evil`) is all shell_word-safe chars, so without the
+    /// check it would paste unquoted into the user's trusted terminal. The
+    /// spawn path gets the same guard from SessionResolver.
+    pub fn resume_command_line(&self, id: PaneId) -> Option<String> {
+        let spec = self.find_spec(id)?;
+        let session = spec.session.as_deref().filter(|s| crate::agents::valid_session_id(s))?;
+        let adapter = self.registry.get(spec.adapter.as_str())?;
+        Some(adapter.resume(&spec.cwd, session).shell_line())
+    }
+
     /// Relaunch the focused dead pane. `fresh` drops the session id first
     /// (for when resume fails because the session was deleted).
     pub fn respawn_focused(&mut self, fresh: bool) {
@@ -8457,6 +8478,30 @@ mod tests {
         assert!(!app.focused_dead());
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert!(saved.tabs[0].panes[&1].session.is_none());
+    }
+
+    /// `y` on the dead-pane bar copies the adapter's own resume command with
+    /// a `cd` prefix — the same `resume()` Enter runs, rendered pasteable.
+    /// Panes without a session pointer (shells, agents that died before
+    /// detection) return None, which is what hides `y` on both bars.
+    /// Session is planted via `set_session` (post-spawn), not the workspace,
+    /// so SessionResolver's on-disk check can't clear it on this machine.
+    #[test]
+    fn resume_command_line_is_cd_plus_adapter_resume_or_none() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert_eq!(app.resume_command_line(1), None, "shell pane: no session, no y");
+        app.new_pane_with("pi");
+        let id = app.focused;
+        assert_eq!(app.resume_command_line(id), None, "agent without a learned session: no y");
+        app.set_session(id, "019fe044-8236".into());
+        assert_eq!(
+            app.resume_command_line(id).as_deref(),
+            Some("cd -- /tmp && pi --session 019fe044-8236")
+        );
+        // A socket-planted, flag-shaped "session" must never reach a shell
+        // line — the same valid_session_id gate the spawn path has.
+        app.set_session(id, "--config=/tmp/evil".into());
+        assert_eq!(app.resume_command_line(id), None, "hostile id: no copy, no y");
     }
 
     // -- characterisation: spawn_pane's session-state decision table -------

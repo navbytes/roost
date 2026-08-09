@@ -660,6 +660,15 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
         InputResult::Forward(bytes) if app.focused_dead() => match bytes.as_slice() {
             b"\r" => app.respawn_focused(false), // retry/resume
             b"f" => app.respawn_focused(true),   // fresh session
+            // Copy the pasteable resume command (`cd <cwd> && …`) for use in
+            // a plain terminal. No-op when there's no session to resume —
+            // matching the bars, which only advertise `y` when there is one.
+            b"y" => {
+                if let Some(line) = app.resume_command_line(app.focused) {
+                    let outcome = infra::clipboard::copy(&line); // U14
+                    app.flash_copy(line.chars().count(), outcome);
+                }
+            }
             _ => {}
         },
         InputResult::Forward(bytes) => {
@@ -1219,6 +1228,34 @@ mod tests {
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.focused_dead(), "Enter must relaunch the dead raw pane, not forward \\r to it");
+    }
+
+    /// `y` on a dead pane copies the pasteable resume command — and must
+    /// never relaunch. Without a session pointer it is inert (no flash),
+    /// matching the bars, which only advertise `y` when one exists.
+    #[test]
+    fn dead_pane_y_copies_resume_command_only_when_resumable() {
+        let mut app = mk_app();
+        let focused = app.focused;
+        app.runtimes.get_mut(&focused).unwrap().kill();
+        assert!(app.focused_dead());
+
+        // Session-less (shell) pane: inert.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.focused_dead(), "y must not relaunch");
+        assert!(app.flash().is_none(), "nothing to copy, nothing to claim");
+
+        // Plant a resume pointer, then y copies and flashes the outcome —
+        // and still doesn't relaunch.
+        {
+            let spec = app.ws.tabs[0].panes.get_mut(&focused).unwrap();
+            spec.adapter = "pi".into();
+            spec.session = Some("019fe044".into());
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.focused_dead(), "y copies, never relaunches");
+        let flash = app.flash().expect("copy must flash its outcome");
+        assert!(flash.starts_with("copied"), "got: {flash}");
     }
 
     #[test]

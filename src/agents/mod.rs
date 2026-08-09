@@ -45,6 +45,32 @@ impl CommandSpec {
         self.args.push(a.into());
         self
     }
+
+    /// The command as a pasteable one-liner for a plain terminal:
+    /// `cd -- <cwd> && <program> <args…>`. `--` because quoting can't save a
+    /// cwd that *starts* with `-` (`-` is shell_word-safe, and cd parses
+    /// options after quote removal anyway). `env` is deliberately absent — it
+    /// carries roost plumbing (ROOST_SOCK/ROOST_TOKEN), not anything a human
+    /// resuming outside roost should replay.
+    pub fn shell_line(&self) -> String {
+        let cwd = shell_word(&self.cwd.to_string_lossy());
+        let mut line = format!("cd -- {cwd} && {}", shell_word(&self.program));
+        for a in &self.args {
+            line.push(' ');
+            line.push_str(&shell_word(a));
+        }
+        line
+    }
+}
+
+/// Quote one word for a POSIX shell, only when it needs it: bare
+/// `[A-Za-z0-9_./:=@%+,-]` tokens (paths, uuids, flags) pass through so the
+/// pasteable line stays readable; anything else is single-quoted with
+/// embedded `'` escaped as `'\''`.
+fn shell_word(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
+    if safe { s.to_string() } else { format!("'{}'", s.replace('\'', r"'\''")) }
 }
 
 pub trait AgentAdapter: Send + Sync {
@@ -106,8 +132,11 @@ pub trait AgentAdapter: Send + Sync {
 }
 
 /// Is `id` a plausible session id we're willing to hand to `pi --session` /
-/// `claude --resume`? No shell is ever involved (ids are passed as separate
-/// argv tokens), so this is defense-in-depth, not the only guard: it rejects a
+/// `claude --resume`? On the spawn path no shell is involved (ids are passed
+/// as separate argv tokens) and this is defense-in-depth behind
+/// SessionResolver; for `App::resume_command_line` — the dead-pane bar's `y`,
+/// which renders the id into a pasteable *shell* line via `shell_line` — it
+/// is the load-bearing guard: it rejects a
 /// tampered `workspace.json` or a poisoned status-socket message trying to
 /// steer resume at an attacker-chosen path, a flag (leading `-`), or something
 /// that isn't an id at all. Real ids from pi/claude are UUID/hex-with-dashes;
@@ -243,6 +272,18 @@ mod tests {
         assert!(!valid_session_id("has space")); // whitespace
         assert!(!valid_session_id("nul\0byte")); // control char
         assert!(!valid_session_id(&"x".repeat(257))); // too long
+    }
+
+    #[test]
+    fn shell_line_quotes_only_what_needs_it() {
+        // The common case — plain path, uuid, flag — reads clean, no quotes.
+        let cmd = CommandSpec::new("pi", Path::new("/Users/x/repos/roost"))
+            .arg("--session")
+            .arg("019fe044-8236");
+        assert_eq!(cmd.shell_line(), "cd -- /Users/x/repos/roost && pi --session 019fe044-8236");
+        // Spaces and embedded quotes get POSIX single-quoting ('\'' escape).
+        let cmd = CommandSpec::new("pi", Path::new("/tmp/my proj")).arg("it's");
+        assert_eq!(cmd.shell_line(), r"cd -- '/tmp/my proj' && pi 'it'\''s'");
     }
 
     /// Adapter whose session root is a caller-supplied path, so session_state
