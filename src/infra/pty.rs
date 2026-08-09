@@ -719,6 +719,10 @@ impl PaneBackend for PtyPane {
         let writer_failed = write_failed.clone();
         let writer_alive = alive.clone();
         std::thread::spawn(move || {
+            // This thread carries the user's typed bytes to the child —
+            // promoted so a machine saturated by the fleet's own agents
+            // still delivers keystrokes promptly (infra::qos module doc).
+            crate::infra::qos::promote_input_delivery_thread();
             // Ends when the pane drops its sender, or when this spawn is
             // killed — a write blocked on a doomed child unblocks by itself
             // once the child dies and the slave side closes.
