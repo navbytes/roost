@@ -1,6 +1,6 @@
 [package]
 name = "roost"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, ...). No daemon: layouts and session IDs persist; processes are disposable."
 license = "MIT"
