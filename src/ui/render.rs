@@ -1472,6 +1472,25 @@ fn take_width(s: &str, budget: u16) -> String {
     out
 }
 
+/// C21 (amended 2026-08-11, zoom indicator): the zoomed pane's top-border
+/// title text — `ZOOM · {n} hidden`, or bare `ZOOM` when `n == 0` (a
+/// single-pane tab has nothing hidden). `width` is the border's title area
+/// (border-to-border, corners excluded — same budget `corner_badge`'s
+/// `inner.width` measures, since a bordered `Block`'s title area is exactly
+/// that). Sheds in two steps: the `· {n} hidden` clause drops first, then
+/// the whole title drops (`None`) — never a partial/clipped title. Pure so
+/// the shedding order is unit-testable without a `Frame`.
+fn zoom_title_text(n: usize, width: u16) -> Option<String> {
+    let full = if n == 0 { "ZOOM".to_string() } else { format!("ZOOM · {n} hidden") };
+    if mouse::display_width(&full) <= width {
+        return Some(full);
+    }
+    if n > 0 && mouse::display_width("ZOOM") <= width {
+        return Some("ZOOM".to_string());
+    }
+    None
+}
+
 fn draw_pane<B: PaneBackend>(
     f: &mut Frame,
     app: &mut App<B>,
@@ -1530,7 +1549,21 @@ fn draw_pane<B: PaneBackend>(
     // and the border no longer carries a title (identity moved to the
     // corner badge, C4). No BOLD.
     let border_style = if focused { theme::accent() } else { theme::rule() };
-    let block = Block::bordered().border_style(border_style);
+    let mut block = Block::bordered().border_style(border_style);
+    // C21 (amended 2026-08-11, zoom indicator): the zoomed pane alone (never
+    // the float, which can render alongside it, C22) gets a right-aligned
+    // border title naming how many real-tree panes zoom is hiding. `n`
+    // reads `app.rects()` — the real (un-zoomed) tree — not the
+    // single-entry `display_rects()` this draw loop is walking, which would
+    // always say zero. Styled `border_style`, matching the border it sits
+    // on (accent() focused, rule() when the zoomed pane draws unfocused
+    // under a focused float) — never its own fixed color.
+    if app.zoomed() && !app.is_float(pr.id) {
+        let n = app.rects().len().saturating_sub(1);
+        if let Some(title) = zoom_title_text(n, pr.rect.width.saturating_sub(2)) {
+            block = block.title_top(Line::from(title).right_aligned().style(border_style));
+        }
+    }
     let inner = block.inner(pr.rect);
     f.render_widget(block, pr.rect);
 
@@ -3779,6 +3812,168 @@ mod tests {
             (0..100).filter_map(|x| term.backend().buffer().cell((x, 0)).map(|c| c.symbol().to_string())).collect();
         assert!(row.contains("ZOOM · "), "tab bar row was: {row:?}");
         assert!(row.trim_end().ends_with(theme::SAVED), "the save word still trails: {row:?}");
+    }
+
+    /// Asserts `text` sits flush against the pane's top-right border
+    /// corner on a drawn border row — i.e. actually right-aligned, not
+    /// merely present somewhere on the row (a left/center-alignment
+    /// regression would still pass a bare `contains`). `border` must be one
+    /// symbol per column, `width` columns wide, corner glyph included.
+    fn assert_title_right_aligned(border: &str, width: u16, text: &str) {
+        let cells: Vec<char> = border.chars().collect();
+        let corner = width as usize - 1;
+        assert_eq!(cells.get(corner), Some(&'┐'), "corner glyph must survive: {border:?}");
+        let start = corner - text.chars().count();
+        let tail: String = cells[start..corner].iter().collect();
+        assert_eq!(tail, text, "title must sit flush against the top-right corner: {border:?}");
+    }
+
+    /// C21 (amended 2026-08-11, zoom indicator): `zoom_title_text`'s own
+    /// two-step shedding rule, pinned without a `Frame` — full text, then
+    /// bare `ZOOM`, then nothing once even that doesn't fit.
+    #[test]
+    fn zoom_title_text_sheds_the_hidden_count_before_the_whole_title() {
+        assert_eq!(super::zoom_title_text(2, 20), Some("ZOOM · 2 hidden".to_string()));
+        // n == 0 (single-pane tab): no count clause to shed in the first place.
+        assert_eq!(super::zoom_title_text(0, 20), Some("ZOOM".to_string()));
+        // Too narrow for the count clause, wide enough for bare ZOOM.
+        assert_eq!(super::zoom_title_text(2, 12), Some("ZOOM".to_string()));
+        // Too narrow for even ZOOM: the whole title drops.
+        assert_eq!(super::zoom_title_text(2, 3), None);
+        assert_eq!(super::zoom_title_text(0, 3), None);
+    }
+
+    /// C21 (amended 2026-08-11): a zoomed multi-pane tab's top border names
+    /// how many real-tree panes it's hiding.
+    #[test]
+    fn a_zoomed_multi_pane_tab_shows_the_hidden_count_on_its_border() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // tab 0: three panes, focus = 3
+        app.apply(Action::ToggleZoom);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        // Row 1: the zoomed pane's top border (row 0 is the tab bar).
+        let border: String =
+            (0..100).filter_map(|x| term.backend().buffer().cell((x, 1)).map(|c| c.symbol().to_string())).collect();
+        assert_title_right_aligned(&border, 100, "ZOOM · 2 hidden");
+    }
+
+    /// C21 (amended 2026-08-11): a zoomed single-pane tab has nothing
+    /// hidden — the border says bare `ZOOM`, no `hidden` clause.
+    #[test]
+    fn a_zoomed_single_pane_tab_shows_bare_zoom_with_no_hidden_count() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleZoom);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let border: String =
+            (0..100).filter_map(|x| term.backend().buffer().cell((x, 1)).map(|c| c.symbol().to_string())).collect();
+        assert_title_right_aligned(&border, 100, "ZOOM");
+        assert!(!border.contains("hidden"), "single pane has nothing hidden: {border:?}");
+    }
+
+    /// C21 (amended 2026-08-11): not zoomed — the border carries no title
+    /// at all, on any pane.
+    #[test]
+    fn an_unzoomed_multi_pane_tab_has_no_zoom_title_anywhere() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes, not zoomed
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let whole: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(!whole.contains("ZOOM"), "no border should say ZOOM while unzoomed: {whole:?}");
+        assert!(!whole.contains("hidden"), "and no hidden count either: {whole:?}");
+    }
+
+    /// C21 (amended 2026-08-11): too narrow for `ZOOM · N hidden` — the
+    /// count is what yields, before the identity badge (a separate row, C4)
+    /// loses anything at all.
+    #[test]
+    fn a_narrow_zoomed_pane_drops_the_count_before_the_badge() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        // Panes need `layout::MIN_SPLIT_COLS` (36) of width to split at all —
+        // build the real 3-pane tree at a roomy size, zoom, then narrow the
+        // terminal. The layout tree itself doesn't un-split on a shrink
+        // (only a fresh split/close touches it), so the real tree still has
+        // 3 panes (n = 2 hidden) even though the zoomed view is now tiny.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes, focus = 3, n = 2 hidden
+        app.apply(Action::ToggleZoom);
+        app.on_resize(Size::new(14, 10), (0, 0));
+        let mut term = Terminal::new(TestBackend::new(14, 10)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let border: String =
+            (0..14).filter_map(|x| buf.cell((x, 1)).map(|c| c.symbol().to_string())).collect();
+        assert_title_right_aligned(&border, 14, "ZOOM");
+        assert!(!border.contains("hidden"), "the count yields first: {border:?}");
+        // The badge (top-right corner of the inner content, row 2) is
+        // untouched by the title's narrow-width shedding — it still draws
+        // its own token rather than going blank.
+        let badge_row: String =
+            (0..14).filter_map(|x| buf.cell((x, 2)).map(|c| c.symbol().to_string())).collect();
+        assert!(badge_row.contains('3'), "the badge still shows the pane id: {badge_row:?}");
+    }
+
+    /// C21/C22 (amended 2026-08-11): "keeps zoom" + the float draws above
+    /// it (C22) — the title belongs to the tiled zoom target alone, never
+    /// the float's own border, even though both are live at once.
+    #[test]
+    fn the_float_never_gets_the_zoom_title_only_the_tiled_target_does() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes, focus = 3, n = 2 hidden
+        app.apply(Action::ToggleZoom);
+        let target = app.focused; // the zoom target, before the float steals focus
+        app.apply(Action::ToggleFloat); // spawns + shows + focuses the float
+        assert!(app.zoomed(), "float toggle keeps zoom (C21)");
+
+        let rects = app.display_rects();
+        let target_pr = rects.iter().find(|pr| pr.id == target).copied().unwrap();
+        let float_pr = rects.iter().find(|pr| pr.id != target).copied().unwrap();
+        assert_eq!(target_pr.rect, app.body_area(), "the target is still the full-body zoom view");
+        assert_ne!(float_pr.rect, target_pr.rect, "the float draws its own smaller rect");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+
+        let row_at = |rect: ratatui::layout::Rect| -> String {
+            (rect.x..rect.x + rect.width)
+                .filter_map(|x| buf.cell((x, rect.y)).map(|c| c.symbol().to_string()))
+                .collect()
+        };
+        assert_title_right_aligned(&row_at(target_pr.rect), target_pr.rect.width, "ZOOM · 2 hidden");
+        let float_border = row_at(float_pr.rect);
+        assert!(!float_border.contains("ZOOM"), "the float's own border stays plain: {float_border:?}");
     }
 
     /// C14 (U20), through the real `draw`: the picker paints two columns —
