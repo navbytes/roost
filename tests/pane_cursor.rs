@@ -17,34 +17,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
-/// Two shell panes, so focus can be moved between a pane that asks for a
-/// cursor shape and one that doesn't.
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            // `vertical` splits along a vertical line: the two panes sit
-            // side by side, so Alt+Right moves focus from 1 to 2.
-            "layout": {
-                "split": {
-                    "dir": "vertical",
-                    "ratios": [0.5, 0.5],
-                    "children": [{ "pane": 1 }, { "pane": 2 }]
-                }
-            },
-            "panes": {
-                "1": {"adapter": "shell", "cwd": cwd},
-                "2": {"adapter": "shell", "cwd": cwd}
-            }
-        }]
-    })
-    .to_string()
-}
-
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -64,12 +36,8 @@ fn placed_cursor(bytes: &[u8]) -> bool {
 fn a_hidden_pane_cursor_is_not_placed_and_decscusr_is_mirrored() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP cursor gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("cursor gate", &harness::two_panes(cwd)) else {
+        return;
     };
     if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("main")).is_none() {
         eprintln!("SKIP cursor gate: roost never drew its first frame");

@@ -17,21 +17,6 @@ mod harness;
 
 use std::time::{Duration, Instant};
 
-use harness::Harness;
-
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// Wait for every pid in `pids` to be gone, up to `grace`. Returns whatever
 /// is still live at the end.
 fn survivors(pids: &[u32], grace: Duration) -> Vec<u32> {
@@ -50,12 +35,8 @@ fn survivors(pids: &[u32], grace: Duration) -> Vec<u32> {
 fn a_backgrounded_job_in_a_pane_does_not_survive_quit() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP orphan gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("orphan gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

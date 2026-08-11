@@ -72,9 +72,10 @@ pub struct PaneEffects {
 }
 
 /// What the pane's inner application asked for, mouse-wise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MouseProto {
     /// App doesn't listen for mouse events → roost handles the wheel itself.
+    #[default]
     None,
     /// App enabled SGR mouse reporting → forward encoded events to the PTY.
     Sgr,
@@ -287,11 +288,6 @@ pub trait PaneBackend: Sized {
 pub trait StateStore {
     fn load(&self) -> Result<Option<Workspace>>;
     fn save(&self, ws: &Workspace) -> Result<()>;
-}
-
-/// "A pane needs you" side-channel. Implemented by `infra::notify`.
-pub trait Notifier {
-    fn notify(&mut self, msg: &str);
 }
 
 #[cfg(test)]
@@ -580,16 +576,6 @@ pub mod fakes {
         fn save(&self, ws: &Workspace) -> Result<()> {
             *self.0.lock().unwrap() = Some(ws.clone());
             Ok(())
-        }
-    }
-
-    /// Records notifications for assertions.
-    #[derive(Clone, Default)]
-    pub struct RecordingNotifier(pub Arc<Mutex<Vec<String>>>);
-
-    impl Notifier for RecordingNotifier {
-        fn notify(&mut self, msg: &str) {
-            self.0.lock().unwrap().push(msg.to_string());
         }
     }
 }

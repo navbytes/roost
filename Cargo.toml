@@ -2,6 +2,10 @@
 name = "roost"
 version = "0.1.5"
 edition = "2021"
+# File::try_lock (main.rs instance lock) landed in 1.89; isqrt in 1.84.
+# Pinned so a source build (Homebrew, cargo install) on older stable fails
+# with a clear message instead of confusing method-not-found errors.
+rust-version = "1.89"
 description = "A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, ...). No daemon: layouts and session IDs persist; processes are disposable."
 license = "MIT"
 repository = "https://github.com/navbytes/roost"
@@ -12,7 +16,6 @@ categories = ["command-line-utilities"]
 anyhow = "1"
 crossterm = "0.29"
 dirs = "6"
-fs2 = "0.4"
 libc = "0.2"
 portable-pty = "0.9"
 ratatui = "0.30"

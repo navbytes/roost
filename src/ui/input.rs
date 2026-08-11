@@ -68,7 +68,7 @@ pub enum InputResult {
     Ignore,
 }
 
-pub fn translate(key: KeyEvent) -> InputResult {
+fn translate(key: KeyEvent) -> InputResult {
     if key.kind == KeyEventKind::Release {
         return InputResult::Ignore;
     }
@@ -611,87 +611,84 @@ pub fn translate_with(key: KeyEvent, keymap: &Keymap) -> InputResult {
     translate(key)
 }
 
-/// Config-facing name for an action (config.json's `"keys"` values):
-/// snake_case of the `Action` variant. **No wildcard arm** — adding an
-/// `Action` variant without a case here is a compile error, which is the
-/// point: a new variant can never be silently unnameable.
+/// Config-facing action names (config.json's `"keys"` values), both
+/// directions at once: `action_name` looks up by `Action`, `action_by_name`
+/// by string — one table instead of a name-producing match plus a separate
+/// reverse scan. `GoToTab` only goes to 9 because that's all the default
+/// chord table ever binds (`Alt+1..9`; `Alt+0` is `LastTab`), same limit the
+/// old `format!("go_to_tab_{}", n + 1)` arm had no way to enforce.
+const NAMES: &[(&str, Action)] = &[
+    ("quit", Action::Quit),
+    ("new_pane", Action::NewPane),
+    ("close_pane", Action::ClosePane),
+    ("focus_left", Action::Focus(Dir::Left)),
+    ("focus_right", Action::Focus(Dir::Right)),
+    ("focus_up", Action::Focus(Dir::Up)),
+    ("focus_down", Action::Focus(Dir::Down)),
+    ("new_tab", Action::NewTab),
+    ("go_to_tab_1", Action::GoToTab(0)),
+    ("go_to_tab_2", Action::GoToTab(1)),
+    ("go_to_tab_3", Action::GoToTab(2)),
+    ("go_to_tab_4", Action::GoToTab(3)),
+    ("go_to_tab_5", Action::GoToTab(4)),
+    ("go_to_tab_6", Action::GoToTab(5)),
+    ("go_to_tab_7", Action::GoToTab(6)),
+    ("go_to_tab_8", Action::GoToTab(7)),
+    ("go_to_tab_9", Action::GoToTab(8)),
+    ("next_tab", Action::NextTab),
+    ("prev_tab", Action::PrevTab),
+    ("last_tab", Action::LastTab),
+    ("move_pane_to_tab_next", Action::MovePaneToTab { forward: true }),
+    ("move_pane_to_tab_prev", Action::MovePaneToTab { forward: false }),
+    ("toggle_stack", Action::ToggleStack),
+    ("flip_split", Action::FlipSplit),
+    ("resize_horizontal_grow", Action::Resize { horizontal: true, grow: true }),
+    ("resize_horizontal_shrink", Action::Resize { horizontal: true, grow: false }),
+    ("resize_vertical_grow", Action::Resize { horizontal: false, grow: true }),
+    ("resize_vertical_shrink", Action::Resize { horizontal: false, grow: false }),
+    ("rename_pane", Action::RenamePane),
+    ("rename_tab", Action::RenameTab),
+    ("quick_launch", Action::QuickLaunch),
+    ("scroll_mode", Action::ScrollMode),
+    ("copy_mode", Action::CopyMode),
+    ("toggle_hints", Action::ToggleHints),
+    ("undo", Action::Undo),
+    ("help", Action::Help),
+    ("jump_attention", Action::JumpAttention),
+    ("toggle_roster", Action::ToggleRoster),
+    ("toggle_zoom", Action::ToggleZoom),
+    ("cycle_layout", Action::CycleLayout),
+    ("toggle_feed", Action::ToggleFeed),
+    ("toggle_float", Action::ToggleFloat),
+    ("toggle_raw", Action::ToggleRaw),
+];
+
+/// Test-only: `action_by_name` is the production reverse lookup (a straight
+/// `NAMES` scan); this — the other direction — only has a caller left in the
+/// round-trip test below, which checks `NAMES` itself against
+/// `default_keymap`'s independently-derived source of truth.
+#[cfg(test)]
 fn action_name(action: &Action) -> String {
-    match action {
-        Action::Quit => "quit".into(),
-        Action::NewPane => "new_pane".into(),
-        Action::ClosePane => "close_pane".into(),
-        Action::Focus(dir) => format!(
-            "focus_{}",
-            match dir {
-                Dir::Left => "left",
-                Dir::Right => "right",
-                Dir::Up => "up",
-                Dir::Down => "down",
-            }
-        ),
-        Action::NewTab => "new_tab".into(),
-        Action::GoToTab(n) => format!("go_to_tab_{}", n + 1),
-        Action::NextTab => "next_tab".into(),
-        Action::PrevTab => "prev_tab".into(),
-        Action::LastTab => "last_tab".into(),
-        Action::MovePaneToTab { forward: true } => "move_pane_to_tab_next".into(),
-        Action::MovePaneToTab { forward: false } => "move_pane_to_tab_prev".into(),
-        Action::ToggleStack => "toggle_stack".into(),
-        Action::FlipSplit => "flip_split".into(),
-        Action::Resize {
-            horizontal: true,
-            grow: true,
-        } => "resize_horizontal_grow".into(),
-        Action::Resize {
-            horizontal: true,
-            grow: false,
-        } => "resize_horizontal_shrink".into(),
-        Action::Resize {
-            horizontal: false,
-            grow: true,
-        } => "resize_vertical_grow".into(),
-        Action::Resize {
-            horizontal: false,
-            grow: false,
-        } => "resize_vertical_shrink".into(),
-        Action::RenamePane => "rename_pane".into(),
-        Action::RenameTab => "rename_tab".into(),
-        Action::QuickLaunch => "quick_launch".into(),
-        Action::ScrollMode => "scroll_mode".into(),
-        Action::CopyMode => "copy_mode".into(),
-        Action::ToggleHints => "toggle_hints".into(),
-        Action::Undo => "undo".into(),
-        Action::Help => "help".into(),
-        Action::JumpAttention => "jump_attention".into(),
-        Action::ToggleRoster => "toggle_roster".into(),
-        Action::ToggleZoom => "toggle_zoom".into(),
-        Action::CycleLayout => "cycle_layout".into(),
-        Action::ToggleFeed => "toggle_feed".into(),
-        Action::ToggleFloat => "toggle_float".into(),
-        Action::ToggleRaw => "toggle_raw".into(),
-    }
+    NAMES
+        .iter()
+        .find(|(_, a)| a == action)
+        .map(|(name, _)| (*name).to_string())
+        .unwrap_or_else(|| panic!("no config name for action {action:?} — add it to NAMES"))
 }
 
-/// Reverse of `action_name`, for parsing config.json's action strings.
-/// Derived from `default_keymap` rather than a second hand-written table:
-/// since every current `Action` variant already has a real default chord,
-/// every variant is reachable here too, in whatever concrete forms the
-/// default table actually uses (`go_to_tab_1..=9`, not arbitrary N) — and a
-/// future variant bound to a new default chord becomes nameable
-/// automatically, with no separate list to remember to update.
+/// Reverse of `action_name` (config.json parsing's `"keys"` values): a
+/// straight `NAMES` scan.
 fn action_by_name(name: &str) -> Option<Action> {
-    default_keymap()
-        .values()
-        .find(|a| action_name(a) == name)
-        .copied()
+    NAMES.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
-/// Every (chord → action) pair `default_chord_action` actually binds, swept
-/// across every key `Chord::parse` can name, crossed with both shift states.
-/// This *is* "the existing default map" — built by asking the same function
-/// `translate` itself calls, not by re-deriving the table by hand — so it is
-/// what tests assert absent-config behavior against, and (`action_by_name`)
-/// config.json's reverse action-name index.
+/// Test-only: every (chord → action) pair `default_chord_action` actually
+/// binds, swept across every key `Chord::parse` can name, crossed with both
+/// shift states. This *is* "the existing default map" — built by asking the
+/// same function `translate` itself calls, not by re-deriving the table by
+/// hand — so it is what tests assert absent-config behavior against, and
+/// (the round-trip test) `NAMES`'s independent check.
+#[cfg(test)]
 fn default_keymap() -> HashMap<Chord, Action> {
     let mut codes: Vec<KeyCode> = (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
     codes.extend([

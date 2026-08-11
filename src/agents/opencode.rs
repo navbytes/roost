@@ -27,8 +27,7 @@
 //!   the way pi/claude/gemini/codex have — see the impl below for the
 //!   resulting (researched, not guessed) limitation.
 
-use super::{AgentAdapter, CommandSpec};
-use std::path::Path;
+use super::AgentAdapter;
 
 pub struct OpencodeAdapter;
 
@@ -37,15 +36,11 @@ impl AgentAdapter for OpencodeAdapter {
         "opencode"
     }
 
-    fn launch(&self, cwd: &Path) -> CommandSpec {
-        CommandSpec::new("opencode", cwd)
-    }
-
     /// Resume by explicit session id only — never `--continue` (module doc:
     /// anomalyco/opencode#2086 can resume a subagent's thread instead of
     /// the parent's).
-    fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
-        CommandSpec::new("opencode", cwd).arg("--session").arg(session)
+    fn resume_flag(&self) -> &'static str {
+        "--session"
     }
 
     // session_root / session_id_from_path / owns_session_file: all left at
@@ -69,6 +64,7 @@ mod tests {
     use super::*;
     use super::super::SessionState;
     use std::collections::HashSet;
+    use std::path::Path;
     use std::time::SystemTime;
 
     #[test]

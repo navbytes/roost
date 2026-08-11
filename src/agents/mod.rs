@@ -76,11 +76,29 @@ fn shell_word(s: &str) -> String {
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
 
-    /// Command to start a brand-new session in `cwd`.
-    fn launch(&self, cwd: &Path) -> CommandSpec;
+    /// Command to start a brand-new session in `cwd`. Default: the bare
+    /// program named by `id()` — true for every adapter here except `shell`
+    /// (spawns `$SHELL`, not a program literally named "shell"), which
+    /// overrides this directly.
+    fn launch(&self, cwd: &Path) -> CommandSpec {
+        CommandSpec::new(self.id(), cwd)
+    }
 
-    /// Command to resume the given session id in `cwd`.
-    fn resume(&self, cwd: &Path, session: &str) -> CommandSpec;
+    /// Command to resume the given session id in `cwd`. Default:
+    /// `launch(cwd)` plus `resume_flag()` then the bare id — covers every
+    /// "program [--]flag id" resume shape here (pi, claude, codex, gemini,
+    /// opencode). `shell` ignores the session id entirely and overrides this
+    /// directly instead.
+    fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
+        self.launch(cwd).arg(self.resume_flag()).arg(session)
+    }
+
+    /// Flag (or bare subcommand) the default `resume` above puts before the
+    /// session id, e.g. `"--resume"`, `"--session"`, or `"resume"`.
+    /// Deliberately no default: a new adapter must state its resume shape,
+    /// not silently inherit one. Adapters that override `resume` directly
+    /// (shell, test doubles) still declare it; theirs is never consulted.
+    fn resume_flag(&self) -> &'static str;
 
     /// Where this tool stores its session files for `cwd`, if it has any.
     fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
@@ -286,9 +304,93 @@ mod tests {
         assert_eq!(cmd.shell_line(), r"cd -- '/tmp/my proj' && pi 'it'\''s'");
     }
 
-    /// Adapter whose session root is a caller-supplied path, so session_state
-    /// branches can be exercised deterministically against a temp dir.
-    struct RootAdapter(Option<PathBuf>);
+    #[test]
+    fn session_state_unknown_without_a_root() {
+        assert_eq!(
+            test_support::RootAdapter::new(None).session_state(Path::new("/x"), "id"),
+            SessionState::Unknown
+        );
+    }
+
+    #[test]
+    fn session_state_unknown_when_root_dir_missing() {
+        // A missing session ROOT (as opposed to an absent id within a present
+        // one) can't tell us the id is stale — the tool may have changed its
+        // on-disk layout, or $HOME may have resolved differently. Treat it as
+        // Unknown so the caller still attempts resume instead of nuking a
+        // possibly-good id.
+        let d = test_support::scratch_dir("ss-missing");
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(
+            test_support::RootAdapter::new(Some(d)).session_state(Path::new("/x"), "id"),
+            SessionState::Unknown
+        );
+    }
+
+    #[test]
+    fn session_state_exists_when_file_present() {
+        let d = test_support::scratch_dir("ss-present");
+        std::fs::write(d.join("the-id.jsonl"), "").unwrap();
+        // default session_id_from_path = file stem = "the-id"
+        assert_eq!(
+            test_support::RootAdapter::new(Some(d.clone())).session_state(Path::new("/x"), "the-id"),
+            SessionState::Exists
+        );
+        assert_eq!(
+            test_support::RootAdapter::new(Some(d.clone())).session_state(Path::new("/x"), "other"),
+            SessionState::Gone
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Shared by adapters' `#[cfg(test)]` modules: every adapter's session-state
+/// tests need (a) an adapter whose `session_root` points at a temp dir
+/// instead of the real `~/.<tool>`, and (b) that temp dir itself. One double
+/// + one helper here rather than each adapter file re-inventing both.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{AgentAdapter, CommandSpec};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Fresh, empty temp directory, isolated from other tests (pid +
+    /// monotonic counter) and from the real filesystem the adapter would
+    /// otherwise touch.
+    pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("roost-agents-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Adapter whose session root is a caller-supplied path, so
+    /// `session_state`/`detect_session` (trait defaults) can be exercised
+    /// deterministically against a temp dir instead of the real `~/.<tool>`.
+    /// `id_from_path` defaults to the trait's own default (file stem);
+    /// `with_id_from_path` swaps in a real adapter's parsing (e.g. codex's
+    /// rollout-filename UUID extraction, gemini's first-line JSON read) via a
+    /// non-capturing closure, which coerces to a plain `fn` pointer.
+    pub(crate) struct RootAdapter {
+        root: Option<PathBuf>,
+        id_from_path: fn(&Path) -> Option<String>,
+    }
+    impl RootAdapter {
+        pub(crate) fn new(root: Option<PathBuf>) -> Self {
+            Self::with_id_from_path(root, |p| {
+                p.file_stem().map(|s| s.to_string_lossy().into_owned())
+            })
+        }
+        pub(crate) fn with_id_from_path(
+            root: Option<PathBuf>,
+            id_from_path: fn(&Path) -> Option<String>,
+        ) -> Self {
+            Self { root, id_from_path }
+        }
+    }
     impl AgentAdapter for RootAdapter {
         fn id(&self) -> &'static str {
             "root"
@@ -299,46 +401,14 @@ mod tests {
         fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
             CommandSpec::new("true", cwd).arg(session)
         }
-        fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
-            self.0.clone()
+        fn resume_flag(&self) -> &'static str {
+            "--resume" // unused: resume() overridden above
         }
-    }
-
-    #[test]
-    fn session_state_unknown_without_a_root() {
-        assert_eq!(RootAdapter(None).session_state(Path::new("/x"), "id"), SessionState::Unknown);
-    }
-
-    #[test]
-    fn session_state_unknown_when_root_dir_missing() {
-        // A missing session ROOT (as opposed to an absent id within a present
-        // one) can't tell us the id is stale — the tool may have changed its
-        // on-disk layout, or $HOME may have resolved differently. Treat it as
-        // Unknown so the caller still attempts resume instead of nuking a
-        // possibly-good id.
-        let d = std::env::temp_dir().join(format!("roost-ss-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        assert_eq!(
-            RootAdapter(Some(d)).session_state(Path::new("/x"), "id"),
-            SessionState::Unknown
-        );
-    }
-
-    #[test]
-    fn session_state_exists_when_file_present() {
-        let d = std::env::temp_dir().join(format!("roost-ss-present-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("the-id.jsonl"), "").unwrap();
-        // default session_id_from_path = file stem = "the-id"
-        assert_eq!(
-            RootAdapter(Some(d.clone())).session_state(Path::new("/x"), "the-id"),
-            SessionState::Exists
-        );
-        assert_eq!(
-            RootAdapter(Some(d.clone())).session_state(Path::new("/x"), "other"),
-            SessionState::Gone
-        );
-        let _ = std::fs::remove_dir_all(&d);
+        fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
+            self.root.clone()
+        }
+        fn session_id_from_path(&self, path: &Path) -> Option<String> {
+            (self.id_from_path)(path)
+        }
     }
 }

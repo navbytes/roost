@@ -500,10 +500,13 @@ src/
 vendor/vt100/  vendored vt100 with a scrollback-underflow fix (see below)
 ```
 
-`vendor/vt100`: upstream vt100 0.15.2 panics (`rows_len - scrollback_offset`
-underflow) when scrolled back further than one screen height; the vendored
-copy fixes `visible_rows()` with a saturating subtraction, which also makes
-deep-history scrolling render correctly.
+`vendor/vt100`: a fork of upstream vt100 0.15.2 carrying roost's SPEC-parity
+patch set — synchronized output (P1), live reflow (P5), focus reporting
+(P10), dim/strikethrough (P16), unicode-width parity (P17), REP (P19),
+stream effects (W3), OSC 9/52/777, DECSCUSR, and assorted hardening
+(including a saturating-subtraction fix for the `visible_rows()`
+scrollback-underflow panic upstream hits when scrolled back further than one
+screen height).
 
 </details>
 

@@ -17,34 +17,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
-/// Two shell panes side by side (a vertical split ⇒ left/right), so Alt+→
-/// and Alt+← move focus between them. Pane 1 is first in DFS order, which
-/// is where roost puts focus at startup — so the probe below runs in the
-/// pane the harness is already typing at.
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": {
-                "split": {
-                    "dir": "vertical",
-                    "ratios": [0.5, 0.5],
-                    "children": [{ "pane": 1 }, { "pane": 2 }]
-                }
-            },
-            "panes": {
-                "1": {"adapter": "shell", "cwd": cwd},
-                "2": {"adapter": "shell", "cwd": cwd}
-            }
-        }]
-    })
-    .to_string()
-}
-
 // xterm modified arrows, mod 3 = Alt (same encoding the UX drive uses).
 const ALT_RIGHT: &[u8] = b"\x1b[1;3C";
 const ALT_LEFT: &[u8] = b"\x1b[1;3D";
@@ -53,12 +25,10 @@ const ALT_LEFT: &[u8] = b"\x1b[1;3D";
 fn a_subscribed_pane_is_told_when_it_loses_and_regains_roost_focus() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP focus-reporting gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip("focus-reporting gate", &harness::two_panes(cwd))
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
@@ -102,12 +72,10 @@ fn a_subscribed_pane_is_told_when_it_loses_and_regains_roost_focus() {
 fn a_pane_that_never_asked_receives_no_focus_bytes() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP focus-reporting gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip("focus-reporting gate", &harness::two_panes(cwd))
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

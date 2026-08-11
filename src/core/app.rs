@@ -14,7 +14,7 @@ use crate::agents::Registry;
 use crate::core::control::{Actor, Method, ReadMode, Reply, Request, TokenTable, UNAUTHORIZED_MSG};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
-use crate::core::session_resolver::SessionResolver;
+use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
 use crate::ports::{ClipboardOutcome, Observation, PaneBackend, StateStore};
@@ -23,13 +23,13 @@ use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// F1 (design audit SG1, exit UX audit 2026-08-07): how long the "Alt keys
-/// aren't reaching roost" hint stays up after its most recent evidence
-/// (`App::alt_swallow_at`) — not since launch. `is_alt_swallow_char`'s
-/// evidence is real but not unambiguous (every character in it is also a
-/// directly-typed letter on some non-US macOS layout), so this bounds a
-/// false positive to a few seconds instead of latching for the session; a
-/// user who keeps producing the evidence keeps re-arming the window.
+/// F1: how long the "Alt keys aren't reaching roost" hint stays up after its
+/// most recent evidence (`App::alt_swallow_at`) — not since launch.
+/// `is_alt_swallow_char`'s evidence is real but not unambiguous (every
+/// character in it is also a directly-typed letter on some non-US macOS
+/// layout), so this bounds a false positive to a few seconds instead of
+/// latching for the session; a user who keeps producing the evidence keeps
+/// re-arming the window.
 const ALT_HINT_WINDOW: Duration = Duration::from_secs(8);
 
 /// P6: how much of a pane's live OSC 0/2 title is adopted as its display
@@ -50,13 +50,6 @@ const HOST_TITLE_INTERVAL: Duration = Duration::from_millis(200);
 /// blow past either. Comfortably wider than any real ENOENT/EACCES message;
 /// same shape as `pty::HOST_NOTIFY_CAP`.
 const DEAD_REASON_CAP: usize = 200;
-
-/// Adapters offered by the quick-launch picker (Alt+Enter), derived from the
-/// single adapter list in `agents` so the picker can never drift out of sync
-/// with the registry.
-pub fn picker_items() -> Vec<&'static str> {
-    crate::agents::picker_ids()
-}
 
 /// What a rename overlay is editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +72,11 @@ pub enum Mode {
     /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
     /// two columns `↑`/`↓` are steering.
     Picker { selection: usize, filter: String, cwd: usize, on_cwd: bool },
-    /// [P14] Scroll mode carries **no offset of its own.** It used to hold a
-    /// mirror of the view's position, which is a second answer to a question
-    /// with exactly one: the vt100 grid auto-advances its offset as new rows
-    /// bank while the view is scrolled, so a cached copy drifts, and the next
-    /// key seeded from it teleported the view toward the tail (measured at 4
-    /// lines per press). Every reader and every step now asks
-    /// `PaneBackend::scroll_offset` — the grid — so the drift has nowhere to
-    /// live.
+    /// [P14] Scroll mode carries **no offset of its own** — a cached mirror
+    /// of the view's position would be a second answer to a question with
+    /// exactly one, since the vt100 grid auto-advances its offset as new
+    /// rows bank while the view is scrolled. Every reader and every step
+    /// asks `PaneBackend::scroll_offset` — the grid — instead.
     Scroll,
     /// Text selection — mouse drag, or the C24 keyboard cursor. `cursor` is
     /// (row, col) in the focused pane's inner cell space; both input
@@ -109,10 +99,10 @@ pub enum Mode {
     /// pane); `top` is the first visible row of the scrolled window, the one
     /// piece of view state the renderer and the mouse hit-test share.
     ///
-    /// [Amended, ux P2-11] `status_filter` narrows the list to one severity
-    /// tier (`None` = every tier), cycled with `Tab`/`Shift+Tab` — the two
-    /// non-`Char` keys the type-ahead (every printable, C27's own rule)
-    /// cannot claim. Composes with `filter` by AND: a row must satisfy both.
+    /// `status_filter` narrows the list to one severity tier (`None` = every
+    /// tier), cycled with `Tab`/`Shift+Tab` — the two non-`Char` keys the
+    /// type-ahead (every printable, C27's own rule) cannot claim. Composes
+    /// with `filter` by AND: a row must satisfy both.
     Roster { cursor: PaneId, filter: String, top: usize, status_filter: Option<AgentStatus> },
     /// P21: the incremental scrollback-search prompt, opened with `/` from
     /// Scroll or Copy mode. The search itself lives on `App::search` (it
@@ -193,14 +183,11 @@ impl Search {
 }
 
 /// S4: (text, fire-at) for a copy staged from a double-click's own release
-/// — see `App::release_native_selection`.
-///
-/// [Amended, code review, exit UX audit 2026-08-07] Used to be `(pane,
-/// anchor, cursor, fire-at)`, re-extracted from the *live* grid when the
-/// deadline passed. A streaming pane can scroll or overwrite those cells in
-/// the meantime, so that re-read could silently copy whatever now occupies
-/// them instead of the word actually double-clicked. The text is grabbed
-/// once, at release time, and staged as itself — nothing left to re-derive.
+/// — see `App::release_native_selection`. The text is grabbed once, at
+/// release time, and staged as itself rather than as pane/anchor/cursor to
+/// re-extract later: a streaming pane can scroll or overwrite those cells
+/// before the deadline fires, so a re-read could silently copy whatever now
+/// occupies them instead of the word actually double-clicked.
 type PendingCopy = (String, Instant);
 
 /// An in-progress / completed text selection within one pane. Coordinates are
@@ -328,11 +315,10 @@ const MIN_FLOAT_BODY_ROWS: u16 = 10;
 /// A tab's aggregate state for the tab bar, worst-relevant-first. `Unknown`
 /// is a lazily-loaded tab whose panes haven't been spawned — deliberately
 /// distinct from `Quiet` (spawned, nothing happening) so a background tab
-/// never masquerades as idle. `Exited` (U13, closing SPEC-GAP-2) is the
-/// same honesty one step further: a tab whose agents are *dead* used to
-/// render the Quiet blank, so a background tab full of corpses looked
-/// exactly like a background tab with nothing to say. `render` maps each to
-/// a glyph + colour.
+/// never masquerades as idle. `Exited` (U13) is the same honesty one step
+/// further: without it, a tab whose agents are *dead* renders the same
+/// Quiet blank as a background tab with nothing to say. `render` maps each
+/// to a glyph + colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabSummary {
     NeedsInput,
@@ -398,25 +384,20 @@ pub struct App<B: PaneBackend> {
     /// "Alt keys aren't reaching roost" startup hint can stop once we know
     /// they are.
     alt_seen: bool,
-    /// F1 (exit UX audit 2026-08-07): when a key last arrived that looks
-    /// like a *swallowed* Alt chord — the character the standard US macOS
-    /// keyboard layout emits for `Option+<letter>` with Option-as-Meta off
-    /// (`˜` for Option+n, `∑` for Option+w, …), carrying no Alt modifier at
-    /// all. Not "any key arrives": that was the old (wrong) evidence — true
-    /// of nearly every keystroke, including the shell prompt a healthy user
-    /// types first. See `is_alt_swallow_char`.
+    /// F1: when a key last arrived that looks like a *swallowed* Alt chord —
+    /// the character the standard US macOS keyboard layout emits for
+    /// `Option+<letter>` with Option-as-Meta off (`˜` for Option+n, `∑` for
+    /// Option+w, …), carrying no Alt modifier at all. See
+    /// `is_alt_swallow_char`.
     ///
-    /// [Amended, design audit SG1, 2026-08-07] Even this narrower evidence
-    /// has a real false-positive: every one of `is_alt_swallow_char`'s
-    /// characters is a directly-typed letter on some non-US macOS layout
-    /// (`ç` on Portuguese/French/Turkish, `å`/`ø` on Nordic, `ß` on German,
-    /// …), so a user typing their own language can trip it with Alt never
-    /// involved. A `bool` latch made that permanent for the rest of the
-    /// session — worse than the bug this fix replaced, which at least
-    /// expired after 8s. Timestamped instead: `show_alt_hint` only reads
-    /// this within `ALT_HINT_WINDOW` of the *most recent* match, so a false
-    /// positive is bounded to a few seconds, not a session, while a user who
-    /// keeps hitting real Alt-swallow evidence keeps re-arming it.
+    /// Every one of `is_alt_swallow_char`'s characters is also a
+    /// directly-typed letter on some non-US macOS layout (`ç` on
+    /// Portuguese/French/Turkish, `å`/`ø` on Nordic, `ß` on German, …), so a
+    /// user typing their own language can trip a false positive with Alt
+    /// never involved — hence a timestamp, not a latch: `show_alt_hint`
+    /// only reads this within `ALT_HINT_WINDOW` of the *most recent* match,
+    /// bounding a false positive to a few seconds while a user who keeps
+    /// hitting real evidence keeps re-arming it.
     alt_swallow_at: Option<Instant>,
     /// Active/last text selection (copy mode).
     pub selection: Option<Selection>,
@@ -494,7 +475,7 @@ pub struct App<B: PaneBackend> {
     /// a stale question never outlives the ask it belongs to); pruned
     /// alongside `last_status` on the same cadence.
     needy_msgs: HashMap<PaneId, String>,
-    /// F3 (exit UX audit 2026-08-07): panes `attention_ring`'s ○ fallback
+    /// F3: panes `attention_ring`'s ○ fallback
     /// must skip because focus already landed on them *during their current
     /// Waiting spell* — unlike ◆, which self-clears the moment you act on a
     /// pane (its status itself moves on), a finished-and-quiet agent's
@@ -540,10 +521,10 @@ pub struct App<B: PaneBackend> {
     /// `main.rs`, because it already runs there).
     pending_open: Option<String>,
     /// P20: the pane a mouse gesture latched onto at button-down, held
-    /// until the matching release. Every event used to be re-hit-tested, so
-    /// a drag that crossed a pane border switched target mid-gesture: the
-    /// origin app never saw its release (left stuck mid-selection) and the
-    /// neighbour got orphan drag/up events for a press it never received.
+    /// until the matching release — so a drag that crosses a pane border
+    /// doesn't switch target mid-gesture (which would leave the origin app
+    /// stuck mid-selection, never seeing its release, and hand the
+    /// neighbour orphan drag/up events for a press it never received).
     mouse_latch: Option<PaneId>,
     /// U21: the pane seam a left-drag is currently resizing, latched at
     /// button-down like `mouse_latch` and for the same reason — the pointer
@@ -553,7 +534,7 @@ pub struct App<B: PaneBackend> {
     /// selection's double/triple-click detection. Crossterm reports no
     /// click count — see `click_count`.
     last_click: Option<(PaneId, u16, u16, u8, Instant)>,
-    /// S4 (PR #46 review): a copy staged from a double-click's own release
+    /// S4: a copy staged from a double-click's own release
     /// — (text, fire-at), grabbed once at release time (see `PendingCopy`).
     /// Firing it immediately made every triple-click copy the word (2nd
     /// click's release) and then the line (3rd click's) a heartbeat later:
@@ -760,20 +741,19 @@ impl<B: PaneBackend> App<B> {
         self.alt_seen = true;
     }
 
-    /// F1 (exit UX audit 2026-08-07): record a key event as possible
-    /// evidence the Alt layer isn't reaching roost. Only counts when the key
-    /// carries no Alt modifier AND its character is one the standard US
-    /// macOS layout produces for `Option+<letter>` with Option-as-Meta off —
-    /// "a key arrived" is not evidence (nearly all typing satisfies that,
-    /// including the shell prompt a healthy user types first); "the
-    /// specific character a swallowed Option chord produces" is.
+    /// F1: record a key event as possible evidence the Alt layer isn't
+    /// reaching roost. Only counts when the key carries no Alt modifier AND
+    /// its character is one the standard US macOS layout produces for
+    /// `Option+<letter>` with Option-as-Meta off — "a key arrived" is not
+    /// evidence (nearly all typing satisfies that, including the shell
+    /// prompt a healthy user types first); "the specific character a
+    /// swallowed Option chord produces" is.
     ///
-    /// [Amended, design audit SG1, 2026-08-07] Stamps the time rather than
-    /// latching a bool — every fresh match re-arms `ALT_HINT_WINDOW` (see
-    /// `show_alt_hint`), so a user who keeps producing the evidence (a
-    /// genuinely broken Alt layer) keeps being told, while one unlucky
-    /// keystroke (a non-US layout's own letter, see `alt_swallow_at`) only
-    /// costs a few seconds, not the session.
+    /// Stamps the time rather than latching a bool — every fresh match
+    /// re-arms `ALT_HINT_WINDOW` (see `show_alt_hint`), so a user who keeps
+    /// producing the evidence (a genuinely broken Alt layer) keeps being
+    /// told, while one unlucky keystroke (a non-US layout's own letter, see
+    /// `alt_swallow_at`) only costs a few seconds, not the session.
     pub fn note_key_seen(&mut self, key: crossterm::event::KeyEvent) {
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
             return;
@@ -794,9 +774,9 @@ impl<B: PaneBackend> App<B> {
     /// recommended terminal (iTerm2) never warned; the trigger is the
     /// evidence itself, on any terminal (see `wants_alt_hint`).
     ///
-    /// [Amended, design audit SG1, 2026-08-07] The evidence is real but not
-    /// unambiguous — deliberately, and not merely unnoticed (see
-    /// `alt_swallow_at`'s doc): every `is_alt_swallow_char` match is also a
+    /// The evidence is real but not unambiguous — deliberately, and not
+    /// merely unnoticed (see `alt_swallow_at`'s doc): every
+    /// `is_alt_swallow_char` match is also a
     /// directly-typed letter on some non-US macOS layout, so this *can*
     /// false-fire on ordinary typing in those languages. What bounds the
     /// cost is `ALT_HINT_WINDOW`, checked against the *most recent* match,
@@ -1081,7 +1061,7 @@ impl<B: PaneBackend> App<B> {
         // §6.1): only launch fresh + clear it when the session is
         // *definitively* gone. All adapter queries happen here, before we
         // borrow self mut.
-        let resolution = SessionResolver.resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref());
+        let resolution = session_resolver::resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref());
         let mut cmd = match &resolution.session {
             Some(s) => adapter.resume(&spec.cwd, s),
             None => adapter.launch(&spec.cwd),
@@ -1134,7 +1114,7 @@ impl<B: PaneBackend> App<B> {
                 // U2: led by the pane id; the `({adapter})` suffix only for
                 // titled panes (an untitled display name already ends in the
                 // adapter/cwd tag — C4's no-dup rule).
-                let label = format!("{id} {}", display_name_of(spec));
+                let label = format!("{id} {}", display_name_live(spec, None));
                 let line = match &spec.title {
                     Some(_) => format!("spawned {label} ({})", spec.adapter),
                     None => format!("spawned {label}"),
@@ -1193,8 +1173,8 @@ impl<B: PaneBackend> App<B> {
             };
             // Session ids already owned by other panes — never re-assign one
             // (concurrent same-cwd launches otherwise cross-wire onto it).
-            let taken = SessionResolver.claimed_sessions(&self.ws);
-            if let Some(session) = SessionResolver.detect(adapter.as_ref(), &spec.cwd, since, &taken) {
+            let taken = session_resolver::claimed_sessions(&self.ws);
+            if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
                 self.set_session(id, session);
             }
         }
@@ -1206,14 +1186,13 @@ impl<B: PaneBackend> App<B> {
     /// birth); a transition landing on `Exited` is suppressed (`on_pty_exit`
     /// owns that line) — one source per transition, no double-reporting.
     ///
-    /// [Amended, ux P2-10, design-supervisor D5] Reads `display_status`, not
-    /// the raw runtime status — same reasoning as D1's `tab_summary` fix:
-    /// the feed is chrome the user reads at a glance, and every other
-    /// surface (badge, roster, collapsed rows, tab bar) already reads a
-    /// quiet shell's `Waiting` as `Idle`. Left alone, the feed was logging
-    /// `1 shell: working → your turn` on every command any shell pane ran —
-    /// "your turn" false in exactly the case P2-10 named — while the rest
-    /// of the chrome, in the same frame, said `idle`.
+    /// Reads `display_status`, not the raw runtime status — same reasoning
+    /// as D1's `tab_summary`: the feed is chrome the user reads at a
+    /// glance, and every other surface (badge, roster, collapsed rows, tab
+    /// bar) already reads a quiet shell's `Waiting` as `Idle`. Without this
+    /// the feed would log `1 shell: working → your turn` on every command
+    /// any shell pane ran, while the rest of the chrome said `idle` in the
+    /// same frame.
     fn diff_statuses(&mut self) {
         let ids: Vec<PaneId> = self.runtimes.keys().copied().collect();
         let current: Vec<(PaneId, AgentStatus)> = ids
@@ -1418,27 +1397,25 @@ impl<B: PaneBackend> App<B> {
     /// and no known status — we report `Unknown` for those rather than letting
     /// the tab look idle/quiet, which would be a lie. A pane that's neither
     /// running nor a recorded spawn-failure is "not spawned yet".
-    /// [Amended 2026-07-28, C2] It now returns the summary **and how many of
-    /// the tab's panes are in that summarized state** — the number the tab bar
-    /// renders beside the glyph (`◆3`), so a tab holding three blocked agents
-    /// stops reading exactly like a tab holding one.
+    /// Returns the summary **and how many of the tab's panes are in that
+    /// summarized state** — the number the tab bar renders beside the glyph
+    /// (`◆3`), so a tab holding three blocked agents stops reading exactly
+    /// like a tab holding one.
     ///
     /// The count is of the *summarized* state only, never a pane total: the
     /// glyph says what the tab is reporting, and the count says how much of it
     /// there is. `Quiet` counts 0 — it reports nothing by construction. The
-    /// ranking is unchanged (U13's order, verbatim), which is why the count
-    /// rides along here rather than in a second function that could disagree
-    /// with it about which state won.
+    /// ranking is U13's order, verbatim, which is why the count rides along
+    /// here rather than in a second function that could disagree with it
+    /// about which state won.
     ///
-    /// [Amended, ux P2-10, design-supervisor D1] Reads `display_status`, not
-    /// the raw runtime status: the badge and the roster already did, so a
-    /// one-shell workspace used to draw `○` on the tab bar and `·` on the
-    /// badge in the *same frame* — C5 is one table for every chrome surface
-    /// that shows status, tab bar included, and this was the exact
-    /// same-frame disagreement C27's own D1 amendment treats as the defect
-    /// that forced a single source. `None` (not spawned) still buckets as
-    /// `unknown`, `Some(Exited)` still as `exited` — `display_status` only
-    /// ever touches the `Waiting` rung, so both map onto today's rungs 1:1.
+    /// Reads `display_status`, not the raw runtime status: the badge and the
+    /// roster already do, and C5 is one table for every chrome surface that
+    /// shows status, tab bar included — a mismatch here would draw `○` on
+    /// the tab bar and `·` on the badge in the same frame. `None` (not
+    /// spawned) still buckets as `unknown`, `Some(Exited)` still as
+    /// `exited` — `display_status` only ever touches the `Waiting` rung, so
+    /// both map onto today's rungs 1:1.
     pub fn tab_summary(&self, tab_index: usize) -> (TabSummary, usize) {
         let Some(tab) = self.ws.tabs.get(tab_index) else { return (TabSummary::Quiet, 0) };
         let (mut unknown, mut needs, mut working, mut waiting, mut exited) = (0, 0, 0, 0, 0);
@@ -1567,11 +1544,10 @@ impl<B: PaneBackend> App<B> {
     /// visited, which the lazy spawn has not started yet.
     ///
     /// One source for that three-rung distinction, because two surfaces read
-    /// it in the same frame. C27's roster used to call every runtime-less
-    /// pane `Exited` while `tab_summary` called the same tab `Unknown` — so
-    /// a workspace restored from disk (every non-active tab unspawned) opened
-    /// its first roster showing the entire fleet as corpses under a tab bar
-    /// of quiet dots.
+    /// it in the same frame — without it, C27's roster could call a
+    /// runtime-less pane `Exited` while `tab_summary` calls the same tab
+    /// `Unknown`, showing a freshly restored workspace's entire fleet as
+    /// corpses under a tab bar of quiet dots.
     pub fn row_status(&self, id: PaneId) -> Option<AgentStatus> {
         if let Some(rt) = self.runtimes.get(&id) {
             return Some(rt.status());
@@ -1934,24 +1910,39 @@ impl<B: PaneBackend> App<B> {
             }
             None => None,
         };
+        self.ctl_spawn_child(actor, adapter, cwd, initial_input, "spawn")
+    }
+
+    /// Shared tail of `ctl_spawn`/`ctl_fork`: resolve `actor`'s owner id,
+    /// split off a new `adapter` pane, and reply. `verb` names the action in
+    /// the refusal message ("spawn"/"fork").
+    ///
+    /// `spawn_child` (shared with the interactive Alt+n path) splits off
+    /// `self.focused` and moves focus to the new pane — fine for a human
+    /// keystroke, but the control API must never steal the human's focus or
+    /// jump their active tab out from under them (DESIGN-control §5.2).
+    /// Save + restore around the call; the new pane is still created,
+    /// spawned, and its id returned either way.
+    fn ctl_spawn_child(
+        &mut self,
+        actor: Actor,
+        adapter: &str,
+        cwd: Option<PathBuf>,
+        initial_input: Option<String>,
+        verb: &str,
+    ) -> Reply {
         let owner = match actor {
             Actor::Fleet => None,
             Actor::Pane(a) => Some(a),
         };
-        // spawn_child (shared with the interactive Alt+n path) splits off
-        // self.focused and moves focus to the new pane — fine for a human
-        // keystroke, but the control API must never steal the human's focus
-        // or jump their active tab out from under them (DESIGN-control
-        // §5.2). Save + restore around the call; the new pane is still
-        // created, spawned, and its id returned either way.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
         let id = self.spawn_child(adapter, cwd, owner);
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
-            return Reply::err(
-                "spawn refused: not enough room to split; stack a pane with Alt+s first",
-            );
+            return Reply::err(format!(
+                "{verb} refused: not enough room to split; stack a pane with Alt+s first"
+            ));
         };
         if let Some(text) = initial_input {
             let mut bytes = text.into_bytes();
@@ -1998,27 +1989,10 @@ impl<B: PaneBackend> App<B> {
         let Some(spec) = self.find_spec(target).cloned() else {
             return Reply::err("no such pane");
         };
-        let owner = match actor {
-            Actor::Fleet => None,
-            Actor::Pane(a) => Some(a),
-        };
         // Same adapter + cwd. Session-branching (a true fork of the agent's
         // conversation) lands with the bidirectional pi extension; for now this
         // opens a fresh sibling in the same context.
-        // See ctl_spawn: the control path must never steal the human's focus
-        // or active tab.
-        let (focused, active_tab) = (self.focused, self.ws.active_tab);
-        let id = self.spawn_child(&spec.adapter, Some(spec.cwd), owner);
-        self.set_focus(focused);
-        self.ws.active_tab = active_tab;
-        let Some(id) = id else {
-            return Reply::err(
-                "fork refused: not enough room to split; stack a pane with Alt+s first",
-            );
-        };
-        self.relayout();
-        self.save();
-        self.spawn_reply(id)
+        self.ctl_spawn_child(actor, &spec.adapter, Some(spec.cwd), None, "fork")
     }
 
     fn ctl_send(&mut self, actor: Actor, pane: PaneId, text: &str, submit: bool) -> Reply {
@@ -2226,7 +2200,7 @@ impl<B: PaneBackend> App<B> {
                 // U2: the spec is already out of the tree, so the label is
                 // built from the captured spec (same `{id} {name}` shape as
                 // `feed_label`).
-                self.push_feed(format!("closed {id} {}", display_name_of(&spec)), false, None);
+                self.push_feed(format!("closed {id} {}", display_name_live(&spec, None)), false, None);
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
@@ -2651,14 +2625,13 @@ impl<B: PaneBackend> App<B> {
     /// C29: double-click — select the whitespace-delimited word under (row,
     /// col), the same tokenizer `find_url_at` uses (`word_bounds_at`,
     /// cell-aware per B1). No word there (whitespace, or past the row's
-    /// trimmed content) **clears the selection outright** (D3, PR #46
-    /// design audit) — it used to degrade to a single-point (anchor ==
-    /// cursor) selection, which `release_native_selection` could not tell
-    /// apart from a genuine one-character *word* (also anchor == cursor,
-    /// by construction): double-clicking `a`, `$`, or any other 1-char
-    /// token silently copied nothing. Tracking "found nothing" here,
-    /// explicitly, instead of inferring it from the resulting range, is
-    /// what makes the two distinguishable again.
+    /// trimmed content) **clears the selection outright** (D3) rather than
+    /// degrading to a single-point (anchor == cursor) selection: a
+    /// single-point selection is indistinguishable from a genuine
+    /// one-character *word* (also anchor == cursor, by construction), so
+    /// double-clicking `a`, `$`, or any other 1-char token would silently
+    /// copy nothing. Tracking "found nothing" explicitly, instead of
+    /// inferring it from the resulting range, keeps the two distinguishable.
     pub fn select_word_at(&mut self, pane: PaneId, row: u16, col: u16) {
         use unicode_width::UnicodeWidthChar;
         let line = self.row_text(pane, row);
@@ -2702,11 +2675,10 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// U14: the hint-bar text for a finished copy of `chars` characters,
-    /// given which clipboard channel actually took it. The flash used to
-    /// fire at extraction time and claim `copied N chars` unconditionally —
-    /// while `clipboard::copy` discarded both channels' results, so an
-    /// empty clipboard reported a successful copy. Pure, so the wording is
-    /// pinned without touching a clipboard.
+    /// given which clipboard channel actually took it — fired only once the
+    /// channel is known, not at extraction time, so a clipboard write that
+    /// silently failed can't still report a successful copy. Pure, so the
+    /// wording is pinned without touching a clipboard.
     pub fn copy_flash_text(chars: usize, outcome: ClipboardOutcome) -> String {
         match outcome {
             ClipboardOutcome::Native => format!("copied {chars} chars"),
@@ -2733,21 +2705,28 @@ impl<B: PaneBackend> App<B> {
         self.set_flash(Self::copy_flash_text(chars, outcome));
     }
 
+    /// Shared by `finish_selection`/`finish_native_selection`: clear
+    /// `dragging` on the live selection and grab its text — `None` for an
+    /// empty grab or no live selection.
+    fn grab_selection_text(&mut self) -> Option<String> {
+        let sel = self.selection.as_mut()?;
+        sel.dragging = false;
+        let (pane, anchor, cursor) = (sel.pane, sel.anchor, sel.cursor);
+        let text = self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
+        if text.is_empty() { None } else { Some(text) }
+    }
+
     /// Finish the drag: extract the selected text and leave copy mode.
     /// Returns the text to hand to the clipboard (None when the selection
     /// is empty). U14: the "copied" flash is *not* set here — it is set by
     /// the caller once the clipboard has actually answered (`flash_copy`).
     pub fn finish_selection(&mut self) -> Option<String> {
-        let sel = self.selection.as_mut()?;
-        sel.dragging = false;
-        let (pane, anchor, cursor) = (sel.pane, sel.anchor, sel.cursor);
-        let text = self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
-        self.mode = Mode::Normal;
-        self.selection = None;
-        if text.is_empty() {
-            return None;
+        let text = self.grab_selection_text();
+        if self.selection.is_some() {
+            self.mode = Mode::Normal;
+            self.selection = None;
         }
-        Some(text)
+        text
     }
 
     /// C29: end a native (Normal-mode) selection gesture *without* discarding
@@ -2757,50 +2736,34 @@ impl<B: PaneBackend> App<B> {
     /// only clears `dragging` and returns the grabbed text, leaving
     /// `self.selection` (and `self.mode`, already `Normal`) untouched.
     pub fn finish_native_selection(&mut self) -> Option<String> {
-        let sel = self.selection.as_mut()?;
-        sel.dragging = false;
-        let (pane, anchor, cursor) = (sel.pane, sel.anchor, sel.cursor);
-        let text = self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
-        if text.is_empty() {
-            return None;
-        }
-        Some(text)
+        self.grab_selection_text()
     }
 
     /// C29: handle a release over a live native selection — the single path
     /// `main.rs`'s `Up` arm calls, so the click-count-aware timing rule
     /// below lives in one place rather than split across the two layers.
     ///
-    /// D3 (PR #46 design audit): a gesture that never moved (`dragging`
-    /// still true — i.e. a plain click or shift-click, never promoted by a
-    /// drag or a click-count upgrade — *and* `anchor == cursor`) selects
-    /// nothing and is cleared outright. Anything else is a real selection,
-    /// **even one cell wide** — a double-click's one-character word must
-    /// not be confused with "found nothing" the way inferring it from
-    /// `anchor == cursor` alone used to (`select_word_at` now clears
-    /// `self.selection` itself when it truly finds nothing, so by the time
-    /// this runs, `Some` already means "there is something here").
+    /// D3: a gesture that never moved (`dragging` still true — a plain
+    /// click or shift-click, never promoted by a drag or a click-count
+    /// upgrade — *and* `anchor == cursor`) selects nothing and is cleared
+    /// outright. Anything else is a real selection, **even one cell wide**
+    /// — `select_word_at` already clears `self.selection` itself when it
+    /// truly finds nothing, so by the time this runs `Some` means "there
+    /// is something here".
     ///
-    /// S4 (PR #46 code review): a double-click's own release is *staged*,
-    /// not committed immediately — it is the one release a still-possible
-    /// 3rd click can supersede within the same double-click window, and
-    /// firing it right away made every triple-click copy the word and then
-    /// the line a heartbeat later. Every other release (a plain drag, or a
-    /// triple-click's own release, which has nothing left to wait for)
-    /// commits straight through `finish_native_selection`.
+    /// S4: a double-click's own release is *staged*, not committed
+    /// immediately — it is the one release a still-possible 3rd click can
+    /// supersede within the same double-click window. Every other release
+    /// (a plain drag, or a triple-click's own release) commits straight
+    /// through `finish_native_selection`.
     ///
-    /// [Amended, code review + F5, exit UX audit 2026-08-07] Every release
-    /// — staged or immediate — now starts by clearing any earlier stage
-    /// outright: a real mouse release always supersedes one, most commonly
-    /// the 3rd click of a triple-click, whose own (wider) selection is the
-    /// one that should win. What no longer cancels a stage is anything
-    /// *other* than a mouse release — a keypress clearing `self.selection`
-    /// (C29's "any click or keypress clears" rule) used to read as
-    /// "superseded" too, silently dropping a double-click's copy if the
-    /// user so much as typed within the window, with nothing telling them
-    /// (F5). A keypress has nothing to do with whether the word actually
-    /// double-clicked should still land on the clipboard, so it no longer
-    /// touches the stage at all — `due_copy` fires it regardless.
+    /// Every release — staged or immediate — starts by clearing any earlier
+    /// stage outright: a real mouse release always supersedes one, most
+    /// commonly the 3rd click of a triple-click, whose own (wider)
+    /// selection is the one that should win. A keypress does NOT cancel a
+    /// stage (F5): it has nothing to do with whether the word actually
+    /// double-clicked should still land on the clipboard, so `due_copy`
+    /// fires it regardless.
     ///
     /// Returns the text to copy *now*, if any — `None` covers "nothing was
     /// selected", "staged for later" (see `due_copy`) and "nothing
@@ -2832,16 +2795,13 @@ impl<B: PaneBackend> App<B> {
     /// passed — `None` otherwise, whether because it's still waiting on a
     /// possible 3rd click, or because there was never one staged.
     ///
-    /// [Amended, code review + F5, exit UX audit 2026-08-07] Used to
-    /// re-check `self.selection` against the staged coordinates and drop
-    /// the copy on any mismatch — which conflated two different things: a
-    /// real supersession (now handled at stage-time, see
-    /// `release_native_selection`) and an unrelated keypress clearing the
-    /// highlight, which used to cancel the copy too, silently. The text is
-    /// already fixed at release time, so once the deadline passes there is
-    /// nothing left to check — it fires. The composition root calls this
-    /// once per event-loop tick and performs the actual clipboard write
-    /// when it answers (core has no I/O of its own).
+    /// Real supersession is handled at stage-time (see
+    /// `release_native_selection`); an unrelated keypress clearing the
+    /// highlight does NOT cancel a staged copy (F5) — the text is already
+    /// fixed at release time, so once the deadline passes there is nothing
+    /// left to check, it fires. The composition root calls this once per
+    /// event-loop tick and performs the actual clipboard write when it
+    /// answers (core has no I/O of its own).
     pub fn due_copy(&mut self) -> Option<String> {
         let at = self.pending_copy.as_ref()?.1;
         if Instant::now() < at {
@@ -2889,10 +2849,9 @@ impl<B: PaneBackend> App<B> {
     /// Alt+click-to-open and copy mode's `o`.
     ///
     /// U19: reads the whole *wrapped run* the row belongs to, not one grid
-    /// row. Agents print long CI/GitHub links into narrow panes constantly,
-    /// and a link that wrapped used to open as its first row's fragment
-    /// from above the break and dead-click everywhere below it — the two
-    /// worst outcomes available: a wrong URL, and a dead affordance.
+    /// row. Agents print long CI/GitHub links into narrow panes constantly;
+    /// reading only the clicked row would open a wrapped link's first-row
+    /// fragment and dead-click everywhere below the break.
     pub fn url_at(&self, id: PaneId, row: u16, col: u16) -> Option<String> {
         let rt = self.runtimes.get(&id)?;
         let (rows, width) = self.pane_inner_dims(id);
@@ -2941,13 +2900,12 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    /// U8: is a modal overlay up? These five modes own the whole
-    /// non-keyboard input surface — mouse and paste alike — while they are
-    /// active. Scroll/Copy are deliberately excluded: they draw no dialog,
-    /// nothing is hidden underneath them, and their mouse behavior (wheel
-    /// scrolls, drag selects) is the point.
-    /// [Amended, C27] the roster is the fifth: it is a C12 modal, so U8's
-    /// rules cover it unchanged.
+    /// U8: is a modal overlay up? These five modes (the roster, C27, is a
+    /// C12 modal like the rest) own the whole non-keyboard input surface —
+    /// mouse and paste alike — while they are active. Scroll/Copy are
+    /// deliberately excluded: they draw no dialog, nothing is hidden
+    /// underneath them, and their mouse behavior (wheel scrolls, drag
+    /// selects) is the point.
     pub fn modal_active(&self) -> bool {
         matches!(
             self.mode,
@@ -2978,7 +2936,7 @@ impl<B: PaneBackend> App<B> {
         // beneath are unreachable while it's up, so position-routing would
         // only mean "the wheel does nothing here" — and reaching the pane
         // under the overlay is U8(c), the bug itself.
-        let page = self.feed_page();
+        let page = self.overlay_page();
         let cap = self.feed.len().saturating_sub(1);
         if let Mode::Feed { offset } = &mut self.mode {
             match me.kind {
@@ -3335,7 +3293,9 @@ impl<B: PaneBackend> App<B> {
         }
         match action {
             Action::Quit => self.quit_guarded(),
-            Action::NewPane => self.new_pane_with("shell"),
+            Action::NewPane => {
+                self.spawn_child("shell", None, None);
+            }
             Action::ClosePane => self.close_pane(),
             Action::Focus(dir) => self.focus_dir(dir),
             Action::NewTab => self.new_tab(),
@@ -3579,8 +3539,8 @@ impl<B: PaneBackend> App<B> {
         self.focus_dir_cross_tab(dir, &rects);
     }
 
-    /// C31, client request 2026-08-07: `Left`/`Right` off the edge of the
-    /// active tab continue into the next/previous tab instead of stopping
+    /// C31: `Left`/`Right` off the edge of the active tab continue into the
+    /// next/previous tab instead of stopping
     /// dead — "keep going right" should behave like it sounds. `Up`/`Down`
     /// are untouched: tabs are roost's own horizontal axis (the strip,
     /// `Alt+i`/`Alt+m`), so only the two keys that already share that axis
@@ -3628,9 +3588,9 @@ impl<B: PaneBackend> App<B> {
                 .find(|p| p.id == self.focused)
                 .is_some_and(|p| p.rect.width == self.body_area().width);
         if spans_full_width {
-            // F7 (exit UX audit 2026-08-07): this same key teleports across
-            // tabs at a real edge — a silent refusal here reads as broken,
-            // not deliberate. roost's own rule is every no-op flashes.
+            // F7: this same key teleports across tabs at a real edge — a
+            // silent refusal here reads as broken, not deliberate. roost's
+            // own rule is every no-op flashes.
             self.set_flash("full-width pane — nothing to cross into");
             return;
         }
@@ -3655,10 +3615,6 @@ impl<B: PaneBackend> App<B> {
         self.spawn_active_tab();
         self.set_focus(target);
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
-    }
-
-    fn new_pane_with(&mut self, adapter: &str) {
-        self.spawn_child(adapter, None, None);
     }
 
     /// Split the focused pane and spawn a new one running `adapter`. `cwd`
@@ -3697,30 +3653,12 @@ impl<B: PaneBackend> App<B> {
         });
         let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by };
 
-        // Split in the widest direction of the split target's rect.
+        // Split in the widest direction of the split target's rect. Refuses
+        // (returns None) a split that would produce unusably tiny panes
+        // (also the trigger for the vt100 underflow crash) — silent no-op,
+        // the layout is left untouched.
         let target_rect = self.rects().iter().find(|pr| pr.id == split_target).map(|pr| pr.rect);
-        let dir = target_rect
-            .map(|r| {
-                if r.width >= r.height * 3 {
-                    SplitDir::Vertical
-                } else {
-                    SplitDir::Horizontal
-                }
-            })
-            .unwrap_or(SplitDir::Vertical);
-
-        // Refuse a split that would produce unusably tiny panes (also the
-        // trigger for the vt100 underflow crash). Silent no-op — the layout
-        // is left untouched. See layout::MIN_SPLIT_* (also the C25 fit floor).
-        if let Some(r) = target_rect {
-            let too_small = match dir {
-                SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
-                SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
-            };
-            if too_small {
-                return None;
-            }
-        }
+        let dir = split_fit(target_rect)?;
 
         let tab = self.ws.active_tab_mut();
         tab.panes.insert(id, spec.clone());
@@ -3970,28 +3908,13 @@ impl<B: PaneBackend> App<B> {
             .filter(|h| drects.iter().any(|pr| pr.id == *h))
             .or_else(|| drects.first().map(|pr| pr.id));
         let Some(host) = host else { return };
-        let host_rect = drects.iter().find(|pr| pr.id == host).map(|pr| pr.rect);
         // Same split rule as `spawn_child`: cut the widest way, and refuse
         // below the C25 floor rather than make a pane nothing can render in.
-        let dir = host_rect
-            .map(|r| {
-                if r.width >= r.height * 3 {
-                    SplitDir::Vertical
-                } else {
-                    SplitDir::Horizontal
-                }
-            })
-            .unwrap_or(SplitDir::Vertical);
-        if let Some(r) = host_rect {
-            let too_small = match dir {
-                SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
-                SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
-            };
-            if too_small {
-                self.set_flash(format!("{} has no room", self.ws.tabs[di].name));
-                return;
-            }
-        }
+        let host_rect = drects.iter().find(|pr| pr.id == host).map(|pr| pr.rect);
+        let Some(dir) = split_fit(host_rect) else {
+            self.set_flash(format!("{} has no room", self.ws.tabs[di].name));
+            return;
+        };
 
         // C21/C22: this is a tab change, so it exits zoom and hides the
         // float exactly like `go_to_tab` — done here rather than inherited,
@@ -4065,38 +3988,32 @@ impl<B: PaneBackend> App<B> {
     /// float (C22), if needy, is last — `needs_input_count` counts `runtimes`
     /// directly (float included), so it must be too.
     ///
-    /// [Amended, ux P1-5] `Alt+a` promises "one key jumps there", but a ◆-only
-    /// ring keeps that promise only for extension-instrumented panes: without
-    /// a hook, `NeedsInput` is reachable solely via the BEL heuristic, so a
-    /// quiet turn-end lands on `Waiting` — which this ring used to ignore
-    /// outright. When the ◆ pass comes back **empty** (nothing anywhere needs
-    /// input), the ring falls through to every pane reading `Waiting` instead
-    /// — same tab/pane_order/float shape, so nothing else about a jump
-    /// changes. An instrumented fleet is untouched by construction: the
-    /// fallback only runs once the ◆ pass is empty, so a real ◆ is never
-    /// skipped in favor of a ○. The predicate is `display_status`, not the
-    /// raw runtime status, so a plain shell sitting at its prompt (P2-10: it
-    /// has no turn to hand back) can never pull the ring — only a pane whose
-    /// `Waiting` actually means something does.
+    /// [ux P1-5] `Alt+a` promises "one key jumps there", but a ◆-only ring
+    /// keeps that promise only for extension-instrumented panes: without a
+    /// hook, `NeedsInput` is reachable solely via the BEL heuristic, so a
+    /// quiet turn-end lands on `Waiting`. When the ◆ pass comes back
+    /// **empty** (nothing anywhere needs input), the ring falls through to
+    /// every pane reading `Waiting` instead — same tab/pane_order/float
+    /// shape, so nothing else about a jump changes. An instrumented fleet
+    /// is untouched by construction: the fallback only runs once the ◆
+    /// pass is empty, so a real ◆ is never skipped in favor of a ○. The
+    /// predicate is `display_status`, not the raw runtime status, so a
+    /// plain shell sitting at its prompt (P2-10: it has no turn to hand
+    /// back) can never pull the ring — only a pane whose `Waiting` actually
+    /// means something does.
     ///
-    /// [Amended F2, exit UX audit 2026-08-07] At N = 0 this ring's fallback
-    /// pass used to run with **no on-screen affordance saying so**: the hint
-    /// bar omitted its segment outright (`n > 0` in `render.rs`), so `Alt+a`
-    /// visibly promised nothing yet still jumped somewhere — the best half
-    /// of the P1-5 work above was invisible. `attention_segment` (below) now
-    /// reads this same ring, so the hint bar's right segment matches what
-    /// `Alt+a` will actually do in *every* case, not just N > 0.
+    /// F2: `attention_segment` (below) reads this same ring, so the hint
+    /// bar's right segment matches what `Alt+a` will actually do in every
+    /// case, not just when the ◆ pass is non-empty.
     ///
-    /// [Amended F3, exit UX audit 2026-08-07] The fallback pass also drops
-    /// any pane in `visited_waiting` — panes focus has already landed on
-    /// during their current `Waiting` spell. Without this, the fallback
-    /// never empties: a real ◆ clears itself the moment you act on it (its
-    /// own status moves on), but a quiet `Waiting` pane's status doesn't
-    /// change just because you looked at it, so a six-pane fleet with
-    /// nothing but finished turns turned `Alt+a` into an endless
-    /// round-robin, and "nothing else needs you" only ever fired with
-    /// exactly one pane waiting. The ◆ pass is untouched — a real ◆ must
-    /// never be hidden by a stale visit.
+    /// F3: the fallback pass also drops any pane in `visited_waiting` —
+    /// panes focus has already landed on during their current `Waiting`
+    /// spell. Without this the fallback never empties: a real ◆ clears
+    /// itself the moment you act on it (its own status moves on), but a
+    /// quiet `Waiting` pane's status doesn't change just because you looked
+    /// at it, so a fleet with nothing but finished turns would turn
+    /// `Alt+a` into an endless round-robin. The ◆ pass is untouched — a
+    /// real ◆ must never be hidden by a stale visit.
     fn attention_ring(&self) -> Vec<PaneId> {
         let needy = self.status_ring(AgentStatus::NeedsInput);
         if !needy.is_empty() {
@@ -4108,7 +4025,7 @@ impl<B: PaneBackend> App<B> {
             .collect()
     }
 
-    /// C9/F2 (exit UX audit 2026-08-07): what the hint bar's right segment
+    /// C9/F2: what the hint bar's right segment
     /// should announce about `Alt+a` — `Some((n, true))` for a real ◆ count
     /// (`needs_input_count`, unchanged wording/style), `Some((n, false))`
     /// for `attention_ring`'s ○ fallback count once none do, `None` only
@@ -4241,10 +4158,10 @@ impl<B: PaneBackend> App<B> {
         };
     }
 
-    /// C20: the feed overlay's paging step — half its drawn height, at least
-    /// one entry. The single source for the keyboard's PgUp/PgDn
-    /// (`handle_mode_key`) and, since U8, one wheel notch over the overlay.
-    fn feed_page(&self) -> usize {
+    /// C20/C27: the feed and roster overlays' shared paging step — half the
+    /// (shared) overlay height, at least one row/entry. The single source
+    /// for both keyboards' PgUp/PgDn and the feed's wheel notch.
+    fn overlay_page(&self) -> usize {
         (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize
     }
 
@@ -4285,10 +4202,10 @@ impl<B: PaneBackend> App<B> {
     /// Hidden is a display state, not an absence; Enter on the row shows it,
     /// exactly as a ring jump does.
     ///
-    /// [Amended, ux P2-11] Tab order is no longer the sort key. Both tiers
-    /// sort worst-first (`roster_rank`, C5's severity order: ◆→○→⠋→·→exited —
-    /// ⠋ standing for the Working spinner, C5 amended 2026-08-07):
-    /// panes within a tab's group, and then the groups themselves by their
+    /// Tab order is not the sort key. Both tiers sort worst-first
+    /// (`roster_rank`, C5's severity order: ◆→○→⠋→·→exited — ⠋ standing for
+    /// the Working spinner): panes within a tab's group, and then the
+    /// groups themselves by their
     /// own worst pane — so the tab holding the one ◆ in a twenty-pane fleet
     /// is the *first* group, and that pane is its *first* row, not something
     /// you scroll a screenful to find. Both sorts are stable, so panes/tabs
@@ -4394,11 +4311,11 @@ impl<B: PaneBackend> App<B> {
 
     /// How many rows the overlay can show at once (its inner height).
     fn roster_view_rows(&self) -> usize {
-        roster_overlay_size(self.body_area()).1.saturating_sub(2) as usize
+        feed_overlay_size(self.body_area()).1.saturating_sub(2) as usize
     }
 
     /// C15: the keymap's paging step — half its visible height, at least one
-    /// row. Same rule as C20's `feed_page` and C27's `roster_page`.
+    /// row. Same rule as C20/C27's shared `overlay_page`.
     fn help_page(&self) -> isize {
         (crate::ui::render::help_scroll_extent(self.body_area()).0 / 2).max(1) as isize
     }
@@ -4422,13 +4339,6 @@ impl<B: PaneBackend> App<B> {
         let moved = next != *top;
         *top = next;
         moved
-    }
-
-    /// C27: the roster's paging step — half the overlay's height, at least
-    /// one row. Same rule (and same reason) as C20's `feed_page`: one source
-    /// for PgUp/PgDn so the keys can't drift from each other.
-    fn roster_page(&self) -> usize {
-        (roster_overlay_size(self.body_area()).1 / 2).max(1) as usize
     }
 
     /// The cursor's index among the rows currently shown, if it is still one
@@ -4572,35 +4482,26 @@ impl<B: PaneBackend> App<B> {
             Mode::Picker { filter, .. } => filter.to_ascii_lowercase(),
             _ => String::new(),
         };
-        picker_items()
+        crate::agents::picker_ids()
             .into_iter()
             .filter(|id| filter.is_empty() || id.to_ascii_lowercase().contains(&filter))
             .collect()
     }
 
     /// U20 / P2-13: the picker rows as display text — `picker_filtered_ids`,
-    /// each annotated when its launch program isn't actually on `$PATH` (a
-    /// Claude-only user's first `Alt+Enter` → `pi` used to be a dead pane
-    /// with no warning at all). Annotated rather than hidden: this registry
-    /// has six adapters, and on a single-agent machine hiding the other five
-    /// would leave one or two rows under a title that still reads "pick
-    /// agent" — confusingly short, and indistinguishable from a picker that
-    /// lost its adapters (the exact failure U20's own type-ahead title
-    /// already guards against).
+    /// each annotated when its launch program isn't actually on `$PATH`.
+    /// Annotated rather than hidden: this registry has six adapters, and on
+    /// a single-agent machine hiding the other five would leave one or two
+    /// rows under a title that still reads "pick agent" — confusingly
+    /// short, and indistinguishable from a picker that lost its adapters
+    /// (the exact failure U20's own type-ahead title already guards
+    /// against).
     ///
-    /// [Amended F8, exit UX audit 2026-08-07] The suffix used to be `"
-    /// gone"`, echoing this file's own voice for "not here" (`roster_jump`'s
-    /// "that pane is gone") — but "gone" implies something that *was* here
-    /// and disappeared, which is false for an adapter that was never
-    /// installed on this machine at all; every other roost picker session
-    /// would show it exactly the same "gone" the moment after a fresh
-    /// install too. Reworded to `" not found"` (the familiar shell idiom for
-    /// "no such program on `$PATH`"), which makes no claim about history.
-    /// Checked against `render.rs`'s `ADAPTER_COL` (widened alongside this
-    /// change, same reasoning there) for the longest id: `opencode` (8
-    /// chars, longer than `claude`/`gemini` since this registry grew to six
-    /// — the comment this amendment replaces was already stale on that
-    /// count too).
+    /// F8: the suffix is `" not found"` (the familiar shell idiom for "no
+    /// such program on `$PATH`"), not "gone" — "gone" implies something
+    /// that *was* here and disappeared, which is false for an adapter never
+    /// installed on this machine at all. Checked against `render.rs`'s
+    /// `ADAPTER_COL` for the longest id: `opencode` (8 chars).
     pub fn picker_filtered(&self) -> Vec<String> {
         self.picker_filtered_ids()
             .into_iter()
@@ -4825,7 +4726,7 @@ impl<B: PaneBackend> App<B> {
         // here (needs a whole `&self` via `body_area()`) rather than inside
         // the match below, where `Mode::Feed`'s arm already holds
         // `self.mode` mutably borrowed.
-        let feed_page = self.feed_page();
+        let feed_page = self.overlay_page();
         // C24: the focused pane's current inner grid, for clamping the copy
         // cursor — same borrow-ordering reason as `feed_page` above.
         let (copy_h, copy_w) = self.focused_inner_dims();
@@ -4872,18 +4773,13 @@ impl<B: PaneBackend> App<B> {
             Mode::Normal => false,
             Mode::Rename { buffer, cursor, target } => {
                 let target = *target;
-                // U16: the dialog used to `push` every `Char` whatever its
-                // modifiers, so Ctrl+W/Ctrl+U literally typed `w`/`u` into
-                // the name (live QA: `abc` + Ctrl+W + Ctrl+U committed
-                // `abcwu`). Two chords are real edits — the two every line
-                // editor on the platform binds — and every *other* modified
-                // char is discarded: a chord roost doesn't implement must
-                // never leave its letter behind in a name.
-                //
-                // [Amended, U16 second half] There is now a **point**. Every
-                // edit below is relative to it, which is what finally makes
-                // Ctrl+W's readline name honest: "word behind point" used to
-                // be "word at the end", because there was no point.
+                // U16: only Ctrl+W/Ctrl+U are real edits here — the two
+                // every line editor on the platform binds — every *other*
+                // modified char is discarded: a chord roost doesn't
+                // implement must never leave its letter behind in a name.
+                // Every edit is relative to `cursor`, the point, which is
+                // what makes Ctrl+W's readline name ("word behind point")
+                // honest.
                 let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 let len = buffer.chars().count();
                 *cursor = (*cursor).min(len);
@@ -5251,11 +5147,11 @@ impl<B: PaneBackend> App<B> {
             // reserve letters (U20's finding, paid for by the picker), so the
             // motions here are the arrows and the paging keys; every
             // printable — `j`, `k` and `q` included — is filter text, and
-            // `Esc` (with Alt+Shift+a) is the way out. [Amended, ux P2-11]
-            // `Tab`/`Shift+Tab` cycle the status filter — the two keys left
-            // over once every `Char` is spoken for.
+            // `Esc` (with Alt+Shift+a) is the way out. `Tab`/`Shift+Tab`
+            // cycle the status filter — the two keys left over once every
+            // `Char` is spoken for.
             Mode::Roster { .. } => {
-                let page = self.roster_page() as isize;
+                let page = self.overlay_page() as isize;
                 match key.code {
                     KeyCode::Up => self.roster_move(-1),
                     KeyCode::Down => self.roster_move(1),
@@ -5433,18 +5329,16 @@ fn method_summary(m: &Method) -> String {
 /// buckets alone never could, because they bound calls and the log bounds
 /// bytes. 512 is far past any legitimate adapter name or status word.
 ///
-/// [Amended, code review, exit UX audit 2026-08-07] This is a **byte**
-/// budget — `sanitize` used to cap by `.chars().take(512)`, so 512
-/// 4-byte codepoints (an adapter-name field stuffed with astral-plane
-/// characters) bought ~2 KiB, not the ~1 KiB "far past any legitimate
-/// name" reads as. Every number in this comment is about bytes on disk
-/// against `AUDIT_LOG_MAX`, so bytes is what the cap now counts.
+/// This is a **byte** budget, not a char count: every number in this
+/// comment is about bytes on disk against `AUDIT_LOG_MAX`, and a char cap
+/// would let an adapter-name field stuffed with 4-byte astral-plane
+/// codepoints buy up to ~2 KiB instead.
 const AUDIT_FIELD_CAP: usize = 512;
 
 /// Cleans control chars, then caps at `AUDIT_FIELD_CAP` **bytes** (not
-/// chars — see the amendment above), never splitting a multi-byte
-/// character: each candidate char is checked against the byte budget
-/// before it's pushed, so truncation always lands on a char boundary.
+/// chars), never splitting a multi-byte character: each candidate char is
+/// checked against the byte budget before it's pushed, so truncation
+/// always lands on a char boundary.
 fn sanitize(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -5457,13 +5351,13 @@ fn sanitize(s: &str) -> String {
     out
 }
 
-/// B1 (PR #46 review): the char index the grid CELL column `cell` falls
-/// inside. `row_text`/`grab_text` (P15) drop wide glyphs' continuation
-/// cells, so the extracted string's char positions and the row's cell
-/// positions diverge the moment a row holds one — indexing the string
-/// directly with a cell column (as `word_bounds_at` used to) walks off by
-/// however many wide glyphs sit before the target, returning the wrong
-/// word entirely. Clamps to the string's length past the end.
+/// B1: the char index the grid CELL column `cell` falls inside.
+/// `row_text`/`grab_text` (P15) drop wide glyphs' continuation cells, so
+/// the extracted string's char positions and the row's cell positions
+/// diverge the moment a row holds one — indexing the string directly with
+/// a cell column would walk off by however many wide glyphs sit before the
+/// target, returning the wrong word entirely. Clamps to the string's
+/// length past the end.
 fn cell_to_char(line: &str, cell: usize) -> usize {
     use unicode_width::UnicodeWidthChar;
     let mut acc = 0usize;
@@ -5510,11 +5404,10 @@ fn word_bounds_at(line: &str, cell: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// Find an http(s) URL that covers grid CELL column `col` in `line`
-/// (B1, PR #46 review — was documented and read as a char index, which
-/// desynced from the cell math every other caller uses the moment a row
-/// held a wide glyph). The URL is the surrounding non-whitespace run, with
-/// wrapping/trailing punctuation stripped. Pure, so it's unit-tested.
+/// Find an http(s) URL that covers grid CELL column `col` in `line` (B1: a
+/// cell column, not a char index — see `cell_to_char`). The URL is the
+/// surrounding non-whitespace run, with wrapping/trailing punctuation
+/// stripped. Pure, so it's unit-tested.
 pub fn find_url_at(line: &str, col: usize) -> Option<String> {
     let (start, end) = word_bounds_at(line, col)?;
     let token: String = line.chars().skip(start).take(end - start + 1).collect();
@@ -5699,14 +5592,19 @@ fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
 }
 
-/// U2: a pane's display name from its spec — the custom title when set, else
-/// `{adapter} · {cwd-tag}` (the cwd's last path component), so a bank of
-/// untitled shells on the same adapter stays tellable apart. This was the
-/// corner badge's render-local fallback; it's shared here so the badge, the
-/// collapsed rows, the feed, notifications, and flashes can never drift
-/// apart on what a pane is called (C4's amendment points at this fn).
-pub fn display_name_of(spec: &PaneSpec) -> String {
-    display_name_live(spec, None)
+/// Shared by `spawn_child` and `move_pane_to_tab`: cut `r` the widest way,
+/// refusing (`None`) below the C25 fit floor (`layout::MIN_SPLIT_*`) — the
+/// vt100 underflow crash's trigger. A `None` rect (split target not found in
+/// the caller's own rect list) is treated as always fitting, matching both
+/// callers' pre-existing fallback.
+fn split_fit(rect: Option<Rect>) -> Option<SplitDir> {
+    let Some(r) = rect else { return Some(SplitDir::Vertical) };
+    let dir = if r.width >= r.height * 3 { SplitDir::Vertical } else { SplitDir::Horizontal };
+    let too_small = match dir {
+        SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
+        SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
+    };
+    if too_small { None } else { Some(dir) }
 }
 
 /// U2 + P6: the full naming chain as a pure function — explicit Alt+r title,
@@ -5811,21 +5709,14 @@ fn rotate_audit_log(path: &std::path::Path, max: u64) {
 /// C20: the feed overlay's `(width, height)` at the given body area —
 /// `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`. Shared by
 /// the renderer (geometry) and `handle_mode_key` (PgUp/PgDn page size) so
-/// both agree on what's actually on screen. Pure so the 72×16 formula is
-/// unit-tested without a `Frame`.
+/// both agree on what's actually on screen — and by the roster overlay
+/// (C27), deliberately the same function so toggling between the two never
+/// resizes the frame. Pure so the 72×16 formula is unit-tested without a
+/// `Frame`.
 pub fn feed_overlay_size(body: Rect) -> (u16, u16) {
     let w = body.width.saturating_sub(4).min(72);
     let h = body.height.saturating_sub(4).min(16);
     (w, h)
-}
-
-/// C27: the roster overlay's `(width, height)` — deliberately C20's formula,
-/// not a second one. The two overlays answer the fleet's two questions
-/// ("what happened" / "what is") and a user toggling between them should not
-/// watch the frame resize; sharing one function also means the 80×24 floor
-/// is proven once.
-pub fn roster_overlay_size(body: Rect) -> (u16, u16) {
-    feed_overlay_size(body)
 }
 
 /// C27: one row of the fleet roster — a tab's group header, or a pane.
@@ -5937,33 +5828,32 @@ fn edge_pane(rects: &[PaneRect], rightmost: bool) -> Option<PaneId> {
 /// Pure decision behind `App::show_alt_hint`, split out so it's testable
 /// without depending on process env vars or wall-clock time.
 ///
-/// U4/F1 (exit UX audit 2026-08-07): the trigger is evidence, not an
-/// allowlist — that part of the original U4 fix was right. What was wrong
-/// was the *evidence*: "keys are arriving and not one of them has carried
-/// Alt" is true of nearly all typing, so it fired on a healthy terminal the
-/// moment the user typed a shell prompt. The real signature of a swallowed
-/// Option chord is narrower — `is_alt_swallow_char` — but, per the design
-/// audit (SG1), still not unambiguous: every character in that set is also
-/// a directly-typed letter on some non-US macOS layout. `since_evidence` is
-/// time elapsed since the *most recent* match (`App::alt_swallow_at`), not
-/// since launch — checked against `ALT_HINT_WINDOW` so a false positive
-/// clears itself in a few seconds rather than latching for the session,
-/// while fresh evidence keeps re-arming the window for a genuinely broken
-/// Alt layer. One real Alt key ever ends it outright, for the rest of the
+/// U4/F1: the trigger is evidence, not an allowlist. "Keys are arriving and
+/// not one of them has carried Alt" is true of nearly all typing, so that
+/// can't be the evidence — it would fire on a healthy terminal the moment
+/// the user typed a shell prompt. The real signature of a swallowed Option
+/// chord is narrower — `is_alt_swallow_char` — but (SG1) still not
+/// unambiguous: every character in that set is also a directly-typed
+/// letter on some non-US macOS layout. `since_evidence` is time elapsed
+/// since the *most recent* match (`App::alt_swallow_at`), not since
+/// launch — checked against `ALT_HINT_WINDOW` so a false positive clears
+/// itself in a few seconds rather than latching for the session, while
+/// fresh evidence keeps re-arming the window for a genuinely broken Alt
+/// layer. One real Alt key ever ends it outright, for the rest of the
 /// session, regardless of any evidence timestamp.
 fn wants_alt_hint(alt_seen: bool, since_evidence: Option<Duration>) -> bool {
     !alt_seen && since_evidence.is_some_and(|d| d < ALT_HINT_WINDOW)
 }
 
-/// F1 (exit UX audit 2026-08-07): the complete set of characters the
-/// standard **US** macOS keyboard layout emits for `Option+<letter>`,
-/// `letter` in `a..=z`, when Option isn't configured as Meta — one entry
-/// per letter, 26 total (this `matches!` arm list *is* the definition; nothing
-/// is abbreviated or approximated here). One of these arriving with no Alt
-/// modifier at all is evidence that *some* Alt chord was just swallowed,
-/// unlike "a key arrived" (true of nearly every keystroke) — see the design
-/// audit's SG1 for the false-positive this still carries on non-US layouts,
-/// and `wants_alt_hint` for how that's bounded.
+/// F1: the complete set of characters the standard **US** macOS keyboard
+/// layout emits for `Option+<letter>`, `letter` in `a..=z`, when Option
+/// isn't configured as Meta — one entry per letter, 26 total (this
+/// `matches!` arm list *is* the definition; nothing is abbreviated or
+/// approximated here). One of these arriving with no Alt modifier at all is
+/// evidence that *some* Alt chord was just swallowed, unlike "a key
+/// arrived" (true of nearly every keystroke) — see SG1 for the
+/// false-positive this still carries on non-US layouts, and
+/// `wants_alt_hint` for how that's bounded.
 ///
 /// Scoped to the US layout only (SG2): a non-US layout's own Option+letter
 /// table is a different 26 characters (mostly overlapping, not identical),
@@ -6092,7 +5982,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// `CommandSpec` `spawn_pane` would build (`adapter.launch`), not a
 /// hardcoded program name, so a new adapter's launch command is PATH-checked
 /// automatically without touching `agents/**`. An id the registry doesn't
-/// know (never happens today — `picker_items()` *is* the registry) is
+/// know (never happens today — `agents::picker_ids()` *is* the registry) is
 /// treated as installed: nothing here to warn about.
 fn adapter_installed(id: &str, registry: &Registry) -> bool {
     let Some(adapter) = registry.get(id) else { return true };
@@ -6132,12 +6022,10 @@ mod tests {
         assert_eq!(super::sanitize(ordinary), ordinary, "a legitimate field is untouched");
     }
 
-    /// Code review (exit UX audit 2026-08-07): the cap bounds bytes written
-    /// to the byte-bounded log (`AUDIT_LOG_MAX`), not chars — capping by
-    /// `.chars().take(512)` let 512 4-byte codepoints buy ~2 KiB, ~4x what
-    /// the comment on `AUDIT_FIELD_CAP` reasons in, making the
-    /// rotation-attack arithmetic that far optimistic. The test above uses
-    /// pure ASCII, where chars and bytes coincide and can't catch this.
+    /// The cap bounds bytes written to the byte-bounded log
+    /// (`AUDIT_LOG_MAX`), not chars — a char cap would let a field of 4-byte
+    /// codepoints buy several times the intended budget. The test above
+    /// uses pure ASCII, where chars and bytes coincide and can't catch this.
     #[test]
     fn an_audit_field_caps_bytes_not_chars_and_never_splits_one() {
         // U+1F600, 4 bytes in UTF-8: 512 / 4 = 128 whole emoji exactly fill
@@ -6303,12 +6191,11 @@ mod tests {
         assert_eq!(app.tab_summary(0).0, TabSummary::Unknown);
     }
 
-    /// C2 (amended 2026-07-28): the summary now carries **how many** panes
-    /// are in the state it reports — the tribunal's finding was that a tab of
-    /// three needy agents drew the same single `◆` as a tab of one. The count
-    /// is of the summarized state alone, never a pane total, and it rides on
-    /// the same call as the ranking so the two can never disagree about which
-    /// state won.
+    /// C2: the summary carries **how many** panes are in the state it
+    /// reports — without this, a tab of three needy agents would draw the
+    /// same single `◆` as a tab of one. The count is of the summarized
+    /// state alone, never a pane total, and it rides on the same call as
+    /// the ranking so the two can never disagree about which state won.
     #[test]
     fn tab_summary_counts_the_panes_in_the_state_it_reports() {
         let (mut app, _) = mk_app(shell_ws());
@@ -6344,8 +6231,9 @@ mod tests {
     }
 
     /// U13 (closes SPEC-GAP-2): a tab whose agents are dead says so instead
-    /// of rendering the Quiet blank — one transient bell, then silence, was
-    /// the entire signal a background tab full of corpses used to get.
+    /// of rendering the Quiet blank — otherwise a background tab full of
+    /// corpses gets only one transient bell, then silence, as its entire
+    /// signal.
     #[test]
     fn tab_summary_reports_exited_and_ranks_it_between_waiting_and_quiet() {
         let (mut app, _) = mk_app(shell_ws());
@@ -6526,10 +6414,11 @@ mod tests {
     }
 
     /// U22: **a shell echoing your own command is not mid-turn.** Any PTY
-    /// output in the last two seconds reads as Working, so closing a shell
-    /// right after `ls` used to arm the confirm and cost a second `Alt+w` —
-    /// a guard that fires on ordinary use is one people learn to double-tap
-    /// through, which is exactly what it must not become.
+    /// output in the last two seconds reads as Working, so without this a
+    /// shell closed right after `ls` would arm the confirm and cost a
+    /// second `Alt+w` — a guard that fires on ordinary use is one people
+    /// learn to double-tap through, which is exactly what it must not
+    /// become.
     #[test]
     fn a_shell_with_only_heuristic_output_closes_on_the_first_press() {
         let (mut app, _) = mk_app(shell_ws());
@@ -6667,10 +6556,11 @@ mod tests {
 
     #[test]
     fn confirm_flash_lives_exactly_as_long_as_its_confirm_window() {
-        // U22: FLASH_WINDOW (2s) < CONFIRM_WINDOW (3s) used to leave a
-        // silent final second where the second press still fired. A confirm
-        // prompt now carries the confirm window itself; ordinary flashes
-        // keep FLASH_WINDOW; a consumed arm takes its prompt down with it.
+        // U22: FLASH_WINDOW (2s) < CONFIRM_WINDOW (3s), so a confirm prompt
+        // carries the confirm window itself rather than FLASH_WINDOW — else
+        // there'd be a silent final second where the second press still
+        // fires with no prompt showing. Ordinary flashes keep FLASH_WINDOW;
+        // a consumed arm takes its prompt down with it.
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         let id = app.focused;
@@ -6978,10 +6868,10 @@ mod tests {
     /// The grid auto-compensates its own offset as new rows bank while the
     /// view is scrolled — that is what keeps the view pinned to the content
     /// you were reading instead of letting it slide. Anything roost cached
-    /// before that happened is stale the moment it does, and a step seeded
-    /// from the stale copy walks the view toward the tail (measured at 4
-    /// lines on one Up). Scroll mode used to hold such a mirror; it holds
-    /// nothing now, and this pins the behaviour that fact guarantees.
+    /// before that happened would go stale the moment it does, walking a
+    /// step seeded from it toward the tail instead (measured at 4 lines on
+    /// one Up) — `Mode::Scroll` holds no such cache, and this pins the
+    /// behaviour that fact guarantees.
     #[test]
     fn a_scroll_step_reads_the_grid_after_it_auto_advanced_under_new_output() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -7362,13 +7252,15 @@ mod tests {
         fn resume(&self, cwd: &Path, _session: &str) -> agents::CommandSpec {
             self.launch(cwd)
         }
+        fn resume_flag(&self) -> &'static str {
+            "--resume" // unused: resume() overridden above
+        }
     }
 
     /// P0-2 / P0-3 end-to-end: a synchronous PTY spawn failure must be
-    /// visible over the socket — in the SAME `spawn` reply that used to say
-    /// only `{"pane": id}`, and again on every later `status`/`list` poll,
-    /// and on the feed. All from the one place `spawn_pane`'s `Err` arm now
-    /// runs.
+    /// visible over the socket — in the `spawn` reply itself (not just
+    /// `{"pane": id}`), and again on every later `status`/`list` poll, and
+    /// on the feed. All from the one place `spawn_pane`'s `Err` arm runs.
     #[test]
     fn ctl_spawn_status_list_and_feed_all_surface_a_synchronous_spawn_failure() {
         use crate::core::control::{Method, Reply, Request};
@@ -7498,10 +7390,10 @@ mod tests {
 
     #[test]
     fn control_read_full_and_tail_reach_scrollback_not_just_the_screen() {
-        // M1 regression: Full/Tail used to alias Screen (grab_text only ever
-        // sees the visible grid), so an orchestrator's read(tail:20) missed
-        // anything that had already scrolled off. FakePane's `grab` (screen)
-        // and `all_text` (full history) are deliberately different here so a
+        // M1: Full/Tail must reach past the visible grid (`grab_text` alone
+        // only sees the screen), or an orchestrator's read(tail:20) misses
+        // anything already scrolled off. FakePane's `grab` (screen) and
+        // `all_text` (full history) are deliberately different here so a
         // test can tell them apart.
         use crate::core::control::{Method, ReadMode, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
@@ -7791,8 +7683,7 @@ mod tests {
         let ct = app.control_token().to_string();
 
         // A denied wait (unknown pane) must be audited as a denial (M3), not
-        // the unconditional "ok ... parked" it used to log regardless of
-        // outcome.
+        // an unconditional "ok ... parked" logged regardless of outcome.
         let (rtx, rrx) = std::sync::mpsc::channel();
         app.handle_control_msg(
             Request {
@@ -7912,10 +7803,9 @@ mod tests {
 
     #[test]
     fn broadcast_pushes_exactly_one_ctl_feed_line() {
-        // Same carry-forward fix, pinned on the C20 feed side: the socket
-        // path used to call `audit()` twice for a broadcast, which — once
-        // `audit()` started feeding C20 — would have shown up as two
-        // near-identical `ctl` rows in the activity overlay.
+        // Pinned on the C20 feed side: a broadcast must call `audit()`
+        // exactly once — `audit()` also feeds C20, so a second call would
+        // show up as two near-identical `ctl` rows in the activity overlay.
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
         let ct = app.control_token().to_string();
@@ -8490,7 +8380,7 @@ mod tests {
     fn resume_command_line_is_cd_plus_adapter_resume_or_none() {
         let (mut app, _) = mk_app(shell_ws());
         assert_eq!(app.resume_command_line(1), None, "shell pane: no session, no y");
-        app.new_pane_with("pi");
+        app.spawn_child("pi", None, None);
         let id = app.focused;
         assert_eq!(app.resume_command_line(id), None, "agent without a learned session: no y");
         app.set_session(id, "019fe044-8236".into());
@@ -8526,6 +8416,9 @@ mod tests {
         }
         fn resume(&self, cwd: &Path, session: &str) -> crate::agents::CommandSpec {
             crate::agents::CommandSpec::new("true", cwd).arg(session)
+        }
+        fn resume_flag(&self) -> &'static str {
+            "--resume" // unused: resume() overridden above
         }
         fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
             self.0.clone()
@@ -8740,10 +8633,9 @@ mod tests {
         assert_eq!(erase_word(&erase_word(&erase_word("one two three"))), "");
     }
 
-    /// U16: the live-QA sequence itself, at the key level. Typing `abc`
-    /// then Ctrl+W then Ctrl+U used to commit `abcwu` — the chords' letters
-    /// pushed straight into the name. Now Ctrl+W erases the word it just
-    /// typed and Ctrl+U clears the line, and no `w`/`u` is ever inserted.
+    /// U16: typing `abc` then Ctrl+W then Ctrl+U must commit the empty
+    /// string, not `abcwu` — Ctrl+W erases the word it just typed, Ctrl+U
+    /// clears the line, and no `w`/`u` is ever inserted.
     #[test]
     fn rename_honors_ctrl_w_and_ctrl_u_instead_of_typing_their_letters() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9147,19 +9039,19 @@ mod tests {
         app.select_word_at(id, 0, 8); // inside "world"
         assert_eq!((app.selection.unwrap().anchor, app.selection.unwrap().cursor), ((0, 6), (0, 10)));
 
-        // D3 (PR #46 design audit): the gap between the words has nothing
-        // to grab, and must clear `self.selection` outright rather than
-        // degrade to a same-point selection — the old degrade was
-        // indistinguishable from a genuine one-character *word* (also
-        // anchor == cursor, by construction), which silently dropped
-        // double-clicks on `a`, `$`, and the like on release.
+        // D3: the gap between the words has nothing to grab, and must clear
+        // `self.selection` outright rather than degrade to a same-point
+        // selection — a same-point selection is indistinguishable from a
+        // genuine one-character *word* (also anchor == cursor, by
+        // construction), which would silently drop double-clicks on `a`,
+        // `$`, and the like on release.
         app.select_word_at(id, 0, 5);
         assert!(app.selection.is_none());
     }
 
-    /// D3 (PR #46 design audit): a one-character word is a real selection,
-    /// not "nothing found" — both share the anchor == cursor shape, so the
-    /// two must be told apart some other way (see `select_word_at`'s doc).
+    /// D3: a one-character word is a real selection, not "nothing found" —
+    /// both share the anchor == cursor shape, so the two must be told apart
+    /// some other way (see `select_word_at`'s doc).
     #[test]
     fn select_word_at_a_one_char_word_is_a_real_selection_not_nothing_found() {
         let (mut app, _) = mk_app(shell_ws());
@@ -9170,12 +9062,12 @@ mod tests {
         assert_eq!((sel.anchor, sel.cursor), ((0, 0), (0, 0)));
     }
 
-    /// B1 (PR #46 code review): `select_word_at` must index by grid CELL,
-    /// not by char — a row holding a wide (2-cell) glyph before the target
-    /// column used to walk off by however many extra cells the glyph ate,
+    /// B1: `select_word_at` must index by grid CELL, not by char — a row
+    /// holding a wide (2-cell) glyph before the target column would
+    /// otherwise walk off by however many extra cells the glyph ate,
     /// selecting (and, on release, copying) the wrong word. `word_bounds_at`
     /// converts cell → char before finding the word and `select_word_at`
-    /// converts the result back — both ends of the fix, pinned together.
+    /// converts the result back — both ends, pinned together.
     #[test]
     fn select_word_at_accounts_for_a_wide_glyph_earlier_in_the_row() {
         let (mut app, _) = mk_app(shell_ws());
@@ -9248,7 +9140,7 @@ mod tests {
         assert_eq!(app.finish_native_selection(), None);
     }
 
-    /// S4 (PR #46 code review): a double-click's own release is *staged*,
+    /// S4: a double-click's own release is *staged*,
     /// not committed immediately — it's the one release a still-possible
     /// 3rd click can supersede within the same double-click window.
     /// `due_copy` reports the staged text once the deadline passes —
@@ -9274,16 +9166,9 @@ mod tests {
 
     /// A 3rd click (triple-click) supersedes a staged double-click copy
     /// entirely — the word is never copied, only the line the 3rd click
-    /// selects instead. Before S4's fix, the word copied on the 2nd
-    /// click's own release regardless, so a triple-click copied twice.
-    ///
-    /// [Amended, code review, exit UX audit 2026-08-07] Supersession used
-    /// to be detected at `due_copy` time, by comparing the live
-    /// `self.selection` against the staged coordinates. It's now the 3rd
-    /// click's own release that cancels the stage directly (every release
-    /// clears `pending_copy` unconditionally — see
-    /// `release_native_selection`), so this test now drives that release
-    /// for real instead of only mutating `self.selection` by hand.
+    /// selects instead. Supersession is detected by the 3rd click's own
+    /// release, which cancels the stage directly (every release clears
+    /// `pending_copy` unconditionally — see `release_native_selection`).
     #[test]
     fn a_third_click_cancels_the_staged_double_click_copy() {
         let (mut app, _) = mk_app(shell_ws());
@@ -9306,14 +9191,11 @@ mod tests {
         assert_eq!(app.due_copy(), None, "nothing left to fire, staged or otherwise");
     }
 
-    /// F5 (exit UX audit 2026-08-07): a keypress clearing the highlight
-    /// (C29's "any click or keypress clears" rule) used to read exactly
-    /// like a supersession at `due_copy` time — `self.selection` no longer
-    /// matched the staged coordinates either way — so double-click, then
-    /// type anything within the window, and the clipboard silently didn't
-    /// update; no flash, no error, nothing. A keypress has nothing to do
-    /// with whether the word actually double-clicked should still be
-    /// copied, so it no longer touches the stage at all.
+    /// F5: a keypress clearing the highlight (C29's "any click or keypress
+    /// clears" rule) must NOT cancel a staged double-click copy — a
+    /// keypress has nothing to do with whether the word actually
+    /// double-clicked should still be copied, so it never touches the
+    /// stage at all.
     #[test]
     fn an_unrelated_keypress_does_not_cancel_the_staged_double_click_copy() {
         let (mut app, _) = mk_app(shell_ws());
@@ -9334,14 +9216,12 @@ mod tests {
         assert_eq!(app.due_copy().as_deref(), Some("world"), "the copy still lands");
     }
 
-    /// Code review (exit UX audit 2026-08-07): the staged copy is the
-    /// string grabbed at release time (`PendingCopy`), not a promise to
-    /// re-read the grid later. Before this, `due_copy` re-extracted the
-    /// text from the *live* grid at fire time — so double-click a word in a
-    /// streaming pane, let the grid scroll or the row get overwritten
-    /// before the 500ms window closes, and the clipboard would silently get
-    /// whatever now occupies those cells instead of the word actually
-    /// double-clicked.
+    /// The staged copy is the string grabbed at release time
+    /// (`PendingCopy`), not a promise to re-read the grid later — `due_copy`
+    /// must not re-extract from the *live* grid at fire time, or a
+    /// streaming pane that scrolls or overwrites the row before the 500ms
+    /// window closes would silently copy whatever now occupies those cells
+    /// instead of the word actually double-clicked.
     #[test]
     fn the_staged_copy_is_fixed_at_release_time_not_re_read_from_a_later_grid() {
         let (mut app, _) = mk_app(shell_ws());
@@ -9463,7 +9343,7 @@ mod tests {
         }
         // From the first row...
         assert_eq!(app.url_at(id, 3, 5).as_deref(), Some(whole.as_str()));
-        // ...and from the continuation row, which used to be a dead click.
+        // ...and from the continuation row, which must not be a dead click.
         assert_eq!(app.url_at(id, 4, 2).as_deref(), Some(whole.as_str()));
         // A token past the URL on the continuation row is still not a URL.
         assert_eq!(app.url_at(id, 4, 12), None); // "and"
@@ -9541,7 +9421,7 @@ mod tests {
     #[test]
     fn picker_number_accelerators_launch_that_row() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let items = picker_items();
+        let items = crate::agents::picker_ids();
         assert!(items.len() >= 2, "this test needs a picker with a second row");
         let (mut app, _) = mk_app(shell_ws());
         let before = app.runtimes.len();
@@ -9570,7 +9450,7 @@ mod tests {
     #[test]
     fn picker_click_launches_the_row_it_landed_on() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let items = picker_items();
+        let items = crate::agents::picker_ids();
         let (mut app, _) = mk_app(shell_ws());
         let before = app.runtimes.len();
         app.apply(Action::QuickLaunch);
@@ -9607,7 +9487,7 @@ mod tests {
     fn picker_type_ahead_filters_the_adapter_list_and_backspace_widens_it() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::QuickLaunch);
-        assert_eq!(app.picker_filtered_ids().len(), picker_items().len(), "no filter shows all");
+        assert_eq!(app.picker_filtered_ids().len(), crate::agents::picker_ids().len(), "no filter shows all");
         app.handle_mode_key(key('l'));
         // Substring, not prefix: `l` finds both `claude` and `shell`.
         assert_eq!(app.picker_filtered_ids(), vec!["claude", "shell"]);
@@ -9729,13 +9609,16 @@ mod tests {
         fn resume(&self, cwd: &Path, _session: &str) -> agents::CommandSpec {
             self.launch(cwd)
         }
+        fn resume_flag(&self) -> &'static str {
+            "--resume" // unused: resume() overridden above
+        }
     }
 
     /// P2-13 end-to-end: a not-installed adapter's picker row is annotated
     /// (not hidden — six adapters is short enough that hiding five would
     /// read as a picker that lost its list), and — the property that
     /// actually matters — launching that row still spawns the RAW id, never
-    /// the annotated display text. `picker_items()` is the static, always-6
+    /// the annotated display text. `agents::picker_ids()` is the static, always-6
     /// registry list (`agents::adapter_specs()`), so the substitution has to
     /// happen in `App::registry` (what `adapter_installed` actually
     /// consults), not in what rows get drawn.
@@ -9758,7 +9641,7 @@ mod tests {
 
         app.apply(Action::QuickLaunch);
         let rows = app.picker_filtered();
-        app.handle_mode_key(key('1')); // row 1 = index 0 = "pi" (picker_items() order)
+        app.handle_mode_key(key('1')); // row 1 = index 0 = "pi" (agents::picker_ids() order)
         let spawned = app.find_spec(app.focused).map(|s| s.adapter.clone());
 
         assert_eq!(rows[0], "pi not found", "pi's substituted launch program can never resolve");
@@ -9766,7 +9649,7 @@ mod tests {
         // path directly, not via a $PATH scan — real, unmodified, and
         // guaranteed to exist on any machine this suite already assumes one
         // on (session_members's pgrep, every shell-spawning test, ...).
-        let shell_at = picker_items().iter().position(|&id| id == "shell").unwrap();
+        let shell_at = crate::agents::picker_ids().iter().position(|&id| id == "shell").unwrap();
         assert_eq!(rows[shell_at], "shell", "resolved via an absolute path, not $PATH");
         assert_eq!(spawned, Some("pi".to_string()), "launch used the raw id, not the annotated text");
     }
@@ -9895,6 +9778,9 @@ mod tests {
         fn resume(&self, cwd: &std::path::Path, session: &str) -> crate::agents::CommandSpec {
             crate::agents::CommandSpec::new("true", cwd).arg(session)
         }
+        fn resume_flag(&self) -> &'static str {
+            "--resume" // unused: resume() overridden above
+        }
         fn session_root(&self, cwd: &std::path::Path) -> Option<PathBuf> {
             Some(cwd.to_path_buf())
         }
@@ -9902,12 +9788,12 @@ mod tests {
 
     #[test]
     fn tick_lets_each_concurrently_launched_pane_claim_its_own_session_file() {
-        // Regression: two panes launched into the same cwd around the same
-        // time share one session root. `tick()` used to process pending
-        // panes in HashMap (i.e. arbitrary) order; whichever pane got
-        // processed first could steal the *other* pane's newer, not-yet-
-        // claimed session file, leaving that other pane with none at all —
-        // it would then relaunch fresh instead of resuming on the next run.
+        // Two panes launched into the same cwd around the same time share
+        // one session root; `tick()` must process them newest-spawned-first
+        // (not HashMap/arbitrary order), or whichever pane got processed
+        // first could steal the *other* pane's newer, not-yet-claimed
+        // session file, leaving that other pane with none at all — it would
+        // then relaunch fresh instead of resuming on the next run.
         let dir = std::env::temp_dir().join(format!("roost-detect-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -9947,8 +9833,8 @@ mod tests {
         .unwrap();
 
         // Pane 1 "spawned" before either file existed (widest window); pane 2
-        // "spawned" after file_a but before file_b — the precise ordering
-        // that used to starve whichever pane got processed second.
+        // "spawned" after file_a but before file_b — an ordering that
+        // starves whichever pane is processed second if order isn't honored.
         app.pending_detect.clear();
         app.pending_detect.insert(1, base);
         app.pending_detect.insert(2, base + Duration::from_millis(15));
@@ -10100,11 +9986,11 @@ mod tests {
 
     #[test]
     fn spawn_initial_input_is_buffered_until_first_output() {
-        // M6 regression: initial_input used to be written the instant the
-        // pane spawned, before the agent's stdin reader was necessarily up —
-        // silently dropping it. It must sit buffered until the pane's first
-        // output (a reliable "it's alive and reading" signal) and be flushed
-        // exactly once then.
+        // M6: `initial_input` must not be written the instant the pane
+        // spawns — the agent's stdin reader isn't necessarily up yet, which
+        // would silently drop it. It must sit buffered until the pane's
+        // first output (a reliable "it's alive and reading" signal) and be
+        // flushed exactly once then.
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
         let ct = app.control_token().to_string();
@@ -10166,10 +10052,8 @@ mod tests {
 
     #[test]
     fn alt_hint_gates_on_evidence_within_the_window_since_it_arrived() {
-        // F1 (exit UX audit 2026-08-07): evidence, not "a key arrived".
-        //
-        // [Amended, design audit SG1] The window is back, but keyed to the
-        // evidence's own timestamp, not launch: is_alt_swallow_char's
+        // F1: evidence, not "a key arrived" — and the window is keyed to
+        // the evidence's own timestamp, not launch: is_alt_swallow_char's
         // evidence is real but not unambiguous (every character is also a
         // directly-typed letter on some non-US layout — see its own doc),
         // so it must not latch for the whole session. Bounded to
@@ -10235,10 +10119,10 @@ mod tests {
         assert!(!app.show_alt_hint(), "and it stays gone for the session");
     }
 
-    /// F1 hard requirement 1 (exit UX audit 2026-08-07): a correctly
-    /// configured terminal must never see the warning just because the user
-    /// typed something — typing a shell prompt is the single most likely
-    /// first action on a fresh launch.
+    /// F1 hard requirement 1: a correctly configured terminal must never
+    /// see the warning just because the user typed something — typing a
+    /// shell prompt is the single most likely first action on a fresh
+    /// launch.
     #[test]
     fn healthy_terminal_typing_a_shell_prompt_never_fires_the_alt_hint() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10248,12 +10132,12 @@ mod tests {
         assert!(!app.show_alt_hint(), "ordinary typing must never look like a swallowed Alt chord");
     }
 
-    /// F1 hard requirement 2 (exit UX audit 2026-08-07): a read-first user
-    /// who studies the screen for 40s before ever touching Alt must still
-    /// get the warning the moment their first (swallowed) Alt press arrives
-    /// — the window (`ALT_HINT_WINDOW`, design audit SG1) is keyed to that
-    /// press's own timestamp, not to launch, so `started` plays no part in
-    /// this decision at all, however long it's been.
+    /// F1 hard requirement 2: a read-first user who studies the screen for
+    /// 40s before ever touching Alt must still get the warning the moment
+    /// their first (swallowed) Alt press arrives — the window
+    /// (`ALT_HINT_WINDOW`, SG1) is keyed to that press's own timestamp, not
+    /// to launch, so `started` plays no part in this decision at all,
+    /// however long it's been.
     #[test]
     fn read_first_user_still_gets_the_hint_however_late_the_first_alt_press_is() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10432,7 +10316,7 @@ mod tests {
         // running this test.
         assert!(adapter_installed("shell", &agents::registry()));
         // Nothing to warn about for an id the registry doesn't even have —
-        // `picker_items()` IS the registry, so this never happens through
+        // `agents::picker_ids()` IS the registry, so this never happens through
         // the picker, but the function must still answer something sane.
         assert!(adapter_installed("not-a-real-adapter-id", &agents::registry()));
     }
@@ -10565,10 +10449,10 @@ mod tests {
         assert_eq!(app.needs_input_count(), expected.len());
     }
 
-    /// [Amended, ux P1-5] With **no** ◆ anywhere, the ring falls through to
-    /// every `Waiting` pane — the fallback that makes an uninstrumented
-    /// agent's finished turn reachable by `Alt+a` at all, not just extension
-    /// panes' explicit `NeedsInput`.
+    /// [ux P1-5] With **no** ◆ anywhere, the ring falls through to every
+    /// `Waiting` pane — the fallback that makes an uninstrumented agent's
+    /// finished turn reachable by `Alt+a` at all, not just extension panes'
+    /// explicit `NeedsInput`.
     #[test]
     fn attention_ring_falls_through_to_waiting_when_nothing_needs_input() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10597,9 +10481,9 @@ mod tests {
         assert_eq!(app.attention_ring(), vec![3], "the one real ◆ wins outright, no ○ mixed in");
     }
 
-    /// F2 (exit UX audit 2026-08-07): the hint bar's right segment must
-    /// match what `Alt+a` actually does in every case — nothing, a real ◆,
-    /// or the ○ fallback — not just when a ◆ exists.
+    /// F2: the hint bar's right segment must match what `Alt+a` actually
+    /// does in every case — nothing, a real ◆, or the ○ fallback — not just
+    /// when a ◆ exists.
     #[test]
     fn attention_segment_matches_the_ring_in_every_case() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10635,14 +10519,14 @@ mod tests {
         assert_eq!(app.flash(), Some("nothing needs you"));
     }
 
-    /// F3 (exit UX audit 2026-08-07): unlike a real ◆, which clears itself
-    /// the moment you act on it, a quiet `Waiting` pane's status never
-    /// changes just because you looked at it — so before this fix, three
-    /// finished agents made `Alt+a` an endless 1→2→3→1→2→3… round-robin and
-    /// "nothing else needs you" never fired at all (it only ever fired with
-    /// exactly one pane waiting). Each visit must permanently retire that
-    /// pane from the rotation, so the ring shrinks to empty exactly once
-    /// every pane has been seen.
+    /// F3: unlike a real ◆, which clears itself the moment you act on it, a
+    /// quiet `Waiting` pane's status never changes just because you looked
+    /// at it — without retiring a visited pane, three finished agents would
+    /// make `Alt+a` an endless 1→2→3→1→2→3… round-robin and "nothing else
+    /// needs you" would never fire (only ever with exactly one pane
+    /// waiting). Each visit must permanently retire that pane from the
+    /// rotation, so the ring shrinks to empty exactly once every pane has
+    /// been seen.
     #[test]
     fn jump_attention_waiting_fallback_shrinks_as_each_pane_is_visited() {
         let (mut app, _) = mk_app(shell_ws());
@@ -10758,8 +10642,8 @@ mod tests {
     /// With every pane tied on severity (the common case), the sort's tie-
     /// break is C19's ring enumeration verbatim — tabs ascending,
     /// `pane_order()` within each — so an all-quiet or all-needy fleet reads
-    /// exactly as it did before `roster_rank` existed. [Amended, ux P2-11]
-    /// The worst-first reorder itself is pinned separately below
+    /// in plain ring order. The worst-first reorder itself is pinned
+    /// separately below
     /// (`roster_rows_sort_worst_first_reorders_both_panes_and_groups`).
     #[test]
     fn roster_rows_group_every_pane_by_tab_in_ring_order() {
@@ -11329,9 +11213,9 @@ mod tests {
         }
     }
 
-    /// client request 2026-08-07: `Alt+Right` at a tab's rightmost pane
-    /// continues into the next tab, landing on *its* leftmost pane — not
-    /// wherever that tab was last left (contrast U11 rule 2's `tab_focus`).
+    /// C31: `Alt+Right` at a tab's rightmost pane continues into the next
+    /// tab, landing on *its* leftmost pane — not wherever that tab was last
+    /// left (contrast U11 rule 2's `tab_focus`).
     #[test]
     fn cross_tab_right_edge_lands_on_next_tabs_leftmost_pane() {
         let (mut app, store) = mk_app(two_tab_row_ws());
@@ -11378,11 +11262,11 @@ mod tests {
     /// Below two tabs this is exactly the pre-existing dead end: `neighbor`
     /// finds nothing and C31 declines to fire at all.
     ///
-    /// [Amended F7, exit UX audit 2026-08-07] The same key teleports across
-    /// tabs at a real edge, so a refusal here must be visible, not silent —
-    /// roost's own rule is every no-op flashes. Reuses `move_pane_to_tab`'s
-    /// identical "only one tab" wording (its `n < 2` refusal is the same
-    /// shape) so the two read as one rule instead of two.
+    /// F7: the same key teleports across tabs at a real edge, so a refusal
+    /// here must be visible, not silent — roost's own rule is every no-op
+    /// flashes. Reuses `move_pane_to_tab`'s identical "only one tab"
+    /// wording (its `n < 2` refusal is the same shape) so the two read as
+    /// one rule instead of two.
     #[test]
     fn cross_tab_focus_is_a_no_op_with_only_one_tab() {
         let (mut app, _) = mk_app(shell_ws());
@@ -11413,18 +11297,16 @@ mod tests {
         assert_eq!(app.flash(), None);
     }
 
-    /// [Fixed 2026-08-07, design audit] `neighbor == None` is not the same
-    /// as "at the tab's edge": a pane spanning the tab's full width (a row
-    /// above/below a split row) has no Left *or* Right neighbour, but is
-    /// not meaningfully "the last or first pane" the client asked about —
-    /// the audit's own repro, `Alt+n`, `Alt+o`, `Alt+n`, from a single
-    /// pane. Neither key may leave the tab from it; a pane that genuinely
-    /// owns the tab's edge, in that same layout, still does.
+    /// `neighbor == None` is not the same as "at the tab's edge": a pane
+    /// spanning the tab's full width (a row above/below a split row) has no
+    /// Left *or* Right neighbour, but is not meaningfully "the last or
+    /// first pane" the client asked about. Neither key may leave the tab
+    /// from it; a pane that genuinely owns the tab's edge, in that same
+    /// layout, still does.
     ///
-    /// [Amended F7, exit UX audit 2026-08-07] The refusal above must flash
-    /// — before this it was indistinguishable from Alt+→ simply not being
-    /// bound, on the one key that visibly does something everywhere else in
-    /// the same tab.
+    /// F7: the refusal above must flash — a silent one would be
+    /// indistinguishable from Alt+→ simply not being bound, on the one key
+    /// that visibly does something everywhere else in the same tab.
     #[test]
     fn cross_tab_focus_ignores_a_full_width_pane_thats_not_the_tabs_only_pane() {
         let (mut app, _) = mk_app(shell_ws());
@@ -11454,8 +11336,8 @@ mod tests {
         assert_ne!(app.ws.active_tab, tab_before, "a real edge still crosses");
     }
 
-    /// [Corrected 2026-08-07, design audit] Landing on a stack's topmost
-    /// member would collapse whatever the tab had expanded — a navigation
+    /// Landing on a stack's topmost member would collapse whatever the tab
+    /// had expanded — a navigation
     /// key must not rearrange a tab you haven't looked at yet. `edge_pane`
     /// prefers the *expanded* member on an x-tie, so the jump lands on
     /// what was already visible and `expand_in_stacks` is a no-op: the
@@ -12121,14 +12003,14 @@ mod tests {
             title: None,
             spawned_by: None,
         };
-        assert_eq!(display_name_of(&spec), "pi · rqa-work");
+        assert_eq!(display_name_live(&spec, None), "pi · rqa-work");
         spec.title = Some("worker1".into());
-        assert_eq!(display_name_of(&spec), "worker1");
+        assert_eq!(display_name_live(&spec, None), "worker1");
         // A cwd with no final component (e.g. `/`) degrades to the bare
         // adapter, no dangling separator.
         spec.title = None;
         spec.cwd = PathBuf::from("/");
-        assert_eq!(display_name_of(&spec), "pi");
+        assert_eq!(display_name_live(&spec, None), "pi");
     }
 
     /// P6: the amended chain — explicit Alt+r title beats the pane's live
@@ -12153,9 +12035,6 @@ mod tests {
         // An explicit rename beats a live title, however busy the app is.
         spec.title = Some("worker1".into());
         assert_eq!(display_name_live(&spec, Some("TASK-42 refactor")), "worker1");
-        // `display_name_of` is exactly the chain with no live title.
-        spec.title = None;
-        assert_eq!(display_name_of(&spec), display_name_live(&spec, None));
     }
 
     /// P6: a plain `shell` pane ignores its live OSC title. A shell's title

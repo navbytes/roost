@@ -31,10 +31,10 @@ use crate::core::control::TokenTable;
 use crate::core::event::AppEvent;
 use crate::core::layout::PaneRect;
 use crate::core::workspace::PaneId;
-use crate::infra::notify::TermNotifier;
+use crate::infra::notify::notify;
 use crate::infra::pty::PtyPane;
 use crate::infra::store::FsStore;
-use crate::ports::{MouseProto, Notifier, PaneBackend, StateStore};
+use crate::ports::{MouseProto, PaneBackend, StateStore};
 use crate::ui::input::{self, Action, InputResult};
 use crate::ui::mouse::{self, MouseAction};
 
@@ -131,26 +131,18 @@ fn main() -> Result<()> {
     // launch and the first frame (measured: 2014 ms vs 23 ms). Run the probe
     // on a helper thread with a short budget: real terminals answer in a few
     // milliseconds, so the enhanced path is unchanged; past the budget we
-    // paint immediately without enhancement and let the main loop adopt a
-    // late "supported" answer if one ever arrives (`run` polls the channel).
+    // paint immediately without enhancement.
     let (kbd_tx, kbd_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = kbd_tx
             .send(matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)));
     });
-    let kbd_pending = match kbd_rx.recv_timeout(KBD_PROBE_BUDGET) {
-        Ok(true) => {
-            push_kbd_enhancement();
-            None
-        }
-        Ok(false) => None,          // answered: no support — settled
-        Err(_) => Some(kbd_rx),     // still probing: run() watches for the answer
-    };
-    let result = run(&mut terminal, kbd_pending);
-    // Pop unconditionally: the probe may have resolved (and pushed) after
-    // the budget expired, so a simple "did we push" bool can't be trusted
-    // here — and popping with nothing pushed is a no-op terminals ignore
-    // (the panic hook already relies on exactly that).
+    if matches!(kbd_rx.recv_timeout(KBD_PROBE_BUDGET), Ok(true)) {
+        push_kbd_enhancement();
+    }
+    let result = run(&mut terminal);
+    // Pop unconditionally: popping with nothing pushed is a no-op terminals
+    // ignore, and the panic hook already relies on exactly that.
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableFocusChange);
     // C29: symmetric with the subset write at startup — see MOUSE_CAPTURE_ENABLE.
@@ -219,14 +211,13 @@ fn push_kbd_enhancement() {
 /// Acquire an exclusive lock on `<state>/roost.lock`. Returns the held file
 /// (keep it alive for the process lifetime) or a user-facing error message.
 fn acquire_instance_lock() -> std::result::Result<std::fs::File, String> {
-    use fs2::FileExt;
     let path = FsStore::default_path().with_extension("lock");
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let file = std::fs::File::create(&path)
         .map_err(|e| format!("roost: cannot open lock file {}: {e}", path.display()))?;
-    file.try_lock_exclusive().map_err(|_| {
+    file.try_lock().map_err(|_| {
         let dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
         format!(
             "roost is already running for this workspace ({dir}).\n\
@@ -274,10 +265,7 @@ fn install_panic_hook() {
 /// block.
 const EVENT_CHANNEL_BOUND: usize = 1024;
 
-fn run(
-    terminal: &mut ratatui::DefaultTerminal,
-    mut kbd_pending: Option<mpsc::Receiver<bool>>,
-) -> Result<()> {
+fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // This thread is the whole visible product — keyboard poll, pane
     // parsing, drawing — so it gets macOS's user-interactive QoS: when the
     // fleet's own agents saturate every core, the keystroke path wins the
@@ -322,7 +310,6 @@ fn run(
         Err(e) => (None, Some(format!("no control plane: {e:#}"))),
     };
     let sock_cleanup = sock_path.clone();
-    let mut notifier = TermNotifier;
     let size = terminal.size()?;
     let mut app: App<PtyPane> = App::new(
         ws,
@@ -390,22 +377,6 @@ fn run(
 
     let loop_result: Result<()> = (|| {
     loop {
-        // P4: adopt a keyboard-enhancement answer that arrived after the
-        // startup budget (the probe thread keeps waiting up to crossterm's
-        // own 2 s). One-shot: any answer (or a dead channel) settles it.
-        if let Some(rx) = &kbd_pending {
-            match rx.try_recv() {
-                Ok(supported) => {
-                    if supported {
-                        push_kbd_enhancement();
-                    }
-                    kbd_pending = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => kbd_pending = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-
         terminal.draw(|f| ui::render::draw(f, &mut app))?;
 
         // Drain ALL pending terminal events this tick, not just one. During a
@@ -513,12 +484,12 @@ fn run(
                 // same way a bell or an extension "needs you" does.
                 AppEvent::Output(id, bytes) => {
                     if let Some(msg) = app.on_pty_output(id, &bytes) {
-                        notifier.notify(&msg);
+                        notify(&msg);
                     }
                 }
                 AppEvent::Exit(id) => {
                     if let Some(msg) = app.on_pty_exit(id) {
-                        notifier.notify(&msg);
+                        notify(&msg);
                     }
                 }
                 // Socket-sourced events must present the pane's token; a
@@ -532,7 +503,7 @@ fn run(
                 AppEvent::Status(id, token, s, detail) => {
                     if app.socket_authorized(id, &token) {
                         if let Some(msg) = app.on_status(id, s, detail) {
-                            notifier.notify(&msg);
+                            notify(&msg);
                         }
                     }
                 }
@@ -1462,7 +1433,7 @@ mod tests {
 
         app.apply(Action::QuickLaunch);
         let rect = ui::render::modal_rect(&app).expect("the picker draws a dialog");
-        let items = crate::core::app::picker_items();
+        let items = crate::agents::picker_ids();
         handle_mouse(&mut app, click(rect.x + 1, rect.y + 1 + (items.len() - 1) as u16));
         assert!(matches!(app.mode, Mode::Normal), "launching leaves the modal");
         assert_eq!(app.rects().len(), 2, "the clicked row spawned a pane");

@@ -12,8 +12,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
 const EMPTY_TAB: &str = r#"{
   "version": 1,
   "active_tab": 0,
@@ -24,12 +22,8 @@ const EMPTY_TAB: &str = r#"{
 
 #[test]
 fn a_workspace_of_empty_tabs_starts_with_a_live_pane() {
-    let mut h = match Harness::try_spawn(EMPTY_TAB) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP empty-tab recovery: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("empty-tab recovery", EMPTY_TAB) else {
+        return;
     };
     // The repaired workspace is the default one: a single tab named "main".
     assert!(

@@ -17,23 +17,6 @@ mod harness;
 
 use std::time::{Duration, Instant};
 
-use harness::Harness;
-
-/// One shell pane. Temp-dir cwd keeps C4's corner badge short (same
-/// reasoning as the firehose gate's fixture).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// Poll for a file to exist non-empty, returning its contents.
 fn wait_for_file(path: &std::path::Path, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
@@ -76,12 +59,10 @@ fn pane_children_see_roost_identity_not_the_hosts() {
         ("ZELLIJ_SESSION_NAME", "jazzy-lemur"),
         ("VSCODE_INJECTION", "1"),
     ];
-    let mut h = match Harness::try_spawn_with_env(&fixture_workspace(cwd), host_env) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP pane env gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip_with_env("pane env gate", &harness::one_pane(cwd), host_env)
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
@@ -146,16 +127,13 @@ fn a_pane_shell_runs_its_login_profile() {
     .expect("write fixture .profile");
 
     let home_str = home.to_str().expect("fixture HOME is valid utf8").to_string();
-    let mut h = match Harness::try_spawn_with_env(
-        &fixture_workspace(cwd),
+    let Some(mut h) = harness::spawn_or_skip_with_env(
+        "login-shell gate",
+        &harness::one_pane(cwd),
         &[("HOME", home_str.as_str())],
-    ) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP login-shell gate: {reason}");
-            let _ = std::fs::remove_dir_all(&home);
-            return;
-        }
+    ) else {
+        let _ = std::fs::remove_dir_all(&home);
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

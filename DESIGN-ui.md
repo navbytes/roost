@@ -124,7 +124,6 @@ should be read against C5's spinner amendment, not looked up as an accessor.
 | `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, `raw` badge token (C23), `↑N` badge token (U3) |
 | `attention()` | `Modifier::REVERSED`, no colour | the **neutral** attention surface: the transient flash (C10) |
 | `attention_problem()` | `Color::Red` + `Modifier::REVERSED` | the **problem** bars: alt-warning (C11), dead-pane action bar (C16) |
-| `ACTIVE_TAB_BG` | `Color::Reset` | the only `bg` chrome sets anywhere, and it sets it to *nothing* (C2) |
 | `ok` / `warn` / `info` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
 
 All chrome styling lives in `src/ui/theme.rs` (C1) — accessors now rather than
@@ -278,7 +277,7 @@ is ALIGNED iff all its bullets hold in the rendered output / code.
 
 **[Amended 2026-07-27, theme inheritance]** The token table is now styles, not
 colours, so the exports are **accessor fns** (`ink`, `quiet`, `rule`,
-`accent`, `accent_quiet`, `attention`) plus the `ACTIVE_TAB_BG` sentinel const
+`accent`, `accent_quiet`, `attention`)
 — a token carries a modifier as well as a colour and `Style`'s builders are
 not `const fn`. **[Amended 2026-08-07, C5]** `pulse_bright` is retired along
 with the colour pulse it existed for — the accessor list above already
@@ -429,8 +428,8 @@ in. `TAB_STRIP` is deleted:
   background, not a band roost painted over it. (A near-black strip on a light
   terminal was half of what the user saw.)
 - **Active vs inactive is ink weight plus the `▎` marker**, never a
-  background: active label = `ink()` with the `ACTIVE_TAB_BG` (`Color::Reset`)
-  sentinel, inactive label = `quiet()`. The old rule — near-white `FG` on
+  background: active label = `ink()` with no background set (chrome paints no
+  fill anywhere), inactive label = `quiet()`. The old rule — near-white `FG` on
   `Color::Reset` — spelled *white text on the user's white background*, which
   is precisely why the active tab was invisible. There is no "inactive bg =
   `TAB_STRIP`" any more; inactive cells set no bg at all.
@@ -591,7 +590,7 @@ with tests `:530–555`.
   **[Amended 2026-07-27, SPEC-ux U2]:** the badge leads with the pane id —
   the join key for `roost send <id>`, which previously appeared nowhere in
   the TUI — and the display-name fallback is no longer render-local: it is
-  the shared `core::app::display_name_of` (title, else
+  the shared `core::app::display_name_live` (title, else
   `{adapter} · {cwd-tag}`), the one helper every fleet surface (badge,
   collapsed rows, feed, notifications, flashes) derives pane identity from.
   **[Amended 2026-07-27, SPEC-parity P6]:** the naming chain gains a middle
@@ -601,7 +600,7 @@ with tests `:530–555`.
   tag and crowding the badge — a hand-launched agent still qualifies the
   moment `observe_panes` promotes the pane's adapter, and demotes back with
   it) → `{adapter} · {cwd-tag}` — resolved by `App::display_name` (the free
-  `display_name_of` remains the chain with no live title, for the paths that
+  `display_name_live(spec, None)` remains the chain with no live title, for the paths that
   have a spec but no runtime, e.g. a closed pane's feed line). An agent CLI
   that publishes `spinner + task` through its title therefore says what it is
   doing, on the badge, in collapsed rows, in the feed, and in notifications.
@@ -1280,7 +1279,7 @@ modals; derived from its rules):**
     comes from `render::modal_rect` — the same geometry `draw_mode_overlay`
     paints, so hit-testing can't drift from the screen (§4/§5 lockstep).
   - **Wheel.** The feed pages by its own PgUp/PgDn step (half the overlay
-    height, `App::feed_page` — one source for key and wheel) wherever the
+    height, `App::overlay_page` — one source for key and wheel) wherever the
     pointer sits, since nothing beneath is reachable anyway. Every other
     modal swallows the wheel.
   - **Click.** Help closes on any click (its "any key closes it", in mouse
@@ -1571,7 +1570,7 @@ So the cap goes, and with it the merges:
   hint bar switches to `↑↓ PgUp/Dn read on` · `any other key close`. The way
   out is more visible while scrolled than it was before, not less.
   `↑`/`↓`/`j`/`k` step, `PgUp`/`PgDn` page by half the visible height
-  (C20's `feed_page` rule), `Home`/`End` jump; the wheel pages, and any
+  (C20's `overlay_page` rule), `Home`/`End` jump; the wheel pages, and any
   **click** still dismisses (U8's mouse form of the same rule).
   **`Space` is deliberately not a page key** — in a modal whose contract is
   "any key closes it", `Space` is what a reader hits to make it go away, and
@@ -1918,7 +1917,7 @@ extension events (`app.rs:1081`) or is polled from `StatusTracker`
 
   **[Amended 2026-07-27, SPEC-ux U2]:** pane-referencing lines lead with the
   pane id (`{id} {name}` via `App::feed_label`; `name` is the shared
-  `display_name_of`) — live QA showed four identical `shell: working → your
+  `display_name_live`) — live QA showed four identical `shell: working → your
   turn` lines with no way to tell the panes apart. Tab lines keep the tab
   name; a pane whose spec is already gone degrades to `pane {id}`. The
   spawn line's `({adapter})` suffix is titled-only (C4's no-dup rule — an
@@ -2453,7 +2452,7 @@ you.**
   + `draw_mode_overlay` path — the same machinery the feed, picker and help
   use, so the backdrop, border, anchoring and U8 mouse rules all apply
   unchanged. It is the **fifth** C12 modal (C12's U8 amendment lists four).
-- **Geometry:** `roster_overlay_size` **is** `feed_overlay_size` —
+- **Geometry:** the roster calls `feed_overlay_size` directly —
   `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`, anchored by
   `centered_near` like every other modal. Deliberately one function, not a
   copy: the two overlays answer the fleet's two questions and must not
@@ -2518,7 +2517,7 @@ you.**
     label, never a destination.
   - **Pane rows reuse C8's collapsed-row format verbatim** — marker + glyph +
     id + name + `{adapter} · {state word}` — by calling the very same
-    `collapsed_row_spans`, one column narrower. `display_name_of` /
+    `collapsed_row_spans`, one column narrower. `display_name_live` /
     `App::display_name`, `state_word`, `collapsed_name_style` and the C5
     glyph table are all shared, so a pane reads identically here, in a
     collapsed stack row, and on its badge. **No new glyphs**: §2's inventory
@@ -2569,7 +2568,7 @@ you.**
 - **Keys.** `↑`/`↓` move by pane (headers are skipped by construction —
   the cursor is a `PaneId`, and a header has none), clamped at both ends
   rather than wrapping; `PgUp`/`PgDn` page by half the overlay's height (C20's
-  `feed_page` rule, one source for both keys); `Enter` jumps; `Esc` dismisses;
+  `overlay_page` rule, one source for both keys); `Enter` jumps; `Esc` dismisses;
   `Alt+Shift+a` toggles closed (U18: a mode's entry chord exits it, derived
   through `translate` like every other mode's). **[Amended 2026-08-07, ux
   P2-11]** `Tab`/`Shift+Tab` cycle the status filter — see below.

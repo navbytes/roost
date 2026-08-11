@@ -13,23 +13,6 @@ mod harness;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use harness::Harness;
-
-/// One shell pane. Temp-dir cwd keeps the corner badge short (same reasoning
-/// as the firehose/socket_status fixtures).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// `roost status 1` against the harness instance, via the real client CLI
 /// (ROOST_STATE routes it to the instance's socket + fleet control token).
 fn cli_status(state_dir: &std::path::Path) -> String {
@@ -48,12 +31,8 @@ fn cli_status(state_dir: &std::path::Path) -> String {
 fn status_hook_subcommand_reports_over_the_real_socket() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP status hook gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("status hook gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

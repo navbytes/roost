@@ -15,39 +15,6 @@ mod harness;
 use std::process::Command;
 use std::time::Duration;
 
-use harness::Harness;
-
-/// Two tabs: `main` holds one pane, `api` holds two.
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [
-            {
-                "name": "main",
-                "layout": { "pane": 1 },
-                "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-            },
-            {
-                "name": "api",
-                "layout": {
-                    "split": {
-                        "dir": "vertical",
-                        "ratios": [0.5, 0.5],
-                        "children": [{ "pane": 2 }, { "pane": 3 }]
-                    }
-                },
-                "panes": {
-                    "2": {"adapter": "shell", "cwd": cwd},
-                    "3": {"adapter": "shell", "cwd": cwd}
-                }
-            }
-        ],
-        "next_pane_id": 4
-    })
-    .to_string()
-}
-
 /// `Alt+Shift+m` as a terminal delivers it: ESC + uppercase `M`. (Like
 /// `Alt+Shift+a`, and unlike C23's `ESC`+`P`, this pair introduces nothing —
 /// no DCS-style ambiguity. `ESC [` would have, which is why `Alt+]` was
@@ -73,12 +40,8 @@ fn pane_tab(state_dir: &std::path::Path, id: u64) -> Option<(u64, bool)> {
 fn alt_shift_m_moves_the_focused_pane_into_the_next_tab_without_restarting_it() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP move-pane e2e: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("move-pane e2e", &harness::two_tabs(cwd)) else {
+        return;
     };
     let sd = h.state_dir().to_path_buf();
     assert!(

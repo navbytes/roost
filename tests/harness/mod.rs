@@ -142,9 +142,8 @@ impl Harness {
         // `#[cfg(test)]` inside src/infra/{clipboard,open}.rs only covers
         // this crate's own unit tests; the binary spawned right below is
         // built without it, so this is the runtime half of that same
-        // fix. A scenario that genuinely needs the real channel (only
-        // `live_qa.rs`'s ignored evidence drive, so far) overrides this
-        // back to "0" via `envs` below, which runs after this default.
+        // fix. A scenario that genuinely needs the real channel overrides
+        // this back to "0" via `envs` below, which runs after this default.
         cmd.env("ROOST_TEST_NO_HOST_IO", "1");
         // Scenario-specific extras last, so a scenario can override any of
         // the defaults above.
@@ -327,6 +326,142 @@ impl Harness {
             std::thread::sleep(Duration::from_millis(15));
         }
     }
+}
+
+/// Spawn `workspace_json`, or print `SKIP <what>: <reason>` and return
+/// `None` — the preamble every call site used to repeat by hand. `what`
+/// names the scenario in the SKIP line, which is the load-bearing part for
+/// CI logs (a sandboxed runner with no `/dev/ptmx` skips loudly, it never
+/// fails silently).
+pub fn spawn_or_skip(what: &str, workspace_json: &str) -> Option<Harness> {
+    match Harness::try_spawn(workspace_json) {
+        Ok(h) => Some(h),
+        Err(reason) => {
+            eprintln!("SKIP {what}: {reason}");
+            None
+        }
+    }
+}
+
+/// Like `spawn_or_skip`, but with extra env vars on the roost process
+/// itself (`Harness::try_spawn_with_env`).
+pub fn spawn_or_skip_with_env(
+    what: &str,
+    workspace_json: &str,
+    envs: &[(&str, &str)],
+) -> Option<Harness> {
+    match Harness::try_spawn_with_env(workspace_json, envs) {
+        Ok(h) => Some(h),
+        Err(reason) => {
+            eprintln!("SKIP {what}: {reason}");
+            None
+        }
+    }
+}
+
+/// Like `spawn_or_skip`, but at an explicit PTY geometry
+/// (`Harness::try_spawn_sized`).
+pub fn spawn_or_skip_sized(
+    what: &str,
+    workspace_json: &str,
+    envs: &[(&str, &str)],
+    rows: u16,
+    cols: u16,
+) -> Option<Harness> {
+    match Harness::try_spawn_sized(workspace_json, envs, rows, cols) {
+        Ok(h) => Some(h),
+        Err(reason) => {
+            eprintln!("SKIP {what}: {reason}");
+            None
+        }
+    }
+}
+
+/// Like `spawn_or_skip`, but also seeds `config.json`
+/// (`Harness::try_spawn_with_config`).
+pub fn spawn_or_skip_with_config(
+    what: &str,
+    workspace_json: &str,
+    config_json: &str,
+) -> Option<Harness> {
+    match Harness::try_spawn_with_config(workspace_json, config_json) {
+        Ok(h) => Some(h),
+        Err(reason) => {
+            eprintln!("SKIP {what}: {reason}");
+            None
+        }
+    }
+}
+
+/// One shell pane, one tab. The fixture every single-pane scenario that
+/// doesn't care about layout used to redefine byte-for-byte.
+pub fn one_pane(cwd: &str) -> String {
+    serde_json::json!({
+        "version": 1,
+        "active_tab": 0,
+        "tabs": [{
+            "name": "main",
+            "layout": { "pane": 1 },
+            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
+        }]
+    })
+    .to_string()
+}
+
+/// Two side-by-side shell panes, one tab. Pane 1 (left) is focused by
+/// default (`App::new` focuses the first pane in DFS order).
+pub fn two_panes(cwd: &str) -> String {
+    serde_json::json!({
+        "version": 1,
+        "active_tab": 0,
+        "tabs": [{
+            "name": "main",
+            "layout": {
+                "split": {
+                    "dir": "vertical",
+                    "ratios": [0.5, 0.5],
+                    "children": [{ "pane": 1 }, { "pane": 2 }]
+                }
+            },
+            "panes": {
+                "1": {"adapter": "shell", "cwd": cwd},
+                "2": {"adapter": "shell", "cwd": cwd}
+            }
+        }]
+    })
+    .to_string()
+}
+
+/// Two tabs: `main` with one shell pane, `api` with two side by side —
+/// enough surface for a scenario that moves or reports panes across tabs.
+pub fn two_tabs(cwd: &str) -> String {
+    serde_json::json!({
+        "version": 1,
+        "active_tab": 0,
+        "tabs": [
+            {
+                "name": "main",
+                "layout": { "pane": 1 },
+                "panes": { "1": {"adapter": "shell", "cwd": cwd} }
+            },
+            {
+                "name": "api",
+                "layout": {
+                    "split": {
+                        "dir": "vertical",
+                        "ratios": [0.5, 0.5],
+                        "children": [{ "pane": 2 }, { "pane": 3 }]
+                    }
+                },
+                "panes": {
+                    "2": {"adapter": "shell", "cwd": cwd},
+                    "3": {"adapter": "shell", "cwd": cwd}
+                }
+            }
+        ],
+        "next_pane_id": 4
+    })
+    .to_string()
 }
 
 impl Drop for Harness {
