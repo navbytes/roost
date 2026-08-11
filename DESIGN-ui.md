@@ -2058,6 +2058,16 @@ draws for `Alt+a` ("a same-tab jump keeps zoom...; a cross-tab jump exits
 zoom (tab-switch rule)") — C31 follows that precedent rather than inventing
 a new one. Nothing else in this contract changes; see C31 for the feature.
 
+**[Amended 2026-08-11, zoom indicator]** "No border/badge change" above is
+narrowed: the zoomed pane's top border now carries a right-aligned title,
+`ZOOM · {n} hidden` where `n` = the real tree's pane count (`rects()`) minus
+one, or bare `ZOOM` when `n == 0`. Styled to match the border it sits on
+(accent() focused, rule() unfocused — under a focused float), never a fixed
+color of its own. Width sheds in two steps, same
+unicode-width measuring as C4's badge: the `· {n} hidden` clause drops
+first, then the whole title — the identity badge (a separate row, C4)
+always keeps its space. No new hitboxes: a border title is cosmetic only.
+
 ### C22 — Floating scratch pane (Alt+f) — [Added 2026-07-22, fleet features]
 
 **Current:** no floating anything. All panes live in a tab's layout tree;

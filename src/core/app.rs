@@ -880,7 +880,7 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// Is `id` the float's pane?
-    fn is_float(&self, id: PaneId) -> bool {
+    pub fn is_float(&self, id: PaneId) -> bool {
         self.float.as_ref().is_some_and(|f| f.id == id)
     }
 
