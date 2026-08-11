@@ -13,23 +13,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
-/// One shell pane. Temp-dir cwd keeps the corner badge short (same
-/// reasoning as the other PTY-harness fixtures).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// Alt+f, meta-ESC encoding — the readline collision this whole feature
 /// exists to fix (DESIGN doc). Same convention as `harness::ALT_Q`.
 const ALT_F: &[u8] = b"\x1bf";
@@ -39,12 +22,10 @@ fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
     let config = serde_json::json!({ "keys": { "alt+f": "disable" } }).to_string();
-    let mut h = match Harness::try_spawn_with_config(&fixture_workspace(cwd), &config) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP config-keys gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip_with_config("config-keys gate", &harness::one_pane(cwd), &config)
+    else {
+        return;
     };
     assert!(
         h.settle(Duration::from_secs(5)),

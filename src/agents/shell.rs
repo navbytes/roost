@@ -62,6 +62,11 @@ impl AgentAdapter for ShellAdapter {
     fn resume(&self, cwd: &Path, _session: &str) -> CommandSpec {
         self.launch(cwd)
     }
+
+    // Never consulted: `resume` above ignores the session id entirely.
+    fn resume_flag(&self) -> &'static str {
+        "--resume"
+    }
 }
 
 #[cfg(test)]

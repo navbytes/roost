@@ -78,13 +78,7 @@ fn fixture_workspace(cwd: &str) -> String {
 fn spawn(what: &str) -> Option<Harness> {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP {what}: {reason}");
-            return None;
-        }
-    };
+    let mut h = harness::spawn_or_skip(what, &fixture_workspace(cwd))?;
     assert!(
         h.wait_for(Duration::from_secs(10), |s| s.contents().contains("1 main")).is_some(),
         "{what}: the tab bar never appeared",
@@ -493,12 +487,10 @@ fn roster_fixture_workspace(cwd: &str) -> String {
 fn the_roster_status_filter_tags_its_title_in_the_tiers_own_colour() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&roster_fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP chrome roster-filter gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip("chrome roster-filter gate", &roster_fixture_workspace(cwd))
+    else {
+        return;
     };
     assert!(
         h.wait_for(Duration::from_secs(10), |s| s.contents().contains("1 main")).is_some(),
@@ -566,12 +558,14 @@ fn the_roster_status_filter_tags_its_title_in_the_tiers_own_colour() {
 fn below_the_two_row_floor_the_notice_is_plain_ink_with_no_fill() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn_sized(&fixture_workspace(cwd), &[], 1, 80) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP chrome sub-two-row gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip_sized(
+        "chrome sub-two-row gate",
+        &fixture_workspace(cwd),
+        &[],
+        1,
+        80,
+    ) else {
+        return;
     };
     assert!(
         h.wait_for(Duration::from_secs(10), |s| s.contents().contains("too small")).is_some(),

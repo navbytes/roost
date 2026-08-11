@@ -1,5 +1,3 @@
-use crate::term::BufWrite as _;
-
 /// Represents a foreground or background color for cells.
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
 pub enum Color {
@@ -109,60 +107,4 @@ impl Attrs {
         }
     }
 
-    pub fn write_escape_code_diff(
-        &self,
-        contents: &mut Vec<u8>,
-        other: &Self,
-    ) {
-        if self != other && self == &Self::default() {
-            crate::term::ClearAttrs::default().write_buf(contents);
-            return;
-        }
-
-        let attrs = crate::term::Attrs::default();
-
-        let attrs = if self.fgcolor == other.fgcolor {
-            attrs
-        } else {
-            attrs.fgcolor(self.fgcolor)
-        };
-        let attrs = if self.bgcolor == other.bgcolor {
-            attrs
-        } else {
-            attrs.bgcolor(self.bgcolor)
-        };
-        // roost (SPEC-parity P16): bold and dim are one *intensity* in
-        // ECMA-48 — SGR 22 is "normal intensity" and clears both, and there
-        // is no code that clears only one. So the pair is diffed as a unit:
-        // if either half changed, both are re-asserted, or turning bold off
-        // would silently take a still-set dim with it.
-        let attrs = if self.bold() == other.bold() && self.dim() == other.dim()
-        {
-            attrs
-        } else {
-            attrs.bold(self.bold()).dim(self.dim())
-        };
-        let attrs = if self.italic() == other.italic() {
-            attrs
-        } else {
-            attrs.italic(self.italic())
-        };
-        let attrs = if self.underline() == other.underline() {
-            attrs
-        } else {
-            attrs.underline(self.underline())
-        };
-        let attrs = if self.inverse() == other.inverse() {
-            attrs
-        } else {
-            attrs.inverse(self.inverse())
-        };
-        let attrs = if self.strikethrough() == other.strikethrough() {
-            attrs
-        } else {
-            attrs.strikethrough(self.strikethrough())
-        };
-
-        attrs.write_buf(contents);
-    }
 }

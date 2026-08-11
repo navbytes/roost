@@ -18,22 +18,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
-/// One shell pane, so every wheel event lands in it whatever the geometry.
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// An SGR wheel-down over (col, row), 0-based — exactly what the host
 /// terminal sends roost once it has enabled mouse capture.
 fn sgr_wheel_down(col: u16, row: u16) -> Vec<u8> {
@@ -48,13 +32,13 @@ fn the_wheel_moves_an_alternate_screen_pager() {
 
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn_with_env(&fixture_workspace(cwd), &[("LESS", "")]) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP alt-screen wheel gate: {reason}");
-            let _ = std::fs::remove_file(&path);
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip_with_env(
+        "alt-screen wheel gate",
+        &harness::one_pane(cwd),
+        &[("LESS", "")],
+    ) else {
+        let _ = std::fs::remove_file(&path);
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

@@ -5,7 +5,7 @@
 //! - clean status signals: Claude Code hooks (Notification / Stop /
 //!   PreToolUse) can run a shell command → point them at roost's socket.
 
-use super::{AgentAdapter, CommandSpec};
+use super::AgentAdapter;
 use std::path::{Path, PathBuf};
 
 /// Claude Code encodes a project cwd into a directory name by replacing
@@ -24,12 +24,8 @@ impl AgentAdapter for ClaudeAdapter {
         "claude"
     }
 
-    fn launch(&self, cwd: &Path) -> CommandSpec {
-        CommandSpec::new("claude", cwd)
-    }
-
-    fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
-        CommandSpec::new("claude", cwd).arg("--resume").arg(session)
+    fn resume_flag(&self) -> &'static str {
+        "--resume"
     }
 
     fn session_root(&self, cwd: &Path) -> Option<PathBuf> {

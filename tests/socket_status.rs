@@ -21,23 +21,6 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use harness::Harness;
-
-/// One shell pane. Temp-dir cwd keeps C4's corner badge short (same
-/// reasoning as the firehose gate's fixture).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// Poll for a file to exist non-empty, returning its trimmed contents.
 fn wait_for_file(path: &std::path::Path, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
@@ -77,12 +60,9 @@ fn cli_status(state_dir: &std::path::Path) -> String {
 fn socket_exited_on_a_live_pane_is_advisory_not_death() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP socket status gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("socket status gate", &harness::one_pane(cwd))
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
@@ -147,12 +127,9 @@ fn socket_exited_on_a_live_pane_is_advisory_not_death() {
 fn output_does_not_promote_a_resting_report_while_the_link_is_live_but_does_once_it_drops() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP socket status gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("socket status gate", &harness::one_pane(cwd))
+    else {
+        return;
     };
     assert!(
         h.settle(Duration::from_secs(5)),

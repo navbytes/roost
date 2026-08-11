@@ -18,23 +18,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
-/// One shell pane. Temp-dir cwd keeps C4's corner badge short (same
-/// reasoning as the firehose gate's fixture).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// Does the echoed screen text contain a cursor-position report —
 /// `^[[{row};{col}R` with 1-based numerics? The exact position depends on
 /// prompt history and on how the kernel chunked the two queries (an echo of
@@ -58,12 +41,8 @@ fn has_cpr(s: &str) -> bool {
 fn pane_da1_and_cursor_position_queries_are_answered() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP pane query gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("pane query gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
@@ -111,12 +90,8 @@ fn pane_da1_and_cursor_position_queries_are_answered() {
 fn the_kitty_ack_promises_only_what_roost_delivers_and_then_delivers_it() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP kitty ACK gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("kitty ACK gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
@@ -162,12 +137,8 @@ fn first_frame_is_not_blocked_by_the_enhancement_probe() {
     // This harness never answers roost's own `CSI ?u`+`CSI c` startup probe
     // — exactly the environment where the pre-fix binary sat on crossterm's
     // internal 2 s timeout before drawing anything.
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP first-frame gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("first-frame gate", &harness::one_pane(cwd)) else {
+        return;
     };
     let elapsed = h
         .wait_for(Duration::from_secs(5), |s| s.contents().contains("main"))

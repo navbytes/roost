@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::SystemTime;
 
 use crate::agents::{valid_session_id, AgentAdapter, SessionState};
 use crate::core::workspace::Workspace;
@@ -36,57 +35,31 @@ pub struct SpawnResolution {
     pub wants_detect: bool,
 }
 
-/// A stateless coordinator over whatever `AgentAdapter`/`Workspace` it's
-/// handed — no running `App` needed to construct or exercise it.
-#[derive(Debug, Clone, Copy)]
-pub struct SessionResolver;
+/// Resolve a pane's stored session id against the adapter's view of disk.
+/// A malformed id (tampered `workspace.json`, poisoned socket message) never
+/// reaches the adapter at all — invalid shape is stale on its own. Otherwise,
+/// only a *definitive* `Gone` clears it: `Exists` and `Unknown` (no session
+/// root, or the root is momentarily unreadable — can't tell) both attempt
+/// resume, so a transient read error never discards a still-valid resume
+/// pointer.
+pub fn resolve(adapter: &dyn AgentAdapter, cwd: &Path, stored: Option<&str>) -> SpawnResolution {
+    let (session, stale) = match stored {
+        None => (None, false),
+        Some(s) if !valid_session_id(s) => (None, true),
+        Some(s) => match adapter.session_state(cwd, s) {
+            SessionState::Gone => (None, true),
+            _ => (Some(s.to_string()), false), // Exists or Unknown → try resume
+        },
+    };
+    let wants_detect = session.is_none() && adapter.session_root(cwd).is_some();
+    SpawnResolution { session, stale, wants_detect }
+}
 
-impl SessionResolver {
-    /// Resolve a pane's stored session id against the adapter's view of
-    /// disk. A malformed id (tampered `workspace.json`, poisoned socket
-    /// message) never reaches the adapter at all — invalid shape is stale on
-    /// its own. Otherwise, only a *definitive* `Gone` clears it: `Exists` and
-    /// `Unknown` (no session root, or the root is momentarily unreadable —
-    /// can't tell) both attempt resume, so a transient read error never
-    /// discards a still-valid resume pointer.
-    pub fn resolve(
-        &self,
-        adapter: &dyn AgentAdapter,
-        cwd: &Path,
-        stored: Option<&str>,
-    ) -> SpawnResolution {
-        let (session, stale) = match stored {
-            None => (None, false),
-            Some(s) if !valid_session_id(s) => (None, true),
-            Some(s) => match adapter.session_state(cwd, s) {
-                SessionState::Gone => (None, true),
-                _ => (Some(s.to_string()), false), // Exists or Unknown → try resume
-            },
-        };
-        let wants_detect = session.is_none() && adapter.session_root(cwd).is_some();
-        SpawnResolution { session, stale, wants_detect }
-    }
-
-    /// The newest not-yet-claimed session file `adapter` can find for `cwd`
-    /// since `since`, or `None`. `taken` excludes ids already owned by other
-    /// panes, so two agents launched into the same cwd at once don't
-    /// cross-wire onto the same session file — see `claimed_sessions`.
-    pub fn detect(
-        &self,
-        adapter: &dyn AgentAdapter,
-        cwd: &Path,
-        since: SystemTime,
-        taken: &HashSet<String>,
-    ) -> Option<String> {
-        adapter.detect_session(cwd, since, taken)
-    }
-
-    /// Session ids already assigned to any pane in `ws` — the exclusion set
-    /// `detect` needs so a newly detected session can never steal an id
-    /// another pane already owns.
-    pub fn claimed_sessions(&self, ws: &Workspace) -> HashSet<String> {
-        ws.tabs.iter().flat_map(|t| t.panes.values()).filter_map(|s| s.session.clone()).collect()
-    }
+/// Session ids already assigned to any pane in `ws` — the exclusion set a
+/// session-file scan needs so a newly detected session can never steal an id
+/// another pane already owns.
+pub fn claimed_sessions(ws: &Workspace) -> HashSet<String> {
+    ws.tabs.iter().flat_map(|t| t.panes.values()).filter_map(|s| s.session.clone()).collect()
 }
 
 #[cfg(test)]
@@ -116,6 +89,9 @@ mod tests {
         fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
             CommandSpec::new("true", cwd).arg(session)
         }
+        fn resume_flag(&self) -> &'static str {
+            "--resume" // unused: resume() overridden above
+        }
         fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
             self.root.clone()
         }
@@ -128,9 +104,8 @@ mod tests {
     /// sight. Also doubles as the `Exists` branch (resume, unchanged).
     #[test]
     fn resolver_is_constructible_and_testable_without_an_app() {
-        let resolver = SessionResolver;
         let adapter = FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Exists };
-        let out = resolver.resolve(&adapter, Path::new("/proj"), Some("real-id"));
+        let out = resolve(&adapter, Path::new("/proj"), Some("real-id"));
         assert_eq!(
             out,
             SpawnResolution { session: Some("real-id".into()), stale: false, wants_detect: false }
@@ -139,9 +114,8 @@ mod tests {
 
     #[test]
     fn gone_session_is_cleared_and_marked_stale() {
-        let resolver = SessionResolver;
         let adapter = FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Gone };
-        let out = resolver.resolve(&adapter, Path::new("/proj"), Some("ghost"));
+        let out = resolve(&adapter, Path::new("/proj"), Some("ghost"));
         assert_eq!(out, SpawnResolution { session: None, stale: true, wants_detect: true });
     }
 
@@ -150,9 +124,8 @@ mod tests {
         // Can't tell (no root, or an unreadable one) must never be treated
         // as Gone — that would discard a possibly-still-valid resume
         // pointer over a transient read error.
-        let resolver = SessionResolver;
         let adapter = FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Unknown };
-        let out = resolver.resolve(&adapter, Path::new("/proj"), Some("kept"));
+        let out = resolve(&adapter, Path::new("/proj"), Some("kept"));
         assert_eq!(out, SpawnResolution { session: Some("kept".into()), stale: false, wants_detect: false });
     }
 
@@ -171,6 +144,9 @@ mod tests {
             fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
                 CommandSpec::new("true", cwd).arg(session)
             }
+            fn resume_flag(&self) -> &'static str {
+                "--resume" // unused: resume() overridden above
+            }
             fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
                 Some(PathBuf::from("/tmp"))
             }
@@ -178,64 +154,22 @@ mod tests {
                 panic!("a malformed id must never reach the adapter");
             }
         }
-        let resolver = SessionResolver;
-        let out = resolver.resolve(&PanicsIfAsked, Path::new("/proj"), Some("../../etc/passwd"));
+        let out = resolve(&PanicsIfAsked, Path::new("/proj"), Some("../../etc/passwd"));
         assert_eq!(out, SpawnResolution { session: None, stale: true, wants_detect: true });
     }
 
     #[test]
     fn a_session_root_with_nothing_stored_arms_detection() {
-        let resolver = SessionResolver;
         let adapter = FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Unknown };
-        let out = resolver.resolve(&adapter, Path::new("/proj"), None);
+        let out = resolve(&adapter, Path::new("/proj"), None);
         assert_eq!(out, SpawnResolution { session: None, stale: false, wants_detect: true });
     }
 
     #[test]
     fn no_session_root_never_arms_detection_even_with_nothing_stored() {
-        let resolver = SessionResolver;
         let adapter = FixedAdapter { root: None, state: SessionState::Unknown };
-        let out = resolver.resolve(&adapter, Path::new("/proj"), None);
+        let out = resolve(&adapter, Path::new("/proj"), None);
         assert_eq!(out, SpawnResolution { session: None, stale: false, wants_detect: false });
-    }
-
-    /// Adapter whose `detect_session` reports `"x"` unless it's in `taken`
-    /// — enough to prove `SessionResolver::detect` forwards `taken` through
-    /// rather than silently dropping it.
-    struct TakenAwareAdapter;
-    impl AgentAdapter for TakenAwareAdapter {
-        fn id(&self) -> &'static str {
-            "taken-aware"
-        }
-        fn launch(&self, cwd: &Path) -> CommandSpec {
-            CommandSpec::new("true", cwd)
-        }
-        fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
-            CommandSpec::new("true", cwd).arg(session)
-        }
-        fn detect_session(
-            &self,
-            _cwd: &Path,
-            _since: SystemTime,
-            taken: &HashSet<String>,
-        ) -> Option<String> {
-            if taken.contains("x") { None } else { Some("x".to_string()) }
-        }
-    }
-
-    #[test]
-    fn detect_forwards_to_the_adapter_and_honors_the_taken_set() {
-        let resolver = SessionResolver;
-        let free = HashSet::new();
-        assert_eq!(
-            resolver.detect(&TakenAwareAdapter, Path::new("/proj"), SystemTime::UNIX_EPOCH, &free),
-            Some("x".to_string())
-        );
-        let taken: HashSet<String> = ["x".to_string()].into();
-        assert_eq!(
-            resolver.detect(&TakenAwareAdapter, Path::new("/proj"), SystemTime::UNIX_EPOCH, &taken),
-            None
-        );
     }
 
     #[test]
@@ -260,7 +194,7 @@ mod tests {
                 Tab { name: "two".into(), layout: LayoutNode::Pane(3), panes: tab2_panes },
             ],
         };
-        let claimed = SessionResolver.claimed_sessions(&ws);
+        let claimed = claimed_sessions(&ws);
         assert_eq!(claimed, ["a".to_string(), "b".to_string()].into_iter().collect());
     }
 }

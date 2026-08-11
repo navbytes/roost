@@ -154,14 +154,14 @@ pub fn display_width(s: &str) -> u16 {
 /// the label body, a space, a 1-col status glyph, a 1-col **count cell**, a
 /// space, the separator, and a trailing gutter space — eight fixed columns
 /// plus the label. The gutter gives every divider symmetric 1-cell padding
-/// (`│ ▎`, amended 2026-07-23).
+/// (`│ ▎`).
 ///
-/// [Amended 2026-07-28] The count cell (`◆3`) is **always reserved**, blank
-/// below 2, so a tab's width never changes as its agents' statuses flip —
-/// stability is worth more than the column, because a bar that reflows under
-/// a background status change moves every hitbox on it (§4/§5 lockstep) for
-/// a signal the user did not act on. `render::tab_count_cell` decides what
-/// goes in it; this function only knows it is exactly one column, always.
+/// The count cell (`◆3`) is **always reserved**, blank below 2, so a tab's
+/// width never changes as its agents' statuses flip — stability is worth
+/// more than the column, because a bar that reflows under a background
+/// status change moves every hitbox on it (§4/§5 lockstep) for a signal the
+/// user did not act on. `render::tab_count_cell` decides what goes in it;
+/// this function only knows it is exactly one column, always.
 pub fn tab_width(index: usize, name: &str) -> u16 {
     display_width(&tab_label(index, name)) + 8
 }
@@ -363,7 +363,9 @@ pub fn status_fit<'a>(
 /// concerned. `proto` alone was enough while the only answers were "forward
 /// it" and "scroll roost's buffer"; P9 needs a third (see `route_mouse`), and
 /// two more facts to pick it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A pane roost has no runtime for defaults to no protocol, no alternate
+/// screen (`MouseProto::None` is itself the `#[default]` variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaneMouseState {
     /// What the pane's inner application asked for, mouse-wise.
     pub proto: MouseProto,
@@ -374,13 +376,6 @@ pub struct PaneMouseState {
     /// the arrow keys P9 synthesizes — the same choice the keyboard path
     /// makes (`input::app_cursor_upgrade`).
     pub app_cursor_keys: bool,
-}
-
-impl Default for PaneMouseState {
-    /// A pane roost has no runtime for: no protocol, no alternate screen.
-    fn default() -> Self {
-        Self { proto: MouseProto::None, alternate_screen: false, app_cursor_keys: false }
-    }
 }
 
 /// Route a mouse event over a pane to the inner app or to roost's scrollback.
@@ -472,18 +467,17 @@ fn modifier_bits(m: KeyModifiers) -> u16 {
 /// Bare motion (no button) is dropped — crossterm's capture doesn't request
 /// it, and forwarding it would just spam apps that didn't ask.
 fn encode_sgr(rect: Rect, me: &MouseEvent) -> Option<Vec<u8>> {
-    let (base, release) = match me.kind {
-        MouseEventKind::Down(b) => (button_code(b), false),
-        MouseEventKind::Up(b) => (button_code(b), false), // SGR marks release via trailing 'm'
-        MouseEventKind::Drag(b) => (button_code(b) + 32, false),
-        MouseEventKind::ScrollUp => (64, false),
-        MouseEventKind::ScrollDown => (65, false),
-        MouseEventKind::ScrollLeft => (66, false),
-        MouseEventKind::ScrollRight => (67, false),
+    let base = match me.kind {
+        MouseEventKind::Down(b) => button_code(b),
+        MouseEventKind::Up(b) => button_code(b), // SGR marks release via trailing 'm'
+        MouseEventKind::Drag(b) => button_code(b) + 32,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
         MouseEventKind::Moved => return None,
     };
     let is_up = matches!(me.kind, MouseEventKind::Up(_));
-    let _ = release;
     let cb = base + modifier_bits(me.modifiers);
     let (cx, cy) = cell_in_pane(rect, me.column, me.row);
     let terminator = if is_up { 'm' } else { 'M' };
@@ -712,7 +706,7 @@ mod tests {
 
     #[test]
     fn tab_hit_testing_matches_the_c2_worked_example() {
-        // C2 worked example (amended 2026-07-28, +8 with the count cell):
+        // C2 worked example (+8 with the count cell):
         // ["main", "api"] → tab 0 spans cols 0..14 ("1 main" is 6 chars + 8
         // fixed cols), tab 1 spans cols 14..27 ("2 api" is 5 chars + 8).
         // Generous bar width, no status area, so this pins the base hit-math
@@ -726,10 +720,10 @@ mod tests {
         assert_eq!(tab_at_x(&names, 100, 0, 0, 200), None);
     }
 
-    /// C2's geometry rule (amended 2026-07-28): the count cell is **always**
-    /// reserved, so a tab's width does not move when its count appears or
-    /// disappears. Width is a pure function of the label — nothing about a
-    /// tab's agents can shift the hitboxes beside it mid-session.
+    /// C2's geometry rule: the count cell is **always** reserved, so a
+    /// tab's width does not move when its count appears or disappears.
+    /// Width is a pure function of the label — nothing about a tab's
+    /// agents can shift the hitboxes beside it mid-session.
     #[test]
     fn tab_width_is_a_function_of_the_label_alone_so_a_count_cannot_move_it() {
         assert_eq!(tab_width(0, "main"), 14); // 6-col label + 8 fixed

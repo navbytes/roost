@@ -26,8 +26,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
 /// The payload: CJK (natively wide), a VS16 emoji-presentation sequence (the
 /// pair the two width tables disagreed about), and a natively-wide emoji,
 /// interleaved with narrow text so a column slip shows up as corrupted ASCII.
@@ -35,31 +33,14 @@ const CJK: &str = "\u{65e5}\u{672c}\u{8a9e}";
 const VS16: &str = "\u{2764}\u{fe0f}";
 const EMOJI: &str = "\u{1f600}";
 
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 #[test]
 fn wide_glyphs_reach_the_host_intact_and_own_two_columns_each() {
     let expected = format!("W1[{CJK}]W2[{VS16}]W3[{EMOJI}]END");
 
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP wide-glyph gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("wide-glyph gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

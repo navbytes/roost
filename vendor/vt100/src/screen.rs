@@ -1,4 +1,3 @@
-use crate::term::BufWrite as _;
 use unicode_width::UnicodeWidthChar as _;
 
 const MODE_APPLICATION_KEYPAD: u8 = 0b0000_0001;
@@ -332,384 +331,6 @@ impl Screen {
         lines.join("\n")
     }
 
-    /// Returns the text contents of the terminal logically between two cells.
-    /// This will include the remainder of the starting row after `start_col`,
-    /// followed by the entire contents of the rows between `start_row` and
-    /// `end_row`, followed by the beginning of the `end_row` up until
-    /// `end_col`. This is useful for things like determining the contents of
-    /// a clipboard selection.
-    #[must_use]
-    pub fn contents_between(
-        &self,
-        start_row: u16,
-        start_col: u16,
-        end_row: u16,
-        end_col: u16,
-    ) -> String {
-        match start_row.cmp(&end_row) {
-            std::cmp::Ordering::Less => {
-                let (_, cols) = self.size();
-                let mut contents = String::new();
-                for (i, row) in self
-                    .grid()
-                    .visible_rows()
-                    .enumerate()
-                    .skip(usize::from(start_row))
-                    .take(usize::from(end_row) - usize::from(start_row) + 1)
-                {
-                    if i == usize::from(start_row) {
-                        row.write_contents(
-                            &mut contents,
-                            start_col,
-                            cols - start_col,
-                            false,
-                        );
-                        if !row.wrapped() {
-                            contents.push('\n');
-                        }
-                    } else if i == usize::from(end_row) {
-                        row.write_contents(&mut contents, 0, end_col, false);
-                    } else {
-                        row.write_contents(&mut contents, 0, cols, false);
-                        if !row.wrapped() {
-                            contents.push('\n');
-                        }
-                    }
-                }
-                contents
-            }
-            std::cmp::Ordering::Equal => {
-                if start_col < end_col {
-                    self.rows(start_col, end_col - start_col)
-                        .nth(usize::from(start_row))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            }
-            std::cmp::Ordering::Greater => String::new(),
-        }
-    }
-
-    /// Return escape codes sufficient to reproduce the entire contents of the
-    /// current terminal state. This is a convenience wrapper around
-    /// `contents_formatted`, `input_mode_formatted`, and `title_formatted`.
-    #[must_use]
-    pub fn state_formatted(&self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_contents_formatted(&mut contents);
-        self.write_input_mode_formatted(&mut contents);
-        self.write_title_formatted(&mut contents);
-        contents
-    }
-
-    /// Return escape codes sufficient to turn the terminal state of the
-    /// screen `prev` into the current terminal state. This is a convenience
-    /// wrapper around `contents_diff`, `input_mode_diff`, `title_diff`, and
-    /// `bells_diff`.
-    #[must_use]
-    pub fn state_diff(&self, prev: &Self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_contents_diff(&mut contents, prev);
-        self.write_input_mode_diff(&mut contents, prev);
-        self.write_title_diff(&mut contents, prev);
-        self.write_bells_diff(&mut contents, prev);
-        contents
-    }
-
-    /// Returns the formatted visible contents of the terminal.
-    ///
-    /// Formatting information will be included inline as terminal escape
-    /// codes. The result will be suitable for feeding directly to a raw
-    /// terminal parser, and will result in the same visual output.
-    #[must_use]
-    pub fn contents_formatted(&self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_contents_formatted(&mut contents);
-        contents
-    }
-
-    fn write_contents_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
-        let prev_attrs = self.grid().write_contents_formatted(contents);
-        self.attrs.write_escape_code_diff(contents, &prev_attrs);
-    }
-
-    /// Returns the formatted visible contents of the terminal by row,
-    /// restricted to the given subset of columns.
-    ///
-    /// Formatting information will be included inline as terminal escape
-    /// codes. The result will be suitable for feeding directly to a raw
-    /// terminal parser, and will result in the same visual output.
-    ///
-    /// You are responsible for positioning the cursor before printing each
-    /// row, and the final cursor position after displaying each row is
-    /// unspecified.
-    // the unwraps in this method shouldn't be reachable
-    #[allow(clippy::missing_panics_doc)]
-    pub fn rows_formatted(
-        &self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = Vec<u8>> + '_ {
-        let mut wrapping = false;
-        self.grid().visible_rows().enumerate().map(move |(i, row)| {
-            // number of rows in a grid is stored in a u16 (see Size), so
-            // visible_rows can never return enough rows to overflow here
-            let i = i.try_into().unwrap();
-            let mut contents = vec![];
-            row.write_contents_formatted(
-                &mut contents,
-                start,
-                width,
-                i,
-                wrapping,
-                None,
-                None,
-            );
-            if start == 0 && width == self.grid.size().cols {
-                wrapping = row.wrapped();
-            }
-            contents
-        })
-    }
-
-    /// Returns a terminal byte stream sufficient to turn the visible contents
-    /// of the screen described by `prev` into the visible contents of the
-    /// screen described by `self`.
-    ///
-    /// The result of rendering `prev.contents_formatted()` followed by
-    /// `self.contents_diff(prev)` should be equivalent to the result of
-    /// rendering `self.contents_formatted()`. This is primarily useful when
-    /// you already have a terminal parser whose state is described by `prev`,
-    /// since the diff will likely require less memory and cause less
-    /// flickering than redrawing the entire screen contents.
-    #[must_use]
-    pub fn contents_diff(&self, prev: &Self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_contents_diff(&mut contents, prev);
-        contents
-    }
-
-    fn write_contents_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        if self.hide_cursor() != prev.hide_cursor() {
-            crate::term::HideCursor::new(self.hide_cursor())
-                .write_buf(contents);
-        }
-        let prev_attrs = self.grid().write_contents_diff(
-            contents,
-            prev.grid(),
-            prev.attrs,
-        );
-        self.attrs.write_escape_code_diff(contents, &prev_attrs);
-    }
-
-    /// Returns a sequence of terminal byte streams sufficient to turn the
-    /// visible contents of the subset of each row from `prev` (as described
-    /// by `start` and `width`) into the visible contents of the corresponding
-    /// row subset in `self`.
-    ///
-    /// You are responsible for positioning the cursor before printing each
-    /// row, and the final cursor position after displaying each row is
-    /// unspecified.
-    // the unwraps in this method shouldn't be reachable
-    #[allow(clippy::missing_panics_doc)]
-    pub fn rows_diff<'a>(
-        &'a self,
-        prev: &'a Self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = Vec<u8>> + 'a {
-        self.grid()
-            .visible_rows()
-            .zip(prev.grid().visible_rows())
-            .enumerate()
-            .map(move |(i, (row, prev_row))| {
-                // number of rows in a grid is stored in a u16 (see Size), so
-                // visible_rows can never return enough rows to overflow here
-                let i = i.try_into().unwrap();
-                let mut contents = vec![];
-                row.write_contents_diff(
-                    &mut contents,
-                    prev_row,
-                    start,
-                    width,
-                    i,
-                    false,
-                    false,
-                    crate::grid::Pos { row: i, col: start },
-                    crate::attrs::Attrs::default(),
-                );
-                contents
-            })
-    }
-
-    /// Returns terminal escape sequences sufficient to set the current
-    /// terminal's input modes.
-    ///
-    /// Supported modes are:
-    /// * application keypad
-    /// * application cursor
-    /// * bracketed paste
-    /// * xterm mouse support
-    #[must_use]
-    pub fn input_mode_formatted(&self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_input_mode_formatted(&mut contents);
-        contents
-    }
-
-    fn write_input_mode_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ApplicationKeypad::new(
-            self.mode(MODE_APPLICATION_KEYPAD),
-        )
-        .write_buf(contents);
-        crate::term::ApplicationCursor::new(
-            self.mode(MODE_APPLICATION_CURSOR),
-        )
-        .write_buf(contents);
-        crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
-            .write_buf(contents);
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            MouseProtocolMode::None,
-        )
-        .write_buf(contents);
-        crate::term::MouseProtocolEncoding::new(
-            self.mouse_protocol_encoding,
-            MouseProtocolEncoding::Default,
-        )
-        .write_buf(contents);
-    }
-
-    /// Returns terminal escape sequences sufficient to change the previous
-    /// terminal's input modes to the input modes enabled in the current
-    /// terminal.
-    #[must_use]
-    pub fn input_mode_diff(&self, prev: &Self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_input_mode_diff(&mut contents, prev);
-        contents
-    }
-
-    fn write_input_mode_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        if self.mode(MODE_APPLICATION_KEYPAD)
-            != prev.mode(MODE_APPLICATION_KEYPAD)
-        {
-            crate::term::ApplicationKeypad::new(
-                self.mode(MODE_APPLICATION_KEYPAD),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_APPLICATION_CURSOR)
-            != prev.mode(MODE_APPLICATION_CURSOR)
-        {
-            crate::term::ApplicationCursor::new(
-                self.mode(MODE_APPLICATION_CURSOR),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_BRACKETED_PASTE) != prev.mode(MODE_BRACKETED_PASTE)
-        {
-            crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
-                .write_buf(contents);
-        }
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            prev.mouse_protocol_mode,
-        )
-        .write_buf(contents);
-        crate::term::MouseProtocolEncoding::new(
-            self.mouse_protocol_encoding,
-            prev.mouse_protocol_encoding,
-        )
-        .write_buf(contents);
-    }
-
-    /// Returns terminal escape sequences sufficient to set the current
-    /// terminal's window title.
-    #[must_use]
-    pub fn title_formatted(&self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_title_formatted(&mut contents);
-        contents
-    }
-
-    fn write_title_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ChangeTitle::new(&self.icon_name, &self.title, "", "")
-            .write_buf(contents);
-    }
-
-    /// Returns terminal escape sequences sufficient to change the previous
-    /// terminal's window title to the window title set in the current
-    /// terminal.
-    #[must_use]
-    pub fn title_diff(&self, prev: &Self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_title_diff(&mut contents, prev);
-        contents
-    }
-
-    fn write_title_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        crate::term::ChangeTitle::new(
-            &self.icon_name,
-            &self.title,
-            &prev.icon_name,
-            &prev.title,
-        )
-        .write_buf(contents);
-    }
-
-    /// Returns terminal escape sequences sufficient to cause audible and
-    /// visual bells to occur if they have been received since the terminal
-    /// described by `prev`.
-    #[must_use]
-    pub fn bells_diff(&self, prev: &Self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_bells_diff(&mut contents, prev);
-        contents
-    }
-
-    fn write_bells_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        if self.audible_bell_count != prev.audible_bell_count {
-            crate::term::AudibleBell::default().write_buf(contents);
-        }
-        if self.visual_bell_count != prev.visual_bell_count {
-            crate::term::VisualBell::default().write_buf(contents);
-        }
-    }
-
-    /// Returns terminal escape sequences sufficient to set the current
-    /// terminal's drawing attributes.
-    ///
-    /// Supported drawing attributes are:
-    /// * fgcolor
-    /// * bgcolor
-    /// * bold
-    /// * italic
-    /// * underline
-    /// * inverse
-    ///
-    /// This is not typically necessary, since `contents_formatted` will leave
-    /// the current active drawing attributes in the correct state, but this
-    /// can be useful in the case of drawing additional things on top of a
-    /// terminal output, since you will need to restore the terminal state
-    /// without the terminal contents necessarily being the same.
-    #[must_use]
-    pub fn attributes_formatted(&self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_attributes_formatted(&mut contents);
-        contents
-    }
-
-    fn write_attributes_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ClearAttrs::default().write_buf(contents);
-        self.attrs.write_escape_code_diff(
-            contents,
-            &crate::attrs::Attrs::default(),
-        );
-    }
-
     /// Returns the current cursor position of the terminal.
     ///
     /// The return value will be (row, col).
@@ -717,41 +338,6 @@ impl Screen {
     pub fn cursor_position(&self) -> (u16, u16) {
         let pos = self.grid().pos();
         (pos.row, pos.col)
-    }
-
-    /// Returns terminal escape sequences sufficient to set the current
-    /// cursor state of the terminal.
-    ///
-    /// This is not typically necessary, since `contents_formatted` will leave
-    /// the cursor in the correct state, but this can be useful in the case of
-    /// drawing additional things on top of a terminal output, since you will
-    /// need to restore the terminal state without the terminal contents
-    /// necessarily being the same.
-    ///
-    /// Note that the bytes returned by this function may alter the active
-    /// drawing attributes, because it may require redrawing existing cells in
-    /// order to position the cursor correctly (for instance, in the case
-    /// where the cursor is past the end of a row). Therefore, you should
-    /// ensure to reset the active drawing attributes if necessary after
-    /// processing this data, for instance by using `attributes_formatted`.
-    #[must_use]
-    pub fn cursor_state_formatted(&self) -> Vec<u8> {
-        let mut contents = vec![];
-        self.write_cursor_state_formatted(&mut contents);
-        contents
-    }
-
-    fn write_cursor_state_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
-        self.grid()
-            .write_cursor_position_formatted(contents, None, None);
-
-        // we don't just call write_attributes_formatted here, because that
-        // would still be confusing - consider the case where the user sets
-        // their own unrelated drawing attributes (on a different parser
-        // instance) and then calls cursor_state_formatted. just documenting
-        // it and letting the user handle it on their own is more
-        // straightforward.
     }
 
     /// Returns the `Cell` object at the given location in the terminal, if it
@@ -775,58 +361,19 @@ impl Screen {
         &self.title
     }
 
-    /// Returns the terminal's icon name.
-    #[must_use]
-    pub fn icon_name(&self) -> &str {
-        &self.icon_name
-    }
-
     /// Returns a value which changes every time an audible bell is received.
     ///
     /// Typically you would store this number after each call to `process`,
     /// and trigger an audible bell whenever it changes.
-    ///
-    /// You shouldn't rely on the exact value returned here, since the exact
-    /// value will not be maintained by `contents_formatted` or
-    /// `contents_diff`.
     #[must_use]
     pub fn audible_bell_count(&self) -> usize {
         self.audible_bell_count
-    }
-
-    /// Returns a value which changes every time an visual bell is received.
-    ///
-    /// Typically you would store this number after each call to `process`,
-    /// and trigger an visual bell whenever it changes.
-    ///
-    /// You shouldn't rely on the exact value returned here, since the exact
-    /// value will not be maintained by `contents_formatted` or
-    /// `contents_diff`.
-    #[must_use]
-    pub fn visual_bell_count(&self) -> usize {
-        self.visual_bell_count
-    }
-
-    /// Returns the number of parsing errors seen so far.
-    ///
-    /// Currently this only tracks invalid UTF-8 and control characters other
-    /// than `0x07`-`0x0f`. This can give an idea of whether the input stream
-    /// being fed to the parser is reasonable or not.
-    #[must_use]
-    pub fn errors(&self) -> usize {
-        self.errors
     }
 
     /// Returns whether the alternate screen is currently in use.
     #[must_use]
     pub fn alternate_screen(&self) -> bool {
         self.mode(MODE_ALTERNATE_SCREEN)
-    }
-
-    /// Returns whether the terminal should be in application keypad mode.
-    #[must_use]
-    pub fn application_keypad(&self) -> bool {
-        self.mode(MODE_APPLICATION_KEYPAD)
     }
 
     /// Returns whether the terminal should be in application cursor mode.
@@ -2772,16 +2319,13 @@ mod roost_tests {
     }
 
     #[test]
-    fn the_intensity_pair_round_trips_through_the_escape_code_diff() {
-        // `contents_formatted` re-emits attribute changes. Since SGR 22
-        // clears both halves, dropping bold while dim stays set has to
-        // re-assert the dim, or the replayed stream loses it.
+    fn the_intensity_pair_tracks_independently_through_sgr_22() {
+        // SGR 22 ("normal intensity") clears both bold and dim at once, so
+        // a dim re-asserted in the same escape (`22;2`) must survive, and a
+        // later, unrelated attribute (strikethrough) must leave it alone.
         let mut p = parser();
         p.process(b"\x1b[1;2mA\x1b[22;2mB\x1b[9mC");
-        let formatted = p.screen().contents_formatted();
-        let mut replay = parser();
-        replay.process(&formatted);
-        let s = replay.screen();
+        let s = p.screen();
         for (col, (bold, dim, strike)) in
             [(true, true, false), (false, true, false), (false, true, true)]
                 .into_iter()

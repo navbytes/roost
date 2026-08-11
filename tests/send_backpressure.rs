@@ -21,24 +21,9 @@ mod harness;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use harness::Harness;
-
 /// Comfortably under `MAX_LINE` (64 KiB) with room for the JSON envelope and
 /// token — the size QA froze roost with.
 const PAYLOAD: usize = 60_000;
-
-fn single_pane_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": {"pane": 1},
-            "panes": {"1": {"adapter": "shell", "cwd": cwd}}
-        }]
-    })
-    .to_string()
-}
 
 /// Run `roost <args>` against `state_dir`, killing it if it outlives
 /// `timeout`. `None` means the call hung — the defect.
@@ -74,12 +59,10 @@ fn roost_cli(state_dir: &std::path::Path, args: &[&str], timeout: Duration) -> O
 fn a_send_to_a_pane_that_never_reads_leaves_roost_fully_alive() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&single_pane_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP send-backpressure gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip("send-backpressure gate", &harness::one_pane(cwd))
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

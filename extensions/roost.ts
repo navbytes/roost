@@ -19,14 +19,12 @@
  * (agent_settled + isIdle); an older pi falls back to agent_end reporting —
  * see the settled handler.
  *
- * promotion-auth-gate: reconnects with backoff on `error`/`close` (up to 5
- * attempts, 250ms doubling to 4s, ±25% jitter; the budget refills once a
- * connection has stayed up 30s) and replays the last known session/status on
- * reconnect, so a transient drop — including a new roost's auth gate closing
- * an old connection that was never authenticated (see the door in
- * `src/infra/sock.rs`) — costs at most one stale status for seconds, not the
- * rest of the session. See `send()` for why a disconnected send must itself
- * kick a reconnect rather than silently drop.
+ * promotion-auth-gate: reconnects on `error`/`close` with a flat 500ms retry
+ * (unlimited attempts — a local unix socket doesn't need backoff/jitter) and
+ * replays the last known session/status on reconnect, so a transient drop —
+ * including a new roost's auth gate closing an old connection that was never
+ * authenticated (see the door in `src/infra/sock.rs`) — costs at most one
+ * stale status for a moment, not the rest of the session.
  */
 import * as net from "node:net";
 import * as os from "node:os";
@@ -55,23 +53,12 @@ export default function (pi: ExtensionAPI) {
       ? path.join(process.env.XDG_RUNTIME_DIR, "roost.sock")
       : path.join(os.homedir(), ".local", "state", "roost", "roost.sock"));
 
-  // Retry policy (design decision, criterion 6): 5 attempts per burst,
-  // 250ms * 2^(n-1) capped at 4s — 250, 500, 1000, 2000, 4000 — ±25% jitter
-  // so a dozen panes reconnecting after the same roost restart don't thunder
-  // in lockstep. A burst's budget only refills after a connection survives
-  // `HEALTHY_AFTER_MS`: a connection that drops again quickly must not get a
-  // fresh 5 attempts immediately, or a persistently-broken socket retries
-  // forever at full speed.
-  const MAX_RETRY_ATTEMPTS = 5;
-  const BASE_DELAY_MS = 250;
-  const MAX_DELAY_MS = 4000;
-  const JITTER_FRACTION = 0.25;
-  const HEALTHY_AFTER_MS = 30_000;
+  // A local unix socket has nothing like network latency to back off from —
+  // a flat retry is plenty; see module doc.
+  const RECONNECT_DELAY_MS = 500;
 
   let sock: net.Socket | null = null;
-  let attempt = 0; // attempts already spent in the current burst
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let healthyTimer: ReturnType<typeof setTimeout> | null = null;
   let shuttingDown = false; // session_shutdown initiated the close — no retry
   // Last known session/status (and the status's message, so a replayed
   // needs_input keeps its question), kept up to date by every send() (even
@@ -79,30 +66,17 @@ export default function (pi: ExtensionAPI) {
   // handler.
   const last: { session?: string; status?: string; message?: string } = {};
 
-  const clearHealthyTimer = () => {
-    if (healthyTimer) {
-      clearTimeout(healthyTimer);
-      healthyTimer = null;
-    }
-  };
-
-  // Schedule the next attempt in the current burst, or do nothing once one
-  // is already pending or the burst is spent — `close` and `error` both fire
-  // for the same failure (Node emits `close` after `error`), so this must be
-  // idempotent per failure, not just per call.
+  // `close` and `error` both fire for the same failure (Node emits `close`
+  // after `error`), so this must be idempotent per failure, not just per call.
   const scheduleReconnect = () => {
-    if (shuttingDown || reconnectTimer || attempt >= MAX_RETRY_ATTEMPTS) return;
-    const backoff = Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
-    attempt += 1;
-    const jitter = backoff * JITTER_FRACTION * (Math.random() * 2 - 1); // ±25%
+    if (shuttingDown || reconnectTimer) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect();
-    }, Math.max(0, Math.round(backoff + jitter)));
+    }, RECONNECT_DELAY_MS);
   };
 
   const connect = () => {
-    clearHealthyTimer();
     const s = net.connect(sockPath);
     sock = s;
     s.on("connect", () => {
@@ -118,41 +92,19 @@ export default function (pi: ExtensionAPI) {
           status: last.status,
           ...(last.message !== undefined ? { message: last.message } : {}),
         });
-      clearHealthyTimer();
-      healthyTimer = setTimeout(() => {
-        attempt = 0;
-        healthyTimer = null;
-      }, HEALTHY_AFTER_MS);
     });
     s.on("error", () => {
       if (sock !== s) return;
       sock = null;
-      clearHealthyTimer();
       scheduleReconnect();
     });
     s.on("close", () => {
       if (sock !== s) return;
       sock = null;
-      clearHealthyTimer();
       if (!shuttingDown) scheduleReconnect();
     });
   };
   connect();
-
-  // A disconnected gap with nothing pending must not just sit there: a
-  // >15s pi cold start would otherwise burn all five retries on idle
-  // connections (five pre-auth 2s kills, since nothing is sent before
-  // session_start fires) before session_start ever calls send() for real,
-  // leaving the session permanently silent. A real send() matters more than
-  // an idle burst's history, so it starts a fresh one; it does NOT kick if a
-  // reconnect is already in flight (`connect()` itself sets `sock`
-  // synchronously, so "no socket and nothing scheduled" only happens once a
-  // burst has genuinely run out).
-  const kickReconnect = () => {
-    if (sock || reconnectTimer) return;
-    attempt = 0;
-    connect();
-  };
 
   const send = (msg: Record<string, unknown>) => {
     if (msg.event === "session" && typeof msg.session === "string") last.session = msg.session;
@@ -162,10 +114,9 @@ export default function (pi: ExtensionAPI) {
       // a later working/waiting replay.
       last.message = typeof msg.message === "string" ? msg.message : undefined;
     }
-    if (!sock) {
-      kickReconnect(); // must not silently no-op — see the comment above
-      return;
-    }
+    // Dropped while disconnected — `last` above lets the next reconnect
+    // replay it, and the flat retry above means that's never far off.
+    if (!sock) return;
     try {
       // ponytail: accepted race — a sub-millisecond window where the server
       // already closed `sock` but the "error"/"close" event hasn't reached
@@ -422,7 +373,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     shuttingDown = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    clearHealthyTimer();
     sock?.end();
   });
 }

@@ -94,19 +94,6 @@ pub fn attention_problem() -> Style {
     Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED)
 }
 
-/// Active tab's label cell background — a deliberate sentinel (§2 background
-/// policy) so the active tab fuses with whatever the terminal's own
-/// background is. It is the *only* `bg` chrome sets, and it sets it to
-/// "nothing".
-pub const ACTIVE_TAB_BG: Color = Color::Reset;
-
-/// The active tab's label: full-strength ink on the terminal's own paper.
-/// Active vs inactive is carried by ink weight plus the `▎` marker (C2) —
-/// there is no highlight fill to lose.
-pub fn active_tab_label() -> Style {
-    ink().bg(ACTIVE_TAB_BG)
-}
-
 // ---- Chrome glyphs (§2 glyph inventory; all single-width) ----
 
 // Status glyphs (C5 table).
@@ -258,14 +245,13 @@ mod tests {
     /// sentinel. Attention surfaces reverse instead (`attention`).
     #[test]
     fn no_chrome_token_pairs_two_theme_variant_colours() {
-        let tokens: [(&str, Style); 7] = [
+        let tokens: [(&str, Style); 6] = [
             ("ink", ink()),
             ("quiet", quiet()),
             ("rule", rule()),
             ("accent", accent()),
             ("accent_quiet", accent_quiet()),
             ("attention", attention()),
-            ("active_tab_label", active_tab_label()),
         ];
         for (name, style) in tokens {
             match style.bg {
@@ -291,10 +277,7 @@ mod tests {
                 if line.contains(PASSTHROUGH) || line.trim_start().starts_with("//") {
                     continue;
                 }
-                if line.contains(setter)
-                    && !line.contains("Reset")
-                    && !line.contains("ACTIVE_TAB_BG")
-                {
+                if line.contains(setter) && !line.contains("Reset") {
                     offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
                 }
             }

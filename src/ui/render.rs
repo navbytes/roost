@@ -10,8 +10,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
-    feed_overlay_size, roster_overlay_size, App, FeedEntry, Mode, RenameTarget,
-    RosterRow, Search, Selection, TabSummary,
+    feed_overlay_size, App, FeedEntry, Mode, RenameTarget, RosterRow, Search, Selection,
+    TabSummary,
 };
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, PaneRect};
@@ -96,29 +96,24 @@ fn draw_too_small(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new("too small — resize").style(theme::ink()), area);
 }
 
-/// C9: Normal-mode hint pairs — exactly these seven; bindings the old
-/// ten-pair list dropped (tab/undo/hide/quit) stay discoverable via
-/// `Alt+?`. Every other mode's pairs are unchanged in content (restyled
-/// only). Pure — no `Frame` — so the exact Normal-mode list pins down.
-/// [Amended, C23] a focused-raw Normal pane shows exactly one pair instead
-/// — every other hint would be a lie, since nothing else is intercepted;
-/// checked ahead of `focused_dead` would be, but a dead pane can't be raw-
-/// routed either way (`raw_routing_active` requires it alive), so the dead
-/// branch stays first and wins when both happen to be true.
+/// C9: Normal-mode hint pairs — exactly these seven; every other binding
+/// stays discoverable via `Alt+?`. Every other mode's pairs are unchanged in
+/// content (restyled only). Pure — no `Frame` — so the exact Normal-mode list
+/// pins down. A focused-raw Normal pane shows exactly one pair — every other
+/// hint would be a lie, since nothing else is intercepted; checked ahead of
+/// `focused_dead` since a dead pane can't be raw-routed either way
+/// (`raw_routing_active` requires it alive), so the dead branch wins when
+/// both are true.
 ///
-/// [Amended 2026-07-28, C15] `help_scrolled` says whether the keymap is
-/// taller than its overlay right now. Only Help reads it, and it is the
-/// difference between two *true* hint rows: on a terminal showing the whole
-/// table every key really does close it; on a shorter one the arrows read on
-/// instead, and a bar still promising "any key close" would be advertising a
-/// dismissal the arrows no longer perform.
+/// `help_scrolled` says whether the keymap is taller than its overlay right
+/// now — the difference between two *true* Help hint rows: on a terminal
+/// showing the whole table every key really does close it; on a shorter one
+/// the arrows read on instead.
 ///
-/// [Amended 2026-08-09] `resumable` — the focused dead pane has a session
-/// pointer (`App::resume_command_line` is Some) — adds `y copy resume` to the
-/// dead branch. Only there: a shell pane's `y` would copy nothing, and a hint
-/// for a key that does nothing is a lie. Placed ahead of `Alt+w`/`Alt+q` in
-/// the yield order because those two are discoverable everywhere; `y` exists
-/// only on this bar.
+/// `resumable` — the focused dead pane has a session pointer
+/// (`App::resume_command_line` is Some) — adds `y copy resume` to the dead
+/// branch, ahead of `Alt+w`/`Alt+q` in the yield order: those two are
+/// discoverable everywhere, `y` exists only on this bar.
 fn hint_pairs(
     mode: &Mode,
     focused_dead: bool,
@@ -127,19 +122,15 @@ fn hint_pairs(
     help_scrolled: bool,
 ) -> Vec<(&'static str, &'static str)> {
     match mode {
-        // C24: keyboard cursor + mouse drag, replacing the old two-pair list.
-        // [Amended, U17] The mode's whole vocabulary is now on the bar: the
-        // word motions and `V` are new, and `0`/`$` had existed since C24
-        // while appearing in no hint and no help row — a binding nothing
-        // advertises may as well not exist.
+        // C24: keyboard cursor + mouse drag — every Copy-mode key is on this
+        // bar (a binding nothing advertises may as well not exist).
         Mode::Copy { .. } => vec![
             ("hjkl", "move"),
             ("w/b/e", "word"),
             ("0/$", "ends"),
             ("v/V", "mark"),
             ("y/↵", "yank"),
-            // [Amended, U19] `o` opens the URL under the cursor — the
-            // keyboard half of Alt+click.
+            // `o` opens the URL under the cursor — the keyboard half of Alt+click.
             ("o", "open"),
             ("drag", "select"),
             ("Esc", "exit"),
@@ -148,9 +139,6 @@ fn hint_pairs(
             vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]
         }
         Mode::Help { .. } => vec![("Alt+?", "all keys"), ("any key", "close")],
-        // [Amended, U16] `←→` joins the list once there is a cursor to move:
-        // a text field whose caret is stuck at the end is one nobody tries
-        // to move, and the motion was the half of U16 left unimplemented.
         // 45 columns.
         Mode::Rename { target, .. } => {
             let what = match target {
@@ -159,12 +147,8 @@ fn hint_pairs(
             };
             vec![("type", what), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
         }
-        // [Amended, U20] `1..9` joins the list: the accelerator is the
-        // fastest way through the picker and the only one that wasn't
-        // advertised anywhere. [Re-amended, U20 second half] and so do the
-        // type-ahead and the cwd column — 71 columns, inside the floor.
-        // `j/k` are gone from the picker (they are filter text now) and
-        // were never on this bar, so nothing advertised was lost.
+        // 71 columns, inside the floor. `j/k` are filter text now, not on
+        // this bar.
         Mode::Picker { .. } => vec![
             ("↑↓", "choose"),
             ("↵", "open"),
@@ -173,10 +157,8 @@ fn hint_pairs(
             ("←→", "dir"),
             ("Esc", "cancel"),
         ],
-        // [Amended, P21] `/ search` and `n/N next` join the list: scroll
-        // mode is where a search starts and where its hits are walked, and
-        // an unadvertised key is an absent one. 59 columns — comfortably
-        // inside the 100-col floor alongside the right segment.
+        // 59 columns — comfortably inside the 100-col floor alongside the
+        // right segment.
         Mode::Scroll => vec![
             ("↑↓", "scroll"),
             ("PgUp/Dn", "page"),
@@ -184,29 +166,22 @@ fn hint_pairs(
             ("n/N", "next"),
             ("Esc", "exit"),
         ],
-        // [Added, P21] The search prompt's own list. `↵ keep` and
-        // `Esc cancel` are the two exits and lead the yield order; the
-        // hits-walking pair trails because it is the one that keeps
-        // working after the prompt closes (and is advertised again on the
-        // Scroll list once it does).
+        // The search prompt's own list. `↵ keep`/`Esc cancel` are the two
+        // exits and lead the yield order; the hits-walking pair trails
+        // because it's the one that keeps working after the prompt closes
+        // (and is advertised again on the Scroll list once it does).
         Mode::Search { .. } => {
             vec![("type", "filter"), ("↵", "keep"), ("Esc", "cancel"), ("n/N", "next")]
         }
-        // [Amended, U25] The feed's own working keys were missing from its
-        // own hint: PgUp/PgDn paged and `q` closed, both unadvertised, and
-        // Enter is new. A mode whose hint omits its keys has no keys.
         Mode::Feed { .. } => vec![
             ("↑↓", "select"),
             ("PgUp/Dn", "page"),
             ("↵", "go to pane"),
             ("q/Esc", "close"),
         ],
-        // [Added, C27] The roster's own key set — 68 columns, inside the
-        // 100-col floor beside the right segment. `q` is deliberately absent
-        // where the feed has it: this list filters as you type, so a letter
-        // is filter text (U20's rule), and `Esc` is the way out. [Amended,
-        // ux P2-11] `Tab status` joins it (81 columns, still inside the
-        // floor) — the one narrowing key that isn't filter text.
+        // 68 columns, inside the 100-col floor beside the right segment. `q`
+        // is deliberately absent (the roster filters as you type, so a
+        // letter is filter text, U20's rule) — `Esc` is the way out.
         Mode::Roster { .. } => vec![
             ("↑↓", "select"),
             ("PgUp/Dn", "page"),
@@ -224,11 +199,9 @@ fn hint_pairs(
             pairs
         }
         Mode::Normal if focused_raw => vec![("Alt+Shift+p", "exit raw")],
-        // [Amended, U6] Same seven pairs, reordered: pairs drop whole from
-        // the right, so `Alt+? keys` leads (it is the last thing to yield —
-        // it's the way to everything that already dropped) and `Alt+r
-        // rename` trails (first to go — the one pair whose absence costs a
-        // user nothing they can't find under Alt+?).
+        // Pairs drop whole from the right, so `Alt+? keys` leads (the way to
+        // everything else once it's dropped) and `Alt+r rename` trails
+        // (costs nothing when gone — still findable under Alt+?).
         Mode::Normal => vec![
             ("Alt+?", "keys"),
             ("Alt+n", "new"),
@@ -267,17 +240,14 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
 /// whole before any of it clips. Pure so the omission rules are
 /// unit-testable without a `Frame`.
 ///
-/// F2 (exit UX audit 2026-08-07): `attention` is `App::attention_segment()`
-/// verbatim — `None` omits the aggregate entirely (rather than a hollow "0
-/// needs you"); `Some((n, true))` is the real ◆ count, unchanged wording and
-/// `accent()`; `Some((n, false))` is `attention_ring`'s ○ fallback count,
-/// `"○ {n} your turn · Alt+a"` in `ink()` (one visual step back from the
-/// accent-red ◆ case — the same style `theme::status_style` already gives
-/// the Waiting glyph everywhere else). Passing the tuple straight through
-/// rather than re-deciding "real vs fallback" here is what keeps this
-/// function unable to show anything `Alt+a` wouldn't actually do.
+/// `attention` is `App::attention_segment()` verbatim — `None` omits the
+/// aggregate entirely (rather than a hollow "0 needs you"); `Some((n, true))`
+/// is the real ◆ count in `accent()`; `Some((n, false))` is
+/// `attention_ring`'s ○ fallback count, `"○ {n} your turn · Alt+a"` in
+/// `ink()` (one visual step back from the accent-red ◆ case, the same style
+/// `theme::status_style` gives the Waiting glyph everywhere else).
 ///
-/// [P21] `query` is the live search prompt (`/foo`) and is the one token on
+/// `query` is the live search prompt (`/foo`) and is the one token on
 /// this bar drawn in `ink`: it is text the user is typing right now, and
 /// quiet input is input you cannot proofread. `position` carries `↑N/M` in
 /// Scroll mode and the `i/n` hit counter while searching — both `quiet`, both
@@ -352,10 +322,9 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
 }
 
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
-    // F1 (exit UX audit 2026-08-07, C9 amended): flash now wins the bar over
-    // the alt-warning — the reverse order let a persistent problem bar
-    // swallow a just-performed copy's confirmation for its entire window.
-    // A transient action result (e.g. "copied") takes over the bar briefly.
+    // Flash wins the bar over the alt-warning: a transient action result
+    // (e.g. "copied") takes over the bar briefly rather than being swallowed
+    // by a persistent problem bar for its entire window.
     if let Some(msg) = app.flash() {
         f.render_widget(
             Paragraph::new(format!(" {msg} ")).style(theme::attention()),
@@ -442,37 +411,30 @@ fn centered_near(anchor: Rect, bounds: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-/// Dim every cell in `body` outside `dialog` so a floating overlay reads as a
-/// distinct modal layer sitting on top of the panes, not more pane chrome.
-fn dim_backdrop(f: &mut Frame, body: Rect, dialog: Rect) {
-    let buf = f.buffer_mut();
-    for y in body.y..body.y + body.height {
-        for x in body.x..body.x + body.width {
-            let inside_dialog =
-                x >= dialog.x && x < dialog.x + dialog.width && y >= dialog.y && y < dialog.y + dialog.height;
-            if inside_dialog {
-                continue;
-            }
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                let style = cell.style().add_modifier(Modifier::DIM);
-                cell.set_style(style);
-            }
-        }
-    }
+/// Dim every cell in `body` so a floating overlay reads as a distinct modal
+/// layer sitting on top of the panes, not more pane chrome. Callers dim the
+/// whole body, then `Clear` the dialog's own rect right after (`modal_frame`)
+/// — that reset already undoes the dim there, so this doesn't need to know
+/// the dialog's rect at all.
+fn dim_backdrop(f: &mut Frame, body: Rect) {
+    f.buffer_mut().set_style(body, Style::new().add_modifier(Modifier::DIM));
 }
 
-/// Border style for floating dialogs (C12): the one look all three modals
-/// share — a modal is the focused interaction surface, so it takes the
-/// focus color; the dimmed backdrop (below) keeps it from being confused
-/// with the focused pane's own accent border. No BOLD (§2 bold policy).
-fn dialog_border_style() -> Style {
-    theme::accent()
-}
-
-/// C12's title style: regular weight, primary ink — shared by all three
-/// modals so there's exactly one place that sets it.
-fn dialog_title(text: &'static str) -> Line<'static> {
-    Line::from(text).style(theme::ink())
+/// C12: the modal preamble every floating dialog shares — dim the body,
+/// clear the dialog's own cells, draw its bordered frame with `title`, and
+/// hand back the inner area for the mode-specific content. Border color is
+/// `theme::accent()`, the one look all dialogs share (a modal is the focused
+/// interaction surface); no BOLD (§2 bold policy).
+fn modal_frame(f: &mut Frame, body: Rect, rect: Rect, title: Line<'static>) -> Rect {
+    dim_backdrop(f, body);
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(title)
+        .border_type(BorderType::Plain)
+        .border_style(theme::accent());
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    inner
 }
 
 /// C14 (U20): a picker row's text after its 1-column marker — the `1..9`
@@ -538,13 +500,10 @@ fn picker_cwd_label(path: &std::path::Path) -> String {
 /// the gap and the two border columns. `centered_near` still clamps it to
 /// the screen. Pure so the sizing and the drawing can't drift.
 ///
-/// [Amended F8, exit UX audit 2026-08-07] `ADAPTER_COL` was 16, sized for
-/// the registry's then-longest id (`claude`/`gemini`, 6 chars) plus
-/// `App::picker_filtered`'s old `" gone"` suffix (5 chars) plus the 3-char
-/// row prefix (`picker_row_body`'s `" {digit} "`) — 14, plus 2 columns of
-/// slack. The registry has since grown a longer id (`opencode`, 8 chars),
-/// and the suffix is now `" not found"` (10 chars, replacing "gone" — see
-/// `picker_filtered`): 3 + 8 + 10 = 21, plus the same 2 columns of slack.
+/// `ADAPTER_COL` = 23: the 3-char row prefix (`picker_row_body`'s
+/// `" {digit} "`) + the registry's longest id (`opencode`, 8 chars) + the
+/// longest status suffix (`" not found"`, 10 chars, see `picker_filtered`) +
+/// 2 columns of slack.
 fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
     const ADAPTER_COL: u16 = 23;
     let widest = cwds
@@ -568,7 +527,7 @@ fn help_key_prefix(key: &str) -> String {
     format!(" {key:<18}")
 }
 
-/// C15 (amended 2026-07-28): the keymap's content width — the widest row
+/// C15: the keymap's content width — the widest row
 /// (key column + description). One *column* of it; the overlay may draw two
 /// side by side, which `help_layout` decides. Pure so the sizing has a
 /// unit-test seam.
@@ -614,7 +573,7 @@ struct HelpLayout {
     size: (u16, u16),
 }
 
-/// C15 (amended 2026-07-28): lay the keymap out for `body`, taking **the
+/// C15: lay the keymap out for `body`, taking **the
 /// fewest columns that fit**.
 ///
 /// One column is the calm form and stays the answer whenever the list fits
@@ -721,7 +680,7 @@ struct HelpGroup {
     rows: &'static [(&'static str, &'static str)],
 }
 
-/// C15/§8 (amended 2026-07-28): the canonical key table, **grouped by what
+/// C15/§8: the canonical key table, **grouped by what
 /// the chord acts on**, plus U23's reference block. The single source
 /// `draw_mode_overlay` reads for `Mode::Help`.
 ///
@@ -739,19 +698,14 @@ struct HelpGroup {
 /// Group order is "how often you reach for it": panes, then their layout,
 /// then tabs, then the fleet surfaces, then reading, then the session.
 ///
-/// [Amended, ux P2-15] `CONTROL CLI` closes the table. Every group above it
-/// teaches keys pressed *inside* roost; this one is the odd surface out —
-/// the reference block for `roost send`/`read`/`status`/`spawn`/`wait`, the
-/// control CLI an outside actor (an LLM, a script, another pane) drives the
-/// fleet with. Before this the whole surface was invisible from inside the
-/// product, even though U2 put the pane id on every badge *specifically* as
-/// the join key between what's on screen and what a caller types — a join
-/// key nothing on screen ever named. Rows are the verbs a caller reaches
+/// `CONTROL CLI` closes the table. Every group above it teaches keys pressed
+/// *inside* roost; this one is the odd surface out — the reference block for
+/// `roost send`/`read`/`status`/`spawn`/`wait`, the control CLI an outside
+/// actor (an LLM, a script, another pane) drives the fleet with, keyed on
+/// the pane id every badge shows (U2). Rows are the verbs a caller reaches
 /// for, not a man page: the CLI's own `--help` covers `list`/`fork`/`close`
 /// and every flag. It sorts last for the same reason `READING THE SCREEN`
-/// does — it teaches the product rather than a binding — and follows it
-/// rather than leading, since a user opens this overlay to remember a
-/// chord first and learns the fleet is scriptable second.
+/// does — it teaches the product rather than a binding.
 const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "PANES",
@@ -907,7 +861,7 @@ fn dialog_rect(
         // answer the fleet's two questions and should not resize under a
         // user toggling between them.
         Mode::Roster { .. } => {
-            let (w, h) = roster_overlay_size(body);
+            let (w, h) = feed_overlay_size(body);
             Some(centered_near(anchor, body, w, h))
         }
     }
@@ -931,18 +885,11 @@ fn draw_mode_overlay<B: PaneBackend>(
     match &app.mode {
         Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => {}
         Mode::Rename { buffer, cursor, target } => {
-            dim_backdrop(f, body, rect);
-            f.render_widget(Clear, rect);
             let heading = match target {
                 RenameTarget::Pane => " rename pane ",
                 RenameTarget::Tab => " rename tab ",
             };
-            let block = Block::bordered()
-                .title(dialog_title(heading))
-                .border_type(BorderType::Plain)
-                .border_style(dialog_border_style());
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
+            let inner = modal_frame(f, body, rect, Line::from(heading).style(theme::ink()));
             f.render_widget(
                 Paragraph::new(rename_field(buffer, *cursor)).style(theme::ink()),
                 inner,
@@ -951,31 +898,21 @@ fn draw_mode_overlay<B: PaneBackend>(
         Mode::Picker { selection, filter, cwd, on_cwd } => {
             let items = app.picker_filtered();
             let cwds = app.picker_cwds();
-            dim_backdrop(f, body, rect);
-            f.render_widget(Clear, rect);
-            // [Amended, U20] The title carries the live type-ahead query, so
-            // a narrowed list always says *why* it is narrow — a filtered
-            // picker showing one row and no query would read as a picker
-            // that lost its adapters.
+            // The title carries the live type-ahead query, so a narrowed
+            // list always says *why* it is narrow.
             let heading = if filter.is_empty() {
                 " new pane — pick agent ".to_string()
             } else {
                 format!(" new pane — {filter}{} ", theme::RENAME_CURSOR)
             };
-            let block = Block::bordered()
-                .title(Line::from(Span::styled(heading, theme::ink())))
-                .border_type(BorderType::Plain)
-                .border_style(dialog_border_style());
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
+            let inner = modal_frame(f, body, rect, Line::from(Span::styled(heading, theme::ink())));
             // C14: selected row is a `❯`-prefix + `ink` item text, no bg
-            // highlight; unselected rows are plain `quiet` text. [Amended,
-            // U20] Each row leads with its `1..9` accelerator — an
-            // accelerator nothing shows is one nobody presses — and a
-            // second column lists the recent working directories. The
-            // column with focus marks its selection with `❯`; the other
-            // shows its selection in `ink` without the marker, so what will
-            // actually be launched is readable from either side.
+            // highlight; unselected rows are plain `quiet` text. Each row
+            // leads with its `1..9` accelerator, and a second column lists
+            // the recent working directories. The column with focus marks
+            // its selection with `❯`; the other shows its selection in
+            // `ink` without the marker, so what will actually be launched
+            // is readable from either side.
             const ADAPTER_COL: usize = 16;
             let rows = items.len().max(cwds.len());
             let lines: Vec<Line> = (0..rows)
@@ -1007,10 +944,8 @@ fn draw_mode_overlay<B: PaneBackend>(
             // single source and `help_layout` the single geometry — the same
             // call `dialog_rect` above made for this rect.
             let layout = help_layout(body);
-            let (visible, total) = (layout.height as usize, layout.columns.iter().map(|c| c.len()).max().unwrap_or(0));
+            let (visible, total) = help_scroll_extent(body);
             let top = (*top).min(total.saturating_sub(visible));
-            dim_backdrop(f, body, rect);
-            f.render_widget(Clear, rect);
             // The title says how to leave — and, only when the table doesn't
             // fit, that there is more of it and which keys reach it. A
             // terminal showing everything says nothing about scrolling,
@@ -1020,38 +955,21 @@ fn draw_mode_overlay<B: PaneBackend>(
             } else {
                 " keys — any key to close ".to_string()
             };
-            let block = Block::bordered()
-                .title(Line::from(heading).style(theme::ink()))
-                .border_type(BorderType::Plain)
-                .border_style(dialog_border_style());
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
+            let inner = modal_frame(f, body, rect, Line::from(heading).style(theme::ink()));
             draw_help_columns(f, &layout, top, inner);
         }
         Mode::Feed { offset } => {
-            dim_backdrop(f, body, rect);
-            f.render_widget(Clear, rect);
-            let block = Block::bordered()
-                .title(dialog_title(" activity "))
-                .border_type(BorderType::Plain)
-                .border_style(dialog_border_style());
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
+            let inner = modal_frame(f, body, rect, Line::from(" activity ").style(theme::ink()));
             draw_feed_entries(f, app.feed(), *offset, inner);
         }
         Mode::Roster { cursor, filter, status_filter, .. } => {
-            dim_backdrop(f, body, rect);
-            f.render_widget(Clear, rect);
             // The live query rides in the title, exactly as the picker's
-            // does (U20): a list narrowed to two rows with an ordinary title
-            // reads as a fleet that lost its panes. [Amended, ux P2-11] The
-            // status filter joins it as a glyph tag, in that status's own C5
-            // glyph *and* color (design-supervisor D4: a bare `ink()` glyph
-            // read as no tier at all) — the same pairing the narrowed rows
-            // themselves draw (`theme::status_style`) — so a narrowed list
-            // always says *why* it is narrow, same as the type-ahead already
-            // did. `ink()` everywhere else: the tag is the one thing this
-            // title borrows color for.
+            // does (U20). The status filter joins it as a glyph tag, in
+            // that status's own C5 glyph *and* color (a bare `ink()` glyph
+            // would read as no tier at all) — the same pairing the narrowed
+            // rows themselves draw (`theme::status_style`). `ink()`
+            // everywhere else: the tag is the one thing this title borrows
+            // color for.
             let glyph_span = status_filter.map(|s| {
                 let (glyph, style, _) = theme::status_style(s);
                 Span::styled(glyph.to_string(), style)
@@ -1073,15 +991,24 @@ fn draw_mode_overlay<B: PaneBackend>(
                     spans.push(Span::styled(format!(" {filter}{} ", theme::RENAME_CURSOR), theme::ink()));
                 }
             }
-            let block = Block::bordered()
-                .title(Line::from(spans))
-                .border_type(BorderType::Plain)
-                .border_style(dialog_border_style());
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
+            let inner = modal_frame(f, body, rect, Line::from(spans));
             draw_roster_rows(f, app, *cursor, inner, spinner);
         }
     }
+}
+
+/// Shared shape for a modal's "nothing here yet" line: one row, vertically
+/// centered in `inner`, horizontally centered by `Paragraph::centered()` —
+/// the roster's "no pane matches" and the feed's "no activity yet".
+fn draw_empty_state(f: &mut Frame, inner: Rect, text: &str) {
+    if inner.height == 0 {
+        return;
+    }
+    let y = inner.y + inner.height / 2;
+    f.render_widget(
+        Paragraph::new(text).style(theme::quiet()).centered(),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
 }
 
 /// C27: the roster's visible rows inside the modal's inner area — tab group
@@ -1102,13 +1029,7 @@ fn draw_roster_rows<B: PaneBackend>(
     if rows.is_empty() {
         // Only reachable through the type-ahead: the workspace always has at
         // least one pane. Same shape as the feed's empty state.
-        let text = "no pane matches";
-        let pad = inner.width.saturating_sub(text.chars().count() as u16) / 2;
-        let y = inner.y + inner.height / 2;
-        f.render_widget(
-            Paragraph::new(format!("{}{text}", " ".repeat(pad as usize))).style(theme::quiet()),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
+        draw_empty_state(f, inner, "no pane matches");
         return;
     }
     let lines: Vec<Line> = rows
@@ -1189,13 +1110,7 @@ fn draw_feed_entries(f: &mut Frame, feed: &VecDeque<FeedEntry>, offset: usize, i
         return;
     }
     if feed.is_empty() {
-        let text = "no activity yet";
-        let pad = inner.width.saturating_sub(text.chars().count() as u16) / 2;
-        let y = inner.y + inner.height / 2;
-        f.render_widget(
-            Paragraph::new(format!("{}{text}", " ".repeat(pad as usize))).style(theme::quiet()),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
+        draw_empty_state(f, inner, "no activity yet");
         return;
     }
     let range = feed_window(feed.len(), offset, inner.height as usize);
@@ -1238,10 +1153,9 @@ fn feed_window(len: usize, offset: usize, rows: usize) -> std::ops::Range<usize>
 /// `quiet` — except a status line landing on NeedsInput, which gets the `◆ `
 /// `accent` prefix and `ink` text (the one red in the feed, same meaning as
 /// everywhere, C5). Pure so the exception is unit-tested without a `Frame`.
-/// [Amended, U25] The row's leading column is now a selection marker: `❯`
-/// `accent` on the entry Enter would act on, a space on every other row. Same
-/// `❯` idiom as the picker (C14), and it costs no columns — the leading
-/// space was already there.
+/// The row's leading column is a selection marker: `❯` `accent` on the entry
+/// Enter would act on, a space on every other row — same idiom as the
+/// picker (C14).
 fn feed_entry_spans(
     hhmmss: &str,
     text: &str,
@@ -1321,10 +1235,15 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner
     // separator/gutter), stopping exactly where `tab_strip` says to.
     for (i, tab) in app.ws.tabs.iter().enumerate().take(strip.end).skip(strip.start) {
         let active = i == app.ws.active_tab;
-        // [Amended 2026-07-28] ...and how many panes are in that state, so a
-        // tab of three needy agents stops reading like a tab of one.
+        // ...and how many panes are in that state, so a tab of three needy
+        // agents stops reading like a tab of one.
         let (summary, count) = app.tab_summary(i);
-        let (glyph, glyph_style) = tab_summary_badge(summary, spinner);
+        // Map the tab's aggregate summary to a tab-bar glyph + style
+        // (theme::C5); `spinner` substitutes in for `Working`'s glyph — the
+        // tab strip shows no grid (unlike a pane's own corner badge), so
+        // there is no frozen view to preserve and it always animates.
+        let (glyph, glyph_style) = theme::tab_summary_style(summary);
+        let glyph = if summary == TabSummary::Working { spinner } else { glyph };
         push_tab_spans(&mut spans, i, &tab.name, active, glyph, glyph_style, count);
         used += mouse::tab_width(i, &tab.name);
     }
@@ -1343,11 +1262,8 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner
             spans.push(Span::raw(" ".repeat(pad as usize)));
         }
         // U15: the mode word reads a step brighter than the cwd beside it —
-        // it's state, not context — while staying inside the ink ramp (never
-        // the accent: it isn't an alarm). [Amended 2026-07-27, theme
-        // inheritance] The ramp is two rungs deep now, so "a step brighter"
-        // is spelled `ink` over `quiet` rather than the old MUTED over DIM —
-        // the *relationship* is what the rule was ever about.
+        // it's state, not context — while staying inside the ink ramp
+        // (never the accent: it isn't an alarm): `ink` over `quiet`.
         if !mode_word.is_empty() {
             spans.push(Span::styled(mode_word, theme::ink()));
         }
@@ -1368,10 +1284,9 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner
 /// **count cell**, the separator, and a trailing gutter space — column count
 /// matches `mouse::tab_width` (`display_width(label) + 8`) exactly.
 ///
-/// [Amended 2026-07-28] `count` is how many of the tab's panes are in the
-/// summarized state (the second half of `App::tab_summary`). It renders in
-/// the glyph's own style. [Amended 2026-08-07, spinner] the style itself no
-/// longer flips — the *glyph* does (C5's spinner), and the count rides right
+/// `count` is how many of the tab's panes are in the summarized state (the
+/// second half of `App::tab_summary`); it renders in the glyph's own style.
+/// The *glyph* is what flips (C5's spinner), and the count rides right
 /// beside it, so `⠋3`→`⠙3`→… still reads as one animating token rather than a
 /// static digit stuck to a spinning dot.
 fn push_tab_spans(
@@ -1392,25 +1307,25 @@ fn push_tab_spans(
 
     // Active vs inactive is ink weight plus the `▎` marker — no highlight
     // fill to go invisible against a light theme (§2, 2026-07-27).
-    let label_style = if active { theme::active_tab_label() } else { theme::quiet() };
+    let label_style = if active { theme::ink() } else { theme::quiet() };
     spans.push(Span::styled(mouse::tab_label(index, name), label_style));
     spans.push(Span::raw(" "));
 
     spans.push(Span::styled(glyph.to_string(), glyph_style));
-    // C2 (amended 2026-07-28): the count cell, glyph-adjacent and in the
+    // C2: the count cell, glyph-adjacent and in the
     // glyph's own style. Always exactly one column — blank below 2 — so tab
     // widths never jitter as statuses flip.
     spans.push(Span::styled(tab_count_cell(count).to_string(), glyph_style));
     spans.push(Span::raw(" "));
 
     spans.push(Span::styled(theme::TAB_SEPARATOR.to_string(), theme::rule()));
-    // C2 (amended 2026-07-23): trailing gutter — one space after the separator
+    // C2: trailing gutter — one space after the separator
     // gives every divider symmetric 1-cell padding, so adjacent tabs read
     // `│ ▎` not `│▎`. Counts as this tab's own column (mouse::tab_width +8).
     spans.push(Span::raw(" "));
 }
 
-/// C2 (amended 2026-07-28): what goes in a tab's count cell for `n` panes in
+/// C2: what goes in a tab's count cell for `n` panes in
 /// the summarized state. **Exactly one column, always** — that invariant is
 /// the contract's geometry rule, and `mouse::tab_width` depends on it:
 /// - `0`/`1` → a space. One is what a glyph already means; drawing `◆1`
@@ -1439,18 +1354,6 @@ fn tab_count_cell(n: usize) -> char {
 #[cfg(test)]
 pub fn tab_count_cell_cols(n: usize) -> u16 {
     mouse::display_width(&tab_count_cell(n).to_string())
-}
-
-/// Map a tab's aggregate summary to a tab-bar glyph + style (theme::C5).
-/// `Quiet` renders as a blank (no clutter for tabs with nothing to report);
-/// `Unknown` is a quiet dot so a not-yet-spawned background tab reads as
-/// "unknown", not idle. `spinner` substitutes in for `Working`'s glyph — the
-/// tab strip shows no grid (unlike a pane's own corner badge), so there is no
-/// frozen view to preserve and it always animates.
-fn tab_summary_badge(s: crate::core::app::TabSummary, spinner: char) -> (char, Style) {
-    let (glyph, style) = theme::tab_summary_style(s);
-    let glyph = if s == TabSummary::Working { spinner } else { glyph };
-    (glyph, style)
 }
 
 /// C8's state-word table: the collapsed row's right-segment word for each
@@ -1494,13 +1397,10 @@ fn row_status_style(status: Option<AgentStatus>) -> (char, Style, bool) {
     }
 }
 
-/// C8's collapsed-row name style, by status and focus.
-///
-/// [Amended 2026-07-27, theme inheritance] The focused row used to be a
-/// `RULE` fill across its whole width. Chrome paints no fills now (§2), so
-/// focus is carried the way the tab bar carries it: full-strength ink plus
-/// the `▎` marker. The status ramp still speaks on unfocused rows — and it
-/// is two rungs deep, not three, so Waiting/Idle/Exited share the quiet one
+/// C8's collapsed-row name style, by status and focus. Chrome paints no
+/// fills (§2), so focus is carried the way the tab bar carries it:
+/// full-strength ink plus the `▎` marker. The status ramp still speaks on
+/// unfocused rows, two rungs deep: Waiting/Idle/Exited share the quiet one
 /// (the `✕` glyph and the `exited` state word already say which is dead).
 fn collapsed_name_style(status: Option<AgentStatus>, focused: bool) -> Style {
     if focused {
@@ -1516,7 +1416,7 @@ fn collapsed_name_style(status: Option<AgentStatus>, focused: bool) -> Style {
 
 /// C4 (amended, U2): the badge leads with the pane id — the join key for
 /// `roost send <id>`, which previously appeared nowhere in the TUI. No-dup
-/// rule: an untitled pane's display `name` (`display_name_of`) already
+/// rule: an untitled pane's display `name` (`display_name_live`) already
 /// embeds the adapter — so appending `· {adapter}` again would duplicate it
 /// ("pi · repo · pi"). Only a custom title needs the adapter spelled out
 /// separately.
@@ -1606,8 +1506,22 @@ fn draw_pane<B: PaneBackend>(
     };
 
     if pr.collapsed {
-        // C8: collapsed stack member — a single-row fleet-view bar.
-        draw_collapsed_row(f, pr.rect, focused, status, pr.id, &name, &adapter, has_title, raw, spinner);
+        // C8: collapsed stack member — a single-row fleet-view bar. `Some`,
+        // always: a drawn row belongs to the active tab (or the float), and
+        // those are spawned by construction — only C27's roster reaches
+        // across into tabs that aren't.
+        let spans = collapsed_row_spans(
+            pr.rect.width,
+            focused,
+            Some(status),
+            pr.id,
+            &name,
+            &adapter,
+            has_title,
+            raw,
+            spinner,
+        );
+        f.render_widget(Paragraph::new(Line::from(spans)), pr.rect);
         return;
     }
 
@@ -1675,7 +1589,6 @@ fn draw_pane<B: PaneBackend>(
     // U3: a scrolled pane's badge gains the dim ↑N token; N1: its Working
     // glyph stops animating while the view is frozen (badge_glyph).
     let (base_glyph, glyph_style, spins) = theme::status_style(status);
-    let scrolled = app.scroll_offset(pr.id);
     let glyph = badge_glyph(spins, scrolled, spinner, base_glyph);
     let text = badge_text(pr.id, &name, &adapter, has_title);
     if let Some((rect, spans)) = corner_badge(inner, &text, raw, scrolled, glyph, glyph_style) {
@@ -1704,10 +1617,9 @@ fn draw_pane<B: PaneBackend>(
 }
 
 /// C16's action-bar text, pure so both variants pin without a `Frame`.
-/// [Amended 2026-08-09] `y: copy resume` rides the bar only when the pane
-/// has a session pointer — same predicate as the hint bar's `resumable`
-/// (`App::resume_command_line`), so the two surfaces can't disagree about
-/// whether `y` does anything.
+/// `y: copy resume` rides the bar only when the pane has a session pointer
+/// — same predicate as the hint bar's `resumable` (`App::resume_command_line`),
+/// so the two surfaces can't disagree about whether `y` does anything.
 fn dead_bar_text(resumable: bool) -> String {
     let copy_hint = if resumable { " · y: copy resume" } else { "" };
     format!(
@@ -1736,23 +1648,20 @@ fn paint_stack_edge(f: &mut Frame, rect: Rect) {
 /// `left`) is what visibly clips. Pure so the width-shedding order is
 /// unit-testable.
 ///
-/// [Amended, U2] the left side carries the pane id ahead of the name — the
+/// The left side carries the pane id ahead of the name — the
 /// `roost send <id>` join key, same placement as the corner badge (C4).
 ///
 /// No-dup rule (C8, mirrors C4's `badge_text`): an untitled pane's `name` is
-/// the shared `display_name_of` fallback, which already embeds the adapter —
+/// the shared `display_name_live` fallback, which already embeds the adapter —
 /// so the right segment drops the `{adapter} · ` prefix and shows just the
 /// state word (`has_title` false). A custom title doesn't embed the adapter,
-/// so titled panes keep the full `"{adapter} · {word}"`.
-/// [Amended, C23] a raw pane's right segment gains a `raw · ` prefix ahead
-/// of whichever of the above it would otherwise be.
-/// [Amended, C27] `status` is optional because the roster reuses this row
-/// for panes in tabs the lazy spawn has not started: `None` is "not started"
-/// (`row_word`/`row_status_style`), not a corpse.
-/// [Amended 2026-08-07, spinner] `spinner` replaces the old resolved
-/// `glyph_style: Style` — the glyph now animates (Working substitutes the
-/// current spinner frame) while its style stays constant, so both are
-/// resolved from `status` in here rather than by every caller.
+/// so titled panes keep the full `"{adapter} · {word}"`. A raw pane's right
+/// segment gains a `raw · ` prefix ahead of whichever of the above it would
+/// otherwise be. `status` is optional because the roster reuses this row for
+/// panes in tabs the lazy spawn has not started: `None` is "not started"
+/// (`row_word`/`row_status_style`), not a corpse. `spinner` is resolved from
+/// `status` in here (Working substitutes the current spinner frame) rather
+/// than by every caller.
 #[allow(clippy::too_many_arguments)]
 fn collapsed_row_spans(
     width: u16,
@@ -1799,40 +1708,6 @@ fn collapsed_row_spans(
     }
 }
 
-/// C8: render one collapsed stack member's row. No row fill in either state
-/// (background policy, §2): focus is the `▎` marker plus full-strength ink
-/// (`collapsed_name_style`), so the row reads the same way the active tab
-/// does and can't go invisible on a light theme.
-#[allow(clippy::too_many_arguments)]
-fn draw_collapsed_row(
-    f: &mut Frame,
-    rect: Rect,
-    focused: bool,
-    status: AgentStatus,
-    id: layout::PaneId,
-    name: &str,
-    adapter: &str,
-    has_title: bool,
-    raw: bool,
-    spinner: char,
-) {
-    // `Some`, always: a drawn row belongs to the active tab (or the float),
-    // and those are spawned by construction — only C27's roster reaches
-    // across into tabs that aren't.
-    let spans = collapsed_row_spans(
-        rect.width,
-        focused,
-        Some(status),
-        id,
-        name,
-        adapter,
-        has_title,
-        raw,
-        spinner,
-    );
-    f.render_widget(Paragraph::new(Line::from(spans)), rect);
-}
-
 /// C6's header text for the given row width: uppercase " STACK · N PANES"
 /// left, "ALT+↑↓ " right-aligned, filled with spaces between. Pure so the
 /// content and right-alignment are unit-testable without a `Frame`.
@@ -1859,12 +1734,11 @@ fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
 
 /// Top-right corner badge (C4): pane name (+ adapter, when titled) and the
 /// status glyph, right-aligned with one column of breathing room. Two-tone:
-/// the text is `quiet`, the glyph carries its own C5 status style. [Amended,
-/// C23] a raw pane's badge gains a `raw` token between the text and the
-/// glyph, in its own `accent_quiet` span (never folded into the quiet text —
-/// it needs its own colour). [Amended, U3] a scrolled pane's badge carries a
-/// quiet `↑N` token — its grid-clamped view offset, 0 = live tail = no token
-/// — glyph-adjacent (after `raw`), same `accent_quiet` family. Returns the
+/// the text is `quiet`, the glyph carries its own C5 status style. A raw
+/// pane's badge gains a `raw` token between the text and the glyph, in its
+/// own `accent_quiet` span. A scrolled pane's badge carries a quiet `↑N`
+/// token — its grid-clamped view offset, 0 = live tail = no token —
+/// glyph-adjacent (after `raw`), same `accent_quiet` family. Returns the
 /// 1-row rect and the clipped spans — or `None` if the pane is too small to
 /// be worth badging. Pure so it can be unit-tested.
 fn corner_badge(
@@ -1926,14 +1800,10 @@ fn highlight_selection(f: &mut Frame, inner: Rect, a: (u16, u16), b: (u16, u16))
     let mut row = start.0;
     while row <= end.0 && row < h {
         let first = if row == start.0 { start.1 } else { 0 };
-        let last = if row == end.0 { end.1 } else { w.saturating_sub(1) };
-        let mut col = first;
-        while col <= last && col < w {
-            if let Some(cell) = buf.cell_mut((inner.x + col, inner.y + row)) {
-                let s = cell.style().add_modifier(Modifier::REVERSED);
-                cell.set_style(s);
-            }
-            col += 1;
+        let last = (if row == end.0 { end.1 } else { w.saturating_sub(1) }).min(w.saturating_sub(1));
+        if first <= last {
+            let rect = Rect::new(inner.x + first, inner.y + row, last - first + 1, 1);
+            buf.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
         }
         row += 1;
     }
@@ -1997,14 +1867,12 @@ fn paint_copy_cursor(f: &mut Frame, inner: Rect, cursor: (u16, u16), selection: 
         return;
     }
     let in_selection = selection.is_some_and(|s| cell_in_selection(cursor, s.anchor, s.cursor));
-    let buf = f.buffer_mut();
-    if let Some(cell) = buf.cell_mut((inner.x + col, inner.y + row)) {
-        let mut style = cell.style().add_modifier(Modifier::REVERSED);
-        if in_selection {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
-        cell.set_style(style);
+    let mut style = Style::new().add_modifier(Modifier::REVERSED);
+    if in_selection {
+        style = style.add_modifier(Modifier::UNDERLINED);
     }
+    let rect = Rect::new(inner.x + col, inner.y + row, 1, 1);
+    f.buffer_mut().set_style(rect, style);
 }
 
 /// P7: may roost place the host's single real cursor inside this pane?
@@ -2125,7 +1993,7 @@ mod tests {
     use crate::App;
     use super::{
         badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_style,
-        collapsed_row_spans, corner_badge, dialog_border_style, feed_entry_spans, feed_window,
+        collapsed_row_spans, corner_badge, feed_entry_spans, feed_window,
         help_content_width, help_layout, help_lines, hint_bar_right_spans, hint_pairs, mode_word,
         push_tab_spans, should_place_cursor, stack_header_text, state_word, HelpLine, HELP_GROUPS,
     };
@@ -2324,10 +2192,9 @@ mod tests {
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
     }
 
-    /// F2 (exit UX audit 2026-08-07): the ○ fallback renders in the same
-    /// slot as a real ◆, with its own wording and one visual step back
-    /// (`ink()` rather than `accent()`) so a real ◆ still reads as more
-    /// urgent.
+    /// The ○ fallback renders in the same slot as a real ◆, with its own
+    /// wording and one visual step back (`ink()` rather than `accent()`) so
+    /// a real ◆ still reads as more urgent.
     #[test]
     fn hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input() {
         let spans = hint_bar_right_spans(Some((3, false)), None, None, "NORMAL");
@@ -2644,13 +2511,6 @@ mod tests {
         assert_eq!(spans[0].style, theme::accent());
     }
 
-    #[test]
-    fn dialog_border_style_is_accent_with_no_modifiers() {
-        // Pins C12: the old bright-fg/double-border/bold dialog look is
-        // gone — one plain accent style for all three modals.
-        assert_eq!(dialog_border_style(), theme::accent());
-    }
-
     /// C15 amended: one column is sized to the widest key-column-plus-
     /// description line, not a fixed 52 that clips long descriptions
     /// mid-word. Every key pads to the same column, so the longest
@@ -2778,10 +2638,8 @@ mod tests {
         );
     }
 
-    /// C16 [Amended 2026-08-09]: the overlay bar's two variants. The
-    /// session-less text must stay byte-identical to the unamended spec
-    /// string; the resumable one inserts `y: copy resume` before close —
-    /// mirroring the hint bar, so the two surfaces read in the same order.
+    /// C16: the overlay bar's two variants — the resumable one inserts
+    /// `y: copy resume` before close, mirroring the hint bar's order.
     #[test]
     fn dead_bar_text_offers_copy_resume_only_when_resumable() {
         assert_eq!(
@@ -2794,10 +2652,8 @@ mod tests {
         );
     }
 
-    /// C20's list as amended by U25: every key the feed actually answers to.
-    /// PgUp/PgDn and `q` worked all along while appearing nowhere, and Enter
-    /// is new — the whole point of making entries actionable is that people
-    /// can tell they are.
+    /// C20: every key the feed actually answers to — the whole point of
+    /// making entries actionable is that people can tell they are.
     #[test]
     fn hint_pairs_feed_mode_lists_every_key_the_feed_answers_to() {
         assert_eq!(
@@ -2875,17 +2731,16 @@ mod tests {
 
     #[test]
     fn push_tab_spans_active_tab_uses_accent_marker_and_reset_bg() {
-        // C2: active tab — marker ▎ `accent`, label `ink` on Color::Reset
-        // (fuses with the terminal's own bg), glyph in its own style,
-        // separator `rule`.
+        // C2: active tab — marker ▎ `accent`, label `ink` (fuses with the
+        // terminal's own bg — no fill), glyph in its own style, separator
+        // `rule`.
         let mut spans = Vec::new();
         push_tab_spans(&mut spans, 0, "main", true, theme::GLYPH_WORKING, theme::accent(), 3);
         assert_eq!(spans.len(), 9); // 8 parts + the count cell (C2, amended 2026-07-28)
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style, theme::accent());
         assert_eq!(spans[2].content.as_ref(), "1 main");
-        assert_eq!(spans[2].style, theme::active_tab_label());
-        assert_eq!(spans[2].style.bg, Some(theme::ACTIVE_TAB_BG));
+        assert_eq!(spans[2].style, theme::ink());
         assert_eq!(spans[4].content.as_ref(), theme::GLYPH_WORKING.to_string());
         assert_eq!(spans[4].style, theme::accent());
         // ...then the count, in the glyph's own style so `⠋3` is one token.
@@ -2916,7 +2771,7 @@ mod tests {
         assert_eq!(spans[5].content.as_ref(), " ");
     }
 
-    /// C2 (amended 2026-07-28): the count cell's whole vocabulary — blank
+    /// C2: the count cell's whole vocabulary — blank
     /// below 2, the digit through 9, `+` past that — and the invariant the
     /// tab-width formula rests on: exactly one column, every time.
     #[test]
@@ -3281,10 +3136,6 @@ mod tests {
 
     /// C14 (U20): the dialog grows to fit the widest cwd label, and stays
     /// the pre-U20 32 columns when there is no cwd column to show.
-    ///
-    /// [Amended F8, exit UX audit 2026-08-07] `ADAPTER_COL` grew from 16 to
-    /// 23 (see its own doc comment) — the "src/roost" case used to land
-    /// under the 32-column floor and no longer does.
     #[test]
     fn picker_dialog_width_covers_the_cwd_column() {
         use std::path::PathBuf;
@@ -3516,13 +3367,11 @@ mod tests {
         assert!(app.show_alt_hint());
         out.push(("alt-trap warning bar", snap(&mut app)));
 
-        // [design-supervisor, SG4, exit UX audit 2026-08-07] No fixture here
-        // ever set a Waiting pane with nothing needing input anywhere, so
-        // the C9 ○ fallback segment (F2) was invisible to the §2 gates
-        // below — its style was pinned only by a unit test, the exact
-        // vacuous-gate pattern PR #61 was meant to close. A shell's Waiting
-        // downgrades to Idle (P2-10) and never pulls the fallback, so this
-        // promotes one pane to a real adapter first.
+        // Exercise the C9 ○ fallback segment (a Waiting pane with nothing
+        // needing input) so it's visible to the §2 gates below, not just
+        // pinned by a unit test. A shell's Waiting downgrades to Idle
+        // (P2-10) and never pulls the fallback, so this promotes one pane
+        // to a real adapter first.
         {
             use crate::core::status::AgentStatus;
             use crate::ports::PaneBackend;
@@ -3554,12 +3403,11 @@ mod tests {
             out.push((name, snap(&mut app)));
         }
 
-        // [design-supervisor, vacuous-gate] The "fleet roster" fixture above
-        // is unfiltered and all-tied (fresh three_panes()), so the §2 gates
-        // below never looked at a filtered title tag or a worst-first
-        // reorder — the two things ux P2-11 added. A mixed fleet with a
-        // status filter active exercises both: the ◆ pane (last in tab
-        // order) sorts first, and the title carries its own colored glyph.
+        // The "fleet roster" fixture above is unfiltered and all-tied
+        // (fresh three_panes()), so it never exercises a filtered title tag
+        // or a worst-first reorder. A mixed fleet with a status filter
+        // active exercises both: the ◆ pane (last in tab order) sorts
+        // first, and the title carries its own colored glyph.
         {
             use crate::core::status::AgentStatus;
             use crate::ports::PaneBackend;
@@ -3669,10 +3517,8 @@ mod tests {
         out
     }
 
-    /// F1 (exit UX audit 2026-08-07, C9 reordered): the alt-warning used to
-    /// pre-empt `draw_hint_bar`'s flash branch outright, so a copy performed
-    /// while the warning wanted to be up showed no confirmation at all. Both
-    /// conditions true at once, flash must still win the row.
+    /// Both the flash and the alt-warning can want the hint bar at once;
+    /// flash must win the row.
     #[test]
     fn flash_wins_the_hint_bar_over_the_alt_warning() {
         use ratatui::backend::TestBackend;
@@ -3693,25 +3539,20 @@ mod tests {
         assert!(!row.contains("Alt keys"), "the alt-warning must not pre-empt the flash: {row:?}");
     }
 
-    /// [design-supervisor pattern, SG-2's own shape] The three §2 gates below
-    /// only audit whatever `chrome_buffers()` happens to produce — a drawn
-    /// state the fixture never visits is checked vacuously, which is exactly
-    /// how the too-small notice, a lit selection and the filtered roster
-    /// each shipped uncovered until someone noticed and patched the fixture
-    /// by hand. `chrome_buffers()` has no way to notice *itself* that a new
-    /// drawn surface exists; only a human remembering does.
+    /// The three §2 gates below only audit whatever `chrome_buffers()`
+    /// happens to produce — a drawn state the fixture never visits is
+    /// checked vacuously. `chrome_buffers()` has no way to notice *itself*
+    /// that a new drawn surface exists; only a human remembering does.
     ///
     /// This closes that gap for exactly one axis: `Mode` gates every modal
     /// chrome surface (C12-C16, C20, C22, C24, C27), and the match below has
     /// **no wildcard arm** — the compiler refuses to build the moment a new
-    /// `Mode` variant is added without a decision here, which is "fails
-    /// until covered" rather than "silently passes" (the brief's own ask).
-    /// It is not a general solution: screen-size variants (C30), status
-    /// combinations (the roster filter), and focus permutations (C7's
-    /// unfocused expanded-stack edge — see the audit) are not enum-shaped,
-    /// so nothing here catches a gap in those axes. That remainder is a
-    /// human-must-remember list, recorded in the audit rather than faked
-    /// into a check that only looks exhaustive.
+    /// `Mode` variant is added without a decision here ("fails until
+    /// covered" rather than "silently passes"). It is not a general
+    /// solution: screen-size variants (C30), status combinations (the
+    /// roster filter), and focus permutations (C7's unfocused
+    /// expanded-stack edge) are not enum-shaped, so nothing here catches a
+    /// gap in those axes — that remainder is a human-must-remember list.
     #[test]
     fn every_mode_variant_has_a_chrome_buffers_fixture() {
         // Exhaustive by construction: a new `Mode` variant is a compile
@@ -3857,15 +3698,12 @@ mod tests {
         }
     }
 
-    /// The heart of the 2026-07-27 stance: every word roost draws is the
-    /// terminal's own foreground on its own background — the one contrast
-    /// pair the user has already validated — optionally one rung quieter.
-    /// A chrome cell carrying a *letter* may therefore only be `Reset`, the
-    /// accent red, or unstyled; never a colour the theme is free to swallow.
-    /// [Amended 2026-08-07, C5] `LightRed` (the retired colour pulse's
-    /// bright phase) is gone from the allow-list — animation lives in the
-    /// glyph now, not a second red, and `LightRed` has no live constructor
-    /// left anywhere under `src/`.
+    /// Every word roost draws is the terminal's own foreground on its own
+    /// background — the one contrast pair the user has already validated —
+    /// optionally one rung quieter. A chrome cell carrying a *letter* may
+    /// therefore only be `Reset`, the accent red, or unstyled; never a
+    /// colour the theme is free to swallow. Status animation lives in the
+    /// glyph (C5's spinner), not a second colour.
     #[test]
     fn every_chrome_word_is_drawn_in_ink_the_user_already_reads() {
         let legible = [Color::Reset, Color::Red];

@@ -16,40 +16,6 @@ mod harness;
 use std::process::Command;
 use std::time::Duration;
 
-use harness::Harness;
-
-/// Two tabs: `main` holds one pane, `api` holds two. The roster must show
-/// all three under two headers whichever tab is active.
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [
-            {
-                "name": "main",
-                "layout": { "pane": 1 },
-                "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-            },
-            {
-                "name": "api",
-                "layout": {
-                    "split": {
-                        "dir": "vertical",
-                        "ratios": [0.5, 0.5],
-                        "children": [{ "pane": 2 }, { "pane": 3 }]
-                    }
-                },
-                "panes": {
-                    "2": {"adapter": "shell", "cwd": cwd},
-                    "3": {"adapter": "shell", "cwd": cwd}
-                }
-            }
-        ],
-        "next_pane_id": 4
-    })
-    .to_string()
-}
-
 /// `Alt+Shift+a` as a terminal delivers it without the kitty disambiguation:
 /// ESC + uppercase `A`. (Unlike C23's ESC+`P`, this pair is not an escape
 /// introducer, so there is no DCS-style ambiguity — SPEC-ux N3.)
@@ -80,12 +46,8 @@ fn focused_pane(state_dir: &std::path::Path) -> u64 {
 fn the_roster_lists_another_tabs_panes_and_jumps_across_to_one() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP roster e2e: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("roster e2e", &harness::two_tabs(cwd)) else {
+        return;
     };
     let sd = h.state_dir().to_path_buf();
     assert!(

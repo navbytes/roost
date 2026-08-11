@@ -23,7 +23,7 @@
 //!   resumable id here means reading that one line, not just parsing the
 //!   filename.
 
-use super::{AgentAdapter, CommandSpec};
+use super::AgentAdapter;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -79,12 +79,8 @@ impl AgentAdapter for GeminiAdapter {
         "gemini"
     }
 
-    fn launch(&self, cwd: &Path) -> CommandSpec {
-        CommandSpec::new("gemini", cwd)
-    }
-
-    fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
-        CommandSpec::new("gemini", cwd).arg("--resume").arg(session)
+    fn resume_flag(&self) -> &'static str {
+        "--resume"
     }
 
     /// Already scoped to `cwd` by construction — the slug lookup is keyed on
@@ -114,6 +110,7 @@ impl AgentAdapter for GeminiAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::test_support::{scratch_dir, RootAdapter};
     use super::super::SessionState;
     use std::collections::HashSet;
     use std::time::{Duration, SystemTime};
@@ -132,16 +129,9 @@ mod tests {
         assert_eq!(cmd.args, vec!["--resume", "a1b2c3d4-e5f6-7890-abcd-ef1234567890"]);
     }
 
-    fn fixture_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("roost-gemini-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     #[test]
     fn project_slug_resolves_the_registered_cwd_and_nothing_else() {
-        let d = fixture_dir("registry");
+        let d = scratch_dir("gemini-registry");
         std::fs::write(
             d.join("projects.json"),
             r#"{"projects":{"/home/nav/proj-x":"crimson-otter-42"}}"#,
@@ -158,7 +148,7 @@ mod tests {
 
     #[test]
     fn project_slug_none_when_registry_file_is_absent() {
-        let d = fixture_dir("no-registry");
+        let d = scratch_dir("gemini-no-registry");
         // No projects.json written — gemini has never run at all.
         assert_eq!(project_slug(&d, Path::new("/x")), None);
         let _ = std::fs::remove_dir_all(&d);
@@ -166,7 +156,7 @@ mod tests {
 
     #[test]
     fn session_id_round_trips_through_the_first_jsonl_record() {
-        let d = fixture_dir("content");
+        let d = scratch_dir("gemini-content");
         let file = d.join("session-2026-08-06T10-30-a1b2c3d4.jsonl");
         std::fs::write(
             &file,
@@ -182,7 +172,7 @@ mod tests {
 
     #[test]
     fn ignores_subagent_transcripts_and_non_jsonl_files() {
-        let d = fixture_dir("filter");
+        let d = scratch_dir("gemini-filter");
         // Subagent transcript: no `session-` prefix.
         let subagent = d.join("a1b2c3d4-e5f6-7890-abcd-ef1234567890.jsonl");
         std::fs::write(&subagent, "{\"sessionId\":\"nope\"}\n").unwrap();
@@ -205,49 +195,26 @@ mod tests {
         assert!(GeminiAdapter.owns_session_file(f, Path::new("/home/nav/unrelated")));
     }
 
-    /// Delegates to the real adapter's parsing but points `session_root` at
-    /// a fixture directory, so `session_state`/`detect_session` (trait
-    /// defaults) can be exercised without touching the real ~/.gemini or a
-    /// real projects.json.
-    struct FixtureGemini(PathBuf);
-    impl AgentAdapter for FixtureGemini {
-        fn id(&self) -> &'static str {
-            "gemini"
-        }
-        fn launch(&self, cwd: &Path) -> CommandSpec {
-            GeminiAdapter.launch(cwd)
-        }
-        fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
-            GeminiAdapter.resume(cwd, session)
-        }
-        fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
-            Some(self.0.clone())
-        }
-        fn session_id_from_path(&self, path: &Path) -> Option<String> {
-            GeminiAdapter.session_id_from_path(path)
-        }
+    fn fixture(root: PathBuf) -> RootAdapter {
+        RootAdapter::with_id_from_path(Some(root), |p| GeminiAdapter.session_id_from_path(p))
     }
 
     #[test]
     fn session_state_unknown_when_root_missing() {
-        let missing =
-            std::env::temp_dir().join(format!("roost-gemini-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&missing);
-        assert_eq!(
-            FixtureGemini(missing).session_state(Path::new("/x"), "id"),
-            SessionState::Unknown
-        );
+        let missing = scratch_dir("gemini-missing");
+        std::fs::remove_dir_all(&missing).unwrap();
+        assert_eq!(fixture(missing).session_state(Path::new("/x"), "id"), SessionState::Unknown);
     }
 
     #[test]
     fn session_state_exists_then_gone() {
-        let d = fixture_dir("state");
+        let d = scratch_dir("gemini-state");
         std::fs::write(
             d.join("session-2026-08-06T10-30-a1b2c3d4.jsonl"),
             "{\"sessionId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\"}\n",
         )
         .unwrap();
-        let a = FixtureGemini(d.clone());
+        let a = fixture(d.clone());
         assert_eq!(
             a.session_state(Path::new("/x"), "a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
             SessionState::Exists
@@ -258,13 +225,13 @@ mod tests {
 
     #[test]
     fn detect_session_finds_the_freshly_written_session_and_skips_taken_ids() {
-        let d = fixture_dir("detect");
+        let d = scratch_dir("gemini-detect");
         let since = SystemTime::now();
         let file = d.join("session-2026-08-06T10-30-a1b2c3d4.jsonl");
         std::fs::write(&file, "{\"sessionId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\"}\n").unwrap();
         std::fs::File::open(&file).unwrap().set_modified(since + Duration::from_millis(10)).unwrap();
 
-        let a = FixtureGemini(d.clone());
+        let a = fixture(d.clone());
         assert_eq!(
             a.detect_session(Path::new("/x"), since, &HashSet::new()).as_deref(),
             Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")

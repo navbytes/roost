@@ -23,23 +23,6 @@ mod harness;
 use std::process::Command;
 use std::time::Duration;
 
-use harness::Harness;
-
-/// One shell pane. Temp-dir cwd keeps C4's corner badge short (same
-/// reasoning as the firehose gate's fixture).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// `roost read 1` against the harness instance, via the real client CLI
 /// (ROOST_STATE routes it to the instance's socket + fleet control token) —
 /// the exact server-side surface P1 measured tearing on.
@@ -68,15 +51,12 @@ fn a_pane_inside_a_2026_bracket_is_never_read_mid_redraw() {
     // only mean the thing the gate is named for — a read that ignored an
     // open bracket. Cap expiry is pinned separately, and without a clock, by
     // `sync_presented`'s own unit tests in src/infra/pty.rs.
-    let mut h = match Harness::try_spawn_with_env(
-        &fixture_workspace(cwd),
+    let Some(mut h) = harness::spawn_or_skip_with_env(
+        "sync-output gate",
+        &harness::one_pane(cwd),
         &[("ROOST_SYNC_CAP_MS", "30000")],
-    ) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP sync-output gate: {reason}");
-            return;
-        }
+    ) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

@@ -13,8 +13,6 @@ mod harness;
 
 use std::time::{Duration, Instant};
 
-use harness::Harness;
-
 /// DESIGN-ui.md §6's own example filler (`printf "%0.sX" $(seq 200); echo`)
 /// prints an IDENTICAL ~200-char line every iteration — a fine stress load,
 /// but useless as a *change* signal: two 500ms samples of a steady-state
@@ -23,32 +21,6 @@ use harness::Harness;
 /// ~200-char lines" while making genuine progress observable, which
 /// assertion 2 below needs.
 const SPEW_CMD: &str = r#"sh -c 'i=0; while :; do i=$((i+1)); printf "%0.sX" $(seq 1 200); printf " %s\n" "$i"; done'"#;
-
-/// Two side-by-side shell panes (DESIGN-ui.md §6 scenario). Pane 1 (left) is
-/// focused by default (`App::new` focuses the first pane in DFS order) and
-/// becomes the firehose; pane 2 (right) stays a quiet interactive shell that
-/// takes focus for the latency check.
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": {
-                "split": {
-                    "dir": "vertical",
-                    "ratios": [0.5, 0.5],
-                    "children": [{"pane": 1}, {"pane": 2}]
-                }
-            },
-            "panes": {
-                "1": {"adapter": "shell", "cwd": cwd},
-                "2": {"adapter": "shell", "cwd": cwd}
-            }
-        }]
-    })
-    .to_string()
-}
 
 /// Text of one half of the screen (all rows, columns restricted to that
 /// half), newline-joined. A cheap way to scope an assertion to "pane A's
@@ -95,12 +67,12 @@ fn firehose_latency_starvation_and_clean_exit() {
     // the way; it isn't what's under test here.
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP firehose gate: {reason}");
-            return;
-        }
+    // Two side-by-side shell panes (DESIGN-ui.md §6 scenario, `harness::
+    // two_panes`). Pane 1 (left) is focused by default (`App::new` focuses
+    // the first pane in DFS order) and becomes the firehose; pane 2 (right)
+    // stays a quiet interactive shell that takes focus for the latency check.
+    let Some(mut h) = harness::spawn_or_skip("firehose gate", &harness::two_panes(cwd)) else {
+        return;
     };
 
     // Let the initial frame (two spawned shell panes) settle before driving it.

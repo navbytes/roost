@@ -17,7 +17,7 @@
 //!   (protocol::SessionMeta), which nothing here reads — see
 //!   `owns_session_file` below.
 
-use super::{AgentAdapter, CommandSpec};
+use super::AgentAdapter;
 use std::path::{Path, PathBuf};
 
 pub struct CodexAdapter;
@@ -27,12 +27,8 @@ impl AgentAdapter for CodexAdapter {
         "codex"
     }
 
-    fn launch(&self, cwd: &Path) -> CommandSpec {
-        CommandSpec::new("codex", cwd)
-    }
-
-    fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
-        CommandSpec::new("codex", cwd).arg("resume").arg(session)
+    fn resume_flag(&self) -> &'static str {
+        "resume"
     }
 
     /// Global rather than per-cwd: codex has no per-project subdirectory to
@@ -78,6 +74,7 @@ impl AgentAdapter for CodexAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::test_support::{scratch_dir, RootAdapter};
     use super::super::SessionState;
     use std::collections::HashSet;
     use std::time::{Duration, SystemTime};
@@ -137,49 +134,20 @@ mod tests {
         assert!(CodexAdapter.owns_session_file(f, Path::new("/home/nav/totally-unrelated")));
     }
 
-    /// Delegates to the real adapter's parsing but points `session_root` at
-    /// a fixture directory, so `session_state`/`detect_session` (trait
-    /// defaults) can be exercised without touching the real ~/.codex.
-    struct FixtureCodex(PathBuf);
-    impl AgentAdapter for FixtureCodex {
-        fn id(&self) -> &'static str {
-            "codex"
-        }
-        fn launch(&self, cwd: &Path) -> CommandSpec {
-            CodexAdapter.launch(cwd)
-        }
-        fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
-            CodexAdapter.resume(cwd, session)
-        }
-        fn session_root(&self, _cwd: &Path) -> Option<PathBuf> {
-            Some(self.0.clone())
-        }
-        fn session_id_from_path(&self, path: &Path) -> Option<String> {
-            CodexAdapter.session_id_from_path(path)
-        }
-    }
-
-    fn fixture_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("roost-codex-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn fixture(root: PathBuf) -> RootAdapter {
+        RootAdapter::with_id_from_path(Some(root), |p| CodexAdapter.session_id_from_path(p))
     }
 
     #[test]
     fn session_state_unknown_when_root_missing() {
-        let missing =
-            std::env::temp_dir().join(format!("roost-codex-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&missing);
-        assert_eq!(
-            FixtureCodex(missing).session_state(Path::new("/x"), "id"),
-            SessionState::Unknown
-        );
+        let missing = scratch_dir("codex-missing");
+        std::fs::remove_dir_all(&missing).unwrap();
+        assert_eq!(fixture(missing).session_state(Path::new("/x"), "id"), SessionState::Unknown);
     }
 
     #[test]
     fn session_state_exists_then_gone() {
-        let d = fixture_dir("state");
+        let d = scratch_dir("codex-state");
         let day = d.join("2026").join("08").join("06");
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(
@@ -187,7 +155,7 @@ mod tests {
             "",
         )
         .unwrap();
-        let a = FixtureCodex(d.clone());
+        let a = fixture(d.clone());
         assert_eq!(
             a.session_state(Path::new("/x"), "3f9a1c2e-7b4d-4a11-9c2e-0f1a2b3c4d5e"),
             SessionState::Exists
@@ -198,7 +166,7 @@ mod tests {
 
     #[test]
     fn detect_session_finds_the_freshly_written_rollout_and_skips_taken_ids() {
-        let d = fixture_dir("detect");
+        let d = scratch_dir("codex-detect");
         let day = d.join("2026").join("08").join("06");
         std::fs::create_dir_all(&day).unwrap();
         let since = SystemTime::now();
@@ -207,7 +175,7 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         std::fs::File::open(&file).unwrap().set_modified(since + Duration::from_millis(10)).unwrap();
 
-        let a = FixtureCodex(d.clone());
+        let a = fixture(d.clone());
         assert_eq!(
             a.detect_session(Path::new("/x"), since, &HashSet::new()).as_deref(),
             Some("3f9a1c2e-7b4d-4a11-9c2e-0f1a2b3c4d5e")

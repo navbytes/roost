@@ -24,33 +24,6 @@ mod harness;
 use std::process::Command;
 use std::time::Duration;
 
-use harness::Harness;
-
-/// Two shell panes side by side: `vertical` splits along a vertical line, so
-/// each pane is half the harness's 120 columns (58 inner) and zooming the
-/// focused one takes it to 118 — P5's measured pair of widths.
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": {
-                "split": {
-                    "dir": "vertical",
-                    "ratios": [0.5, 0.5],
-                    "children": [{ "pane": 1 }, { "pane": 2 }]
-                }
-            },
-            "panes": {
-                "1": {"adapter": "shell", "cwd": cwd},
-                "2": {"adapter": "shell", "cwd": cwd}
-            }
-        }]
-    })
-    .to_string()
-}
-
 /// `roost read 1 --tail N` against the harness instance, via the real client
 /// CLI (ROOST_STATE routes it to the instance's socket + fleet control token)
 /// — the pane's whole recorded output, history included, which is where a
@@ -73,12 +46,8 @@ const ALT_Z: &[u8] = b"\x1bz";
 fn a_zoom_round_trip_keeps_every_column_of_a_line_printed_while_zoomed() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP reflow gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("reflow gate", &harness::two_panes(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 

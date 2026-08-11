@@ -24,23 +24,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
-/// One shell pane. Temp-dir cwd keeps C4's corner badge short (same
-/// reasoning as the firehose gate's fixture).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -49,12 +32,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP pane-title gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("pane-title gate", &harness::one_pane(cwd)) else {
+        return;
     };
     // Before: the untitled pane's badge carries the `adapter · cwd-tag`
     // fallback, so "1 shell" is on screen and no task name is.

@@ -42,28 +42,18 @@ use std::time::{Duration, Instant};
 use crate::core::control::{Reply, Request, TokenReader, UNAUTHORIZED_MSG};
 
 /// Wall-clock deadline for a connection that has *not yet* sent a
-/// well-formed control request (audit finding C1 — a second review pass on
-/// the H1 fix). A separate, smaller *shared* pre-auth pool made this cheaper
-/// to attack than the bug it replaced: 16 idle connections (one keepalive
-/// byte each per <30s, no valid token needed) permanently shed every *new*
-/// connection, including the human's CLI. The lesson: any shared pool sized
-/// to bound an attacker also bounds the victim, because sock.rs can't tell
-/// them apart — per-connection resources are the only ones an attacker
-/// can't share with someone else. Bounding pre-auth connections by *time*
-/// instead means a pile of squatters recycles on its own; nobody else is
-/// ever blocked from getting in.
+/// well-formed control request. A per-connection wall-clock bound rather
+/// than a shared pool: any shared pool sized to bound an attacker also
+/// bounds the victim, since sock.rs can't tell them apart. Bounding
+/// pre-auth connections by *time* instead means a pile of squatters
+/// recycles on its own; nobody else is ever blocked from getting in.
 ///
-/// This must be enforced as real elapsed time since the connection was
-/// accepted, not merely as `SO_RCVTIMEO` (`set_read_timeout`, below) — a
-/// first cut of this fix used only the socket-level read timeout and
-/// `read_until`, and that bounds a single `read()` *syscall*, not the
-/// connection: a client drip-feeding one byte slower than a full line but
-/// faster than the timeout (repro: one byte every 1.2s against a 2s
-/// timeout) never trips it, and `read_until` loops internally with no
-/// wall-clock check of its own, so it just kept accumulating — charged
-/// nothing, never promoted, never timed out. `read_line_deadlined` drives
-/// `fill_buf`/`consume` by hand instead and checks an `Instant` recorded at
-/// connection start against this constant on every iteration, independent
+/// Enforced as real elapsed time since accept, not merely `SO_RCVTIMEO`
+/// (`set_read_timeout`, below) — a socket timeout only bounds one `read()`
+/// *syscall*, not the connection: a client drip-feeding one byte slower
+/// than a full line but faster than the timeout never trips it.
+/// `read_line_deadlined` drives `fill_buf`/`consume` by hand and checks an
+/// `Instant` recorded at connection start on every iteration, independent
 /// of the socket timeout. The socket timeout is still set (it's what makes
 /// that loop tick on a truly silent connection rather than block forever on
 /// one `read()`), but it's no longer what *bounds* pre-auth admission.
@@ -77,44 +67,29 @@ const PRE_AUTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// existing `Err(_) => break` below already exits without logging, so a
 /// timeout firing is silent, not spammy.
 ///
-/// Exception (P1): a connection promoted only by a status/session line,
-/// never a control request (`guard.principal.is_none()` in
-/// `spawn_accept_loop`), retries past this instead of ending the
-/// connection — see the comment on that retry clause. That's the pi
-/// extension's actual shape: it dials once and holds the socket for the
-/// pane's whole process lifetime with no keepalive and no reconnect on
-/// error, so a `READ_TIMEOUT` firing on it is an ordinary gap between an
-/// agent's status transitions (a human reading the output for a while is
-/// the normal case), not a hung client — the P0 wedge this constant exists
-/// to prevent. A connection that *did* send a control request is
+/// Exception: a connection promoted only by a status/session line, never a
+/// control request (`guard.principal.is_none()` in `spawn_accept_loop`),
+/// retries past this instead of ending the connection — see the retry
+/// clause there for why. A connection that *did* send a control request is
 /// unaffected: it's still reaped here, unchanged.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wall-clock budget for handing one whole reply to the client, enforced by
-/// `write_reply`'s own loop. The write-side twin of `READ_TIMEOUT`, and the
-/// only thing that bounds a connection parked in `write_reply`: P0 above says
-/// no client *read* may block forever, nothing said the same about the reply,
-/// and a blocking `write_all` on a peer that has stopped reading is reached
-/// by none of the reaping paths here — `PRE_AUTH_READ_TIMEOUT` and
-/// `READ_TIMEOUT` only ever fire on a thread that is in a `read()`. Repro:
-/// `MAX_CONN` connections that each send one request and never read the
-/// answer (pipelining more replies than their receive buffer holds does it
-/// too); every connection thread wedges in `write_all`, the global pool sits
-/// at `MAX_CONN` for as long as those peers live, and the accept loop sheds
-/// every new client with nothing left that can ever free a slot — a black
-/// hole only a restart clears. The identical flood with a *readable* peer is
-/// reaped on `READ_TIMEOUT` and recovers, which is what isolates the write.
+/// `write_reply`'s own loop — the write-side twin of `READ_TIMEOUT`, and the
+/// only thing that bounds a connection parked in `write_reply`: a blocking
+/// `write_all` on a peer that has stopped reading is reached by none of the
+/// reaping paths here — `PRE_AUTH_READ_TIMEOUT` and `READ_TIMEOUT` only ever
+/// fire on a thread that is in a `read()`. Without this, `MAX_CONN`
+/// connections that each send one request and never read the answer wedge
+/// every connection thread in `write_all`; the global pool sits full for as
+/// long as those peers live, and nothing left can ever free a slot — a black
+/// hole only a restart clears.
 ///
-/// Wall-clock, not `SO_SNDTIMEO`, for exactly the reason `PRE_AUTH_READ_
-/// TIMEOUT` is: a socket option bounds one `write()` syscall, not the reply.
-/// A first cut used only `set_write_timeout` and `write_all`, and a peer that
-/// accepts a few bytes per timeout window — `write_all` loops with no
-/// wall-clock check of its own — simply stretched one reply across as many
-/// windows as the payload has chunks. That is the same drip the C1 fix closed
-/// on the read side, pointed the other way, and it showed up first as this
-/// file's own regression test taking 10s alone but blowing a 30s deadline
-/// under a loaded parallel suite run: with the bound proportional to the
-/// payload rather than fixed, there was no honest number to assert.
+/// Wall-clock, not `SO_SNDTIMEO`, for the same reason as
+/// `PRE_AUTH_READ_TIMEOUT`: a socket option bounds one `write()` syscall,
+/// not the reply, so a peer that accepts a few bytes per timeout window
+/// would otherwise stretch one reply across as many windows as the payload
+/// has chunks.
 ///
 /// Five seconds is enormous for a *local* socket, where any live client
 /// drains a multi-megabyte `read` in milliseconds; a peer that cannot take
@@ -136,12 +111,7 @@ const WRITE_TICK: Duration = Duration::from_millis(250);
 /// this; a client that streams without a newline past the cap gets
 /// `OVERSIZE_LINE_MSG` back instead of being allowed to grow an unbounded
 /// buffer (local DoS) — then the connection is closed regardless, since
-/// there is no newline left in it to resynchronise a next request on. Before
-/// that reply existed the caller just saw the connection vanish (EPIPE),
-/// which `cli.rs` reported as "cannot reach a running roost" — exactly the
-/// wrong diagnosis, and the neighbouring size to the one that used to freeze
-/// the whole process (PR #67), so it's exactly where someone lands right
-/// after hitting that.
+/// there is no newline left in it to resynchronise a next request on.
 const MAX_LINE: u64 = 64 * 1024;
 
 /// The exact reply for a line that hits `MAX_LINE`. `cli.rs` matches this
@@ -149,7 +119,7 @@ const MAX_LINE: u64 = 64 * 1024;
 /// runtime one (1) every other `err` reply here gets — this is the caller's
 /// own oversized input, not a roost failure. A `pub const` shared by both
 /// sides rather than hand-typed twice, same reasoning as
-/// `UNSAFE_SOCKET_DIR_MSG` above: two copies would let a reword here quietly
+/// `UNSAFE_SOCKET_DIR_MSG` below: two copies would let a reword here quietly
 /// stop matching what `cli.rs` checks.
 pub const OVERSIZE_LINE_MSG: &str = "message too large (max 64 KiB); split it or use a file";
 
@@ -158,81 +128,54 @@ pub const OVERSIZE_LINE_MSG: &str = "message too large (max 64 KiB); split it or
 const MAX_CONN: usize = 64;
 
 /// Per-principal share of `MAX_CONN`, for connections that *have* sent a
-/// well-formed request (DESIGN-control.md §5.6 / audit M3). Must be at least
-/// `app.rs`'s `MAX_WAITS` (16, private to that file — a cross-file invariant
-/// kept in sync by hand; NEED: consider making it `pub(crate)`): each parked
+/// well-formed request. Must be at least `app.rs`'s `MAX_WAITS` (16, private
+/// to that file — a cross-file invariant kept in sync by hand): each parked
 /// `wait` holds one connection open for its deferred reply, so a cap below
 /// MAX_WAITS refuses a fleet-wide wait the rest of the system already
-/// considers and bounds — a self-inflicted product regression, not a
-/// security property. 20 leaves a few spare connections for other commands
-/// (list/spawn/send) alongside a fully-parked 16-wait fleet, while still
-/// bounding one principal under a third of the global pool.
+/// bounds. 20 leaves a few spare connections for other commands (list/
+/// spawn/send) alongside a fully-parked 16-wait fleet, while still bounding
+/// one principal under a third of the global pool.
 const PRINCIPAL_MAX_CONN: usize = 20;
+
+/// Per-*connection* token bucket for every line read, well-formed or not —
+/// the lock-free fast path: plain local state (no lock, no shared map), so
+/// the cost of a line flood lands on whichever connection sent it, never on
+/// anyone else's. 128 gives a legitimate connection's own request burst room
+/// before this throttles it; 20/s is a generous steady rate for one
+/// connection. On its own this bounds one *connection*, not one *attacker*
+/// — a fresh connection gets a fresh bucket — so it's paired with the
+/// reconnect-surviving `PRINCIPAL_BUCKET_CAPACITY` bucket below (see the
+/// `Limits` doc comment for the two-layer shape).
+const LINE_BUCKET_CAPACITY: f64 = 128.0;
+const LINE_REFILL_PER_SEC: f64 = 20.0;
 
 /// Token-bucket capacity for control *commands* (not connections, not raw
 /// lines — see `LINE_BUCKET_CAPACITY`) from one principal — see
-/// `Bucket`/`Limits::take_principal`. A real fan-out is two commands per
-/// pane (`spawn` then `wait`); DESIGN-control.md §7 illustrates this with 10
-/// panes for brevity, but a realistic fleet is closer to 20 panes = 40
-/// commands back-to-back (audit finding M3). 64 covers that with room for a
-/// dozen more interleaved `list`/`status`/`read` calls.
+/// `Bucket`/`Limits::take_principal`. Unlike the per-connection line bucket,
+/// this persists across reconnects (keyed on the admitted token, not the
+/// connection), so it's what actually bounds `while :; do roost list; done`
+/// (a fresh connection, and so a fresh line bucket, every request). A real
+/// fan-out is two commands per pane (`spawn` then `wait`); a realistic fleet
+/// is closer to 20 panes = 40 commands back-to-back. 64 covers that with
+/// room for a dozen more interleaved `list`/`status`/`read` calls.
 const PRINCIPAL_BUCKET_CAPACITY: f64 = 64.0;
 
 /// Steady-state refill for one principal once its burst is spent. Real
 /// control actions (spawn/send/read/close) are issued one at a time by a
 /// human or an orchestrator reacting to a `wait` reply — `wait` exists
 /// precisely so a caller never has to poll in a tight loop, so 5/s is
-/// generous headroom above any legitimate cadence. This bucket is *not* by
-/// itself an effective deterrent against the audit-log-rotation flood — see
-/// `GLOBAL_BUCKET_CAPACITY` and DESIGN-control.md §5.6 for the corrected
-/// (audit finding H3) arithmetic.
+/// generous headroom above any legitimate cadence while still cutting a
+/// reconnect-per-request flood down to a rate an audit log can outlive (see
+/// `src/core/app.rs`'s truncated-audit-line accounting).
 const PRINCIPAL_REFILL_PER_SEC: f64 = 5.0;
 
-/// Per-*connection* token bucket for every line read, well-formed or not
-/// (audit finding C2 — a second review pass on the H1/M2 per-line charge).
-/// That charge originally landed on the *shared* aggregate bucket: one
-/// connection spewing blank lines emptied it in milliseconds and held it at
-/// zero, `rate limited`-ing every other connection on the socket — cheaper
-/// than the M3 flood it replaced, and it serialized all control traffic on
-/// the aggregate's mutex besides. A per-connection bucket is plain local
-/// state (no lock, no shared map): the cost of a line flood lands on
-/// whichever connection sent it, never on anyone else's. 128 is double
-/// `PRINCIPAL_BUCKET_CAPACITY` so a legitimate connection's own request
-/// burst is never throttled here first; 20/s matches the old aggregate
-/// rate, now scoped to one connection instead of the whole control plane.
-const LINE_BUCKET_CAPACITY: f64 = 128.0;
-const LINE_REFILL_PER_SEC: f64 = 20.0;
-
-/// Aggregate backstop across *all* principals, charged only once a request
-/// has passed its own connection's line bucket and per-principal bucket and
-/// is genuinely about to be dispatched to the main loop (audit finding C2)
-/// — never for raw line volume, which is bounded per-connection instead.
-/// This still bounds total command throughput regardless of how many
-/// admitted identities a flood claims (finding H2). 256 (4x the
-/// per-principal capacity) covers one principal's full burst with headroom
-/// for a couple more concurrent principals bursting at once.
-///
-/// Audit finding H3 correction: `app.rs`'s audit-log write is bounded by
-/// *bytes* attacker-controlled fields contribute (`sanitize`, app.rs, does
-/// not truncate — NEED: fix there, out of this file's lane), not by call
-/// count. With `MAX_LINE` (64 KiB) against a 4 MiB log kept at one
-/// generation, as few as ~140 *allowed* requests roll it twice and erase
-/// everything. At this bucket's 20/s steady state that's ~7s; at one
-/// principal's 5/s alone it's ~22s. These buckets slow a flood from "as
-/// fast as the wire allows" to that — they do not make the log-rotation
-/// attack impractical by themselves; only truncating the audit line
-/// (app.rs) does.
-const GLOBAL_BUCKET_CAPACITY: f64 = 256.0;
-const GLOBAL_REFILL_PER_SEC: f64 = 20.0;
-
 /// Reject any control request whose token exceeds this, in `parse_control`,
-/// before it can reach per-principal bookkeeping (audit finding M1). Real
-/// tokens are 32 hex chars; 128 is generous headroom. Without this cap, a
-/// same-uid attacker could set an arbitrarily long (up to `MAX_LINE`, 64 KiB)
-/// token and make `evict_one`'s scan (bounded to `MAX_TRACKED_TOKENS`
-/// entries) clone up to 64 KiB *per entry scanned* — tens of MiB of
-/// alloc+memcpy, on the hot path, before the aggregate check even runs.
-/// Cheapest fix: refuse it at the source rather than pay for it later.
+/// before it can reach per-principal bookkeeping. Real tokens are 32 hex
+/// chars; 128 is generous headroom. Without this cap, a same-uid attacker
+/// could set an arbitrarily long (up to `MAX_LINE`, 64 KiB) token and make
+/// `evict_one`'s scan (bounded to `MAX_TRACKED_TOKENS` entries) clone up to
+/// 64 KiB *per entry scanned* — cheapest fix is to refuse it at the source
+/// rather than pay for it later.
 const MAX_TOKEN_LEN: usize = 128;
 
 /// Cap on distinct tokens tracked in `Limits::buckets` at once (see
@@ -241,22 +184,17 @@ const MAX_TOKEN_LEN: usize = 128;
 /// map — and with it, roost's memory — grows without limit. `MAX_TOKEN_LEN`
 /// bounds the cost *per* tracked entry; this bounds how many entries there
 /// can be. Real principal counts here are tiny (the fleet token plus however
-/// many panes exist, itself accidentally bounded by terminal size —
-/// MIN_SPLIT_COLS, per the audit); 512 is generous headroom above that, so
-/// eviction only ever engages under actual token-rotation abuse, never
-/// legitimate use.
+/// many panes exist); 512 is generous headroom above that, so eviction only
+/// ever engages under actual token-rotation abuse, never legitimate use.
 const MAX_TRACKED_TOKENS: usize = 512;
 
 /// The exact substring `main.rs`'s `is_unsafe_socket_dir` matches a
 /// `spawn_listener` failure against to decide whether it's the one fatal
 /// case (an attacker may have pre-created the socket directory) versus
-/// every other failure, which degrades to "no control plane" instead (P2).
-/// A `pub const` shared by the `bail!` below and that check, rather than two
-/// hand-typed copies of the same wording: with two copies, rewording this
-/// message here left nothing to notice the check in `main.rs` — or its
-/// test, which built its own `anyhow!` strings instead of driving this
-/// code — no longer matching it. Sharing the identifier makes that
-/// divergence impossible to introduce by editing wording alone.
+/// every other failure, which degrades to "no control plane" instead. A
+/// `pub const` shared by the `bail!` below and that check, rather than two
+/// hand-typed copies of the same wording — sharing the identifier makes it
+/// impossible for the two to drift apart by editing wording alone.
 pub const UNSAFE_SOCKET_DIR_MSG: &str = "unsafe ownership/permissions";
 
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
@@ -460,18 +398,18 @@ impl Bucket {
     }
 }
 
-/// `lock().unwrap()` that survives a poisoned mutex (audit finding L1). These
-/// mutexes only ever guard plain counters/maps; a panic on *some other*
-/// thread leaving one "poisoned" is not a reason for *this* thread to also
-/// lose the ability to release its own slots — recovering the (still
-/// structurally valid) inner state and proceeding beats a cascading panic
-/// that leaks every connection behind it.
+/// `lock().unwrap()` that survives a poisoned mutex. These mutexes only ever
+/// guard plain counters/maps; a panic on *some other* thread leaving one
+/// "poisoned" is not a reason for *this* thread to also lose the ability to
+/// release its own slots — recovering the (still structurally valid) inner
+/// state and proceeding beats a cascading panic that leaks every connection
+/// behind it.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Connection and command accounting shared by the listener's accept loop
-/// and every per-connection thread it spawns (DESIGN-control.md §5.6).
+/// Connection accounting shared by the listener's accept loop and every
+/// per-connection thread it spawns (DESIGN-control.md §5.6).
 ///
 /// Every cap here is keyed on the caller's raw wire `token` string, not a
 /// resolved `Actor` — sock.rs has no access to `App::resolve_actor` (that's
@@ -482,36 +420,37 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// rejected: in this same-uid threat model the uid is always the operator's
 /// own, and the pid is the *client* process on the other end of one
 /// connection — for the one-shot `roost <verb>` CLI that's a fresh pid every
-/// single invocation, so a `for i in (seq 200000); roost list; end` flood
-/// would never repeat a pid and a pid-keyed cap would never trip. The token
-/// is the one thing that *is* stable across exactly that loop (one
-/// `ROOST_TOKEN` env var, inherited by every re-exec), so it is not merely
-/// "all we have" — it's the only stable handle on the actual attack shape.
+/// single invocation, so a pid-keyed cap would never trip against a flood of
+/// them. The token is the one thing that *is* stable across exactly that
+/// loop (one `ROOST_TOKEN` env var, inherited by every re-exec), so it's the
+/// only stable handle on the actual attack shape.
 ///
-/// A design constraint from a second review pass, worth stating plainly:
-/// **any *shared* pool sized to bound an attacker also bounds the victim,
-/// because sock.rs cannot tell them apart. Per-connection resources are the
-/// only ones an attacker can't share with a victim.** Two mitigations here
-/// used to be shared pools and got cheaper to attack than the bug they
-/// replaced as a result (findings C1/C2); neither is any more:
-/// - Pre-auth admission is bounded by a short read timeout
-///   (`PRE_AUTH_READ_TIMEOUT`, see `spawn_accept_loop`), not a shared
-///   counter — a pile of squatters can never prevent a fresh connection
-///   from being accepted and promoted.
+/// A design constraint worth stating plainly: **any *shared* pool sized to
+/// bound an attacker also bounds the victim, because sock.rs cannot tell
+/// them apart. Per-connection resources are the only ones an attacker can't
+/// share with a victim.** That's why there is no *shared* aggregate bucket
+/// here any more — one used to sit downstream of the per-principal bucket
+/// and was cheaper to attack than the flood it replaced (one connection's
+/// blank-line flood could `rate limited` every other connection on the
+/// socket), so it's gone. What's left is two layers, each earning its
+/// keep by bounding something the other can't:
 /// - Every line a connection sends costs one token from a *per-connection*
 ///   `Bucket` (`spawn_accept_loop`'s `line_bucket` — plain local state, no
-///   lock, no map) before it's even parsed. The *shared* aggregate bucket
-///   (`take_global`) is charged only once a request has already passed the
-///   per-principal check and is genuinely about to be dispatched.
+///   lock, no map) before it's even parsed. Lock-free fast path, but scoped
+///   to the connection: a fresh connection gets a fresh bucket, so this
+///   alone doesn't bound a caller that reconnects per request.
+/// - A request that's actually about to be dispatched also costs one token
+///   from a *per-principal* `Bucket` (`Limits.buckets`, keyed on the
+///   admitted token, entries persisting for the life of the listener) —
+///   this is the bound that survives `while :; do roost list; done` (a
+///   fresh connection, and fresh `line_bucket`, every time).
 ///
 /// A connection only ever charges the identity it was *admitted* under,
 /// never a token that merely appears in a later request's body.
 /// `ConnGuard::principal` is set once, from the first well-formed request's
 /// token, and every later charge on that connection uses that same value —
 /// so varying the `token` field request-to-request on one already-open
-/// connection can't mint a fresh per-principal bucket (audit finding H2). An
-/// "unresolved" token — one that never admitted a connection — therefore
-/// never becomes a `buckets` key at all.
+/// connection can't mint a fresh per-principal bucket (audit finding H2).
 struct Limits {
     /// Race-free global connection count.
     global: AtomicUsize,
@@ -520,23 +459,20 @@ struct Limits {
     /// more entries than there are currently-open admitted connections.
     per_principal: Mutex<HashMap<String, usize>>,
     /// Command-rate bucket per *admitted* principal (see the struct doc
-    /// comment above). Entries persist for the life of the listener — a
-    /// flood-by-reconnect must not reset its budget. Bounded at
-    /// `MAX_TRACKED_TOKENS` (see `evict_one`): sock.rs can't validate
-    /// tokens, so leaving this unbounded would let the same attacker this
-    /// map exists to throttle instead exhaust memory by minting a fresh
-    /// admitted identity per connection — a security fix that opens a
-    /// (smaller) security hole is not a deferral worth taking here.
+    /// comment above) — the reconnect-surviving layer. Entries persist for
+    /// the life of the listener — a flood-by-reconnect must not reset its
+    /// budget. Bounded at `MAX_TRACKED_TOKENS` (see `evict_one`): sock.rs
+    /// can't validate tokens, so leaving this unbounded would let the same
+    /// attacker this map exists to throttle instead exhaust memory by
+    /// minting a fresh admitted identity per connection.
     buckets: Mutex<HashMap<String, Bucket>>,
-    /// Aggregate command-rate backstop — see `GLOBAL_BUCKET_CAPACITY`.
-    global_bucket: Mutex<Bucket>,
-    /// promotion-auth-gate: open *authenticated reporter* connections per
-    /// pane — `REPORTER_MAX_CONN_PER_PANE` (8), a separate pool from
-    /// `per_principal` (decision 8: a pane's own status links must not be
-    /// able to starve its control budget, or vice versa). Entries removed
-    /// at 0, same convention as `per_principal`. Reserved iff a
-    /// `link_panes` entry is actually inserted — see `ConnGuard`'s doc
-    /// comment for why that pairing is load-bearing.
+    /// Open *authenticated reporter* connections per pane —
+    /// `REPORTER_MAX_CONN_PER_PANE` (8), a separate pool from
+    /// `per_principal`: a pane's own status links must not be able to
+    /// starve its control budget, or vice versa. Entries removed at 0, same
+    /// convention as `per_principal`. Reserved iff a `link_panes` entry is
+    /// actually inserted — see `ConnGuard`'s doc comment for why that
+    /// pairing is load-bearing.
     reporters: Mutex<HashMap<PaneId, usize>>,
 }
 
@@ -546,15 +482,14 @@ impl Limits {
             global: AtomicUsize::new(0),
             per_principal: Mutex::new(HashMap::new()),
             buckets: Mutex::new(HashMap::new()),
-            global_bucket: Mutex::new(Bucket::new(GLOBAL_BUCKET_CAPACITY, GLOBAL_REFILL_PER_SEC)),
             reporters: Mutex::new(HashMap::new()),
         }
     }
 
     /// Atomically check-and-increment the global connection cap in one step.
-    /// Was load-then-add (audit Info (a)): two threads could both observe
-    /// `< MAX_CONN` and both add, landing a few over. `fetch_update` makes
-    /// the check and the increment one atomic step — no window between them.
+    /// Not load-then-add: two threads could both observe `< MAX_CONN` and
+    /// both add, landing a few over. `fetch_update` makes the check and the
+    /// increment one atomic step — no window between them.
     fn try_reserve_global(&self) -> bool {
         self.global
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c < MAX_CONN).then_some(c + 1))
@@ -588,16 +523,8 @@ impl Limits {
         }
     }
 
-    /// The aggregate charge for one genuinely-dispatched command (audit
-    /// finding C2) — called only after a request has already passed its
-    /// connection's own line bucket and per-principal bucket, never for raw
-    /// line volume (see the struct doc comment).
-    fn take_global(&self) -> bool {
-        lock(&self.global_bucket).take()
-    }
-
-    /// One command already admitted past `take_global`, charged against
-    /// `principal` — the connection's *admitted* identity, not a raw
+    /// The reconnect-surviving charge for one genuinely-dispatched command,
+    /// against `principal` — the connection's *admitted* identity, not a raw
     /// per-request token (audit finding H2; see the struct doc comment).
     fn take_principal(&self, principal: &str) -> bool {
         let mut map = lock(&self.buckets);
@@ -638,10 +565,9 @@ impl Limits {
 
 /// Free one slot in `map` for a new token, at `MAX_TRACKED_TOKENS`. Picks the
 /// entry with the most tokens *after* refilling it for elapsed idle time,
-/// cloning a key only when it becomes the new leader — not, as an earlier
-/// version did, unconditionally for every entry scanned (audit finding M1;
-/// `MAX_TOKEN_LEN` bounds what a clone costs, this bounds how often one
-/// happens).
+/// cloning a key only when it becomes the new leader — not unconditionally
+/// for every entry scanned (`MAX_TOKEN_LEN` bounds what a clone costs, this
+/// bounds how often one happens).
 ///
 /// The single "most tokens" comparison covers both cases the policy cares
 /// about: a bucket idle long enough to have fully refilled (tokens ==
@@ -666,47 +592,43 @@ fn evict_one(map: &mut HashMap<String, Bucket>) {
     }
 }
 
-/// [F2] Cap on distinct panes one connection's `link_panes` will track. A
-/// real reporter — the pi extension, a Claude Code hook — serves exactly
-/// one pane for its whole life; this is a defensive bound against a
-/// buggy/malicious connection claiming to report for an unbounded number of
-/// panes (each entry is small — a `PaneId` and a token — but nothing else
-/// here caps how many distinct ones a single connection could otherwise
-/// mint). Past the cap, a line for a *new* pane on that connection still
-/// forwards its underlying status/session event exactly as before (App's
-/// own token check is what actually judges it) — only this connection's own
-/// link-liveness bookkeeping for that extra pane is skipped.
+/// Cap on distinct panes one connection's `link_panes` will track. A real
+/// reporter — the pi extension, a Claude Code hook — serves exactly one pane
+/// for its whole life; this is a defensive bound against a buggy/malicious
+/// connection claiming to report for an unbounded number of panes (each
+/// entry is small — a `PaneId` and a token — but nothing else here caps how
+/// many distinct ones a single connection could otherwise mint). Past the
+/// cap, a line for a *new* pane on that connection still forwards its
+/// underlying status/session event exactly as before (App's own token check
+/// is what actually judges it) — only this connection's own link-liveness
+/// bookkeeping for that extra pane is skipped.
 const MAX_LINK_PANES_PER_CONN: usize = 4;
 
-/// promotion-auth-gate: cap on concurrent *authenticated reporter*
-/// connections one pane will admit, enforced in `Limits.reporters` at the
-/// same site as `link_panes` insertion (one mechanism, so the cap count,
-/// `link_panes`, and App's `ext_link_counts` all count the same thing by
-/// construction — no double-counting). Sizing: legit worst case is one
-/// long-lived pi connection + one dying old-generation connection
-/// mid-respawn + a burst of transient claude-hook one-shots (`roost
-/// __status`, each lives milliseconds) — 8 is ~2x that. Reporter
-/// connections do NOT share `PRINCIPAL_MAX_CONN`: that pool is sized
-/// against control traffic (`MAX_WAITS` in app.rs), and charging reporters
-/// there would let a pane's own status links starve its control budget.
-///
-/// ponytail: accepted edge — a >8-wide parallel claude PreToolUse hook
-/// batch can exceed this. Zero operational cost: every parallel hook in
-/// one batch reports the same `working`, the refused one-shot exits 0
-/// (cli.rs's `status_hook` is silent-by-contract either way), and it's
-/// refused before any `link_panes` insert (no strand, no false negative
-/// on a real status change). Keep the cap at 8.
+/// Cap on concurrent *authenticated reporter* connections one pane will
+/// admit, enforced in `Limits.reporters` at the same site as `link_panes`
+/// insertion (one mechanism, so the cap count, `link_panes`, and App's
+/// `ext_link_counts` all count the same thing by construction — no
+/// double-counting). Without this, one pane's token could pin all `MAX_CONN`
+/// slots (status-only connections never set `guard.principal` and are never
+/// idle-reaped the way a silent control connection is) and starve every
+/// control connection on the socket — a pane's own status links must not be
+/// able to starve its control budget, or vice versa. Sizing: legit worst
+/// case is one long-lived pi connection + one dying old-generation
+/// connection mid-respawn + a burst of transient claude-hook one-shots
+/// (`roost __status`, each lives milliseconds) — 8 is ~2x that. Reporter
+/// connections do NOT share `PRINCIPAL_MAX_CONN`: that pool is sized against
+/// control traffic (`MAX_WAITS` in app.rs).
 const REPORTER_MAX_CONN_PER_PANE: usize = 8;
 
 /// RAII: releases whatever connection-accounting slots this connection holds
-/// when dropped — including during a panic unwind (audit finding L1).
-/// Without this, a panic partway through the read loop (e.g. a
-/// poisoned-mutex `.unwrap()` after some *other* thread already panicked —
-/// see `lock` above) would skip the release-at-the-bottom calls entirely and
-/// leak the slot forever. `principal` is set at most once, the moment this
-/// connection is admitted under a real principal (see the `Limits` doc
-/// comment — before that, a connection is bounded by time, not a shared
-/// slot, so there's nothing else here to release).
+/// when dropped — including during a panic unwind. Without this, a panic
+/// partway through the read loop (e.g. a poisoned-mutex `.unwrap()` after
+/// some *other* thread already panicked — see `lock` above) would skip the
+/// release-at-the-bottom calls entirely and leak the slot forever.
+/// `principal` is set at most once, the moment this connection is admitted
+/// under a real principal (see the `Limits` doc comment — before that, a
+/// connection is bounded by time, not a shared slot, so there's nothing else
+/// here to release).
 ///
 /// D2: also the one place that emits link-down. `link_panes` accumulates the
 /// panes (and the token last seen for each) this connection has reported a
@@ -720,9 +642,9 @@ const REPORTER_MAX_CONN_PER_PANE: usize = 8;
 /// status-only connection (P1, `spawn_accept_loop`) is a `continue`, not a
 /// `break`, so it never reaches here at all — no flap from that path.
 ///
-/// [F1] `link_panes` being a map (keyed on pane, entry inserted at most once
-/// per connection — see the `Entry::Vacant` guard below) is exactly what
-/// makes `App::ext_link_counts` a sound refcount rather than a bool: this
+/// `link_panes` being a map (keyed on pane, entry inserted at most once per
+/// connection — see the `Entry::Vacant` guard below) is exactly what makes
+/// `App::ext_link_counts` a sound refcount rather than a bool: this
 /// connection contributes at most one link-up and, here, at most one
 /// matching link-down *per pane*, no matter how many status/session lines
 /// it actually sent. A pane with two open connections (e.g. a nested
@@ -731,12 +653,12 @@ const REPORTER_MAX_CONN_PER_PANE: usize = 8;
 /// so App's count always equals the number of connections genuinely still
 /// open for that pane.
 ///
-/// promotion-auth-gate: `link_panes` is ALSO now exactly the set of panes
-/// this connection holds a `Limits.reporters` slot for — one is reserved
-/// iff an entry is inserted (the door's status/session handling), so
-/// draining the map here and releasing a reporter slot per entry keeps
-/// slot and entry 1:1 by construction, the same way this struct already
-/// keeps link-up and link-down 1:1 (`MC-overflow-no-strand`).
+/// `link_panes` is ALSO exactly the set of panes this connection holds a
+/// `Limits.reporters` slot for — one is reserved iff an entry is inserted
+/// (the door's status/session handling), so draining the map here and
+/// releasing a reporter slot per entry keeps slot and entry 1:1 by
+/// construction, the same way this struct already keeps link-up and
+/// link-down 1:1 (`MC-overflow-no-strand`).
 struct ConnGuard<'a> {
     limits: &'a Limits,
     principal: Option<String>,
@@ -1000,14 +922,15 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                 // `PRE_AUTH_READ_TIMEOUT`, however many well-formed-but-wrong-
                 // token lines it sends.
                 //
-                // A status-only connection (the pi extension: connects once,
-                // holds the socket for the pane's process lifetime, sends
-                // nothing but status/session lines) never sets
-                // `guard.principal` — it isn't a "principal" for
+                // A status-only connection (the pi extension: connects once
+                // per pane and sends nothing but status/session lines) never
+                // sets `guard.principal` — it isn't a "principal" for
                 // connection-cap/rate-limit purposes — so gating promotion on
                 // that alone would leave every such connection permanently
-                // pre-auth: killed ~`PRE_AUTH_READ_TIMEOUT` after connecting
-                // and never reconnecting (the extension dials once, on load).
+                // pre-auth: killed ~`PRE_AUTH_READ_TIMEOUT` after every idle
+                // gap, forcing the extension to redial (extensions/roost.ts's
+                // unconditional reconnect) on every ordinary quiet stretch
+                // instead of just a genuine drop.
                 // `promoted` tracks "authenticated by *either* door", so this
                 // shape is promoted on its first correctly-authenticated
                 // status/session line same as a control request would be.
@@ -1025,22 +948,21 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                             // P1: a promoted connection that has never sent a
                             // control request (no `guard.principal`) is
                             // status-only — the pi extension's actual shape
-                            // (extensions/roost.ts): dials once at pane
-                            // start, holds the socket for the pane's whole
-                            // process lifetime, no keepalive, no reconnect on
-                            // error. A `READ_TIMEOUT` firing on it is the
+                            // (extensions/roost.ts): holds one socket per
+                            // pane for its whole process lifetime, no
+                            // keepalive. A `READ_TIMEOUT` firing on it is the
                             // *normal* gap between an agent's status
                             // transitions (a human reading the output for a
                             // while — routinely >30s — is the everyday case,
                             // not an edge one), not a hung client, so retry
                             // past it exactly like a pre-auth connection
                             // retries past `PRE_AUTH_READ_TIMEOUT` above.
-                            // Without this, the read timeout silently ended
-                            // the connection here (`Err(_) => break`); the
-                            // extension's next write then EPIPEs, nulls its
-                            // socket handle for good (no reconnect anywhere
-                            // in it), and every status/session report for
-                            // that pane is dropped for the rest of its life.
+                            // Without this, the read timeout would silently
+                            // end the connection here (`Err(_) => break`) on
+                            // every idle gap past 30s — routine, not rare —
+                            // forcing the extension to redial constantly on
+                            // ordinary idling instead of just the genuine
+                            // drops this exists for.
                             //
                             // Retrying the inner loop (not `continue 'conn`)
                             // matters: `'conn`'s top clears `buf`, which
@@ -1051,12 +973,7 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                             // (`guard.principal.is_some()`) is untouched:
                             // P0's wedge — reap a silent *control* client
                             // after `READ_TIMEOUT` — still applies to it
-                            // unchanged. So is the pre-auth wall-clock
-                            // deadline: it's enforced inside
-                            // `read_line_deadlined` independently of
-                            // `promoted`, and only ever returned while
-                            // `pre_auth_start` is `Some` — before `promoted`
-                            // (required below) can even be true.
+                            // unchanged.
                             Err(e)
                                 if promoted
                                     && guard.principal.is_none()
@@ -1075,13 +992,12 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                     // close regardless: there is no newline left in this
                     // connection to resynchronise a next request on, so
                     // trying to keep parsing it would corrupt the framing.
-                    // This sits ahead of `line_bucket`/principal/global —
-                    // deliberately: an oversized line is never parsed, let
-                    // alone dispatched, and it costs the sender their entire
-                    // connection (one of only MAX_CONN) for a single
-                    // attempt, a harsher toll than any of those buckets
-                    // charge a well-formed line, so there is no cheaper flood
-                    // to be had by skipping them here.
+                    // This sits ahead of `line_bucket`/principal — deliberately:
+                    // an oversized line is never parsed, let alone dispatched,
+                    // and it costs the sender their entire connection (one
+                    // of only MAX_CONN) for a single attempt, a harsher toll
+                    // than either bucket charges a well-formed line, so there's
+                    // no cheaper flood to be had by skipping it here.
                     if buf.last() != Some(&b'\n') && n as u64 == MAX_LINE {
                         if write_reply(&mut reader, &Reply::err(OVERSIZE_LINE_MSG)) {
                             // The client may still be mid-write of the
@@ -1182,24 +1098,17 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                                 let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
                             }
                             let principal = guard.principal.clone().expect("just set above");
-                            // Rate limit: a command this connection is
-                            // otherwise allowed to make can still be
-                            // throttled if it's coming too fast. Checked
-                            // (and charged) before the request ever reaches
-                            // the main loop / audit log — a throttled
-                            // request must cost nothing there (M2).
-                            //
-                            // NOTE (low-severity ordering inversion, not
-                            // fixed here): this per-principal gate runs
-                            // *before* the shared `take_global` one below,
-                            // so a request that's ultimately refused by the
-                            // global backstop still burns one of the
-                            // caller's own principal tokens first — a
-                            // victim sharing the aggregate with a genuine
-                            // flood pays for requests it never got to make.
-                            // Checking the shared gate first would avoid
-                            // that, but reordering is a behavior change and
-                            // out of scope for this pass.
+                            // Reconnect-surviving rate limit: a command this
+                            // connection is otherwise allowed to make can
+                            // still be throttled if `principal` is coming in
+                            // too fast overall — unlike `line_bucket`, this
+                            // bucket is keyed on the admitted token and
+                            // persists across reconnects, so it's what
+                            // actually bounds a caller that dodges
+                            // `line_bucket` by reconnecting per request.
+                            // Checked (and charged) before the request ever
+                            // reaches the main loop / audit log — a
+                            // throttled request must cost nothing there.
                             if !limits.take_principal(&principal) {
                                 let msg = "rate limited: too many commands too fast; \
                                            slow down and retry"
@@ -1208,18 +1117,6 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                                     break; // client hung up
                                 }
                                 continue; // stay connected; this is not a ban
-                            }
-                            // Only a request that's actually about to be
-                            // dispatched charges the shared aggregate
-                            // (audit finding C2) — never raw line volume.
-                            if !limits.take_global() {
-                                let msg = "rate limited: too many commands too fast; \
-                                           slow down and retry"
-                                    .to_string();
-                                if !write_reply(&mut reader, &Reply::err(msg)) {
-                                    break; // client hung up
-                                }
-                                continue;
                             }
                             let (rtx, rrx) = std::sync::mpsc::channel();
                             if tx.send(AppEvent::Command(req, rtx)).is_err() {
@@ -1267,13 +1164,13 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                                 log_dropped(line);
                                 continue;
                             }
-                            // D2 + promotion-auth-gate reporter cap: the
-                            // first accepted status/session line for a given
-                            // pane on this connection makes it that pane's
-                            // live reporting link — tell App (link-up) and
-                            // remember it so `ConnGuard`'s `Drop` can tell
-                            // App again (link-down) whenever this connection
-                            // ends, however it ends. A later line for a pane
+                            // D2 + per-pane reporter cap: the first accepted
+                            // status/session line for a given pane on this
+                            // connection makes it that pane's live reporting
+                            // link — tell App (link-up) and remember it so
+                            // `ConnGuard`'s `Drop` can tell App again
+                            // (link-down) whenever this connection ends,
+                            // however it ends. A later line for a pane
                             // already in the map doesn't re-emit or re-check
                             // any cap; the connection's liveness hasn't
                             // changed, only its status has (the `ev` send
@@ -1284,16 +1181,12 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                             // `link_panes` insert is about to happen — the
                             // two calls are adjacent, on purpose, so there is
                             // no window where one could succeed without the
-                            // other. [F2]'s existing MAX_LINK_PANES_PER_CONN
-                            // (this CONNECTION's own cap on distinct panes)
-                            // is checked *first*: when IT is what's full, the
+                            // other. MAX_LINK_PANES_PER_CONN (this
+                            // CONNECTION's own cap on distinct panes) is
+                            // checked *first*: when IT is what's full, the
                             // reserve is never even attempted — reserving
                             // there would strand a slot with no entry to ever
-                            // release it, slowly eating the pane's cap. Both
-                            // checks are one `&&`-condition (not nested
-                            // `if`s), so there is no separate branch that
-                            // could reach the reserve while the CONN cap
-                            // check is what's failing.
+                            // release it, slowly eating the pane's cap.
                             if !guard.link_panes.contains_key(&pane)
                                 && guard.link_panes.len() < MAX_LINK_PANES_PER_CONN
                             {
@@ -1320,15 +1213,8 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                                 // else: already promoted via an earlier pane
                                 // on this same connection — don't kill it for
                                 // a second pane's cap. Skip link tracking for
-                                // `pane` only; `ev` still forwards below,
-                                // same as the MAX_LINK_PANES_PER_CONN
-                                // overflow case.
+                                // `pane` only; `ev` still forwards below.
                             }
-                            // else (either guard above false): a pane already
-                            // tracked needs no new reserve/insert, and the
-                            // MAX_LINK_PANES_PER_CONN overflow case ([F2],
-                            // unchanged) never attempts one — either way `ev`
-                            // still forwards below.
                             // A well-formed, authenticated status/session
                             // report promotes this connection exactly like a
                             // control request does, above — see the
@@ -1638,7 +1524,7 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    // --- promotion-auth-gate: the per-pane reporter cap ---------------------
+    // --- the per-pane reporter cap ------------------------------------------
 
     /// MC-pane-cap: `REPORTER_MAX_CONN_PER_PANE` (8) valid reporter
     /// connections for one pane are all admitted (each earns a link-up); a
@@ -1699,15 +1585,14 @@ mod tests {
 
     /// MC-overflow-no-strand: a connection already tracking
     /// `MAX_LINK_PANES_PER_CONN` distinct panes (its own, unrelated,
-    /// per-CONNECTION cap) sends a further pane's line — [F2]'s existing
-    /// behavior (the report still forwards, no link tracking) is unchanged,
-    /// but the pinned addition is that NO reporter slot is consumed for it
-    /// either: the reserve must never even be attempted on that overflow-skip
-    /// path. Repeating well past `REPORTER_MAX_CONN_PER_PANE` must never
-    /// erode the pane's real cap — a fresh, independent connection for it is
-    /// still admitted afterward. *Reds if the overflow-skip path reserves
-    /// (strands) a slot — the silent cap-erosion bug slot⟺entry pinning
-    /// exists to prevent.*
+    /// per-CONNECTION cap) sends a further pane's line — the report still
+    /// forwards, no link tracking — but the pinned addition is that NO
+    /// reporter slot is consumed for it either: the reserve must never even
+    /// be attempted on that overflow-skip path. Repeating well past
+    /// `REPORTER_MAX_CONN_PER_PANE` must never erode the pane's real cap — a
+    /// fresh, independent connection for it is still admitted afterward.
+    /// *Reds if the overflow-skip path reserves (strands) a slot — the
+    /// silent cap-erosion bug slot⟺entry pinning exists to prevent.*
     #[test]
     fn mc_overflow_no_strand_the_conn_cap_overflow_path_never_reserves_a_reporter_slot() {
         let (path, listener) = scratch_listener("mc-overflow-no-strand");
@@ -2254,11 +2139,11 @@ mod tests {
     /// that 2s deadline, deliberately not the larger gap that actually
     /// matters in practice.
     /// `a_status_only_connection_survives_an_idle_gap_past_read_timeout`
-    /// below is the real pi-extension shape (`extensions/roost.ts`: dials
-    /// once, holds the socket for the pane's whole process lifetime, no
-    /// keepalive, no reconnect) at the timescale that matters —
-    /// `READ_TIMEOUT` (30s), not `PRE_AUTH_READ_TIMEOUT` (2s), since a
-    /// *promoted* connection is bound by the former, not the latter (P1).
+    /// below is the real pi-extension shape (`extensions/roost.ts`: holds
+    /// one socket per pane for its whole process lifetime, no keepalive) at
+    /// the timescale that matters — `READ_TIMEOUT` (30s), not
+    /// `PRE_AUTH_READ_TIMEOUT` (2s), since a *promoted* connection is bound
+    /// by the former, not the latter (P1).
     #[test]
     fn a_status_only_connection_survives_past_the_pre_auth_deadline() {
         let (path, listener) = scratch_listener("status-survives");
@@ -2292,12 +2177,12 @@ mod tests {
     /// (`agent_settled` → `waiting`), the human reads the output for more than
     /// 30s — the *normal* operating condition, not an edge case — the
     /// server silently closed the connection (`Err(_) => break` on the
-    /// `READ_TIMEOUT` firing), and the extension's next write EPIPEs and
-    /// nulls its socket handle for good (`sock.on("error", () => sock =
-    /// null)`, no reconnect anywhere in it): every later status/session
-    /// report for that pane is dropped for the rest of its life. Sleeps past
-    /// the real constant on purpose — this is the timescale that matters,
-    /// not a shortened stand-in for it.
+    /// `READ_TIMEOUT` firing), and the extension's next write EPIPEd,
+    /// forcing a redial (extensions/roost.ts's unconditional reconnect) on
+    /// what was really just an idle agent, not a genuine drop — dropping
+    /// reports until it reconnected. Sleeps past the real constant on
+    /// purpose — this is the timescale that matters, not a shortened
+    /// stand-in for it.
     ///
     /// D2 rides the same 30s wait to pin its own requirement for free rather
     /// than pay for a second sleep elsewhere: the retry that lets this
@@ -2694,11 +2579,10 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// Audit finding M3: re-derived from a *real* 20-pane fleet (not the
-    /// 10-pane hello-world DESIGN-control.md §7 uses for brevity) — spawn
-    /// x20 then wait x20, 40 commands fired back-to-back. Regressing this
-    /// (the burst getting throttled) would make the fix worse than the bug
-    /// it closes.
+    /// Re-derived from a *real* 20-pane fleet (not a 10-pane hello-world) —
+    /// spawn x20 then wait x20, 40 commands fired back-to-back. Regressing
+    /// this (the burst getting throttled) would make the fix worse than the
+    /// bug it closes.
     #[test]
     fn a_legitimate_bursty_sequence_is_not_throttled() {
         let (path, listener) = scratch_listener("burst");
@@ -2722,16 +2606,16 @@ mod tests {
     /// per-principal buckets — only the identity the connection was
     /// actually admitted under (its first request's token) is ever charged.
     ///
-    /// promotion-auth-gate correction: an unauthenticated "rotated-N" body
-    /// token would now be refused at the door on every single request
-    /// (never reaching `take_principal` at all), which would make this test
-    /// pass for the wrong reason — it wouldn't be proving H2's attribution
-    /// property anymore, just that the door rejects junk. So the rotation is
-    /// between exactly TWO real, seeded identities: "admitted" (this
-    /// connection's real admission — the first request) and "rotated" (a
-    /// different, equally valid principal). Both pass the door and reach
-    /// dispatch; H2 is that only "admitted" is ever charged, never
-    /// "rotated", regardless of which one a later request's body claims.
+    /// An unauthenticated "rotated-N" body token would now be refused at the
+    /// door on every single request (never reaching `take_principal` at
+    /// all), which would make this test pass for the wrong reason — it
+    /// wouldn't be proving H2's attribution property anymore, just that the
+    /// door rejects junk. So the rotation is between exactly TWO real,
+    /// seeded identities: "admitted" (this connection's real admission — the
+    /// first request) and "rotated" (a different, equally valid principal).
+    /// Both pass the door and reach dispatch; H2 is that only "admitted" is
+    /// ever charged, never "rotated", regardless of which one a later
+    /// request's body claims.
     #[test]
     fn rotating_the_bodys_token_does_not_mint_a_fresh_bucket_on_one_connection() {
         let (path, listener) = scratch_listener("rotate");
@@ -2766,14 +2650,8 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    // --- audit finding C2: per-line cost is per-connection, not shared -----
-    //
-    // A second review pass found the original H1(a)/M2 fix (every line
-    // charges the *shared* aggregate bucket) let one connection's blank-line
-    // flood empty that bucket and `rate limited` every other connection —
-    // cheaper than the M3 flood it replaced, and it serialized all control
-    // traffic on the aggregate's mutex. These assert the property that fix
-    // was supposed to provide: a flood on one connection can't deny another.
+    // --- per-connection line bucket: a flood on one connection can't deny --
+    // --- another --------------------------------------------------------
 
     #[test]
     fn a_line_flood_on_one_connection_cannot_deny_a_different_connection() {

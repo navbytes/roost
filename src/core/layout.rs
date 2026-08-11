@@ -44,9 +44,11 @@ pub fn pane_order(node: &LayoutNode, out: &mut Vec<PaneId>) {
 }
 
 fn subtree_contains(node: &LayoutNode, target: PaneId) -> bool {
-    let mut v = Vec::new();
-    pane_order(node, &mut v);
-    v.contains(&target)
+    match node {
+        LayoutNode::Pane(id) => *id == target,
+        LayoutNode::Stack { children, .. } => children.contains(&target),
+        LayoutNode::Split { children, .. } => children.iter().any(|c| subtree_contains(c, target)),
+    }
 }
 
 /// Replace `Pane(target)` with a two-way split containing the old and new pane.
@@ -478,7 +480,8 @@ pub fn grid_layout(panes: &[PaneId]) -> LayoutNode {
         [id] => LayoutNode::Pane(*id),
         _ => {
             let n = panes.len();
-            let cols = (1..=n).find(|c| c * c >= n).unwrap_or(1);
+            let root = n.isqrt();
+            let cols = if root * root >= n { root } else { root + 1 }.max(1);
             let mut rows: Vec<LayoutNode> = panes.chunks(cols).map(grid_row).collect();
             if rows.len() == 1 {
                 rows.remove(0)

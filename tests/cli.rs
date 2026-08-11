@@ -17,8 +17,6 @@ mod harness;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use harness::Harness;
-
 /// A path nothing is listening on. Any test that points `ROOST_SOCK` here
 /// and still gets a clean, non-network answer has proven that answer never
 /// touched the socket — the whole claim behind "help never executes".
@@ -139,22 +137,10 @@ fn every_verb_help_is_its_own_text() {
 fn list_status_fork_help_never_execute_against_a_live_instance() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let workspace = serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string();
-    let mut h = match Harness::try_spawn(&workspace) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP list/status/fork --help gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip("list/status/fork --help gate", &harness::one_pane(cwd))
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
     wait_until_reachable(h.state_dir(), Duration::from_secs(5));
@@ -226,22 +212,8 @@ fn bare_invocation_off_tty_fails_cleanly_instead_of_panicking() {
 fn wait_timeout_exits_nonzero_and_distinct_from_runtime_and_usage_errors() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let workspace = serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string();
-    let mut h = match Harness::try_spawn(&workspace) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP wait-timeout gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("wait-timeout gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
     wait_until_reachable(h.state_dir(), Duration::from_secs(5));
@@ -280,22 +252,10 @@ fn wait_timeout_exits_nonzero_and_distinct_from_runtime_and_usage_errors() {
 fn oversized_request_gets_a_true_diagnosis_and_leaves_the_instance_alive() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let workspace = serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string();
-    let mut h = match Harness::try_spawn(&workspace) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP oversized-request gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip("oversized-request gate", &harness::one_pane(cwd))
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
     wait_until_reachable(h.state_dir(), Duration::from_secs(5));

@@ -21,21 +21,6 @@ use std::time::Duration;
 
 use harness::Harness;
 
-/// One shell pane. Temp-dir cwd keeps C4's corner badge short (same
-/// reasoning as the firehose gate's fixture).
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// `roost status 1` against the harness instance, via the real client CLI
 /// (ROOST_STATE routes it to the instance's socket + fleet control token).
 fn cli_status(state_dir: &std::path::Path) -> String {
@@ -58,12 +43,8 @@ fn cli_status(state_dir: &std::path::Path) -> String {
 fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP notification gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("notification gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
@@ -113,12 +94,8 @@ fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
 fn a_pane_bare_bell_relays_to_the_host_and_is_rate_limited() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP bare-bell gate: {reason}");
-            return;
-        }
+    let Some(mut h) = harness::spawn_or_skip("bare-bell gate", &harness::one_pane(cwd)) else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
     let bell_count = |h: &mut Harness| h.host_bytes().iter().filter(|&&b| b == 0x07).count();

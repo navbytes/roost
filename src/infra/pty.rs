@@ -25,36 +25,30 @@ const SCROLLBACK_LINES: usize = 5000;
 /// refuses more.
 ///
 /// **Why a queue exists at all.** A write to a PTY master blocks whenever the
-/// kernel's tty input queue is full and the child isn't draining it — a few KB
-/// is all it holds. The child may be paused (SIGSTOP), stuck in a foreground
-/// command that never reads stdin, or a line editor mid-redraw; none of that is
-/// roost's business, and none of it is guaranteed to end. Done on the event
-/// loop, that write took the whole process down: measured with one 60 KB
-/// `roost send` (under the control plane's 64 KiB line cap, so accepted), the
-/// main thread parked in `write(2)` inside `ctl_send`, which is also the only
-/// thread that drains the PTY event channel — so the pane's reader thread
-/// filled that channel and parked too, the pane's own output queue backed up,
-/// its line discipline stopped consuming input, and the write could never
-/// complete. A closed cycle: no render, no keystrokes, no control requests, no
-/// recovery short of killing the process. See `tests/send_backpressure.rs`.
+/// kernel's tty input queue is full and the child isn't draining it — the
+/// child may be paused (SIGSTOP), stuck in a foreground command that never
+/// reads stdin, or a line editor mid-redraw, and none of it is guaranteed to
+/// end. Done on the event loop, that write takes the whole process down: no
+/// render, no keystrokes, no control requests, no recovery short of killing
+/// the process — see `tests/send_backpressure.rs`. So the write moves to a
+/// per-pane thread and the event loop only ever enqueues, never blocking for
+/// any amount of time.
 ///
-/// So the write moves to a per-pane thread and the event loop only ever
-/// enqueues, never blocking for any amount of time. The queue is **bounded**
-/// because the child genuinely may never drain, and an unbounded one would
-/// trade a freeze for an OOM: past this much pending input `write_input_raw`
-/// reports `false`, which is already the codebase's "this pane did not take
-/// your input" signal (`ctl_send` turns it into an error reply rather than a
-/// dishonest `sent` count).
+/// The queue is **bounded** because the child genuinely may never drain, and
+/// an unbounded one would trade a freeze for an OOM: past this much pending
+/// input `write_input_raw` reports `false`, which is already the codebase's
+/// "this pane did not take your input" signal (`ctl_send` turns it into an
+/// error reply rather than a dishonest `sent` count).
 ///
 /// **A byte budget, deliberately not a message count.** Every keystroke is its
 /// own `write_input` call (`App::forward_bytes`, one per key event), so a
-/// message-counted queue is bounded by *typing speed*, not by memory: a 64-slot
-/// version of this shed the tail of any command longer than 64 characters
-/// whenever the writer thread was briefly descheduled, silently corrupting it
-/// mid-line. Bytes are what the bound is actually protecting, and 1 MiB of
-/// them is unreachable by any real burst — a typed command is ~100 bytes, a
-/// paste or a `roost send` at the control plane's own cap is 64 KiB — while
-/// still capping a wedged pane at a megabyte.
+/// message-counted queue is bounded by *typing speed*, not by memory — a
+/// fixed slot count would shed the tail of any command longer than that many
+/// characters, silently corrupting it mid-line. Bytes are what the bound is
+/// actually protecting, and 1 MiB of them is unreachable by any real burst —
+/// a typed command is ~100 bytes, a paste or a `roost send` at the control
+/// plane's own cap is 64 KiB — while still capping a wedged pane at a
+/// megabyte.
 const WRITE_QUEUE_BYTES: usize = 1024 * 1024;
 
 /// P2: at most one OSC 9 re-emission per pane per this window. An agent that
@@ -233,21 +227,12 @@ fn host_clipboard_bytes(
 /// again. Torn beats frozen.
 const SYNC_STALE_CAP_DEFAULT: Duration = Duration::from_millis(150);
 
-/// The cap actually in force, `$ROOST_SYNC_CAP_MS` overriding the default.
-///
-/// The override exists for `tests/pane_sync_output.rs`, which drives a real
-/// pane through real brackets and samples `roost read` from outside. That
-/// test can only hold a bracket open by sleeping inside it, and a loaded CI
-/// runner stretches a 60 ms shell `sleep` past 150 ms often enough to expire
-/// the cap — at which point roost correctly presents the torn frame and the
-/// gate reports a defect that isn't one (observed: two of three macOS runs).
-/// Raising the cap for that one process removes the race instead of making
-/// it rarer, and leaves the gate asserting what it means to assert: that an
-/// *unexpired* bracket is never read mid-redraw. Expiry itself stays pinned
-/// by the pure unit test below, which needs no clock at all.
-///
-/// Same shape as `ROOST_NO_EXT_INSTALL`: a knob the product does not
-/// advertise, read once, with the shipped behavior as its default.
+/// The shipped cap, overridable via `ROOST_SYNC_CAP_MS`. Not user config: it
+/// exists so the end-to-end gate (tests/pane_sync_output.rs) can hold the cap
+/// out of reach on a loaded CI runner, where a stretched in-bracket sleep
+/// blowing past 150 ms turns the honest expiry path into a false torn-frame
+/// failure. Unit tests pin expiry itself through `sync_presented`'s cap
+/// parameter; this override is only for the spawned-binary test.
 fn sync_stale_cap() -> Duration {
     static CAP: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
@@ -359,8 +344,8 @@ fn scrub_host_identity(cmd: &mut CommandBuilder) {
 /// threat model the pane is same-uid and can compute the default state dir
 /// itself, so a token it could already read is not protected by hiding the
 /// variable that names it. The genuinely inert ones — `ROOST_NO_EXT_INSTALL`,
-/// `ROOST_SYNC_CAP_MS`, `ROOST_DEBUG`, `ROOST_PANE` — are left alone because
-/// they carry no authority at all.
+/// `ROOST_DEBUG`, `ROOST_PANE` — are left alone because they carry no
+/// authority at all.
 ///
 /// Keep that split honest when `resolve_token` changes: anything that becomes
 /// a *carried* credential belongs in this list.
@@ -468,28 +453,21 @@ pub struct PtyPane {
     /// P1: while the pane's app holds a synchronized-output bracket (mode
     /// 2026) open, the last frame it declared complete — captured by the
     /// parser at the exact stream position of the `?2026h` — plus when the
-    /// bracket opened (for `SYNC_STALE_CAP`). This is what `screen()` and
-    /// `grab_text` present by default: the app asked for its in-progress
-    /// redraw not to be shown, and a half-drawn grid is exactly what P1
-    /// measured leaking into both the TUI and `roost read`.
+    /// bracket opened (for `SYNC_STALE_CAP_DEFAULT`). This is what
+    /// `screen()` and `grab_text` present by default: the app asked for its
+    /// in-progress redraw not to be shown.
     ///
     /// Deliberately NOT consulted by scroll state (`scroll_offset`/
     /// `scroll_total`/`set_scrollback`/`scroll_by`), full-history reads
     /// (`grab_all_text`), or the input-mode accessors: those answer for the
-    /// live grid, which stays the single source of truth.
-    ///
-    /// **[Amended, C29 selection-freeze amendment]** "The snapshot is a
-    /// ≤150 ms presentation veneer over the visible frame, not a second
-    /// terminal state" no longer describes the whole picture: `presented()`
-    /// now has a second tenant, `gesture_freeze`, which wins ahead of this
-    /// one and can legitimately outlive it by 200× (`GESTURE_FREEZE_STALE_CAP`
-    /// vs `SYNC_STALE_CAP`) — see that field's own doc. Still true of *this*
-    /// field alone: still ≤150 ms, still not a second terminal state, still
-    /// what `screen()`/`grab_text` present absent a gesture. What's no
-    /// longer true: `roost read`'s screen mode is **not** a `grab_text`
-    /// consumer any more — `read_screen_text` reads through this veneer
-    /// (unchanged) but deliberately skips `gesture_freeze` (a control
-    /// client polling a pane is not the human dragging a mouse over it).
+    /// live grid, which stays the single source of truth. A ≤150 ms
+    /// presentation veneer over the visible frame, not a second terminal
+    /// state — `gesture_freeze` below is a second tenant of `presented()`
+    /// that wins ahead of this one and can legitimately outlive it by 200×
+    /// (`GESTURE_FREEZE_STALE_CAP` vs `SYNC_STALE_CAP_DEFAULT`). `roost
+    /// read`'s screen mode reads through this veneer via `read_screen_text`
+    /// but deliberately skips `gesture_freeze` — a control client polling a
+    /// pane is not the human dragging a mouse over it.
     sync_view: Option<(vt100::Screen, Instant)>,
     /// C29 (selection-freeze amendment): the frame `presented()` was
     /// showing at a native-selection gesture's `Down`, held through `Up` —
@@ -553,11 +531,7 @@ impl PtyPane {
     /// read` is a control client, not the human whose mouse drag this is
     /// protecting, and must see live content while one is in progress.
     fn presented_live(&self) -> &vt100::Screen {
-        sync_presented(
-            self.parser.screen(),
-            self.sync_view.as_ref(),
-            sync_stale_cap(),
-        )
+        sync_presented(self.parser.screen(), self.sync_view.as_ref(), sync_stale_cap())
     }
 
     /// W3: turn one parser effect into roost-side consequences — attention
@@ -797,32 +771,16 @@ impl PaneBackend for PtyPane {
         self.parser.process(bytes);
         if self.parser.screen().audible_bell_count() != bells_before {
             self.status.on_bell();
-            // ux P1-6: relay only the case the bell heuristic exists to
-            // serve — no *live* extension report is covering this pane
-            // (`recently_reported()`: none installed, or a resting report a
-            // bell promotes — an adapter/TUI genuinely ringing for a "needs
-            // you" its own hook can't see; NOT pi, which never emits an
-            // audible bell at all — see `StatusTracker::bell_after_ext`).
-            // Checked here rather than against
-            // `current()`: `current()`'s own quiet-window grace (badges
-            // don't flip to ◆ until output settles) would mask almost every
-            // real case — a bell riding the same burst as its own dialog
-            // text, which is the common case, not the exception. An
-            // audible ring has to fire the moment the child rings its own
-            // (tmux's monitor-bell doesn't wait either); a live
-            // "working"/"needs you" report already owns or separately
-            // notifies the bell (`on_status`'s `Notifier::notify` rings the
-            // host bell of its own accord) — relaying here too would be a
-            // second, redundant ring for a signal that already has one.
-            //
-            // [F4] `recently_reported`, not `vouched_live`: this gate wants
-            // "did an extension actually say something recently", strictly
-            // time-bounded. `vouched_live` also trusts a live `ext_link`
-            // past that window (right, for the close guard it's for) — but
-            // `current()`'s own Working arm stops trusting a live-linked
-            // report the same way once it's gone stale (decays to Idle,
-            // D2), so using the link-aware check here would swallow a real,
-            // audible bell with no compensating signal at all.
+            // ux P1-6: relay only when no *live* extension report is
+            // covering this pane (`recently_reported()`) — an adapter/TUI
+            // genuinely ringing for a "needs you" its own hook can't see,
+            // not pi (which never emits an audible bell at all — see
+            // `StatusTracker::bell_after_ext`). Checked here rather than
+            // against `current()` (whose quiet-window grace would mask most
+            // real cases) or `vouched_live` (which trusts a stale live link
+            // past the point `current()` itself stops trusting it, and
+            // would swallow a real audible bell with no compensating
+            // signal).
             if !self.status.recently_reported() {
                 self.queue_host_bell();
             }
@@ -1110,11 +1068,9 @@ impl PaneBackend for PtyPane {
         self.parser.set_scrollback(want);
     }
 
-    /// [P14] The grid, and only the grid. This used to sit beside a
-    /// roost-side `scroll` counter that could exceed what the grid actually
-    /// banked (U9's overshoot) and drifted whenever the grid auto-advanced
-    /// under new output; that field is gone, so U3's honesty surfaces cannot
-    /// report anything but the view.
+    /// [P14] The grid, and only the grid — no roost-side `scroll` counter
+    /// that could drift from what the grid actually banked, so U3's honesty
+    /// surfaces cannot report anything but the view.
     fn scroll_offset(&self) -> usize {
         self.parser.screen().scrollback()
     }

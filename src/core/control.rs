@@ -15,21 +15,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// How much of a pane to read back.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadMode {
     /// The current visible grid (default) — bounded, usually the "answer" region.
+    #[default]
     Screen,
     /// The last N non-empty lines.
     Tail(usize),
     /// The full scrollback buffer (opt-in; can be large).
     Full,
-}
-
-impl Default for ReadMode {
-    fn default() -> Self {
-        ReadMode::Screen
-    }
 }
 
 /// A control verb. Deserialized from the socket/CLI; `Wait` is handled by the
@@ -179,12 +174,13 @@ pub const UNAUTHORIZED_MSG: &str = "unauthorized: unknown or missing token";
 /// unreadable — the caller decides whether that's fatal (`TokenTable::new`
 /// does, for the fleet token; `gen_token` below tolerates it for a pane's).
 pub(crate) fn gen_secret() -> Option<String> {
+    use std::fmt::Write;
     use std::io::Read;
     let mut buf = [0u8; 16];
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).ok()?;
     let mut s = String::with_capacity(32);
     for b in buf {
-        s.push_str(&format!("{b:02x}"));
+        write!(s, "{b:02x}").unwrap();
     }
     Some(s)
 }

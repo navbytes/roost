@@ -18,21 +18,6 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::Harness;
-
-fn fixture_workspace(cwd: &str) -> String {
-    serde_json::json!({
-        "version": 1,
-        "active_tab": 0,
-        "tabs": [{
-            "name": "main",
-            "layout": { "pane": 1 },
-            "panes": { "1": {"adapter": "shell", "cwd": cwd} }
-        }]
-    })
-    .to_string()
-}
-
 /// Alt+PageUp — scroll mode. xterm modified-key encoding, mod 3 = Alt.
 const ALT_PGUP: &[u8] = b"\x1b[5;3~";
 
@@ -40,12 +25,10 @@ const ALT_PGUP: &[u8] = b"\x1b[5;3~";
 fn slash_finds_a_line_that_has_scrolled_off_and_jumps_the_view_to_it() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let mut h = match Harness::try_spawn(&fixture_workspace(cwd)) {
-        Ok(h) => h,
-        Err(reason) => {
-            eprintln!("SKIP scrollback-search gate: {reason}");
-            return;
-        }
+    let Some(mut h) =
+        harness::spawn_or_skip("scrollback-search gate", &harness::one_pane(cwd))
+    else {
+        return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
