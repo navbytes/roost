@@ -31,6 +31,9 @@ pub enum Action {
     Resize { horizontal: bool, grow: bool },
     RenamePane,
     RenameTab,
+    /// Open the focused pane's parking-note editor, Alt+Shift+n (C32) —
+    /// first line is the headline the C4 badge shows.
+    NotePane,
     QuickLaunch,
     ScrollMode,
     CopyMode,
@@ -121,7 +124,13 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         KeyCode::Down if shift => Some(Action::Resize { horizontal: false, grow: true }),
         KeyCode::Up if shift => Some(Action::Resize { horizontal: false, grow: false }),
         KeyCode::Char('q') => Some(Action::Quit),
-        KeyCode::Char('n') => Some(Action::NewPane),
+        // Alt+n makes a pane; Alt+Shift+n annotates the one you're in.
+        // The shift pairing is mnemonic (n = note), not the C28-style
+        // "shifted sibling acts on the same target" convention — Alt+r's
+        // shift reaches the *tab*, this one stays on the pane. `Alt+N` is
+        // the same uppercase-delivery tolerance Alt+Shift+r carries.
+        KeyCode::Char('n') => Some(if shift { Action::NotePane } else { Action::NewPane }),
+        KeyCode::Char('N') => Some(Action::NotePane),
         KeyCode::Char('w') => Some(Action::ClosePane),
         KeyCode::Char('t') => Some(Action::NewTab),
         KeyCode::Char('s') => Some(Action::ToggleStack),
@@ -648,6 +657,7 @@ const NAMES: &[(&str, Action)] = &[
     ("resize_vertical_shrink", Action::Resize { horizontal: false, grow: false }),
     ("rename_pane", Action::RenamePane),
     ("rename_tab", Action::RenameTab),
+    ("note_pane", Action::NotePane),
     ("quick_launch", Action::QuickLaunch),
     ("scroll_mode", Action::ScrollMode),
     ("copy_mode", Action::CopyMode),
@@ -897,6 +907,25 @@ mod tests {
         assert!(matches!(
             translate(alt(KeyCode::Char('R'))),
             InputResult::Action(Action::RenameTab)
+        ));
+    }
+
+    /// C32: Alt+Shift+n opens the note editor; plain Alt+n still makes a
+    /// pane — the shift split on `n` must never bleed into the unshifted
+    /// chord people already have in muscle memory.
+    #[test]
+    fn alt_shift_n_notes_pane_alt_n_still_news() {
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('n'))),
+            InputResult::Action(Action::NotePane)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('N'))),
+            InputResult::Action(Action::NotePane)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('n'))),
+            InputResult::Action(Action::NewPane)
         ));
     }
 
@@ -1316,6 +1345,8 @@ mod tests {
             (alt(KeyCode::Char('r')), Action::RenamePane),
             (alt_shift(KeyCode::Char('r')), Action::RenameTab),
             (alt(KeyCode::Char('R')), Action::RenameTab),
+            (alt_shift(KeyCode::Char('n')), Action::NotePane),
+            (alt(KeyCode::Char('N')), Action::NotePane),
             (alt_shift(KeyCode::Char('p')), Action::ToggleRaw),
             (alt(KeyCode::Char('P')), Action::ToggleRaw),
             (alt(KeyCode::Enter), Action::QuickLaunch),

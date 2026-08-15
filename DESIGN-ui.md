@@ -117,8 +117,8 @@ should be read against C5's spinner amendment, not looked up as an accessor.
 
 | Token | ratatui expression | Where used in chrome |
 |---|---|---|
-| `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text |
-| `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…` |
+| `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text, the `¶` note marker and the focused badge's note headline (C32) |
+| `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…`, the note age tag (C32) |
 | `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders, tab separators `│`. Never text (see the legibility principle). |
 | `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, the Working spinner (C5, amended 2026-08-07 — one steady red, no second phase), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
 | `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, `raw` badge token (C23), `↑N` badge token (U3) |
@@ -644,6 +644,26 @@ folded into the text. No bg — the badge is a watermark over the pane's own
 last output, and `quiet()` is exactly the right shape for that: the user's
 ink, one rung back.
 
+**[Amended 2026-08-15, C32 — the note segment.]** A pane carrying a parking
+note (C32) grows a note segment between the identity text and the
+`raw`/`↑N`/glyph tail; identity keeps leading, so U2's id-first rule holds
+untouched and a narrow pane clips the note before the join key:
+- **Focused:** `"{id} {name} · ¶ {headline} ({age}) {glyph}"` — `¶` (or
+  `¶⋮` when the note has body lines under its headline) plus the note's
+  first line in `ink()`, one span; the `({age})` tag in `quiet()`. The
+  headline is the badge's one full-strength element — reveal-on-visit is
+  C32's display contract, and the focused pane is the visit. This is the
+  only chrome text that ever renders note *content*.
+- **Unfocused:** the bare marker, `"{id} {name} ¶ {glyph}"` — `¶`/`¶⋮` in
+  `ink()`, no headline, no age. Presence, never content.
+- The age tag is `render::age_word`: floored coarsest-sensible unit —
+  `now` under a minute, then `{n}m` / `{n}h` / `{n}d` — read from one
+  wall-clock sample per frame (C5's shared-read idiom, `now_unix_secs`).
+  A backwards clock clamps to `now`. Staleness confessing its age is the
+  design's whole defense against a Tuesday note lying on a Friday.
+- Width behavior unchanged: same parts pipeline (`clip_spans`), tail
+  trimmed first; no bg, no new colour, no BOLD.
+
 ### C5 — Status glyph system + spinner
 
 **Current:** glyphs from `status.rs:34–42`; colors `render.rs:282–290`
@@ -874,6 +894,15 @@ focused = Black on status-color bg, unfocused = status-color fg.
 - Right segment `quiet()`. Width-shedding order, the no-dup rule, the state
   words and the C23 `raw · ` prefix are all untouched.
 
+**[Amended 2026-08-15, C32]** A noted pane's right segment leads with a
+`¶ ` marker in its own `ink()` span (ahead of the C23 `raw · ` prefix's
+position in the string, i.e. `"¶ raw · {word} "` when both) — the C4
+marker's exact meaning here: presence of a parked note, never its text;
+collapsed rows and the roster stay reveal-on-visit surfaces. It rides the
+right segment, so a narrow row sheds it with the segment — the C32 marker
+is a courtesy, identity and status stay the row's priority. The roster's
+rows (C27) inherit it through the shared `collapsed_row_spans`.
+
 ### C9 — Hint bar
 
 **Current:** `render.rs:44–108` — key chips Black-on-DarkGray BOLD, labels
@@ -1073,6 +1102,15 @@ actually do in every case, not only N > 0. Pinned by
 `attention_segment_matches_the_ring_in_every_case` (app.rs) and
 `hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input`
 (render.rs).
+
+**[Amended 2026-08-15, C32]** The mode-word list gains `NOTE`, and the note
+editor gets its own pair list (the C13 shape, plus the vertical keys):
+`type note` · `↵ save` · `Shift+↵ new line` · `↑↓←→ move` · `Esc cancel` —
+62 columns rendered, inside the 100-col floor beside the right segment.
+`Ctrl+↵`/`Alt+↵` are unhinted synonyms of `Shift+↵`, the same alias rule as
+everywhere else on this bar. The Normal-mode seven-pair list still gains
+nothing: `Alt+Shift+n` is discoverable via `Alt+?` (C15), and the badge's
+`¶` marker (C4) is its own advertisement.
 
 ### C10 — Flash message
 
@@ -1307,6 +1345,16 @@ mode-specific answers are contracted in C27 — the wheel moves its cursor (it
 has one; the feed's `offset` *is* its cursor, so both are "the wheel drives
 the selection"), and a click on a row jumps while a click outside dismisses,
 the picker's shape. Paste is swallowed, like every non-Rename modal.
+
+**[Amended 2026-08-15, C32]** The note editor is a **sixth** C12 modal. It
+takes the frame, backdrop, anchoring and stacking unchanged, and extends
+exactly two of the U8 answers to a second member: an outside **click** is
+swallowed, not a cancel (Rename's carve-out, same unsaved-work rationale
+with more at stake), and a **paste** belongs to its buffer — with the one
+filter difference contracted in C32: newlines survive as line breaks
+(CR/CRLF normalized) where Rename strips them, because in a multi-line
+field a pasted newline is content, not a commit. Wheel swallowed, like
+every non-feed/roster modal.
 
 ### C13 — Rename dialog
 
@@ -3441,6 +3489,80 @@ sanity check that a genuine edge still crosses) ·
 `cross_tab_focus_exits_zoom_like_any_other_tab_change` ·
 `float_rule2_focus_dir_does_not_cross_tabs_even_with_more_than_one`.
 
+### C32 — Pane parking notes (`Alt+Shift+n`) — [Added 2026-08-15, client request]
+
+**Problem being solved:** the client runs many tabs and panes, sleeps the
+laptop overnight (no quit, so no resurrection moment), and returns having
+forgotten each pane's *intent* — the transcript survives in the agent's own
+session, but "waiting on CI", "this approach is a dead end", "next: rebase
+then merge" do not. A name (`Alt+r`) says what a pane *is*; a note says
+where it *stands*.
+
+**Data:** `PaneSpec.note: Option<String>` + `PaneSpec.noted_at: Option<u64>`
+(unix seconds), both `#[serde(default)]` — a pre-C32 `workspace.json` loads
+untouched, and notes ride the existing auto-save/`Alt+u` clauses with no
+machinery of their own (pinned: `note_and_timestamp_roundtrip_through_json`,
+`pre_note_workspace_json_loads_with_no_note`,
+`undo_reopens_a_closed_pane_with_its_note`). Newlines separate lines; the
+**first line is the headline** every chrome surface shows; `noted_at` is
+set/cleared with `note`, never separately. The float (C22) takes a note
+in memory like any pane and loses it at quit — its own documented scope.
+
+**Editor (the C12 modal, C13's multi-line sibling):** `Alt+Shift+n` opens
+`Mode::Note` on the focused pane — prefilled, point at the very end,
+because the editor is also the note's *reader* (peek, edit and clear are
+one surface; there is no separate viewer). `pane` is pinned at open time.
+The dialog is Rename's 44-col width, one content row per line, growing to
+`NOTE_MAX_LINES` (8) instead of scrolling; heading `" pane note "`; all
+text `ink()`; the `▏` caret rides the cursor row (C13's `rename_field`).
+Keys: C13's whole editing vocabulary per row (insert at point, Backspace/
+Delete, `←→`/Home/End, Ctrl+U/W), plus the vertical half — `↑↓` move rows,
+`Shift+↵` splits the line at the point (`Ctrl+↵` synonym; **`Alt+↵` is
+claimed inside this dialog only** — Terminal.app delivers Shift+↵ as
+exactly Alt+↵'s bytes, so on that terminal it is the only spelling of
+"newline" the dialog will ever receive; every other Alt chord still
+cancels out to the global bindings, U18's toggle-off included), and
+Backspace/Delete at a line edge join across it. At the cap a split is
+swallowed whole. `↵` commits; `Esc`/toggle-off/outside-anything cancels.
+
+**Commit:** whole-text trim (stray blank edge lines die — a headline of
+`""` would make the badge segment a lie; interior blanks are the author's
+call); empty result clears `note` + `noted_at` both — **the clear gesture
+is the acknowledgment**, C32's staleness hygiene alongside the age tag;
+non-empty sets both and re-stamps. Either way the workspace saves
+immediately (the overnight story is a disk write, not a mode).
+
+**Display is reveal-on-visit, contracted in the surface contracts:** the
+focused pane's badge reads its headline + age out; every other surface —
+unfocused badges, collapsed rows, roster rows — shows only a `¶` presence
+marker. No startup digest, no toast, no timer, nothing shouts: C4's
+amendment holds the badge forms and the age-tag rule, C8's the row marker,
+C9's the `NOTE` mode word and pair list, C12's the modal-family rules
+(outside click swallowed; paste keeps newlines). Deliberately **not**
+built: tab-level notes (entering a tab focuses its remembered pane, whose
+note is the tab's de facto status line), roster note *text* (against
+reveal-on-visit), and a `roost note <id>` control verb (natural follow-up;
+the data model already supports it).
+
+**Unit tests (`core::app::tests`):**
+`note_types_splits_saves_and_stamps` ·
+`note_opens_prefilled_and_an_empty_save_clears` ·
+`note_esc_and_toggle_off_both_cancel_without_touching_the_note` ·
+`note_alt_enter_splits_instead_of_opening_the_picker` ·
+`note_line_cap_swallows_the_split` ·
+`note_paste_weaves_lines_and_folds_overflow_at_the_cap` ·
+`note_backspace_at_line_start_joins_lines` ·
+`undo_reopens_a_closed_pane_with_its_note`; input:
+`alt_shift_n_notes_pane_alt_n_still_news`. **Render:**
+`focused_badge_reads_the_headline_in_ink_with_a_quiet_age` ·
+`unfocused_badge_shows_only_the_note_marker` ·
+`age_word_floors_to_the_coarsest_sensible_unit` ·
+`noted_collapsed_row_marks_the_right_segment` ·
+`note_dialog_height_tracks_its_line_count`; the §2 gates audit the new
+spans through the `noted badges` / `noted collapsed rows` / `note dialog`
+`chrome_buffers()` fixtures (C12's every-Mode-variant rule enforces the
+fixture's existence at compile time).
+
 ---
 
 ## 4. Pixel-idea translations (explicit)
@@ -3708,6 +3830,7 @@ shows only the C9-curated subsets.
 | 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one. `Tab`/`Shift+Tab` inside it cycle a status filter** | C27 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
 | 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
+| 12b | `Alt+Shift+n` | **note this pane — parking note; first line shows on its badge** | C32 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
 | 13b | `Alt+i / Alt+m` | **previous / next tab (wraps)** | C2 |
 | 13c | `Alt+Shift+i / Alt+Shift+m` | **move this pane to the previous / next tab (wraps)** | C28 |

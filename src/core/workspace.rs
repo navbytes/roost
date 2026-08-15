@@ -23,6 +23,19 @@ pub struct PaneSpec {
     /// panes in its own spawned subtree, but not panes it didn't create.
     #[serde(default)]
     pub spawned_by: Option<PaneId>,
+    /// The pane's parking note (Alt+Shift+n): where this pane stands and
+    /// what's next, left for a future session of the person. Newlines
+    /// separate lines; the **first line is the headline** chrome shows —
+    /// the C4 badge renders headline + age on the focused pane and a bare
+    /// `¶` elsewhere. `None` = no note (an empty save clears back to this).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// When `note` was last saved, unix seconds — feeds the badge's age tag
+    /// (`5m`/`3h`/`2d`), which is how a stale note confesses its age
+    /// instead of reading as current. Set and cleared with `note`, never
+    /// separately.
+    #[serde(default)]
+    pub noted_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +58,7 @@ impl Workspace {
         let mut panes = HashMap::new();
         panes.insert(
             1,
-            PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None },
+            PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None, note: None, noted_at: None },
         );
         Workspace {
             version: 1,
@@ -106,6 +119,8 @@ impl Workspace {
                     session: None,
                     title: None,
                     spawned_by: None,
+                    note: None,
+                    noted_at: None,
                 });
             }
         }
@@ -163,7 +178,7 @@ mod tests {
         // Orphan spec: a pane id with no place in the layout tree.
         ws.tabs[0].panes.insert(
             5,
-            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
         );
         // Orphan layout leaf: the layout references pane 1, but drop its spec.
         ws.tabs[0].panes.remove(&1);
@@ -207,5 +222,36 @@ mod tests {
         let back: Workspace = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tabs[0].name, "main");
         assert!(back.tabs[0].panes[&1].session.is_none());
+    }
+
+    /// A parking note — newlines included — survives the save/load cycle,
+    /// timestamp attached. This is the whole overnight story: the note is
+    /// ordinary `PaneSpec` data, so it rides the same auto-save the
+    /// session id does.
+    #[test]
+    fn note_and_timestamp_roundtrip_through_json() {
+        let mut ws = Workspace::default_in(PathBuf::from("/tmp"));
+        let spec = ws.tabs[0].panes.get_mut(&1).unwrap();
+        spec.note = Some("tests green, PR up\nnext: rebase, merge".into());
+        spec.noted_at = Some(1_755_200_000);
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: Workspace = serde_json::from_str(&json).unwrap();
+        let spec = &back.tabs[0].panes[&1];
+        assert_eq!(spec.note.as_deref(), Some("tests green, PR up\nnext: rebase, merge"));
+        assert_eq!(spec.noted_at, Some(1_755_200_000));
+    }
+
+    /// A workspace.json written before notes existed loads with both fields
+    /// `None` — `#[serde(default)]`, pinned so the fields can never become
+    /// load-breaking for the state file everyone already has on disk.
+    #[test]
+    fn pre_note_workspace_json_loads_with_no_note() {
+        let json = r#"{"version":1,"active_tab":0,"tabs":[{"name":"main",
+            "layout":{"pane":1},
+            "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}}]}"#;
+        let back: Workspace = serde_json::from_str(json).unwrap();
+        let spec = &back.tabs[0].panes[&1];
+        assert!(spec.note.is_none());
+        assert!(spec.noted_at.is_none());
     }
 }
