@@ -65,7 +65,7 @@ adds a glyph or a colour.
 **Amendment 2026-08-06 (native selection):** **C29** (drag-select,
 double/triple-click, shift-click-extend over a pane whose app never asked
 for the mouse) is new — the client's standing macOS-parity requirement
-(`openspec/changes/best-in-class/PLAN.md`, Phase 2N, client requirement #1).
+(`docs/engagements/2026-08-07-best-in-class/PLAN.md`, Phase 2N, client requirement #1).
 It reuses C17's `Selection`/`highlight_selection` and
 C24's `finish_selection`/`grab_text` verbatim rather than forking them, adds
 no glyph and no colour, and needed no amendment to C23 or C24 (both verified
@@ -2777,7 +2777,7 @@ a pane whose app never asked for mouse reporting (`MouseProto::None`),
 (`App::on_click`) do anything. Selection exists only inside the modal
 `Alt+c` copy mode (C17/C24), reachable by nobody who doesn't already know
 the chord. The client's standing requirement
-(`openspec/changes/best-in-class/PLAN.md`, Phase 2N, client requirement #1)
+(`docs/engagements/2026-08-07-best-in-class/PLAN.md`, Phase 2N, client requirement #1)
 is that drag-select, double-click-word, triple-click-line and
 shift-click-extend work with **no new shortcuts to learn** — indistinguishable
 from a native macOS app — and that ⌘C always lands the emulator's own copy of
