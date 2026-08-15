@@ -38,6 +38,9 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // the clock to tick past a frame boundary mid-draw and split a frame
     // across two different spinner glyphs.
     let spinner: char = theme::spinner_frame(app.elapsed());
+    // C32: the badge age tags share one wall-clock read per frame, for the
+    // same no-split-frame reason as the spinner above.
+    let now: u64 = crate::core::app::now_unix_secs();
 
     draw_tab_bar(f, app, tab_bar, spinner);
 
@@ -66,7 +69,7 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // singleton, or disjoint tiled rects that never overlap each other).
     let rects = app.display_rects();
     for pr in rects.iter().rev() {
-        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), spinner);
+        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), spinner, now);
     }
 
     if app.hints_shown() {
@@ -147,6 +150,16 @@ fn hint_pairs(
             };
             vec![("type", what), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
         }
+        // C32, 62 columns. `Shift+↵` names the line break — the multi-line
+        // editor's one key Rename doesn't have (Ctrl/Alt+↵ are unhinted
+        // synonyms, same rule as every alias elsewhere on this bar).
+        Mode::Note { .. } => vec![
+            ("type", "note"),
+            ("↵", "save"),
+            ("Shift+↵", "new line"),
+            ("↑↓←→", "move"),
+            ("Esc", "cancel"),
+        ],
         // 71 columns, inside the floor. `j/k` are filter text now, not on
         // this bar.
         Mode::Picker { .. } => vec![
@@ -223,6 +236,7 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Normal if zoomed => "ZOOM",
         Mode::Normal => "NORMAL",
         Mode::Rename { .. } => "RENAME",
+        Mode::Note { .. } => "NOTE",
         Mode::Picker { .. } => "PICKER",
         Mode::Scroll => "SCROLL",
         Mode::Copy { .. } => "COPY",
@@ -714,6 +728,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
             ("Alt+←↓↑→ / hjkl", "move focus (←/→ continue to next/prev tab at an edge)"),
             ("Alt+r", "rename this pane"),
+            ("Alt+Shift+n", "note this pane — first line shows on its badge"),
             ("Alt+w", "close pane (confirm if busy)"),
             ("Alt+u", "reopen the last pane or tab you closed"),
             ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
@@ -842,6 +857,11 @@ fn dialog_rect(
         // stays fully visible while the query narrows.
         Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => None,
         Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
+        // C32: Rename's width, one content row per note line — the dialog
+        // grows a row per Shift+↵ (to NOTE_MAX_LINES) instead of scrolling.
+        Mode::Note { lines, .. } => {
+            Some(centered_near(anchor, body, 44, lines.len() as u16 + 2))
+        }
         Mode::Picker { .. } => {
             // U20: as tall as the longer of the two columns (a filter can
             // shrink the adapter side below the cwd side), never shorter
@@ -894,6 +914,26 @@ fn draw_mode_overlay<B: PaneBackend>(
                 Paragraph::new(rename_field(buffer, *cursor)).style(theme::ink()),
                 inner,
             );
+        }
+        // C32: the note editor — Rename's frame and field idiom, one row
+        // per line, the `▏` caret riding the cursor row only. Everything
+        // `ink()`: it is all input, and quiet input can't be proofread
+        // (C13's own rule).
+        Mode::Note { lines, row, col, .. } => {
+            let inner =
+                modal_frame(f, body, rect, Line::from(" pane note ").style(theme::ink()));
+            let rendered: Vec<Line> = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if i == *row {
+                        Line::from(rename_field(l, *col))
+                    } else {
+                        Line::from(l.clone())
+                    }
+                })
+                .collect();
+            f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
         }
         Mode::Picker { selection, filter, cwd, on_cwd } => {
             let items = app.picker_filtered();
@@ -1095,6 +1135,7 @@ fn roster_row_spans<B: PaneBackend>(
                 &adapter,
                 has_title,
                 app.is_raw(id),
+                spec.and_then(|s| s.note.as_ref()).is_some(),
                 spinner,
             ));
             spans
@@ -1497,10 +1538,11 @@ fn draw_pane<B: PaneBackend>(
     pr: PaneRect,
     stack_expanded: bool,
     spinner: char,
+    now: u64,
 ) {
     let focused = app.focused == pr.id;
     let raw = app.is_raw(pr.id);
-    let (status, name, has_title, adapter) = {
+    let (status, name, has_title, adapter, note) = {
         // find_spec, not the active tab's map directly: C22 learns the
         // float here too (its spec lives on the `Float`, not `Tab::panes`).
         let spec = app.find_spec(pr.id);
@@ -1521,7 +1563,22 @@ fn draw_pane<B: PaneBackend>(
         // indistinguishable at a glance; a pane publishing a live task line
         // now says what it's doing.
         let name = if spec.is_some() { app.display_name(pr.id) } else { "?".into() };
-        (status, name, has_title, adapter)
+        // C32: the badge's note segment — headline + age on the focused
+        // pane, a bare `¶` elsewhere; `¶⋮` marks a body under the
+        // headline. Built here because only draw_pane knows focus.
+        let note = spec.and_then(|s| {
+            s.note.as_ref().map(|n| {
+                let mut ls = n.lines();
+                let headline = ls.next().unwrap_or_default().to_string();
+                BadgeNote {
+                    headline,
+                    more: ls.next().is_some(),
+                    age: s.noted_at.map(|t| age_word(t, now)),
+                    focused,
+                }
+            })
+        });
+        (status, name, has_title, adapter, note)
     };
 
     if pr.collapsed {
@@ -1538,6 +1595,7 @@ fn draw_pane<B: PaneBackend>(
             &adapter,
             has_title,
             raw,
+            note.is_some(),
             spinner,
         );
         f.render_widget(Paragraph::new(Line::from(spans)), pr.rect);
@@ -1624,7 +1682,9 @@ fn draw_pane<B: PaneBackend>(
     let (base_glyph, glyph_style, spins) = theme::status_style(status);
     let glyph = badge_glyph(spins, scrolled, spinner, base_glyph);
     let text = badge_text(pr.id, &name, &adapter, has_title);
-    if let Some((rect, spans)) = corner_badge(inner, &text, raw, scrolled, glyph, glyph_style) {
+    if let Some((rect, spans)) =
+        corner_badge(inner, &text, note.as_ref(), raw, scrolled, glyph, glyph_style)
+    {
         f.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
 
@@ -1695,6 +1755,11 @@ fn paint_stack_edge(f: &mut Frame, rect: Rect) {
 /// (`row_word`/`row_status_style`), not a corpse. `spinner` is resolved from
 /// `status` in here (Working substitutes the current spinner frame) rather
 /// than by every caller.
+///
+/// C32: `noted` grows the right segment a leading `¶ ` in `ink()` — the
+/// C4 marker's exact meaning here (presence of a parked note, never its
+/// text: collapsed rows and the roster stay reveal-on-visit surfaces).
+/// It rides the right segment, so narrow rows shed it with the segment.
 #[allow(clippy::too_many_arguments)]
 fn collapsed_row_spans(
     width: u16,
@@ -1705,6 +1770,7 @@ fn collapsed_row_spans(
     adapter: &str,
     has_title: bool,
     raw: bool,
+    noted: bool,
     spinner: char,
 ) -> Vec<Span<'static>> {
     let (base_glyph, glyph_style, spins) = row_status_style(status);
@@ -1728,12 +1794,18 @@ fn collapsed_row_spans(
         format!("{} ", row_word(status))
     };
     let right = if raw { format!("raw · {right}") } else { right };
-    let right_w = mouse::display_width(&right);
+    // C32: the note marker leads the right segment, its own `ink()` span so
+    // it stays findable in a column of quiet state words.
+    let marker_w: u16 = if noted { 2 } else { 0 }; // "¶ "
+    let right_w = mouse::display_width(&right) + marker_w;
 
     if width >= left_w + right_w {
         let pad = width - left_w - right_w;
         let mut spans: Vec<Span> = left.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
         spans.push(Span::raw(" ".repeat(pad as usize)));
+        if noted {
+            spans.push(Span::styled("¶ ", theme::ink()));
+        }
         spans.push(Span::styled(right, theme::quiet()));
         spans
     } else {
@@ -1765,6 +1837,34 @@ fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
     );
 }
 
+/// C4's note segment data (C32): what the badge says about a parked note.
+/// `headline` is the note's first line, `more` marks a body under it (the
+/// `⋮`), `age` is the pre-rendered age tag — `None` when the note has no
+/// timestamp (hand-edited state): an absent fact renders as absent, never
+/// as a fabricated `now` — and `focused` picks between the two forms: the
+/// focused pane reads its note out, everything else shows a bare marker.
+/// Built by `draw_pane`, consumed by `corner_badge`.
+struct BadgeNote {
+    headline: String,
+    more: bool,
+    age: Option<String>,
+    focused: bool,
+}
+
+/// C4 (C32): the note age tag — the coarsest sensible unit, floored:
+/// `now` under a minute, then `5m` / `3h` / `2d`. This is how a stale
+/// note confesses instead of reading as current. A clock that moved
+/// backwards clamps to `now` rather than underflowing. Pure.
+fn age_word(noted_at: u64, now: u64) -> String {
+    let s = now.saturating_sub(noted_at);
+    match s {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
 /// Top-right corner badge (C4): pane name (+ adapter, when titled) and the
 /// status glyph, right-aligned with one column of breathing room. Two-tone:
 /// the text is `quiet`, the glyph carries its own C5 status style. A raw
@@ -1774,9 +1874,19 @@ fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
 /// glyph-adjacent (after `raw`), same `accent_quiet` family. Returns the
 /// 1-row rect and the clipped spans — or `None` if the pane is too small to
 /// be worth badging. Pure so it can be unit-tested.
+///
+/// C32: a pane with a parking note grows a note segment after the identity
+/// text — on the focused pane `¶ {headline} ({age})`, headline in `ink()`
+/// (the badge's one full-strength element: reveal-on-visit is the note's
+/// whole display story, and quiet input you're hunting for is input you
+/// cannot find), age in `quiet`; on an unfocused pane just the `¶` marker
+/// in `ink()` — presence, not content. `¶⋮` when a body sits under the
+/// headline. Identity leads and the note trails it, so C4's id-first rule
+/// holds untouched and a narrow pane clips the note before the join key.
 fn corner_badge(
     inner: Rect,
     text: &str,
+    note: Option<&BadgeNote>,
     raw: bool,
     scrolled: usize,
     glyph: char,
@@ -1788,11 +1898,24 @@ fn corner_badge(
     let max = inner.width.saturating_sub(1);
     // One space of breathing room on the right edge (the trailing space in
     // the glyph part).
-    let mut parts: Vec<(String, Style)> = Vec::with_capacity(4);
-    if raw || scrolled > 0 {
+    let mut parts: Vec<(String, Style)> = Vec::with_capacity(6);
+    let noted_focused = note.is_some_and(|n| n.focused);
+    if raw || scrolled > 0 || noted_focused {
         parts.push((format!(" {text} · "), theme::quiet()));
     } else {
         parts.push((format!(" {text} "), theme::quiet()));
+    }
+    if let Some(n) = note {
+        let marker = if n.more { "¶⋮" } else { "¶" };
+        if n.focused {
+            parts.push((format!("{marker} {}", n.headline), theme::ink()));
+            match &n.age {
+                Some(age) => parts.push((format!(" ({age}) "), theme::quiet())),
+                None => parts.push((" ".into(), theme::quiet())),
+            }
+        } else {
+            parts.push((format!("{marker} "), theme::ink()));
+        }
     }
     if raw {
         let token = if scrolled > 0 { "raw · " } else { "raw " };
@@ -2025,10 +2148,11 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 mod tests {
     use crate::App;
     use super::{
-        badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_style,
-        collapsed_row_spans, corner_badge, feed_entry_spans, feed_window,
-        help_content_width, help_layout, help_lines, hint_bar_right_spans, hint_pairs, mode_word,
-        push_tab_spans, should_place_cursor, stack_header_text, state_word, HelpLine, HELP_GROUPS,
+        age_word, badge_text, blit_screen, cell_in_selection, centered_near,
+        collapsed_name_style, collapsed_row_spans, corner_badge, dialog_rect, feed_entry_spans,
+        feed_window, help_content_width, help_layout, help_lines, hint_bar_right_spans,
+        hint_pairs, mode_word, push_tab_spans, should_place_cursor, stack_header_text,
+        state_word, BadgeNote, HelpLine, HELP_GROUPS,
     };
     use crate::core::app::{Mode, RenameTarget, RosterRow};
     use crate::core::status::AgentStatus;
@@ -2073,7 +2197,7 @@ mod tests {
     fn badge_is_two_toned_and_right_aligned_on_top_row() {
         // inner content area at (1,1) sized 40x20 (borders excluded)
         let inner = Rect::new(1, 1, 40, 20);
-        let (rect, spans) = corner_badge(inner, "claude", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
+        let (rect, spans) = corner_badge(inner, "claude", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         assert_eq!(rect.y, inner.y); // top row of the content
         assert_eq!(rect.height, 1);
         // right edge: badge ends one col shy of the inner right edge is fine;
@@ -2090,7 +2214,7 @@ mod tests {
     fn badge_clips_and_drops_the_glyph_first_when_pane_too_small() {
         let inner = Rect::new(0, 0, 6, 5);
         let (rect, spans) =
-            corner_badge(inner, "a-very-long-name", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
+            corner_badge(inner, "a-very-long-name", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         assert!(total <= 5); // width-1 breathing room
         assert!(rect.x >= inner.x && rect.x + rect.width <= inner.x + inner.width);
@@ -2105,7 +2229,7 @@ mod tests {
         // overflow the pane by several columns (D1). The fix must stop
         // clipping on a display-width boundary and never split a glyph.
         let inner = Rect::new(0, 0, 5, 5); // budget = inner.width - 1 = 4
-        let (rect, spans) = corner_badge(inner, "日本語", false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+        let (rect, spans) = corner_badge(inner, "日本語", None, false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let rendered_width: u16 = spans.iter().map(|s| mouse::display_width(&s.content)).sum();
         assert!(rendered_width <= 4, "clipped badge must fit its column budget, got {rendered_width}");
         assert!(rect.width <= 4);
@@ -2137,9 +2261,9 @@ mod tests {
 
     #[test]
     fn no_badge_for_tiny_or_empty() {
-        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
     }
 
     // -- C23 raw indication ---------------------------------------------------
@@ -2148,7 +2272,7 @@ mod tests {
     fn badge_gains_a_raw_token_in_its_own_quiet_red() {
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "scratch · shell", true, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+            corner_badge(inner, "scratch · shell", None, true, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" scratch · shell · raw {} ", theme::GLYPH_IDLE));
         let raw_span = spans.iter().find(|s| s.content.as_ref() == "raw ").expect("raw token span");
@@ -2160,7 +2284,7 @@ mod tests {
     #[test]
     fn badge_without_raw_has_no_raw_token() {
         let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) = corner_badge(inner, "pi", false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+        let (_, spans) = corner_badge(inner, "pi", None, false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("raw"));
     }
@@ -2173,7 +2297,7 @@ mod tests {
         // quiet-red family as the raw token, glyph-adjacent.
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", false, 42, theme::GLYPH_WORKING, theme::accent()).unwrap();
+            corner_badge(inner, "3 pi", None, false, 42, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · ↑42 {} ", theme::GLYPH_WORKING));
         let token = spans.iter().find(|s| s.content.as_ref() == "↑42 ").expect("↑N token span");
@@ -2185,7 +2309,7 @@ mod tests {
         // raw · ↑N — input state first, then view state, then the glyph.
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", true, 7, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+            corner_badge(inner, "3 pi", None, true, 7, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · raw · ↑7 {} ", theme::GLYPH_IDLE));
     }
@@ -2194,9 +2318,148 @@ mod tests {
     fn badge_at_live_tail_has_no_scrolled_token() {
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
+            corner_badge(inner, "3 pi", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains('↑'), "{text}");
+    }
+
+    // -- C32: the badge's note segment ------------------------------------
+
+    /// C32: the focused pane's badge reads its note out — headline in
+    /// `ink()` (the badge's one full-strength element), age tag `quiet` —
+    /// after the identity text, so C4's id-first rule holds and a narrow
+    /// pane clips the note before the join key.
+    #[test]
+    fn focused_badge_reads_the_headline_in_ink_with_a_quiet_age() {
+        let inner = Rect::new(0, 0, 60, 20);
+        let note = BadgeNote {
+            headline: "tests green, PR up".into(),
+            more: false,
+            age: Some("14h".into()),
+            focused: true,
+        };
+        let (_, spans) =
+            corner_badge(inner, "3 api", Some(&note), false, 0, theme::GLYPH_WAITING, theme::ink())
+                .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 api · ¶ tests green, PR up (14h) {} ", theme::GLYPH_WAITING));
+        let headline =
+            spans.iter().find(|s| s.content.as_ref().contains("tests green")).unwrap();
+        assert_eq!(headline.style, theme::ink(), "the headline is the badge's loud element");
+        let age = spans.iter().find(|s| s.content.as_ref().contains("(14h)")).unwrap();
+        assert_eq!(age.style, theme::quiet(), "the age tag stays quiet");
+
+        // A note missing its timestamp (hand-edited state) shows NO age tag
+        // — an absent fact renders as absent, never as a fabricated "now".
+        let unstamped = BadgeNote { age: None, ..note };
+        let (_, spans) = corner_badge(
+            inner,
+            "3 api",
+            Some(&unstamped),
+            false,
+            0,
+            theme::GLYPH_WAITING,
+            theme::ink(),
+        )
+        .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 api · ¶ tests green, PR up {} ", theme::GLYPH_WAITING));
+    }
+
+    /// C32: an unfocused pane's badge marks presence, never content — a
+    /// bare `¶` in `ink()` (`¶⋮` when a body exists), no headline, no age.
+    /// Reveal-on-visit is the display contract.
+    #[test]
+    fn unfocused_badge_shows_only_the_note_marker() {
+        let inner = Rect::new(0, 0, 60, 20);
+        let note = BadgeNote {
+            headline: "tests green, PR up".into(),
+            more: false,
+            age: Some("14h".into()),
+            focused: false,
+        };
+        let (_, spans) =
+            corner_badge(inner, "3 api", Some(&note), false, 0, theme::GLYPH_IDLE, theme::quiet())
+                .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 api ¶ {} ", theme::GLYPH_IDLE));
+        let marker = spans.iter().find(|s| s.content.as_ref() == "¶ ").unwrap();
+        assert_eq!(marker.style, theme::ink(), "the marker is findable, not dim");
+
+        // A body under the headline shows as ¶⋮ — "there's more here".
+        let deeper = BadgeNote { more: true, ..note };
+        let (_, spans) =
+            corner_badge(inner, "3 api", Some(&deeper), false, 0, theme::GLYPH_IDLE, theme::quiet())
+                .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("¶⋮"), "{text}");
+    }
+
+    /// C32: the age tag's units — floored, coarsest-sensible, "now" under
+    /// a minute; a backwards clock clamps instead of underflowing.
+    #[test]
+    fn age_word_floors_to_the_coarsest_sensible_unit() {
+        assert_eq!(age_word(100, 100), "now");
+        assert_eq!(age_word(100, 159), "now");
+        assert_eq!(age_word(100, 160), "1m");
+        assert_eq!(age_word(0, 59 * 60), "59m");
+        assert_eq!(age_word(0, 3600), "1h");
+        assert_eq!(age_word(0, 86399), "23h");
+        assert_eq!(age_word(0, 86400), "1d");
+        assert_eq!(age_word(0, 86400 * 3 + 7), "3d");
+        assert_eq!(age_word(500, 100), "now", "a clock that moved backwards clamps");
+    }
+
+    /// C32: a noted collapsed row's right segment leads with `¶ ` in its
+    /// own `ink()` span — presence only, same meaning as the unfocused
+    /// badge marker — and sheds with the segment when narrow.
+    #[test]
+    fn noted_collapsed_row_marks_the_right_segment() {
+        let spans = collapsed_row_spans(
+            40,
+            false,
+            Some(AgentStatus::Idle),
+            2,
+            "api",
+            "shell",
+            false,
+            false,
+            true,
+            theme::GLYPH_WORKING,
+        );
+        let marker = spans.iter().find(|s| s.content.as_ref() == "¶ ").expect("marker span");
+        assert_eq!(marker.style, theme::ink());
+        // Narrow: the whole right segment — marker included — sheds.
+        let spans = collapsed_row_spans(
+            8,
+            false,
+            Some(AgentStatus::Idle),
+            2,
+            "api",
+            "shell",
+            false,
+            false,
+            true,
+            theme::GLYPH_WORKING,
+        );
+        assert!(spans.iter().all(|s| !s.content.as_ref().contains('¶')));
+    }
+
+    /// C32: the note dialog is Rename's width, one content row per line —
+    /// it grows a row per Shift+↵ instead of scrolling.
+    #[test]
+    fn note_dialog_height_tracks_its_line_count() {
+        let body = Rect::new(0, 0, 100, 30);
+        let mk = |n: usize| Mode::Note {
+            lines: vec![String::new(); n],
+            row: 0,
+            col: 0,
+            pane: 1,
+        };
+        let one = dialog_rect(&mk(1), body, body, 0, &[]).unwrap();
+        assert_eq!((one.width, one.height), (44, 3), "one line matches Rename's dialog");
+        let five = dialog_rect(&mk(5), body, body, 0, &[]).unwrap();
+        assert_eq!(five.height, 7);
     }
 
     #[test]
@@ -2360,7 +2623,7 @@ mod tests {
     #[test]
     fn collapsed_row_shows_right_segment_when_it_fits() {
         let spans =
-            collapsed_row_spans(40, false, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(40, false, Some(AgentStatus::Working), 2, "pi", "pi", true, false, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("pi · working "));
     }
@@ -2372,7 +2635,7 @@ mod tests {
         // right segment is the bare state word — "your turn", not
         // "shell · your turn". [DESIGN-ui.md amended 2026-07-22, ux #3.]
         let spans =
-            collapsed_row_spans(40, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(40, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, false, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("your turn "));
         assert!(!text.contains("shell ·"));
@@ -2385,7 +2648,7 @@ mod tests {
         // nothing more (U2: the id rides with the name on the left).
         let left_w = 5 + name.chars().count() as u16;
         let spans =
-            collapsed_row_spans(left_w, false, Some(AgentStatus::Idle), 2, name, "shell", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(left_w, false, Some(AgentStatus::Idle), 2, name, "shell", true, false, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" · 2 {name}"));
         assert!(!text.contains("shell"));
@@ -2400,6 +2663,7 @@ mod tests {
             2,
             "a-very-long-pane-name",
             "shell",
+            false,
             true,
             false,
             theme::GLYPH_WORKING,
@@ -2412,19 +2676,19 @@ mod tests {
     #[test]
     fn collapsed_row_focused_marker_is_accent() {
         let spans =
-            collapsed_row_spans(40, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(40, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, false, theme::GLYPH_WORKING);
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style, theme::accent());
     }
 
     #[test]
     fn collapsed_row_raw_gains_the_prefix_ahead_of_the_usual_right_segment() {
-        let titled = collapsed_row_spans(60, false, Some(AgentStatus::Working), 2, "pi", "pi", true, true, theme::GLYPH_WORKING);
+        let titled = collapsed_row_spans(60, false, Some(AgentStatus::Working), 2, "pi", "pi", true, true, false, theme::GLYPH_WORKING);
         let text: String = titled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · pi · working "), "{text}");
 
         let untitled =
-            collapsed_row_spans(60, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, true, theme::GLYPH_WORKING);
+            collapsed_row_spans(60, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, true, false, theme::GLYPH_WORKING);
         let text: String = untitled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · your turn "), "{text}");
     }
@@ -2884,7 +3148,7 @@ mod tests {
     #[test]
     fn collapsed_row_spans_at_zero_width_is_empty_not_panicking() {
         let spans =
-            collapsed_row_spans(0, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(0, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, false, theme::GLYPH_WORKING);
         assert!(spans.is_empty());
     }
 
@@ -2996,8 +3260,8 @@ mod tests {
         for chord in [
             "Alt+n", "Alt+Enter", "Alt+r", "Alt+w", "Alt+u", "Alt+Shift+p", "Alt+Shift+←↓↑→",
             "Alt+s", "Alt+o", "Alt+g", "Alt+z", "Alt+f", "Alt+t", "Alt+1..9", "Alt+0", "Alt+i",
-            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a", "Alt+e", "Alt+PgUp",
-            "Alt+c", "Alt+/", "Alt+?", "Alt+q",
+            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+Shift+n", "Alt+a", "Alt+Shift+a",
+            "Alt+e", "Alt+PgUp", "Alt+c", "Alt+/", "Alt+?", "Alt+q",
         ] {
             assert!(text.contains(chord), "the keymap must document {chord:?}");
         }
@@ -3457,6 +3721,38 @@ mod tests {
         app.apply(Action::ToggleHints); // the tab bar picks up the mode word
         out.push(("zoom with the hint bar hidden", snap(&mut app)));
 
+        // C32: parked notes, both badge forms at once — the focused pane's
+        // headline + age segment and an unfocused pane's bare `¶` — plus
+        // the same two panes as collapsed rows (the right segment's marker),
+        // so the §2 gates audit every note span the chrome can draw.
+        {
+            let mut app = three_panes();
+            let first = app.pane_order()[0];
+            let focused = app.focused;
+            assert_ne!(first, focused, "fixture needs an unfocused noted pane");
+            let spec = app.ws.tabs[0].panes.get_mut(&first).unwrap();
+            spec.note = Some("waiting on CI".into());
+            spec.noted_at = Some(0);
+            let spec = app.ws.tabs[0].panes.get_mut(&focused).unwrap();
+            spec.note = Some("tests green, PR up\nnext: rebase onto main".into());
+            spec.noted_at = Some(0);
+            out.push(("noted badges, focused and not", snap(&mut app)));
+            app.apply(Action::ToggleStack);
+            out.push(("noted collapsed rows", snap(&mut app)));
+        }
+
+        // C32: the note dialog itself, prefilled with a two-line note so
+        // both the caret row and a plain row are drawn.
+        {
+            let mut app = three_panes();
+            let focused = app.focused;
+            let spec = app.ws.tabs[0].panes.get_mut(&focused).unwrap();
+            spec.note = Some("tests green, PR up\nnext: rebase onto main".into());
+            spec.noted_at = Some(0);
+            app.apply(Action::NotePane);
+            out.push(("note dialog", snap(&mut app)));
+        }
+
         // C16: a dead pane's action bar. The fixture omitted every
         // pane-overlay state, which is exactly how a span-styled (rather than
         // widget-styled) bar hid from these gates — it reversed its ~76 text
@@ -3598,6 +3894,7 @@ mod tests {
                 // The baseline: every fixture is Normal-mode chrome.
                 Mode::Normal => None,
                 Mode::Rename { .. } => Some("rename dialog"),
+                Mode::Note { .. } => Some("note dialog"),
                 Mode::Picker { .. } => Some("picker"),
                 Mode::Scroll => Some("scroll mode"),
                 Mode::Copy { .. } => Some("copy mode"),
@@ -3613,6 +3910,7 @@ mod tests {
         let samples = [
             Mode::Normal,
             Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane },
+            Mode::Note { lines: vec![String::new()], row: 0, col: 0, pane: 1 },
             Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
             Mode::Scroll,
             Mode::Copy { cursor: (0, 0) },
@@ -4361,6 +4659,7 @@ mod tests {
             other,
             &app.display_name(other),
             "shell",
+            false,
             false,
             false,
             theme::GLYPH_WORKING,

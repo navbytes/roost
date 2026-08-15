@@ -173,7 +173,7 @@ by default.
 
 - **[done] Golden-frame *color* scenarios.** The deferred trigger fired
   (this engagement leaned on `src/ui/render.rs` heavily — see
-  `openspec/changes/best-in-class/PLAN.md` Phase 5). Audit first: of
+  `docs/engagements/2026-08-07-best-in-class/PLAN.md` Phase 5). Audit first: of
   C1-C30, the in-process `chrome_buffers()` fixture (render.rs) already
   covered nearly every contract — four prior reactive patches (the
   too-small notice, a lit selection, the filtered/reordered roster, the

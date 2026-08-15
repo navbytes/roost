@@ -147,6 +147,7 @@ you're in.
 | `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
 | `Alt+r` | rename pane |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
+| `Alt+Shift+n` | note the focused pane — a parking note for tomorrow-you; its first line shows on the badge |
 | `Alt+t`, `Alt+1..9`, `Alt+0` | new tab / go to tab / go to the last tab |
 | `Alt+i` / `Alt+m` | previous / next tab (wraps — the route to tabs past the ninth) |
 | `Alt+Shift+i` / `Alt+Shift+m` | carry the focused pane to the previous / next tab |
@@ -251,7 +252,7 @@ mouse regardless, and copy mode is there if you need it.
 
 ## Fleet features
 
-Nine keyboard-first additions for running more agents at once, plus one
+Ten keyboard-first additions for running more agents at once, plus one
 CLI-only escape hatch — all Alt-only, same layer as everything above.
 
 - **Jump to attention (`Alt+a`).** Jumps to the next pane whose status is
@@ -316,6 +317,19 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   sessions intact, but re-split off the focused pane rather than at their
   original geometry. The undo stack holds the last 20 closes and is
   session-only (cleared on quit).
+- **Pane notes (`Alt+Shift+n`).** A parking note on the focused pane —
+  where this pane stands and what's next, written before you close the lid,
+  read the next morning without a ritual: the note's **first line shows in
+  the focused pane's corner badge** with an age tag (`14h`, `2d` — a stale
+  note confesses instead of lying), and every other pane that carries one
+  shows a bare `¶` (`¶⋮` when there's more under the first line), so
+  walking your tabs and panes reveals each note where you're already
+  looking. Nothing is ever shown all at once. The editor is the reader:
+  the same chord reopens it prefilled — edit and `Enter` re-stamps,
+  `Ctrl+U` + `Enter` clears ("handled"), `Shift+Enter` adds a line (up to
+  8; multi-line pastes work too). Notes live in `workspace.json` next to
+  the session id, so they survive quits and reboots, and `Alt+u` restores
+  a note with its closed pane.
 - **Broadcast.** `roost send --all TEXT [--enter]` types into every running
   pane at once — CLI/control-plane only, deliberately no TUI key so a
   fat-fingered `Alt` chord can't blast the whole fleet. See
@@ -378,7 +392,10 @@ Each pane also carries a faint **corner badge**, top-right (iTerm2-style):
 `name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
 (pi, claude, codex, gemini, opencode, or shell) when unnamed, and the glyph is the pane's live
 status. A cell TUI can't do true translucency, so it's rendered dim rather
-than see-through; the inner app's content still draws underneath it.
+than see-through; the inner app's content still draws underneath it. A pane
+with an `Alt+Shift+n` note adds a `¶` here — and on the focused pane, the
+note's first line and age, full-strength: the one thing in the badge that
+isn't dim.
 
 ## Appearance
 

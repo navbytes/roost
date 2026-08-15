@@ -58,6 +58,13 @@ pub enum RenameTarget {
     Tab,
 }
 
+/// C32: the note editor's line cap. A parking note is a headline plus a
+/// few lines of "what's next" — eight is comfortably past the 2–3 the
+/// surface is for, while keeping the dialog a dialog (it must fit inside
+/// an 80×24 body with the C12 frame). At the cap, a newline is swallowed,
+/// not split; a paste's overflow joins the last line instead of vanishing.
+pub const NOTE_MAX_LINES: usize = 8;
+
 /// UI mode: non-Normal modes capture all keys (see handle_mode_key).
 pub enum Mode {
     Normal,
@@ -67,6 +74,15 @@ pub enum Mode {
     /// every motion, edit and the `▏` caret's position are all counted in
     /// what the user sees, and a byte index would split a multi-byte name.
     Rename { buffer: String, cursor: usize, target: RenameTarget },
+    /// C32: the parking-note editor (Alt+Shift+n) — Rename's multi-line
+    /// sibling. `lines` is the note split on newlines, never empty (an
+    /// empty note edits as one empty line); (`row`, `col`) is the point,
+    /// `col` a **char** index into `lines[row]` for the same reason
+    /// Rename's cursor is. `pane` pins the note's owner at open time, so
+    /// the commit can never land on a different pane than the dialog
+    /// opened on (Rename re-reads `self.focused` at commit; a note is
+    /// bigger unsaved work, so its target is nailed down instead).
+    Note { lines: Vec<String>, row: usize, col: usize, pane: PaneId },
     /// U20: the quick-launch picker. `selection` indexes the **filtered**
     /// adapter list (`filter` is the type-ahead query, empty = everything);
     /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
@@ -2462,6 +2478,41 @@ impl<B: PaneBackend> App<B> {
     /// to the pane *under* the dialog — live QA typed `PSTX` into a hidden
     /// shell while the dialog's own buffer ignored it.
     pub fn handle_paste(&mut self, text: &str) {
+        // U8(b) for C32: the note dialog owns the paste, and newlines are
+        // the one control character that survives it — pasting a small
+        // checklist is the multi-line editor's best entry path. CR/CRLF
+        // normalize to LF first; every other control char drops, as
+        // Rename's filter does. Overflow past the line cap folds into the
+        // last line (space-joined) rather than vanishing: a clipped paste
+        // must still read as the text you pasted. The point lands after
+        // the insertion, ahead of whatever tail it split off.
+        if let Mode::Note { lines, row, col, .. } = &mut self.mode {
+            let clean = text.replace("\r\n", "\n").replace('\r', "\n");
+            let clean: String =
+                clean.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            *row = (*row).min(lines.len().saturating_sub(1));
+            let at = byte_at(&lines[*row], (*col).min(lines[*row].chars().count()));
+            let tail = lines[*row][at..].to_string();
+            lines[*row].truncate(at);
+            let mut parts = clean.split('\n');
+            if let Some(first) = parts.next() {
+                lines[*row].push_str(first);
+            }
+            for part in parts {
+                if lines.len() < NOTE_MAX_LINES {
+                    *row += 1;
+                    lines.insert(*row, part.to_string());
+                } else {
+                    if !lines[*row].is_empty() && !part.is_empty() {
+                        lines[*row].push(' ');
+                    }
+                    lines[*row].push_str(part);
+                }
+            }
+            *col = lines[*row].chars().count();
+            lines[*row].push_str(&tail);
+            return;
+        }
         if let Mode::Rename { buffer, cursor, .. } = &mut self.mode {
             // U16: a paste lands at the point, like typing does, and leaves
             // the point after what it inserted — a paste that always
@@ -2900,7 +2951,7 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    /// U8: is a modal overlay up? These five modes (the roster, C27, is a
+    /// U8: is a modal overlay up? These six modes (the roster, C27, is a
     /// C12 modal like the rest) own the whole non-keyboard input surface —
     /// mouse and paste alike — while they are active. Scroll/Copy are
     /// deliberately excluded: they draw no dialog, nothing is hidden
@@ -2910,6 +2961,7 @@ impl<B: PaneBackend> App<B> {
         matches!(
             self.mode,
             Mode::Rename { .. }
+                | Mode::Note { .. }
                 | Mode::Picker { .. }
                 | Mode::Help { .. }
                 | Mode::Feed { .. }
@@ -2990,8 +3042,10 @@ impl<B: PaneBackend> App<B> {
         // buffer is unsaved work, and throwing it away on a stray click is
         // U8(a)'s harm inverted (the live QA script types `ZZZ`, clicks
         // another pane, and expects the commit to land on the pane the
-        // dialog opened on). Esc/Enter stay the ways out.
-        if matches!(self.mode, Mode::Rename { .. }) {
+        // dialog opened on). Esc/Enter stay the ways out. The note editor
+        // (C32) rides the same rule for the same reason, with more unsaved
+        // work at stake.
+        if matches!(self.mode, Mode::Rename { .. } | Mode::Note { .. }) {
             return;
         }
         if matches!(self.mode, Mode::Picker { .. }) {
@@ -3333,6 +3387,26 @@ impl<B: PaneBackend> App<B> {
                 let cursor = current.chars().count();
                 self.mode = Mode::Rename { buffer: current, cursor, target: RenameTarget::Tab };
             }
+            Action::NotePane => {
+                // C32: opens prefilled — the editor IS the note's reader
+                // (peek, edit and clear are one surface), so an existing
+                // note must arrive intact, point at the very end like
+                // Rename's. A specless pane (dead mid-frame) has nowhere
+                // to keep a note; the chord just does nothing there.
+                let focused = self.focused;
+                if let Some(spec) = self.find_spec(focused) {
+                    let lines: Vec<String> = match &spec.note {
+                        Some(n) => n.lines().map(str::to_string).collect(),
+                        None => vec![String::new()],
+                    };
+                    // `str::lines` on "" yields no lines; the editor's
+                    // invariant is at least one.
+                    let lines = if lines.is_empty() { vec![String::new()] } else { lines };
+                    let row = lines.len() - 1;
+                    let col = lines[row].chars().count();
+                    self.mode = Mode::Note { lines, row, col, pane: focused };
+                }
+            }
             Action::QuickLaunch => {
                 // U20: a fresh picker every time — no sticky filter from a
                 // previous visit, and the cwd column parked on its most
@@ -3651,7 +3725,7 @@ impl<B: PaneBackend> App<B> {
                 .map(|s| s.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         });
-        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by };
+        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by, note: None, noted_at: None };
 
         // Split in the widest direction of the split target's rect. Refuses
         // (returns None) a split that would produce unusably tiny panes
@@ -3791,7 +3865,7 @@ impl<B: PaneBackend> App<B> {
         let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
-        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None });
+        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None, note: None, noted_at: None });
         self.ws.tabs.push(Tab {
             name: format!("tab{}", self.ws.tabs.len() + 1),
             layout: LayoutNode::Pane(id),
@@ -4585,6 +4659,8 @@ impl<B: PaneBackend> App<B> {
             session: None,
             title: Some("scratch".into()),
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
         self.set_focus(id);
@@ -4675,6 +4751,20 @@ impl<B: PaneBackend> App<B> {
         // would leave the pane you were reading frozen mid-history while scroll
         // keys silently drive a different pane.
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            // C32: Alt+Enter *inside the note editor* is a line break, not
+            // a cancel into the quick-launch picker. Terminal.app reports
+            // Shift+Enter as exactly these bytes (ESC CR — the README's
+            // documented collapse), so on that terminal this is the only
+            // spelling of "newline" the dialog can ever receive; on CSI-u
+            // terminals it's a synonym for Shift+Enter. No other Alt chord
+            // is claimed — the rest still cancel out to the global
+            // bindings below, Alt+Shift+n's own toggle-off included.
+            if key.code == KeyCode::Enter {
+                if let Mode::Note { lines, row, col, .. } = &mut self.mode {
+                    note_split_line(lines, row, col);
+                    return true;
+                }
+            }
             // U18: a mode's own entry chord toggles it OFF. C20's Alt+e had
             // this rule special-cased for the feed; every other mode fell
             // through to the global binding and *re-entered* — Alt+c in copy
@@ -4851,6 +4941,126 @@ impl<B: PaneBackend> App<B> {
                         self.save();
                         self.mode = Mode::Normal;
                     }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                true
+            }
+            Mode::Note { lines, row, col, pane } => {
+                // C32: Rename's editing vocabulary, one row at a time —
+                // Ctrl+U/W, insert-at-point, Backspace/Delete, ←→/Home/End
+                // all mean on `lines[row]` exactly what they mean on
+                // Rename's buffer — plus the vertical half: ↑↓ move rows,
+                // Shift+Enter (or Ctrl+Enter; Alt+Enter is caught in the
+                // Alt branch above) splits the line, and Backspace/Delete
+                // at a line edge join across it. Plain Enter commits,
+                // Esc walks away.
+                let pane = *pane;
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+                // Same stale-point hygiene as Rename: clamp, never slice bad.
+                *row = (*row).min(lines.len() - 1);
+                let len = lines[*row].chars().count();
+                *col = (*col).min(len);
+                match key.code {
+                    KeyCode::Enter if shift || ctrl => {
+                        note_split_line(lines, row, col);
+                    }
+                    KeyCode::Enter => {
+                        // Whole-text trim: stray blank lines at either end
+                        // die here (a headline of "" would make the badge
+                        // segment a lie), interior blanks are kept — a
+                        // spacer line inside a note is the author's call.
+                        let text = lines.join("\n").trim().to_string();
+                        if let Some(spec) = self.find_spec_mut(pane) {
+                            if text.is_empty() {
+                                // Empty save = clear: the one gesture is
+                                // also the acknowledgment ("handled").
+                                spec.note = None;
+                                spec.noted_at = None;
+                            } else {
+                                spec.note = Some(text);
+                                spec.noted_at = Some(now_unix_secs());
+                            }
+                        }
+                        self.save();
+                        self.mode = Mode::Normal;
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        lines[*row] = lines[*row][byte_at(&lines[*row], *col)..].to_string();
+                        *col = 0;
+                    }
+                    KeyCode::Char('w') if ctrl => {
+                        let at = byte_at(&lines[*row], *col);
+                        let head = erase_word(&lines[*row][..at]);
+                        *col = head.chars().count();
+                        lines[*row] = head + &lines[*row][at..];
+                    }
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        let at = byte_at(&lines[*row], *col);
+                        lines[*row].insert(at, c);
+                        *col += 1;
+                    }
+                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
+                    KeyCode::Backspace => {
+                        if *col > 0 {
+                            *col -= 1;
+                            let at = byte_at(&lines[*row], *col);
+                            lines[*row].remove(at);
+                        } else if *row > 0 {
+                            // At a line's left edge the join is the erase.
+                            let cur = lines.remove(*row);
+                            *row -= 1;
+                            *col = lines[*row].chars().count();
+                            lines[*row].push_str(&cur);
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if *col < len {
+                            let at = byte_at(&lines[*row], *col);
+                            lines[*row].remove(at);
+                        } else if *row + 1 < lines.len() {
+                            let next = lines.remove(*row + 1);
+                            lines[*row].push_str(&next);
+                        }
+                    }
+                    // ←/→ flow across line ends, the way every textarea
+                    // reads; ↑/↓ keep the column where they can.
+                    KeyCode::Left => {
+                        if *col > 0 {
+                            *col -= 1;
+                        } else if *row > 0 {
+                            *row -= 1;
+                            *col = lines[*row].chars().count();
+                        }
+                    }
+                    KeyCode::Right => {
+                        if *col < len {
+                            *col += 1;
+                        } else if *row + 1 < lines.len() {
+                            *row += 1;
+                            *col = 0;
+                        }
+                    }
+                    KeyCode::Up => {
+                        if *row > 0 {
+                            *row -= 1;
+                            *col = (*col).min(lines[*row].chars().count());
+                        }
+                    }
+                    KeyCode::Down => {
+                        if *row + 1 < lines.len() {
+                            *row += 1;
+                            *col = (*col).min(lines[*row].chars().count());
+                        }
+                    }
+                    KeyCode::Home => *col = 0,
+                    KeyCode::End => *col = len,
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
                 }
@@ -5467,6 +5677,7 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
         Mode::Normal => None,
         Mode::Rename { target: RenameTarget::Pane, .. } => Some(Action::RenamePane),
         Mode::Rename { target: RenameTarget::Tab, .. } => Some(Action::RenameTab),
+        Mode::Note { .. } => Some(Action::NotePane),
         Mode::Picker { .. } => Some(Action::QuickLaunch),
         Mode::Scroll => Some(Action::ScrollMode),
         Mode::Copy { .. } => Some(Action::CopyMode),
@@ -5519,6 +5730,36 @@ pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
 /// accented word), and slicing one down the middle panics.
 fn byte_at(s: &str, at: usize) -> usize {
     s.char_indices().nth(at).map_or(s.len(), |(b, _)| b)
+}
+
+/// C32: split the note line at the point — Shift+Enter / Ctrl+Enter /
+/// Alt+Enter's one edit, shared by the mode arm and the Alt-branch
+/// carve-out so the three spellings can never drift. At `NOTE_MAX_LINES`
+/// the split is swallowed whole (no new line, nothing scrolled off the
+/// dialog); the clamps are the Rename arm's stale-point hygiene.
+fn note_split_line(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
+    if lines.len() >= NOTE_MAX_LINES {
+        return;
+    }
+    *row = (*row).min(lines.len() - 1);
+    let line = &mut lines[*row];
+    let at = byte_at(line, (*col).min(line.chars().count()));
+    let tail = line[at..].to_string();
+    line.truncate(at);
+    lines.insert(*row + 1, tail);
+    *row += 1;
+    *col = 0;
+}
+
+/// C32: wall-clock seconds for `noted_at`. A pre-1970 system clock yields
+/// 0 rather than a panic — the age tag then reads absurdly old, which is
+/// at least honest about the clock being broken. `pub` because the badge's
+/// age tag reads the same clock, once per frame (C5's shared-read idiom).
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// U17 word motions, shared shape: is cell `i` of `line` whitespace? Past the
@@ -8616,6 +8857,184 @@ mod tests {
         assert_eq!(app.find_spec(id).and_then(|s| s.title.clone()), Some("api[0mbox".into()));
     }
 
+    // -- C32: the pane parking note ---------------------------------------
+
+    /// The note editor's lines and point, for the tests below.
+    fn note_state(app: &App<FakePane>) -> (Vec<String>, usize, usize) {
+        match &app.mode {
+            Mode::Note { lines, row, col, .. } => (lines.clone(), *row, *col),
+            _ => panic!("the note dialog must be up"),
+        }
+    }
+
+    fn shift_enter() -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    }
+
+    /// C32, the whole write path: type a headline, Shift+Enter, type a body
+    /// line, Enter — the note lands on the spec with a timestamp, and the
+    /// workspace is saved (the overnight story is a disk write, not a mode).
+    #[test]
+    fn note_types_splits_saves_and_stamps() {
+        use crossterm::event::KeyCode;
+        let (mut app, store) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::NotePane);
+        type_query(&mut app, "tests green");
+        app.handle_mode_key(shift_enter());
+        type_query(&mut app, "next: merge");
+        assert_eq!(
+            note_state(&app).0,
+            vec!["tests green".to_string(), "next: merge".to_string()]
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        let spec = app.find_spec(id).unwrap();
+        assert_eq!(spec.note.as_deref(), Some("tests green\nnext: merge"));
+        assert!(spec.noted_at.is_some(), "a saved note carries its write time");
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(
+            saved.tabs[0].panes[&id].note.as_deref(),
+            Some("tests green\nnext: merge"),
+            "the note must hit the store the moment Enter lands"
+        );
+    }
+
+    /// C32: the editor opens prefilled with the existing note, point at the
+    /// very end (Rename's own convention) — the editor is also the reader,
+    /// so the note must arrive intact. An emptied buffer clears note and
+    /// timestamp both: the clear gesture is the acknowledgment.
+    #[test]
+    fn note_opens_prefilled_and_an_empty_save_clears() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let spec = app.ws.tabs[0].panes.get_mut(&id).unwrap();
+        spec.note = Some("old line\nsecond".into());
+        spec.noted_at = Some(5);
+        app.apply(Action::NotePane);
+        let (lines, row, col) = note_state(&app);
+        assert_eq!(lines, vec!["old line".to_string(), "second".to_string()]);
+        assert_eq!((row, col), (1, 6), "the point opens at the very end");
+        // Ctrl+U the second line, join up with Backspace, Ctrl+U the rest.
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Backspace);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Enter);
+        let spec = app.find_spec(id).unwrap();
+        assert!(spec.note.is_none(), "an empty save clears the note");
+        assert!(spec.noted_at.is_none(), "…and its timestamp with it");
+    }
+
+    /// C32: Esc and the entry chord's toggle-off (U18) both cancel — typed
+    /// edits die with the dialog, the stored note stays exactly as it was.
+    #[test]
+    fn note_esc_and_toggle_off_both_cancel_without_touching_the_note() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        app.ws.tabs[0].panes.get_mut(&id).unwrap().note = Some("keep me".into());
+        app.apply(Action::NotePane);
+        type_query(&mut app, " junk");
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.find_spec(id).unwrap().note.as_deref(), Some("keep me"));
+        app.apply(Action::NotePane);
+        type_query(&mut app, " junk");
+        let consumed = app.handle_mode_key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert!(consumed, "the toggle-off is handled, not forwarded");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.find_spec(id).unwrap().note.as_deref(), Some("keep me"));
+    }
+
+    /// C32: Alt+Enter inside the dialog is a line break, never a cancel
+    /// into the quick-launch picker — on Terminal.app it is the only bytes
+    /// Shift+Enter can arrive as.
+    #[test]
+    fn note_alt_enter_splits_instead_of_opening_the_picker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NotePane);
+        type_query(&mut app, "ab");
+        let consumed =
+            app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(consumed);
+        let (lines, row, col) = note_state(&app);
+        assert_eq!(lines, vec!["ab".to_string(), String::new()]);
+        assert_eq!((row, col), (1, 0));
+    }
+
+    /// C32: the dialog stops growing at NOTE_MAX_LINES — the split is
+    /// swallowed whole, nothing scrolls off and nothing is half-split.
+    #[test]
+    fn note_line_cap_swallows_the_split() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NotePane);
+        for _ in 0..NOTE_MAX_LINES + 3 {
+            app.handle_mode_key(shift_enter());
+        }
+        assert_eq!(note_state(&app).0.len(), NOTE_MAX_LINES);
+    }
+
+    /// C32 + U8(b): a paste belongs to the dialog; its newlines survive as
+    /// line breaks (CR/CRLF normalized), other control bytes drop, and
+    /// overflow past the cap folds into the last line instead of vanishing.
+    #[test]
+    fn note_paste_weaves_lines_and_folds_overflow_at_the_cap() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NotePane);
+        app.handle_paste("a\r\nb\rc\x1b[0m");
+        let (lines, row, col) = note_state(&app);
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string(), "c[0m".to_string()]);
+        assert_eq!((row, col), (2, 4), "the point lands after the insertion");
+
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NotePane);
+        app.handle_paste("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+        let (lines, ..) = note_state(&app);
+        assert_eq!(lines.len(), NOTE_MAX_LINES);
+        assert_eq!(lines[NOTE_MAX_LINES - 1], "8 9 10", "overflow folds, space-joined");
+    }
+
+    /// C32: Backspace at a line's left edge joins it into the line above —
+    /// the vertical counterpart of eating the char behind the point.
+    #[test]
+    fn note_backspace_at_line_start_joins_lines() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NotePane);
+        type_query(&mut app, "ab");
+        app.handle_mode_key(shift_enter());
+        type_query(&mut app, "cd");
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Backspace);
+        let (lines, row, col) = note_state(&app);
+        assert_eq!(lines, vec!["abcd".to_string()]);
+        assert_eq!((row, col), (0, 2), "the point sits at the junction");
+    }
+
+    /// C32: the note rides `PaneSpec`, so `Alt+u` restores it with the
+    /// pane — same clause as the session id, no separate machinery.
+    #[test]
+    fn undo_reopens_a_closed_pane_with_its_note() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        let spec = app.ws.tabs[0].panes.get_mut(&id).unwrap();
+        spec.note = Some("parked: retry flaky e2e".into());
+        spec.noted_at = Some(7);
+        app.apply(Action::ClosePane);
+        app.apply(Action::Undo);
+        let restored = app.focused;
+        let spec = app.find_spec(restored).unwrap();
+        assert_eq!(spec.note.as_deref(), Some("parked: retry flaky e2e"));
+        assert_eq!(spec.noted_at, Some(7));
+    }
+
     /// U16: `unix-word-rubout`'s exact boundary rule — trailing whitespace
     /// goes first, then one whole word; a buffer of only whitespace, or an
     /// empty one, empties without panicking.
@@ -9807,8 +10226,8 @@ mod tests {
         std::fs::File::open(&file_b).unwrap().set_modified(base + Duration::from_millis(20)).unwrap();
 
         let mut panes = HashMap::new();
-        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
-        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
+        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
+        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
         let layout = LayoutNode::Split {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],
@@ -9876,9 +10295,11 @@ mod tests {
                 session: Some("b".into()), // already claimed before this tick
                 title: None,
                 spawned_by: None,
+                note: None,
+                noted_at: None,
             },
         );
-        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
+        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
         let layout = LayoutNode::Split {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],
@@ -11111,7 +11532,7 @@ mod tests {
         for id in [1u64, 2, 3] {
             panes.insert(
                 id,
-                PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+                PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
             );
         }
         let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
@@ -11193,7 +11614,7 @@ mod tests {
             for &id in ids {
                 panes.insert(
                     id,
-                    PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+                    PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
                 );
             }
             let children = ids.iter().map(|&id| LayoutNode::Pane(id)).collect::<Vec<_>>();
@@ -11345,7 +11766,7 @@ mod tests {
     #[test]
     fn cross_tab_focus_lands_on_the_already_expanded_stack_member_at_the_destination() {
         fn spec() -> PaneSpec {
-            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None }
+            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None }
         }
         let mut panes0 = HashMap::new();
         panes0.insert(1, spec());
@@ -12002,6 +12423,8 @@ mod tests {
             session: None,
             title: None,
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         assert_eq!(display_name_live(&spec, None), "pi · rqa-work");
         spec.title = Some("worker1".into());
@@ -12025,6 +12448,8 @@ mod tests {
             session: None,
             title: None,
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         // No title anywhere: the adapter/cwd fallback, unchanged.
         assert_eq!(display_name_live(&spec, None), "claude · rqa-work");
@@ -12051,6 +12476,8 @@ mod tests {
             session: None,
             title: None,
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         let ps1 = Some("user@host: ~/rqa-work");
         assert_eq!(display_name_live(&spec, ps1), "shell · rqa-work");

@@ -180,6 +180,8 @@ mod tests {
             session: session.map(String::from),
             title: None,
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         let mut tab1_panes = HashMap::new();
         tab1_panes.insert(1, pane(Some("a")));
