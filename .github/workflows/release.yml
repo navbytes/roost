@@ -141,3 +141,13 @@ jobs:
       - name: Sync Homebrew formula (navbytes/homebrew-tap)
         if: env.HOMEBREW_TAP_TOKEN != ''
         run: bash scripts/update-homebrew-formula.sh
+
+      # The skip above must be LOUD, not silent: v0.1.6 and v0.1.7 both
+      # released green while the tap quietly stayed behind (the secret has
+      # never been configured), and the gap only surfaced when a brew
+      # install served the old version. A warning annotation on the run's
+      # summary makes "release ok, tap NOT synced" readable at a glance.
+      - name: Warn that the tap was NOT synced
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: |
+          echo "::warning title=Homebrew tap not synced::HOMEBREW_TAP_TOKEN is unset, so Formula/roost.rb in navbytes/homebrew-tap was NOT updated for ${RELEASE_TAG}. Add the secret (fine-grained PAT, contents:write on navbytes/homebrew-tap — see packaging/README.md) or sync by hand (scripts/update-homebrew-formula.sh)."
