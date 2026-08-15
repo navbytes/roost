@@ -15,3 +15,12 @@ each adapter's own session ids.
   durable lessons/decisions get promoted to nt, not left in engagement docs.
 - Records of past multi-agent engagements live in `docs/engagements/`
   (plans, worker scopes, handoffs, reports — historical, not specs).
+- **Releasing is PR-mergeable end to end** — bump the version everywhere
+  (Cargo.toml + Cargo.lock, README badge and pin examples, landing page),
+  then touch `.github/release-request` and merge: the request workflow
+  dispatches Release, which builds four targets, **creates the `v*` tag
+  itself** from Cargo.toml's version, publishes with SHA256SUMS.txt, and
+  syncs the Homebrew tap. Built this way (v0.1.7, 2026-08-15) because
+  agent-session credentials can merge PRs but get 403 on both
+  `refs/tags/*` pushes and the workflow-dispatch API — don't re-derive
+  that. Human tag pushes and the Actions "Run workflow" button still work.
