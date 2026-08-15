@@ -253,6 +253,14 @@ with their existing meanings. The tab bar's count cell (C2) holds a **digit or
 are governed by their own contracts. Any new *glyph* under `src/ui/` is still
 a DEVIATED.
 
+**[Amended 2026-08-15, C32]:** two glyphs added: `¶` U+00B6 — the note
+presence marker (C4 badge, C8 collapsed rows, and the roster through the
+shared row) — and `⋮` U+22EE, appended to it as `¶⋮` when a note has body
+lines under its headline. Both single-width (no badge-column or mouse-math
+hazard), both drawn in `ink()`, and both governed by C32's reveal-on-visit
+rule: they appear only on a pane carrying a parking note. No other new
+glyph is sanctioned.
+
 ---
 
 ## 3. Component contracts
@@ -660,7 +668,11 @@ untouched and a narrow pane clips the note before the join key:
   `now` under a minute, then `{n}m` / `{n}h` / `{n}d` — read from one
   wall-clock sample per frame (C5's shared-read idiom, `now_unix_secs`).
   A backwards clock clamps to `now`. Staleness confessing its age is the
-  design's whole defense against a Tuesday note lying on a Friday.
+  design's whole defense against a Tuesday note lying on a Friday. A note
+  **missing its timestamp** (C32 always writes the pair together, so only
+  hand-edited state or a future writer can produce one) shows **no age tag
+  at all** rather than a fabricated `now` — an absent fact renders as
+  absent, never as fresh.
 - Width behavior unchanged: same parts pipeline (`clip_spans`), tail
   trimmed first; no bg, no new colour, no BOLD.
 
@@ -1106,7 +1118,8 @@ actually do in every case, not only N > 0. Pinned by
 **[Amended 2026-08-15, C32]** The mode-word list gains `NOTE`, and the note
 editor gets its own pair list (the C13 shape, plus the vertical keys):
 `type note` · `↵ save` · `Shift+↵ new line` · `↑↓←→ move` · `Esc cancel` —
-62 columns rendered, inside the 100-col floor beside the right segment.
+65 columns rendered (`hint_pair_cols`), inside the 100-col floor beside the
+right segment.
 `Ctrl+↵`/`Alt+↵` are unhinted synonyms of `Shift+↵`, the same alias rule as
 everywhere else on this bar. The Normal-mode seven-pair list still gains
 nothing: `Alt+Shift+n` is discoverable via `Alt+?` (C15), and the badge's
@@ -3515,15 +3528,23 @@ one surface; there is no separate viewer). `pane` is pinned at open time.
 The dialog is Rename's 44-col width, one content row per line, growing to
 `NOTE_MAX_LINES` (8) instead of scrolling; heading `" pane note "`; all
 text `ink()`; the `▏` caret rides the cursor row (C13's `rename_field`).
-Keys: C13's whole editing vocabulary per row (insert at point, Backspace/
-Delete, `←→`/Home/End, Ctrl+U/W), plus the vertical half — `↑↓` move rows,
-`Shift+↵` splits the line at the point (`Ctrl+↵` synonym; **`Alt+↵` is
-claimed inside this dialog only** — Terminal.app delivers Shift+↵ as
-exactly Alt+↵'s bytes, so on that terminal it is the only spelling of
-"newline" the dialog will ever receive; every other Alt chord still
-cancels out to the global bindings, U18's toggle-off included), and
-Backspace/Delete at a line edge join across it. At the cap a split is
-swallowed whole. `↵` commits; `Esc`/toggle-off/outside-anything cancels.
+Keys: C13's editing vocabulary on the current row (insert at point,
+Backspace/Delete, Home/End per row, Ctrl+U/W), plus the vertical half —
+`↑↓` move rows keeping the column where they can; **`←→` flow across line
+ends** (the one C13 clamp deliberately relaxed: in a multi-line field a
+line edge is a seam, not a wall — C13's "never wrapping" stays true of
+single-line Rename); `Shift+↵` splits the line at the point (`Ctrl+↵`
+synonym; **`Alt+↵` is claimed inside this dialog only** — Terminal.app
+delivers Shift+↵ as exactly Alt+↵'s bytes, so on that terminal it is the
+only spelling of "newline" the dialog will ever receive; every other Alt
+chord still cancels out to the global bindings, U18's toggle-off
+included); and Backspace/Delete at a line edge join across it. At the cap
+a split is swallowed whole. A line wider than the field clips at the
+field's right edge, caret included — C13's own field behavior, accepted:
+the 8-line dialog interior is the honest bound of a parking note, not a
+document editor. `↵` commits; `Esc` and the U18 toggle-off cancel; an
+outside click is **swallowed, not a cancel** (C12's Rename carve-out,
+extended — see C12's 2026-08-15 amendment).
 
 **Commit:** whole-text trim (stray blank edge lines die — a headline of
 `""` would make the badge segment a lie; interior blanks are the author's

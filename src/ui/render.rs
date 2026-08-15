@@ -1573,7 +1573,7 @@ fn draw_pane<B: PaneBackend>(
                 BadgeNote {
                     headline,
                     more: ls.next().is_some(),
-                    age: age_word(s.noted_at.unwrap_or(now), now),
+                    age: s.noted_at.map(|t| age_word(t, now)),
                     focused,
                 }
             })
@@ -1839,13 +1839,15 @@ fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
 
 /// C4's note segment data (C32): what the badge says about a parked note.
 /// `headline` is the note's first line, `more` marks a body under it (the
-/// `⋮`), `age` is the pre-rendered age tag, and `focused` picks between
-/// the two forms — the focused pane reads its note out, everything else
-/// shows a bare marker. Built by `draw_pane`, consumed by `corner_badge`.
+/// `⋮`), `age` is the pre-rendered age tag — `None` when the note has no
+/// timestamp (hand-edited state): an absent fact renders as absent, never
+/// as a fabricated `now` — and `focused` picks between the two forms: the
+/// focused pane reads its note out, everything else shows a bare marker.
+/// Built by `draw_pane`, consumed by `corner_badge`.
 struct BadgeNote {
     headline: String,
     more: bool,
-    age: String,
+    age: Option<String>,
     focused: bool,
 }
 
@@ -1907,7 +1909,10 @@ fn corner_badge(
         let marker = if n.more { "¶⋮" } else { "¶" };
         if n.focused {
             parts.push((format!("{marker} {}", n.headline), theme::ink()));
-            parts.push((format!(" ({}) ", n.age), theme::quiet()));
+            match &n.age {
+                Some(age) => parts.push((format!(" ({age}) "), theme::quiet())),
+                None => parts.push((" ".into(), theme::quiet())),
+            }
         } else {
             parts.push((format!("{marker} "), theme::ink()));
         }
@@ -2330,7 +2335,7 @@ mod tests {
         let note = BadgeNote {
             headline: "tests green, PR up".into(),
             more: false,
-            age: "14h".into(),
+            age: Some("14h".into()),
             focused: true,
         };
         let (_, spans) =
@@ -2343,6 +2348,22 @@ mod tests {
         assert_eq!(headline.style, theme::ink(), "the headline is the badge's loud element");
         let age = spans.iter().find(|s| s.content.as_ref().contains("(14h)")).unwrap();
         assert_eq!(age.style, theme::quiet(), "the age tag stays quiet");
+
+        // A note missing its timestamp (hand-edited state) shows NO age tag
+        // — an absent fact renders as absent, never as a fabricated "now".
+        let unstamped = BadgeNote { age: None, ..note };
+        let (_, spans) = corner_badge(
+            inner,
+            "3 api",
+            Some(&unstamped),
+            false,
+            0,
+            theme::GLYPH_WAITING,
+            theme::ink(),
+        )
+        .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 api · ¶ tests green, PR up {} ", theme::GLYPH_WAITING));
     }
 
     /// C32: an unfocused pane's badge marks presence, never content — a
@@ -2354,7 +2375,7 @@ mod tests {
         let note = BadgeNote {
             headline: "tests green, PR up".into(),
             more: false,
-            age: "14h".into(),
+            age: Some("14h".into()),
             focused: false,
         };
         let (_, spans) =
@@ -3239,8 +3260,8 @@ mod tests {
         for chord in [
             "Alt+n", "Alt+Enter", "Alt+r", "Alt+w", "Alt+u", "Alt+Shift+p", "Alt+Shift+←↓↑→",
             "Alt+s", "Alt+o", "Alt+g", "Alt+z", "Alt+f", "Alt+t", "Alt+1..9", "Alt+0", "Alt+i",
-            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a", "Alt+e", "Alt+PgUp",
-            "Alt+c", "Alt+/", "Alt+?", "Alt+q",
+            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+Shift+n", "Alt+a", "Alt+Shift+a",
+            "Alt+e", "Alt+PgUp", "Alt+c", "Alt+/", "Alt+?", "Alt+q",
         ] {
             assert!(text.contains(chord), "the keymap must document {chord:?}");
         }
