@@ -23,7 +23,7 @@ pub struct PaneSpec {
     /// panes in its own spawned subtree, but not panes it didn't create.
     #[serde(default)]
     pub spawned_by: Option<PaneId>,
-    /// The pane's parking note (Alt+Shift+n): where this pane stands and
+    /// The pane's parking note (the Alt+r editor): where this pane stands and
     /// what's next, left for a future session of the person. Newlines
     /// separate lines; the **first line is the headline** chrome shows —
     /// the C4 badge renders headline + age on the focused pane and a bare

@@ -1307,14 +1307,14 @@ mod tests {
         let mut app = mk_app();
         app.apply(Action::NewPane); // panes 1 | 2, focus 2
         let target = app.focused;
-        app.apply(Action::RenamePane);
+        app.apply(Action::EditPane);
         for c in "ZZZ".chars() {
             app.handle_mode_key(key(KeyCode::Char(c)));
         }
         handle_mouse(&mut app, click(5, 5)); // pane 1's area, outside the dialog
 
         assert_eq!(app.focused, target, "the click must not move focus beneath the modal");
-        assert!(matches!(app.mode, Mode::Rename { .. }), "the dialog must still be up");
+        assert!(matches!(app.mode, Mode::PaneEdit { .. }), "the dialog must still be up");
 
         app.handle_mode_key(key(KeyCode::Enter));
         assert_eq!(app.find_spec(target).and_then(|s| s.title.clone()), Some("ZZZ".into()));
@@ -1403,7 +1403,7 @@ mod tests {
     /// Every other modal swallows the wheel outright.
     #[test]
     fn the_wheel_is_swallowed_by_the_other_modals() {
-        for open in [Action::RenamePane, Action::QuickLaunch, Action::Help] {
+        for open in [Action::EditPane, Action::QuickLaunch, Action::Help] {
             let mut app = mk_app();
             let pane = app.focused;
             app.apply(open);
