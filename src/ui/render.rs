@@ -142,19 +142,15 @@ fn hint_pairs(
             vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]
         }
         Mode::Help { .. } => vec![("Alt+?", "all keys"), ("any key", "close")],
-        // 45 columns.
-        Mode::Rename { target, .. } => {
-            let what = match target {
-                RenameTarget::Pane => "pane name",
-                RenameTarget::Tab => "tab name",
-            };
-            vec![("type", what), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
+        // 48 columns. Tab is Rename's one remaining target (C32).
+        Mode::Rename { .. } => {
+            vec![("type", "tab name"), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
         }
-        // C32, 62 columns. `Shift+↵` names the line break — the multi-line
-        // editor's one key Rename doesn't have (Ctrl/Alt+↵ are unhinted
-        // synonyms, same rule as every alias elsewhere on this bar).
-        Mode::Note { .. } => vec![
-            ("type", "note"),
+        // C32 (combined), 72 columns. `Shift+↵` names the break — descend
+        // from the name row, split inside the note (Ctrl/Alt+↵ are
+        // unhinted synonyms, same rule as every alias on this bar).
+        Mode::PaneEdit { .. } => vec![
+            ("type", "name / note"),
             ("↵", "save"),
             ("Shift+↵", "new line"),
             ("↑↓←→", "move"),
@@ -222,7 +218,7 @@ fn hint_pairs(
             ("Alt+s", "stack"),
             ("Alt+←↓↑→", "focus"),
             ("Alt+w", "close"),
-            ("Alt+r", "rename"),
+            ("Alt+r", "edit"),
         ],
     }
 }
@@ -236,7 +232,7 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Normal if zoomed => "ZOOM",
         Mode::Normal => "NORMAL",
         Mode::Rename { .. } => "RENAME",
-        Mode::Note { .. } => "NOTE",
+        Mode::PaneEdit { .. } => "EDIT",
         Mode::Picker { .. } => "PICKER",
         Mode::Scroll => "SCROLL",
         Mode::Copy { .. } => "COPY",
@@ -727,8 +723,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             ("Alt+n", "new shell pane (auto split)"),
             ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
             ("Alt+←↓↑→ / hjkl", "move focus (←/→ continue to next/prev tab at an edge)"),
-            ("Alt+r", "rename this pane"),
-            ("Alt+Shift+n", "note this pane — first line shows on its badge"),
+            ("Alt+r", "name + parking note (first line shows on the badge)"),
             ("Alt+w", "close pane (confirm if busy)"),
             ("Alt+u", "reopen the last pane or tab you closed"),
             ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
@@ -857,10 +852,11 @@ fn dialog_rect(
         // stays fully visible while the query narrows.
         Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => None,
         Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
-        // C32: Rename's width, one content row per note line — the dialog
-        // grows a row per Shift+↵ (to NOTE_MAX_LINES) instead of scrolling.
-        Mode::Note { lines, .. } => {
-            Some(centered_near(anchor, body, 44, lines.len() as u16 + 2))
+        // C32 (combined): Rename's width; one row for the name plus one
+        // per note line — the dialog grows a row per Shift+↵ (to
+        // NOTE_MAX_LINES) instead of scrolling.
+        Mode::PaneEdit { lines, .. } => {
+            Some(centered_near(anchor, body, 44, lines.len() as u16 + 3))
         }
         Mode::Picker { .. } => {
             // U20: as tall as the longer of the two columns (a filter can
@@ -905,34 +901,41 @@ fn draw_mode_overlay<B: PaneBackend>(
     match &app.mode {
         Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => {}
         Mode::Rename { buffer, cursor, target } => {
-            let heading = match target {
-                RenameTarget::Pane => " rename pane ",
-                RenameTarget::Tab => " rename tab ",
-            };
-            let inner = modal_frame(f, body, rect, Line::from(heading).style(theme::ink()));
+            // Tab is the one target left (C32 absorbed pane renames).
+            let RenameTarget::Tab = target;
+            let inner =
+                modal_frame(f, body, rect, Line::from(" rename tab ").style(theme::ink()));
             f.render_widget(
                 Paragraph::new(rename_field(buffer, *cursor)).style(theme::ink()),
                 inner,
             );
         }
-        // C32: the note editor — Rename's frame and field idiom, one row
-        // per line, the `▏` caret riding the cursor row only. Everything
-        // `ink()`: it is all input, and quiet input can't be proofread
-        // (C13's own rule).
-        Mode::Note { lines, row, col, .. } => {
+        // C32 (combined): the pane editor — Rename's frame and field
+        // idiom; the name row on top, one row per note line under it, the
+        // `▏` caret riding the cursor row only. The name row is
+        // UNDERLINED and padded edge to edge (stack_header_text's fill
+        // trick), so the underline doubles as the name/note separator —
+        // C6's header idiom, zero rows spent — and stays visible even
+        // with an empty name. Everything `ink()`: it is all input, and
+        // quiet input can't be proofread (C13's own rule).
+        Mode::PaneEdit { name, lines, row, col, .. } => {
             let inner =
-                modal_frame(f, body, rect, Line::from(" pane note ").style(theme::ink()));
-            let rendered: Vec<Line> = lines
-                .iter()
-                .enumerate()
-                .map(|(i, l)| {
-                    if i == *row {
-                        Line::from(rename_field(l, *col))
-                    } else {
-                        Line::from(l.clone())
-                    }
-                })
-                .collect();
+                modal_frame(f, body, rect, Line::from(" edit pane ").style(theme::ink()));
+            let name_text =
+                if *row == 0 { rename_field(name, *col) } else { name.clone() };
+            let pad =
+                (inner.width as usize).saturating_sub(mouse::display_width(&name_text) as usize);
+            let mut rendered: Vec<Line> = vec![Line::from(Span::styled(
+                format!("{name_text}{}", " ".repeat(pad)),
+                theme::ink().add_modifier(Modifier::UNDERLINED),
+            ))];
+            rendered.extend(lines.iter().enumerate().map(|(i, l)| {
+                if i + 1 == *row {
+                    Line::from(rename_field(l, *col))
+                } else {
+                    Line::from(l.clone())
+                }
+            }));
             f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
         }
         Mode::Picker { selection, filter, cwd, on_cwd } => {
@@ -2450,16 +2453,17 @@ mod tests {
     #[test]
     fn note_dialog_height_tracks_its_line_count() {
         let body = Rect::new(0, 0, 100, 30);
-        let mk = |n: usize| Mode::Note {
+        let mk = |n: usize| Mode::PaneEdit {
+            name: String::new(),
             lines: vec![String::new(); n],
             row: 0,
             col: 0,
             pane: 1,
         };
         let one = dialog_rect(&mk(1), body, body, 0, &[]).unwrap();
-        assert_eq!((one.width, one.height), (44, 3), "one line matches Rename's dialog");
+        assert_eq!((one.width, one.height), (44, 4), "name row + one note line");
         let five = dialog_rect(&mk(5), body, body, 0, &[]).unwrap();
-        assert_eq!(five.height, 7);
+        assert_eq!(five.height, 8);
     }
 
     #[test]
@@ -2715,7 +2719,7 @@ mod tests {
                 ("Alt+s", "stack"),
                 ("Alt+←↓↑→", "focus"),
                 ("Alt+w", "close"),
-                ("Alt+r", "rename"),
+                ("Alt+r", "edit"),
             ],
         );
     }
@@ -2734,7 +2738,7 @@ mod tests {
 
         let shown = super::fit_hint_pairs(&pairs, right_w, 120);
         assert_eq!(shown, pairs.len() - 1, "exactly one pair yields at 120 cols");
-        assert!(!pairs[..shown].contains(&("Alt+r", "rename")), "rename drops first");
+        assert!(!pairs[..shown].contains(&("Alt+r", "edit")), "the edit pair drops first");
         assert!(pairs[..shown].contains(&("Alt+?", "keys")), "the help pair survives");
 
         // Squeeze until a single pair is left: it must be the help pair.
@@ -2844,7 +2848,7 @@ mod tests {
     fn mode_word_matches_c9_table() {
         assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
         assert_eq!(
-            mode_word(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false),
+            mode_word(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false),
             "RENAME"
         );
         assert_eq!(mode_word(&Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false }, false, false), "PICKER");
@@ -3016,14 +3020,28 @@ mod tests {
         assert_eq!(mode_word(&Mode::Feed { offset: 0 }, true, false), "FEED");
     }
 
+    /// C32: the tab dialog and the combined pane editor lead their hint
+    /// lists with different words — the bar always says which one is up.
     #[test]
-    fn hint_pairs_rename_word_differs_pane_vs_tab() {
-        let pane =
-            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false, false, false);
+    fn hint_pairs_rename_word_differs_tab_vs_pane_editor() {
         let tab =
             hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false, false, false);
-        assert_eq!(pane[0], ("type", "pane name"));
+        let editor = hint_pairs(
+            &Mode::PaneEdit {
+                name: String::new(),
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                pane: 1,
+            },
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(tab[0], ("type", "tab name"));
+        assert_eq!(editor[0], ("type", "name / note"));
+        assert!(editor.iter().any(|p| *p == ("Shift+\u{21b5}", "new line")) || editor.iter().any(|p| p.1 == "new line"));
     }
 
     #[test]
@@ -3260,7 +3278,7 @@ mod tests {
         for chord in [
             "Alt+n", "Alt+Enter", "Alt+r", "Alt+w", "Alt+u", "Alt+Shift+p", "Alt+Shift+←↓↑→",
             "Alt+s", "Alt+o", "Alt+g", "Alt+z", "Alt+f", "Alt+t", "Alt+1..9", "Alt+0", "Alt+i",
-            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+Shift+n", "Alt+a", "Alt+Shift+a",
+            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a",
             "Alt+e", "Alt+PgUp", "Alt+c", "Alt+/", "Alt+?", "Alt+q",
         ] {
             assert!(text.contains(chord), "the keymap must document {chord:?}");
@@ -3688,7 +3706,7 @@ mod tests {
             ("picker", Action::QuickLaunch),
             ("activity feed", Action::ToggleFeed),
             ("fleet roster", Action::ToggleRoster),
-            ("rename dialog", Action::RenamePane),
+            ("rename dialog", Action::RenameTab),
             ("scroll mode", Action::ScrollMode),
             ("copy mode", Action::CopyMode),
             ("raw pane", Action::ToggleRaw),
@@ -3741,16 +3759,17 @@ mod tests {
             out.push(("noted collapsed rows", snap(&mut app)));
         }
 
-        // C32: the note dialog itself, prefilled with a two-line note so
-        // both the caret row and a plain row are drawn.
+        // C32: the combined pane editor, prefilled with a name and a
+        // two-line note so the underlined name row, the caret row and a
+        // plain row are all drawn.
         {
             let mut app = three_panes();
             let focused = app.focused;
             let spec = app.ws.tabs[0].panes.get_mut(&focused).unwrap();
             spec.note = Some("tests green, PR up\nnext: rebase onto main".into());
             spec.noted_at = Some(0);
-            app.apply(Action::NotePane);
-            out.push(("note dialog", snap(&mut app)));
+            app.apply(Action::EditPane);
+            out.push(("pane editor", snap(&mut app)));
         }
 
         // C16: a dead pane's action bar. The fixture omitted every
@@ -3894,7 +3913,7 @@ mod tests {
                 // The baseline: every fixture is Normal-mode chrome.
                 Mode::Normal => None,
                 Mode::Rename { .. } => Some("rename dialog"),
-                Mode::Note { .. } => Some("note dialog"),
+                Mode::PaneEdit { .. } => Some("pane editor"),
                 Mode::Picker { .. } => Some("picker"),
                 Mode::Scroll => Some("scroll mode"),
                 Mode::Copy { .. } => Some("copy mode"),
@@ -3909,8 +3928,14 @@ mod tests {
         // arbitrary placeholders.
         let samples = [
             Mode::Normal,
-            Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane },
-            Mode::Note { lines: vec![String::new()], row: 0, col: 0, pane: 1 },
+            Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab },
+            Mode::PaneEdit {
+                name: String::new(),
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                pane: 1,
+            },
             Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
             Mode::Scroll,
             Mode::Copy { cursor: (0, 0) },

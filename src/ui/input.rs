@@ -29,11 +29,12 @@ pub enum Action {
     FlipSplit,
     /// Grow (+) or shrink (−) the focused pane along an axis.
     Resize { horizontal: bool, grow: bool },
-    RenamePane,
+    /// Open the combined pane editor, Alt+r (C32) — name row + parking
+    /// note lines in one dialog; the note's first line is the headline
+    /// the C4 badge shows. Absorbed v0.1.7's separate Alt+Shift+n note
+    /// chord after one release.
+    EditPane,
     RenameTab,
-    /// Open the focused pane's parking-note editor, Alt+Shift+n (C32) —
-    /// first line is the headline the C4 badge shows.
-    NotePane,
     QuickLaunch,
     ScrollMode,
     CopyMode,
@@ -124,19 +125,15 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         KeyCode::Down if shift => Some(Action::Resize { horizontal: false, grow: true }),
         KeyCode::Up if shift => Some(Action::Resize { horizontal: false, grow: false }),
         KeyCode::Char('q') => Some(Action::Quit),
-        // Alt+n makes a pane; Alt+Shift+n annotates the one you're in.
-        // The shift pairing is mnemonic (n = note), not the C28-style
-        // "shifted sibling acts on the same target" convention — Alt+r's
-        // shift reaches the *tab*, this one stays on the pane. `Alt+N` is
-        // the same uppercase-delivery tolerance Alt+Shift+r carries.
-        KeyCode::Char('n') => Some(if shift { Action::NotePane } else { Action::NewPane }),
-        KeyCode::Char('N') => Some(Action::NotePane),
+        KeyCode::Char('n') => Some(Action::NewPane),
         KeyCode::Char('w') => Some(Action::ClosePane),
         KeyCode::Char('t') => Some(Action::NewTab),
         KeyCode::Char('s') => Some(Action::ToggleStack),
         KeyCode::Char('o') => Some(Action::FlipSplit), // orientation
-        // Alt+r renames the pane; Alt+Shift+r (or Alt+R) renames the tab.
-        KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::RenamePane }),
+        // Alt+r edits the pane (name + note, one dialog — C32; it also
+        // retired Alt+Shift+n after one release, returning `n` to §8's
+        // free pool); Alt+Shift+r (or Alt+R) renames the tab.
+        KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::EditPane }),
         KeyCode::Char('R') => Some(Action::RenameTab),
         // Alt+Shift+p toggles raw; Alt+P tolerates the uppercase-delivery
         // quirk some terminals use for a shifted Alt+letter (same
@@ -655,9 +652,14 @@ const NAMES: &[(&str, Action)] = &[
     ("resize_horizontal_shrink", Action::Resize { horizontal: true, grow: false }),
     ("resize_vertical_grow", Action::Resize { horizontal: false, grow: true }),
     ("resize_vertical_shrink", Action::Resize { horizontal: false, grow: false }),
-    ("rename_pane", Action::RenamePane),
+    ("edit_pane", Action::EditPane),
+    // Parse-only aliases: config.json files written against v0.1.7's two
+    // separate actions keep working. Listed after the canonical name so
+    // the reverse lookup (`action_name`, first match wins) never emits
+    // them.
+    ("rename_pane", Action::EditPane),
+    ("note_pane", Action::EditPane),
     ("rename_tab", Action::RenameTab),
-    ("note_pane", Action::NotePane),
     ("quick_launch", Action::QuickLaunch),
     ("scroll_mode", Action::ScrollMode),
     ("copy_mode", Action::CopyMode),
@@ -897,7 +899,7 @@ mod tests {
     fn alt_r_renames_pane_alt_shift_r_renames_tab() {
         assert!(matches!(
             translate(alt(KeyCode::Char('r'))),
-            InputResult::Action(Action::RenamePane)
+            InputResult::Action(Action::EditPane)
         ));
         assert!(matches!(
             translate(alt_shift(KeyCode::Char('r'))),
@@ -910,23 +912,26 @@ mod tests {
         ));
     }
 
-    /// C32: Alt+Shift+n opens the note editor; plain Alt+n still makes a
-    /// pane — the shift split on `n` must never bleed into the unshifted
-    /// chord people already have in muscle memory.
+    /// C32 (combined editor): Alt+Shift+n is RETIRED — it lived one
+    /// release (v0.1.7) before Alt+r absorbed the note editor, and the
+    /// chord went back to §8's free pool, meaning U5's unbound-printable
+    /// rule now forwards it to the pane. Plain Alt+n still makes a pane.
     #[test]
-    fn alt_shift_n_notes_pane_alt_n_still_news() {
+    fn alt_shift_n_is_retired_back_to_the_free_pool() {
+        // Pre-v0.1.7 behavior restored exactly: a terminal reporting the
+        // chord as 'n'+SHIFT falls through to the unshifted arm (new
+        // pane, shift ignored); one reporting uppercase 'N' hits U5's
+        // unbound-printable forward.
         assert!(matches!(
             translate(alt_shift(KeyCode::Char('n'))),
-            InputResult::Action(Action::NotePane)
+            InputResult::Action(Action::NewPane)
         ));
-        assert!(matches!(
-            translate(alt(KeyCode::Char('N'))),
-            InputResult::Action(Action::NotePane)
-        ));
+        assert!(matches!(translate(alt(KeyCode::Char('N'))), InputResult::Forward(_)));
         assert!(matches!(
             translate(alt(KeyCode::Char('n'))),
             InputResult::Action(Action::NewPane)
         ));
+        assert!(matches!(translate(alt(KeyCode::Char('r'))), InputResult::Action(Action::EditPane)));
     }
 
     #[test]
@@ -1342,11 +1347,9 @@ mod tests {
             (alt(KeyCode::Char('t')), Action::NewTab),
             (alt(KeyCode::Char('s')), Action::ToggleStack),
             (alt(KeyCode::Char('o')), Action::FlipSplit),
-            (alt(KeyCode::Char('r')), Action::RenamePane),
+            (alt(KeyCode::Char('r')), Action::EditPane),
             (alt_shift(KeyCode::Char('r')), Action::RenameTab),
             (alt(KeyCode::Char('R')), Action::RenameTab),
-            (alt_shift(KeyCode::Char('n')), Action::NotePane),
-            (alt(KeyCode::Char('N')), Action::NotePane),
             (alt_shift(KeyCode::Char('p')), Action::ToggleRaw),
             (alt(KeyCode::Char('P')), Action::ToggleRaw),
             (alt(KeyCode::Enter), Action::QuickLaunch),

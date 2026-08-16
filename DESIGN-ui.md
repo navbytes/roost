@@ -212,7 +212,9 @@ red). Modifiers permitted, and what each is load-bearing for:
 - `REVERSED` — the three attention surfaces (C10/C11/C16), copy selection
   (C17), copy cursor (C24), search hits (C17 amendment).
 - `UNDERLINED` — the stack header rule (C6), the copy cursor inside a
-  selection and the current search hit (C24/C17).
+  selection and the current search hit (C24/C17), and the pane editor's
+  name row (C32, amended 2026-08-15 — the field's own rule, padded edge
+  to edge so it doubles as the name/note separator).
 
 Program output keeps whatever attributes it sent.
 
@@ -1125,6 +1127,16 @@ everywhere else on this bar. The Normal-mode seven-pair list still gains
 nothing: `Alt+Shift+n` is discoverable via `Alt+?` (C15), and the badge's
 `¶` marker (C4) is its own advertisement.
 
+**[Amended 2026-08-15 (later), C32 combined editor]** `NOTE` retires with
+its mode; the word for the combined pane editor is `EDIT`. Its pair list:
+`type name / note` · `↵ save` · `Shift+↵ new line` · `↑↓←→ move` ·
+`Esc cancel` — 72 columns rendered, still inside the floor. The Rename
+list's leading pair reads `type tab name` unconditionally (Tab is Rename's
+one target now). And one Normal-mode relabel, content otherwise untouched:
+`Alt+r rename` becomes **`Alt+r edit`** — the chord names and notes now,
+and "rename" would under-describe it; two columns narrower, so the
+seven-pair fit math only loosens.
+
 ### C10 — Flash message
 
 **Current:** `render.rs:56–64` — Black on Green BOLD.
@@ -1391,7 +1403,18 @@ the U8 rule that an outside click does not dismiss unsaved work.
 - **Motion is clamped, never wrapping.** `←` at the start and `→` at the
   end do nothing. A one-line field that teleported the caret between its
   ends on an overshoot would make every held arrow key a hazard.
-- **Hint bar** gains `←→ move` (45 columns, C9).
+- **Hint bar** gains `←→ move` (48 columns since the 2026-08-15
+  amendment — the leading pair reads `type tab name` now, C9).
+
+**[Amended 2026-08-15, C32 combined editor — Tab is the one target
+left.]** Pane renames moved into the combined pane editor (C32's dialog,
+where the name is the underlined first row); `Alt+r` opens that editor and
+`Alt+Shift+r` still opens this dialog for the tab. Everything above — the
+frame, the moving caret, char-indexing, the clamped single-line motion,
+U8's outside-click rule — is unchanged and now describes the tab dialog
+alone (heading ` rename tab `, hint list leading `type tab name`).
+`RenameTarget` keeps its enum shape with `Tab` as the sole variant, so the
+mode doesn't churn twice if a third single-line target ever appears.
 
 ### C14 — Picker (quick-launch)
 
@@ -3584,6 +3607,64 @@ spans through the `noted badges` / `noted collapsed rows` / `note dialog`
 `chrome_buffers()` fixtures (C12's every-Mode-variant rule enforces the
 fixture's existence at compile time).
 
+**[Amended 2026-08-15 (later, client request) — the COMBINED pane editor:
+one dialog, one chord, two fields.]** Alt+Shift+n retires after one
+release (v0.1.7) and **`Alt+r` opens the pane's whole text surface**:
+the name as the dialog's first row, the note lines under it —
+`Mode::PaneEdit`, replacing `Mode::Note`. Motivation is chord economy (the
+client's: "I don't want the user to remember so many shortcut keys"): the
+feature's net new-chord count returns to zero, and `n` goes back to §8's
+free pool. Everything the original C32 contracts — storage, badge/row
+display, reveal-on-visit, U8 modal rules, the cap, paste, cancel semantics
+— carries over unchanged except as follows:
+
+- **The dialog** (` edit pane `, 44 cols, C12 frame): row 0 is the name,
+  **`ink()` + `UNDERLINED`, padded edge to edge** so the underline reads
+  as the field's rule and the name/note separator even when the name is
+  empty (stack_header_text's fill trick; §2 modifier inventory amended);
+  rows below are the note in plain `ink()`. Height = name + note lines +
+  frame (`lines + 3`), growing to `NOTE_MAX_LINES`. The point opens at
+  the **end of the name row** — Alt+r's rename muscle memory is preserved
+  keystroke for keystroke.
+- **The seam**: `↑↓` and `←→` cross between name and note freely (`←→`
+  flow across row ends); **edits never cross** — Backspace at the note's
+  top-left and Delete at the name's end are walls, so a typo can never
+  merge status text into identity. Inside the note, edge joins still work.
+- **Break key**: `Shift+↵` (`Ctrl+↵`/`Alt+↵` synonyms, the Alt-branch
+  carve-out unchanged) *descends* from the name row into the note — the
+  name is single-line by contract, so "line break" there means "start the
+  note", making name → headline → body one continuous typing flow. The
+  descent lands at the **headline's end** (the writing point of an
+  existing line), never at the name's column carried over. On note rows
+  it splits at the point, at the cap swallowed whole.
+- **Commit** (`↵`, from either field): name trims, empty clears the title
+  back to the adapter fallback (C13's rule, unchanged); note trims/joins
+  as before — and **`noted_at` re-stamps only when the note text actually
+  changed**. A pure rename can't refresh a stale note's age; an untouched
+  note keeps its honest timestamp; an emptied note still clears both.
+  Tightened from the original "every save re-stamps", which the combined
+  dialog would have turned into a lie.
+- **Paste** targets the row it lands on: name row = Rename's
+  printables-only filter (a name paste never descends); note rows = the
+  newline-preserving weave, unchanged.
+- **Chrome renames**: mode word `EDIT` (C9), Normal-bar pair `Alt+r edit`,
+  §8 row 12 covers both chords, the C15 keymap row reads "name + parking
+  note (first line shows on the badge)". Config names: `edit_pane` is
+  canonical; `rename_pane` and `note_pane` parse as aliases so v0.1.7
+  config.json remaps keep working.
+
+**Unit tests (combined):** `edit_pane_types_name_and_note_in_one_flow` ·
+`edit_pane_opens_prefilled_and_an_emptied_note_clears_only_the_note` ·
+`edit_pane_restamps_the_note_age_only_when_the_note_changed` ·
+`edit_pane_esc_and_toggle_off_both_cancel_without_touching_either_field` ·
+`edit_pane_alt_enter_breaks_instead_of_opening_the_picker` ·
+`edit_pane_line_cap_swallows_the_split` ·
+`edit_pane_note_paste_weaves_lines_and_folds_overflow_at_the_cap` ·
+`edit_pane_edits_never_cross_the_name_note_wall` ·
+`alt_shift_n_is_retired_back_to_the_free_pool` (input) ·
+`hint_pairs_rename_word_differs_tab_vs_pane_editor` (render); the
+`pane editor` chrome fixture replaces `note dialog`.
+
 ---
 
 ## 4. Pixel-idea translations (explicit)
@@ -3850,8 +3931,7 @@ shows only the C9-curated subsets.
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
 | 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one. `Tab`/`Shift+Tab` inside it cycle a status filter** | C27 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
-| 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
-| 12b | `Alt+Shift+n` | **note this pane — parking note; first line shows on its badge** | C32 |
+| 12 | `Alt+r / Alt+Shift+r` | **edit pane (name + parking note, one dialog)** / rename tab | C32/C13 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
 | 13b | `Alt+i / Alt+m` | **previous / next tab (wraps)** | C2 |
 | 13c | `Alt+Shift+i / Alt+Shift+m` | **move this pane to the previous / next tab (wraps)** | C28 |
@@ -3874,6 +3954,15 @@ reason: one physical chord, two spellings on the wire. Reported from real
 use on macOS, where the unshifted arm was claiming the event first and row
 20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
+
+[Amended 2026-08-15, C32 combined editor: row 12's pane half is the
+combined editor now, and **row 12b (`Alt+Shift+n`, added earlier the same
+day) is withdrawn** — the chord lived exactly one release (v0.1.7) before
+`Alt+r` absorbed the note editor. `n`'s shifted form returns to the free
+pool: a terminal reporting it as `n`+SHIFT falls through to row 1's
+unshifted arm exactly as before v0.1.7, one reporting uppercase `N` takes
+U5's unbound-printable forward. Chord economy was the client's explicit
+ask; nothing else in this table moved.]
 
 [Amended 2026-07-22, supervisor SPEC-GAP: row 20 `Alt+?` was bound in
 translate() and advertised by C9's hint bar but missing from this canonical
