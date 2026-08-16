@@ -5775,8 +5775,11 @@ fn byte_at(s: &str, at: usize) -> usize {
 /// note row it splits at the point via `note_split_line`.
 fn pane_edit_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
     if *row == 0 {
+        // Land at the headline's END, not at the name's column carried
+        // over: descending means "write the note now", and the writing
+        // point of an existing line is after its last character.
         *row = 1;
-        *col = (*col).min(lines[0].chars().count());
+        *col = lines[0].chars().count();
     } else {
         let mut nrow = *row - 1;
         note_split_line(lines, &mut nrow, col);

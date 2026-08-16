@@ -1403,7 +1403,8 @@ the U8 rule that an outside click does not dismiss unsaved work.
 - **Motion is clamped, never wrapping.** `←` at the start and `→` at the
   end do nothing. A one-line field that teleported the caret between its
   ends on an overshoot would make every held arrow key a hazard.
-- **Hint bar** gains `←→ move` (45 columns, C9).
+- **Hint bar** gains `←→ move` (48 columns since the 2026-08-15
+  amendment — the leading pair reads `type tab name` now, C9).
 
 **[Amended 2026-08-15, C32 combined editor — Tab is the one target
 left.]** Pane renames moved into the combined pane editor (C32's dialog,
@@ -3632,8 +3633,10 @@ display, reveal-on-visit, U8 modal rules, the cap, paste, cancel semantics
 - **Break key**: `Shift+↵` (`Ctrl+↵`/`Alt+↵` synonyms, the Alt-branch
   carve-out unchanged) *descends* from the name row into the note — the
   name is single-line by contract, so "line break" there means "start the
-  note", making name → headline → body one continuous typing flow — and
-  splits at the point on note rows, at the cap swallowed whole.
+  note", making name → headline → body one continuous typing flow. The
+  descent lands at the **headline's end** (the writing point of an
+  existing line), never at the name's column carried over. On note rows
+  it splits at the point, at the cap swallowed whole.
 - **Commit** (`↵`, from either field): name trims, empty clears the title
   back to the adapter fallback (C13's rule, unchanged); note trims/joins
   as before — and **`noted_at` re-stamps only when the note text actually

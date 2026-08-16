@@ -142,7 +142,7 @@ fn hint_pairs(
             vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]
         }
         Mode::Help { .. } => vec![("Alt+?", "all keys"), ("any key", "close")],
-        // 44 columns. Tab is Rename's one remaining target (C32).
+        // 48 columns. Tab is Rename's one remaining target (C32).
         Mode::Rename { .. } => {
             vec![("type", "tab name"), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
         }
