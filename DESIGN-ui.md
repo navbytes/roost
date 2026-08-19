@@ -2088,8 +2088,9 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
   expanded first (`expand_in_stacks`), then zoomed.
 - **Exits zoom** (exhaustive list): Alt+z again · any tab change (Alt+t,
   Alt+1..9, tab-bar click, cross-tab Alt+a) · any structural layout action —
-  Alt+n, picker launch, Alt+s, Alt+o, Alt+Shift+arrows, Alt+g — which exit
-  zoom *first, then apply*, so the layout never changes invisibly · the
+  Alt+n, picker launch, Alt+s, Alt+o, Alt+Shift+arrows, Alt+g,
+  Alt+Shift+hjkl — which exit zoom *first, then apply*, so the layout never
+  changes invisibly · the
   zoomed pane closing (Alt+w or control close). **Keeps zoom:** focus moves,
   same-tab Alt+a, entering/leaving scroll·copy·rename·help·feed modes, the
   float toggle (the float draws above the zoomed view, C22), control-plane
@@ -2103,6 +2104,14 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
 - Unit tests: display list is `[focused @ body]` iff zoomed; each exit
   trigger clears the flag; focus-move-under-zoom retargets the display list;
   PTY resize targets.
+
+**[Amended 2026-08-19, C33]** The structural-action list above gains
+`Alt+Shift+hjkl`. Recorded rather than left implied: the list is labelled
+*exhaustive*, so a new structural action that exits zoom without appearing
+here does not leave the contract vague — it makes it false. (Found by the
+design-supervisor audit of C33, which is the check that exists to catch
+exactly this.) C22 rule 3's sibling list takes the same addition on the same
+date.
 
 **[Amended 2026-07-27, SPEC-parity P5 — the round trip is lossless]** Zoom
 resizing the pane's PTY both ways is only safe because the resize itself now
@@ -2200,12 +2209,18 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
      (that click then lands normally on what it hit). Focus returns to
      `prev_focus`.
   3. Structural pane actions — Alt+n, picker launch, Alt+s, Alt+o,
-     Alt+Shift+arrows, Alt+g, Alt+z — first hide the float and restore
+     Alt+Shift+arrows, Alt+g, Alt+Shift+hjkl, Alt+z — first hide the float
+     and restore
      `prev_focus`, *then* apply. (The float is outside the layout tree;
      without this, `spawn_child`'s empty-tab fallback at `app.rs:1425–1427`
      would wipe the tab's layout when asked to split a pane the tree doesn't
      contain.)
   4. Alt+w closes it for real (above); Alt+f hides it.
+
+  **[Amended 2026-08-19, C33]** Rule 3's list gains `Alt+Shift+hjkl` — a
+  swap is a structural pane action and hides the float like the rest. Same
+  reasoning as C21's amendment of the same date: a list this one enumerates
+  by name is wrong, not merely incomplete, when an action is missing from it.
 - **Mouse:** when shown, the float's rect is **first** in the hit-test list
   (`hit_test` takes the first match — the caller orders the slice; topmost
   wins). Wheel, clicks, drags, and copy-mode selection inside it behave as
@@ -3996,8 +4011,23 @@ C22 rule 2's grounds.
 **Chrome.** §8 gains row 4b. C15's `LAYOUT` group gains one row, placed
 directly under `Alt+Shift+←↓↑→ resize` — the two shifted-direction chords sit
 adjacent so the one thing a reader must learn (**arrows resize, letters carry
-the pane**) is visible at a glance rather than inferred. That adjacency is
-C28's own argument in the `TABS` group. The C9 hint bar's Normal-mode seven
+the pane**) is visible at a glance rather than inferred.
+
+**This is a different adjacency rule from C28's, deliberately** (caught by the
+design-supervisor audit of this contract, which found the first draft claiming
+C28's argument as its own). C28 seats a row under *its own unshifted form* —
+`Alt+Shift+i / +m` directly below `Alt+i / Alt+m`, both in `TABS` — so the
+pairing itself explains the chord. C33 cannot do that: `Alt+hjkl` is a focus
+verb and lives in `PANES`, while this is a layout verb and belongs in
+`LAYOUT`. What C33 seats itself under is therefore the chord it is most likely
+to be *confused with* rather than the one it derives from — the other
+shifted-direction chord — because the reader's live question at that row is
+"shift plus a direction did something different a moment ago, which is which?"
+The two rules share the tactic (teach by adjacency) and not the criterion
+(derivation vs. confusability); the older one should not be cited for the
+newer.
+
+The C9 hint bar's Normal-mode seven
 **gain nothing**: the 100-column arithmetic is unchanged and the chord is
 discoverable via `Alt+?`, exactly as C27 and C28 were.
 
