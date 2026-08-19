@@ -1127,6 +1127,27 @@ everywhere else on this bar. The Normal-mode seven-pair list still gains
 nothing: `Alt+Shift+n` is discoverable via `Alt+?` (C15), and the badge's
 `¶` marker (C4) is its own advertisement.
 
+**[Amended 2026-08-19, C34 — the chord spellings on this bar are derived]**
+Every `Alt` key this contract quotes as bar text (the Normal seven, the
+raw-mode pair, the dead-focused list's `Alt+w`/`Alt+q`, and the right
+segment's `· Alt+a`) is now **resolved from the live keymap**, not printed
+from these strings. On a default keymap the bar is byte-identical to what
+this contract has always specified — the quotations below stay accurate as
+the *default* rendering — but under a `config.json` remap the bar correctly
+disagrees with them, which is the whole point (C34).
+
+Three consequences worth stating rather than inferring:
+- **The pair lists and the 100-column arithmetic are untouched.** The seven
+  Normal pairs, their U6 yield order, and every column count in this
+  contract describe the default keymap and still hold.
+- **A remap degrades through the machinery already here.** A longer resolved
+  label makes trailing pairs drop from the right, exactly as a narrow
+  terminal does — `fit_hint_pairs` is a prefix loop, so nothing clips. No
+  new rule was needed.
+- **A disabled chord drops its pair** rather than advertising a dead key.
+- **Mode-local keys stay literal** (`hjkl`, `v/V`, `Esc`, `n/N`, `↵`, `f`,
+  `y`): config.json cannot reach them, so they cannot go stale.
+
 **[Amended 2026-08-15 (later), C32 combined editor]** `NOTE` retires with
 its mode; the word for the combined pane editor is `EDIT`. Its pair list:
 `type name / note` · `↵ save` · `Shift+↵ new line` · `↑↓←→ move` ·
@@ -1765,6 +1786,19 @@ line and flashes the U14 copy outcome. Session-less panes (shells, agents
 dead before detection) keep the bar unchanged — `y` would copy nothing
 there, and both this bar and the C9 hint bar gate on the same predicate so
 they can't disagree.
+
+**[Amended 2026-08-19, C34 — the close chord is resolved]** The bar's
+`· Alt+w: close` is **derived from the live keymap**, not printed from the
+text quoted above; an unbound close drops the clause entirely rather than
+naming a key that does nothing. The quotation stays accurate as the default
+rendering.
+
+Why this bar specifically, beyond C34's general rule: the C9 hint bar sits
+**one screen row below it** and already derived the same chord, so before
+this a remap made two surfaces a single glance apart disagree about which key
+closes the pane. `Enter`, `f` and `y` stay literal — mode-local keys
+config.json cannot reach (C34's stated exemption), and the same predicate
+still gates `y` on both bars so they cannot disagree about *that* either.
 
 **[Amended 2026-07-27, theme inheritance]** The spawn-error line stays
 `accent()` on no bg. The action bar becomes `attention_problem()` instead
@@ -4042,6 +4076,161 @@ four newly bound chords; the list was extended by hand here. Deriving that gate
 from the effective keymap is F1 of the review that produced this contract, and
 is where the real fix belongs.
 
+### C34 — The chrome reads the live keymap (`config.json` awareness) — [Added 2026-08-19, comparative UX review F1]
+
+**The defect.** roost has shipped a keybinding escape hatch since v0.1.3:
+`config.json` can disable or remap any `Alt` chord, and `translate_with`
+applies it. Both surfaces that *teach* those chords ignored it. `HELP_GROUPS`
+(C15) was a `const` of `(&'static str, &'static str)` tuples and `hint_pairs`
+(C9) returned `&'static str` keys, so the README's own worked example —
+remapping away from the `Alt+f`/`Alt+b`/`Alt+d` readline collisions — produced
+a roost whose `Alt+?` still taught `Alt+f` and never mentioned the chord that
+replaced it. The one modal you open when you are lost was the one that could
+lie to you.
+
+**The check could not catch it, and was weaker than it looked.**
+`every_bound_chord_is_documented_in_the_keymap` was a hand-kept list of 27
+chord literals tested for containment against the hand-kept `HELP_GROUPS`
+text. Both sides `const`; neither derived from `default_chord_action`. It
+proved that one constant mentioned strings another constant was written to
+contain — nothing about the running binary under any configuration — and a
+newly bound chord passed it silently unless someone remembered to extend the
+list. C33 bound four chords and had to do exactly that, by hand, four days
+before this contract.
+
+**The rule.** *Any chrome that names a chord derives that name from the live
+keymap.* A surface may not spell a binding it did not ask the keymap for.
+
+**Scope, enumerated** (the C34 audit found the first draft asserting the rule
+universally while implementing it for two surfaces — so here is the list, and
+it is the list the rule is accountable to):
+- **C15** help-overlay rows — resolved.
+- **C9** hint-bar `Alt` pairs — resolved.
+- **C9** attention segment (`◆ N needs you · Alt+a`) — resolved. C9's own
+  amendment calls this "this feature's discoverability surface"; a surface
+  teaching a dead chord is worse than one teaching nothing, so an unbound
+  jump drops the `· chord` tail.
+- **C16** dead-pane bar (`· Alt+w: close`) — resolved. It and the C9 hint bar
+  one screen row below name the same chord, and before this only one derived
+  it.
+- **C10** confirm and refusal flashes (`Alt+w again to close`, `stack a pane
+  with Alt+s first`) — resolved, via `App::chord_label`. The confirms matter
+  most: "press X again" naming a dead X is a guard that cannot be satisfied
+  by the key it names, which is U1's hazard wearing a helpful face. Unbound
+  degrades to a bare "again", still true because the confirm is armed on the
+  *action* and a repeat by any route satisfies it.
+
+**Not in scope, and why:** mode-local keys (`hjkl`, `v/V`, `Esc`, `n/N`,
+`↵`, `f`, `y`) and mouse verbs. config.json's grammar is `Alt` chords only
+(`Chord::parse` requires the prefix), so none of them can move and none can
+go stale. Only what can move is derived.
+
+**The width rule, and what C34 nearly cost it.** C15 requires one *column* to
+stay ≤ 80 or `centered_near` clamps and clips a description mid-word. Before
+C34 a row's key was authored text of known width, so that was a thing you
+checked once. Deriving it made it **unbounded**: an enumerated family grows
+with its membership, and the audit measured `{"keys":{"alt+h":"disable"}}`
+producing a 107-column column — reintroducing the precise failure C15's rule
+exists to prevent, by the mechanism meant to make the row truthful. (The
+pinning test had only ever exercised the default keymap: a default-only
+assertion about a quantity that had just stopped being constant.)
+
+So a resolved key column is **elided** to fit: cut at a `" / "` boundary with
+a trailing `…`, never mid-chord. **The key yields and the description never
+does** — a reader who sees two of eight chords still learns what the row is
+for and can widen the terminal for the rest, while a clipped description
+teaches nothing at any width. Pinned by
+`one_help_column_fits_the_floor_under_a_remap_too`, which sweeps the configs
+the audit measured rather than the default alone.
+
+**Mechanism.** `input::effective_bindings(&Keymap)` returns every
+`(label, action)` roost actually binds — the default table merged with
+config.json's overrides, which is the same merge `translate_with` dispatches
+on, asked as a question instead of answered one key at a time. `default_keymap`
+stops being `#[cfg(test)]` to serve it (memoized; the render path asks every
+frame).
+
+**One physical chord, one entry.** The sweep collapses three redundant
+spellings, or the overlay would print one key twice — or a key nobody can
+press:
+1. **Uppercase-delivery twins of a shifted letter.** Terminals disagree
+   (`('p', SHIFT)` vs bare `'P'`) and the table binds both (C23/C27/C28/C33).
+   Letters keep the `Alt+Shift+p` spelling.
+2. **Shifted-punctuation twins** — the same duality on the other half of the
+   keyboard (`('/', SHIFT)` vs `('?', no shift)`). Here the *glyph* spelling
+   wins (`Alt+?`, not `Alt+Shift+/`): mirror-image choices, each keeping the
+   half that reads naturally. The two rules are mutually exclusive by
+   construction — letters are excluded from rule 2 — because as symmetric
+   rules they would otherwise delete both halves of every letter pair.
+3. **Shift states no arm ever tested.** Most arms don't guard `shift`, so
+   `('1', SHIFT)` resolves to `GoToTab(0)`. Nothing is *bound* to
+   `Alt+Shift+1`; the arm ignores shift, and the unshifted spelling is the
+   chord.
+Each rule fires only when both spellings carry the same action — where they
+differ, both are real (`Alt+←` focuses, `Alt+Shift+←` resizes).
+
+**Row model (C15).** A help row declares the **actions** it documents, not a
+chord string:
+- `Chords(actions)` — print whatever is bound to them, joined by `" / "`.
+  A second chord for a documented action therefore documents *itself*.
+- `Family(spelling, actions)` — a compact hand-written spelling for a family
+  too wide to enumerate (`Alt+←↓↑→ / hjkl`, `Alt+1..9 / Alt+0`). The actions
+  are still declared, so the coverage sweep sees each one; the shorthand is
+  printed **only while every member is still on its default chord**. Move one
+  and the row enumerates the real chords — otherwise the shorthand would be
+  precisely the stale spelling this contract abolishes, merely a wider one.
+- `Text(key)` — authored text of known width: the C5 legend, the mouse-verb
+  rows, the control-CLI block. Named "names no chord" in this contract's
+  first draft, which the C34 audit found to be false of one row —
+  `Alt+click / o` is a `Text` row that does name a chord. It is correct
+  *behaviourally* (a mouse chord is not in config.json's grammar, so it
+  cannot move) but the criterion is authorship, not chord-freeness: `Text`
+  is what roost writes by hand, `Chords`/`Family` is what it resolves.
+A row whose every chord is disabled is **dropped**, and a group left with no
+rows drops its heading too: an empty titled block advertises a section that
+isn't there.
+
+**Hint bar (C9).** Same treatment for its `Alt` pairs, and a disabled chord
+drops its pair. **Mode-local keys stay literal** — `hjkl`, `v/V`, `Esc`,
+`n/N`, `↑↓` — and that is not an oversight: config.json's grammar is Alt
+chords only (`Chord::parse` requires the prefix), so those keys cannot move
+and cannot go stale. Only what can move is derived. C9's fit/yield machinery
+is untouched and absorbs the rest: a remap that lengthens a label simply
+makes pairs drop from the right, in the order U6 fixed.
+
+**Two spellings, deliberately.** `Chord::label` is *not* `Chord::parse`'s
+inverse. `parse` accepts config.json's grammar — lowercase, spelled out
+(`alt+pageup`) — because it is typed into a JSON file; `label` produces the
+chrome's vocabulary (`Alt+PgUp`, `Alt+←`), which is what the key table has
+always shown. Each register serves its own reader; the README documents the
+config one.
+
+**What replaces the old check.** Two gates, neither keeping a list:
+- `every_bound_chord_is_documented_in_the_keymap` sweeps
+  `effective_bindings` and asserts every bound **action** is declared by some
+  row. Actions rather than spellings, because a `Family` legitimately draws a
+  string containing no single chord as a substring — and only ever draws it
+  while it is accurate.
+- `every_documented_row_names_an_action_roost_actually_binds` is the
+  converse, covering a failure mode that did not exist before: a row naming
+  an unbound action now renders nothing and **vanishes silently**, where the
+  old literal row would have stayed visible and merely lied.
+
+**Cost, recorded.** `HelpLine::Row` carries an owned `String`;
+`help_content_width` takes the resolved lines rather than reading the const;
+`help_layout`, `help_scroll_extent`, `dialog_rect` and `hint_pairs` take a
+`&Keymap`. `HelpLayout` gained a `content` field so the drawer stops
+recomputing a width that now costs a resolution pass.
+
+`effective_bindings` clones and sorts the default map on each call — one to
+two calls per frame in Normal mode, up to four while the help overlay is
+open. Left uncached deliberately: the memoization that matters
+(`default_keymap`'s `OnceLock`) covers the expensive half, the remainder is a
+~51-element sort whose cost does not register against the §6 firehose gate,
+and a keyed cache would need a lock in the render path to stay correct across
+the several keymaps a single test process uses. Recorded so a later pass
+measures rather than rediscovers.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -4087,6 +4276,15 @@ reason: one physical chord, two spellings on the wire. Reported from real
 use on macOS, where the unshifted arm was claiming the event first and row
 20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
+
+[Amended 2026-08-19, C34: this table is still the canonical *list* of what
+roost binds by default, but it is no longer what the chrome *prints*. The
+C15 overlay and the C9 hint bar resolve every chord they name from the live
+keymap (defaults merged with config.json), so on a machine with a remap they
+correctly disagree with the rows below. The check that they cover this table
+is `every_bound_chord_is_documented_in_the_keymap`, rewritten as a sweep over
+`input::effective_bindings` — it keeps no list of chord literals, so a chord
+added here can no longer go undocumented by anyone forgetting to.]
 
 [Amended 2026-08-15, C32 combined editor: row 12's pane half is the
 combined editor now, and **row 12b (`Alt+Shift+n`, added earlier the same

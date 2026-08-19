@@ -178,7 +178,10 @@ file — the default — and roost behaves exactly as documented above.
 ```
 
 A value is `"disable"` (the chord passes straight through to the pane, like
-an unbound key) or a snake_case `Action` name (see `src/ui/input.rs`). A
+an unbound key) or a snake_case `Action` name (see `src/ui/input.rs`).
+**`Alt+?` and the hint bar follow your remaps** — both read the live keymap,
+so they show the chord you bound and stop showing the one you disabled,
+rather than teaching the defaults at you. A
 chord entry covers however your terminal happens to report that key (e.g.
 `alt+shift+p` and `alt+P` are the same chord), so one entry is enough
 regardless of which encoding your terminal uses. A chord listed twice keeps

@@ -724,14 +724,29 @@ fn action_by_name(name: &str) -> Option<Action> {
     NAMES.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
-/// Test-only: every (chord → action) pair `default_chord_action` actually
-/// binds, swept across every key `Chord::parse` can name, crossed with both
-/// shift states. This *is* "the existing default map" — built by asking the
-/// same function `translate` itself calls, not by re-deriving the table by
-/// hand — so it is what tests assert absent-config behavior against, and
-/// (the round-trip test) `NAMES`'s independent check.
-#[cfg(test)]
-fn default_keymap() -> HashMap<Chord, Action> {
+/// Every (chord → action) pair `default_chord_action` actually binds, swept
+/// across every key `Chord::parse` can name, crossed with both shift states.
+/// This *is* "the existing default map" — built by asking the same function
+/// `translate` itself calls, not by re-deriving the table by hand — so it is
+/// what tests assert absent-config behavior against, and (the round-trip
+/// test) `NAMES`'s independent check.
+///
+/// **[F1, 2026-08-19]** This was `#[cfg(test)]` for as long as the only
+/// thing that needed the swept table was a test. It is production now
+/// because `effective_bindings` needs it: the help overlay and hint bar
+/// used to hard-code their chord spellings, so a `config.json` remap left
+/// both surfaces teaching a chord that no longer worked. Deriving what they
+/// draw from the same table `translate` dispatches on is the only way those
+/// two can't drift, and this function is that table.
+///
+/// Memoized: it is a pure function of the compiled-in chord table, and the
+/// render path asks for it every frame.
+fn default_keymap() -> &'static HashMap<Chord, Action> {
+    static TABLE: std::sync::OnceLock<HashMap<Chord, Action>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_default_keymap)
+}
+
+fn build_default_keymap() -> HashMap<Chord, Action> {
     let mut codes: Vec<KeyCode> = (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
     codes.extend([
         KeyCode::Enter,
@@ -750,6 +765,178 @@ fn default_keymap() -> HashMap<Chord, Action> {
         }
     }
     map
+}
+
+impl Chord {
+    /// The chord's **UI spelling** — what the help overlay and hint bar
+    /// print. `Alt+Shift+h`, `Alt+←`, `Alt+Enter`, `Alt+PgUp`.
+    ///
+    /// Deliberately *not* `Chord::parse`'s inverse. `parse` accepts
+    /// config.json's grammar, which is lowercase and spelled-out
+    /// (`alt+pageup`, `alt+left`) because it is typed into a JSON file;
+    /// this is the chrome's vocabulary, which uses the arrow glyphs and
+    /// title-case names the key table has always used. Two spellings of one
+    /// chord, each in the register its reader is in — the README documents
+    /// the config one.
+    fn label(&self) -> String {
+        let key = match self.code {
+            KeyCode::Enter => "Enter".to_string(),
+            KeyCode::PageUp => "PgUp".to_string(),
+            KeyCode::Up => "↑".to_string(),
+            KeyCode::Down => "↓".to_string(),
+            KeyCode::Left => "←".to_string(),
+            KeyCode::Right => "→".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            other => format!("{other:?}"),
+        };
+        if self.shift {
+            format!("Alt+Shift+{key}")
+        } else {
+            format!("Alt+{key}")
+        }
+    }
+
+    /// Sort key giving `effective_bindings` a stable, readable order:
+    /// specials before printables (so a focus row reads `Alt+← / Alt+h`, the
+    /// order the key table has always written), then unshifted before
+    /// shifted, then by the case-folded character.
+    fn order(&self) -> (u8, u8, char) {
+        let (rank, ch) = match self.code {
+            KeyCode::Left => (0, ' '),
+            KeyCode::Down => (1, ' '),
+            KeyCode::Up => (2, ' '),
+            KeyCode::Right => (3, ' '),
+            KeyCode::Enter => (4, ' '),
+            KeyCode::PageUp => (5, ' '),
+            KeyCode::Char(c) => (6, c.to_ascii_lowercase()),
+            _ => (7, ' '),
+        };
+        (rank, u8::from(self.shift), ch)
+    }
+}
+
+/// The character a US keyboard produces when Shift is held with `c` —
+/// `h`→`H`, `/`→`?`, `1`→`!`. The two halves of one physical keypress, which
+/// is why `effective_bindings` needs it: terminals disagree about which half
+/// they report, and the default table binds both so either works.
+fn shifted_char(c: char) -> Option<char> {
+    if c.is_ascii_lowercase() {
+        return Some(c.to_ascii_uppercase());
+    }
+    Some(match c {
+        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%', '6' => '^',
+        '7' => '&', '8' => '*', '9' => '(', '0' => ')', '-' => '_', '=' => '+',
+        '[' => '{', ']' => '}', '\\' => '|', ';' => ':', '\'' => '"',
+        ',' => '<', '.' => '>', '/' => '?', '`' => '~',
+        _ => return None,
+    })
+}
+
+/// Is this entry a *second spelling* of a chord already in the table, rather
+/// than a chord of its own? Three shapes, all of which would otherwise make
+/// the help overlay print one physical key twice — or print a key that is
+/// not really bound at all.
+///
+/// 1. **The uppercase-delivery twin of a shifted letter.** Some terminals
+///    send `Alt+Shift+p` as `('p', SHIFT)`, others as bare `'P'`; the table
+///    binds both (C23/C27/C28/C33). The `Alt+Shift+p` spelling is the one
+///    roost documents, so the bare-uppercase entry is the redundant one.
+/// 2. **The shifted-punctuation twin.** Same duality, other half of the
+///    keyboard: `Alt+?` arrives as `('?', no shift)` or `('/', SHIFT)`. Here
+///    the *glyph* spelling is the one roost documents (`Alt+?`, not
+///    `Alt+Shift+/`), so it is the `('/', SHIFT)` entry that drops — the
+///    mirror image of rule 1, because that is which half reads naturally in
+///    each case.
+/// 3. **A shift state the binding never tested.** Most arms in
+///    `default_chord_action` don't guard `shift`, so `('1', SHIFT)` resolves
+///    to `GoToTab(0)` exactly as `('1', no shift)` does. That is not a
+///    binding anyone should be taught — nothing is bound to `Alt+Shift+1`;
+///    the arm simply ignores shift. The unshifted spelling is the chord.
+///
+/// Every rule fires only when both spellings carry the **same action**: when
+/// they differ, both are real and distinct (`Alt+←` focuses, `Alt+Shift+←`
+/// resizes; `Alt+h` focuses, `Alt+Shift+h` moves the pane).
+fn is_redundant_spelling(
+    chord: &Chord,
+    action: &Action,
+    table: &HashMap<Chord, Action>,
+) -> bool {
+    let same = |code: KeyCode, shift: bool| table.get(&Chord { code, shift }) == Some(action);
+    // 3: the arm ignored shift.
+    if chord.shift && same(chord.code, false) {
+        return true;
+    }
+    let KeyCode::Char(c) = chord.code else { return false };
+    if chord.shift {
+        // 2: `('/', SHIFT)` when `('?', no shift)` says the same thing.
+        // **Letters are excluded here, and the exclusion is load-bearing.**
+        // Rules 1 and 2 are mirror images, so without it a letter pair
+        // satisfies both — rule 1 drops `'P'` because `('p', SHIFT)` exists,
+        // rule 2 drops `('p', SHIFT)` because `'P'` exists — and the chord
+        // vanishes from the table entirely rather than being spelled once.
+        // Each rule owns the half of the keyboard whose *surviving* spelling
+        // it names: letters keep `Alt+Shift+p`, punctuation keeps `Alt+?`.
+        !c.is_ascii_lowercase() && shifted_char(c).is_some_and(|g| same(KeyCode::Char(g), false))
+    } else {
+        // 1: bare `'P'` when `('p', SHIFT)` says the same thing.
+        c.is_ascii_uppercase() && same(KeyCode::Char(c.to_ascii_lowercase()), true)
+    }
+}
+
+/// F1: every chord roost **actually** binds right now, as `(label, action)`,
+/// with `keymap`'s config.json overrides applied on top of the default
+/// table — the same merge `translate_with` dispatches on, asked as a
+/// question instead of answered one key at a time.
+///
+/// This exists so the chrome can *derive* what it teaches. Before F1 the
+/// help overlay and the hint bar spelled their chords as `&'static str`
+/// literals, so `{"keys": {"alt+f": "disable"}}` — the README's own escape
+/// hatch — produced a roost whose `Alt+?` still taught `Alt+f`. Any surface
+/// that renders from this cannot say that.
+///
+/// **Twins are collapsed.** A shifted letter is delivered as `('h', SHIFT)`
+/// by some terminals and bare `'H'` by others, and the default table binds
+/// both (C23/C27/C28/C33). They are one physical chord, so the bare
+/// uppercase form is dropped whenever its shifted-lowercase sibling carries
+/// the same action — otherwise every such row would print its chord twice.
+///
+/// Sorted by `Chord::order`, so the output is deterministic and a row that
+/// joins several chords reads in the order the key table always wrote them.
+pub fn effective_bindings(keymap: &Keymap) -> Vec<(String, Action)> {
+    let mut merged: HashMap<Chord, Action> = default_keymap().clone();
+    for (chord, ov) in &keymap.overrides {
+        match ov {
+            Override::Disabled => {
+                merged.remove(chord);
+            }
+            Override::Bound(a) => {
+                merged.insert(*chord, *a);
+            }
+        }
+    }
+    let dropped: Vec<Chord> = merged
+        .iter()
+        .filter(|(chord, action)| is_redundant_spelling(chord, action, &merged))
+        .map(|(chord, _)| *chord)
+        .collect();
+    let mut out: Vec<(Chord, Action)> =
+        merged.into_iter().filter(|(c, _)| !dropped.contains(c)).collect();
+    out.sort_by_key(|(c, _)| c.order());
+    out.into_iter().map(|(c, a)| (c.label(), a)).collect()
+}
+
+/// F1/C34: the chord a single action is on, for the chrome surfaces that
+/// name one chord in a sentence rather than listing a row's worth — C9's
+/// attention segment (`· Alt+a`), C16's dead-pane bar, C10's confirm
+/// flashes. `None` when the action has no chord at all (disabled in
+/// config.json), which those callers render by dropping the clause rather
+/// than naming a key that does nothing.
+///
+/// The *first* label in `Chord::order`, so a doubly-bound action names its
+/// arrow/specials form before its letter form — the same order the key
+/// table has always written.
+pub fn chord_for(keymap: &Keymap, action: Action) -> Option<String> {
+    effective_bindings(keymap).into_iter().find(|(_, a)| *a == action).map(|(l, _)| l)
 }
 
 /// Every `(code, shift)` the default table already treats as the *same*
@@ -1445,7 +1632,7 @@ mod tests {
     #[test]
     fn absent_config_keeps_translate_byte_for_byte() {
         let empty = Keymap::default();
-        for (chord, _) in default_keymap() {
+        for &chord in default_keymap().keys() {
             let mut mods = KeyModifiers::ALT;
             if chord.shift {
                 mods |= KeyModifiers::SHIFT;
@@ -1589,7 +1776,7 @@ mod tests {
     /// test failing, never a silent gap either way.
     #[test]
     fn every_default_bound_actions_name_round_trips() {
-        for (chord, action) in default_keymap() {
+        for (&chord, &action) in default_keymap() {
             let name = action_name(&action);
             assert_eq!(
                 action_by_name(&name),
@@ -1658,6 +1845,98 @@ mod tests {
             translate_with(alt(KeyCode::Char('H')), &keymap),
             InputResult::Action(Action::Quit),
             "the uppercase delivery must move too, or the remap half-applies",
+        );
+    }
+
+    // ---- F1: effective_bindings -----------------------------------------
+
+    /// The property the whole of F1 rests on: what `effective_bindings`
+    /// reports **is** what `translate_with` dispatches on. Swept over every
+    /// chord it returns rather than spot-checked, so a binding that renders
+    /// one way and fires another is a failure, not a gap in the test.
+    #[test]
+    fn every_reported_binding_is_what_the_chord_actually_does() {
+        let keymap = Keymap::default();
+        for (label, action) in effective_bindings(&keymap) {
+            let chord = parse_label(&label);
+            assert_eq!(
+                translate_with(chord, &keymap),
+                InputResult::Action(action),
+                "{label} is reported as {action:?} but does something else",
+            );
+        }
+    }
+
+    /// Rebuild a `KeyEvent` from a label, so the sweep above can press what
+    /// it read. The inverse of `Chord::label` for the forms that table
+    /// produces.
+    fn parse_label(label: &str) -> KeyEvent {
+        let rest = label.strip_prefix("Alt+").expect("every label is an Alt chord");
+        let (shift, key) = match rest.strip_prefix("Shift+") {
+            Some(k) => (true, k),
+            None => (false, rest),
+        };
+        let code = match key {
+            "Enter" => KeyCode::Enter,
+            "PgUp" => KeyCode::PageUp,
+            "↑" => KeyCode::Up,
+            "↓" => KeyCode::Down,
+            "←" => KeyCode::Left,
+            "→" => KeyCode::Right,
+            k => KeyCode::Char(k.chars().next().unwrap()),
+        };
+        let mut m = KeyModifiers::ALT;
+        if shift {
+            m |= KeyModifiers::SHIFT;
+        }
+        KeyEvent::new(code, m)
+    }
+
+    /// Each collapse rule, named. Without them the overlay would print one
+    /// physical key twice (rules 1 and 2) or advertise a chord nothing is
+    /// bound to (rule 3).
+    #[test]
+    fn one_physical_chord_is_reported_exactly_once() {
+        let labels: Vec<String> =
+            effective_bindings(&Keymap::default()).into_iter().map(|(l, _)| l).collect();
+        let has = |l: &str| labels.iter().any(|x| x == l);
+
+        // Rule 1 — letters keep the Alt+Shift+<lower> spelling.
+        assert!(has("Alt+Shift+p"), "the documented spelling survives");
+        assert!(!has("Alt+P"), "its uppercase-delivery twin does not");
+        // Rule 2 — punctuation keeps the glyph spelling, the mirror choice.
+        assert!(has("Alt+?"), "the documented spelling survives");
+        assert!(!has("Alt+Shift+/"), "its shifted-base twin does not");
+        // Rule 3 — an arm that never tested shift binds no shifted chord.
+        assert!(has("Alt+1"));
+        assert!(!has("Alt+Shift+1"), "nothing is bound to Alt+Shift+1");
+        // ... and where the two shift states really differ, both survive.
+        assert!(has("Alt+h") && has("Alt+Shift+h"), "focus and move are distinct");
+        assert!(has("Alt+←") && has("Alt+Shift+←"), "focus and resize are distinct");
+
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "no label appears twice");
+    }
+
+    /// The point of the exercise: a remap moves what the chrome will draw,
+    /// and a disable removes it. Before F1 the help overlay and hint bar
+    /// spelled their chords as `&'static str`, so neither could.
+    #[test]
+    fn a_remap_moves_the_reported_binding_and_a_disable_removes_it() {
+        let (keymap, diagnostics) = Keymap::parse(
+            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            "config.json",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let bindings = effective_bindings(&keymap);
+        let float: Vec<&String> =
+            bindings.iter().filter(|(_, a)| *a == Action::ToggleFloat).map(|(l, _)| l).collect();
+        assert_eq!(float, vec!["Alt+v"], "the float is on Alt+v now, and only there");
+        assert!(
+            !bindings.iter().any(|(l, _)| l == "Alt+f"),
+            "the disabled chord is gone entirely — it forwards to the pane now",
         );
     }
 
@@ -1738,12 +2017,12 @@ mod tests {
     #[test]
     fn twin_derivation_finds_every_same_letter_same_action_default_chord() {
         let table = default_keymap();
-        for (&chord, &action) in &table {
+        for (&chord, &action) in table {
             let KeyCode::Char(c) = chord.code else {
                 continue;
             };
             let found = twins(chord.code, chord.shift);
-            for (&other, &other_action) in &table {
+            for (&other, &other_action) in table {
                 let KeyCode::Char(oc) = other.code else {
                     continue;
                 };
@@ -1757,3 +2036,4 @@ mod tests {
         }
     }
 }
+
