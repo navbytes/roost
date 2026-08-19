@@ -84,11 +84,29 @@ the `('h', SHIFT)` form and silently no-ops on terminals that send `'H'`,
 which is precisely the failure `twins`' own doc comment says must never
 happen.
 
-**Second-order.** The vim vocabulary stops at focus. `Alt+←↓↑→` and
-`Alt+hjkl` are equal partners for focus (§8 row 3), but resize is
-`Alt+Shift+←↓↑→` only (row 4) — so the vim user's natural `Alt+Shift+h`
-doesn't shrink the pane, it moves focus left (or leaks to the agent). zellij's
-resize mode gives `hjkl` the resize verbs too.
+**The sharper framing (raised in review).** On the terminals where
+`Alt+Shift+l` *does* resolve, it resolves to `Focus(Dir::Right)` — which is
+exactly what `Alt+l` already does. So the four shifted vim chords are not
+merely inconsistent, they are **spent on nothing**: four chords duplicating
+four chords, in a table whose free unshifted pool is empty (F7). That is the
+strongest argument for the change, and it is independent of the delivery
+split.
+
+It also names the real defect in the vocabulary, which is visible with no
+config at all: **shift + a direction key resizes with arrows and moves focus
+with letters.** `KeyCode::Right if shift` (`input.rs:123`) is a resize arm and
+sits above `KeyCode::Right | KeyCode::Char('l')` (`input.rs:191`), which has
+no shift guard — so `Alt+Shift+→` shrinks a pane and `Alt+Shift+l` walks
+focus. Same gesture, two verbs. §8 rows 3 and 4 read as though the arrows and
+the letters are equal partners; for the shifted half they are not. zellij's
+resize mode gives `hjkl` the resize verbs.
+
+**Severity, honestly.** Because the resolving case is a duplicate, nobody has
+been silently broken by it — this is not a user-facing bug of the U1 class,
+and it should not be sold as one. What it is: a leak into the agent on one
+terminal class, a config remap that half-applies on the other, and four dead
+chords. The reason to do it early is the ordering dependency below, not
+urgency.
 
 **Fix shape.** Bind the shifted vim letters to the resize actions they
 obviously mean, on both delivery forms — which is the change that closes the
@@ -346,10 +364,15 @@ Recorded so a future pass doesn't "improve" these toward the comparison tools:
 
 ## Suggested order
 
-1. **F1** (surfaces read the live keymap) — highest value, self-contained, and
+1. **F2** (shifted vim keys) — *not* because it is urgent (see its severity
+   note; the resolving case is a harmless duplicate), but because F1 renders
+   chords by reverse-lookup through the live table. Ask today's table "what
+   moves focus left?" and it answers `Alt+←`, `Alt+h` **and** `Alt+Shift+h` —
+   so F1 would print a redundant binding that only works on half of
+   terminals, in the one surface whose job is telling the truth. Clear the
+   table before rendering from it. Smallest item on the list either way.
+2. **F1** (surfaces read the live keymap) — highest value, self-contained, and
    it unblocks F5's descriptions and F11's `roost keys`.
-2. **F2** (shifted vim keys) — smallest, and it's a live cross-terminal split,
-   not a missing feature.
 3. **F7** (leader key) — its stated trigger has fired; building it first stops
    F3/F6/F5 from each spending a scarce chord under pressure.
 4. **F3** (broadcast in the TUI) and **F6** (back) — the two verbs the fleet
