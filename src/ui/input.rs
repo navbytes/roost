@@ -12,6 +12,11 @@ pub enum Action {
     ClosePane,
     /// Move focus spatially (arrows / hjkl).
     Focus(Dir),
+    /// C36: open the broadcast composer — type one message, send it to
+    /// every reachable pane (`Alt+'`). The verb roost is uniquely
+    /// positioned for, and until now the only one you had to leave roost
+    /// to use.
+    ToggleBroadcast,
     /// C35: return focus to the pane it was on before this one — the
     /// alternate-pane toggle (`Alt+;`, tmux's `prefix ;`). Every other
     /// navigation chord is absolute or forward-directional; this is the
@@ -216,6 +221,10 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         // `/` and `?` was still free. tmux's own last-pane key, and no
         // readline binding to collide with.
         KeyCode::Char(';') => Some(Action::FocusAlternate),
+        // C36: `'` neighbours `;` on the keyboard, and the two are the
+        // fleet's pair of punctuation verbs — go back, and speak to
+        // everyone. Punctuation costs the §8 letter pool nothing (C35).
+        KeyCode::Char('\'') => Some(Action::ToggleBroadcast),
         KeyCode::Char('l') if shift => Some(Action::MovePane(Dir::Right)),
         KeyCode::Char('L') => Some(Action::MovePane(Dir::Right)),
         KeyCode::Char('h') if shift => Some(Action::MovePane(Dir::Left)),
@@ -668,6 +677,7 @@ const NAMES: &[(&str, Action)] = &[
     ("focus_up", Action::Focus(Dir::Up)),
     ("focus_down", Action::Focus(Dir::Down)),
     ("focus_alternate", Action::FocusAlternate),
+    ("toggle_broadcast", Action::ToggleBroadcast),
     ("move_pane_left", Action::MovePane(Dir::Left)),
     ("move_pane_right", Action::MovePane(Dir::Right)),
     ("move_pane_up", Action::MovePane(Dir::Up)),

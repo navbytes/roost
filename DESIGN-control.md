@@ -153,6 +153,16 @@ protect.
    scoped to the pane's own subtree (see Open decisions §3 for the resolved
    in-pane trust model).
 4. **Reports and commands do not share an authorization surface.**
+
+   **[Amended 2026-08-19, DESIGN-ui.md C36 — a third actor.]** `Actor` gains
+   `Local`: the human at the keyboard, reaching every pane exactly as `Fleet`
+   does. It is **not an authorization change** — no token resolves to it,
+   `TokenTable::resolve` never returns it, and it is unreachable from the
+   socket. A chord pressed inside roost is already the strongest credential
+   there is; the variant exists so the **audit trail can tell the two apart**.
+   Logging a keyboard broadcast as `fleet` would make a human's action
+   indistinguishable from a token holder's in `control.log` and the C20 feed,
+   and attribution is the whole reason that log exists. Audited as `local`.
 5. **Reads are scoped + consented.** Owner-created panes only; no in-pane read
    verb; no all-panes passive stream without explicit consent.
 6. **Rate-limited + per-principal connection cap** (not just the global

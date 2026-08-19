@@ -146,6 +146,7 @@ you're in.
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
 | `Alt+;` | go back to the pane you came from — toggles, and follows across tabs (tmux's `prefix ;`) |
 | `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |
+| `Alt+'` | broadcast — compose one message, send it to every pane (`Tab` picks who: all, or one status tier); the title shows how many will get it |
 | `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
 | `Alt+r` | edit pane — name and parking note in one dialog; the note's first line shows on the badge |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |

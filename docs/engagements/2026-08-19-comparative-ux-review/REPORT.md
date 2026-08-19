@@ -170,7 +170,7 @@ deliberate no-cross-tab-handoff-at-the-edge divergence from C31, is in C33.
 
 ---
 
-## F3 · High · Broadcast exists, but only outside the TUI
+## F3 · High · **RESOLVED 2026-08-19 (C36)** · Broadcast exists, but only outside the TUI
 
 **What.** `roost send --all` is implemented end to end (`control.rs:70`,
 `Method::Broadcast`) and is explicitly **CLI-only by design, no TUI key** per
@@ -182,7 +182,30 @@ to do. zellij's sync-input-to-tab is one of its most-cited features and it
 isn't even aimed at agents; roost has the better version of it already built
 and unreachable from the keyboard.
 
-**Fix shape — and the part to get right.** Not a sticky sync mode. A
+**What shipped (C36), and the part the finding got half-right.** Not a sticky
+sync mode — that stands, and for the reason given below. But this finding
+proposed the guard be "a modal composer" and left it there; building it
+surfaced the actual question, which is not *whether* the send is deliberate
+but *whether you know who receives it*.
+
+The answer is the title: `broadcast → N panes`, live, moving as `Tab` cycles
+the status filter, `accent()` at zero. **The visible blast radius is the
+guard**, not a confirm-twice. A second keypress tells you nothing a first
+didn't; a count tells you *whom*. Confirm-twice is right for closing one busy
+pane ("are you sure"); this question is "sure about whom".
+
+For that to be a guard and not a decoration, the count and the send had to
+come from one predicate — `broadcast_targets` — so they cannot disagree. A
+guard that lies is worse than none.
+
+Two other things the build settled: `Tab`'s filter is C27's, *extracted and
+shared* rather than copied, because a filter meaning something subtly
+different in each surface would make the count unreadable; and a keyboard
+broadcast needed a third `Actor` variant (`Local`), because logging it as
+`fleet` would have made a human's action indistinguishable from a token
+holder's in a log whose whole value is attribution.
+
+**Original fix shape, for the record.** Not a sticky sync mode. A
 persistent "every keystroke goes to five panes" state is exactly the
 unguarded-destructive-action shape U1 exists to prevent, and it fails the same
 way `Alt+q` did: one forgotten mode indicator and you've typed into a fleet.
@@ -477,18 +500,16 @@ Recorded so a future pass doesn't "improve" these toward the comparison tools:
 
 ## Suggested order
 
-**Done.** F6 as **C35** (`Alt+;` goes back). F11 as `roost keys`. F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
+**Done.** F3 as **C36** (`Alt+'` broadcast composer). F6 as **C35** (`Alt+;` goes back). F11 as `roost keys`. F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
 one change closed both, since the redundant chords F2 found were the chords
 F8's missing verb needed). F1 as **C34** (the chrome reads the live keymap),
 which also retired the const-vs-const documentation gate for a real sweep.
 
 **Next.**
 
-1. **F3** (broadcast in the TUI) — the verb roost is uniquely positioned for
-   and the one thing you must leave roost to do.
-2. **F4** (declare a fleet) — largest, and the one that needs a stance
+1. **F4** (declare a fleet) — largest, and the one that needs a stance
    decision before any code.
-3. **F5**, **F9**, **F10** as capacity allows. F5 (custom commands) got
+2. **F5**, **F9**, **F10** as capacity allows. F5 (custom commands) got
    cheaper for the same reason F11 did: `effective_bindings` is the table it
    needs, and it exists now.
 

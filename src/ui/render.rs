@@ -16,6 +16,7 @@ use crate::core::app::{
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, Dir, PaneRect};
 use crate::ports::PaneBackend;
+use crate::core::control::Actor;
 use crate::ui::input::{self, Action, Keymap};
 use crate::ui::mouse;
 use crate::ui::theme;
@@ -175,6 +176,17 @@ fn hint_pairs(
         // C32 (combined), 72 columns. `Shift+↵` names the break — descend
         // from the name row, split inside the note (Ctrl/Alt+↵ are
         // unhinted synonyms, same rule as every alias on this bar).
+        // C36, 76 columns. `Tab` leads the filter half because the
+        // target count in the title moves with it — the pair is how you
+        // learn the count is steerable. `↵ send` is deliberately worded as
+        // the irreversible thing it is.
+        Mode::Broadcast { .. } => vec![
+            lit("type", "message"),
+            lit("↵", "send"),
+            lit("Shift+↵", "new line"),
+            lit("Tab", "who gets it"),
+            lit("Esc", "cancel"),
+        ],
         Mode::PaneEdit { .. } => vec![
             lit("type", "name / note"),
             lit("↵", "save"),
@@ -285,6 +297,7 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Help { .. } => "HELP",
         Mode::Feed { .. } => "FEED",
         Mode::Roster { .. } => "ROSTER",
+        Mode::Broadcast { .. } => "BROADCAST",
         Mode::Search { .. } => "SEARCH",
     }
 }
@@ -1029,6 +1042,10 @@ const HELP_GROUPS: &[HelpGroup] = &[
                 "roster: every pane, grouped by tab · Tab filters by status",
             ),
             chords(&[Action::ToggleFeed], "activity feed (status / spawns / exits / control)"),
+            chords(
+                &[Action::ToggleBroadcast],
+                "broadcast: type once, send to every pane · Tab picks who",
+            ),
         ],
     },
     HelpGroup {
@@ -1130,6 +1147,13 @@ fn dialog_rect(
         Mode::PaneEdit { lines, .. } => {
             Some(centered_near(anchor, body, 44, lines.len() as u16 + 3))
         }
+        // C36: C13's width, one row per message line. Wider than the pane
+        // editor would be tempting, but a broadcast is read at the moment
+        // of sending and the eye should be on the title's target count,
+        // not sweeping a wide field.
+        Mode::Broadcast { lines, .. } => {
+            Some(centered_near(anchor, body, 44, lines.len() as u16 + 2))
+        }
         Mode::Picker { .. } => {
             // U20: as tall as the longer of the two columns (a filter can
             // shrink the adapter side below the cwd side), never shorter
@@ -1208,6 +1232,37 @@ fn draw_mode_overlay<B: PaneBackend>(
                     Line::from(l.clone())
                 }
             }));
+            f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
+        }
+        // C36: the composer. The title carries the **live target count**,
+        // and that count is the contract's safety affordance — a visible
+        // blast radius at the moment of commit, in place of a
+        // confirm-twice. It moves with `Tab`, so the filter reads as "who
+        // gets this" rather than as a setting.
+        Mode::Broadcast { lines, row, col, status_filter } => {
+            let targets = app.broadcast_targets(Actor::Local, *status_filter).len();
+            let noun = if targets == 1 { "pane" } else { "panes" };
+            let tier = status_filter.map(|s| {
+                let (glyph, _, _) = theme::status_style(s);
+                format!(" {glyph}")
+            });
+            let heading =
+                format!(" broadcast → {targets} {noun}{} ", tier.unwrap_or_default());
+            // `accent()` on an empty target set: sending into nothing is
+            // the one state the title must not read as ordinary.
+            let style = if targets == 0 { theme::accent() } else { theme::ink() };
+            let inner = modal_frame(f, body, rect, Line::from(Span::styled(heading, style)));
+            let rendered: Vec<Line> = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if i == *row {
+                        Line::from(rename_field(l, *col))
+                    } else {
+                        Line::from(l.clone())
+                    }
+                })
+                .collect();
             f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
         }
         Mode::Picker { selection, filter, cwd, on_cwd } => {
@@ -4261,6 +4316,7 @@ mod tests {
             ("picker", Action::QuickLaunch),
             ("activity feed", Action::ToggleFeed),
             ("fleet roster", Action::ToggleRoster),
+            ("broadcast composer", Action::ToggleBroadcast),
             ("rename dialog", Action::RenameTab),
             ("scroll mode", Action::ScrollMode),
             ("copy mode", Action::CopyMode),
@@ -4475,6 +4531,7 @@ mod tests {
                 Mode::Help { .. } => Some("help overlay"),
                 Mode::Feed { .. } => Some("activity feed"),
                 Mode::Roster { .. } => Some("fleet roster"),
+                Mode::Broadcast { .. } => Some("broadcast composer"),
                 Mode::Search { .. } => Some("scrollback search"),
             }
         }
@@ -4497,6 +4554,12 @@ mod tests {
             Mode::Help { top: 0 },
             Mode::Feed { offset: 0 },
             Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None },
+            Mode::Broadcast {
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                status_filter: None,
+            },
             Mode::Search { copy_cursor: None },
         ];
         let names: Vec<&str> = chrome_buffers().iter().map(|(n, _)| *n).collect();

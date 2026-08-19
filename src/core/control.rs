@@ -6,6 +6,8 @@
 //! Authorization (see DESIGN-control.md §5): a request carries a token.
 //! - The fleet control token (from `<state>/control.token`, never in any pane's
 //!   env) resolves to `Actor::Fleet` — may act on any pane.
+//! - A chord pressed inside roost is `Actor::Local` — no token involved,
+//!   reaches every pane, audited under its own name (C36).
 //! - A pane's own `ROOST_TOKEN` resolves to `Actor::Pane(id)` — may spawn/fork
 //!   freely, and may drive only the panes in its own spawned subtree.
 
@@ -125,6 +127,14 @@ pub enum Actor {
     Fleet,
     /// A pane acting via its own `ROOST_TOKEN` — subtree-scoped.
     Pane(PaneId),
+    /// C36: the human at the keyboard. Reaches every pane, like `Fleet`,
+    /// and is a separate variant **for the audit trail's sake**: a
+    /// keyboard-initiated fleet action logged as `fleet` would be
+    /// indistinguishable from a token holder's, and attribution is the
+    /// whole value of that log. It authenticates nothing — no token
+    /// resolves to it (`TokenTable::resolve` never returns it) — because
+    /// pressing a key inside roost *is* the credential.
+    Local,
 }
 
 /// The result of a control request, serialized back to the client.

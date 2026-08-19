@@ -87,6 +87,19 @@ pub enum Mode {
     /// `pane` pins the editor's owner at open time, so the commit can
     /// never land on a different pane than the dialog opened on.
     PaneEdit { name: String, lines: Vec<String>, row: usize, col: usize, pane: PaneId },
+    /// C36: the broadcast composer (`Alt+'`). `lines` is the message being
+    /// written, split on newlines and never empty; `row` indexes it and
+    /// `col` is a **char** index into that row, for the same reason
+    /// Rename's cursor is. `status_filter` narrows the targets — the same
+    /// `Option<AgentStatus>` C27's roster cycles with `Tab`, and the reason
+    /// the dialog can show a live count of who is about to receive this.
+    ///
+    /// Deliberately **not** a sticky sync-input mode. A persistent "every
+    /// keystroke goes to five panes" state is the unguarded-destructive
+    /// shape U1 exists to prevent: you would have to notice a mode
+    /// indicator to avoid typing into a fleet. One composed message, one
+    /// deliberate send.
+    Broadcast { lines: Vec<String>, row: usize, col: usize, status_filter: Option<AgentStatus> },
     /// U20: the quick-launch picker. `selection` indexes the **filtered**
     /// adapter list (`filter` is the type-ahead query, empty = everything);
     /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
@@ -1575,7 +1588,10 @@ impl<B: PaneBackend> App<B> {
     /// only within its own spawned subtree (itself included).
     fn may_target(&self, actor: Actor, target: PaneId) -> bool {
         match actor {
-            Actor::Fleet => true,
+            // C36: the human at the keyboard reaches every pane, same as
+            // the fleet token. They are separate variants so the audit can
+            // tell them apart, not because their reach differs.
+            Actor::Fleet | Actor::Local => true,
             Actor::Pane(a) => self.in_subtree(a, target),
         }
     }
@@ -1731,6 +1747,7 @@ impl<B: PaneBackend> App<B> {
     fn audit(&mut self, actor: Option<Actor>, summary: &str, ok: bool, detail: &str) {
         let principal = match actor {
             Some(Actor::Fleet) => "fleet".to_string(),
+            Some(Actor::Local) => "local".to_string(),
             Some(Actor::Pane(id)) => format!("pane:{id}"),
             None => "?".to_string(),
         };
@@ -1988,7 +2005,7 @@ impl<B: PaneBackend> App<B> {
         verb: &str,
     ) -> Reply {
         let owner = match actor {
-            Actor::Fleet => None,
+            Actor::Fleet | Actor::Local => None,
             Actor::Pane(a) => Some(a),
         };
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
@@ -2032,7 +2049,9 @@ impl<B: PaneBackend> App<B> {
         let target = match (pane, actor) {
             (Some(p), _) => p,
             (None, Actor::Pane(a)) => a,
-            (None, Actor::Fleet) => return Reply::err("fork requires a pane id for a fleet caller"),
+            (None, Actor::Fleet | Actor::Local) => {
+                return Reply::err("fork requires a pane id for a fleet caller")
+            }
         };
         // M1: forking the float would clone its spec into a brand-new real
         // pane (and surface its cwd in `list`) — refused before authz, same
@@ -2094,27 +2113,51 @@ impl<B: PaneBackend> App<B> {
     /// whose write call actually succeeded. There's no per-target id to
     /// validate (unlike send/read/close), so this never errors — zero
     /// matching panes is `ok` with count 0.
+    /// C36: every pane a broadcast by `actor` would reach — alive, not the
+    /// float, within the actor's authority — sorted for determinism.
+    ///
+    /// Factored out of `ctl_broadcast` so the TUI composer can *count* the
+    /// targets before sending (the visible blast radius that is C36's whole
+    /// safety affordance) using the identical predicate the send then uses.
+    /// A count that disagreed with the send would be worse than no count:
+    /// it would be a guard that lies.
+    ///
+    /// `status` narrows it further when the composer's filter is set — the
+    /// same `Option<AgentStatus>` idiom C27's roster cycles with `Tab`.
+    pub fn broadcast_targets(&self, actor: Actor, status: Option<AgentStatus>) -> Vec<PaneId> {
+        let mut targets: Vec<PaneId> = self
+            .runtimes
+            .iter()
+            .filter(|(&id, rt)| {
+                rt.status() != AgentStatus::Exited
+                    && !self.is_float(id)
+                    && self.may_target(actor, id)
+                    && status.is_none_or(|want| self.display_status(id) == Some(want))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        targets.sort_unstable();
+        targets
+    }
+
+    /// C36: write `bytes` to each of `targets`, returning the ones that took
+    /// it. The one place a broadcast actually delivers, shared by the
+    /// control verb and the TUI composer.
+    fn deliver_broadcast(&mut self, targets: &[PaneId], bytes: &[u8]) -> Vec<PaneId> {
+        targets
+            .iter()
+            .copied()
+            .filter(|id| self.runtimes.get_mut(id).is_some_and(|rt| rt.write_input(bytes)))
+            .collect()
+    }
+
     fn ctl_broadcast(&mut self, actor: Actor, text: &str, submit: bool) -> Reply {
         let mut bytes = text.as_bytes().to_vec();
         if submit {
             bytes.push(b'\r');
         }
-        let mut targets: Vec<PaneId> = Vec::new();
-        for (&id, rt) in self.runtimes.iter() {
-            if rt.status() != AgentStatus::Exited && !self.is_float(id) && self.may_target(actor, id)
-            {
-                targets.push(id);
-            }
-        }
-        targets.sort_unstable();
-        let mut sent: Vec<PaneId> = Vec::new();
-        for &id in &targets {
-            if let Some(rt) = self.runtimes.get_mut(&id) {
-                if rt.write_input(&bytes) {
-                    sent.push(id);
-                }
-            }
-        }
+        let targets = self.broadcast_targets(actor, None);
+        let sent = self.deliver_broadcast(&targets, &bytes);
         let count = sent.len();
         // Self-audit with the real count — the generic post-dispatch audit
         // in handle_control_msg only ever sees an opaque `Reply::Ok` (it
@@ -3407,6 +3450,7 @@ impl<B: PaneBackend> App<B> {
             Action::Focus(dir) => self.focus_dir(dir),
             Action::MovePane(dir) => self.move_pane_dir(dir),
             Action::FocusAlternate => self.focus_alternate(),
+            Action::ToggleBroadcast => self.toggle_broadcast(),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
             Action::NextTab => self.step_tab(1),
@@ -4292,6 +4336,54 @@ impl<B: PaneBackend> App<B> {
         self.focus_attention_target(next);
     }
 
+    /// C36 (`Alt+'`): open the broadcast composer, or close it if it is
+    /// already open (C24b's uniform mode-entry toggle).
+    fn toggle_broadcast(&mut self) {
+        self.mode = match self.mode {
+            Mode::Broadcast { .. } => Mode::Normal,
+            _ => Mode::Broadcast {
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                status_filter: None,
+            },
+        };
+    }
+
+    /// C36: deliver the composed message to every pane the filter selects.
+    ///
+    /// `--enter` semantics deliberately: a broadcast that only *types* into
+    /// five agents and leaves each prompt sitting there un-submitted has
+    /// done the tedious half of the job and left the half you opened it for.
+    /// `roost send --all` makes submitting opt-in because a script may want
+    /// to stage text; a human who just typed a message and pressed Enter has
+    /// already expressed the intent.
+    ///
+    /// Audited as `Actor::Local`, so `control.log` and the C20 feed record a
+    /// keyboard broadcast as its own thing rather than as a token holder's.
+    fn send_broadcast(&mut self, text: &str, status: Option<AgentStatus>) {
+        if text.is_empty() {
+            self.set_flash("nothing to broadcast");
+            return;
+        }
+        let targets = self.broadcast_targets(Actor::Local, status);
+        if targets.is_empty() {
+            self.set_flash("no panes to broadcast to");
+            return;
+        }
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(b'\r');
+        let sent = self.deliver_broadcast(&targets, &bytes);
+        let count = sent.len();
+        let summary = method_summary(&Method::Broadcast {
+            text: text.to_string(),
+            submit: true,
+        });
+        self.audit(Some(Actor::Local), &summary, true, &format!("count={count}"));
+        let noun = if count == 1 { "pane" } else { "panes" };
+        self.set_flash(format!("broadcast to {count} {noun}"));
+    }
+
     /// C35 (`Alt+;`): return to the pane focus was on before this one.
     ///
     /// The motion `Alt+a` cannot make. Every other navigation chord is
@@ -4514,9 +4606,7 @@ impl<B: PaneBackend> App<B> {
     /// to keep it visible.
     fn roster_cycle_status(&mut self, delta: isize) {
         let Mode::Roster { status_filter, .. } = &mut self.mode else { return };
-        let n = ROSTER_STATUS_CYCLE.len() as isize;
-        let at = ROSTER_STATUS_CYCLE.iter().position(|s| s == status_filter).unwrap_or(0) as isize;
-        *status_filter = ROSTER_STATUS_CYCLE[(at + delta).rem_euclid(n) as usize];
+        *status_filter = cycle_status_filter(*status_filter, delta < 0);
         self.roster_clamp_cursor();
     }
 
@@ -5085,6 +5175,121 @@ impl<B: PaneBackend> App<B> {
                         self.save();
                         self.mode = Mode::Normal;
                     }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                true
+            }
+            Mode::Broadcast { lines, row, col, status_filter } => {
+                // C36: C32's editing vocabulary over a plain line buffer —
+                // no name row, so `row` indexes `lines` directly and the
+                // seam rules PaneEdit needs don't apply. Enter *sends*
+                // (Shift/Ctrl+Enter breaks a line, C32's convention), Tab
+                // cycles the target filter, Esc walks away having sent
+                // nothing.
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+                *row = (*row).min(lines.len().saturating_sub(1));
+                let len = lines[*row].chars().count();
+                *col = (*col).min(len);
+                match key.code {
+                    KeyCode::Enter if shift || ctrl => {
+                        let at = byte_at(&lines[*row], *col);
+                        let tail = lines[*row].split_off(at);
+                        lines.insert(*row + 1, tail);
+                        *row += 1;
+                        *col = 0;
+                    }
+                    KeyCode::Enter => {
+                        let text = lines.join("\n").trim().to_string();
+                        let filter = *status_filter;
+                        self.mode = Mode::Normal;
+                        self.send_broadcast(&text, filter);
+                    }
+                    // C27's idiom: Tab cycles which statuses are targeted,
+                    // and the title's count moves with it — so the filter
+                    // is legible as "who gets this", not as a setting.
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let back = matches!(key.code, KeyCode::BackTab);
+                        *status_filter = cycle_status_filter(*status_filter, back);
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        let cur = &mut lines[*row];
+                        *cur = cur[byte_at(cur, *col)..].to_string();
+                        *col = 0;
+                    }
+                    KeyCode::Char('w') if ctrl => {
+                        let cur = &mut lines[*row];
+                        let at = byte_at(cur, *col);
+                        let head = erase_word(&cur[..at]);
+                        *col = head.chars().count();
+                        *cur = head + &cur[at..];
+                    }
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        let cur = &mut lines[*row];
+                        let at = byte_at(cur, *col);
+                        cur.insert(at, c);
+                        *col += 1;
+                    }
+                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
+                    KeyCode::Backspace => {
+                        if *col > 0 {
+                            *col -= 1;
+                            let cur = &mut lines[*row];
+                            let at = byte_at(cur, *col);
+                            cur.remove(at);
+                        } else if *row > 0 {
+                            let cur = lines.remove(*row);
+                            *row -= 1;
+                            *col = lines[*row].chars().count();
+                            lines[*row].push_str(&cur);
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if *col < len {
+                            let cur = &mut lines[*row];
+                            let at = byte_at(cur, *col);
+                            cur.remove(at);
+                        } else if *row + 1 < lines.len() {
+                            let next = lines.remove(*row + 1);
+                            lines[*row].push_str(&next);
+                        }
+                    }
+                    KeyCode::Left => {
+                        if *col > 0 {
+                            *col -= 1;
+                        } else if *row > 0 {
+                            *row -= 1;
+                            *col = lines[*row].chars().count();
+                        }
+                    }
+                    KeyCode::Right => {
+                        if *col < len {
+                            *col += 1;
+                        } else if *row + 1 < lines.len() {
+                            *row += 1;
+                            *col = 0;
+                        }
+                    }
+                    KeyCode::Up => {
+                        if *row > 0 {
+                            *row -= 1;
+                            *col = (*col).min(lines[*row].chars().count());
+                        }
+                    }
+                    KeyCode::Down => {
+                        if *row + 1 < lines.len() {
+                            *row += 1;
+                            *col = (*col).min(lines[*row].chars().count());
+                        }
+                    }
+                    KeyCode::Home => *col = 0,
+                    KeyCode::End => *col = len,
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
                 }
@@ -5862,6 +6067,7 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
         Mode::Help { .. } => Some(Action::Help),
         Mode::Feed { .. } => Some(Action::ToggleFeed),
         Mode::Roster { .. } => Some(Action::ToggleRoster),
+        Mode::Broadcast { .. } => Some(Action::ToggleBroadcast),
         // P21: the search prompt is entered with `/`, not an Alt chord, so
         // there is no chord for it to toggle off. Alt+PgUp while searching
         // therefore falls through to the global binding, exactly as it
@@ -5916,6 +6122,19 @@ fn byte_at(s: &str, at: usize) -> usize {
 /// single-line by contract, so "line break" there means "start writing
 /// the note", which makes name → note one continuous typing flow. On a
 /// note row it splits at the point via `note_split_line`.
+/// C27/C36: one step through `ROSTER_STATUS_CYCLE` (worst-first, with
+/// `None` = every tier at both ends so cycling never dead-ends). Shared by
+/// the roster's `Tab` and the broadcast composer's, so the two surfaces
+/// cannot drift about what the tiers are or what order they come in — the
+/// composer is showing a *target count* for the filter it names, and a
+/// filter that meant something different in each place would make that
+/// count unreadable.
+fn cycle_status_filter(current: Option<AgentStatus>, back: bool) -> Option<AgentStatus> {
+    let n = ROSTER_STATUS_CYCLE.len() as isize;
+    let at = ROSTER_STATUS_CYCLE.iter().position(|s| *s == current).unwrap_or(0) as isize;
+    ROSTER_STATUS_CYCLE[(at + if back { -1 } else { 1 }).rem_euclid(n) as usize]
+}
+
 fn pane_edit_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
     if *row == 0 {
         // Land at the headline's END, not at the name's column carried
@@ -11833,6 +12052,122 @@ mod tests {
         let flash = app.flash().unwrap_or_default().to_string();
         assert!(flash.contains("again to quit roost"), "still instructive: {flash}");
         assert!(!flash.contains("Alt+"), "but names no dead key: {flash}");
+    }
+
+    // ---- C36: broadcast composer (Alt+') --------------------------------
+
+    /// The verb roost was uniquely positioned for and you had to leave roost
+    /// to use: one message, every reachable pane, submitted.
+    #[test]
+    fn broadcast_sends_the_composed_message_to_every_reachable_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes
+
+        app.apply(Action::ToggleBroadcast);
+        for c in "ship it".chars() {
+            app.handle_mode_key(key(c));
+        }
+        press(&mut app, crossterm::event::KeyCode::Enter);
+
+        assert!(matches!(app.mode, Mode::Normal), "sending closes the composer");
+        for id in app.pane_order() {
+            assert!(
+                app.runtimes.get(&id).unwrap().input.ends_with(b"ship it\r"),
+                "pane {id} got the message, submitted",
+            );
+        }
+        assert!(app.flash().unwrap_or_default().contains("broadcast to 3 panes"), "{:?}", app.flash());
+    }
+
+    /// C36's safety affordance is the *visible target count*, so the count
+    /// the title shows and the set the send writes to must be the same
+    /// predicate — a guard that lies is worse than no guard. Both go
+    /// through `broadcast_targets`; this pins that they agree, including
+    /// under a status filter.
+    #[test]
+    fn the_target_count_is_the_set_that_actually_receives() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        let order = app.pane_order();
+        // Put exactly one pane in NeedsInput.
+        let marked = order[1];
+        app.runtimes.get_mut(&marked).unwrap().set_extension_status(AgentStatus::NeedsInput);
+
+        let filtered = app.broadcast_targets(Actor::Local, Some(AgentStatus::NeedsInput));
+        assert_eq!(filtered, vec![marked], "the filter selects exactly the ◆ pane");
+
+        app.apply(Action::ToggleBroadcast);
+        if let Mode::Broadcast { status_filter, .. } = &mut app.mode {
+            *status_filter = Some(AgentStatus::NeedsInput);
+        }
+        for c in "only you".chars() {
+            app.handle_mode_key(key(c));
+        }
+        press(&mut app, crossterm::event::KeyCode::Enter);
+
+        assert!(app.flash().unwrap_or_default().contains("broadcast to 1 pane"), "{:?}", app.flash());
+        for id in order {
+            let got = app.runtimes.get(&id).unwrap().input.ends_with(b"only you\r");
+            assert_eq!(got, id == marked, "pane {id} received iff it was targeted");
+        }
+    }
+
+    /// Esc is a real abort: nothing is written. The composer exists so that
+    /// a fleet-wide send is always a deliberate act.
+    #[test]
+    fn escaping_the_composer_sends_nothing() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleBroadcast);
+        for c in "never".chars() {
+            app.handle_mode_key(key(c));
+        }
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        for id in app.pane_order() {
+            let got = String::from_utf8_lossy(&app.runtimes.get(&id).unwrap().input).into_owned();
+            assert!(!got.contains("never"), "pane {id} got nothing");
+        }
+    }
+
+    /// Shift+Enter breaks a line rather than sending — C32's convention,
+    /// and the reason the composer can carry a multi-line agent prompt at
+    /// all. Plain Enter after it still sends the whole thing.
+    #[test]
+    fn shift_enter_breaks_a_line_instead_of_sending() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleBroadcast);
+        app.handle_mode_key(key('a'));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_mode_key(key('b'));
+        match &app.mode {
+            Mode::Broadcast { lines, row, .. } => {
+                assert_eq!(lines, &vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(*row, 1);
+            }
+            _ => panic!("still composing, not sent"),
+        }
+    }
+
+    /// C36 audits as `Actor::Local`, not `Fleet`: attribution is the audit
+    /// log's whole value, and a keyboard broadcast logged as a token
+    /// holder's would be indistinguishable from one. The C20 feed comes
+    /// along for free because it renders the same ctl lines.
+    #[test]
+    fn a_keyboard_broadcast_is_audited_as_local_and_reaches_the_feed() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleBroadcast);
+        app.handle_mode_key(key('x'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+
+        let ctl: Vec<&FeedEntry> =
+            app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        assert_eq!(ctl.len(), 1, "exactly one ctl line, as the control path also guarantees");
+        assert!(ctl[0].text.contains("local"), "attributed to the human, not the fleet: {:?}", ctl[0].text);
     }
 
     // ---- C35: go back (Alt+;) -------------------------------------------
