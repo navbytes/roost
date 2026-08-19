@@ -1848,6 +1848,107 @@ mod tests {
         );
     }
 
+    // ---- C34: no surface may spell a chord it did not resolve -----------
+
+    /// The literals a chord spelling is allowed to appear as in production
+    /// code, each because it is **handed to a resolver as a default**
+    /// rather than printed as-is.
+    ///
+    /// Why an allowlist rather than a ban: the two authoring sites below are
+    /// legitimate and permanent, so a flat ban would need suppressions that
+    /// mean nothing. Exact-match on the *whole* literal is what gives this
+    /// gate its teeth — a bare `"Alt+w"` is what a resolver argument looks
+    /// like, while a chord embedded in a sentence
+    /// (`"last pane — Alt+w again to quit roost"`) is what a hard-coded UI
+    /// string looks like, and only the first form can be listed here.
+    /// Every C34 deviation the design audit found was of the second form.
+    const CHORD_LITERALS: &[&str] = &[
+        // `Chord::label`, the producer every other surface resolves through.
+        "Alt+Shift+{key}",
+        "Alt+{key}",
+        // C9 hint-bar defaults, passed to `alt(..)` — the bar prints what
+        // the keymap returns and falls back to these only when they are
+        // still accurate.
+        "Alt+?",
+        "Alt+n",
+        "Alt+↵",
+        "Alt+s",
+        "Alt+←↓↑→",
+        "Alt+w",
+        "Alt+r",
+        "Alt+q",
+        "Alt+Shift+p",
+        // C15 `HelpKey::Family` shorthands, which give way to enumeration
+        // the moment any member moves.
+        "Alt+←↓↑→ / hjkl",
+        "Alt+Shift+←↓↑→",
+        "Alt+Shift+hjkl",
+        "Alt+1..9 / Alt+0",
+        "Alt+Shift+i / +m",
+        // The one authored `HelpKey::Text` row that names a chord: a mouse
+        // chord, outside config.json's grammar, so it cannot move (C34).
+        "Alt+click / o",
+    ];
+
+    /// C34's rule, made mechanical: *any chrome that names a chord derives
+    /// that name from the live keymap.*
+    ///
+    /// Two runtime gates already check that the help overlay covers every
+    /// bound chord, but neither can see a chord spelled into an arbitrary
+    /// `format!` somewhere else in the tree — which is exactly where the
+    /// design audit found C34's rule broken in five places (C10's confirm
+    /// flashes) plus two more surfaces. Each was caught by a human reading
+    /// code. This is the check that would have caught all seven.
+    ///
+    /// A new spelling fails here until it is either resolved or added to
+    /// `CHORD_LITERALS` — and adding it is the moment its author has to ask
+    /// whether the surface should be deriving instead.
+    ///
+    /// Not a proof: `format!("press {} now", "Alt+w")` would slip through.
+    /// It is a guardrail against the accident, not a defence against
+    /// deliberate circumvention.
+    #[test]
+    fn no_surface_spells_a_chord_it_did_not_resolve() {
+        use crate::ui::srcscan::{is_comment, production, src_files, string_literals};
+        let mut offenders = Vec::new();
+        for (path, text) in src_files() {
+            for (i, line) in production(&text).lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                for lit in string_literals(line) {
+                    if lit.contains("Alt+") && !CHORD_LITERALS.contains(&lit) {
+                        offenders.push(format!("{}:{}: {lit:?}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "C34: a chord spelled into a literal instead of resolved from the keymap.\n\
+             Resolve it (`input::chord_for` / `App::chord_label`), or add the literal to \
+             CHORD_LITERALS if it is a resolver default:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// The gate's own teeth, since a passing scan proves nothing about what
+    /// it would reject: the shapes C34's audit actually found must fail it.
+    #[test]
+    fn the_chord_gate_rejects_a_chord_buried_in_a_sentence() {
+        let caught = |lit: &str| lit.contains("Alt+") && !CHORD_LITERALS.contains(&lit);
+        // The five C10 flashes, verbatim from before they were resolved.
+        assert!(caught("last pane — Alt+w again to quit roost"));
+        assert!(caught("{} busy — Alt+w again to close"));
+        assert!(caught("{busy} {noun} busy — Alt+q again to quit"));
+        assert!(caught("no room to rearrange; stack a pane with Alt+s first"));
+        // C9's attention segment and C16's dead-pane bar (D2, D3).
+        assert!(caught("◆ {n} needs you · Alt+a"));
+        assert!(caught(" ✕ exited — Enter: relaunch/resume · Alt+w: close "));
+        // And a resolver default still passes, or the gate would be unusable.
+        assert!(!caught("Alt+w"));
+    }
+
     // ---- F1: effective_bindings -----------------------------------------
 
     /// The property the whole of F1 rests on: what `effective_bindings`
@@ -2036,4 +2137,5 @@ mod tests {
         }
     }
 }
+
 

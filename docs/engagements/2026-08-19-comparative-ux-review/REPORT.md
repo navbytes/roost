@@ -81,6 +81,14 @@ Three things the implementation turned up that the finding did not predict:
   nothing, where the old literal row stayed visible and merely lied. That is
   quieter, so it got a gate of its own.
 
+**And the rule needed a mechanical check, not just contracts.** The first
+implementation covered two surfaces while C34 asserted the rule universally;
+a design audit found five more places spelling chords as literals. All seven
+were caught by a person reading code. `no_surface_spells_a_chord_it_did_not_resolve`
+now scans `src/` for chord literals outside a short allowlist of resolver
+defaults, so the next one fails a test instead of needing a reviewer — the
+same shape as §2's fixed-hue gate, and sharing its walker.
+
 Then
 `every_bound_chord_is_documented_in_the_keymap` can be restated as a real
 sweep over the *effective* map (`default_keymap()` overlaid with the config's

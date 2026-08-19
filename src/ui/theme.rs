@@ -192,24 +192,7 @@ mod tests {
     /// must keep the full palette (C18). Everything else in `src/` inherits.
     const PASSTHROUGH: &str = "chrome-gate-exempt";
 
-    /// Every `.rs` file under `src/`, as (path, contents).
-    fn src_files() -> Vec<(std::path::PathBuf, String)> {
-        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
-        let mut out = Vec::new();
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("read a src/ directory") {
-                let path = entry.expect("a src/ dir entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&path).expect("read a src/ file");
-                    out.push((path, text));
-                }
-            }
-        }
-        assert!(out.len() > 5, "the source scan found almost nothing — check the walk");
-        out
-    }
+    use crate::ui::srcscan::src_files;
 
     /// Gate 1 (§2 theme-inherited stance): chrome inherits or it doesn't
     /// ship. No truecolor and no palette-indexed colour may be constructed
