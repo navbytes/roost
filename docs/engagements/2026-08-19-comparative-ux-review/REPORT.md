@@ -205,6 +205,17 @@ broadcast needed a third `Actor` variant (`Local`), because logging it as
 `fleet` would have made a human's action indistinguishable from a token
 holder's in a log whose whole value is attribution.
 
+**The design audit caught five things, one serious.** Worth recording because
+the pattern now holds across four consecutive contracts: the composer was not
+in `App::modal_active`, which is U8(b) verbatim — a click moved focus *under*
+the open dialog and a **paste landed in the pane behind it**. Compose a
+fleet-wide message, paste a snippet, and it goes silently into whichever agent
+happened to be focused. Also: C32's `Alt+Enter` carve-out was `PaneEdit`-only,
+so on Terminal.app the chord that should break a line opened the picker and
+discarded the message; the tier glyph was printed without its C5 colour; the
+title's conditional `accent()` was unsanctioned by C12; and nothing capped the
+line count on a dialog that grows a row per break and never scrolls.
+
 **Original fix shape, for the record.** Not a sticky sync mode. A
 persistent "every keystroke goes to five panes" state is exactly the
 unguarded-destructive-action shape U1 exists to prevent, and it fails the same

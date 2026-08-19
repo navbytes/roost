@@ -3061,6 +3061,10 @@ impl<B: PaneBackend> App<B> {
                 | Mode::Help { .. }
                 | Mode::Feed { .. }
                 | Mode::Roster { .. }
+                // C36: omitting the composer here was U8(b) verbatim — a
+                // paste landed in the pane *behind* the dialog and a click
+                // moved focus under it. Found by the C36 design audit.
+                | Mode::Broadcast { .. }
         )
     }
 
@@ -5002,9 +5006,23 @@ impl<B: PaneBackend> App<B> {
             // is claimed — the rest still cancel out to the global
             // bindings below, Alt+r's own toggle-off included.
             if key.code == KeyCode::Enter {
-                if let Mode::PaneEdit { lines, row, col, .. } = &mut self.mode {
-                    pane_edit_break(lines, row, col);
-                    return true;
+                match &mut self.mode {
+                    Mode::PaneEdit { lines, row, col, .. } => {
+                        pane_edit_break(lines, row, col);
+                        return true;
+                    }
+                    // C36: the composer needs the same carve-out. On
+                    // Terminal.app, Shift+Enter arrives as Alt+Enter
+                    // (README's CSI-u note), so without this the one chord
+                    // that should break a line instead opened the picker
+                    // and discarded the composed message. Found by the C36
+                    // design audit; C36's "keys are C32's, exactly" was an
+                    // overclaim until now.
+                    Mode::Broadcast { lines, row, col, .. } => {
+                        broadcast_break(lines, row, col);
+                        return true;
+                    }
+                    _ => {}
                 }
             }
             // U18: a mode's own entry chord toggles it OFF. C20's Alt+e had
@@ -5194,11 +5212,7 @@ impl<B: PaneBackend> App<B> {
                 *col = (*col).min(len);
                 match key.code {
                     KeyCode::Enter if shift || ctrl => {
-                        let at = byte_at(&lines[*row], *col);
-                        let tail = lines[*row].split_off(at);
-                        lines.insert(*row + 1, tail);
-                        *row += 1;
-                        *col = 0;
+                        broadcast_break(lines, row, col);
                     }
                     KeyCode::Enter => {
                         let text = lines.join("\n").trim().to_string();
@@ -6135,6 +6149,26 @@ fn cycle_status_filter(current: Option<AgentStatus>, back: bool) -> Option<Agent
     ROSTER_STATUS_CYCLE[(at + if back { -1 } else { 1 }).rem_euclid(n) as usize]
 }
 
+/// C36: split the composer's current line at the point.
+///
+/// **Capped at `BROADCAST_MAX_LINES`.** The dialog is `lines + 2` rows tall
+/// and `centered_near` clamps to the body, so without a cap a long enough
+/// message pushes its own rows — and the caret — off the bottom silently,
+/// with nothing to scroll them back. C32 caps its note for the same reason;
+/// this is that rule applied to the surface that borrowed its keys. At the
+/// cap the break is refused rather than partially applied: losing the split
+/// is recoverable, losing the text under it is not.
+fn broadcast_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
+    if lines.len() >= BROADCAST_MAX_LINES {
+        return;
+    }
+    let at = byte_at(&lines[*row], *col);
+    let tail = lines[*row].split_off(at);
+    lines.insert(*row + 1, tail);
+    *row += 1;
+    *col = 0;
+}
+
 fn pane_edit_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
     if *row == 0 {
         // Land at the headline's END, not at the name's column carried
@@ -6409,6 +6443,11 @@ fn roster_rank(status: Option<AgentStatus>) -> u8 {
 /// this list, `Shift+Tab` back, wrapping both ways. Worst-first, same as
 /// `roster_rank`, with `None` ("every tier") at the front so the first press
 /// narrows from "everything" to the severity you'd actually go looking for.
+/// C36: the composer's line ceiling — the dialog grows a row per break and
+/// never scrolls, so this is what keeps it inside the body. Matches C32's
+/// note cap in spirit and in number.
+const BROADCAST_MAX_LINES: usize = NOTE_MAX_LINES;
+
 const ROSTER_STATUS_CYCLE: [Option<AgentStatus>; 6] = [
     None,
     Some(AgentStatus::NeedsInput),
@@ -12168,6 +12207,67 @@ mod tests {
             app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
         assert_eq!(ctl.len(), 1, "exactly one ctl line, as the control path also guarantees");
         assert!(ctl[0].text.contains("local"), "attributed to the human, not the fleet: {:?}", ctl[0].text);
+    }
+
+    /// C12/U8, and the highest-severity thing the C36 audit found: the
+    /// composer was not a modal to the mouse or to paste. `modal_active`
+    /// omitted it, so a click moved focus under the open dialog and — the
+    /// dangerous half — a paste landed in the **pane behind it**. Someone
+    /// composing a fleet-wide message and pasting a snippet would have
+    /// silently typed it into whichever agent happened to be focused.
+    #[test]
+    fn the_composer_is_a_modal_to_the_mouse_and_to_paste() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let focused = app.focused;
+        app.apply(Action::ToggleBroadcast);
+        assert!(app.modal_active(), "the composer takes the mouse/paste path");
+
+        app.handle_paste("pasted");
+        for id in app.pane_order() {
+            let got = String::from_utf8_lossy(&app.runtimes.get(&id).unwrap().input).into_owned();
+            assert!(!got.contains("pasted"), "pane {id} must not receive a paste meant for the dialog");
+        }
+        assert_eq!(app.focused, focused, "and focus did not move beneath it");
+    }
+
+    /// C36/D2: on Terminal.app, Shift+Enter arrives as Alt+Enter, so
+    /// without the same carve-out C32 has, the one chord that should break
+    /// a line instead opened the quick-launch picker and discarded the
+    /// composed message. "Keys are C32's, exactly" was an overclaim until
+    /// this passed.
+    #[test]
+    fn alt_enter_breaks_a_composer_line_rather_than_opening_the_picker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleBroadcast);
+        app.handle_mode_key(key('a'));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        app.handle_mode_key(key('b'));
+        match &app.mode {
+            Mode::Broadcast { lines, .. } => {
+                assert_eq!(lines, &vec!["a".to_string(), "b".to_string()]);
+            }
+            _ => panic!("Alt+Enter left the composer — it opened the picker and ate the message"),
+        }
+    }
+
+    /// C36: the dialog grows a row per break and never scrolls, so an
+    /// uncapped message pushes its own rows and the caret off the body with
+    /// no way back. The break is refused at the cap rather than partly
+    /// applied — losing the split is recoverable, losing the text is not.
+    #[test]
+    fn the_composer_stops_growing_at_its_line_cap() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleBroadcast);
+        for _ in 0..(BROADCAST_MAX_LINES + 5) {
+            app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        }
+        match &app.mode {
+            Mode::Broadcast { lines, .. } => assert_eq!(lines.len(), BROADCAST_MAX_LINES),
+            _ => panic!("still composing"),
+        }
     }
 
     // ---- C35: go back (Alt+;) -------------------------------------------

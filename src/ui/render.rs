@@ -176,16 +176,22 @@ fn hint_pairs(
         // C32 (combined), 72 columns. `Shift+↵` names the break — descend
         // from the name row, split inside the note (Ctrl/Alt+↵ are
         // unhinted synonyms, same rule as every alias on this bar).
-        // C36, 76 columns. `Tab` leads the filter half because the
-        // target count in the title moves with it — the pair is how you
-        // learn the count is steerable. `↵ send` is deliberately worded as
-        // the irreversible thing it is.
+        // C36, **74 columns** — and ordered by U6's rule that list order
+        // *is* yield order, because 74 plus the 33-column needs-you
+        // segment overflows the 100-col floor and trailing pairs drop.
+        // The two that must survive a busy fleet lead: `↵ send` (what the
+        // dialog is for) and `Esc cancel` (the escape hatch C24's list
+        // refused to let yield). `type message` trails — a text field you
+        // are already typing into is the pair whose absence costs least.
+        // The motion keys are deliberately absent, on C24's precedent:
+        // an eighth pair would push `Esc` off, and they are C13/C32's
+        // shared vocabulary, taught by the C15 overlay.
         Mode::Broadcast { .. } => vec![
-            lit("type", "message"),
             lit("↵", "send"),
-            lit("Shift+↵", "new line"),
-            lit("Tab", "who gets it"),
             lit("Esc", "cancel"),
+            lit("Tab", "who gets it"),
+            lit("Shift+↵", "new line"),
+            lit("type", "message"),
         ],
         Mode::PaneEdit { .. } => vec![
             lit("type", "name / note"),
@@ -1241,17 +1247,28 @@ fn draw_mode_overlay<B: PaneBackend>(
         // gets this" rather than as a setting.
         Mode::Broadcast { lines, row, col, status_filter } => {
             let targets = app.broadcast_targets(Actor::Local, *status_filter).len();
-            let noun = if targets == 1 { "pane" } else { "panes" };
-            let tier = status_filter.map(|s| {
-                let (glyph, _, _) = theme::status_style(s);
-                format!(" {glyph}")
-            });
-            let heading =
-                format!(" broadcast → {targets} {noun}{} ", tier.unwrap_or_default());
-            // `accent()` on an empty target set: sending into nothing is
-            // the one state the title must not read as ordinary.
-            let style = if targets == 0 { theme::accent() } else { theme::ink() };
-            let inner = modal_frame(f, body, rect, Line::from(Span::styled(heading, style)));
+            // The zero case is carried by **words**, not by a colour. The
+            // C36 audit flagged the first draft's conditional `accent()`
+            // title: C12 says a modal title is `ink()`, no other dialog
+            // varies its title token by state, and §2's attention idiom is
+            // reversal rather than recolouring. Saying "no panes" outright
+            // is both unmissable and inside the existing contracts — the
+            // same "words beat a colour" instinct C16's bar text follows.
+            let who = match targets {
+                0 => " broadcast → no panes ".to_string(),
+                1 => " broadcast → 1 pane ".to_string(),
+                n => format!(" broadcast → {n} panes "),
+            };
+            let mut title = vec![Span::styled(who, theme::ink())];
+            // C27's rule, verbatim: the tier glyph carries its own C5
+            // colour, because "a bare `ink()` glyph would read as no tier
+            // at all". The first draft discarded the style and printed a
+            // colourless ◆ (audit D3).
+            if let Some(tier) = status_filter {
+                let (glyph, style, _) = theme::status_style(*tier);
+                title.push(Span::styled(format!("{glyph} "), style));
+            }
+            let inner = modal_frame(f, body, rect, Line::from(title));
             let rendered: Vec<Line> = lines
                 .iter()
                 .enumerate()
@@ -3331,6 +3348,44 @@ mod tests {
                 ("q/Esc", "close"),
             ]),
         );
+    }
+
+    /// C36/C9: the composer's list, its column figure, and — the part that
+    /// matters — its **yield order**. At the 100-col floor with the
+    /// needs-you segment up, trailing pairs drop, so the order is a safety
+    /// property rather than a style choice: `↵ send` and `Esc cancel` must
+    /// still be on the bar when the fleet is busy, which is exactly when
+    /// someone is composing a broadcast. (The C36 audit found C9 had never
+    /// been amended for this mode and nothing pinned the list.)
+    #[test]
+    fn hint_pairs_broadcast_leads_with_the_two_that_must_not_yield() {
+        let mode = Mode::Broadcast {
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+            status_filter: None,
+        };
+        let pairs = hint_pairs(&mode, false, false, false, false);
+        assert_eq!(
+            pairs,
+            p(&[
+                ("↵", "send"),
+                ("Esc", "cancel"),
+                ("Tab", "who gets it"),
+                ("Shift+↵", "new line"),
+                ("type", "message"),
+            ]),
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        assert_eq!(cols, 74, "C36 quotes 74 columns");
+
+        // The property the order exists for: with the needs-you segment up
+        // at the floor, what survives is send and cancel.
+        let right_w = " ◆ 3 needs you · Alt+a  BROADCAST ".chars().count() as u16 - 1;
+        let shown = super::fit_hint_pairs(&pairs, right_w, 100);
+        assert!(shown >= 2, "at least send and cancel survive a busy fleet");
+        assert_eq!(pairs[0], one("↵", "send"));
+        assert_eq!(pairs[1], one("Esc", "cancel"));
     }
 
     /// C27/C9: the roster's own list, and the 68-column number the contract
