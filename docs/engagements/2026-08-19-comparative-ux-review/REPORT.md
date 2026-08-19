@@ -34,13 +34,25 @@ the `Alt+f` / `Alt+b` / `Alt+d` readline collisions — produces a roost whose
 `Alt+?` overlay teaches a chord that no longer works and never names the one
 that does. The hint bar's seven curated pairs lie in the same way.
 
-The guard that should catch this cannot. `every_bound_chord_is_documented_in_the_keymap`
-(`render.rs:3271`) walks `default_keymap()` — the *default* table, built by
-sweeping `default_chord_action`. Under a custom keymap the test still passes,
-proving something that is no longer true of the running binary. This is the
-same shape as the D2 finding on mouse verbs (a check that structurally cannot
-see the thing it exists to catch), and it is the only place where roost's spec
-discipline can be silently, invisibly wrong.
+The guard that should catch this cannot — and it is weaker than it looks.
+`every_bound_chord_is_documented_in_the_keymap` (`render.rs:3271`) is a
+**hardcoded list of 27 chord literals** checked for containment against the
+hardcoded `HELP_GROUPS` text. Both sides are `const`; neither is derived from
+`default_chord_action`, and `default_keymap()` — the swept table `input.rs`
+builds for exactly this purpose — is never referenced outside `input.rs`'s own
+tests. So the check proves that one const mentions the strings another const
+was written to contain. It says nothing about the running binary under any
+configuration, and **a newly bound chord passes it silently** unless someone
+remembers to extend the literal list by hand.
+
+This is the D2 finding on mouse verbs, one layer up: a check that structurally
+cannot see the thing it exists to catch. It is the only place where roost's
+spec discipline can be silently, invisibly wrong.
+
+**Corollary for whatever F2 decides.** Because the gate is const-vs-const, the
+F2 fix — under *either* option — can bind four new chords and stay green.
+Deriving this gate from the effective table is part of F1's work, and it is
+what makes the fix self-enforcing rather than remembered.
 
 **What the others do.** lazygit renders its `?` menu from the live config,
 including user-defined custom commands, and lists commands that have *no* key
@@ -52,8 +64,11 @@ string; render the chord by reverse-lookup through the live keymap (defaults
 overlaid with overrides). A disabled chord's row drops out. Group titles, row
 order, descriptions, the yield order and the ≤80-column rule are all
 untouched — only the left column becomes computed. Then
-`every_bound_chord_is_documented_in_the_keymap` can be restated over the
-*effective* map, which is the assertion that was always meant.
+`every_bound_chord_is_documented_in_the_keymap` can be restated as a real
+sweep over the *effective* map (`default_keymap()` overlaid with the config's
+overrides) rather than a hand-kept literal list — the assertion that was
+always meant, and the one that stops a future chord going undocumented
+without anyone noticing.
 
 **Cost note.** Rows become owned strings rather than `&'static str`, so
 `help_content_width` / `help_layout` / `hint_pair_cols` take a borrow instead
