@@ -1846,6 +1846,29 @@ mod tests {
         }
     }
 
+    /// C37: the reverse cycle resolves on both delivery forms, like every
+    /// other shifted letter. Noted by the C37 audit as the one thing no
+    /// input-layer test asserted — the render row and the app behaviour were
+    /// covered, but not the translation, which is exactly the layer C33's
+    /// cross-terminal split lived in.
+    #[test]
+    fn the_shifted_g_reverses_the_cycle_on_both_delivery_forms() {
+        assert_eq!(
+            translate(alt(KeyCode::Char('g'))),
+            InputResult::Action(Action::CycleLayout { forward: true }),
+        );
+        assert_eq!(
+            translate(alt_shift(KeyCode::Char('g'))),
+            InputResult::Action(Action::CycleLayout { forward: false }),
+            "the shift bit reverses it",
+        );
+        assert_eq!(
+            translate(alt(KeyCode::Char('G'))),
+            InputResult::Action(Action::CycleLayout { forward: false }),
+            "and so does a terminal that sends bare uppercase",
+        );
+    }
+
     /// The unshifted half is untouched — C33 took the *shifted* letters,
     /// which were a redundant second spelling of exactly this.
     #[test]

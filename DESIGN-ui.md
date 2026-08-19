@@ -1683,6 +1683,12 @@ So the cap goes, and with it the merges:
 - **Width rule, unchanged in substance:** one *column* must stay ≤ 80 or
   `centered_near` clamps and clips a description mid-word. Pinned by
   `one_help_column_fits_the_eighty_column_floor`.
+  **[Clarified 2026-08-19, C37 audit]** That test measures the **dialog rect**
+  (`help_layout(..).size.0` = column + 3 for border and padding), not the
+  column, so it is stricter than this bullet's wording: a column of 80 is
+  already a dialog of 83 and clamps at an 80-column terminal. The test is the
+  operative check; read this bullet as "the dialog must fit the floor", which
+  is what it was always defending.
 - **What replaces the cap as the binding check:**
   `every_bound_chord_is_documented_in_the_keymap` — every chord roost binds
   appears in the overlay. That assertion was *impossible* to write under the
@@ -2123,8 +2129,8 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
 - **Exits zoom** (exhaustive list): Alt+z again · any tab change (Alt+t,
   Alt+1..9, tab-bar click, cross-tab Alt+a) · any structural layout action —
   Alt+n, picker launch, Alt+s, Alt+o, Alt+Shift+arrows, Alt+g,
-  Alt+Shift+hjkl — which exit zoom *first, then apply*, so the layout never
-  changes invisibly · the
+  Alt+Shift+g, Alt+Shift+hjkl — which exit zoom *first, then apply*, so the
+  layout never changes invisibly · the
   zoomed pane closing (Alt+w or control close). **Keeps zoom:** focus moves,
   same-tab Alt+a, entering/leaving scroll·copy·rename·help·feed modes, the
   float toggle (the float draws above the zoomed view, C22), control-plane
@@ -2139,8 +2145,11 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
   trigger clears the flag; focus-move-under-zoom retargets the display list;
   PTY resize targets.
 
-**[Amended 2026-08-19, C33]** The structural-action list above gains
-`Alt+Shift+hjkl`. Recorded rather than left implied: the list is labelled
+**[Amended 2026-08-19, C33 and C37]** The structural-action list above gains
+`Alt+Shift+hjkl`, and `Alt+Shift+g` on the same date for the same reason —
+C37's reverse cycle is as structural as C25's forward one, and this list is
+*enumerated by name*, so an omission makes it false rather than vague. Both
+were found by a design audit, which is the check that exists for exactly this. Recorded rather than left implied: the list is labelled
 *exhaustive*, so a new structural action that exits zoom without appearing
 here does not leave the contract vague — it makes it false. (Found by the
 design-supervisor audit of C33, which is the check that exists to catch
@@ -2243,18 +2252,19 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
      (that click then lands normally on what it hit). Focus returns to
      `prev_focus`.
   3. Structural pane actions — Alt+n, picker launch, Alt+s, Alt+o,
-     Alt+Shift+arrows, Alt+g, Alt+Shift+hjkl, Alt+z — first hide the float
-     and restore
+     Alt+Shift+arrows, Alt+g, Alt+Shift+g, Alt+Shift+hjkl, Alt+z — first hide
+     the float and restore
      `prev_focus`, *then* apply. (The float is outside the layout tree;
      without this, `spawn_child`'s empty-tab fallback at `app.rs:1425–1427`
      would wipe the tab's layout when asked to split a pane the tree doesn't
      contain.)
   4. Alt+w closes it for real (above); Alt+f hides it.
 
-  **[Amended 2026-08-19, C33]** Rule 3's list gains `Alt+Shift+hjkl` — a
-  swap is a structural pane action and hides the float like the rest. Same
-  reasoning as C21's amendment of the same date: a list this one enumerates
-  by name is wrong, not merely incomplete, when an action is missing from it.
+  **[Amended 2026-08-19, C33 and C37]** Rule 3's list gains `Alt+Shift+hjkl`
+  and `Alt+Shift+g` — a swap and a reverse layout cycle are both structural
+  pane actions and hide the float like the rest. Same reasoning as C21's
+  amendment of the same date: a list this one enumerates by name is wrong,
+  not merely incomplete, when an action is missing from it.
 - **Mouse:** when shown, the float's rect is **first** in the hit-test list
   (`hit_test` takes the first match — the caller orders the slice; topmost
   wins). Wheel, clicks, drags, and copy-mode selection inside it behave as
@@ -2449,7 +2459,7 @@ calls that scroll mode, Alt+? in Help closes and reopens the overlay.
   explicit second Alt+r is a deliberate act, unlike U8's stray click, which
   still may not throw unsaved text away.
 
-### C25 — Canned layout cycle (Alt+g) — [Added 2026-07-22, fleet features]
+### C25 — Canned layout cycle (Alt+g / Alt+Shift+g) — [Added 2026-07-22, fleet features]
 
 **Current:** layout shape is built up manually (splits Alt+n/Alt+o, stacks
 Alt+s, ratios Alt+Shift+arrows); no way to snap the tab to a known-good
@@ -2459,6 +2469,10 @@ arrangement. Tree ops live in `layout.rs` (`toggle_stack :129–166`,
 
 **Target:**
 - New `Action::CycleLayout`, bound to **Alt+g**. Mnemonic: *arranGe / grid*.
+  **[Amended 2026-08-19, C37]** It carries a `forward: bool` now, and
+  `Alt+Shift+g` walks the same cycle backwards — see C37 for the arithmetic
+  and for why stepping back from the first arrangement wraps to the last
+  rather than restoring a pre-cycle layout.
   (Rejected alternatives, recorded: `Alt+Space` — tmux's next-layout key, but
   OS-captured as the window/system menu on GNOME and Windows Terminal;
   `Alt+[`/`Alt+]` — zellij's, but ESC-`[` *is* the CSI introducer byte pair,
@@ -2490,8 +2504,14 @@ arrangement. Tree ops live in `layout.rs` (`toggle_stack :129–166`,
   non-collapsed rect it would produce in the current body area is
   ≥ `MIN_SPLIT_COLS × MIN_SPLIT_ROWS` (36×10 — the existing split floors;
   collapsed 1-row stack bars are exempt by design). Alt+g applies the next
-  **fitting** arrangement, skipping unfit ones; the counter lands on what was
-  applied.
+  **fitting** arrangement, skipping unfit ones.
+
+  **[Corrected 2026-08-19, C37 audit]** This used to end "the counter lands on
+  what was applied", which is not what the code does and never was:
+  `layout_cycle` is set to `idx + 1`, i.e. **the arrangement to try next**, so
+  what is showing is `layout_cycle - 1`. The distinction is invisible while the
+  cycle only runs forward and is exactly what C37's reverse direction has to
+  reason about, which is how the error surfaced.
 - **Cycling is disabled** (press is a no-op, counter does not advance) when:
   `n < 2` → flash `one pane — nothing to arrange`; or no arrangement fits →
   flash `no room to rearrange`.
@@ -4491,12 +4511,24 @@ rather than trees — inherited here rather than introduced.
 
 **Chrome, and a merge that did not fit.** C15's `LAYOUT` group gains a
 **second row** rather than merging both directions into one. The merged form
-(`Alt+g / Alt+Shift+g` + "…(shift reverses)") measured **83 columns** and blew
-the 80-column floor — the same floor two prior audits found sitting at exactly
-80 with zero slack. Two rows is also the more correct presentation: C28's
+(`Alt+g / Alt+Shift+g` + "…(shift reverses)") put the **content column at
+exactly 80 and the dialog rect at 83**, failing
+`one_help_column_fits_the_eighty_column_floor`.
+
+*Which number matters is worth pinning down, because this contract's first
+draft said "83 columns" and blew past the distinction.* C15's rule is written
+about one **column**; its pinning test measures `help_layout(..).size.0`, the
+**dialog** — the column plus three cells of border and padding. The test is
+therefore the stricter of the two and is the operative check: a column of 80
+is already a dialog of 83, which `centered_near` clamps at an 80-column
+terminal. The merged row did not exceed the rule as literally worded; it
+exceeded what the rule exists to prevent. Two rows is also the more correct presentation: C28's
 adjacency rule seats a row under *its own unshifted form*, which is precisely
-what this is (the C33 audit drew that distinction against C36's
-confusability-based placement). C15's row cap was retired in 2026-07-28
+what this is. The other kind of adjacency — seating a row under the chord it
+is most likely to be *confused with* — is **C33's** (`Alt+Shift+hjkl` under
+`Alt+Shift+←↓↑→`), and C33's own design audit is where the two rules were
+first told apart. An earlier draft of this paragraph credited that to C36;
+corrected by this contract's audit. C15's row cap was retired in 2026-07-28
 specifically so rows need not be merged to fit; this is the first change to
 take that at its word.
 
