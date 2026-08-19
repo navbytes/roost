@@ -4205,7 +4205,38 @@ chrome's vocabulary (`Alt+PgUp`, `Alt+←`), which is what the key table has
 always shown. Each register serves its own reader; the README documents the
 config one.
 
-**What replaces the old check.** Two gates, neither keeping a list:
+**The rule is mechanical.** `no_surface_spells_a_chord_it_did_not_resolve`
+(`input.rs`) scans every production line under `src/` and fails on a string
+literal containing `Alt+` that is not on a short allowlist of **resolver
+defaults** — `Chord::label`'s two format strings, C9's `alt(..)` fallbacks,
+C15's `Family` shorthands, and the one authored mouse row.
+
+The allowlist matches the **whole literal**, which is what gives the gate its
+teeth: a bare `"Alt+w"` is what a resolver argument looks like, while a chord
+inside a sentence (`"last pane — Alt+w again to quit roost"`) is what a
+hard-coded surface looks like, and only the first form can be listed. Every
+deviation this contract's own audit found was of the second form — and every
+one of them was caught by a person reading code, which is the reviewing
+capacity this gate exists to stop spending. A new spelling now fails until it
+is either resolved or added to the list, and adding it is the moment its
+author has to ask whether the surface should be deriving instead.
+
+Not a proof — `format!("press {} now", "Alt+w")` would pass — and the
+contract claims no more than it does: a guardrail against the accident, not a
+defence against circumvention.
+
+Scanning source is the honest way to pin a rule about *what may be written*,
+the same argument §2's fixed-hue gate makes; the two now share one walker
+(`ui::srcscan`). Two things about that scanner were found by its own guard
+tests rather than reasoned out, and are worth knowing before touching it: the
+production/test cut must land on a test **module** (`#[cfg(test)]` also
+attaches to test-support items scattered through production code, and cutting
+at the first of those hid most of two files), and it must accept **any**
+test-gated `cfg` (`infra/qos.rs` gates its module on
+`all(test, target_os = "macos")`). A source scan that silently stops reading
+is worse than none.
+
+**What replaces the old check.** Three gates, none keeping a list of chords:
 - `every_bound_chord_is_documented_in_the_keymap` sweeps
   `effective_bindings` and asserts every bound **action** is declared by some
   row. Actions rather than spellings, because a `Family` legitimately draws a

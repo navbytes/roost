@@ -4,4 +4,6 @@
 pub mod input;
 pub mod mouse;
 pub mod render;
+#[cfg(test)]
+pub mod srcscan;
 pub mod theme;
