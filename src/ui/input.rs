@@ -12,6 +12,14 @@ pub enum Action {
     ClosePane,
     /// Move focus spatially (arrows / hjkl).
     Focus(Dir),
+    /// C33: swap the focused pane with its neighbour in that direction,
+    /// within the active tab — `Alt+Shift+hjkl`. The shifted siblings of
+    /// `Alt+hjkl` carry the *pane* the way the unshifted ones carry *you*,
+    /// which is C28's rule (`Alt+Shift+i`/`Alt+Shift+m`) on the within-tab
+    /// axis instead of the across-tab one. Focus follows the pane for free:
+    /// the tree swaps two ids, so the focused id is unchanged and simply
+    /// occupies a different slot.
+    MovePane(Dir),
     NewTab,
     GoToTab(usize),
     /// U7: step to the next / previous tab, wrapping at both ends — the
@@ -188,6 +196,24 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
             Some(if shift { Action::MovePaneToTab { forward: true } } else { Action::NextTab })
         }
         KeyCode::Char('M') => Some(Action::MovePaneToTab { forward: true }),
+        // C33: the shifted vim letters move the *pane*. These four arms
+        // must sit above the focus arms below, which match `Char('l')` &c
+        // with **no shift guard** — before C33 a shifted lowercase delivery
+        // fell into them and silently did the unshifted thing, while the
+        // uppercase delivery matched nothing at all and forwarded meta-L to
+        // the pane. One physical chord, two behaviours, split by terminal.
+        // Both spellings are bound here for the same reason Alt+Shift+r /
+        // Alt+R and C28's Alt+Shift+i / Alt+I are: `twins` then pairs them
+        // automatically (both now default to the same action), so a
+        // config.json remap of `alt+shift+h` can no longer half-apply.
+        KeyCode::Char('l') if shift => Some(Action::MovePane(Dir::Right)),
+        KeyCode::Char('L') => Some(Action::MovePane(Dir::Right)),
+        KeyCode::Char('h') if shift => Some(Action::MovePane(Dir::Left)),
+        KeyCode::Char('H') => Some(Action::MovePane(Dir::Left)),
+        KeyCode::Char('j') if shift => Some(Action::MovePane(Dir::Down)),
+        KeyCode::Char('J') => Some(Action::MovePane(Dir::Down)),
+        KeyCode::Char('k') if shift => Some(Action::MovePane(Dir::Up)),
+        KeyCode::Char('K') => Some(Action::MovePane(Dir::Up)),
         KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
@@ -631,6 +657,10 @@ const NAMES: &[(&str, Action)] = &[
     ("focus_right", Action::Focus(Dir::Right)),
     ("focus_up", Action::Focus(Dir::Up)),
     ("focus_down", Action::Focus(Dir::Down)),
+    ("move_pane_left", Action::MovePane(Dir::Left)),
+    ("move_pane_right", Action::MovePane(Dir::Right)),
+    ("move_pane_up", Action::MovePane(Dir::Up)),
+    ("move_pane_down", Action::MovePane(Dir::Down)),
     ("new_tab", Action::NewTab),
     ("go_to_tab_1", Action::GoToTab(0)),
     ("go_to_tab_2", Action::GoToTab(1)),
@@ -1567,6 +1597,68 @@ mod tests {
                 "chord {chord:?}'s action {action:?} named {name:?} didn't round-trip"
             );
         }
+    }
+
+    /// C33, the regression this chord family exists to close. Before it,
+    /// `Alt+Shift+h` resolved **two different ways depending on the
+    /// terminal**: one delivering `('h', SHIFT)` fell into the unguarded
+    /// focus arm and moved focus left (a duplicate of plain `Alt+h`), while
+    /// one delivering `'H'` matched nothing and forwarded meta-H into the
+    /// agent. Both spellings now mean the same thing, for all four letters.
+    #[test]
+    fn the_shifted_vim_letters_move_the_pane_on_both_delivery_forms() {
+        for (lower, upper, dir) in [
+            ('h', 'H', Dir::Left),
+            ('j', 'J', Dir::Down),
+            ('k', 'K', Dir::Up),
+            ('l', 'L', Dir::Right),
+        ] {
+            assert_eq!(
+                translate(alt_shift(KeyCode::Char(lower))),
+                InputResult::Action(Action::MovePane(dir)),
+                "Alt+Shift+{lower} on a terminal that sends the shift bit",
+            );
+            assert_eq!(
+                translate(alt(KeyCode::Char(upper))),
+                InputResult::Action(Action::MovePane(dir)),
+                "Alt+Shift+{lower} on a terminal that sends {upper}",
+            );
+        }
+    }
+
+    /// The unshifted half is untouched — C33 took the *shifted* letters,
+    /// which were a redundant second spelling of exactly this.
+    #[test]
+    fn the_unshifted_vim_letters_still_move_focus() {
+        for (c, dir) in [('h', Dir::Left), ('j', Dir::Down), ('k', Dir::Up), ('l', Dir::Right)] {
+            assert_eq!(
+                translate(alt(KeyCode::Char(c))),
+                InputResult::Action(Action::Focus(dir)),
+            );
+        }
+    }
+
+    /// C33's payoff for the escape hatch: because both delivery forms now
+    /// default to the same action, `twins` pairs them on its existing rule
+    /// ("same case-folded letter and both already default to the same
+    /// action") with no change to `twins` itself. Before C33 a remap of
+    /// `alt+shift+h` bound only the `('h', SHIFT)` form and silently
+    /// no-opped on terminals sending `'H'` — the exact failure `twins`'
+    /// own doc comment says must never happen.
+    #[test]
+    fn remapping_a_shifted_vim_letter_reaches_both_delivery_forms() {
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+shift+h": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            translate_with(alt_shift(KeyCode::Char('h')), &keymap),
+            InputResult::Action(Action::Quit),
+        );
+        assert_eq!(
+            translate_with(alt(KeyCode::Char('H')), &keymap),
+            InputResult::Action(Action::Quit),
+            "the uppercase delivery must move too, or the remap half-applies",
+        );
     }
 
     /// The literal `"disable"` keyword is never itself a valid action name,

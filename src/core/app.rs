@@ -3356,6 +3356,7 @@ impl<B: PaneBackend> App<B> {
                 | Action::FlipSplit
                 | Action::Resize { .. }
                 | Action::CycleLayout
+                | Action::MovePane(_)
         ) {
             self.exit_zoom();
             self.hide_float();
@@ -3367,6 +3368,7 @@ impl<B: PaneBackend> App<B> {
             }
             Action::ClosePane => self.close_pane(),
             Action::Focus(dir) => self.focus_dir(dir),
+            Action::MovePane(dir) => self.move_pane_dir(dir),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
             Action::NextTab => self.step_tab(1),
@@ -3620,6 +3622,55 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         self.focus_dir_cross_tab(dir, &rects);
+    }
+
+    /// C33 (`Alt+Shift+hjkl`): swap the focused pane with its spatial
+    /// neighbour in `dir`, inside the active tab.
+    ///
+    /// Deliberately the same first two steps as `focus_dir` above — same
+    /// `rects()`, same `layout::neighbor` — so "which pane is that way?"
+    /// has exactly one answer in roost and the move can never disagree with
+    /// the focus key that taught the user the direction. Stacks need no
+    /// special case for the same reason: every member already carries its
+    /// own `PaneRect` (collapsed ones a single row), so `Down` inside a
+    /// stack finds the next member the way it finds the next split.
+    ///
+    /// **No cross-tab handoff at the edge.** `focus_dir` falls through to
+    /// `focus_dir_cross_tab`; this deliberately does not. Moving a pane out
+    /// of its tab is a structural edit rather than a look, `Alt+Shift+i`/
+    /// `Alt+Shift+m` (C28) already do exactly that and say so, and a no-op
+    /// is the recoverable failure — see DESIGN-ui.md C33 for the full
+    /// argument.
+    ///
+    /// The float is excluded on C22 rule 2's grounds, exactly as
+    /// `focus_dir` excludes it: it has no position in the tiled tree, so no
+    /// direction applies to it. Unlike `focus_dir` this does not *hide* the
+    /// float — `apply`'s structural-action guard above already did, so by
+    /// the time this runs a float-focused user has been returned to
+    /// `prev_focus` and the chord acts on that pane instead.
+    fn move_pane_dir(&mut self, dir: layout::Dir) {
+        if self.float_focused() {
+            return;
+        }
+        let rects = self.rects();
+        let Some(target) = layout::neighbor(&rects, self.focused, dir) else {
+            return;
+        };
+        let focused = self.focused;
+        let layout = &mut self.ws.active_tab_mut().layout;
+        if !layout::swap_panes(layout, focused, target) {
+            return;
+        }
+        // The focused id never changed — it just sits in a different slot —
+        // so focus follows the pane with no `set_focus` call (and no
+        // spurious CSI O/I pair, per `focus_dir_cross_tab`'s note). What it
+        // may need is expanding: swapping *into* a stack can land it in a
+        // collapsed slot, the same condition `focus_dir` calls this for.
+        layout::expand_in_stacks(layout, focused);
+        // No save/relayout here: `apply` does both on the way out, which is
+        // also what resizes each pane's PTY to the rect it just moved into
+        // (same as `FlipSplit`/`Resize`/`ToggleStack` — none of them persist
+        // by hand either).
     }
 
     /// C31: `Left`/`Right` off the edge of the active tab continue into the
@@ -11656,6 +11707,105 @@ mod tests {
         app.apply(Action::ToggleZoom);
         assert!(!app.zoomed());
         assert_eq!(app.display_rects().len(), app.rects().len());
+    }
+
+    // ---- C33: move a pane within its tab (Alt+Shift+hjkl) ---------------
+
+    /// The core gesture: the focused pane trades places with its spatial
+    /// neighbour, and focus follows it — for free, because the tree swaps
+    /// two ids and the focused id never changes.
+    #[test]
+    fn moving_a_pane_swaps_it_with_its_neighbour_and_focus_follows() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2 side by side, focus = 2 (right)
+
+        let left_before = app.rects().iter().min_by_key(|p| p.rect.x).unwrap().id;
+        assert_eq!(left_before, 1);
+
+        app.apply(Action::MovePane(Dir::Left));
+
+        let left_after = app.rects().iter().min_by_key(|p| p.rect.x).unwrap().id;
+        assert_eq!(left_after, 2, "pane 2 took the left slot");
+        assert_eq!(app.focused, 2, "focus rode along with the pane it moved");
+    }
+
+    /// C33's stated edge rule, and the one deliberate divergence from
+    /// `focus_dir`: `Alt+←/→` continues into the next tab at an edge (C31),
+    /// but moving a pane there does **not** — `Alt+Shift+i`/`Alt+Shift+m`
+    /// (C28) are the chords that take a pane out of its tab, and they say
+    /// so. A no-op is the recoverable failure.
+    #[test]
+    fn moving_a_pane_off_the_tabs_edge_is_a_no_op_not_a_cross_tab_move() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // tab 2
+        app.apply(Action::NewPane); // tab 2 holds panes 2|3, focus = 3 (right)
+        let tab_before = app.ws.active_tab;
+        let panes_before = app.ws.active_tab().panes.len();
+
+        app.apply(Action::MovePane(Dir::Right)); // already at the right edge
+
+        assert_eq!(app.ws.active_tab, tab_before, "the tab did not change");
+        assert_eq!(
+            app.ws.active_tab().panes.len(),
+            panes_before,
+            "and the pane did not leave the tab",
+        );
+        assert_eq!(app.focused, 3);
+    }
+
+    /// Inside a stack the gesture reorders — no special case in the app, it
+    /// falls out of every stack member owning its own `PaneRect`. The moved
+    /// pane must still be the expanded one afterwards (layout's
+    /// `expanded`-follows-the-swap rule), or "move down" would collapse the
+    /// pane you are reading.
+    #[test]
+    fn moving_a_pane_inside_a_stack_reorders_it_and_keeps_it_expanded() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes
+        app.apply(Action::ToggleStack); // ... collapsed into one stack
+        let moved = app.focused;
+
+        let order_before: Vec<_> = app.rects().iter().map(|p| p.id).collect();
+        let i_before = order_before.iter().position(|&id| id == moved).unwrap();
+        assert!(i_before > 0, "this fixture needs a member above the focused one");
+
+        app.apply(Action::MovePane(Dir::Up));
+
+        let order_after: Vec<_> = app.rects().iter().map(|p| p.id).collect();
+        let i_after = order_after.iter().position(|&id| id == moved).unwrap();
+        assert_eq!(i_after, i_before - 1, "the pane moved one slot up the stack");
+        assert_eq!(app.focused, moved, "focus stayed on it");
+        // It is also still the *expanded* member, so "move up" never
+        // collapses the pane you are reading. Note this assertion cannot
+        // fail on its own: `move_pane_dir`'s `expand_in_stacks` call would
+        // re-expand the focused pane even if `swap_panes` had left the
+        // index behind (verified by mutation — this test stays green with
+        // layout's rule removed). The rule itself is pinned where it lives,
+        // by `layout::tests::swapping_inside_one_stack_carries_the_expanded_
+        // slot_with_the_pane`; this line pins the *user-visible* outcome
+        // through whichever of the two produces it.
+        assert!(
+            !app.rects().iter().find(|p| p.id == moved).unwrap().collapsed,
+            "the moved pane is the expanded member",
+        );
+    }
+
+    /// C21/C22: a swap is a structural layout edit, so it leaves zoom the
+    /// way `FlipSplit`/`Resize`/`CycleLayout` do — the tab must never change
+    /// invisibly behind a full-screen pane.
+    #[test]
+    fn moving_a_pane_leaves_zoom_first() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::MovePane(Dir::Left));
+        assert!(!app.zoomed(), "a structural edit exits zoom");
     }
 
     #[test]
