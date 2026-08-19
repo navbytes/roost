@@ -137,6 +137,7 @@ you're in.
 | `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
 | `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
 | `Alt+Shift+arrow` | resize along that axis |
+| `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
 | `Alt+g` | cycle layout: even grid → main pane + stack → all-stack (skips shapes that don't fit) |

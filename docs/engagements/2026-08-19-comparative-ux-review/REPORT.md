@@ -76,7 +76,7 @@ of a const. Real, but bounded to those three width functions.
 
 ---
 
-## F2 · High · `Alt+Shift+hjkl` does two different things on two terminals
+## F2 · High · **RESOLVED 2026-08-19 (C33)** · `Alt+Shift+hjkl` does two different things on two terminals
 
 **What.** Confirmed by running `default_chord_action` directly:
 
@@ -123,12 +123,24 @@ terminal class, a config remap that half-applies on the other, and four dead
 chords. The reason to do it early is the ordering dependency below, not
 urgency.
 
-**Fix shape.** Bind the shifted vim letters to the resize actions they
-obviously mean, on both delivery forms — which is the change that closes the
-split *and* completes the vocabulary in one edit. Rows 3 and 4 of §8 gain the
-letter forms; the help overlay's LAYOUT group gains
-`Alt+Shift+hjkl` alongside `Alt+Shift+←↓↑→`. Whatever is decided, `h`/`H`
-should become twins so a remap can't half-apply.
+**What shipped, and why not resize.** This report first proposed binding the
+four letters to *resize*. Reviewed against F8 and rejected: resize already has
+the arrows, so that trade spends four scarce chords on a second spelling of an
+existing verb. They went to **moving a pane within its tab** instead — F8's
+missing capability — as **DESIGN-ui.md C33**.
+
+That is also the better-justified binding. C28 already established that a
+shifted sibling *carries the pane* the way the unshifted one *carries you*
+(`Alt+i`/`Alt+m` → `Alt+Shift+i`/`Alt+Shift+m`). `Alt+hjkl` moves you within a
+tab; `Alt+Shift+hjkl` moving the pane within a tab is the same sentence on the
+other axis, so shifted-letter-carries-the-pane becomes a rule holding on both
+axes rather than a tab special case. It is C28's idiom generalized, not a new
+one.
+
+Both delivery forms are bound, which makes `h`/`H` twins under `twins`' own
+existing rule — no change to `twins` — so a `config.json` remap of
+`alt+shift+h` can no longer half-apply. Full rationale, including the
+deliberate no-cross-tab-handoff-at-the-edge divergence from C31, is in C33.
 
 ---
 
@@ -286,7 +298,7 @@ acquires the merges C15's cap retirement was written to undo.
 
 ---
 
-## F8 · Medium · You cannot rearrange panes inside a tab
+## F8 · Medium · **RESOLVED 2026-08-19 (C33)** · You cannot rearrange panes inside a tab
 
 **What.** `layout.rs` has `remove_pane`, split/stack ops, orientation flip and
 the C25 canned cycle — but no swap or move-within-tab. `Action::MovePaneToTab`
@@ -298,10 +310,24 @@ except by closing and respawning it.
 this. lazygit has directional reordering where reordering makes sense
 (commits).
 
-**Fix shape.** A swap-with-neighbour in the four directions is the small
-version and probably enough: it composes with `Alt+g`'s canned layouts (swap
-into the main slot) and needs no new geometry. Keyboard-first; drag-to-swap is
-the larger, later version.
+**What shipped.** Swap-with-neighbour in all four directions, on
+`Alt+Shift+hjkl` — the chords F2 freed. `layout::swap_panes` exchanges two
+`PaneId`s and leaves the tree's shape bit-identical (same split directions,
+same ratios, same stack arity), so it needs no ratio arithmetic and can reach
+no layout a pair of splits couldn't already build. Direction comes from
+`layout::neighbor` — the same call `focus_dir` makes — so "which pane is that
+way?" keeps exactly one answer in roost.
+
+Stacks fell out with no special case: every member already owns a `PaneRect`,
+so `Down` inside a stack reorders it. The one thing that did need handling is
+that `Stack`'s `expanded` is an index rather than an id, so the expanded slot
+follows its pane — otherwise "move down" would collapse the pane you are
+reading. Focus follows for free (the focused id never changes, it just
+occupies a different slot).
+
+Left for later, deliberately: drag-to-swap, and the cross-tab handoff at a
+tab's edge. See C33 for why the edge is a no-op rather than inheriting C31's
+continue-into-the-next-tab rule.
 
 ---
 
@@ -379,22 +405,27 @@ Recorded so a future pass doesn't "improve" these toward the comparison tools:
 
 ## Suggested order
 
-1. **F2** (shifted vim keys) — *not* because it is urgent (see its severity
-   note; the resolving case is a harmless duplicate), but because F1 renders
-   chords by reverse-lookup through the live table. Ask today's table "what
-   moves focus left?" and it answers `Alt+←`, `Alt+h` **and** `Alt+Shift+h` —
-   so F1 would print a redundant binding that only works on half of
-   terminals, in the one surface whose job is telling the truth. Clear the
-   table before rendering from it. Smallest item on the list either way.
-2. **F1** (surfaces read the live keymap) — highest value, self-contained, and
-   it unblocks F5's descriptions and F11's `roost keys`.
-3. **F7** (leader key) — its stated trigger has fired; building it first stops
-   F3/F6/F5 from each spending a scarce chord under pressure.
-4. **F3** (broadcast in the TUI) and **F6** (back) — the two verbs the fleet
+**Done.** F2 + F8 — shipped together as C33 (`Alt+Shift+hjkl` moves a pane
+within its tab). One change closed both: the redundant chords F2 found were
+the chords F8's missing verb needed.
+
+**Next.**
+
+1. **F1** (surfaces read the live keymap) — highest value, self-contained, and
+   it unblocks F5's descriptions and F11's `roost keys`. C33 also left it a
+   concrete first task: the documentation gate is still a hand-kept list of
+   chord literals, extended by hand for C33 because it structurally could not
+   notice four newly bound chords.
+2. **F7** (leader key) — its stated trigger has fired; building it before F3
+   and F6 stops each from spending a scarce chord under pressure. Note C33
+   spent four chords that were previously wasted, so the squeeze is slightly
+   looser than when this report was written — but the unshifted pool is
+   unchanged and still empty.
+3. **F3** (broadcast in the TUI) and **F6** (back) — the two verbs the fleet
    most obviously wants.
-5. **F4** (declare a fleet) — largest, and the one that needs a stance
+4. **F4** (declare a fleet) — largest, and the one that needs a stance
    decision before any code.
-6. **F5**, **F8**, **F9**, **F10**, **F11** as capacity allows.
+5. **F5**, **F9**, **F10**, **F11** as capacity allows.
 
 ## Sources
 

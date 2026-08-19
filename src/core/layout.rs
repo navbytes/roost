@@ -219,6 +219,80 @@ pub fn resize_pane(node: &mut LayoutNode, target: PaneId, axis: SplitDir, delta:
     true
 }
 
+/// C33 (`Alt+Shift+hjkl`): exchange two panes' positions in the tree,
+/// leaving the tree's *shape* untouched — every `Split`'s `dir`, its
+/// `ratios` and every `Stack`'s membership count are the same before and
+/// after. Only two `PaneId`s trade places.
+///
+/// That shape-preservation is the whole reason this is a swap rather than a
+/// re-parenting "move": a swap cannot collapse a split to one child (the
+/// hazard `remove_pane` carries its own collapse rule for), cannot invent a
+/// nesting `Alt+g`'s canned cycle would never produce, and needs no ratio
+/// arithmetic. There is no layout a swap can reach that a pair of splits
+/// couldn't already have built.
+///
+/// Returns false — changing nothing — if either id is absent, or if they are
+/// the same id.
+///
+/// **Stacks.** A stack's `expanded` is an *index*, not an id, so a bare id
+/// exchange inside one stack would leave the moved pane collapsed and expand
+/// whichever pane it displaced: you press "move down", and the pane you were
+/// reading shrinks to a title bar while a different one opens. `expanded`
+/// therefore follows the swap, so the pane that was expanded stays expanded
+/// wherever it lands. (Across two *different* stacks each index still names
+/// the same slot in its own stack, so neither moves — the pane arriving in an
+/// expanded slot is expanded there, which is again "the slot keeps its
+/// meaning".) `App` calls `expand_in_stacks` afterwards for the cross-stack
+/// case, exactly as `focus_dir` already does.
+pub fn swap_panes(node: &mut LayoutNode, a: PaneId, b: PaneId) -> bool {
+    if a == b || !subtree_contains(node, a) || !subtree_contains(node, b) {
+        return false;
+    }
+    swap_in(node, a, b);
+    true
+}
+
+/// The unchecked half of `swap_panes` — walks the whole tree exchanging the
+/// two ids wherever they appear. Both are known present by the caller, and a
+/// pane id is unique across the tree, so this rewrites exactly two slots.
+fn swap_in(node: &mut LayoutNode, a: PaneId, b: PaneId) {
+    match node {
+        LayoutNode::Pane(id) => {
+            if *id == a {
+                *id = b;
+            } else if *id == b {
+                *id = a;
+            }
+        }
+        LayoutNode::Stack { children, expanded } => {
+            let (mut ia, mut ib) = (None, None);
+            for (i, c) in children.iter_mut().enumerate() {
+                if *c == a {
+                    *c = b;
+                    ia = Some(i);
+                } else if *c == b {
+                    *c = a;
+                    ib = Some(i);
+                }
+            }
+            // Both in *this* stack: the expanded slot follows its pane, so
+            // "move down" never collapses the pane you are reading.
+            if let (Some(ia), Some(ib)) = (ia, ib) {
+                if *expanded == ia {
+                    *expanded = ib;
+                } else if *expanded == ib {
+                    *expanded = ia;
+                }
+            }
+        }
+        LayoutNode::Split { children, .. } => {
+            for c in children {
+                swap_in(c, a, b);
+            }
+        }
+    }
+}
+
 /// A spatial focus direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -578,6 +652,100 @@ mod tests {
         assert!(!remove_pane(&mut root, 2));
         assert!(matches!(root, LayoutNode::Pane(1)));
         assert!(remove_pane(&mut root, 1)); // root empty
+    }
+
+    // ---- C33: swap_panes -------------------------------------------------
+
+    /// The headline property, and the reason C33 is a *swap* rather than a
+    /// re-parenting move: the tree's shape is bit-identical afterwards —
+    /// same split direction, same ratios, same arity. Only two ids trade
+    /// places, so no swap can produce a layout a pair of splits couldn't.
+    #[test]
+    fn swapping_two_panes_leaves_the_trees_shape_untouched() {
+        let mut root = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.7, 0.3],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        assert!(swap_panes(&mut root, 1, 2));
+        match &root {
+            LayoutNode::Split { dir, ratios, children } => {
+                assert_eq!(*dir, SplitDir::Vertical, "orientation is untouched");
+                assert_eq!(ratios, &vec![0.7, 0.3], "ratios stay with the slots, not the panes");
+                assert_eq!(children.len(), 2);
+            }
+            other => panic!("shape changed: {other:?}"),
+        }
+        let mut order = vec![];
+        pane_order(&root, &mut order);
+        assert_eq!(order, vec![2, 1], "the two panes exchanged slots");
+    }
+
+    /// Across a nesting boundary — a leaf deep in one subtree swapped with
+    /// one in another. The recursion has to rewrite both, and exactly both.
+    #[test]
+    fn a_swap_reaches_across_nested_splits() {
+        let mut root = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![
+                LayoutNode::Pane(1),
+                LayoutNode::Split {
+                    dir: SplitDir::Horizontal,
+                    ratios: vec![0.5, 0.5],
+                    children: vec![LayoutNode::Pane(2), LayoutNode::Pane(3)],
+                },
+            ],
+        };
+        assert!(swap_panes(&mut root, 1, 3));
+        let mut order = vec![];
+        pane_order(&root, &mut order);
+        assert_eq!(order, vec![3, 2, 1]);
+    }
+
+    /// The stack case C33's doc comment exists for: `expanded` is an index,
+    /// so a bare id exchange would collapse the pane you just moved and
+    /// expand the one it displaced. The expanded *slot* follows its pane.
+    #[test]
+    fn swapping_inside_one_stack_carries_the_expanded_slot_with_the_pane() {
+        let mut root = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        assert!(swap_panes(&mut root, 1, 2));
+        match &root {
+            LayoutNode::Stack { children, expanded } => {
+                assert_eq!(children, &vec![2, 1, 3], "pane 1 moved down one slot");
+                assert_eq!(*expanded, 1, "and stayed expanded — it is at index 1 now");
+            }
+            other => panic!("not a stack: {other:?}"),
+        }
+    }
+
+    /// The other half of the same rule: swapping a pane that is *not* the
+    /// expanded one must leave the expanded pane expanded — the index only
+    /// moves when it is one of the two being exchanged.
+    #[test]
+    fn a_stack_swap_that_misses_the_expanded_pane_leaves_it_expanded() {
+        let mut root = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        assert!(swap_panes(&mut root, 2, 3));
+        match &root {
+            LayoutNode::Stack { children, expanded } => {
+                assert_eq!(children, &vec![1, 3, 2]);
+                assert_eq!(*expanded, 0, "pane 1 is still the expanded member");
+            }
+            other => panic!("not a stack: {other:?}"),
+        }
+    }
+
+    /// An absent id, or the same id twice, changes nothing and says so —
+    /// `App::move_pane_dir` leans on the bool to leave the tab alone rather
+    /// than persisting a no-op edit.
+    #[test]
+    fn a_swap_of_an_absent_or_identical_pane_is_a_reported_no_op() {
+        let mut root = tree();
+        assert!(!swap_panes(&mut root, 1, 99), "99 is not in the tree");
+        assert!(!swap_panes(&mut root, 1, 1), "a pane cannot swap with itself");
+        let mut order = vec![];
+        pane_order(&root, &mut order);
+        assert_eq!(order, vec![1, 2], "neither call touched the tree");
     }
 
     #[test]

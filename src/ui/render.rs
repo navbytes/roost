@@ -733,6 +733,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "LAYOUT",
         rows: &[
             ("Alt+Shift+←↓↑→", "resize along that axis"),
+            // C33 sits directly under the resize row on purpose: the two
+            // shifted-direction chords are adjacent, so the one thing a
+            // reader has to learn — arrows resize, letters carry the pane —
+            // is visible in a single glance rather than inferred. Same
+            // adjacency argument C28 makes in the TABS group.
+            ("Alt+Shift+hjkl", "move this pane that way (swaps with its neighbour)"),
             ("Alt+s", "toggle split ⇄ stack"),
             ("Alt+o", "flip this split's orientation"),
             ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
@@ -3278,7 +3284,7 @@ mod tests {
         for chord in [
             "Alt+n", "Alt+Enter", "Alt+r", "Alt+w", "Alt+u", "Alt+Shift+p", "Alt+Shift+←↓↑→",
             "Alt+s", "Alt+o", "Alt+g", "Alt+z", "Alt+f", "Alt+t", "Alt+1..9", "Alt+0", "Alt+i",
-            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a",
+            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a", "Alt+Shift+hjkl",
             "Alt+e", "Alt+PgUp", "Alt+c", "Alt+/", "Alt+?", "Alt+q",
         ] {
             assert!(text.contains(chord), "the keymap must document {chord:?}");

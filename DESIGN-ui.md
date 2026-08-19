@@ -3910,6 +3910,108 @@ not a benchmark suite.
 
 ---
 
+### C33 — Move a pane within its tab (`Alt+Shift+hjkl`) — [Added 2026-08-19, comparative UX review]
+
+**Origin.** The comparative review against zellij / lazygit / gh dash
+(`docs/engagements/2026-08-19-comparative-ux-review/`) opened two findings
+that turn out to be one change. F8: roost could move a pane *between* tabs
+(C28) but not *within* one, so promoting an agent into main+stack's main slot
+meant closing and respawning it — zellij has a whole move mode for this. F2:
+`Alt+Shift+hjkl` was bound to nothing coherent. The shifted vim letters fell
+into the focus arms, which carry no `shift` guard, so a terminal delivering
+`('h', SHIFT)` moved focus left — a duplicate of plain `Alt+h` — while one
+delivering `'H'` matched nothing and forwarded meta-H into the agent. One
+physical chord, two behaviours, split by terminal.
+
+So four chords were being spent on a redundant second spelling of `Alt+hjkl`,
+in a table whose free unshifted pool (§8) is empty, while the verb that wanted
+them had no chord at all. C33 spends them on the verb.
+
+**The binding, and why it is not a new idiom.** C28 already established that
+the shifted sibling *carries the pane* the way the unshifted one *carries
+you*: `Alt+i`/`Alt+m` move you between tabs, `Alt+Shift+i`/`Alt+Shift+m` move
+the focused pane there. `Alt+hjkl` moves you within a tab; `Alt+Shift+hjkl`
+moves the pane within a tab is the same sentence on the other axis. Shifted-
+letter-carries-the-pane stops being a tab special case and becomes a rule that
+holds on both axes.
+
+Both delivery forms are bound (`Char('h')` + SHIFT and bare `Char('H')`, for
+all four letters), the same tolerance C23's `Alt+P`, C27's `Alt+A` and C28's
+`Alt+I`/`Alt+M` carry. That also repairs the escape hatch: `twins` pairs two
+`Char` chords exactly when they share a case-folded letter **and both already
+default to the same action**, so before C33 a `config.json` remap of
+`alt+shift+h` bound only one encoding and silently no-opped on terminals
+sending the other — the precise failure `twins`' own doc comment forbids. With
+both forms defaulting to `MovePane`, `twins` pairs them with no change to
+`twins` itself.
+
+**Swap, not re-parent.** The operation is `layout::swap_panes` — two `PaneId`s
+exchange slots and *nothing else changes*: every `Split`'s `dir` and `ratios`,
+every `Stack`'s arity, the whole shape is bit-identical afterwards. A true
+"move" (detach and reinsert) would change tree shape, could collapse a split
+to one child — the hazard `remove_pane` carries its own collapse rule for —
+and could reach nestings `Alt+g`'s canned cycle would never generate. There is
+no layout a swap can produce that a pair of splits couldn't already have
+built, which is why it needs no new invariant and no ratio arithmetic.
+
+**Direction comes from `layout::neighbor` — the same call `focus_dir` makes.**
+Deliberately not a second adjacency rule: "which pane is that way?" has one
+answer in roost, so the move can never disagree with the focus key that taught
+the user the direction.
+
+**Stacks need no special case.** Every stack member already owns a `PaneRect`
+(collapsed ones a single row, C8), so `Down` inside a stack finds the next
+member exactly as it finds the next split, and the gesture reorders the stack.
+One thing does need handling: `Stack`'s `expanded` is an **index**, not an id,
+so a bare id exchange would leave the moved pane collapsed and expand whichever
+pane it displaced — press "move down" and the pane you are reading shrinks to a
+title bar while a different one opens. `swap_panes` therefore carries the
+expanded slot with its pane, the same way `remove_pane` already repairs
+`expanded` itself rather than making callers remember to.
+
+**Focus follows the pane, for free.** The tree swaps two ids, so the focused id
+never changes — it simply occupies a different slot. No `set_focus` call, and
+therefore none of the spurious CSI O/I focus-report pairs `focus_dir_cross_tab`
+documents.
+
+**No cross-tab handoff at the edge — the one deliberate divergence from
+`focus_dir`.** C31 lets `Alt+←/→` continue into the next tab at a tab's edge;
+`Alt+Shift+hjkl` at an edge is a **no-op**. Three reasons. Moving a pane out of
+its tab is a structural edit rather than a look, so the recoverable failure is
+doing nothing. `Alt+Shift+i`/`Alt+Shift+m` (C28) already do exactly that job and
+name it. And C31's own rule — "tabs are roost's own horizontal axis, so only
+the two keys that already share that axis pick up tab-switching semantics" —
+would give `h`/`l` a cross-tab meaning that `j`/`k` could never have, splitting
+one chord family across two scopes. The handoff remains available as a later
+amendment if use argues for it; it is not the default because an accidental
+cross-tab move is the more expensive mistake.
+
+**Zoom and the float.** A swap joins `NewPane`/`ToggleStack`/`FlipSplit`/
+`Resize`/`CycleLayout` in `apply`'s structural-action guard: it exits zoom
+(C21 — the tab must never change invisibly behind a full-screen pane) and hides
+the float (C22 — the float has no position in the tiled tree, so no direction
+applies to it). The float is additionally excluded inside `move_pane_dir` on
+C22 rule 2's grounds.
+
+**Chrome.** §8 gains row 4b. C15's `LAYOUT` group gains one row, placed
+directly under `Alt+Shift+←↓↑→ resize` — the two shifted-direction chords sit
+adjacent so the one thing a reader must learn (**arrows resize, letters carry
+the pane**) is visible at a glance rather than inferred. That adjacency is
+C28's own argument in the `TABS` group. The C9 hint bar's Normal-mode seven
+**gain nothing**: the 100-column arithmetic is unchanged and the chord is
+discoverable via `Alt+?`, exactly as C27 and C28 were.
+
+**Config.** Four new `NAMES` entries — `move_pane_left` / `_right` / `_up` /
+`_down` — so the chords can be remapped or disabled like any other.
+
+**Known gap, stated rather than left implicit.** C15's
+`every_bound_chord_is_documented_in_the_keymap` is a hand-kept list of chord
+literals checked against the hand-kept `HELP_GROUPS` text — both `const`,
+neither derived from `default_chord_action`. It did not and could not catch
+four newly bound chords; the list was extended by hand here. Deriving that gate
+from the effective keymap is F1 of the review that produced this contract, and
+is where the real fix belongs.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -3923,6 +4025,7 @@ shows only the C9-curated subsets.
 | 2 | `Alt+Enter` | quick-launch picker (pi / claude / shell) | C14 |
 | 3 | `Alt+←↓↑→ / hjkl` | move focus (`←`/`→` continue into the next/prev tab at an edge) | C31 |
 | 4 | `Alt+Shift+←↓↑→` | resize along that axis | — |
+| 4b | `Alt+Shift+hjkl` | **move this pane that way inside the tab (swaps with its neighbour)** | C33 |
 | 5 | `Alt+s` | toggle split ⇄ stack | C6–C8 |
 | 6 | `Alt+o` | flip split orientation | — |
 | 7 | `Alt+g` | **cycle layout: grid / main+stack / all-stack** | C25 |
