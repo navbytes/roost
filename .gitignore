@@ -4,3 +4,9 @@
 # second lockfile and target dir which are build artifacts, not source.
 /vendor/vt100/Cargo.lock
 /vendor/vt100/target
+
+# Agent worktrees: `isolation: "worktree"` gives a subagent its own checkout
+# under here so it can build and write scratch harnesses without touching the
+# main tree. They are whole repo copies and pure scratch — auto-removed when
+# the agent finishes. `.claude/` itself stays tracked (agents/, settings).
+/.claude/worktrees/
