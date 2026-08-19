@@ -71,8 +71,9 @@ pub enum Action {
     /// Toggle a full-screen, focus-following view of the focused pane — a
     /// pure view transform, no layout change (C21).
     ToggleZoom,
-    /// Snap the active tab to the next canned arrangement that fits (C25).
-    CycleLayout,
+    /// Snap the active tab to the next canned arrangement that fits (C25);
+    /// `forward: false` walks the same cycle backwards (C37, `Alt+Shift+g`).
+    CycleLayout { forward: bool },
     /// Toggle the C20 activity-feed overlay (status/spawn/close/exit/control
     /// events), Alt+e.
     ToggleFeed,
@@ -179,7 +180,11 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         }
         KeyCode::Char('A') => Some(Action::ToggleRoster),
         KeyCode::Char('z') => Some(Action::ToggleZoom),
-        KeyCode::Char('g') => Some(Action::CycleLayout),
+        // C37: the shifted sibling reverses the cycle — C28's idiom
+        // (shift = the inverse of the unshifted chord), and the same
+        // both-delivery-forms tolerance every shifted letter carries.
+        KeyCode::Char('g') => Some(Action::CycleLayout { forward: !shift }),
+        KeyCode::Char('G') => Some(Action::CycleLayout { forward: false }),
         KeyCode::Char('e') => Some(Action::ToggleFeed),
         KeyCode::Char('f') => Some(Action::ToggleFloat),
         KeyCode::PageUp => Some(Action::ScrollMode),
@@ -720,7 +725,8 @@ const NAMES: &[(&str, Action)] = &[
     ("jump_attention", Action::JumpAttention),
     ("toggle_roster", Action::ToggleRoster),
     ("toggle_zoom", Action::ToggleZoom),
-    ("cycle_layout", Action::CycleLayout),
+    ("cycle_layout", Action::CycleLayout { forward: true }),
+    ("cycle_layout_back", Action::CycleLayout { forward: false }),
     ("toggle_feed", Action::ToggleFeed),
     ("toggle_float", Action::ToggleFloat),
     ("toggle_raw", Action::ToggleRaw),
@@ -1043,7 +1049,7 @@ mod tests {
         ));
         assert!(matches!(
             translate(alt(KeyCode::Char('g'))),
-            InputResult::Action(Action::CycleLayout)
+            InputResult::Action(Action::CycleLayout { forward: true })
         ));
     }
 
@@ -1606,7 +1612,7 @@ mod tests {
             (alt_shift(KeyCode::Char('/')), Action::Help),
             (alt(KeyCode::Char('a')), Action::JumpAttention),
             (alt(KeyCode::Char('z')), Action::ToggleZoom),
-            (alt(KeyCode::Char('g')), Action::CycleLayout),
+            (alt(KeyCode::Char('g')), Action::CycleLayout { forward: true }),
             (alt(KeyCode::Char('e')), Action::ToggleFeed),
             (alt(KeyCode::Char('f')), Action::ToggleFloat),
             (alt(KeyCode::PageUp), Action::ScrollMode),
@@ -1735,7 +1741,7 @@ mod tests {
         ));
         assert!(!matches!(
             translate_with(alt(KeyCode::Char('g')), &keymap),
-            InputResult::Action(Action::CycleLayout)
+            InputResult::Action(Action::CycleLayout { forward: true })
         ));
     }
 

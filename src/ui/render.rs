@@ -996,7 +996,18 @@ const HELP_GROUPS: &[HelpGroup] = &[
             ),
             chords(&[Action::ToggleStack], "toggle split ⇄ stack"),
             chords(&[Action::FlipSplit], "flip this split's orientation"),
-            chords(&[Action::CycleLayout], "cycle layout: grid / main+stack / all-stack"),
+            chords(
+                &[Action::CycleLayout { forward: true }],
+                "cycle layout: grid / main+stack / all-stack",
+            ),
+            // C37 sits directly under its own unshifted form, which is
+            // C28's actual rule (the C33 audit drew the distinction: C28
+            // pairs a row with the chord it is the shifted *form of*, not
+            // merely one it could be confused with). Two rows rather than
+            // one merged row because C15's cap was retired precisely so
+            // rows need not be merged to fit — and merging these two did
+            // push the column to 83, past the 80-col floor.
+            chords(&[Action::CycleLayout { forward: false }], "the same cycle, backwards"),
             chords(&[Action::ToggleZoom], "zoom the focused pane (view only)"),
             chords(&[Action::ToggleFloat], "floating scratch shell"),
         ],
