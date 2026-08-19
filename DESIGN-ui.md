@@ -4120,6 +4120,16 @@ it is the list the rule is accountable to):
   degrades to a bare "again", still true because the confirm is armed on the
   *action* and a repeat by any route satisfies it.
 
+- **`roost keys`** (F11, the control CLI's one *local* verb) — the same
+  resolution, printed. It is not a socket verb: it reads `config.json` off
+  disk and answers with no running roost, because the moment you want to ask
+  "what did my dotfile do" is before launching, or because launching is what
+  is going wrong. Deriving it from `effective_bindings` is what made it a
+  printer rather than a feature; it also gives config.json's diagnostics a
+  home outside the TUI, which is the gap the review named — they used to
+  surface only as a startup toast, so a mistyped chord was found by catching
+  a transient message.
+
 **Not in scope, and why:** mode-local keys (`hjkl`, `v/V`, `Esc`, `n/N`,
 `↵`, `f`, `y`) and mouse verbs. config.json's grammar is `Alt` chords only
 (`Chord::parse` requires the prefix), so none of them can move and none can

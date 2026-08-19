@@ -391,18 +391,32 @@ is free and means exactly one thing. zellij's swap-layout keys
 
 ---
 
-## F11 · Low · No `roost keys` / no config validation from the shell
+## F11 · Low · **RESOLVED 2026-08-19** · No `roost keys` / no config validation from the shell
 
 `config.json` diagnostics surface only as a startup toast in the TUI
 (`config.rs:load_keymap`), so a mistyped chord in a dotfile is discovered by
 launching roost and reading a transient message. zellij has
 `zellij setup --check` and `--dump-config`; lazygit has `lazygit --config`.
 
-A `roost keys` that prints the effective table (defaults + overrides, honest
-about disabled chords) and exits non-zero on a bad entry costs almost nothing
-once F1 has made the effective table a value rather than a const — and it is
-the natural thing to pipe into a README, a dotfile-repo test, or an agent that
-wants to know what it can press.
+**What shipped.** `roost keys` prints the effective table as TSV
+(`chord<TAB>action`, with a third column naming `config.json` for anything it
+changed), and exits 2 with the diagnostics on stderr when an entry had to be
+skipped. Disabled chords are listed as `disabled` rather than omitted — "why
+doesn't `Alt+f` work any more" is the question the command gets asked, and a
+table of live bindings structurally cannot answer it.
+
+It is deliberately **not** a control verb: every one of those is a socket
+request against a running roost, and this one reads `config.json` directly.
+Routing it through the socket would make the only question you can ask about a
+config require the program that config configures to already be running.
+
+As predicted, F1 made it a printer rather than a feature — `effective_bindings`
+was the whole of the hard part. Two things the build turned up: `action_name`
+had to be promoted out of `#[cfg(test)]` (F1 promoted `default_keymap` for the
+same reason), and the first output padded chords into columns, which quietly
+broke the TSV contract the help text advertises — `cut -f1` would return
+`"Alt+q     "`. Padding is what `column -t` is for; a caller who wants fields
+cannot un-pad them.
 
 ---
 
@@ -431,7 +445,7 @@ Recorded so a future pass doesn't "improve" these toward the comparison tools:
 
 ## Suggested order
 
-**Done.** F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
+**Done.** F11 as `roost keys`. F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
 one change closed both, since the redundant chords F2 found were the chords
 F8's missing verb needed). F1 as **C34** (the chrome reads the live keymap),
 which also retired the const-vs-const documentation gate for a real sweep.
@@ -447,9 +461,9 @@ which also retired the const-vs-const documentation gate for a real sweep.
    most obviously wants.
 3. **F4** (declare a fleet) — largest, and the one that needs a stance
    decision before any code.
-4. **F5**, **F9**, **F10**, **F11** as capacity allows. F5 (custom commands)
-   and F11 (`roost keys`) both got cheaper: `effective_bindings` is the table
-   each of them needed, and it exists now.
+4. **F5**, **F9**, **F10** as capacity allows. F5 (custom commands) got
+   cheaper for the same reason F11 did: `effective_bindings` is the table it
+   needs, and it exists now.
 
 ## Sources
 

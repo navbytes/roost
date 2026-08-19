@@ -705,12 +705,18 @@ const NAMES: &[(&str, Action)] = &[
     ("toggle_raw", Action::ToggleRaw),
 ];
 
-/// Test-only: `action_by_name` is the production reverse lookup (a straight
-/// `NAMES` scan); this — the other direction — only has a caller left in the
-/// round-trip test below, which checks `NAMES` itself against
-/// `default_keymap`'s independently-derived source of truth.
-#[cfg(test)]
-fn action_name(action: &Action) -> String {
+/// An action's config.json name — the reverse of `action_by_name`, and the
+/// spelling `roost keys` prints so its output can be pasted straight into a
+/// `"keys"` block.
+///
+/// Where `NAMES` carries aliases for one action (`edit_pane` /
+/// `rename_pane` / `note_pane`), the **first** entry wins: it is the name
+/// the table leads with, so it is the canonical one to print.
+///
+/// **[F11, 2026-08-19]** Promoted out of `#[cfg(test)]`. It had one test
+/// caller — the round-trip check against `default_keymap` — until `roost
+/// keys` needed to name what each chord does.
+pub fn action_name(action: &Action) -> String {
     NAMES
         .iter()
         .find(|(_, a)| a == action)

@@ -278,3 +278,109 @@ fn oversized_request_gets_a_true_diagnosis_and_leaves_the_instance_alive() {
 
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }
+
+// ---- F11: `roost keys` --------------------------------------------------
+
+/// A scratch state dir with `config.json` written into it, so these tests
+/// drive the real config path (`$ROOST_STATE`) rather than a stub.
+fn state_with_config(tag: &str, config: Option<&str>) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("roost-keys-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the state dir");
+    if let Some(c) = config {
+        std::fs::write(dir.join("config.json"), c).expect("write config.json");
+    }
+    dir
+}
+
+fn keys_in(dir: &std::path::Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_roost"))
+        .arg("keys")
+        .env("ROOST_STATE", dir)
+        // Pointed at a dead socket on purpose: `keys` must answer without a
+        // running roost. That is the whole reason it is not a control verb —
+        // you ask what your config did *before* launching, or because
+        // launching is what is going wrong.
+        .env("ROOST_SOCK", DEAD_SOCK)
+        .output()
+        .expect("run roost keys")
+}
+
+/// The default case: every chord roost binds, named by its config.json
+/// action, on a clean exit — and without touching the socket.
+#[test]
+fn keys_prints_the_default_map_without_a_running_roost() {
+    let dir = state_with_config("default", None);
+    let o = keys_in(&dir);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", err(&o));
+    let text = out(&o);
+    for expected in ["Alt+q\tquit", "Alt+n\tnew_pane", "Alt+Shift+hjkl"] {
+        // The family chords are listed individually here (this is the real
+        // table, not the overlay's curated rows), so check the ones that
+        // stand alone plus one shifted form.
+        if expected.contains('\t') {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+    }
+    assert!(text.contains("Alt+Shift+h\tmove_pane_left"), "C33's chords are in the table:\n{text}");
+    assert!(err(&o).is_empty(), "a clean config says nothing: {}", err(&o));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The question this command exists to answer: what did my config.json do?
+/// A remap moves the chord, and — the half a table of live bindings
+/// structurally cannot show — a disabled chord is still listed, because
+/// "why doesn't Alt+f work any more" is exactly what gets asked.
+#[test]
+fn keys_reports_what_config_json_changed_including_what_it_disabled() {
+    let dir = state_with_config(
+        "remap",
+        Some(r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#),
+    );
+    let o = keys_in(&dir);
+    assert_eq!(o.status.code(), Some(0), "a valid config is a clean exit: {}", err(&o));
+    let text = out(&o);
+    assert!(text.contains("Alt+v\ttoggle_float\tconfig.json"), "the remap is attributed:\n{text}");
+    assert!(text.contains("Alt+f\tdisabled\tconfig.json"), "the disable is shown:\n{text}");
+    assert!(
+        !text.contains("Alt+f\ttoggle_float"),
+        "and the float is no longer claimed to be on Alt+f:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gap the review actually named: config.json's diagnostics used to
+/// surface *only* as a transient toast inside the TUI, so a mistyped chord in
+/// a dotfile was found by launching roost and catching a message. They go to
+/// stderr with a non-zero exit now, so a dotfile test can gate on it — while
+/// the table still prints, and still prints what roost would really run.
+#[test]
+fn keys_reports_bad_config_entries_on_stderr_and_exits_nonzero() {
+    let dir = state_with_config(
+        "bad",
+        Some(r#"{"keys": {"alt+zz": "quit", "alt+g": "no_such_action"}}"#),
+    );
+    let o = keys_in(&dir);
+    assert_eq!(o.status.code(), Some(2), "a skipped entry is a non-zero exit");
+    let (text, diag) = (out(&o), err(&o));
+    assert!(diag.contains("alt+zz"), "the unparseable chord is named: {diag}");
+    assert!(diag.contains("no_such_action"), "the unknown action is named: {diag}");
+    // The table is still the truth about what roost would run: `alt+g`'s
+    // entry was skipped, so the chord keeps its default.
+    assert!(text.contains("Alt+g\tcycle_layout"), "the skipped entry left the default:\n{text}");
+    assert!(!text.contains("config.json"), "and nothing is attributed to it:\n{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Same conventions as every other verb: `--help` on stdout at exit 0, an
+/// unexpected argument is a usage error rather than being silently dropped.
+#[test]
+fn keys_help_and_bad_arguments_follow_the_cli_conventions() {
+    let help = roost(&["keys", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(out(&help).contains("roost keys"), "usage on stdout: {}", out(&help));
+
+    let bad = roost(&["keys", "--nope"]);
+    assert_eq!(bad.status.code(), Some(2), "an unknown flag is a usage error");
+    assert!(err(&bad).contains("--nope"), "and it names the offender: {}", err(&bad));
+}

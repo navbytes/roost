@@ -178,7 +178,20 @@ file — the default — and roost behaves exactly as documented above.
 ```
 
 A value is `"disable"` (the chord passes straight through to the pane, like
-an unbound key) or a snake_case `Action` name (see `src/ui/input.rs`).
+an unbound key) or a snake_case `Action` name — **`roost keys` prints every
+one of them**, alongside the chord it is currently on:
+
+```console
+$ roost keys | head -3
+Alt+/	toggle_hints
+Alt+0	last_tab
+Alt+1	go_to_tab_1
+```
+
+It reads `config.json` directly and needs no running roost, so it answers
+before you launch: remapped and disabled chords are marked `config.json`, and
+an entry roost had to skip is named on stderr with a non-zero exit — so a
+dotfile test can gate on it instead of you catching a startup toast.
 **`Alt+?` and the hint bar follow your remaps** — both read the live keymap,
 so they show the chord you bound and stop showing the one you disabled,
 rather than teaching the defaults at you. A
