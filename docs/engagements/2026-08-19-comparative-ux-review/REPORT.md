@@ -446,7 +446,7 @@ mode leads with READING. No new keys, no carve-out.
 
 ---
 
-## F10 · Low · `Alt+g` cycles one way only
+## F10 · Low · **RESOLVED 2026-08-19 (C37)** · `Alt+g` cycles one way only
 
 Three layouts, forward-only, so the one you want can be two presses away.
 Every other cycle in roost goes both ways — `Alt+i`/`Alt+m` for tabs,
@@ -454,6 +454,27 @@ Every other cycle in roost goes both ways — `Alt+i`/`Alt+m` for tabs,
 idiom that a shifted chord is its unshifted sibling's inverse. `Alt+Shift+g`
 is free and means exactly one thing. zellij's swap-layout keys
 (`Alt+[` / `Alt+]`) are bidirectional for the same reason.
+
+**What shipped (C37).** The arithmetic is the interesting part: `layout_cycle`
+holds the arrangement to try *next going forward*, so backward starts two
+behind it — `lc+1, lc, lc-1`, the forward order reversed. Both directions share
+C25's skip-what-doesn't-fit rule.
+
+Two things the build corrected in my own first attempt. The inverse property
+only holds **from inside the ring**: a tab's layout before the first `Alt+g`
+isn't one of the three canned arrangements, so stepping back from the first
+wraps to the last rather than restoring a custom layout — it is a ring, not an
+undo stack. And arrangements compare by **shape, not tree**, because
+`arrangement_for` re-derives from the live `pane_order`, which a previous step
+can have reordered; my first test compared whole trees and failed on pane
+placement rather than on arrangement.
+
+Also: merging both directions onto one help row measured **83 columns** and
+blew the 80-col floor that two prior audits found sitting at exactly 80. Two
+rows instead — which is also the more correct presentation, since C28's
+adjacency rule seats a row under its own unshifted form. C15's row cap was
+retired in July precisely so rows need not be merged to fit; this is the first
+change to take that at its word.
 
 ---
 
@@ -511,7 +532,7 @@ Recorded so a future pass doesn't "improve" these toward the comparison tools:
 
 ## Suggested order
 
-**Done.** F3 as **C36** (`Alt+'` broadcast composer). F6 as **C35** (`Alt+;` goes back). F11 as `roost keys`. F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
+**Done.** F10 as **C37** (`Alt+Shift+g` reverses the layout cycle). F3 as **C36** (`Alt+'` broadcast composer). F6 as **C35** (`Alt+;` goes back). F11 as `roost keys`. F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
 one change closed both, since the redundant chords F2 found were the chords
 F8's missing verb needed). F1 as **C34** (the chrome reads the live keymap),
 which also retired the const-vs-const documentation gate for a real sweep.
@@ -520,7 +541,7 @@ which also retired the const-vs-const documentation gate for a real sweep.
 
 1. **F4** (declare a fleet) — largest, and the one that needs a stance
    decision before any code.
-2. **F5**, **F9**, **F10** as capacity allows. F5 (custom commands) got
+2. **F5** and **F9** as capacity allows. F5 (custom commands) got
    cheaper for the same reason F11 did: `effective_bindings` is the table it
    needs, and it exists now.
 

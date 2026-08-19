@@ -140,7 +140,7 @@ you're in.
 | `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
-| `Alt+g` | cycle layout: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
+| `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
 | `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |
 | `Alt+f` | toggle the floating scratch shell (readline forward-word collision — already swallowed; raw mode below gets it back) |
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |

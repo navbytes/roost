@@ -3439,7 +3439,7 @@ impl<B: PaneBackend> App<B> {
                 | Action::ToggleStack
                 | Action::FlipSplit
                 | Action::Resize { .. }
-                | Action::CycleLayout
+                | Action::CycleLayout { .. }
                 | Action::MovePane(_)
         ) {
             self.exit_zoom();
@@ -3544,7 +3544,7 @@ impl<B: PaneBackend> App<B> {
                     self.toggle_zoom();
                 }
             }
-            Action::CycleLayout => self.cycle_layout(),
+            Action::CycleLayout { forward } => self.cycle_layout(forward),
             Action::ToggleFeed => self.toggle_feed(),
             Action::ToggleFloat => self.toggle_float(),
             Action::ToggleRaw => self.toggle_raw(),
@@ -4447,7 +4447,16 @@ impl<B: PaneBackend> App<B> {
     /// skipping ones that don't fit the current body area. No-ops (without
     /// advancing the cycle counter) when there's nothing to arrange or
     /// nothing fits.
-    fn cycle_layout(&mut self) {
+    /// **[C37, 2026-08-19]** `forward` is false for `Alt+Shift+g`, which
+    /// walks the same cycle backwards.
+    ///
+    /// `layout_cycle` is the arrangement to try *next going forward*, so
+    /// what is showing is `layout_cycle - 1` and stepping back means
+    /// starting two behind it. The `1 - step` below is exactly that:
+    /// candidates `lc+1, lc, lc-1` — the forward order reversed, with the
+    /// same skip-what-doesn't-fit behaviour, so a shape the terminal is too
+    /// small for is passed over in both directions alike.
+    fn cycle_layout(&mut self, forward: bool) {
         let order = self.pane_order();
         if order.len() < 2 {
             self.set_flash("one pane — nothing to arrange");
@@ -4456,7 +4465,8 @@ impl<B: PaneBackend> App<B> {
         let focused = self.focused;
         let area = self.body_area();
         for step in 0..3 {
-            let idx = (self.layout_cycle + step) % 3;
+            let offset = if forward { step } else { 1 - step };
+            let idx = (self.layout_cycle as isize + offset).rem_euclid(3) as usize;
             let node = arrangement_for(idx, &order, focused);
             if layout::arrangement_fits(&node, area) {
                 self.ws.active_tab_mut().layout = node;
@@ -12093,6 +12103,106 @@ mod tests {
         assert!(!flash.contains("Alt+"), "but names no dead key: {flash}");
     }
 
+    // ---- C37: reverse the layout cycle (Alt+Shift+g) ---------------------
+
+    /// Which of C25's three arrangements a tab is showing.
+    ///
+    /// The cycle compares by *shape*, not by tree: `arrangement_for`
+    /// re-derives from the live `pane_order`, which a previous step can
+    /// have reordered, so two visits to "grid" are the same arrangement
+    /// with the panes in different slots. That is pre-existing C25
+    /// behaviour — the forward-only tests already assert shapes rather than
+    /// trees — and C37 inherits it rather than introducing it.
+    fn arrangement_kind(layout: &LayoutNode) -> &'static str {
+        match layout {
+            LayoutNode::Stack { .. } => "all-stack",
+            LayoutNode::Split { ratios, .. } if ratios == &vec![0.6, 0.4] => "main+stack",
+            LayoutNode::Split { .. } => "grid",
+            LayoutNode::Pane(_) => "single",
+        }
+    }
+
+    /// The property that makes a reverse cycle worth a chord at all: from
+    /// inside the ring it is the *inverse*. Forward then back lands on the
+    /// arrangement you started from, at every point — otherwise it is just
+    /// a second way to go forward, and with three arrangements that buys
+    /// nothing.
+    ///
+    /// "From inside the ring" is the contract, not a test convenience: a
+    /// tab's layout before the first `Alt+g` is whatever splitting left it,
+    /// which is **not** one of the three canned arrangements.
+    /// `layout_cycle` is a position in a three-item ring, not an undo
+    /// stack, so stepping back from the first wraps to the last rather than
+    /// restoring a pre-cycle custom layout. Anything else would need the
+    /// cycle to remember arbitrary layouts, which is what `Alt+u` and the
+    /// split chords are for.
+    #[test]
+    fn reversing_the_layout_cycle_undoes_a_forward_step() {
+        let (mut app, _) = mk_app(shell_ws()); // 100x30 fits all three shapes
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout { forward: true }); // enter the ring
+
+        for _ in 0..3 {
+            let before = arrangement_kind(&app.ws.tabs[0].layout);
+            app.apply(Action::CycleLayout { forward: true });
+            assert_ne!(arrangement_kind(&app.ws.tabs[0].layout), before, "forward moved");
+            app.apply(Action::CycleLayout { forward: false });
+            assert_eq!(
+                arrangement_kind(&app.ws.tabs[0].layout),
+                before,
+                "back returns to the arrangement forward left",
+            );
+        }
+    }
+
+    /// Walking backwards reaches all three arrangements and closes the
+    /// ring, so the reverse direction is a full traversal rather than a
+    /// one-step nudge that then sticks.
+    #[test]
+    fn the_reverse_cycle_visits_every_arrangement() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout { forward: true }); // enter the ring
+
+        let start = arrangement_kind(&app.ws.tabs[0].layout);
+        let mut seen = vec![start];
+        for _ in 0..2 {
+            app.apply(Action::CycleLayout { forward: false });
+            seen.push(arrangement_kind(&app.ws.tabs[0].layout));
+        }
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "three distinct arrangements going back: {seen:?}");
+
+        app.apply(Action::CycleLayout { forward: false });
+        assert_eq!(arrangement_kind(&app.ws.tabs[0].layout), start, "and the ring closes");
+    }
+
+    /// The skip-what-doesn't-fit rule (C25) applies in reverse too: a shape
+    /// the terminal is too small for is passed over going back exactly as
+    /// it is going forward, so the two directions can't disagree about
+    /// which arrangements exist.
+    #[test]
+    fn the_reverse_cycle_skips_shapes_that_do_not_fit() {
+        // Narrow enough that main+stack cannot fit, as the forward-only
+        // sibling test already establishes for this geometry.
+        let (mut app, _) = mk_app(shell_ws());
+        // The same geometry the forward-only sibling test uses: body ~80x20,
+        // where main+stack's 0.4 column falls under the split floor.
+        app.on_resize(Size::new(80, 22), (0, 0));
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout { forward: false });
+        // Whatever it landed on must be a shape that actually fits — the
+        // reverse walk never installs an arrangement forward would refuse.
+        assert!(
+            layout::arrangement_fits(&app.ws.tabs[0].layout, app.body_area()),
+            "the reverse walk only installs shapes that fit",
+        );
+    }
+
     // ---- C36: broadcast composer (Alt+') --------------------------------
 
     /// The verb roost was uniquely positioned for and you had to leave roost
@@ -12486,7 +12596,7 @@ mod tests {
             Action::ToggleStack,
             Action::FlipSplit,
             Action::Resize { horizontal: true, grow: true },
-            Action::CycleLayout,
+            Action::CycleLayout { forward: true },
             Action::NewTab,
         ];
         for action in triggers {
@@ -13138,19 +13248,19 @@ mod tests {
         app.apply(Action::NewPane);
         app.apply(Action::NewPane); // 3 panes total
 
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
 
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         match &app.ws.tabs[0].layout {
             LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.6, 0.4]),
             other => panic!("expected a main+stack split, got {other:?}"),
         }
 
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
 
-        app.apply(Action::CycleLayout); // wraps back to grid
+        app.apply(Action::CycleLayout { forward: true }); // wraps back to grid
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
     }
 
@@ -13160,20 +13270,20 @@ mod tests {
         app.on_resize(Size::new(80, 22), (0, 0)); // body ~80x20: main+stack's 0.4 column (32) < the 36 floor
         app.apply(Action::NewPane); // 2 panes
 
-        app.apply(Action::CycleLayout); // 1st: grid (0.5/0.5) fits
+        app.apply(Action::CycleLayout { forward: true }); // 1st: grid (0.5/0.5) fits
         match &app.ws.tabs[0].layout {
             LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]),
             other => panic!("expected grid (0.5/0.5 split), got {other:?}"),
         }
 
-        app.apply(Action::CycleLayout); // 2nd: main+stack unfit here → skipped → all-stack applied
+        app.apply(Action::CycleLayout { forward: true }); // 2nd: main+stack unfit here → skipped → all-stack applied
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
     }
 
     #[test]
     fn cycle_layout_noop_when_fewer_than_two_panes() {
         let (mut app, _) = mk_app(shell_ws()); // 1 pane
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Pane(_)));
         assert_eq!(app.flash(), Some("one pane — nothing to arrange"));
     }
@@ -13185,7 +13295,7 @@ mod tests {
         app.apply(Action::NewPane); // 3 panes, organically nested splits
         app.on_resize(Size::new(30, 10), (0, 0)); // body far below the 36x10 floor for any arrangement
         let before = format!("{:?}", app.ws.tabs[0].layout);
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
         assert_eq!(app.flash(), Some("no room to rearrange; stack a pane with Alt+s first"));
     }
@@ -13197,7 +13307,7 @@ mod tests {
         app.apply(Action::NewPane);
         let focused = app.focused;
         for _ in 0..3 {
-            app.apply(Action::CycleLayout);
+            app.apply(Action::CycleLayout { forward: true });
             assert_eq!(app.focused, focused);
         }
     }
@@ -13206,7 +13316,7 @@ mod tests {
     fn cycle_layout_persists_like_any_layout_edit() {
         let (mut app, store) = mk_app(shell_ws());
         app.apply(Action::NewPane);
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         let saved = store.0.lock().unwrap().clone().unwrap();
         match &saved.tabs[0].layout {
             LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]), // grid, n=2
@@ -14078,7 +14188,7 @@ mod tests {
         app.apply(Action::NewPane);
         app.apply(Action::ToggleFloat);
         assert!(app.float.as_ref().unwrap().shown);
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(!app.float.as_ref().unwrap().shown);
         assert_eq!(app.pane_order().len(), 2, "the real 2-pane tab is untouched");
     }
