@@ -4272,6 +4272,71 @@ and a keyed cache would need a lock in the render path to stay correct across
 the several keymaps a single test process uses. Recorded so a later pass
 measures rather than rediscovers.
 
+### C35 — Go back (`Alt+;`) — [Added 2026-08-19, comparative UX review F6]
+
+**The gap.** Every navigation chord roost had was absolute (`Alt+1..9`,
+`Alt+0`) or forward-directional (`Alt+a`, `Alt+i`/`Alt+m`, `Alt+hjkl`).
+Nothing returned you to the pane you were just on. At fleet scale the
+dominant motion is "check on B, come back to A", and `Alt+a` only ever walks
+*on* through the attention ring — on a two-pane hop it is the wrong tool, and
+across a tab switch there was nothing at all. tmux has had `prefix ;` for
+last-pane since forever; vim has `Ctrl-^`.
+
+**The chord, and why it costs nothing.** `Alt+;` — and the reason it was
+available is worth recording, because this table's own §8 accounting had
+declared the pool empty. That accounting enumerated **letters**. Outside
+`Alt+/` and `Alt+?` every punctuation chord was, and mostly still is, free
+(`;` `'` `,` `.` `]` `-` `=` `` ` ``). `Alt+[` remains rejected — `ESC [` is
+the CSI introducer (§8) — but the rest were never counted. So F7's leader key
+is **not** a prerequisite for this contract, and the "concrete feature needs
+a chord and finds none free" trigger has not fired here.
+
+`;` is also the right key rather than merely a free one: it is tmux's own
+last-pane binding, so the muscle memory already exists, and `M-;` is not a
+readline binding, so nothing in a shell pane loses a key.
+
+**One chokepoint.** `App::alternate` is maintained in `set_focus`, which
+`set_focus`'s own comment already establishes is where *every* focus move
+funnels — a click, an arrow, `Alt+a`, a tab switch, a roster jump. Recording
+there rather than per call site is what makes the trail complete without the
+next focus-moving feature having to remember to update it.
+
+**It toggles.** The pointer records every real transition, including the ones
+this chord causes, so A→B leaves A, going back to A leaves B, and pressing
+again returns to B. A stack would be the other design and is deliberately not
+it: "back" that sometimes goes somewhere new is worse than one that always
+goes to the same place.
+
+**Existence is checked at both ends, by one predicate.** `pane_exists`
+(tiled or float) guards both the record and the use:
+- **Recording** — `focused` initializes to a `0` sentinel that names no pane,
+  so without this the very first focus move would file a phantom and the
+  first press would report a pane that never existed. (Found by the
+  "nothing to go back to" test, which failed with the wrong message.)
+- **Using** — the pane can close while you are away. Landing focus on a dead
+  id would be a real bug.
+Sharing the predicate is deliberate: two ends that disagree about what
+"exists" means is how the phantom gets back in.
+
+**It flashes rather than no-oping.** No alternate yet, or an alternate that
+has closed, each say so. A navigation key that silently does nothing reads as
+broken, and the whole value of this one is confidence about where it lands.
+
+**Reuses `focus_attention_target`.** A cross-tab return switches tabs, expands
+a collapsed stack member and handles the float exactly as `Alt+a`'s jump does
+— "which pane" and "how do I get there" stay one answer each rather than two
+that can drift.
+
+**Chrome.** §8 gains row 10c. C15's `FLEET` group gains one row, directly
+under `Alt+a`: the two are the pair a fleet navigates with — one goes on to
+whoever needs you, the other comes back. Both the row and the chord spelling
+are resolved from the live keymap (C34), so this contract adds no literal and
+needed no allowlist entry — the C34 machinery absorbed a new chord with no
+manual bookkeeping. The C9 hint bar's Normal seven **gain nothing** (the
+100-column arithmetic is unchanged; `Alt+?` teaches it).
+
+**Config.** One new `NAMES` entry, `focus_alternate`.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -4292,6 +4357,7 @@ shows only the C9-curated subsets.
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
 | 9 | `Alt+f` | **floating scratch shell (toggle)** | C22 |
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
+| 10c | `Alt+;` | **go back to the pane you came from (toggles)** | C35 |
 | 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one. `Tab`/`Shift+Tab` inside it cycle a status filter** | C27 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
 | 12 | `Alt+r / Alt+Shift+r` | **edit pane (name + parking note, one dialog)** / rename tab | C32/C13 |

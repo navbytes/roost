@@ -271,7 +271,7 @@ their `description` (lazygit's rule), which F1's fix makes free.
 
 ---
 
-## F6 · Medium · Nothing takes you back
+## F6 · Medium · **RESOLVED 2026-08-19 (C35)** · Nothing takes you back
 
 **What.** Every navigation chord is absolute or forward-directional:
 `Alt+1..9`, `Alt+0`, `Alt+i`/`Alt+m`, `Alt+hjkl`, `Alt+a`. There is no
@@ -287,9 +287,30 @@ is nothing at all. tmux has had `prefix ;` (last pane) and `prefix l` (last
 window) forever; vim has `Ctrl-^`; lazygit gives every panel a digit *and*
 `[`/`]`.
 
-**Fix shape.** One `PaneId` on `App`, updated at every focus change that
-isn't itself the toggle, and one chord. Small — the expensive part is the
-chord, not the state.
+**What shipped (C35), and the premise that turned out wrong.** This finding
+said "the expensive part is the chord, not the state", and F7 was queued ahead
+of it to pay that cost. **The chord was free.** §8's pool accounting — the one
+this report quoted to argue the keyspace was exhausted — enumerates *letters*.
+Outside `Alt+/` and `Alt+?`, every punctuation chord was untouched
+(`;` `'` `,` `.` `]` `-` `=` `` ` ``). `Alt+[` stays rejected (`ESC [` is the
+CSI introducer), but nothing else had ever been counted.
+
+So `Alt+;` — which is also tmux's own last-pane binding, so the muscle memory
+exists, and collides with no readline op. **F7 is not a prerequisite for F6,
+and the leader key's trigger has not fired here.**
+
+The state was smaller than expected too: `set_focus` is already a documented
+single chokepoint ("every focus move funnels through here"), so one field
+maintained there gives a complete trail without the next focus-moving feature
+having to remember it. It reuses `focus_attention_target` for the landing, so
+cross-tab returns, stack expansion and the float all behave exactly as
+`Alt+a`'s jump does.
+
+One thing the build turned up: `focused` initializes to a `0` sentinel naming
+no pane, so recording unconditionally filed a phantom and the first press
+reported a pane that never existed. Existence is now checked at both ends by
+one shared predicate — two ends that disagree about what "exists" means is how
+the phantom gets back in.
 
 ---
 
@@ -318,9 +339,20 @@ precisely because there's no prefix to swallow the agent's own keys), but it
 is why zellij never runs out of room. The leader-key design already on the
 roadmap is roost's version of the same escape valve, scoped to one modal hop.
 
-**Recommendation.** Build the leader key *before* F3 and F6, not after.
-Deciding three chords under pressure, one at a time, is how a key table
-acquires the merges C15's cap retirement was written to undo.
+**Recommendation, amended 2026-08-19 — this finding overstated its case.**
+The pool accounting it quotes covers **letters**. Punctuation was never
+counted, and outside `Alt+/` and `Alt+?` all of it was free; C35 (`Alt+;`)
+took one and the letter pool is untouched. So "zero comfortably-available
+chords" was wrong, and two of the three findings said to be blocked on F7
+were not: F6 shipped without it, and F5's whole point is that the *user*
+picks a chord.
+
+What survives: F3 (broadcast) still wants a chord, and the leader key remains
+the right answer once punctuation runs thin or a feature needs a whole
+keyspace rather than one key. Its trigger — "a concrete feature needs a chord
+and finds none free" — has **not** fired. Build it when it does, with the
+design the roadmap already assessed, and not before; that is what the roadmap
+entry said, and this report was wrong to override it on a miscount.
 
 ---
 
@@ -445,23 +477,18 @@ Recorded so a future pass doesn't "improve" these toward the comparison tools:
 
 ## Suggested order
 
-**Done.** F11 as `roost keys`. F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
+**Done.** F6 as **C35** (`Alt+;` goes back). F11 as `roost keys`. F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
 one change closed both, since the redundant chords F2 found were the chords
 F8's missing verb needed). F1 as **C34** (the chrome reads the live keymap),
 which also retired the const-vs-const documentation gate for a real sweep.
 
 **Next.**
 
-1. **F7** (leader key) — its stated trigger has fired; building it before F3
-   and F6 stops each from spending a scarce chord under pressure. Note C33
-   spent four chords that were previously wasted, so the squeeze is slightly
-   looser than when this report was written — but the unshifted pool is
-   unchanged and still empty.
-2. **F3** (broadcast in the TUI) and **F6** (back) — the two verbs the fleet
-   most obviously wants.
-3. **F4** (declare a fleet) — largest, and the one that needs a stance
+1. **F3** (broadcast in the TUI) — the verb roost is uniquely positioned for
+   and the one thing you must leave roost to do.
+2. **F4** (declare a fleet) — largest, and the one that needs a stance
    decision before any code.
-4. **F5**, **F9**, **F10** as capacity allows. F5 (custom commands) got
+3. **F5**, **F9**, **F10** as capacity allows. F5 (custom commands) got
    cheaper for the same reason F11 did: `effective_bindings` is the table it
    needs, and it exists now.
 

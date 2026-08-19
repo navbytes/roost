@@ -1020,6 +1020,10 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "FLEET",
         rows: &[
             chords(&[Action::JumpAttention], "jump to the next pane that needs you"),
+            // C35 sits under the jump because they are the pair a fleet
+            // navigates with: one goes on to whoever needs you, the other
+            // comes back to where you were.
+            chords(&[Action::FocusAlternate], "back to the pane you came from"),
             chords(
                 &[Action::ToggleRoster],
                 "roster: every pane, grouped by tab · Tab filters by status",

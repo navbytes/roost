@@ -12,6 +12,11 @@ pub enum Action {
     ClosePane,
     /// Move focus spatially (arrows / hjkl).
     Focus(Dir),
+    /// C35: return focus to the pane it was on before this one — the
+    /// alternate-pane toggle (`Alt+;`, tmux's `prefix ;`). Every other
+    /// navigation chord is absolute or forward-directional; this is the
+    /// only one that goes back.
+    FocusAlternate,
     /// C33: swap the focused pane with its neighbour in that direction,
     /// within the active tab — `Alt+Shift+hjkl`. The shifted siblings of
     /// `Alt+hjkl` carry the *pane* the way the unshifted ones carry *you*,
@@ -206,6 +211,11 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         // Alt+R and C28's Alt+Shift+i / Alt+I are: `twins` then pairs them
         // automatically (both now default to the same action), so a
         // config.json remap of `alt+shift+h` can no longer half-apply.
+        // C35: `;` is punctuation, so it costs the §8 letter pool nothing —
+        // the pool that is "empty" is the *letters*, and every chord outside
+        // `/` and `?` was still free. tmux's own last-pane key, and no
+        // readline binding to collide with.
+        KeyCode::Char(';') => Some(Action::FocusAlternate),
         KeyCode::Char('l') if shift => Some(Action::MovePane(Dir::Right)),
         KeyCode::Char('L') => Some(Action::MovePane(Dir::Right)),
         KeyCode::Char('h') if shift => Some(Action::MovePane(Dir::Left)),
@@ -657,6 +667,7 @@ const NAMES: &[(&str, Action)] = &[
     ("focus_right", Action::Focus(Dir::Right)),
     ("focus_up", Action::Focus(Dir::Up)),
     ("focus_down", Action::Focus(Dir::Down)),
+    ("focus_alternate", Action::FocusAlternate),
     ("move_pane_left", Action::MovePane(Dir::Left)),
     ("move_pane_right", Action::MovePane(Dir::Right)),
     ("move_pane_up", Action::MovePane(Dir::Up)),
