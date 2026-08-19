@@ -16,6 +16,7 @@ use crate::core::app::{
 use crate::core::status::AgentStatus;
 use crate::core::layout::{self, Dir, PaneRect};
 use crate::ports::PaneBackend;
+use crate::core::control::Actor;
 use crate::ui::input::{self, Action, Keymap};
 use crate::ui::mouse;
 use crate::ui::theme;
@@ -175,6 +176,23 @@ fn hint_pairs(
         // C32 (combined), 72 columns. `Shift+↵` names the break — descend
         // from the name row, split inside the note (Ctrl/Alt+↵ are
         // unhinted synonyms, same rule as every alias on this bar).
+        // C36, **74 columns** — and ordered by U6's rule that list order
+        // *is* yield order, because 74 plus the 33-column needs-you
+        // segment overflows the 100-col floor and trailing pairs drop.
+        // The two that must survive a busy fleet lead: `↵ send` (what the
+        // dialog is for) and `Esc cancel` (the escape hatch C24's list
+        // refused to let yield). `type message` trails — a text field you
+        // are already typing into is the pair whose absence costs least.
+        // The motion keys are deliberately absent, on C24's precedent:
+        // an eighth pair would push `Esc` off, and they are C13/C32's
+        // shared vocabulary, taught by the C15 overlay.
+        Mode::Broadcast { .. } => vec![
+            lit("↵", "send"),
+            lit("Esc", "cancel"),
+            lit("Tab", "who gets it"),
+            lit("Shift+↵", "new line"),
+            lit("type", "message"),
+        ],
         Mode::PaneEdit { .. } => vec![
             lit("type", "name / note"),
             lit("↵", "save"),
@@ -285,6 +303,7 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Help { .. } => "HELP",
         Mode::Feed { .. } => "FEED",
         Mode::Roster { .. } => "ROSTER",
+        Mode::Broadcast { .. } => "BROADCAST",
         Mode::Search { .. } => "SEARCH",
     }
 }
@@ -1029,6 +1048,10 @@ const HELP_GROUPS: &[HelpGroup] = &[
                 "roster: every pane, grouped by tab · Tab filters by status",
             ),
             chords(&[Action::ToggleFeed], "activity feed (status / spawns / exits / control)"),
+            chords(
+                &[Action::ToggleBroadcast],
+                "broadcast: type once, send to every pane · Tab picks who",
+            ),
         ],
     },
     HelpGroup {
@@ -1130,6 +1153,13 @@ fn dialog_rect(
         Mode::PaneEdit { lines, .. } => {
             Some(centered_near(anchor, body, 44, lines.len() as u16 + 3))
         }
+        // C36: C13's width, one row per message line. Wider than the pane
+        // editor would be tempting, but a broadcast is read at the moment
+        // of sending and the eye should be on the title's target count,
+        // not sweeping a wide field.
+        Mode::Broadcast { lines, .. } => {
+            Some(centered_near(anchor, body, 44, lines.len() as u16 + 2))
+        }
         Mode::Picker { .. } => {
             // U20: as tall as the longer of the two columns (a filter can
             // shrink the adapter side below the cwd side), never shorter
@@ -1208,6 +1238,48 @@ fn draw_mode_overlay<B: PaneBackend>(
                     Line::from(l.clone())
                 }
             }));
+            f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
+        }
+        // C36: the composer. The title carries the **live target count**,
+        // and that count is the contract's safety affordance — a visible
+        // blast radius at the moment of commit, in place of a
+        // confirm-twice. It moves with `Tab`, so the filter reads as "who
+        // gets this" rather than as a setting.
+        Mode::Broadcast { lines, row, col, status_filter } => {
+            let targets = app.broadcast_targets(Actor::Local, *status_filter).len();
+            // The zero case is carried by **words**, not by a colour. The
+            // C36 audit flagged the first draft's conditional `accent()`
+            // title: C12 says a modal title is `ink()`, no other dialog
+            // varies its title token by state, and §2's attention idiom is
+            // reversal rather than recolouring. Saying "no panes" outright
+            // is both unmissable and inside the existing contracts — the
+            // same "words beat a colour" instinct C16's bar text follows.
+            let who = match targets {
+                0 => " broadcast → no panes ".to_string(),
+                1 => " broadcast → 1 pane ".to_string(),
+                n => format!(" broadcast → {n} panes "),
+            };
+            let mut title = vec![Span::styled(who, theme::ink())];
+            // C27's rule, verbatim: the tier glyph carries its own C5
+            // colour, because "a bare `ink()` glyph would read as no tier
+            // at all". The first draft discarded the style and printed a
+            // colourless ◆ (audit D3).
+            if let Some(tier) = status_filter {
+                let (glyph, style, _) = theme::status_style(*tier);
+                title.push(Span::styled(format!("{glyph} "), style));
+            }
+            let inner = modal_frame(f, body, rect, Line::from(title));
+            let rendered: Vec<Line> = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if i == *row {
+                        Line::from(rename_field(l, *col))
+                    } else {
+                        Line::from(l.clone())
+                    }
+                })
+                .collect();
             f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
         }
         Mode::Picker { selection, filter, cwd, on_cwd } => {
@@ -3278,6 +3350,44 @@ mod tests {
         );
     }
 
+    /// C36/C9: the composer's list, its column figure, and — the part that
+    /// matters — its **yield order**. At the 100-col floor with the
+    /// needs-you segment up, trailing pairs drop, so the order is a safety
+    /// property rather than a style choice: `↵ send` and `Esc cancel` must
+    /// still be on the bar when the fleet is busy, which is exactly when
+    /// someone is composing a broadcast. (The C36 audit found C9 had never
+    /// been amended for this mode and nothing pinned the list.)
+    #[test]
+    fn hint_pairs_broadcast_leads_with_the_two_that_must_not_yield() {
+        let mode = Mode::Broadcast {
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+            status_filter: None,
+        };
+        let pairs = hint_pairs(&mode, false, false, false, false);
+        assert_eq!(
+            pairs,
+            p(&[
+                ("↵", "send"),
+                ("Esc", "cancel"),
+                ("Tab", "who gets it"),
+                ("Shift+↵", "new line"),
+                ("type", "message"),
+            ]),
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        assert_eq!(cols, 74, "C36 quotes 74 columns");
+
+        // The property the order exists for: with the needs-you segment up
+        // at the floor, what survives is send and cancel.
+        let right_w = " ◆ 3 needs you · Alt+a  BROADCAST ".chars().count() as u16 - 1;
+        let shown = super::fit_hint_pairs(&pairs, right_w, 100);
+        assert!(shown >= 2, "at least send and cancel survive a busy fleet");
+        assert_eq!(pairs[0], one("↵", "send"));
+        assert_eq!(pairs[1], one("Esc", "cancel"));
+    }
+
     /// C27/C9: the roster's own list, and the 68-column number the contract
     /// quotes — it has to fit beside the right segment at the 100-col floor,
     /// which is the only reason the number is in the contract at all. Note
@@ -4261,6 +4371,7 @@ mod tests {
             ("picker", Action::QuickLaunch),
             ("activity feed", Action::ToggleFeed),
             ("fleet roster", Action::ToggleRoster),
+            ("broadcast composer", Action::ToggleBroadcast),
             ("rename dialog", Action::RenameTab),
             ("scroll mode", Action::ScrollMode),
             ("copy mode", Action::CopyMode),
@@ -4475,6 +4586,7 @@ mod tests {
                 Mode::Help { .. } => Some("help overlay"),
                 Mode::Feed { .. } => Some("activity feed"),
                 Mode::Roster { .. } => Some("fleet roster"),
+                Mode::Broadcast { .. } => Some("broadcast composer"),
                 Mode::Search { .. } => Some("scrollback search"),
             }
         }
@@ -4497,6 +4609,12 @@ mod tests {
             Mode::Help { top: 0 },
             Mode::Feed { offset: 0 },
             Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None },
+            Mode::Broadcast {
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                status_filter: None,
+            },
             Mode::Search { copy_cursor: None },
         ];
         let names: Vec<&str> = chrome_buffers().iter().map(|(n, _)| *n).collect();

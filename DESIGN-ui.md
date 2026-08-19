@@ -4337,6 +4337,126 @@ manual bookkeeping. The C9 hint bar's Normal seven **gain nothing** (the
 
 **Config.** One new `NAMES` entry, `focus_alternate`.
 
+### C36 — Broadcast composer (`Alt+'`) — [Added 2026-08-19, comparative UX review F3]
+
+**The gap.** `roost send --all` has existed since the fleet-features round and
+was **CLI-only by design, no TUI key**. So the one verb roost is uniquely
+positioned for — say the same thing to every agent at once — was the one thing
+you had to leave roost to do. zellij's sync-input-to-tab is among its
+most-cited features and it isn't even aimed at agents; roost had the better
+version of it, built, and unreachable from the keyboard.
+
+**Not a sticky sync mode, and that is the design.** The obvious shape — a
+mode where every keystroke goes to every pane — is rejected. It is the
+unguarded-destructive shape U1 exists to prevent: you would have to *notice a
+mode indicator* to avoid typing a stray `Alt+q` into five agents, and U1's
+whole lesson is that a fleet-wide action must not depend on the user
+remembering what mode they are in. C36 is one composed message and one
+deliberate send.
+
+**The guard is the visible blast radius.** The dialog's title is
+`broadcast → N panes`, live: it moves as `Tab` cycles the status filter, and
+at zero it says **`broadcast → no panes`** outright. That count is the safety
+affordance — *not* a confirm-twice.
+
+*The zero case is carried by words, not by a colour.* The first draft styled
+the title `accent()` at zero; the design audit flagged it as unsanctioned —
+C12 specifies a modal title as `ink()`, no other dialog varies its title token
+by state, and §2's attention idiom is reversal rather than recolouring.
+Amending C12 for one dialog would have been the wrong trade when the words can
+simply say it, which is also unmissable in a way a colour is not. The tier
+glyph, by contrast, *does* carry its own C5 colour — C27's rule verbatim,
+since "a bare `ink()` glyph would read as no tier at all" — and the first
+draft discarded that style, which the same audit caught. A count you read at the moment of commit tells you something a
+second keypress cannot: **who**, and how many. The confirm-twice idiom (U1,
+U22) is right for closing one busy pane, where the question is "are you sure";
+here the question is "sure about whom", and only a count answers it.
+
+For that to be a guard rather than a decoration, the number and the send must
+come from **one predicate**: `App::broadcast_targets(actor, status)` — alive,
+not the float, within the actor's authority, matching the filter. The title
+counts it; the send writes to it. A guard that lies would be worse than none,
+so the two cannot be separate code paths. Pinned by
+`the_target_count_is_the_set_that_actually_receives`.
+
+**`Tab` is C27's filter, shared.** The composer and the roster cycle the same
+`ROSTER_STATUS_CYCLE` through the same `cycle_status_filter` — extracted here
+rather than copied, because the composer is showing a *count* for the filter
+it names, and a filter that meant something subtly different in each surface
+would make that count unreadable. "Send to the three panes that are `◆`" is
+now one gesture, and it composes two surfaces that already existed.
+
+**Keys are C32's.** `Enter` sends · `Shift+Enter` (or `Ctrl+Enter`, **or
+`Alt+Enter`**) breaks a line · `Tab`/`Shift+Tab` cycle the targets · `Esc`
+walks away having sent nothing · `Ctrl+U`/`Ctrl+W` and the motion keys are
+Rename's vocabulary. Multi-line matters: agent prompts are, and a composer
+that could only carry one line would push people back to the CLI for exactly
+the messages worth broadcasting.
+
+*This contract's first draft said "exactly C32's" and was wrong by one:*
+C32's `Alt+Enter` carve-out was `PaneEdit`-only, so on Terminal.app — where
+Shift+Enter arrives as `Alt+Enter` (README's CSI-u note) — the one chord that
+should break a line opened the quick-launch picker and **discarded the
+composed message**. Found by this contract's own design audit; the carve-out
+now covers both modes through one shared `broadcast_break`.
+
+**Capped at `BROADCAST_MAX_LINES`** (= C32's `NOTE_MAX_LINES`). The dialog is
+`lines + 2` rows tall and never scrolls, so an uncapped message pushes its own
+rows and the caret off the body with nothing to bring them back. At the cap
+the break is *refused* rather than partially applied: losing the split is
+recoverable, losing the text under it is not.
+
+**It submits.** Unlike `roost send --all`, where `--enter` is opt-in because a
+script may want to stage text, the composer always appends `\r`. A human who
+typed a message and pressed Enter has expressed the intent; typing into five
+agents and leaving five prompts un-submitted does the tedious half of the job
+and skips the half you opened it for.
+
+**Audited as `Actor::Local`** — a third actor variant beside `Fleet` and
+`Pane(id)`, added by this contract. It reaches every pane like `Fleet` and
+authenticates nothing (no token resolves to it; pressing a key inside roost
+*is* the credential). Separate purely for the audit trail: a keyboard
+broadcast logged as `fleet` would be indistinguishable from a token holder's,
+and attribution is that log's whole value. The C20 feed comes free, since it
+renders the same `ctl` lines — exactly one per broadcast, the property the
+control path already pins.
+
+**Chord.** `Alt+'`, which neighbours C35's `Alt+;`: the fleet's two
+punctuation verbs — go back, and speak to everyone. Punctuation costs the §8
+letter pool nothing (C35's amendment), so the leader key's trigger **still**
+has not fired.
+
+**Chrome.** §8 gains row 22. C15's `FLEET` group gains one row after the feed.
+C9's mode word gains `BROADCAST` and the composer gets its own pair list —
+**74 columns**, ordered `↵ send` · `Esc cancel` · `Tab who gets it` ·
+`Shift+↵ new line` · `type message`.
+
+That order is a safety property, not a style choice. 74 plus the 33-column
+needs-you segment overflows the 100-column floor, and U6's rule is that list
+order *is* yield order, so trailing pairs drop exactly when the fleet is busy
+— which is exactly when someone is composing a broadcast. The two that must
+survive therefore lead: what the dialog does, and how to leave without doing
+it. `type message` trails because a text field you are already typing into is
+the pair whose absence costs least. The motion keys are deliberately **not**
+on this bar, on C24's precedent: an eighth pair would push `Esc` off, and a
+bar that drops its escape hatch to advertise a convenience has its priorities
+backwards. They are C13/C32's shared vocabulary and the C15 overlay teaches
+them. Pinned by
+`hint_pairs_broadcast_leads_with_the_two_that_must_not_yield`. The dialog is C12's frame at C13's 44-column width — deliberately
+not wider, because the eye should be on the title's count, not sweeping a wide
+field. The Normal-mode seven gain nothing.
+
+**C12/U8 — the composer is a modal, and had to be told so.** Its first draft
+omitted `Mode::Broadcast` from `App::modal_active`, which is U8(b) verbatim:
+a click moved focus *under* the open dialog, and a paste landed in the **pane
+behind it**. Someone composing a fleet-wide message and pasting a snippet
+would have silently typed it into whichever agent happened to be focused. The
+highest-severity finding of this contract's design audit, and the reason
+`modal_active` is the single list every modal must join rather than a
+behaviour each one implements.
+
+**Config.** One new `NAMES` entry, `toggle_broadcast`.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -4383,6 +4503,7 @@ reason: one physical chord, two spellings on the wire. Reported from real
 use on macOS, where the unshifted arm was claiming the event first and row
 20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
+| 22 | `Alt+'` | **broadcast: type once, send to every pane (`Tab` picks who)** | C36 |
 
 [Amended 2026-08-19, C34: this table is still the canonical *list* of what
 roost binds by default, but it is no longer what the chrome *prints*. The
