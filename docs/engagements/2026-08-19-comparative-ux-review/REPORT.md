@@ -19,7 +19,7 @@ Findings are ordered by value-per-cost, not severity.
 
 ---
 
-## F1 · High · The help overlay and hint bar hard-code the default chords
+## F1 · High · **RESOLVED 2026-08-19 (C34)** · The help overlay and hint bar hard-code the default chords
 
 **What.** `config.json` can disable or remap any `Alt` chord
 (`ui::input::Keymap`, `translate_with` — `input.rs:602`), and `App` holds the
@@ -59,11 +59,29 @@ including user-defined custom commands, and lists commands that have *no* key
 bound so they stay discoverable. zellij's status bar renders the actual bound
 keys for the current mode — remap a key and the bar changes with it.
 
-**Fix shape.** Make a help row and a hint pair carry an `Action`, not a chord
-string; render the chord by reverse-lookup through the live keymap (defaults
-overlaid with overrides). A disabled chord's row drops out. Group titles, row
-order, descriptions, the yield order and the ≤80-column rule are all
-untouched — only the left column becomes computed. Then
+**What shipped (DESIGN-ui.md C34).** A help row and a hint pair carry
+`Action`s, not chord strings, and the chord is resolved through
+`input::effective_bindings` — the same default-plus-overrides merge
+`translate_with` dispatches on. Group titles, row order, descriptions, the
+yield order and the ≤80-column rule are untouched; only the key column became
+computed.
+
+Three things the implementation turned up that the finding did not predict:
+
+- **One physical chord had to be collapsed to one entry, three different
+  ways** — uppercase-delivery letter twins, shifted-punctuation twins, and
+  shift states no match arm ever tested (`Alt+Shift+1` is not a binding, it
+  is an unguarded arm). Rules 1 and 2 are mirror images and, left symmetric,
+  deleted both halves of every letter pair.
+- **A compact family spelling has to give way.** `Alt+←↓↑→ / hjkl` is a
+  shorthand for the *default* chords; printed unconditionally it would be
+  exactly the stale spelling this finding is about, merely wider. It now
+  prints only while every member holds its default, and enumerates otherwise.
+- **A row can now vanish silently.** A row naming an unbound action renders
+  nothing, where the old literal row stayed visible and merely lied. That is
+  quieter, so it got a gate of its own.
+
+Then
 `every_bound_chord_is_documented_in_the_keymap` can be restated as a real
 sweep over the *effective* map (`default_keymap()` overlaid with the config's
 overrides) rather than a hand-kept literal list — the assertion that was
@@ -405,27 +423,25 @@ Recorded so a future pass doesn't "improve" these toward the comparison tools:
 
 ## Suggested order
 
-**Done.** F2 + F8 — shipped together as C33 (`Alt+Shift+hjkl` moves a pane
-within its tab). One change closed both: the redundant chords F2 found were
-the chords F8's missing verb needed.
+**Done.** F2 + F8 as **C33** (`Alt+Shift+hjkl` moves a pane within its tab —
+one change closed both, since the redundant chords F2 found were the chords
+F8's missing verb needed). F1 as **C34** (the chrome reads the live keymap),
+which also retired the const-vs-const documentation gate for a real sweep.
 
 **Next.**
 
-1. **F1** (surfaces read the live keymap) — highest value, self-contained, and
-   it unblocks F5's descriptions and F11's `roost keys`. C33 also left it a
-   concrete first task: the documentation gate is still a hand-kept list of
-   chord literals, extended by hand for C33 because it structurally could not
-   notice four newly bound chords.
-2. **F7** (leader key) — its stated trigger has fired; building it before F3
+1. **F7** (leader key) — its stated trigger has fired; building it before F3
    and F6 stops each from spending a scarce chord under pressure. Note C33
    spent four chords that were previously wasted, so the squeeze is slightly
    looser than when this report was written — but the unshifted pool is
    unchanged and still empty.
-3. **F3** (broadcast in the TUI) and **F6** (back) — the two verbs the fleet
+2. **F3** (broadcast in the TUI) and **F6** (back) — the two verbs the fleet
    most obviously wants.
-4. **F4** (declare a fleet) — largest, and the one that needs a stance
+3. **F4** (declare a fleet) — largest, and the one that needs a stance
    decision before any code.
-5. **F5**, **F9**, **F10**, **F11** as capacity allows.
+4. **F5**, **F9**, **F10**, **F11** as capacity allows. F5 (custom commands)
+   and F11 (`roost keys`) both got cheaper: `effective_bindings` is the table
+   each of them needed, and it exists now.
 
 ## Sources
 

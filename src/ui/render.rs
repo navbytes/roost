@@ -14,8 +14,9 @@ use crate::core::app::{
     TabSummary,
 };
 use crate::core::status::AgentStatus;
-use crate::core::layout::{self, PaneRect};
+use crate::core::layout::{self, Dir, PaneRect};
 use crate::ports::PaneBackend;
+use crate::ui::input::{self, Action, Keymap};
 use crate::ui::mouse;
 use crate::ui::theme;
 
@@ -117,109 +118,152 @@ fn draw_too_small(f: &mut Frame, area: Rect) {
 /// (`App::resume_command_line` is Some) — adds `y copy resume` to the dead
 /// branch, ahead of `Alt+w`/`Alt+q` in the yield order: those two are
 /// discoverable everywhere, `y` exists only on this bar.
+/// **[F1, 2026-08-19]** Pairs are `(String, &'static str)` now, and every
+/// **Alt** key on this bar is resolved from the live keymap rather than
+/// compiled in — the hint bar had the same defect as the help overlay, and
+/// it is the surface a user reads *most*, on every frame.
+///
+/// Mode-local keys (`hjkl`, `v/V`, `Esc`, `↑↓`, `n/N` …) stay literal, and
+/// that is not an oversight: config.json's grammar is Alt chords only
+/// (`Chord::parse` requires the `alt+` prefix), so those keys cannot be
+/// remapped and cannot go stale. Only what can move is derived.
 fn hint_pairs(
     mode: &Mode,
     focused_dead: bool,
     resumable: bool,
     focused_raw: bool,
     help_scrolled: bool,
-) -> Vec<(&'static str, &'static str)> {
+    keymap: &Keymap,
+) -> Vec<(String, &'static str)> {
+    let b = input::effective_bindings(keymap);
+    // A literal pair: a key config.json cannot touch.
+    let lit = |k: &str, d: &'static str| (k.to_string(), d);
+    // An Alt pair, resolved. `None` — every chord for it disabled — drops
+    // the pair off the bar, the same rule the help overlay's rows follow.
+    let alt = |actions: &'static [Action], spelling: &'static str, d: &'static str| {
+        help_key_text(&HelpKey::Family(spelling, actions), &b).map(|k| (k, d))
+    };
     match mode {
         // C24: keyboard cursor + mouse drag — every Copy-mode key is on this
         // bar (a binding nothing advertises may as well not exist).
         Mode::Copy { .. } => vec![
-            ("hjkl", "move"),
-            ("w/b/e", "word"),
-            ("0/$", "ends"),
-            ("v/V", "mark"),
-            ("y/↵", "yank"),
+            lit("hjkl", "move"),
+            lit("w/b/e", "word"),
+            lit("0/$", "ends"),
+            lit("v/V", "mark"),
+            lit("y/↵", "yank"),
             // `o` opens the URL under the cursor — the keyboard half of Alt+click.
-            ("o", "open"),
-            ("drag", "select"),
-            ("Esc", "exit"),
+            lit("o", "open"),
+            lit("drag", "select"),
+            lit("Esc", "exit"),
         ],
         Mode::Help { .. } if help_scrolled => {
-            vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]
+            vec![lit("↑↓ PgUp/Dn", "read on"), lit("any other key", "close")]
         }
-        Mode::Help { .. } => vec![("Alt+?", "all keys"), ("any key", "close")],
+        Mode::Help { .. } => {
+            let mut pairs = Vec::new();
+            pairs.extend(alt(&[Action::Help], "Alt+?", "all keys"));
+            pairs.push(lit("any key", "close"));
+            pairs
+        }
         // 48 columns. Tab is Rename's one remaining target (C32).
         Mode::Rename { .. } => {
-            vec![("type", "tab name"), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
+            vec![lit("type", "tab name"), lit("←→", "move"), lit("↵", "save"), lit("Esc", "cancel")]
         }
         // C32 (combined), 72 columns. `Shift+↵` names the break — descend
         // from the name row, split inside the note (Ctrl/Alt+↵ are
         // unhinted synonyms, same rule as every alias on this bar).
         Mode::PaneEdit { .. } => vec![
-            ("type", "name / note"),
-            ("↵", "save"),
-            ("Shift+↵", "new line"),
-            ("↑↓←→", "move"),
-            ("Esc", "cancel"),
+            lit("type", "name / note"),
+            lit("↵", "save"),
+            lit("Shift+↵", "new line"),
+            lit("↑↓←→", "move"),
+            lit("Esc", "cancel"),
         ],
         // 71 columns, inside the floor. `j/k` are filter text now, not on
         // this bar.
         Mode::Picker { .. } => vec![
-            ("↑↓", "choose"),
-            ("↵", "open"),
-            ("1..9", "launch"),
-            ("type", "filter"),
-            ("←→", "dir"),
-            ("Esc", "cancel"),
+            lit("↑↓", "choose"),
+            lit("↵", "open"),
+            lit("1..9", "launch"),
+            lit("type", "filter"),
+            lit("←→", "dir"),
+            lit("Esc", "cancel"),
         ],
         // 59 columns — comfortably inside the 100-col floor alongside the
         // right segment.
         Mode::Scroll => vec![
-            ("↑↓", "scroll"),
-            ("PgUp/Dn", "page"),
-            ("/", "search"),
-            ("n/N", "next"),
-            ("Esc", "exit"),
+            lit("↑↓", "scroll"),
+            lit("PgUp/Dn", "page"),
+            lit("/", "search"),
+            lit("n/N", "next"),
+            lit("Esc", "exit"),
         ],
         // The search prompt's own list. `↵ keep`/`Esc cancel` are the two
         // exits and lead the yield order; the hits-walking pair trails
         // because it's the one that keeps working after the prompt closes
         // (and is advertised again on the Scroll list once it does).
         Mode::Search { .. } => {
-            vec![("type", "filter"), ("↵", "keep"), ("Esc", "cancel"), ("n/N", "next")]
+            vec![lit("type", "filter"), lit("↵", "keep"), lit("Esc", "cancel"), lit("n/N", "next")]
         }
         Mode::Feed { .. } => vec![
-            ("↑↓", "select"),
-            ("PgUp/Dn", "page"),
-            ("↵", "go to pane"),
-            ("q/Esc", "close"),
+            lit("↑↓", "select"),
+            lit("PgUp/Dn", "page"),
+            lit("↵", "go to pane"),
+            lit("q/Esc", "close"),
         ],
         // 68 columns, inside the 100-col floor beside the right segment. `q`
         // is deliberately absent (the roster filters as you type, so a
         // letter is filter text, U20's rule) — `Esc` is the way out.
         Mode::Roster { .. } => vec![
-            ("↑↓", "select"),
-            ("PgUp/Dn", "page"),
-            ("↵", "go to pane"),
-            ("type", "filter"),
-            ("Tab", "status"),
-            ("Esc", "close"),
+            lit("↑↓", "select"),
+            lit("PgUp/Dn", "page"),
+            lit("↵", "go to pane"),
+            lit("type", "filter"),
+            lit("Tab", "status"),
+            lit("Esc", "close"),
         ],
         Mode::Normal if focused_dead => {
-            let mut pairs = vec![("↵", "relaunch"), ("f", "fresh — drops resume")];
+            let mut pairs = vec![lit("↵", "relaunch"), lit("f", "fresh — drops resume")];
             if resumable {
-                pairs.push(("y", "copy resume"));
+                pairs.push(lit("y", "copy resume"));
             }
-            pairs.extend([("Alt+w", "close"), ("Alt+q", "quit")]);
+            pairs.extend(alt(&[Action::ClosePane], "Alt+w", "close"));
+            pairs.extend(alt(&[Action::Quit], "Alt+q", "quit"));
             pairs
         }
-        Mode::Normal if focused_raw => vec![("Alt+Shift+p", "exit raw")],
+        // C23: the one pair on a raw pane's bar — and the one whose
+        // accuracy matters most, since it is the only advertised way out of
+        // a mode that swallows everything else. Resolved, not compiled in.
+        Mode::Normal if focused_raw => alt(&[Action::ToggleRaw], "Alt+Shift+p", "exit raw")
+            .into_iter()
+            .collect(),
         // Pairs drop whole from the right, so `Alt+? keys` leads (the way to
         // everything else once it's dropped) and `Alt+r rename` trails
         // (costs nothing when gone — still findable under Alt+?).
-        Mode::Normal => vec![
-            ("Alt+?", "keys"),
-            ("Alt+n", "new"),
-            ("Alt+↵", "launch"),
-            ("Alt+s", "stack"),
-            ("Alt+←↓↑→", "focus"),
-            ("Alt+w", "close"),
-            ("Alt+r", "edit"),
-        ],
+        Mode::Normal => {
+            // C9's seven, in the yield order U6 fixed: pairs drop whole from
+            // the right, so `Alt+? keys` leads (the route to everything a
+            // narrow bar just dropped) and the edit pair trails.
+            const FOCUS: &[Action] = &[
+                Action::Focus(Dir::Left),
+                Action::Focus(Dir::Down),
+                Action::Focus(Dir::Up),
+                Action::Focus(Dir::Right),
+            ];
+            [
+                alt(&[Action::Help], "Alt+?", "keys"),
+                alt(&[Action::NewPane], "Alt+n", "new"),
+                alt(&[Action::QuickLaunch], "Alt+↵", "launch"),
+                alt(&[Action::ToggleStack], "Alt+s", "stack"),
+                alt(FOCUS, "Alt+←↓↑→", "focus"),
+                alt(&[Action::ClosePane], "Alt+w", "close"),
+                alt(&[Action::EditPane], "Alt+r", "edit"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        }
     }
 }
 
@@ -318,11 +362,11 @@ fn hint_pair_cols(key: &str, label: &str) -> u16 {
 
 /// How many leading hint pairs fit alongside the right segment (C9 yield
 /// order: pairs drop whole, from the right, before the segment ever yields).
-fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u16) -> usize {
+fn fit_hint_pairs<K: AsRef<str>>(hints: &[(K, &'static str)], right_w: u16, width: u16) -> usize {
     let budget = width.saturating_sub(right_w);
     let mut used = 0u16;
     for (i, (key, label)) in hints.iter().enumerate() {
-        let w = hint_pair_cols(key, label);
+        let w = hint_pair_cols(key.as_ref(), label);
         if used + w > budget {
             return i;
         }
@@ -360,10 +404,11 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // and "◆ N needs you" the fleet's primary signal — trailing pairs drop
     // whole until the segment fits.
     let focused_raw = app.is_raw(app.focused);
-    let (help_visible, help_total) = help_scroll_extent(app.body_area());
+    let (help_visible, help_total) = help_scroll_extent(app.body_area(), app.keymap());
     let resumable = app.focused_dead() && app.resume_command_line(app.focused).is_some();
     let scrolled = help_visible < help_total;
-    let hints = hint_pairs(&app.mode, app.focused_dead(), resumable, focused_raw, scrolled);
+    let hints =
+        hint_pairs(&app.mode, app.focused_dead(), resumable, focused_raw, scrolled, app.keymap());
     // U3: Scroll mode's right segment shows where in history the view sits
     // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
     // can never report a phantom row the grid refused (U9's overshoot).
@@ -537,24 +582,75 @@ fn help_key_prefix(key: &str) -> String {
     format!(" {key:<18}")
 }
 
+/// F1: the chord table with no config.json applied — what `HelpKey::Family`
+/// compares against to decide whether its compact spelling is still true.
+/// Memoized; it is a pure function of the compiled-in table.
+fn default_bindings() -> &'static [(String, Action)] {
+    static B: std::sync::OnceLock<Vec<(String, Action)>> = std::sync::OnceLock::new();
+    B.get_or_init(|| input::effective_bindings(&Keymap::default()))
+}
+
+/// F1: the chords currently bound to `actions`, joined by `" / "` in the
+/// order the row declared them. `None` when **none** of them is bound —
+/// every chord disabled in config.json — which drops the row from the
+/// overlay entirely: a row teaching a key that no longer exists is worse
+/// than no row.
+fn join_chords(actions: &[Action], bindings: &[(String, Action)]) -> Option<String> {
+    let mut labels = Vec::new();
+    for a in actions {
+        for (label, bound) in bindings {
+            if bound == a {
+                labels.push(label.as_str());
+            }
+        }
+    }
+    (!labels.is_empty()).then(|| labels.join(" / "))
+}
+
+/// F1: a row's key column, resolved against the live keymap.
+fn help_key_text(key: &HelpKey, bindings: &[(String, Action)]) -> Option<String> {
+    match key {
+        HelpKey::Text(s) => Some((*s).to_string()),
+        HelpKey::Chords(actions) => join_chords(actions, bindings),
+        HelpKey::Family(spelling, actions) => {
+            let live = join_chords(actions, bindings)?;
+            // The compact spelling is a display shorthand for the default
+            // chords and nothing else. If any member moved, it is no longer
+            // a description of this keymap, so enumerate what is really
+            // bound instead.
+            if join_chords(actions, default_bindings()).as_deref() == Some(live.as_str()) {
+                Some((*spelling).to_string())
+            } else {
+                Some(live)
+            }
+        }
+    }
+}
+
 /// C15: the keymap's content width — the widest row
 /// (key column + description). One *column* of it; the overlay may draw two
 /// side by side, which `help_layout` decides. Pure so the sizing has a
 /// unit-test seam.
-fn help_content_width() -> u16 {
-    HELP_GROUPS
+fn help_content_width(lines: &[HelpLine]) -> u16 {
+    lines
         .iter()
-        .flat_map(|g| g.rows.iter())
-        .map(|(k, d)| mouse::display_width(&help_key_prefix(k)) + mouse::display_width(d))
+        .filter_map(|l| match l {
+            HelpLine::Row(k, d) => {
+                Some(mouse::display_width(&help_key_prefix(k)) + mouse::display_width(d))
+            }
+            HelpLine::Head(_) => None,
+        })
         .max()
         .unwrap_or(0)
 }
 
 /// C15: one line of the drawn keymap — a group heading or a chord row.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The row's key column is owned rather than `&'static`: since F1 it is
+/// resolved from the live keymap, not compiled in.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum HelpLine {
     Head(&'static str),
-    Row(&'static str, &'static str),
+    Row(String, &'static str),
 }
 
 /// C15: the keymap flattened into drawable lines, in group order — each
@@ -562,11 +658,25 @@ enum HelpLine {
 /// underlined heading is the separator (C6's idiom, exactly as C27's roster
 /// stacks its groups), and a blank row per group would cost six rows of a
 /// table that already has to scroll on a short terminal.
-fn help_lines() -> Vec<HelpLine> {
+fn help_lines(keymap: &Keymap) -> Vec<HelpLine> {
+    let bindings = input::effective_bindings(keymap);
     let mut out = Vec::new();
     for g in HELP_GROUPS {
+        let rows: Vec<HelpLine> = g
+            .rows
+            .iter()
+            .filter_map(|r| {
+                help_key_text(&r.key, &bindings).map(|k| HelpLine::Row(k, r.desc))
+            })
+            .collect();
+        // A group whose every chord was disabled in config.json contributes
+        // no heading either — an empty titled block advertises a section
+        // that isn't there.
+        if rows.is_empty() {
+            continue;
+        }
         out.push(HelpLine::Head(g.title));
-        out.extend(g.rows.iter().map(|(k, d)| HelpLine::Row(k, d)));
+        out.extend(rows);
     }
     out
 }
@@ -581,6 +691,11 @@ struct HelpLayout {
     height: u16,
     /// The dialog rect's size, borders included.
     size: (u16, u16),
+    /// One column's content width. Carried rather than recomputed by the
+    /// drawer: since F1 deriving it means resolving every row against the
+    /// keymap, and doing that twice per frame to reach the same number is
+    /// waste the old `&'static` table didn't have to think about.
+    content: u16,
 }
 
 /// C15: lay the keymap out for `body`, taking **the
@@ -595,9 +710,9 @@ struct HelpLayout {
 ///
 /// The split point is a group boundary, chosen to balance the two columns,
 /// so a group is never sawn in half across the gutter.
-fn help_layout(body: Rect) -> HelpLayout {
-    let lines = help_lines();
-    let content = help_content_width();
+fn help_layout(body: Rect, keymap: &Keymap) -> HelpLayout {
+    let lines = help_lines(keymap);
+    let content = help_content_width(&lines);
     let avail_h = body.height.saturating_sub(2); // the dialog's borders
     let one_fits = lines.len() as u16 <= avail_h;
     let two_wide_enough = content * 2 + HELP_GUTTER + 2 <= body.width;
@@ -613,7 +728,7 @@ fn help_layout(body: Rect) -> HelpLayout {
     // +1 so a row that spends the full content width still has a column of
     // air before the right border (the key column already opens with one).
     let w = content * columns.len() as u16 + HELP_GUTTER * (columns.len() as u16 - 1) + 3;
-    HelpLayout { columns, height, size: (w.min(body.width), height + 2) }
+    HelpLayout { columns, height, size: (w.min(body.width), height + 2), content }
 }
 
 /// Columns are separated by this many blank cells.
@@ -627,7 +742,7 @@ const HELP_GUTTER: u16 = 2;
 /// uppercase, `quiet()`, underlined across its own column so it reads as a
 /// rule rather than as another chord.
 fn draw_help_columns(f: &mut Frame, layout: &HelpLayout, top: usize, inner: Rect) {
-    let content = help_content_width();
+    let content = layout.content;
     for (i, column) in layout.columns.iter().enumerate() {
         let x = inner.x + i as u16 * (content + HELP_GUTTER);
         if x >= inner.x + inner.width {
@@ -664,8 +779,8 @@ fn draw_help_columns(f: &mut Frame, layout: &HelpLayout, top: usize, inner: Rect
 /// the keymap can move. Equal values mean the whole table is on screen and
 /// the scroll keys have nothing to do (`Mode::Help`'s "any key closes it"
 /// then holds unamended).
-pub fn help_scroll_extent(body: Rect) -> (usize, usize) {
-    let l = help_layout(body);
+pub fn help_scroll_extent(body: Rect, keymap: &Keymap) -> (usize, usize) {
+    let l = help_layout(body, keymap);
     (l.height as usize, l.columns.iter().map(|c| c.len()).max().unwrap_or(0))
 }
 
@@ -684,10 +799,50 @@ fn help_split_point(lines: &[HelpLine]) -> usize {
         .unwrap_or(lines.len())
 }
 
+/// C15/F1: how a help row spells its key column.
+///
+/// Before F1 every row was a `(&'static str, &'static str)` tuple, so the
+/// overlay's chord spellings were compiled-in literals and a `config.json`
+/// remap left them teaching a chord that no longer worked. A row now
+/// declares the *actions* it documents, and the spelling is resolved from
+/// the live keymap at draw time.
+enum HelpKey {
+    /// Spell whatever chords are bound to these actions, joined by `" / "`.
+    /// The common case.
+    Chords(&'static [Action]),
+    /// A compact hand-written spelling for a family too wide to enumerate
+    /// (`Alt+←↓↑→ / hjkl`, `Alt+1..9 / Alt+0`).
+    ///
+    /// The actions are still declared, so the coverage sweep sees every one
+    /// of them — only the *rendering* is by hand. And the compact form is
+    /// printed **only while every action in the family is still on its
+    /// default chord**: remap one and the row enumerates the real chords
+    /// instead, because `Alt+←↓↑→ / hjkl` would otherwise be exactly the
+    /// stale spelling F1 exists to abolish, merely a wider one.
+    Family(&'static str, &'static [Action]),
+    /// Binds nothing: a legend line or a control-CLI reference row.
+    Text(&'static str),
+}
+
+struct HelpRow {
+    key: HelpKey,
+    desc: &'static str,
+}
+
+const fn chords(actions: &'static [Action], desc: &'static str) -> HelpRow {
+    HelpRow { key: HelpKey::Chords(actions), desc }
+}
+const fn family(spelling: &'static str, actions: &'static [Action], desc: &'static str) -> HelpRow {
+    HelpRow { key: HelpKey::Family(spelling, actions), desc }
+}
+const fn reference(key: &'static str, desc: &'static str) -> HelpRow {
+    HelpRow { key: HelpKey::Text(key), desc }
+}
+
 /// C15: one titled block of the keymap.
 struct HelpGroup {
     title: &'static str,
-    rows: &'static [(&'static str, &'static str)],
+    rows: &'static [HelpRow],
 }
 
 /// C15/§8: the canonical key table, **grouped by what
@@ -720,88 +875,143 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "PANES",
         rows: &[
-            ("Alt+n", "new shell pane (auto split)"),
-            ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
-            ("Alt+←↓↑→ / hjkl", "move focus (←/→ continue to next/prev tab at an edge)"),
-            ("Alt+r", "name + parking note (first line shows on the badge)"),
-            ("Alt+w", "close pane (confirm if busy)"),
-            ("Alt+u", "reopen the last pane or tab you closed"),
-            ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
+            chords(&[Action::NewPane], "new shell pane (auto split)"),
+            chords(&[Action::QuickLaunch], "picker: 1..9 launch · type filters · ←→ recent cwd"),
+            family(
+                "Alt+←↓↑→ / hjkl",
+                &[
+                    Action::Focus(Dir::Left),
+                    Action::Focus(Dir::Down),
+                    Action::Focus(Dir::Up),
+                    Action::Focus(Dir::Right),
+                ],
+                "move focus (←/→ continue to next/prev tab at an edge)",
+            ),
+            chords(&[Action::EditPane], "name + parking note (first line shows on the badge)"),
+            chords(&[Action::ClosePane], "close pane (confirm if busy)"),
+            chords(&[Action::Undo], "reopen the last pane or tab you closed"),
+            chords(&[Action::ToggleRaw], "raw pass-through for this pane (same chord exits)"),
         ],
     },
     HelpGroup {
         title: "LAYOUT",
         rows: &[
-            ("Alt+Shift+←↓↑→", "resize along that axis"),
+            family(
+                "Alt+Shift+←↓↑→",
+                &[
+                    Action::Resize { horizontal: true, grow: false },
+                    Action::Resize { horizontal: false, grow: true },
+                    Action::Resize { horizontal: false, grow: false },
+                    Action::Resize { horizontal: true, grow: true },
+                ],
+                "resize along that axis",
+            ),
             // C33 sits directly under the resize row on purpose: the two
             // shifted-direction chords are adjacent, so the one thing a
             // reader has to learn — arrows resize, letters carry the pane —
-            // is visible in a single glance rather than inferred. Same
-            // adjacency argument C28 makes in the TABS group.
-            ("Alt+Shift+hjkl", "move this pane that way (swaps with its neighbour)"),
-            ("Alt+s", "toggle split ⇄ stack"),
-            ("Alt+o", "flip this split's orientation"),
-            ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-            ("Alt+z", "zoom the focused pane (view only)"),
-            ("Alt+f", "floating scratch shell"),
+            // is visible in a single glance rather than inferred. This is a
+            // *different* criterion from C28's adjacency in TABS (which
+            // seats a row under its own unshifted form): C33 seats itself
+            // under the chord it is most likely to be confused with. Same
+            // tactic, different rule — see C33 in DESIGN-ui.md.
+            family(
+                "Alt+Shift+hjkl",
+                &[
+                    Action::MovePane(Dir::Left),
+                    Action::MovePane(Dir::Down),
+                    Action::MovePane(Dir::Up),
+                    Action::MovePane(Dir::Right),
+                ],
+                "move this pane that way (swaps with its neighbour)",
+            ),
+            chords(&[Action::ToggleStack], "toggle split ⇄ stack"),
+            chords(&[Action::FlipSplit], "flip this split's orientation"),
+            chords(&[Action::CycleLayout], "cycle layout: grid / main+stack / all-stack"),
+            chords(&[Action::ToggleZoom], "zoom the focused pane (view only)"),
+            chords(&[Action::ToggleFloat], "floating scratch shell"),
         ],
     },
     HelpGroup {
         title: "TABS",
         rows: &[
-            ("Alt+t", "new tab"),
-            ("Alt+1..9 / Alt+0", "go to that tab / the last one"),
-            ("Alt+i / Alt+m", "previous / next tab (wraps)"),
+            chords(&[Action::NewTab], "new tab"),
+            family(
+                "Alt+1..9 / Alt+0",
+                &[
+                    Action::GoToTab(0),
+                    Action::GoToTab(1),
+                    Action::GoToTab(2),
+                    Action::GoToTab(3),
+                    Action::GoToTab(4),
+                    Action::GoToTab(5),
+                    Action::GoToTab(6),
+                    Action::GoToTab(7),
+                    Action::GoToTab(8),
+                    Action::LastTab,
+                ],
+                "go to that tab / the last one",
+            ),
+            chords(&[Action::PrevTab, Action::NextTab], "previous / next tab (wraps)"),
             // C28: the shifted siblings sit directly under the chords they
             // are the shifted form of — the pairing *is* the explanation.
-            ("Alt+Shift+i / +m", "move this pane to the previous / next tab"),
-            ("Alt+Shift+r", "rename this tab"),
+            family(
+                "Alt+Shift+i / +m",
+                &[
+                    Action::MovePaneToTab { forward: false },
+                    Action::MovePaneToTab { forward: true },
+                ],
+                "move this pane to the previous / next tab",
+            ),
+            chords(&[Action::RenameTab], "rename this tab"),
         ],
     },
     HelpGroup {
         title: "FLEET",
         rows: &[
-            ("Alt+a", "jump to the next pane that needs you"),
-            ("Alt+Shift+a", "roster: every pane, grouped by tab · Tab filters by status"),
-            ("Alt+e", "activity feed (status / spawns / exits / control)"),
+            chords(&[Action::JumpAttention], "jump to the next pane that needs you"),
+            chords(
+                &[Action::ToggleRoster],
+                "roster: every pane, grouped by tab · Tab filters by status",
+            ),
+            chords(&[Action::ToggleFeed], "activity feed (status / spawns / exits / control)"),
         ],
     },
     HelpGroup {
         title: "READING",
         rows: &[
-            ("Alt+PgUp", "scroll back — `/` searches, n/N step the hits"),
-            ("Alt+c", "copy mode: hjkl wbe 0$ · v/V select · y yank · o URL"),
+            chords(&[Action::ScrollMode], "scroll back — `/` searches, n/N step the hits"),
+            chords(&[Action::CopyMode], "copy mode: hjkl wbe 0$ · v/V select · y yank · o URL"),
         ],
     },
     HelpGroup {
         title: "SESSION",
         rows: &[
-            ("Alt+/", "toggle the hint bar"),
-            ("Alt+?", "this keymap"),
-            ("Alt+q", "quit (workspace saved; sessions live)"),
+            chords(&[Action::ToggleHints], "toggle the hint bar"),
+            chords(&[Action::Help], "this keymap"),
+            chords(&[Action::Quit], "quit (workspace saved; sessions live)"),
         ],
     },
     HelpGroup {
         title: "READING THE SCREEN",
         rows: &[
-            ("status", "⠋ working ◆ needs you ○ waiting · idle ✕ exited"),
+            reference("status", "⠋ working ◆ needs you ○ waiting · idle ✕ exited"),
             // D2 (PR #46 design audit, C29 amendment): widened for native
             // selection — a chord (Shift+click) gets a row here by C15's
             // own stated rule ("Alt+click gets its own row because it is a
             // chord"), applied to the mouse verb that is now also one.
-            ("mouse", "wheel scrolls · click focuses · drag/2x/3x/shift selects"),
-            ("Alt+click / o", "open the URL under the pointer / copy cursor"),
+            reference("mouse", "wheel scrolls · click focuses · drag/2x/3x/shift selects"),
+            reference("Alt+click / o", "open the URL under the pointer / copy cursor"),
         ],
     },
     HelpGroup {
         title: "CONTROL CLI",
         rows: &[
-            ("<id>", "same id shown on each pane's badge"),
-            ("roost send <id> \"text\"", "type into that pane (--enter submits)"),
-            ("roost read <id>", "print its current screen"),
-            ("roost status", "list every pane and its status"),
-            ("roost spawn ADAPTER", "launch a new pane"),
-            ("roost wait <id>", "block until its turn ends"),
+            reference("<id>", "same id shown on each pane's badge"),
+            reference("roost send <id> \"text\"", "type into that pane (--enter submits)"),
+            reference("roost read <id>", "print its current screen"),
+            reference("roost status", "list every pane and its status"),
+            reference("roost spawn ADAPTER", "launch a new pane"),
+            reference("roost wait <id>", "block until its turn ends"),
         ],
     },
 ];
@@ -835,7 +1045,7 @@ pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
         .find(|pr| pr.id == app.focused)
         .map(|pr| pr.rect)
         .unwrap_or(body);
-    dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
+    dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds(), app.keymap())
 }
 
 /// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
@@ -850,6 +1060,7 @@ fn dialog_rect(
     anchor: Rect,
     rows: usize,
     cwds: &[std::path::PathBuf],
+    keymap: &Keymap,
 ) -> Option<Rect> {
     match mode {
         // Copy mode has no centered overlay — the cursor/selection are
@@ -872,7 +1083,7 @@ fn dialog_rect(
             Some(centered_near(anchor, body, picker_dialog_width(cwds), h))
         }
         Mode::Help { .. } => {
-            let (w, h) = help_layout(body).size;
+            let (w, h) = help_layout(body, keymap).size;
             Some(centered_near(anchor, body, w, h))
         }
         Mode::Feed { .. } => {
@@ -900,7 +1111,7 @@ fn draw_mode_overlay<B: PaneBackend>(
     spinner: char,
 ) {
     let Some(rect) =
-        dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
+        dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds(), app.keymap())
     else {
         return;
     };
@@ -992,8 +1203,8 @@ fn draw_mode_overlay<B: PaneBackend>(
             // fit and scrolled when even those don't. `HELP_GROUPS` is the
             // single source and `help_layout` the single geometry — the same
             // call `dialog_rect` above made for this rect.
-            let layout = help_layout(body);
-            let (visible, total) = help_scroll_extent(body);
+            let layout = help_layout(body, app.keymap());
+            let (visible, total) = help_scroll_extent(body, app.keymap());
             let top = (*top).min(total.saturating_sub(visible));
             // The title says how to leave — and, only when the table doesn't
             // fit, that there is more of it and which keys reach it. A
@@ -2160,9 +2371,36 @@ mod tests {
         age_word, badge_text, blit_screen, cell_in_selection, centered_near,
         collapsed_name_style, collapsed_row_spans, corner_badge, dialog_rect, feed_entry_spans,
         feed_window, help_content_width, help_layout, help_lines, hint_bar_right_spans,
-        hint_pairs, mode_word, push_tab_spans, should_place_cursor, stack_header_text,
-        state_word, BadgeNote, HelpLine, HELP_GROUPS,
+        mode_word, push_tab_spans, should_place_cursor, stack_header_text,
+        state_word, BadgeNote, HelpKey, HelpLine, HELP_GROUPS,
     };
+    use crate::ui::input::{self, Action, Keymap};
+
+    /// F1: `hint_pairs` takes a keymap now. Every test below is about the
+    /// *content* of a bar rather than about remapping, so they go through
+    /// this default-keymap wrapper and keep reading as they did — the
+    /// remap behaviour has its own tests.
+    fn hint_pairs(
+        mode: &Mode,
+        focused_dead: bool,
+        resumable: bool,
+        focused_raw: bool,
+        help_scrolled: bool,
+    ) -> Vec<(String, &'static str)> {
+        super::hint_pairs(mode, focused_dead, resumable, focused_raw, help_scrolled,
+            &Keymap::default())
+    }
+
+    /// Build an expected pair list. Keys are owned since F1 (they are
+    /// resolved, not compiled in), and writing `.to_string()` on every
+    /// literal would drown the lists this file is meant to make readable.
+    fn p(pairs: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
+        pairs.iter().map(|(k, d)| ((*k).to_string(), *d)).collect()
+    }
+
+    fn one(k: &str, d: &'static str) -> (String, &'static str) {
+        (k.to_string(), d)
+    }
     use crate::core::app::{Mode, RenameTarget, RosterRow};
     use crate::core::status::AgentStatus;
     use crate::ui::mouse;
@@ -2466,9 +2704,9 @@ mod tests {
             col: 0,
             pane: 1,
         };
-        let one = dialog_rect(&mk(1), body, body, 0, &[]).unwrap();
+        let one = dialog_rect(&mk(1), body, body, 0, &[], &Keymap::default()).unwrap();
         assert_eq!((one.width, one.height), (44, 4), "name row + one note line");
-        let five = dialog_rect(&mk(5), body, body, 0, &[]).unwrap();
+        let five = dialog_rect(&mk(5), body, body, 0, &[], &Keymap::default()).unwrap();
         assert_eq!(five.height, 8);
     }
 
@@ -2718,7 +2956,7 @@ mod tests {
         // last, `Alt+r rename` last so it drops first.
         assert_eq!(
             hint_pairs(&Mode::Normal, false, false, false, false),
-            vec![
+            p(&[
                 ("Alt+?", "keys"),
                 ("Alt+n", "new"),
                 ("Alt+↵", "launch"),
@@ -2726,7 +2964,7 @@ mod tests {
                 ("Alt+←↓↑→", "focus"),
                 ("Alt+w", "close"),
                 ("Alt+r", "edit"),
-            ],
+            ]),
         );
     }
 
@@ -2739,19 +2977,19 @@ mod tests {
     #[test]
     fn the_help_pair_is_the_last_hint_to_yield_and_rename_the_first() {
         let pairs = hint_pairs(&Mode::Normal, false, false, false, false);
-        let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
+        let pw = |x: &(String, &str)| super::hint_pair_cols(&x.0, x.1);
         let right_w = " ◆ 1 needs you · Alt+a  NORMAL ".chars().count() as u16 - 1;
 
         let shown = super::fit_hint_pairs(&pairs, right_w, 120);
         assert_eq!(shown, pairs.len() - 1, "exactly one pair yields at 120 cols");
-        assert!(!pairs[..shown].contains(&("Alt+r", "edit")), "the edit pair drops first");
-        assert!(pairs[..shown].contains(&("Alt+?", "keys")), "the help pair survives");
+        assert!(!pairs[..shown].contains(&one("Alt+r", "edit")), "the edit pair drops first");
+        assert!(pairs[..shown].contains(&one("Alt+?", "keys")), "the help pair survives");
 
         // Squeeze until a single pair is left: it must be the help pair.
         let width = right_w + pw(&pairs[0]);
         let shown = super::fit_hint_pairs(&pairs, right_w, width);
         assert_eq!(shown, 1);
-        assert_eq!(pairs[0], ("Alt+?", "keys"));
+        assert_eq!(pairs[0], one("Alt+?", "keys"));
     }
 
     /// C24's list as amended by U17: the mode's whole vocabulary, and it
@@ -2762,7 +3000,7 @@ mod tests {
         let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false, false, false);
         assert_eq!(
             pairs,
-            vec![
+            p(&[
                 ("hjkl", "move"),
                 ("w/b/e", "word"),
                 ("0/$", "ends"),
@@ -2771,7 +3009,7 @@ mod tests {
                 ("o", "open"),
                 ("drag", "select"),
                 ("Esc", "exit"),
-            ],
+            ]),
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
         let right_w = super::hint_bar_right_spans(None, None, None, "COPY")
@@ -2787,7 +3025,7 @@ mod tests {
     #[test]
     fn hint_pairs_focused_raw_normal_is_exactly_one_pair() {
         // C23: every other hint would be a lie — nothing else is intercepted.
-        assert_eq!(hint_pairs(&Mode::Normal, false, false, true, false), vec![("Alt+Shift+p", "exit raw")]);
+        assert_eq!(hint_pairs(&Mode::Normal, false, false, true, false), p(&[("Alt+Shift+p", "exit raw")]));
     }
 
     #[test]
@@ -2798,7 +3036,7 @@ mod tests {
         // not a raw-exit hint nothing would honor.
         assert_eq!(
             hint_pairs(&Mode::Normal, true, false, true, false),
-            vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")],
+            p(&[("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]),
         );
     }
 
@@ -2824,18 +3062,20 @@ mod tests {
     /// description decides it.
     #[test]
     fn help_content_width_fits_the_widest_row() {
-        let widest = HELP_GROUPS
+        // F1: measured over the *resolved* lines, since a row's key column
+        // is no longer a compiled-in literal.
+        let lines = help_lines(&Keymap::default());
+        let widest = lines
             .iter()
-            .flat_map(|g| g.rows.iter())
-            .max_by_key(|(k, d)| {
-                mouse::display_width(&super::help_key_prefix(k)) + mouse::display_width(d)
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => {
+                    Some(mouse::display_width(&super::help_key_prefix(k)) + mouse::display_width(d))
+                }
+                HelpLine::Head(_) => None,
             })
+            .max()
             .expect("the keymap has rows");
-        assert_eq!(
-            help_content_width(),
-            mouse::display_width(&super::help_key_prefix(widest.0))
-                + mouse::display_width(widest.1),
-        );
+        assert_eq!(help_content_width(&lines), widest);
     }
 
     #[test]
@@ -2844,7 +3084,7 @@ mod tests {
         // `centered_near` clamps the placement — same as every other modal
         // (C15's anchoring is unchanged).
         let body = Rect::new(0, 1, 30, 20);
-        let (w, h) = help_layout(body).size;
+        let (w, h) = help_layout(body, &Keymap::default()).size;
         assert!(w <= body.width);
         let rect = centered_near(body, body, w, h);
         assert!(rect.width <= body.width && rect.height <= body.height);
@@ -2889,7 +3129,7 @@ mod tests {
         // via the SAME `hint_pair_cols` the draw path uses — a +3/+4 drift
         // here once let the whole segment drop at widths 111-116 (D2).
         let pairs = hint_pairs(&Mode::Normal, false, false, false, false);
-        let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
+        let pw = |x: &(String, &str)| super::hint_pair_cols(&x.0, x.1);
         let all_w: u16 = pairs.iter().map(&pw).sum();
 
         // Roomy bar, no right segment: everything fits.
@@ -2921,12 +3161,12 @@ mod tests {
         let dead = hint_pairs(&Mode::Normal, true, false, false, false);
         assert_eq!(
             dead,
-            vec![
+            p(&[
                 ("↵", "relaunch"),
                 ("f", "fresh — drops resume"),
                 ("Alt+w", "close"),
                 ("Alt+q", "quit"),
-            ],
+            ]),
         );
         // A live pane never offers "relaunch"; a dead one never offers "new".
         assert_ne!(dead, hint_pairs(&Mode::Normal, false, false, false, false));
@@ -2935,13 +3175,13 @@ mod tests {
         // lives on this bar). A session-less pane must NOT advertise it.
         assert_eq!(
             hint_pairs(&Mode::Normal, true, true, false, false),
-            vec![
+            p(&[
                 ("↵", "relaunch"),
                 ("f", "fresh — drops resume"),
                 ("y", "copy resume"),
                 ("Alt+w", "close"),
                 ("Alt+q", "quit"),
-            ],
+            ]),
         );
     }
 
@@ -2965,12 +3205,12 @@ mod tests {
     fn hint_pairs_feed_mode_lists_every_key_the_feed_answers_to() {
         assert_eq!(
             hint_pairs(&Mode::Feed { offset: 0 }, false, false, false, false),
-            vec![
+            p(&[
                 ("↑↓", "select"),
                 ("PgUp/Dn", "page"),
                 ("↵", "go to pane"),
                 ("q/Esc", "close"),
-            ],
+            ]),
         );
     }
 
@@ -2985,14 +3225,14 @@ mod tests {
         let pairs = hint_pairs(&mode, false, false, false, false);
         assert_eq!(
             pairs,
-            vec![
+            p(&[
                 ("↑↓", "select"),
                 ("PgUp/Dn", "page"),
                 ("↵", "go to pane"),
                 ("type", "filter"),
                 ("Tab", "status"),
                 ("Esc", "close"),
-            ],
+            ]),
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
         assert_eq!(cols, 81, "C27 quotes 81 columns");
@@ -3007,9 +3247,9 @@ mod tests {
     #[test]
     fn the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls() {
         let whole = hint_pairs(&Mode::Help { top: 0 }, false, false, false, false);
-        assert_eq!(whole, vec![("Alt+?", "all keys"), ("any key", "close")]);
+        assert_eq!(whole, p(&[("Alt+?", "all keys"), ("any key", "close")]));
         let scrolled = hint_pairs(&Mode::Help { top: 0 }, false, false, false, true);
-        assert_eq!(scrolled, vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]);
+        assert_eq!(scrolled, p(&[("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]));
         let cols: u16 = scrolled.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
         assert!(cols < 100, "the scrolled row still fits beside the right segment: {cols}");
     }
@@ -3045,9 +3285,9 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(tab[0], ("type", "tab name"));
-        assert_eq!(editor[0], ("type", "name / note"));
-        assert!(editor.iter().any(|p| *p == ("Shift+\u{21b5}", "new line")) || editor.iter().any(|p| p.1 == "new line"));
+        assert_eq!(tab[0], one("type", "tab name"));
+        assert_eq!(editor[0], one("type", "name / note"));
+        assert!(editor.iter().any(|x| x.1 == "new line"));
     }
 
     #[test]
@@ -3269,26 +3509,167 @@ mod tests {
     // -- C15/§8 help overlay ---------------------------------------------------
 
     /// §8's table and the drawn keymap are the same table: **every chord
-    /// roost binds appears in the overlay**. This is the check the old ≤20
-    /// cap made impossible to state — under a cap, a new chord's options
-    /// were "merge a row" or "go undocumented", and the second is exactly
-    /// what a keymap must never do.
+    /// roost binds is documented by the overlay**.
+    ///
+    /// **[Rewritten by F1, 2026-08-19.]** This used to be a hand-kept list
+    /// of 27 chord literals checked for containment against the hand-kept
+    /// `HELP_GROUPS` text — both `const`, neither derived from
+    /// `default_chord_action`. It therefore proved only that one constant
+    /// mentioned strings another constant was written to contain: it said
+    /// nothing about the running binary, and a newly bound chord passed it
+    /// silently unless someone remembered to extend the list by hand. C33
+    /// bound four chords and had to do exactly that.
+    ///
+    /// It is a real sweep now, over the same merged table `translate_with`
+    /// dispatches on. It checks **actions rather than chord spellings**,
+    /// deliberately: a row may legitimately draw a family shorthand
+    /// (`Alt+←↓↑→ / hjkl`) that contains no single chord as a substring, and
+    /// that shorthand is only ever drawn while it is an accurate
+    /// description of the defaults (`help_key_text`, pinned by
+    /// `a_family_spelling_gives_way_once_one_of_its_chords_moves`). So
+    /// "which chords does this row account for" is a question about the
+    /// actions it declares, and asking it that way needs no list to keep.
     #[test]
     fn every_bound_chord_is_documented_in_the_keymap() {
-        let text = HELP_GROUPS
+        let documented: Vec<Action> = HELP_GROUPS
             .iter()
             .flat_map(|g| g.rows.iter())
-            .map(|(k, d)| format!("{k} {d}"))
+            .flat_map(|r| match &r.key {
+                HelpKey::Chords(a) | HelpKey::Family(_, a) => *a,
+                HelpKey::Text(_) => &[],
+            })
+            .copied()
+            .collect();
+        for (label, action) in input::effective_bindings(&Keymap::default()) {
+            assert!(
+                documented.contains(&action),
+                "roost binds {label} to {action:?} and no keymap row documents it",
+            );
+        }
+    }
+
+    /// The converse, and the failure mode the coverage sweep cannot see: a
+    /// row that declares an action **nothing binds** renders nothing and
+    /// vanishes from the overlay silently. Before F1 that could not happen
+    /// (rows were literal text, so a stale row stayed visible and merely
+    /// lied); now a typo'd or orphaned row is invisible instead, which is
+    /// quieter and therefore worth a gate of its own.
+    #[test]
+    fn every_documented_row_names_an_action_roost_actually_binds() {
+        let bound: Vec<Action> =
+            input::effective_bindings(&Keymap::default()).into_iter().map(|(_, a)| a).collect();
+        for group in HELP_GROUPS {
+            for row in group.rows {
+                let (HelpKey::Chords(actions) | HelpKey::Family(_, actions)) = &row.key else {
+                    continue; // a legend or CLI reference row names no chord
+                };
+                for action in *actions {
+                    assert!(
+                        bound.contains(action),
+                        "{}'s row {:?} declares {action:?}, which no chord binds — \
+                         the row would silently vanish from the overlay",
+                        group.title,
+                        row.desc,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The property that makes the coverage gate above sufficient rather
+    /// than merely necessary: a row draws **every** chord bound to the
+    /// actions it declares, so a second chord for a documented action
+    /// documents itself. Verified by remapping a free key onto `Quit` and
+    /// watching the existing row grow — no table edit involved.
+    ///
+    /// This is why the gate can check actions instead of keeping a list of
+    /// chord spellings: the two questions "is this action documented" and
+    /// "is this chord documented" only came apart under the old `&'static`
+    /// table, where a row named one fixed chord no matter what was bound.
+    #[test]
+    fn a_second_chord_for_a_documented_action_documents_itself() {
+        let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+x": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let quit_row = help_lines(&keymap)
+            .into_iter()
+            .find_map(|l| match l {
+                HelpLine::Row(k, d) if d.starts_with("quit") => Some(k),
+                _ => None,
+            })
+            .expect("a quit row");
+        assert_eq!(quit_row, "Alt+q / Alt+x", "the row grew the new chord on its own");
+    }
+
+    /// F1's headline behaviour, end to end: remap a chord in config.json and
+    /// the overlay teaches the new key and stops teaching the old one.
+    /// Before F1 both surfaces were `&'static str` literals and this was
+    /// impossible — the README's own escape-hatch example produced a roost
+    /// whose `Alt+?` still taught `Alt+f`.
+    #[test]
+    fn a_remapped_chord_is_taught_at_its_new_key() {
+        let (keymap, diagnostics) = Keymap::parse(
+            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            "config.json",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let drawn = help_lines(&keymap)
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Head(_) => None,
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        for chord in [
-            "Alt+n", "Alt+Enter", "Alt+r", "Alt+w", "Alt+u", "Alt+Shift+p", "Alt+Shift+←↓↑→",
-            "Alt+s", "Alt+o", "Alt+g", "Alt+z", "Alt+f", "Alt+t", "Alt+1..9", "Alt+0", "Alt+i",
-            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a", "Alt+Shift+hjkl",
-            "Alt+e", "Alt+PgUp", "Alt+c", "Alt+/", "Alt+?", "Alt+q",
-        ] {
-            assert!(text.contains(chord), "the keymap must document {chord:?}");
-        }
+        assert!(drawn.contains("Alt+v floating scratch shell"), "taught at its new chord");
+        assert!(
+            !drawn.contains("Alt+f "),
+            "and not at the old one — that key forwards to the pane now",
+        );
+    }
+
+    /// A row whose every chord is disabled leaves the overlay rather than
+    /// standing there naming nothing.
+    #[test]
+    fn a_fully_disabled_row_leaves_the_overlay() {
+        let (keymap, _) = Keymap::parse(r#"{"keys": {"alt+e": "disable"}}"#, "config.json");
+        let drawn = help_lines(&keymap)
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Head(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!drawn.contains("activity feed"), "the feed row is gone with its chord");
+    }
+
+    /// A `Family`'s compact spelling is a shorthand for the default chords
+    /// and nothing else, so it survives only while they all hold. Move one
+    /// and the row enumerates what is really bound — otherwise
+    /// `Alt+←↓↑→ / hjkl` would be precisely the stale spelling F1 abolished,
+    /// just a wider one.
+    #[test]
+    fn a_family_spelling_gives_way_once_one_of_its_chords_moves() {
+        let compact = |keymap: &Keymap| {
+            help_lines(keymap).iter().any(|l| {
+                matches!(l, HelpLine::Row(k, _) if k == "Alt+←↓↑→ / hjkl")
+            })
+        };
+        assert!(compact(&Keymap::default()), "the defaults render compactly");
+
+        let (moved, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+b": "focus_left"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(!compact(&moved), "a moved member retires the shorthand");
+        let drawn = help_lines(&moved)
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, _) => Some(k.clone()),
+                HelpLine::Head(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drawn.contains("Alt+b"), "the real chord is named instead");
     }
 
     /// C28's pair is documented as a pair, directly under the chords it is
@@ -3296,15 +3677,22 @@ mod tests {
     /// makes the tab chord take the pane with you").
     #[test]
     fn the_tabs_group_teaches_the_move_pane_chords_under_their_unshifted_siblings() {
+        // F1: rows resolve their key column from the keymap, so this walks
+        // the drawn lines rather than the const table — which is also the
+        // stronger check: adjacency in the *table* would not prove adjacency
+        // in what the reader sees.
+        let bindings = input::effective_bindings(&Keymap::default());
         let tabs = HELP_GROUPS.iter().find(|g| g.title == "TABS").expect("a TABS group");
-        let step = tabs.rows.iter().position(|(k, _)| *k == "Alt+i / Alt+m").expect("the step row");
-        let move_row = tabs
+        let keys: Vec<String> = tabs
             .rows
             .iter()
-            .position(|(k, _)| k.starts_with("Alt+Shift+i"))
-            .expect("the move row");
+            .filter_map(|r| super::help_key_text(&r.key, &bindings))
+            .collect();
+        let step = keys.iter().position(|k| k == "Alt+i / Alt+m").expect("the step row");
+        let move_row =
+            keys.iter().position(|k| k.starts_with("Alt+Shift+i")).expect("the move row");
         assert_eq!(move_row, step + 1, "the shifted pair sits directly under the unshifted one");
-        assert!(tabs.rows[move_row].1.contains("move this pane"));
+        assert!(tabs.rows[move_row].desc.contains("move this pane"));
     }
 
     /// U23: the legend is the C5 glyph table, not a hand-copied lookalike —
@@ -3312,13 +3700,13 @@ mod tests {
     /// teaching a symbol roost no longer draws.
     #[test]
     fn help_legend_row_matches_the_theme_glyph_table() {
-        let (key, desc) = HELP_GROUPS
-            .iter()
-            .flat_map(|g| g.rows.iter())
-            .find(|(k, _)| *k == "status")
-            .copied()
+        let desc = help_lines(&Keymap::default())
+            .into_iter()
+            .find_map(|l| match l {
+                HelpLine::Row(k, d) if k == "status" => Some(d),
+                _ => None,
+            })
             .expect("the overlay carries a status-glyph legend row");
-        assert_eq!(key, "status");
         assert_eq!(desc, super::status_legend_text());
         // The two glyphs the live-QA drive greps the frame for.
         assert!(
@@ -3332,17 +3720,18 @@ mod tests {
     /// columns that fit, never columns for their own sake.
     #[test]
     fn help_takes_the_fewest_columns_that_fit() {
-        let lines = help_lines().len() as u16;
-        let content = help_content_width();
+        let all = help_lines(&Keymap::default());
+        let lines = all.len() as u16;
+        let content = help_content_width(&all);
 
         // Tall enough for the whole table: one column, however wide the
         // terminal is.
         let tall = Rect::new(0, 1, content * 4, lines + 2);
-        assert_eq!(help_layout(tall).columns.len(), 1, "a body that fits stays one column");
+        assert_eq!(help_layout(tall, &Keymap::default()).columns.len(), 1, "a body that fits stays one column");
 
         // Too short, and wide enough for two: two columns.
         let wide = Rect::new(0, 1, content * 2 + super::HELP_GUTTER + 2, lines / 2 + 2);
-        let two = help_layout(wide);
+        let two = help_layout(wide, &Keymap::default());
         assert_eq!(two.columns.len(), 2, "a short, wide body splits");
         assert_eq!(
             two.columns.iter().map(|c| c.len()).sum::<usize>(),
@@ -3353,9 +3742,9 @@ mod tests {
         // Too short and too narrow: one column, and it scrolls (see
         // `help_scroll_extent`).
         let narrow = Rect::new(0, 1, content + 2, 12);
-        let one = help_layout(narrow);
+        let one = help_layout(narrow, &Keymap::default());
         assert_eq!(one.columns.len(), 1);
-        let (visible, total) = super::help_scroll_extent(narrow);
+        let (visible, total) = super::help_scroll_extent(narrow, &Keymap::default());
         assert!(visible < total, "a narrow, short body scrolls rather than dropping rows");
     }
 
@@ -3363,9 +3752,9 @@ mod tests {
     /// with half its chords in the other is worse than either arrangement.
     #[test]
     fn a_second_column_always_starts_on_a_group_heading() {
-        let content = help_content_width();
+        let content = help_content_width(&help_lines(&Keymap::default()));
         let wide = Rect::new(0, 1, content * 2 + super::HELP_GUTTER + 2, 14);
-        let layout = help_layout(wide);
+        let layout = help_layout(wide, &Keymap::default());
         assert_eq!(layout.columns.len(), 2);
         assert!(
             matches!(layout.columns[1].first(), Some(HelpLine::Head(_))),
@@ -3384,11 +3773,11 @@ mod tests {
     #[test]
     fn help_fits_the_eighty_column_floor_and_reaches_every_row() {
         let body = Rect::new(0, 1, 80, 22); // 80×24 minus the two bars
-        let layout = help_layout(body);
+        let layout = help_layout(body, &Keymap::default());
         assert!(layout.size.0 <= 80, "the keymap is {} cols wide", layout.size.0);
         assert!(layout.size.1 <= body.height);
-        let (visible, total) = super::help_scroll_extent(body);
-        assert_eq!(total, help_lines().len(), "one column at the floor holds the whole table");
+        let (visible, total) = super::help_scroll_extent(body, &Keymap::default());
+        assert_eq!(total, help_lines(&Keymap::default()).len(), "one column at the floor holds the whole table");
         assert!(visible >= 1);
     }
 
@@ -3484,14 +3873,14 @@ mod tests {
         );
         assert_eq!(
             pairs,
-            vec![
+            p(&[
                 ("↑↓", "choose"),
                 ("↵", "open"),
                 ("1..9", "launch"),
                 ("type", "filter"),
                 ("←→", "dir"),
                 ("Esc", "cancel"),
-            ],
+            ]),
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
         assert_eq!(cols, 71, "C9: the picker list must stay inside the 100-col floor");
@@ -3508,10 +3897,12 @@ mod tests {
     /// actually has to know they exist.
     #[test]
     fn help_rows_document_every_mouse_verb() {
-        let text = HELP_GROUPS
+        let text = help_lines(&Keymap::default())
             .iter()
-            .flat_map(|g| g.rows.iter())
-            .map(|(k, d)| format!("{k} {d}"))
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Head(_) => None,
+            })
             .collect::<Vec<_>>()
             .join("\n");
         for token in ["mouse", "wheel", "click", "drag", "2x", "3x", "shift", "Alt+click", "URL"] {
@@ -3525,7 +3916,7 @@ mod tests {
     /// stop. The reference rows are long; this is their guard rail.
     #[test]
     fn one_help_column_fits_the_eighty_column_floor() {
-        let w = help_layout(Rect::new(0, 1, 200, 200)).size.0;
+        let w = help_layout(Rect::new(0, 1, 200, 200), &Keymap::default()).size.0;
         assert!(w <= 80, "the keymap is {w} cols wide; the 80-col floor would clip it");
     }
 
@@ -3540,8 +3931,15 @@ mod tests {
             .iter()
             .find(|g| g.title == "CONTROL CLI")
             .expect("a CONTROL CLI group");
-        let text =
-            cli.rows.iter().map(|(k, d)| format!("{k} {d}")).collect::<Vec<_>>().join("\n");
+        let bindings = input::effective_bindings(&Keymap::default());
+        let text = cli
+            .rows
+            .iter()
+            .filter_map(|r| {
+                super::help_key_text(&r.key, &bindings).map(|k| format!("{k} {}", r.desc))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         for verb in ["roost send", "roost read", "roost status", "roost spawn", "roost wait"] {
             assert!(text.contains(verb), "the control-CLI group must mention {verb:?}");
         }
@@ -4549,7 +4947,7 @@ mod tests {
 
         // A 30-row terminal cannot hold the whole table, so the title has to
         // own up to it — the alternative is a list that just stops.
-        let (visible, total) = super::help_scroll_extent(app.body_area());
+        let (visible, total) = super::help_scroll_extent(app.body_area(), app.keymap());
         assert!(visible < total, "the fixture is genuinely scrolled");
         assert!(frame.contains(&format!("/{total}")), "the title counts the rows:\n{frame}");
         assert!(frame.contains("↑↓ more"), "…and names the keys that reach them:\n{frame}");
@@ -4768,7 +5166,7 @@ mod tests {
             let mut term = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
             term.draw(|f| super::draw(f, &mut app)).unwrap();
             // …and scrolled to its end, where `top` is at its largest.
-            let (visible, total) = super::help_scroll_extent(app.body_area());
+            let (visible, total) = super::help_scroll_extent(app.body_area(), app.keymap());
             app.mode = Mode::Help { top: total.saturating_sub(visible) };
             term.draw(|f| super::draw(f, &mut app)).unwrap();
         }
@@ -4918,3 +5316,4 @@ mod tests {
         );
     }
 }
+

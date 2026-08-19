@@ -4451,7 +4451,7 @@ impl<B: PaneBackend> App<B> {
     /// C15: the keymap's paging step — half its visible height, at least one
     /// row. Same rule as C20/C27's shared `overlay_page`.
     fn help_page(&self) -> isize {
-        (crate::ui::render::help_scroll_extent(self.body_area()).0 / 2).max(1) as isize
+        (crate::ui::render::help_scroll_extent(self.body_area(), &self.keymap).0 / 2).max(1) as isize
     }
 
     /// C15: move the keymap's window `delta` rows, clamped to the table.
@@ -4462,7 +4462,7 @@ impl<B: PaneBackend> App<B> {
     /// scroll key, so it falls through to "any key closes it" and the
     /// amendment stays invisible on any terminal that shows the whole table.
     fn help_scroll(&mut self, delta: isize) -> bool {
-        let (visible, total) = crate::ui::render::help_scroll_extent(self.body_area());
+        let (visible, total) = crate::ui::render::help_scroll_extent(self.body_area(), &self.keymap);
         let max = total.saturating_sub(visible) as isize;
         let Mode::Help { top } = &mut self.mode else { return false };
         let next = match delta {
@@ -7471,7 +7471,7 @@ mod tests {
     fn the_keymap_scrolls_on_a_short_terminal_and_still_closes_on_any_other_key() {
         use crossterm::event::{KeyCode, KeyEvent};
         let (mut app, _) = mk_app(shell_ws());
-        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area());
+        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area(), app.keymap());
         assert!(visible < total, "this fixture's body is too short for the whole keymap");
 
         app.apply(Action::Help);
@@ -7507,7 +7507,7 @@ mod tests {
         ws.tabs[0].name = "main".into();
         let (mut app, _) = mk_app(ws);
         app.on_resize(Size::new(120, 60), (0, 0));
-        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area());
+        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area(), app.keymap());
         assert_eq!(visible, total, "a tall body shows the whole keymap at once");
         for key in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Char('j')] {
             app.apply(Action::Help);
