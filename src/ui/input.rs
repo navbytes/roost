@@ -925,6 +925,20 @@ pub fn effective_bindings(keymap: &Keymap) -> Vec<(String, Action)> {
     out.into_iter().map(|(c, a)| (c.label(), a)).collect()
 }
 
+/// F1/C34: the chord a single action is on, for the chrome surfaces that
+/// name one chord in a sentence rather than listing a row's worth — C9's
+/// attention segment (`· Alt+a`), C16's dead-pane bar, C10's confirm
+/// flashes. `None` when the action has no chord at all (disabled in
+/// config.json), which those callers render by dropping the clause rather
+/// than naming a key that does nothing.
+///
+/// The *first* label in `Chord::order`, so a doubly-bound action names its
+/// arrow/specials form before its letter form — the same order the key
+/// table has always written.
+pub fn chord_for(keymap: &Keymap, action: Action) -> Option<String> {
+    effective_bindings(keymap).into_iter().find(|(_, a)| *a == action).map(|(l, _)| l)
+}
+
 /// Every `(code, shift)` the default table already treats as the *same*
 /// logical chord as `(code, shift)` itself — the terminal-delivery duality
 /// `default_chord_action` already carries for a handful of letters (p/P,

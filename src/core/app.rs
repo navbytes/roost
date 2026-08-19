@@ -703,6 +703,22 @@ impl<B: PaneBackend> App<B> {
     /// where it already installs the other startup-only pieces
     /// (`relayout`, the extension/socket flashes) — never by a test, which
     /// keeps `new`'s empty default: today's unconfigured behavior.
+    /// C34: the chord an action is currently on, for the C10 flashes that
+    /// name a key in a sentence. `None` when config.json disabled it —
+    /// callers drop the clause rather than instruct a key that does
+    /// nothing. The confirm flashes matter most here: "press X again to
+    /// close" naming a dead X is a guard that cannot be satisfied, which is
+    /// U1's hazard wearing a helpful face.
+    fn chord_label(&self, action: Action) -> Option<String> {
+        crate::ui::input::chord_for(&self.keymap, action)
+    }
+
+    /// The same, with the clause pre-formatted: `" · Alt+s"`-style inserts
+    /// collapse to nothing when the chord is unbound.
+    fn chord_clause(&self, action: Action, fmt: impl Fn(&str) -> String) -> String {
+        self.chord_label(action).map(|c| fmt(&c)).unwrap_or_default()
+    }
+
     pub fn set_keymap(&mut self, keymap: Keymap) {
         self.keymap = keymap;
     }
@@ -1960,9 +1976,10 @@ impl<B: PaneBackend> App<B> {
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
-            return Reply::err(format!(
-                "{verb} refused: not enough room to split; stack a pane with Alt+s first"
-            ));
+            let hint = self.chord_clause(Action::ToggleStack, |c| {
+                format!("; stack a pane with {c} first")
+            });
+            return Reply::err(format!("{verb} refused: not enough room to split{hint}"));
         };
         if let Some(text) = initial_input {
             let mut bytes = text.into_bytes();
@@ -3866,11 +3883,19 @@ impl<B: PaneBackend> App<B> {
         let armed = self.confirm_close.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
         if (is_busy || would_quit) && !armed {
             self.confirm_close = Some(Instant::now());
+            // C34: the chord you are being told to press again is resolved.
+            // Unbound (config.json disabled it) drops to "again", which is
+            // still true however the repeat arrives — the confirm is armed
+            // on the action, not on one key.
+            let again = self
+                .chord_label(Action::ClosePane)
+                .map(|c| format!("{c} again"))
+                .unwrap_or_else(|| "again".to_string());
             let msg = if would_quit {
-                "last pane — Alt+w again to quit roost".to_string()
+                format!("last pane — {again} to quit roost")
             } else {
                 // U2: name which agent the close would interrupt.
-                format!("{} busy — Alt+w again to close", self.display_name(id))
+                format!("{} busy — {again} to close", self.display_name(id))
             };
             self.set_confirm_flash(msg);
             return;
@@ -3912,7 +3937,11 @@ impl<B: PaneBackend> App<B> {
         if busy > 0 && !armed {
             self.confirm_quit = Some(Instant::now());
             let noun = if busy == 1 { "agent" } else { "agents" };
-            self.set_confirm_flash(format!("{busy} {noun} busy — Alt+q again to quit"));
+            let again = self
+                .chord_label(Action::Quit)
+                .map(|c| format!("{c} again"))
+                .unwrap_or_else(|| "again".to_string());
+            self.set_confirm_flash(format!("{busy} {noun} busy — {again} to quit"));
             return;
         }
         self.quit = true;
@@ -4278,7 +4307,9 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
         }
-        self.set_flash("no room to rearrange; stack a pane with Alt+s first");
+        let hint =
+            self.chord_clause(Action::ToggleStack, |c| format!("; stack a pane with {c} first"));
+        self.set_flash(format!("no room to rearrange{hint}"));
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -11707,6 +11738,40 @@ mod tests {
         app.apply(Action::ToggleZoom);
         assert!(!app.zoomed());
         assert_eq!(app.display_rects().len(), app.rects().len());
+    }
+
+    /// C34: the confirm flashes name the chord you are being told to press
+    /// again, and before C34 they spelled it as a literal — so under a
+    /// remap the guard instructed a key that does nothing. That is U1's
+    /// hazard wearing a helpful face: a confirmation that cannot be
+    /// satisfied by the key it names.
+    #[test]
+    fn the_close_confirm_names_the_live_chord() {
+        use crate::ui::input::Keymap;
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+v": "close_pane"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let (mut app, _) = mk_app(shell_ws());
+        app.set_keymap(keymap);
+        app.apply(Action::ClosePane); // last pane ⇒ arms the quit confirm
+        let flash = app.flash().unwrap_or_default().to_string();
+        assert!(flash.contains("Alt+v again"), "names the live chord: {flash}");
+        assert!(!flash.contains("Alt+w"), "and not the default: {flash}");
+    }
+
+    /// And with the chord disabled entirely the sentence stays true rather
+    /// than naming nothing: the confirm is armed on the *action*, so a
+    /// repeat by any route satisfies it.
+    #[test]
+    fn the_close_confirm_drops_the_chord_when_it_is_unbound() {
+        use crate::ui::input::Keymap;
+        let (keymap, _) = Keymap::parse(r#"{"keys": {"alt+w": "disable"}}"#, "config.json");
+        let (mut app, _) = mk_app(shell_ws());
+        app.set_keymap(keymap);
+        app.apply(Action::ClosePane);
+        let flash = app.flash().unwrap_or_default().to_string();
+        assert!(flash.contains("again to quit roost"), "still instructive: {flash}");
+        assert!(!flash.contains("Alt+"), "but names no dead key: {flash}");
     }
 
     // ---- C33: move a pane within its tab (Alt+Shift+hjkl) ---------------

@@ -141,7 +141,9 @@ fn hint_pairs(
     // An Alt pair, resolved. `None` — every chord for it disabled — drops
     // the pair off the bar, the same rule the help overlay's rows follow.
     let alt = |actions: &'static [Action], spelling: &'static str, d: &'static str| {
-        help_key_text(&HelpKey::Family(spelling, actions), &b).map(|k| (k, d))
+        // The hint bar has its own fit/yield machinery (pairs drop whole from
+        // the right), so a long label needs no elision here — C9 absorbs it.
+        help_key_text(&HelpKey::Family(spelling, actions), "", &b).map(|k| (k, d))
     };
     match mode {
         // C24: keyboard cursor + mouse drag — every Copy-mode key is on this
@@ -311,13 +313,20 @@ fn hint_bar_right_spans(
     query: Option<String>,
     position: Option<String>,
     word: &str,
+    jump_chord: Option<String>,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if let Some((n, needs_input)) = attention {
+        // C34: the chord is resolved, not spelled. C9's own amendment calls
+        // this segment "this feature's discoverability surface" — a surface
+        // that teaches a dead chord after a remap is worse than one that
+        // teaches nothing, so an unbound jump drops the `· chord` tail
+        // rather than naming a key that does nothing.
+        let tail = jump_chord.map(|c| format!(" · {c}")).unwrap_or_default();
         let (text, style) = if needs_input {
-            (format!("◆ {n} needs you · Alt+a"), theme::accent())
+            (format!("◆ {n} needs you{tail}"), theme::accent())
         } else {
-            (format!("○ {n} your turn · Alt+a"), theme::ink())
+            (format!("○ {n} your turn{tail}"), theme::ink())
         };
         spans.push(Span::styled(text, style));
         spans.push(Span::raw("  "));
@@ -428,6 +437,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         query,
         position,
         mode_word(&app.mode, app.zoomed(), focused_raw),
+        input::chord_for(app.keymap(), Action::JumpAttention),
     );
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
 
@@ -607,11 +617,52 @@ fn join_chords(actions: &[Action], bindings: &[(String, Action)]) -> Option<Stri
     (!labels.is_empty()).then(|| labels.join(" / "))
 }
 
+/// C15's 80-column floor: the width one *column* of the overlay may not
+/// exceed, or `centered_near` clamps and a description clips mid-word.
+const HELP_COL_FLOOR: u16 = 80;
+
+/// C34/C15: keep a resolved key column inside the floor by eliding **the
+/// key**, never the description.
+///
+/// Before C34 a row's key was authored text of known width, so the floor
+/// was a thing you checked once. It is derived now, and an enumerated
+/// family is unbounded: disabling `Alt+←` alone makes the focus row spell
+/// eight chords and pushes its column to 107, which at an 80-column
+/// terminal clips the description — the exact failure C15's width rule
+/// exists to prevent, reintroduced by the mechanism meant to make the row
+/// truthful. (Found by the design-supervisor audit of C34, measured rather
+/// than predicted.)
+///
+/// The key yields because the description is the row's irreplaceable half:
+/// a reader who sees two of eight chords still learns what the row is for
+/// and can widen the terminal for the rest, while a clipped description
+/// teaches nothing at any width. Elision lands on a `" / "` boundary so a
+/// chord is never shown half-spelled, and `…` marks that more exist. A
+/// single chord that still doesn't fit is left alone: that is authored
+/// width, not something this function created.
+fn elide_key(key: String, desc: &str) -> String {
+    let fits = |k: &str| {
+        mouse::display_width(&help_key_prefix(k)) + mouse::display_width(desc) <= HELP_COL_FLOOR
+    };
+    if fits(&key) {
+        return key;
+    }
+    let parts: Vec<&str> = key.split(" / ").collect();
+    (1..parts.len())
+        .rev()
+        .map(|n| format!("{} …", parts[..n].join(" / ")))
+        .find(|candidate| fits(candidate))
+        .unwrap_or(key)
+}
+
 /// F1: a row's key column, resolved against the live keymap.
-fn help_key_text(key: &HelpKey, bindings: &[(String, Action)]) -> Option<String> {
+fn help_key_text(key: &HelpKey, desc: &str, bindings: &[(String, Action)]) -> Option<String> {
     match key {
+        // Authored text of known width — the control-CLI block and the
+        // legends. Not elided: it names no chord this function resolved, so
+        // there is no " / " here that is safe to cut.
         HelpKey::Text(s) => Some((*s).to_string()),
-        HelpKey::Chords(actions) => join_chords(actions, bindings),
+        HelpKey::Chords(actions) => join_chords(actions, bindings).map(|k| elide_key(k, desc)),
         HelpKey::Family(spelling, actions) => {
             let live = join_chords(actions, bindings)?;
             // The compact spelling is a display shorthand for the default
@@ -621,7 +672,7 @@ fn help_key_text(key: &HelpKey, bindings: &[(String, Action)]) -> Option<String>
             if join_chords(actions, default_bindings()).as_deref() == Some(live.as_str()) {
                 Some((*spelling).to_string())
             } else {
-                Some(live)
+                Some(elide_key(live, desc))
             }
         }
     }
@@ -666,7 +717,7 @@ fn help_lines(keymap: &Keymap) -> Vec<HelpLine> {
             .rows
             .iter()
             .filter_map(|r| {
-                help_key_text(&r.key, &bindings).map(|k| HelpLine::Row(k, r.desc))
+                help_key_text(&r.key, r.desc, &bindings).map(|k| HelpLine::Row(k, r.desc))
             })
             .collect();
         // A group whose every chord was disabled in config.json contributes
@@ -1916,7 +1967,10 @@ fn draw_pane<B: PaneBackend>(
             lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
         }
         let resumable = app.resume_command_line(pr.id).is_some();
-        lines.push(Line::from(Span::raw(dead_bar_text(resumable))));
+        lines.push(Line::from(Span::raw(dead_bar_text(
+            resumable,
+            input::chord_for(app.keymap(), Action::ClosePane).as_deref(),
+        ))));
         let n = lines.len() as u16;
         let y = inner.y + inner.height.saturating_sub(n);
         let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
@@ -1933,10 +1987,16 @@ fn draw_pane<B: PaneBackend>(
 /// `y: copy resume` rides the bar only when the pane has a session pointer
 /// — same predicate as the hint bar's `resumable` (`App::resume_command_line`),
 /// so the two surfaces can't disagree about whether `y` does anything.
-fn dead_bar_text(resumable: bool) -> String {
+/// C34: `close` is resolved. This bar and the C9 hint bar one screen row
+/// below name the same chord, and before C34 only one of them derived it —
+/// so a remap made two surfaces on one screen disagree. An unbound close
+/// drops the clause; `Enter`/`f`/`y` stay literal because they are
+/// mode-local keys config.json cannot reach (C34's stated exemption).
+fn dead_bar_text(resumable: bool, close_chord: Option<&str>) -> String {
     let copy_hint = if resumable { " · y: copy resume" } else { "" };
+    let close = close_chord.map(|c| format!(" · {c}: close")).unwrap_or_default();
     format!(
-        " {} exited — Enter: relaunch/resume · f: fresh (drops resume){copy_hint} · Alt+w: close ",
+        " {} exited — Enter: relaunch/resume · f: fresh (drops resume){copy_hint}{close} ",
         theme::GLYPH_EXITED
     )
 }
@@ -2726,12 +2786,12 @@ mod tests {
     fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
         // U3: `↑N/M` rides inside the right segment (quiet), so C9's yield
         // machinery covers it — and it only exists when a position is given.
-        let spans = hint_bar_right_spans(None, None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(None, None, Some("↑12/300".into()), "SCROLL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "↑12/300 SCROLL ");
         assert_eq!(spans[0].style, theme::quiet());
 
-        let spans = hint_bar_right_spans(Some((2, true)), None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(Some((2, true)), None, Some("↑12/300".into()), "SCROLL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
     }
@@ -2741,12 +2801,12 @@ mod tests {
     /// a real ◆ still reads as more urgent.
     #[test]
     fn hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input() {
-        let spans = hint_bar_right_spans(Some((3, false)), None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, false)), None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "○ 3 your turn · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::ink());
 
-        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::accent());
@@ -2763,7 +2823,7 @@ mod tests {
         let lines: Vec<String> = ["alpha beta", "beta beta"].map(String::from).to_vec();
         let mut s = Search::over(lines, "beta", 1);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/beta{} 2/3 SEARCH ", theme::RENAME_CURSOR));
         assert_eq!(spans[0].style, theme::ink(), "the typed query is legible, not dim");
@@ -2773,7 +2833,7 @@ mod tests {
         // empty result is the answer, not the absence of one.
         s = Search::over(vec!["alpha beta".into()], "gamma", 0);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/gamma{} 0/0 SEARCH ", theme::RENAME_CURSOR));
 
@@ -3012,7 +3072,7 @@ mod tests {
             ]),
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        let right_w = super::hint_bar_right_spans(None, None, None, "COPY")
+        let right_w = super::hint_bar_right_spans(None, None, None, "COPY", Some("Alt+a".into()))
             .iter()
             .map(|s| mouse::display_width(&s.content))
             .sum::<u16>();
@@ -3042,7 +3102,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_omits_needs_segment_at_zero() {
-        let spans = hint_bar_right_spans(None, None, None, "NORMAL");
+        let spans = hint_bar_right_spans(None, None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "NORMAL ");
         assert!(!text.contains('◆'));
@@ -3050,7 +3110,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
-        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::accent());
@@ -3190,11 +3250,11 @@ mod tests {
     #[test]
     fn dead_bar_text_offers_copy_resume_only_when_resumable() {
         assert_eq!(
-            super::dead_bar_text(false),
+            super::dead_bar_text(false, Some("Alt+w")),
             " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close "
         );
         assert_eq!(
-            super::dead_bar_text(true),
+            super::dead_bar_text(true, Some("Alt+w")),
             " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · y: copy resume · Alt+w: close "
         );
     }
@@ -3600,6 +3660,90 @@ mod tests {
         assert_eq!(quit_row, "Alt+q / Alt+x", "the row grew the new chord on its own");
     }
 
+    /// C34/C15, the regression the design-supervisor audit of C34 caught by
+    /// measuring instead of assuming: a row's key column became
+    /// keymap-derived and therefore **unbounded**, so disabling one focus
+    /// chord made the row enumerate eight and pushed the column from 77 to
+    /// 107 — clipping the description at an 80-column terminal, the exact
+    /// failure C15's width rule exists to prevent.
+    ///
+    /// The old pin only ever exercised `Keymap::default()`, which is a
+    /// default-only assertion about a quantity that is no longer constant.
+    /// This one sweeps the configs the audit actually measured.
+    #[test]
+    fn one_help_column_fits_the_floor_under_a_remap_too() {
+        for cfg in [
+            r#"{}"#,
+            // The README's own worked example.
+            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            // The four the audit measured at 99, 107, 107 and 123.
+            r#"{"keys": {"alt+1": "disable"}}"#,
+            r#"{"keys": {"alt+h": "disable"}}"#,
+            r#"{"keys": {"alt+left": "disable"}}"#,
+            r#"{"keys": {"alt+b": "focus_left"}}"#,
+        ] {
+            let (keymap, diagnostics) = Keymap::parse(cfg, "config.json");
+            assert!(diagnostics.is_empty(), "{cfg}: {diagnostics:?}");
+            let w = help_content_width(&help_lines(&keymap));
+            assert!(w <= 80, "{cfg} makes a column {w} wide; the 80-col floor would clip it");
+        }
+    }
+
+    /// Elision cuts the *key*, never the description, and lands on a chord
+    /// boundary so no chord is shown half-spelled.
+    #[test]
+    fn an_over_wide_key_column_elides_at_a_chord_boundary() {
+        let (keymap, _) = Keymap::parse(r#"{"keys": {"alt+h": "disable"}}"#, "config.json");
+        let focus = help_lines(&keymap)
+            .into_iter()
+            .find_map(|l| match l {
+                HelpLine::Row(k, d) if d.starts_with("move focus") => Some(k),
+                _ => None,
+            })
+            .expect("a focus row");
+        assert!(focus.ends_with(" …"), "elision is marked: {focus}");
+        for chord in focus.trim_end_matches(" …").split(" / ") {
+            assert!(chord.starts_with("Alt+"), "no chord is cut mid-spelling: {focus}");
+        }
+        // And the description survived intact — it is the half that cannot
+        // be reconstructed by widening the terminal.
+        let full = help_lines(&keymap)
+            .into_iter()
+            .any(|l| matches!(l, HelpLine::Row(_, d)
+                if d == "move focus (←/→ continue to next/prev tab at an edge)"));
+        assert!(full, "the description is never what yields");
+    }
+
+    /// C34/D2: C9's attention segment is the jump chord's discoverability
+    /// surface, and it spelled `Alt+a` as a literal — so after a remap it
+    /// taught a dead chord. An unbound jump drops the tail rather than
+    /// naming a key that does nothing.
+    #[test]
+    fn the_attention_segment_names_the_live_jump_chord() {
+        let text = |chord: Option<String>| {
+            super::hint_bar_right_spans(Some((2, true)), None, None, "NORMAL", chord)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert!(text(Some("Alt+v".into())).contains("· Alt+v"), "the remapped chord");
+        assert!(!text(Some("Alt+v".into())).contains("Alt+a"), "and not the default");
+        let unbound = text(None);
+        assert!(unbound.contains("2 needs you"), "the count still reports");
+        assert!(!unbound.contains(" · "), "but no chord is advertised: {unbound}");
+    }
+
+    /// C34/D3: the dead-pane bar and the hint bar one screen row below name
+    /// the same close chord. Before C34 only the hint bar derived it, so a
+    /// remap made two surfaces on one screen disagree.
+    #[test]
+    fn the_dead_pane_bar_names_the_live_close_chord() {
+        assert!(super::dead_bar_text(false, Some("Alt+v")).contains("· Alt+v: close"));
+        let unbound = super::dead_bar_text(false, None);
+        assert!(!unbound.contains("close"), "an unbound close drops the clause: {unbound}");
+        assert!(unbound.contains("relaunch"), "the mode-local keys stay: {unbound}");
+    }
+
     /// F1's headline behaviour, end to end: remap a chord in config.json and
     /// the overlay teaches the new key and stops teaching the old one.
     /// Before F1 both surfaces were `&'static str` literals and this was
@@ -3686,7 +3830,7 @@ mod tests {
         let keys: Vec<String> = tabs
             .rows
             .iter()
-            .filter_map(|r| super::help_key_text(&r.key, &bindings))
+            .filter_map(|r| super::help_key_text(&r.key, r.desc, &bindings))
             .collect();
         let step = keys.iter().position(|k| k == "Alt+i / Alt+m").expect("the step row");
         let move_row =
@@ -3916,6 +4060,9 @@ mod tests {
     /// stop. The reference rows are long; this is their guard rail.
     #[test]
     fn one_help_column_fits_the_eighty_column_floor() {
+        // The default-keymap case. Remapped keymaps — where the width is no
+        // longer constant — are swept by
+        // `one_help_column_fits_the_floor_under_a_remap_too`.
         let w = help_layout(Rect::new(0, 1, 200, 200), &Keymap::default()).size.0;
         assert!(w <= 80, "the keymap is {w} cols wide; the 80-col floor would clip it");
     }
@@ -3936,7 +4083,7 @@ mod tests {
             .rows
             .iter()
             .filter_map(|r| {
-                super::help_key_text(&r.key, &bindings).map(|k| format!("{k} {}", r.desc))
+                super::help_key_text(&r.key, r.desc, &bindings).map(|k| format!("{k} {}", r.desc))
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -5316,4 +5463,5 @@ mod tests {
         );
     }
 }
+
 
