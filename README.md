@@ -144,6 +144,7 @@ you're in.
 | `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |
 | `Alt+f` | toggle the floating scratch shell (readline forward-word collision — already swallowed; raw mode below gets it back) |
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
+| `Alt+;` | go back to the pane you came from — toggles, and follows across tabs (tmux's `prefix ;`) |
 | `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |
 | `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
 | `Alt+r` | edit pane — name and parking note in one dialog; the note's first line shows on the badge |
@@ -178,7 +179,20 @@ file — the default — and roost behaves exactly as documented above.
 ```
 
 A value is `"disable"` (the chord passes straight through to the pane, like
-an unbound key) or a snake_case `Action` name (see `src/ui/input.rs`).
+an unbound key) or a snake_case `Action` name — **`roost keys` prints every
+one of them**, alongside the chord it is currently on:
+
+```console
+$ roost keys | head -3
+Alt+/	toggle_hints
+Alt+0	last_tab
+Alt+1	go_to_tab_1
+```
+
+It reads `config.json` directly and needs no running roost, so it answers
+before you launch: remapped and disabled chords are marked `config.json`, and
+an entry roost had to skip is named on stderr with a non-zero exit — so a
+dotfile test can gate on it instead of you catching a startup toast.
 **`Alt+?` and the hint bar follow your remaps** — both read the live keymap,
 so they show the chord you bound and stop showing the one you disabled,
 rather than teaching the defaults at you. A

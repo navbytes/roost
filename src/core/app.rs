@@ -357,6 +357,15 @@ pub struct App<B: PaneBackend> {
     /// `set_focus`, which is also where P10's `CSI I`/`CSI O` reports are
     /// produced; a bare write would move focus without telling the panes.
     pub focused: PaneId,
+    /// C35: the pane focus was on immediately before the current one — the
+    /// target of "go back". Maintained in `set_focus`, which every focus
+    /// move funnels through, so a click, an arrow, a tab switch and a
+    /// roster jump all leave the same trail.
+    ///
+    /// `None` until focus has moved once, and never equal to `focused`
+    /// (`set_focus` only records a real transition), so a toggle always
+    /// ping-pongs: A→B leaves A, going back to A leaves B.
+    alternate: Option<PaneId>,
     /// P10: does roost's own window hold the host terminal's focus? Starts
     /// **true** — a host that never reports focus (no mode 1004 support, a
     /// bare PTY, another multiplexer) must not leave every pane believing it
@@ -617,6 +626,7 @@ impl<B: PaneBackend> App<B> {
         // its fatal-if-unavailable mint) has to exist first.
         let mut app = Self {
             focused: 0,
+            alternate: None,
             host_focused: true,
             ws,
             runtimes: HashMap::new(),
@@ -1568,6 +1578,16 @@ impl<B: PaneBackend> App<B> {
             Actor::Fleet => true,
             Actor::Pane(a) => self.in_subtree(a, target),
         }
+    }
+
+    /// C35: does this id name a pane that exists right now — tiled or the
+    /// float? Used at both ends of the alternate pointer: recording (so
+    /// `focused`'s `0` initializer never becomes a phantom "previous pane"
+    /// on the first focus move) and using it (a pane can close while you are
+    /// away). One predicate rather than two, so the two ends cannot disagree
+    /// about what "exists" means.
+    fn pane_exists(&self, id: PaneId) -> bool {
+        self.tab_of(id).is_some() || self.float.as_ref().is_some_and(|f| f.id == id)
     }
 
     fn tab_of(&self, id: PaneId) -> Option<usize> {
@@ -3386,6 +3406,7 @@ impl<B: PaneBackend> App<B> {
             Action::ClosePane => self.close_pane(),
             Action::Focus(dir) => self.focus_dir(dir),
             Action::MovePane(dir) => self.move_pane_dir(dir),
+            Action::FocusAlternate => self.focus_alternate(),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
             Action::NextTab => self.step_tab(1),
@@ -3574,6 +3595,14 @@ impl<B: PaneBackend> App<B> {
     /// would undo exactly what U9 fixed.
     fn set_focus(&mut self, id: PaneId) {
         let old = self.focused;
+        // C35: the trail "go back" follows. Recorded here rather than at each
+        // call site precisely because this is the one chokepoint — the
+        // comment below already says every focus move funnels through it, and
+        // a per-caller version would have to be remembered by the next
+        // feature that moves focus.
+        if old != id && self.pane_exists(old) {
+            self.alternate = Some(old);
+        }
         self.focused = id;
         // F3: landing focus on a pane that's currently in the ○ fallback
         // takes it out of `attention_ring`'s rotation — see
@@ -4261,6 +4290,38 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         self.focus_attention_target(next);
+    }
+
+    /// C35 (`Alt+;`): return to the pane focus was on before this one.
+    ///
+    /// The motion `Alt+a` cannot make. Every other navigation chord is
+    /// absolute (`Alt+1..9`) or forward-directional (`Alt+a`, `Alt+m`,
+    /// `Alt+hjkl`); at fleet scale the dominant move is "check on B, come
+    /// back to A", and roost had no key for the second half. tmux has had
+    /// `prefix ;` for last-pane since forever, vim has `Ctrl-^`.
+    ///
+    /// Reuses `focus_attention_target`, so a cross-tab return switches tabs,
+    /// expands a collapsed stack member and handles a float exactly as
+    /// `Alt+a`'s jump does — "which pane is that" and "how do I get there"
+    /// stay one answer each.
+    ///
+    /// A closed alternate flashes rather than no-oping silently: the whole
+    /// value of the chord is confidence about where it lands, so "the pane
+    /// you'd go back to is gone" is information, not noise.
+    fn focus_alternate(&mut self) {
+        let Some(target) = self.alternate else {
+            self.set_flash("no pane to go back to yet");
+            return;
+        };
+        if !self.pane_exists(target) {
+            self.alternate = None;
+            self.set_flash("the pane you were on has closed");
+            return;
+        }
+        if target == self.focused {
+            return;
+        }
+        self.focus_attention_target(target);
     }
 
     /// Land focus on `target`, switching tabs first (go_to_tab semantics,
@@ -11772,6 +11833,80 @@ mod tests {
         let flash = app.flash().unwrap_or_default().to_string();
         assert!(flash.contains("again to quit roost"), "still instructive: {flash}");
         assert!(!flash.contains("Alt+"), "but names no dead key: {flash}");
+    }
+
+    // ---- C35: go back (Alt+;) -------------------------------------------
+
+    /// The motion the fleet actually makes: check on B, come back to A. And
+    /// it must *ping-pong* — pressing it twice returns you where you
+    /// started — which falls out of recording the trail on every real focus
+    /// transition rather than only on the toggle.
+    #[test]
+    fn back_returns_to_the_previous_pane_and_toggles() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        app.apply(Action::Focus(Dir::Left));
+        assert_eq!(app.focused, 1);
+
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, 2, "back goes to where focus came from");
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, 1, "and again returns — it is a toggle, not a stack");
+    }
+
+    /// The case that motivates the chord over `Alt+a`: the pane you were on
+    /// is in another tab. Reusing `focus_attention_target` means the tab
+    /// switch comes for free and behaves exactly like the jump's.
+    #[test]
+    fn back_returns_across_a_tab_switch() {
+        let (mut app, _) = mk_app(shell_ws());
+        let first = app.focused;
+        app.apply(Action::NewTab);
+        let second_tab = app.ws.active_tab;
+        assert_ne!(second_tab, 0, "the fixture really switched tabs");
+
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, first, "focus is back on the original pane");
+        assert_eq!(app.ws.active_tab, 0, "and the tab came with it");
+    }
+
+    /// Before focus has ever moved there is nothing to go back to, and the
+    /// chord says so rather than doing nothing — a navigation key that
+    /// silently no-ops reads as broken.
+    #[test]
+    fn back_with_nowhere_to_go_flashes() {
+        let (mut app, _) = mk_app(shell_ws());
+        let focused = app.focused;
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, focused);
+        assert!(
+            app.flash().unwrap_or_default().contains("no pane to go back to"),
+            "{:?}",
+            app.flash()
+        );
+    }
+
+    /// The alternate can die while you are away. Landing focus on a closed
+    /// pane id would be a real bug, so the pointer is validated on use and
+    /// cleared — the whole value of this chord is confidence about where it
+    /// puts you.
+    #[test]
+    fn back_to_a_closed_pane_flashes_instead_of_landing_on_a_dead_id() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // 1|2, focus 2
+        app.apply(Action::Focus(Dir::Left)); // focus 1, alternate 2
+        let doomed = 2;
+        app.close_pane_id(doomed);
+
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, 1, "focus did not move to the closed pane");
+        assert!(
+            app.flash().unwrap_or_default().contains("has closed"),
+            "{:?}",
+            app.flash()
+        );
     }
 
     // ---- C33: move a pane within its tab (Alt+Shift+hjkl) ---------------
