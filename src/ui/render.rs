@@ -858,6 +858,13 @@ struct HelpLayout {
     /// construction. C15's 2026-08-20 amendment named that shape ("a
     /// tautology that reads like a gate is worse than no gate") and C39's
     /// first floor test reintroduced it in this file anyway.
+    ///
+    /// Read only by tests — it exists so a floor gate has something honest
+    /// to assert on, which is a job nothing in the draw path needs. The
+    /// allow is narrow and deliberate rather than a `#[cfg(test)]` field,
+    /// because a struct that changes shape between builds is a worse trade
+    /// than one unused field.
+    #[allow(dead_code)]
     asked: u16,
 }
 
@@ -1170,7 +1177,13 @@ const HELP_GROUPS: &[HelpGroup] = &[
             // here documents a key whose effect depends on context.
             HelpRow {
                 key: HelpKey::Text("↵ / f / y"),
-                desc: "dead pane: relaunch · fresh (drops resume) · copy resume",
+                // The description mirrors the key column's `/`, which is
+                // what every other positionally-mapped row here does — and
+                // it matters more than usual, because `·` elsewhere in this
+                // table separates independent clauses *of one key*. Using
+                // both spellings in one row inverted the table's own
+                // convention. Named by the C39 audit.
+                desc: "dead pane: relaunch / fresh (drops resume) / copy resume",
             },
             chords(&[Action::ToggleRaw], "raw pass-through for this pane (same chord exits)"),
         ],
@@ -4477,27 +4490,42 @@ mod tests {
     /// a new dead-pane key would appear first.
     #[test]
     fn the_overlay_teaches_every_key_the_dead_pane_bar_advertises() {
-        let bar = hint_pairs(&Mode::Normal, true, false, true, false);
-        let keys: Vec<String> = bar
-            .iter()
-            .map(|(k, _)| k.clone())
-            .filter(|k| !k.starts_with("Alt+")) // Alt chords are C34's sweep
-            .collect();
-        assert!(!keys.is_empty(), "the dead-pane bar must actually be the dead-pane bar");
+        // Both bars: `resumable` gates whether `y` is offered, and the
+        // un-resumable one alone was the whole test — leaving `y`, the key
+        // C39 spends a paragraph justifying as unconditional, outside the
+        // assertion set entirely. Found by the C39 audit.
+        let mut keys: Vec<String> = Vec::new();
+        for resumable in [false, true] {
+            for (k, _) in hint_pairs(&Mode::Normal, true, resumable, false, false) {
+                if !k.starts_with("Alt+") && !keys.contains(&k) {
+                    keys.push(k); // Alt chords are C34's sweep, not this one
+                }
+            }
+        }
+        assert!(keys.len() >= 3, "the dead-pane bar must offer ↵, f and y: {keys:?}");
 
-        let overlay: String = help_lines(&Keymap::default(), "")
+        // Match the **key columns**, not the whole overlay text. The first
+        // version searched the joined rows for each key as a substring —
+        // and every letter a–z already appears in `HELP_GROUPS`'s prose
+        // ("close pane (confirm if busy)" alone supplies both `f` and `y`),
+        // so a future dead-pane key added with no row would have passed
+        // silently. Only `↵` was load-bearing, by the accident of occurring
+        // once. The mutation check that "proved" the gate used an uppercase
+        // `Q`, which happens not to appear — picking an unrepresentative
+        // mutant is how a vacuous check survives its own verification.
+        let key_columns: Vec<String> = help_lines(&Keymap::default(), "")
             .iter()
-            .map(|l| match l {
-                HelpLine::Row(k, d) => format!("{k} {d}"),
-                HelpLine::Head(h) => h.to_string(),
+            .filter_map(|l| match l {
+                HelpLine::Row(k, _) => Some(k.clone()),
+                HelpLine::Head(_) => None,
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
         for k in keys {
             assert!(
-                overlay.contains(&k),
-                "the dead-pane bar offers {k:?} and the overlay never mentions it — \
-                 a key nothing but the bar advertises is a key nobody finds (P21)",
+                key_columns.iter().any(|col| col.split(['/', ' ']).any(|tok| tok == k)),
+                "the dead-pane bar offers {k:?} and no overlay row has it in its key \
+                 column — a key nothing but the bar advertises is a key nobody finds \
+                 (P21). Key columns: {key_columns:?}",
             );
         }
     }

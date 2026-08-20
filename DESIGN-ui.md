@@ -5105,8 +5105,22 @@ on context.
 
 `the_overlay_teaches_every_key_the_dead_pane_bar_advertises` is keyed off
 the **bar**, not a written list, because the bar is where a new dead-pane
-key would appear first. It fails both ways: dropping the overlay row, and
-adding a bar key with no row.
+key would appear first. It walks both bars — `resumable` gates `y`, so the
+un-resumable one alone leaves out the key this amendment spends a paragraph
+on — and it matches each key against the overlay's **key columns**, not its
+text.
+
+That last part is the load-bearing one. The first version searched the
+joined overlay text for each key as a substring, and every letter a–z
+already appears in `HELP_GROUPS`'s prose — "close pane (confirm if busy)"
+alone supplies both `f` and `y`. A future dead-pane key added with no row
+would have passed silently; only `↵` was doing any work, by the accident of
+occurring once. Worse, the mutation check that "proved" the gate used an
+uppercase `Q`, which happens not to appear anywhere: **picking an
+unrepresentative mutant is how a vacuous check survives its own
+verification.** Both directions are now checked with a lowercase letter
+that does appear. Named by the C39 audit; a seventh instance of the shape
+in §7's list, with a rule of its own.
 
 **Not in scope.** The report's other half — ordering the groups by context
 — is deliberately not built. Two separate reasons, and both are worth
@@ -5126,11 +5140,12 @@ recording because the report proposed it as the cheap alternative:
   anything before building it.
 
 ### On gates that pass by construction
-**[Added 2026-08-20, after the sixth instance]**
+**[Added 2026-08-20, after the seventh instance]**
 
-Six assertions on this branch turned out to prove nothing, all the same
-shape: **a test asserting a bound on a value that was already clamped to
-that bound.** Recorded here because the count is the argument — each one was
+Seven assertions on this branch turned out to prove nothing, six of them
+the same shape — **a test asserting a bound on a value already clamped to
+that bound** — and the seventh its generalisation: a comparison whose right
+side is satisfied by construction. Recorded here because the count is the argument — each one was
 found by a design audit or a deliberate sweep, never by CI, and each made a
 check look done when it was not.
 
@@ -5149,6 +5164,11 @@ The instances, so the shape is recognisable:
    vacuous, and the test's own comment stated the clamps before asserting
    them. Two clamps covered for each other, so deleting either left it
    green.
+7. `the_overlay_teaches_every_key_the_dead_pane_bar_advertises` — matched
+   single-character keys with `contains` over the whole overlay text, where
+   every letter a–z already appears. Only `↵` was load-bearing, by accident.
+   Not a clamp this time but the same family: **a comparison whose right
+   side is satisfied by construction.** Now matched against the key columns.
 6. `roster_window_follows_the_cursor_and_clamps` — `top + height <=
    rows.len()` asserted after `roster_view`, which had just applied
    `roster_top_clamped` (`top.min(len - height)`). The assertion restated
@@ -5172,6 +5192,12 @@ Three rules follow, and they are cheap:
   rewrite of (5) asserted placement and *still* passed with the clamp
   deleted, because a dialog centred on the whole body is inside it either
   way. Only the mutation showed that; the assertion looked meaningful.
+- **Pick a *representative* mutant.** (7)'s gate matched single-character
+  keys with `contains` over the whole overlay text, where every letter a–z
+  already appears; the mutation that "proved" it used an uppercase `Q`,
+  which happens not to occur. The check was vacuous and its own
+  verification said otherwise. A mutant chosen for convenience tests the
+  mutant, not the gate.
 - **Test a clamp where it lives, not through a caller that applies it.**
   (6)'s property was real; asserting it downstream of the clamp made it
   unfalsifiable *and* hid that the clamp had no test. A pure helper with an
