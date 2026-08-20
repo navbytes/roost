@@ -11771,6 +11771,366 @@ mod tests {
         }
     }
 
+    // -- the layout invariant fuzzer -----------------------------------------
+    //
+    // roost's structural state is three things that must agree: each tab's
+    // layout tree, its `panes` map, and the workspace-wide `runtimes` map —
+    // with the float sitting deliberately outside all three. Nearly every
+    // action moves at least two of them, and the crossings (zoom under a
+    // float, a control-plane close of a pane in another tab, undo after a
+    // tab was removed) are where they drift apart. Each such drift is
+    // invisible until it isn't: a pane in the tree with no spec, a runtime
+    // nothing can reach, a rect handed to the renderer for a pane that is
+    // gone.
+    //
+    // Hand-written tests cover the crossings someone thought of. This walks
+    // long random sequences and re-checks every invariant after every single
+    // operation, so the failure arrives with the exact trail that produced
+    // it. It has earned its runtime: the one-member stack, both float
+    // close-path crossings, C35's go-back, and the control-spawn float
+    // restore were all found here, none of them by reading the code.
+
+    fn inv_tree_ids(node: &LayoutNode) -> Vec<PaneId> {
+        let mut v = Vec::new();
+        layout::pane_order(node, &mut v);
+        v
+    }
+
+    fn inv_check_node(node: &LayoutNode, ctx: &str, tab: usize) {
+        match node {
+            LayoutNode::Pane(_) => {}
+            LayoutNode::Stack { children, expanded } => {
+                assert!(!children.is_empty(), "{ctx}: tab {tab} has an empty Stack node");
+                assert!(
+                    *expanded < children.len(),
+                    "{ctx}: tab {tab} stack expanded={expanded} out of range ({} members)",
+                    children.len()
+                );
+            }
+            LayoutNode::Split { children, ratios, .. } => {
+                assert!(
+                    children.len() >= 2,
+                    "{ctx}: tab {tab} has a Split with {} child(ren) — layout.rs says it never builds one",
+                    children.len()
+                );
+                assert_eq!(
+                    ratios.len(),
+                    children.len(),
+                    "{ctx}: tab {tab} split ratios {ratios:?} vs {} children",
+                    children.len()
+                );
+                for c in children {
+                    inv_check_node(c, ctx, tab);
+                }
+            }
+        }
+    }
+
+    /// THE invariant: per tab, the set of PaneIds in `layout` == the keys of
+    /// `panes`; ids are unique within a tab AND across tabs; the float is in
+    /// no tree.
+    fn inv_check(app: &App<FakePane>, ctx: &str) {
+        use std::collections::HashSet;
+        let mut global: HashMap<PaneId, usize> = HashMap::new();
+        for (i, tab) in app.ws.tabs.iter().enumerate() {
+            let ids = inv_tree_ids(&tab.layout);
+            let set: HashSet<PaneId> = ids.iter().copied().collect();
+            assert_eq!(set.len(), ids.len(), "{ctx}: tab {i} tree lists a pane twice: {ids:?}");
+            let keys: HashSet<PaneId> = tab.panes.keys().copied().collect();
+            assert_eq!(set, keys, "{ctx}: tab {i} tree ids {set:?} != panes map keys {keys:?}");
+            if let Some(f) = &app.float {
+                assert!(!set.contains(&f.id), "{ctx}: tab {i} tree contains the float's id {}", f.id);
+            }
+            for id in ids {
+                if let Some(prev) = global.insert(id, i) {
+                    panic!("{ctx}: pane {id} is in tab {prev} AND tab {i}");
+                }
+            }
+            inv_check_node(&tab.layout, ctx, i);
+        }
+        if app.float.as_ref().is_some_and(|f| !f.shown && f.id == app.focused) {
+            panic!("{ctx}: the float is HIDDEN but still focused");
+        }
+        // C22 rule 1: a shown float is the focused pane.
+        if app.float.as_ref().is_some_and(|f| f.shown) {
+            assert!(app.float_focused(), "{ctx}: the float is shown but focus is on {}", app.focused);
+        }
+        // Focus is always a real pane: the float, or a pane in the tab on screen.
+        assert!(
+            app.is_float(app.focused) || app.ws.active_tab().panes.contains_key(&app.focused),
+            "{ctx}: focused pane {} is in neither the active tab nor the float",
+            app.focused
+        );
+        // Nothing is drawn that does not exist.
+        let live: HashSet<PaneId> = app.ws.active_tab().panes.keys().copied().collect();
+        for pr in app.display_rects() {
+            assert!(
+                app.is_float(pr.id) || live.contains(&pr.id),
+                "{ctx}: display_rects hands the renderer pane {} — not in the active tab {live:?}",
+                pr.id
+            );
+        }
+        // (A pane that exists but is allocated no area is a real hazard,
+        // but at these densities — 20 panes in 58 rows — it is honest
+        // overcrowding rather than a bug. The one case that ISN'T is
+        // covered by `a_split_never_allocates_its_last_child_nothing`.)
+        // No runtime outlives its pane: `runtimes` is keyed by PaneId
+        // workspace-wide, and a leftover entry is a live child process
+        // nothing can reach.
+        let all_panes: HashSet<PaneId> =
+            app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+        let orphan_runtimes: Vec<PaneId> = app
+            .runtimes
+            .keys()
+            .copied()
+            .filter(|id| !all_panes.contains(id) && !app.is_float(*id))
+            .collect();
+        assert!(
+            orphan_runtimes.is_empty(),
+            "{ctx}: runtimes {orphan_runtimes:?} belong to no pane and no float"
+        );
+        // Split ratios describe a whole: they are renormalised on removal
+        // and traded on resize, so they always sum to 1.
+        fn inv_ratio_sums(node: &LayoutNode, ctx: &str) {
+            if let LayoutNode::Split { children, ratios, .. } = node {
+                let sum: f32 = ratios.iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 0.01,
+                    "{ctx}: split ratios {ratios:?} sum to {sum}, not 1"
+                );
+                for c in children {
+                    inv_ratio_sums(c, ctx);
+                }
+            }
+        }
+        for tab in &app.ws.tabs {
+            inv_ratio_sums(&tab.layout, ctx);
+        }
+    }
+
+    fn inv_app(cols: u16, rows: u16) -> App<FakePane> {
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(4096);
+        App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(cols, rows),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap()
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn inv_has_stack(node: &LayoutNode) -> bool {
+        match node {
+            LayoutNode::Pane(_) => false,
+            LayoutNode::Stack { .. } => true,
+            LayoutNode::Split { children, .. } => children.iter().any(inv_has_stack),
+        }
+    }
+
+    /// Long random operation sequences must never break the tree↔map
+    /// invariant.
+    #[test]
+    fn layout_tree_and_panes_map_never_diverge_under_random_operations() {
+        use crate::core::layout::Dir;
+        let dirs = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+        let mut coverage: HashMap<&'static str, usize> = HashMap::new();
+        let mut stacks_seen = 0usize;
+        let mut zoom_seen = 0usize;
+        let mut float_seen = 0usize;
+        let mut float_and_zoom = 0usize;
+        let mut multi_tab = 0usize;
+        let mut ops_total = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(12345));
+            let mut app = inv_app(200, 60);
+            let mut trail: Vec<String> = Vec::new();
+            'step: for step in 0..400 {
+                let would_quit = app.ws.tabs.len() == 1 && app.ws.active_tab().panes.len() == 1;
+                let (name, action) = loop {
+                    let pick = rng.below(40);
+                    let d = dirs[rng.below(4) as usize];
+                    let a = match pick {
+                        0..=3 => ("NewPane", Action::NewPane),
+                        4 | 5 => {
+                            if would_quit {
+                                continue;
+                            }
+                            ("ClosePane", Action::ClosePane)
+                        }
+                        6..=8 => ("Focus", Action::Focus(d)),
+                        9..=11 => ("MovePane", Action::MovePane(d)),
+                        12 => ("NewTab", Action::NewTab),
+                        13 => ("MovePaneToTab+", Action::MovePaneToTab { forward: true }),
+                        14 => ("MovePaneToTab-", Action::MovePaneToTab { forward: false }),
+                        15 => ("NextTab", Action::NextTab),
+                        16 => ("PrevTab", Action::PrevTab),
+                        17 | 18 => ("ToggleStack", Action::ToggleStack),
+                        19 => ("FlipSplit", Action::FlipSplit),
+                        20 => (
+                            "Resize",
+                            Action::Resize { horizontal: rng.below(2) == 0, grow: rng.below(2) == 0 },
+                        ),
+                        21 => ("Undo", Action::Undo),
+                        22 => ("ToggleZoom", Action::ToggleZoom),
+                        23 => ("CycleLayout+", Action::CycleLayout { forward: true }),
+                        24 => ("CycleLayout-", Action::CycleLayout { forward: false }),
+                        25 => ("ToggleFloat", Action::ToggleFloat),
+                        26 => ("GoToTab", Action::GoToTab(rng.below(4) as usize)),
+                        27 => {
+                            // Control-plane close of an arbitrary live pane
+                            // (the other close_pane_id caller). Refuses the
+                            // last pane itself, so nothing to guard here.
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let victim = all[rng.below(all.len() as u64) as usize];
+                            let ct = app.control_token().to_string();
+                            app.handle_control(crate::core::control::Request {
+                                token: ct,
+                                method: crate::core::control::Method::Close {
+                                    pane: victim,
+                                    force: true,
+                                },
+                            });
+                            *coverage.entry("CtlClose").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:CtlClose({victim})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        28 => {
+                            let (w, h) = match rng.below(4) {
+                                0 => (200u16, 60u16),
+                                1 => (120, 40),
+                                2 => (80, 24),
+                                _ => (60, 18),
+                            };
+                            app.on_resize(Size::new(w, h), (0, 0));
+                            *coverage.entry("Resize(term)").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:Term({w}x{h})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        29 => ("LastTab", Action::LastTab),
+                        30 => ("JumpAttention", Action::JumpAttention),
+                        31 => {
+                            // C27: jump to an arbitrary pane through the
+                            // roster's own path (tab switch + stack expand).
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let dest = all[rng.below(all.len() as u64) as usize];
+                            app.apply(Action::ToggleRoster);
+                            app.roster_jump(dest);
+                            *coverage.entry("RosterJump").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:RosterJump({dest})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        32 => {
+                            // Control-plane spawn: the other pane-creating
+                            // path, which allocates its own id.
+                            let ct = app.control_token().to_string();
+                            app.handle_control(crate::core::control::Request {
+                                token: ct,
+                                method: crate::core::control::Method::Spawn {
+                                    adapter: "shell".into(),
+                                    cwd: None,
+                                    initial_input: None,
+                                },
+                            });
+                            *coverage.entry("CtlSpawn").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:CtlSpawn"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        33 => {
+                            // U25: jump out of the activity feed (the third
+                            // `focus_attention_target` caller).
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let dest = all[rng.below(all.len() as u64) as usize];
+                            app.push_feed("fuzz".into(), false, Some(dest));
+                            app.apply(Action::ToggleFeed);
+                            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                                crossterm::event::KeyCode::Enter,
+                            ));
+                            app.mode = Mode::Normal;
+                            *coverage.entry("FeedJump").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:FeedJump({dest})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        34 | 35 => ("ToggleFloat", Action::ToggleFloat),
+                        36 | 37 => ("ToggleZoom", Action::ToggleZoom),
+                        _ => ("FocusAlternate", Action::FocusAlternate),
+                    };
+                    break a;
+                };
+                trail.push(format!("{step}:{name}"));
+                *coverage.entry(name).or_default() += 1;
+                ops_total += 1;
+                app.apply(action);
+                if app.zoomed() {
+                    zoom_seen += 1;
+                }
+                if app.float.as_ref().is_some_and(|f| f.shown) {
+                    float_seen += 1;
+                    if app.zoomed() {
+                        float_and_zoom += 1;
+                    }
+                }
+                if app.ws.tabs.len() > 1 {
+                    multi_tab += 1;
+                }
+                if app.ws.tabs.iter().any(|t| inv_has_stack(&t.layout)) {
+                    stacks_seen += 1;
+                }
+                inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                assert!(!app.quit, "seed {seed}: quit unexpectedly at [{}]", trail.join(","));
+            }
+        }
+        let mut cov: Vec<_> = coverage.iter().collect();
+        cov.sort();
+        println!("ops={ops_total} coverage={cov:?}");
+        println!(
+            "states: stack-present={stacks_seen} zoomed={zoom_seen} float-shown={float_seen} float+zoom={float_and_zoom} multi-tab={multi_tab}"
+        );
+        assert!(stacks_seen > 1000, "generator never reached stacks");
+        assert!(zoom_seen > 1000, "generator never reached zoom");
+        assert!(float_seen > 1000, "generator never reached the float");
+        assert!(float_and_zoom > 100, "generator never crossed the float with zoom");
+        assert!(multi_tab > 1000, "generator never reached multiple tabs");
+    }
+
+
     /// One principal must not be able to deny `wait` to the whole fleet.
     ///
     /// A parked waiter is freed only by firing or timing out — nothing
