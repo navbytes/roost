@@ -5939,6 +5939,16 @@ impl<B: PaneBackend> App<B> {
                 }
 
                 if filtering {
+                    // Delete is an *edit* key, and a reader reaching for it
+                    // is erasing a typo — closing the overlay instead is the
+                    // sharpest way there is to lose a query. It has nothing
+                    // to delete (the caret is always at the end of an
+                    // append-only query), so it does nothing, which is what
+                    // Delete does at the end of any text field. Found by the
+                    // C39 design audit, which called it the sharp one.
+                    if key.code == KeyCode::Delete {
+                        return true;
+                    }
                     // Scrolling still works while filtering — none of these
                     // are printable, so nothing is displaced. Handled below
                     // by falling through to the shared `delta` match.
@@ -13199,6 +13209,31 @@ mod tests {
         );
     }
 
+    /// [C39] Delete must not close a live query — a reader reaching for it
+    /// is erasing a typo, and losing the overlay is the sharpest possible
+    /// answer. Enter and Tab *do* close, deliberately: neither has a
+    /// meaning here (the filtered list has no cursor to act on), so they
+    /// read as "done", and the alternative is a key that silently does
+    /// nothing on a surface whose whole point is answering questions.
+    #[test]
+    fn delete_edits_the_query_while_enter_and_tab_deliberately_close() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/tab");
+        help_key(&mut app, KeyCode::Delete);
+        assert_eq!(app.help_filter(), Some("tab"), "Delete left the query alone…");
+        assert!(matches!(app.mode, Mode::Help { .. }), "…and did not close the overlay");
+
+        for code in [KeyCode::Enter, KeyCode::Tab] {
+            let (mut app, _) = mk_app(shell_ws());
+            open_help(&mut app);
+            help_type(&mut app, "/tab");
+            help_key(&mut app, code);
+            assert!(matches!(app.mode, Mode::Normal), "{code:?} closes, by contract");
+        }
+    }
+
     /// `j`/`k` scroll while the filter is closed and type while it is open.
     /// The same trade C27's roster makes for every letter.
     #[test]
@@ -15650,6 +15685,33 @@ mod tests {
         modes
     }
 
+    /// States that are a **second key surface inside one variant**, and so
+    /// have to be swept even though `every_mode()` already lists the
+    /// variant once.
+    ///
+    /// Kept separate rather than added to `every_mode()`, whose duplicate
+    /// check is the mechanism that makes its exhaustive `match` mean
+    /// something — a second `Mode::Help` there fails that check, correctly.
+    /// One list answers "is every variant covered", this one answers "is
+    /// every distinct key surface covered", and they are different
+    /// questions.
+    ///
+    /// C39's filtering overlay is the first entry and the reason this
+    /// exists: it holds every printable key, so it is precisely where
+    /// C24b's rule is under real pressure, and the sweeps were proving
+    /// nothing about it. Named by the C39 design audit.
+    fn extra_mode_states() -> Vec<(&'static str, Mode)> {
+        vec![("Help (filtering)", Mode::Help { top: 0, filter: Some("pane".into()) })]
+    }
+
+    /// Every mode surface the C24b sweeps must cover: one of each variant,
+    /// plus the second surfaces above.
+    fn every_key_surface() -> Vec<(&'static str, Mode)> {
+        let mut all = every_mode();
+        all.extend(extra_mode_states());
+        all
+    }
+
     /// `handle_mode_key`'s central promise: an Alt chord is never consumed
     /// by a mode, it drops the mode and yields to the global bindings —
     /// "Alt+q must quit from anywhere". Enforced by a single `if` at the
@@ -15664,7 +15726,7 @@ mod tests {
     #[test]
     fn no_mode_swallows_an_alt_chord() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        for (label, m) in every_mode() {
+        for (label, m) in every_key_surface() {
             let (mut app, _) = mk_app(shell_ws());
             app.mode = m;
             let consumed =
@@ -15707,8 +15769,8 @@ mod tests {
         let mut swept = 0;
         // `Mode` is deliberately not `Clone` (a mode owns buffers), so each
         // probe rebuilds the list and takes its own copy of the variant.
-        for i in 0..every_mode().len() {
-            let (label, m) = every_mode().swap_remove(i);
+        for i in 0..every_key_surface().len() {
+            let (label, m) = every_key_surface().swap_remove(i);
             let entry = mode_entry_action(&m);
             let editor = matches!(m, Mode::PaneEdit { .. } | Mode::Broadcast { .. });
             for &code in &codes {
@@ -15721,7 +15783,7 @@ mod tests {
                     let (mut app, _) = mk_app(shell_ws());
                     let Some(action) = bound_action(key, &app) else { continue };
                     swept += 1;
-                    app.mode = every_mode().swap_remove(i).1;
+                    app.mode = every_key_surface().swap_remove(i).1;
                     if !app.handle_mode_key(key) {
                         assert!(
                             matches!(app.mode, Mode::Normal),
@@ -15779,7 +15841,7 @@ mod tests {
     #[test]
     fn alt_q_quits_from_every_mode() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        for (label, m) in every_mode() {
+        for (label, m) in every_key_surface() {
             let (mut app, _) = mk_app(shell_ws());
             app.mode = m;
             let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);

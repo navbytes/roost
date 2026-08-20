@@ -850,6 +850,15 @@ struct HelpLayout {
     /// keymap, and doing that twice per frame to reach the same number is
     /// waste the old `&'static` table didn't have to think about.
     content: u16,
+    /// The width the dialog **asked for**, before `.min(body.width)`.
+    ///
+    /// The only honest thing for a floor test to assert on. `size.0` is
+    /// already clamped, so at an 80-column body it reports 80 whether the
+    /// layout fitted or was cut down to it — a gate on it passes by
+    /// construction. C15's 2026-08-20 amendment named that shape ("a
+    /// tautology that reads like a gate is worse than no gate") and C39's
+    /// first floor test reintroduced it in this file anyway.
+    asked: u16,
 }
 
 /// C15: lay the keymap out for `body`, taking **the
@@ -893,9 +902,21 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
     // Found by driving it in a PTY; no unit test was looking at the title
     // and the frame together.
     let tallest_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
-    let title = help_title(filter, tallest_rows, tallest_rows, tallest_rows > height as usize);
+    let title = help_title(
+        filter,
+        tallest_rows,
+        tallest_rows,
+        tallest_rows > height as usize,
+        body.width.saturating_sub(2),
+    );
     let title_w = mouse::display_width(&title) + 2; // the two border columns
-    HelpLayout { columns, height, size: (w.max(title_w).min(body.width), height + 2), content }
+    // `asked` is the un-clamped want, carried so a floor test can assert on
+    // it: `size.0` is `.min(body.width)` and therefore reports the body's
+    // width whether the dialog fitted or was cut down to it. Asserting on
+    // `size.0` is the tautology C15's own 2026-08-20 amendment named — and
+    // that this field exists is the second time it had to be named.
+    let asked = w.max(title_w);
+    HelpLayout { columns, height, size: (asked.min(body.width), height + 2), content, asked }
 }
 
 /// [F9] C39's four title wordings, in one place — because the dialog's
@@ -906,15 +927,48 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
 /// `shown` is the last visible row's index (the scrolled counter's left
 /// half); pass `total` for the worst case when the caller does not know
 /// `top` yet — the count only ever gets narrower, never wider.
-fn help_title(filter: Option<&str>, shown: usize, total: usize, scrolled: bool) -> String {
-    match (filter, scrolled) {
-        (Some(q), true) => format!(" keys — /{q} · {shown}/{total} · ↑↓ more · Esc clears "),
-        (Some(q), false) => format!(" keys — /{q} · {total} shown · Esc clears "),
+///
+/// `avail` is the widest the title may be. **The query is what gives**, and
+/// it is elided rather than truncated by the frame: everything after it —
+/// the count, and critically `Esc clears` — is how a filtering reader gets
+/// out, so clipping from the right removes exactly the wrong end. Widening
+/// the dialog cannot help here: at the 80-column floor a 46-character query
+/// exceeds the whole terminal, so *something* must give and it has to be
+/// the part the user can already see themselves typing.
+fn help_title(
+    filter: Option<&str>,
+    shown: usize,
+    total: usize,
+    scrolled: bool,
+    avail: u16,
+) -> String {
+    let (head, tail) = match (filter, scrolled) {
+        (Some(_), true) => (" keys — /", format!(" · {shown}/{total} · ↑↓ more · Esc clears ")),
+        (Some(_), false) => (" keys — /", format!(" · {total} shown · Esc clears ")),
         (None, true) => {
-            format!(" keys — {shown}/{total} · ↑↓ more · / filters · any key closes ")
+            return format!(" keys — {shown}/{total} · ↑↓ more · / filters · any key closes ");
         }
-        (None, false) => " keys — / filters · any key closes ".to_string(),
+        (None, false) => return " keys — / filters · any key closes ".to_string(),
+    };
+    let q = filter.unwrap_or("");
+    let fixed = mouse::display_width(head) + mouse::display_width(&tail);
+    let room = avail.saturating_sub(fixed);
+    format!("{head}{}{tail}", elide_to(q, room))
+}
+
+/// Cut `text` to `room` columns, marking the cut with `…` when it bites.
+/// Room for nothing at all yields nothing at all — an ellipsis alone says
+/// less than the count and exit hint it would be stealing space from.
+fn elide_to(text: &str, room: u16) -> String {
+    if mouse::display_width(text) <= room {
+        return text.to_string();
     }
+    if room == 0 {
+        return String::new();
+    }
+    let keep = room.saturating_sub(1) as usize;
+    let cut: String = text.chars().take(keep).collect();
+    format!("{cut}…")
 }
 
 /// [F9] Does this row survive the type-ahead query? Case-insensitive over
@@ -1216,7 +1270,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "SESSION",
         rows: &[
             chords(&[Action::ToggleHints], "toggle the hint bar"),
-            chords(&[Action::Help], "this keymap"),
+            // C39's `/` is folded into the row that already owns this
+            // surface, which is C15's own P21 precedent (`/ search, n/N`
+            // rides the `Alt+c` row rather than taking one). A key that
+            // appears in §8 and in the live title but in no printed row is
+            // a key the overlay does not actually teach.
+            chords(&[Action::Help], "this keymap — / filters it"),
             chords(&[Action::Quit], "quit (workspace saved; sessions live)"),
         ],
     },
@@ -1504,6 +1563,7 @@ fn draw_mode_overlay<B: PaneBackend>(
                 (top + visible).min(total),
                 total,
                 total > visible,
+                body.width.saturating_sub(2),
             );
             let inner = modal_frame(f, body, rect, Line::from(heading).style(theme::ink()));
             draw_help_columns(f, &layout, top, inner);
@@ -4379,6 +4439,32 @@ mod tests {
         );
     }
 
+    /// [C39] A query that matches nothing still draws a frame that says so
+    /// — C14's rule ("an empty result still needs a frame to say so"), and
+    /// the bug this branch already fixed for the roster and the feed, where
+    /// a zero-height dialog left the chord looking unbound.
+    ///
+    /// It works here for a reason worth pinning rather than relying on: the
+    /// width floor is the *title's*, and the title is never empty, so an
+    /// empty table still has a frame wide enough to read. The design audit
+    /// found the behaviour correct and the guard missing.
+    #[test]
+    fn a_query_matching_nothing_still_draws_a_frame_that_says_so() {
+        let body = Rect::new(0, 0, 120, 40);
+        let km = Keymap::default();
+        let layout = help_layout(body, &km, Some("zzzzz-no-such-thing"));
+        assert_eq!(layout.columns.iter().map(|c| c.len()).max().unwrap_or(0), 0, "nothing matched");
+        assert_eq!(layout.size.1, 2, "two border rows — a frame, not a void");
+        let title = super::help_title(Some("zzzzz-no-such-thing"), 0, 0, false, body.width - 2);
+        assert!(title.contains("0 shown"), "and it says the result is empty: {title:?}");
+        assert!(title.contains("Esc clears"), "and how to leave: {title:?}");
+        assert!(
+            layout.size.0 as usize >= mouse::display_width(&title) as usize + 2,
+            "the frame is wide enough to read that: {} vs {title:?}",
+            layout.size.0,
+        );
+    }
+
     /// [F9] The dialog is sized for the *filtered* table — C14's picker rule
     /// applied to the surface that borrowed its type-ahead. A query cutting
     /// 36 rows to 3 must not leave a 36-row frame around them.
@@ -4410,7 +4496,8 @@ mod tests {
         for q in ["this keymap", "hint bar", "toggle the hint", "quit", "zoom"] {
             let layout = help_layout(body, &km, Some(q));
             let rows = layout.columns.iter().map(|c| c.len()).max().unwrap_or(0);
-            let title = super::help_title(Some(q), rows, rows, rows > layout.height as usize);
+            let title =
+                super::help_title(Some(q), rows, rows, rows > layout.height as usize, body.width - 2);
             assert!(
                 layout.size.0 as usize >= mouse::display_width(&title) as usize + 2,
                 "query {q:?}: a {}-column dialog under a {}-column title — {title:?} clips",
@@ -4421,22 +4508,62 @@ mod tests {
     }
 
     /// [F9] The 80-column floor holds for every query, not just the empty
-    /// one. Filtering can only remove rows, so the widest surviving row is
-    /// never wider than the widest row overall — but that is an argument,
-    /// and the floor is the thing two prior audits found sitting at exactly
-    /// its limit with zero slack. Check it.
+    /// one — asserted on the **ask**, not on `size.0`.
+    ///
+    /// The first version of this test read `size.0 <= 80` at an 80-column
+    /// body. `size.0` is `.min(body.width)`, so it could only ever report
+    /// 80: the gate passed by construction. C15's own 2026-08-20 amendment
+    /// had already named that exact shape — "a tautology that reads like a
+    /// gate is worse than no gate" — and the corrected version of it sits
+    /// 160 lines above this one in the same file, with a comment saying
+    /// "assert on the ask instead". The design audit caught it anyway.
+    /// Third time on this branch; the lesson is that a floor test must
+    /// never read a clamped value, however it is spelled.
     #[test]
     fn the_help_dialog_fits_the_floor_under_every_query() {
         let floor = Rect::new(0, 0, 80, 24);
         let km = Keymap::default();
-        for q in ["", "a", "alt", "Alt+Shift", "pane", "e", "/"] {
-            let size = help_layout(floor, &km, Some(q)).size;
+        for q in ["", "a", "alt", "Alt+Shift", "pane", "e", "/", "this keymap"] {
+            let layout = help_layout(floor, &km, Some(q));
             assert!(
-                size.0 <= 80,
-                "query {q:?} produced an {}-column dialog, past the floor",
-                size.0,
+                layout.asked <= floor.width,
+                "query {q:?} asked for {} columns, past the {}-column floor",
+                layout.asked,
+                floor.width,
             );
         }
+    }
+
+    /// [F9] ...and a query longer than the terminal cannot push the title
+    /// past the floor either — the query elides, the exit hint survives.
+    ///
+    /// `help_layout` floors the dialog on the title's width, but that only
+    /// answers *content narrower than the title*. A body narrower than the
+    /// title is the other half, and the `.min(body.width)` re-admitted it:
+    /// at the floor a 46-character query clamped and `modal_frame`
+    /// truncated the tail — losing "Esc clears", the one thing a filtering
+    /// reader needs. Nothing widened the dialog because nothing could;
+    /// the query had to give instead. Found by the C39 design audit, which
+    /// also found why no test saw it (the floor gate above was vacuous).
+    #[test]
+    fn a_query_wider_than_the_terminal_elides_and_keeps_the_way_out() {
+        let floor = Rect::new(0, 0, 80, 24);
+        let km = Keymap::default();
+        let long = "a".repeat(120);
+        for scrolled in [false, true] {
+            let title = super::help_title(Some(&long), 3, 40, scrolled, floor.width - 2);
+            assert!(
+                mouse::display_width(&title) <= floor.width - 2,
+                "the title outgrew the terminal: {} cols",
+                mouse::display_width(&title),
+            );
+            assert!(title.contains("Esc clears"), "the way out survived: {title:?}");
+            assert!(title.contains('…'), "and the cut is marked: {title:?}");
+        }
+        // The layout agrees — it builds the same title through the same
+        // function, which is why there is only one.
+        let layout = help_layout(floor, &km, Some(&long));
+        assert!(layout.asked <= floor.width, "asked for {} at the floor", layout.asked);
     }
 
     /// C14 (U20): every picker row's cwd column starts at the same place,
@@ -4774,6 +4901,23 @@ row's — widen ADAPTER_COL",
             app.apply(Action::ToggleRoster);
             app.handle_mode_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab));
             out.push(("fleet roster, filtered and reordered", snap(&mut app)));
+        }
+
+        // [C39] Same reason, one surface later: the "help overlay" fixture
+        // above is unfiltered, so the §2 gates below never saw the
+        // filtering title or the hint row that replaces "any key closes".
+        // Both are chrome roost draws and neither was covered. Named by the
+        // C39 design audit.
+        {
+            let mut app = three_panes();
+            app.apply(Action::Help);
+            for c in "/pane".chars() {
+                app.handle_mode_key(crossterm::event::KeyEvent::from(
+                    crossterm::event::KeyCode::Char(c),
+                ));
+            }
+            assert_eq!(app.help_filter(), Some("pane"), "fixture must actually be filtering");
+            out.push(("help overlay, filtering", snap(&mut app)));
         }
 
         let mut app = three_panes();

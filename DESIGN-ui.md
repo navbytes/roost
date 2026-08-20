@@ -4938,7 +4938,7 @@ tier, the roster keeps it, and §7 records why the two are not in tension.
 ### C39 — The keymap filters (`/`) — [Added 2026-08-20, comparative UX review F9]
 
 **The gap.** The overlay is roost's longest list and its only unfilterable
-one. `Alt+?` draws thirty-odd rows in seven groups; finding "the one that
+one. `Alt+?` draws thirty-odd rows in eight groups; finding "the one that
 moves a pane between tabs" means reading. Meanwhile roost already has
 type-ahead in C14's picker and C27's roster, and `/` search inside scroll
 mode (P21) — three surfaces where narrowing a list is a reflex, and the one
@@ -4966,8 +4966,8 @@ through and dismisses, so on a terminal showing the whole table the
 amendment is invisible. It is tempting to present this one as the same
 shape. **It is not, and the difference should be read plainly:**
 
-- The scroll carve-out claims six keys, conditionally, and hands them back
-  the moment they have nothing to do.
+- The scroll carve-out claims eight keys (`↑ ↓ j k PgUp PgDn Home End`),
+  conditionally, and hands them back the moment they have nothing to do.
 - This one claims **every printable key, unconditionally**, for as long as
   the query is open. There is no "did nothing, fall through" available:
   `Backspace` has to work when the query matches nothing, or a typo becomes
@@ -5026,6 +5026,19 @@ lockstep, applied to a modal's own heading.
   over-pressed `↓` is exactly the "the modal you open when you are lost is
   the one with a surprising way out" failure that made U23 reject scrolling
   in the first place.
+- **`/` is taught in the overlay's own `Alt+?` row** (`this keymap — /
+  filters it`), not only in §8 and the live title. C15's P21 precedent:
+  `/ search, n/N` rides the `Alt+c` row rather than taking one of its own,
+  because a key the overlay does not print is a key the overlay does not
+  teach. The C39 audit found `/` documented everywhere except the surface
+  whose job is documenting.
+- **Enter and Tab close a live query; Delete does not.** Delete is an
+  *edit* key and a reader reaching for it is erasing a typo — losing the
+  overlay would be the sharpest possible answer. It has nothing to delete
+  (the caret is always at the end of an append-only query), so it does
+  nothing, which is what Delete does at the end of any text field. Enter
+  and Tab have no meaning on a list with no cursor, so they read as "done"
+  — contracted deliberately rather than left as a fall-through.
 - **A group whose every row is filtered away contributes no heading**, the
   rule `config.json`'s `disable` already put there. A heading that matched
   while its rows did not would title an empty block.
@@ -5048,6 +5061,32 @@ lockstep, applied to a modal's own heading.
   title, never at the two together. The same shape as the C15 padding bug —
   each half correct, the pair wrong — and the second time on this branch
   that the check which caught it was "render it and look".
+
+  **That floor is only half the answer, and the audit had to say so.** It
+  fixes *content narrower than the title*; a **body** narrower than the
+  title is the other half, and `.min(body.width)` re-admitted it — at the
+  80-column floor a 46-character query clamped and the frame truncated the
+  tail, losing `Esc clears` all over again. Widening cannot help when the
+  title already exceeds the terminal, so **the query elides** (`…`) and
+  everything after it survives: the count, and the way out. The query is
+  the right thing to cut because it is the one part the user can already
+  see themselves typing.
+- **The floor test asserts on the un-clamped `asked`, never on `size.0`.**
+  `size.0` is `.min(body.width)`, so at an 80-column body it reports 80
+  whether the dialog fitted or was cut down to it. C39's first floor gate
+  read `size.0` and therefore passed by construction — the third tautology
+  on this branch, written 160 lines below a corrected test in the same file
+  carrying the comment "assert on the ask instead", and five days after
+  C15's own amendment named the shape. `HelpLayout::asked` exists so the
+  honest assertion is the easy one.
+- **The filtering state has its own chrome fixture and its own C24b
+  probe.** `chrome_buffers` rendered only the un-filtered overlay, so §2's
+  gates never saw the filtering title or hint row; and `every_mode()` lists
+  one state per variant, so the sweeps never probed the one surface that
+  holds every printable key — precisely where C24b's rule is under real
+  pressure. A second list (`extra_mode_states`) covers surfaces-within-a-
+  variant without weakening `every_mode()`'s duplicate check, which is what
+  makes its exhaustive `match` mean anything.
 
 **Not in scope.** The report's other half — ordering the groups by context,
 so a dead-focused pane's overlay leads with the dead-pane verbs — is
