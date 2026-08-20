@@ -12,6 +12,24 @@ pub enum Action {
     ClosePane,
     /// Move focus spatially (arrows / hjkl).
     Focus(Dir),
+    /// C36: open the broadcast composer — type one message, send it to
+    /// every reachable pane (`Alt+'`). The verb roost is uniquely
+    /// positioned for, and until now the only one you had to leave roost
+    /// to use.
+    ToggleBroadcast,
+    /// C35: return focus to the pane it was on before this one — the
+    /// alternate-pane toggle (`Alt+;`, tmux's `prefix ;`). Every other
+    /// navigation chord is absolute or forward-directional; this is the
+    /// only one that goes back.
+    FocusAlternate,
+    /// C33: swap the focused pane with its neighbour in that direction,
+    /// within the active tab — `Alt+Shift+hjkl`. The shifted siblings of
+    /// `Alt+hjkl` carry the *pane* the way the unshifted ones carry *you*,
+    /// which is C28's rule (`Alt+Shift+i`/`Alt+Shift+m`) on the within-tab
+    /// axis instead of the across-tab one. Focus follows the pane for free:
+    /// the tree swaps two ids, so the focused id is unchanged and simply
+    /// occupies a different slot.
+    MovePane(Dir),
     NewTab,
     GoToTab(usize),
     /// U7: step to the next / previous tab, wrapping at both ends — the
@@ -29,7 +47,11 @@ pub enum Action {
     FlipSplit,
     /// Grow (+) or shrink (−) the focused pane along an axis.
     Resize { horizontal: bool, grow: bool },
-    RenamePane,
+    /// Open the combined pane editor, Alt+r (C32) — name row + parking
+    /// note lines in one dialog; the note's first line is the headline
+    /// the C4 badge shows. Absorbed v0.1.7's separate Alt+Shift+n note
+    /// chord after one release.
+    EditPane,
     RenameTab,
     QuickLaunch,
     ScrollMode,
@@ -49,8 +71,9 @@ pub enum Action {
     /// Toggle a full-screen, focus-following view of the focused pane — a
     /// pure view transform, no layout change (C21).
     ToggleZoom,
-    /// Snap the active tab to the next canned arrangement that fits (C25).
-    CycleLayout,
+    /// Snap the active tab to the next canned arrangement that fits (C25);
+    /// `forward: false` walks the same cycle backwards (C37, `Alt+Shift+g`).
+    CycleLayout { forward: bool },
     /// Toggle the C20 activity-feed overlay (status/spawn/close/exit/control
     /// events), Alt+e.
     ToggleFeed,
@@ -126,8 +149,10 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         KeyCode::Char('t') => Some(Action::NewTab),
         KeyCode::Char('s') => Some(Action::ToggleStack),
         KeyCode::Char('o') => Some(Action::FlipSplit), // orientation
-        // Alt+r renames the pane; Alt+Shift+r (or Alt+R) renames the tab.
-        KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::RenamePane }),
+        // Alt+r edits the pane (name + note, one dialog — C32; it also
+        // retired Alt+Shift+n after one release, returning `n` to §8's
+        // free pool); Alt+Shift+r (or Alt+R) renames the tab.
+        KeyCode::Char('r') => Some(if shift { Action::RenameTab } else { Action::EditPane }),
         KeyCode::Char('R') => Some(Action::RenameTab),
         // Alt+Shift+p toggles raw; Alt+P tolerates the uppercase-delivery
         // quirk some terminals use for a shifted Alt+letter (same
@@ -155,7 +180,11 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         }
         KeyCode::Char('A') => Some(Action::ToggleRoster),
         KeyCode::Char('z') => Some(Action::ToggleZoom),
-        KeyCode::Char('g') => Some(Action::CycleLayout),
+        // C37: the shifted sibling reverses the cycle — C28's idiom
+        // (shift = the inverse of the unshifted chord), and the same
+        // both-delivery-forms tolerance every shifted letter carries.
+        KeyCode::Char('g') => Some(Action::CycleLayout { forward: !shift }),
+        KeyCode::Char('G') => Some(Action::CycleLayout { forward: false }),
         KeyCode::Char('e') => Some(Action::ToggleFeed),
         KeyCode::Char('f') => Some(Action::ToggleFloat),
         KeyCode::PageUp => Some(Action::ScrollMode),
@@ -182,6 +211,33 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
             Some(if shift { Action::MovePaneToTab { forward: true } } else { Action::NextTab })
         }
         KeyCode::Char('M') => Some(Action::MovePaneToTab { forward: true }),
+        // C33: the shifted vim letters move the *pane*. These four arms
+        // must sit above the focus arms below, which match `Char('l')` &c
+        // with **no shift guard** — before C33 a shifted lowercase delivery
+        // fell into them and silently did the unshifted thing, while the
+        // uppercase delivery matched nothing at all and forwarded meta-L to
+        // the pane. One physical chord, two behaviours, split by terminal.
+        // Both spellings are bound here for the same reason Alt+Shift+r /
+        // Alt+R and C28's Alt+Shift+i / Alt+I are: `twins` then pairs them
+        // automatically (both now default to the same action), so a
+        // config.json remap of `alt+shift+h` can no longer half-apply.
+        // C35: `;` is punctuation, so it costs the §8 letter pool nothing —
+        // the pool that is "empty" is the *letters*, and every chord outside
+        // `/` and `?` was still free. tmux's own last-pane key, and no
+        // readline binding to collide with.
+        KeyCode::Char(';') => Some(Action::FocusAlternate),
+        // C36: `'` neighbours `;` on the keyboard, and the two are the
+        // fleet's pair of punctuation verbs — go back, and speak to
+        // everyone. Punctuation costs the §8 letter pool nothing (C35).
+        KeyCode::Char('\'') => Some(Action::ToggleBroadcast),
+        KeyCode::Char('l') if shift => Some(Action::MovePane(Dir::Right)),
+        KeyCode::Char('L') => Some(Action::MovePane(Dir::Right)),
+        KeyCode::Char('h') if shift => Some(Action::MovePane(Dir::Left)),
+        KeyCode::Char('H') => Some(Action::MovePane(Dir::Left)),
+        KeyCode::Char('j') if shift => Some(Action::MovePane(Dir::Down)),
+        KeyCode::Char('J') => Some(Action::MovePane(Dir::Down)),
+        KeyCode::Char('k') if shift => Some(Action::MovePane(Dir::Up)),
+        KeyCode::Char('K') => Some(Action::MovePane(Dir::Up)),
         KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
@@ -625,6 +681,12 @@ const NAMES: &[(&str, Action)] = &[
     ("focus_right", Action::Focus(Dir::Right)),
     ("focus_up", Action::Focus(Dir::Up)),
     ("focus_down", Action::Focus(Dir::Down)),
+    ("focus_alternate", Action::FocusAlternate),
+    ("toggle_broadcast", Action::ToggleBroadcast),
+    ("move_pane_left", Action::MovePane(Dir::Left)),
+    ("move_pane_right", Action::MovePane(Dir::Right)),
+    ("move_pane_up", Action::MovePane(Dir::Up)),
+    ("move_pane_down", Action::MovePane(Dir::Down)),
     ("new_tab", Action::NewTab),
     ("go_to_tab_1", Action::GoToTab(0)),
     ("go_to_tab_2", Action::GoToTab(1)),
@@ -646,7 +708,13 @@ const NAMES: &[(&str, Action)] = &[
     ("resize_horizontal_shrink", Action::Resize { horizontal: true, grow: false }),
     ("resize_vertical_grow", Action::Resize { horizontal: false, grow: true }),
     ("resize_vertical_shrink", Action::Resize { horizontal: false, grow: false }),
-    ("rename_pane", Action::RenamePane),
+    ("edit_pane", Action::EditPane),
+    // Parse-only aliases: config.json files written against v0.1.7's two
+    // separate actions keep working. Listed after the canonical name so
+    // the reverse lookup (`action_name`, first match wins) never emits
+    // them.
+    ("rename_pane", Action::EditPane),
+    ("note_pane", Action::EditPane),
     ("rename_tab", Action::RenameTab),
     ("quick_launch", Action::QuickLaunch),
     ("scroll_mode", Action::ScrollMode),
@@ -657,18 +725,25 @@ const NAMES: &[(&str, Action)] = &[
     ("jump_attention", Action::JumpAttention),
     ("toggle_roster", Action::ToggleRoster),
     ("toggle_zoom", Action::ToggleZoom),
-    ("cycle_layout", Action::CycleLayout),
+    ("cycle_layout", Action::CycleLayout { forward: true }),
+    ("cycle_layout_back", Action::CycleLayout { forward: false }),
     ("toggle_feed", Action::ToggleFeed),
     ("toggle_float", Action::ToggleFloat),
     ("toggle_raw", Action::ToggleRaw),
 ];
 
-/// Test-only: `action_by_name` is the production reverse lookup (a straight
-/// `NAMES` scan); this — the other direction — only has a caller left in the
-/// round-trip test below, which checks `NAMES` itself against
-/// `default_keymap`'s independently-derived source of truth.
-#[cfg(test)]
-fn action_name(action: &Action) -> String {
+/// An action's config.json name — the reverse of `action_by_name`, and the
+/// spelling `roost keys` prints so its output can be pasted straight into a
+/// `"keys"` block.
+///
+/// Where `NAMES` carries aliases for one action (`edit_pane` /
+/// `rename_pane` / `note_pane`), the **first** entry wins: it is the name
+/// the table leads with, so it is the canonical one to print.
+///
+/// **[F11, 2026-08-19]** Promoted out of `#[cfg(test)]`. It had one test
+/// caller — the round-trip check against `default_keymap` — until `roost
+/// keys` needed to name what each chord does.
+pub fn action_name(action: &Action) -> String {
     NAMES
         .iter()
         .find(|(_, a)| a == action)
@@ -682,14 +757,29 @@ fn action_by_name(name: &str) -> Option<Action> {
     NAMES.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
-/// Test-only: every (chord → action) pair `default_chord_action` actually
-/// binds, swept across every key `Chord::parse` can name, crossed with both
-/// shift states. This *is* "the existing default map" — built by asking the
-/// same function `translate` itself calls, not by re-deriving the table by
-/// hand — so it is what tests assert absent-config behavior against, and
-/// (the round-trip test) `NAMES`'s independent check.
-#[cfg(test)]
-fn default_keymap() -> HashMap<Chord, Action> {
+/// Every (chord → action) pair `default_chord_action` actually binds, swept
+/// across every key `Chord::parse` can name, crossed with both shift states.
+/// This *is* "the existing default map" — built by asking the same function
+/// `translate` itself calls, not by re-deriving the table by hand — so it is
+/// what tests assert absent-config behavior against, and (the round-trip
+/// test) `NAMES`'s independent check.
+///
+/// **[F1, 2026-08-19]** This was `#[cfg(test)]` for as long as the only
+/// thing that needed the swept table was a test. It is production now
+/// because `effective_bindings` needs it: the help overlay and hint bar
+/// used to hard-code their chord spellings, so a `config.json` remap left
+/// both surfaces teaching a chord that no longer worked. Deriving what they
+/// draw from the same table `translate` dispatches on is the only way those
+/// two can't drift, and this function is that table.
+///
+/// Memoized: it is a pure function of the compiled-in chord table, and the
+/// render path asks for it every frame.
+fn default_keymap() -> &'static HashMap<Chord, Action> {
+    static TABLE: std::sync::OnceLock<HashMap<Chord, Action>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_default_keymap)
+}
+
+fn build_default_keymap() -> HashMap<Chord, Action> {
     let mut codes: Vec<KeyCode> = (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
     codes.extend([
         KeyCode::Enter,
@@ -708,6 +798,178 @@ fn default_keymap() -> HashMap<Chord, Action> {
         }
     }
     map
+}
+
+impl Chord {
+    /// The chord's **UI spelling** — what the help overlay and hint bar
+    /// print. `Alt+Shift+h`, `Alt+←`, `Alt+Enter`, `Alt+PgUp`.
+    ///
+    /// Deliberately *not* `Chord::parse`'s inverse. `parse` accepts
+    /// config.json's grammar, which is lowercase and spelled-out
+    /// (`alt+pageup`, `alt+left`) because it is typed into a JSON file;
+    /// this is the chrome's vocabulary, which uses the arrow glyphs and
+    /// title-case names the key table has always used. Two spellings of one
+    /// chord, each in the register its reader is in — the README documents
+    /// the config one.
+    fn label(&self) -> String {
+        let key = match self.code {
+            KeyCode::Enter => "Enter".to_string(),
+            KeyCode::PageUp => "PgUp".to_string(),
+            KeyCode::Up => "↑".to_string(),
+            KeyCode::Down => "↓".to_string(),
+            KeyCode::Left => "←".to_string(),
+            KeyCode::Right => "→".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            other => format!("{other:?}"),
+        };
+        if self.shift {
+            format!("Alt+Shift+{key}")
+        } else {
+            format!("Alt+{key}")
+        }
+    }
+
+    /// Sort key giving `effective_bindings` a stable, readable order:
+    /// specials before printables (so a focus row reads `Alt+← / Alt+h`, the
+    /// order the key table has always written), then unshifted before
+    /// shifted, then by the case-folded character.
+    fn order(&self) -> (u8, u8, char) {
+        let (rank, ch) = match self.code {
+            KeyCode::Left => (0, ' '),
+            KeyCode::Down => (1, ' '),
+            KeyCode::Up => (2, ' '),
+            KeyCode::Right => (3, ' '),
+            KeyCode::Enter => (4, ' '),
+            KeyCode::PageUp => (5, ' '),
+            KeyCode::Char(c) => (6, c.to_ascii_lowercase()),
+            _ => (7, ' '),
+        };
+        (rank, u8::from(self.shift), ch)
+    }
+}
+
+/// The character a US keyboard produces when Shift is held with `c` —
+/// `h`→`H`, `/`→`?`, `1`→`!`. The two halves of one physical keypress, which
+/// is why `effective_bindings` needs it: terminals disagree about which half
+/// they report, and the default table binds both so either works.
+fn shifted_char(c: char) -> Option<char> {
+    if c.is_ascii_lowercase() {
+        return Some(c.to_ascii_uppercase());
+    }
+    Some(match c {
+        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%', '6' => '^',
+        '7' => '&', '8' => '*', '9' => '(', '0' => ')', '-' => '_', '=' => '+',
+        '[' => '{', ']' => '}', '\\' => '|', ';' => ':', '\'' => '"',
+        ',' => '<', '.' => '>', '/' => '?', '`' => '~',
+        _ => return None,
+    })
+}
+
+/// Is this entry a *second spelling* of a chord already in the table, rather
+/// than a chord of its own? Three shapes, all of which would otherwise make
+/// the help overlay print one physical key twice — or print a key that is
+/// not really bound at all.
+///
+/// 1. **The uppercase-delivery twin of a shifted letter.** Some terminals
+///    send `Alt+Shift+p` as `('p', SHIFT)`, others as bare `'P'`; the table
+///    binds both (C23/C27/C28/C33). The `Alt+Shift+p` spelling is the one
+///    roost documents, so the bare-uppercase entry is the redundant one.
+/// 2. **The shifted-punctuation twin.** Same duality, other half of the
+///    keyboard: `Alt+?` arrives as `('?', no shift)` or `('/', SHIFT)`. Here
+///    the *glyph* spelling is the one roost documents (`Alt+?`, not
+///    `Alt+Shift+/`), so it is the `('/', SHIFT)` entry that drops — the
+///    mirror image of rule 1, because that is which half reads naturally in
+///    each case.
+/// 3. **A shift state the binding never tested.** Most arms in
+///    `default_chord_action` don't guard `shift`, so `('1', SHIFT)` resolves
+///    to `GoToTab(0)` exactly as `('1', no shift)` does. That is not a
+///    binding anyone should be taught — nothing is bound to `Alt+Shift+1`;
+///    the arm simply ignores shift. The unshifted spelling is the chord.
+///
+/// Every rule fires only when both spellings carry the **same action**: when
+/// they differ, both are real and distinct (`Alt+←` focuses, `Alt+Shift+←`
+/// resizes; `Alt+h` focuses, `Alt+Shift+h` moves the pane).
+fn is_redundant_spelling(
+    chord: &Chord,
+    action: &Action,
+    table: &HashMap<Chord, Action>,
+) -> bool {
+    let same = |code: KeyCode, shift: bool| table.get(&Chord { code, shift }) == Some(action);
+    // 3: the arm ignored shift.
+    if chord.shift && same(chord.code, false) {
+        return true;
+    }
+    let KeyCode::Char(c) = chord.code else { return false };
+    if chord.shift {
+        // 2: `('/', SHIFT)` when `('?', no shift)` says the same thing.
+        // **Letters are excluded here, and the exclusion is load-bearing.**
+        // Rules 1 and 2 are mirror images, so without it a letter pair
+        // satisfies both — rule 1 drops `'P'` because `('p', SHIFT)` exists,
+        // rule 2 drops `('p', SHIFT)` because `'P'` exists — and the chord
+        // vanishes from the table entirely rather than being spelled once.
+        // Each rule owns the half of the keyboard whose *surviving* spelling
+        // it names: letters keep `Alt+Shift+p`, punctuation keeps `Alt+?`.
+        !c.is_ascii_lowercase() && shifted_char(c).is_some_and(|g| same(KeyCode::Char(g), false))
+    } else {
+        // 1: bare `'P'` when `('p', SHIFT)` says the same thing.
+        c.is_ascii_uppercase() && same(KeyCode::Char(c.to_ascii_lowercase()), true)
+    }
+}
+
+/// F1: every chord roost **actually** binds right now, as `(label, action)`,
+/// with `keymap`'s config.json overrides applied on top of the default
+/// table — the same merge `translate_with` dispatches on, asked as a
+/// question instead of answered one key at a time.
+///
+/// This exists so the chrome can *derive* what it teaches. Before F1 the
+/// help overlay and the hint bar spelled their chords as `&'static str`
+/// literals, so `{"keys": {"alt+f": "disable"}}` — the README's own escape
+/// hatch — produced a roost whose `Alt+?` still taught `Alt+f`. Any surface
+/// that renders from this cannot say that.
+///
+/// **Twins are collapsed.** A shifted letter is delivered as `('h', SHIFT)`
+/// by some terminals and bare `'H'` by others, and the default table binds
+/// both (C23/C27/C28/C33). They are one physical chord, so the bare
+/// uppercase form is dropped whenever its shifted-lowercase sibling carries
+/// the same action — otherwise every such row would print its chord twice.
+///
+/// Sorted by `Chord::order`, so the output is deterministic and a row that
+/// joins several chords reads in the order the key table always wrote them.
+pub fn effective_bindings(keymap: &Keymap) -> Vec<(String, Action)> {
+    let mut merged: HashMap<Chord, Action> = default_keymap().clone();
+    for (chord, ov) in &keymap.overrides {
+        match ov {
+            Override::Disabled => {
+                merged.remove(chord);
+            }
+            Override::Bound(a) => {
+                merged.insert(*chord, *a);
+            }
+        }
+    }
+    let dropped: Vec<Chord> = merged
+        .iter()
+        .filter(|(chord, action)| is_redundant_spelling(chord, action, &merged))
+        .map(|(chord, _)| *chord)
+        .collect();
+    let mut out: Vec<(Chord, Action)> =
+        merged.into_iter().filter(|(c, _)| !dropped.contains(c)).collect();
+    out.sort_by_key(|(c, _)| c.order());
+    out.into_iter().map(|(c, a)| (c.label(), a)).collect()
+}
+
+/// F1/C34: the chord a single action is on, for the chrome surfaces that
+/// name one chord in a sentence rather than listing a row's worth — C9's
+/// attention segment (`· Alt+a`), C16's dead-pane bar, C10's confirm
+/// flashes. `None` when the action has no chord at all (disabled in
+/// config.json), which those callers render by dropping the clause rather
+/// than naming a key that does nothing.
+///
+/// The *first* label in `Chord::order`, so a doubly-bound action names its
+/// arrow/specials form before its letter form — the same order the key
+/// table has always written.
+pub fn chord_for(keymap: &Keymap, action: Action) -> Option<String> {
+    effective_bindings(keymap).into_iter().find(|(_, a)| *a == action).map(|(l, _)| l)
 }
 
 /// Every `(code, shift)` the default table already treats as the *same*
@@ -787,7 +1049,7 @@ mod tests {
         ));
         assert!(matches!(
             translate(alt(KeyCode::Char('g'))),
-            InputResult::Action(Action::CycleLayout)
+            InputResult::Action(Action::CycleLayout { forward: true })
         ));
     }
 
@@ -887,7 +1149,7 @@ mod tests {
     fn alt_r_renames_pane_alt_shift_r_renames_tab() {
         assert!(matches!(
             translate(alt(KeyCode::Char('r'))),
-            InputResult::Action(Action::RenamePane)
+            InputResult::Action(Action::EditPane)
         ));
         assert!(matches!(
             translate(alt_shift(KeyCode::Char('r'))),
@@ -898,6 +1160,28 @@ mod tests {
             translate(alt(KeyCode::Char('R'))),
             InputResult::Action(Action::RenameTab)
         ));
+    }
+
+    /// C32 (combined editor): Alt+Shift+n is RETIRED — it lived one
+    /// release (v0.1.7) before Alt+r absorbed the note editor, and the
+    /// chord went back to §8's free pool, meaning U5's unbound-printable
+    /// rule now forwards it to the pane. Plain Alt+n still makes a pane.
+    #[test]
+    fn alt_shift_n_is_retired_back_to_the_free_pool() {
+        // Pre-v0.1.7 behavior restored exactly: a terminal reporting the
+        // chord as 'n'+SHIFT falls through to the unshifted arm (new
+        // pane, shift ignored); one reporting uppercase 'N' hits U5's
+        // unbound-printable forward.
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('n'))),
+            InputResult::Action(Action::NewPane)
+        ));
+        assert!(matches!(translate(alt(KeyCode::Char('N'))), InputResult::Forward(_)));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('n'))),
+            InputResult::Action(Action::NewPane)
+        ));
+        assert!(matches!(translate(alt(KeyCode::Char('r'))), InputResult::Action(Action::EditPane)));
     }
 
     #[test]
@@ -1313,7 +1597,7 @@ mod tests {
             (alt(KeyCode::Char('t')), Action::NewTab),
             (alt(KeyCode::Char('s')), Action::ToggleStack),
             (alt(KeyCode::Char('o')), Action::FlipSplit),
-            (alt(KeyCode::Char('r')), Action::RenamePane),
+            (alt(KeyCode::Char('r')), Action::EditPane),
             (alt_shift(KeyCode::Char('r')), Action::RenameTab),
             (alt(KeyCode::Char('R')), Action::RenameTab),
             (alt_shift(KeyCode::Char('p')), Action::ToggleRaw),
@@ -1328,7 +1612,7 @@ mod tests {
             (alt_shift(KeyCode::Char('/')), Action::Help),
             (alt(KeyCode::Char('a')), Action::JumpAttention),
             (alt(KeyCode::Char('z')), Action::ToggleZoom),
-            (alt(KeyCode::Char('g')), Action::CycleLayout),
+            (alt(KeyCode::Char('g')), Action::CycleLayout { forward: true }),
             (alt(KeyCode::Char('e')), Action::ToggleFeed),
             (alt(KeyCode::Char('f')), Action::ToggleFloat),
             (alt(KeyCode::PageUp), Action::ScrollMode),
@@ -1381,7 +1665,7 @@ mod tests {
     #[test]
     fn absent_config_keeps_translate_byte_for_byte() {
         let empty = Keymap::default();
-        for (chord, _) in default_keymap() {
+        for &chord in default_keymap().keys() {
             let mut mods = KeyModifiers::ALT;
             if chord.shift {
                 mods |= KeyModifiers::SHIFT;
@@ -1457,7 +1741,7 @@ mod tests {
         ));
         assert!(!matches!(
             translate_with(alt(KeyCode::Char('g')), &keymap),
-            InputResult::Action(Action::CycleLayout)
+            InputResult::Action(Action::CycleLayout { forward: true })
         ));
     }
 
@@ -1525,7 +1809,7 @@ mod tests {
     /// test failing, never a silent gap either way.
     #[test]
     fn every_default_bound_actions_name_round_trips() {
-        for (chord, action) in default_keymap() {
+        for (&chord, &action) in default_keymap() {
             let name = action_name(&action);
             assert_eq!(
                 action_by_name(&name),
@@ -1533,6 +1817,284 @@ mod tests {
                 "chord {chord:?}'s action {action:?} named {name:?} didn't round-trip"
             );
         }
+    }
+
+    /// C33, the regression this chord family exists to close. Before it,
+    /// `Alt+Shift+h` resolved **two different ways depending on the
+    /// terminal**: one delivering `('h', SHIFT)` fell into the unguarded
+    /// focus arm and moved focus left (a duplicate of plain `Alt+h`), while
+    /// one delivering `'H'` matched nothing and forwarded meta-H into the
+    /// agent. Both spellings now mean the same thing, for all four letters.
+    #[test]
+    fn the_shifted_vim_letters_move_the_pane_on_both_delivery_forms() {
+        for (lower, upper, dir) in [
+            ('h', 'H', Dir::Left),
+            ('j', 'J', Dir::Down),
+            ('k', 'K', Dir::Up),
+            ('l', 'L', Dir::Right),
+        ] {
+            assert_eq!(
+                translate(alt_shift(KeyCode::Char(lower))),
+                InputResult::Action(Action::MovePane(dir)),
+                "Alt+Shift+{lower} on a terminal that sends the shift bit",
+            );
+            assert_eq!(
+                translate(alt(KeyCode::Char(upper))),
+                InputResult::Action(Action::MovePane(dir)),
+                "Alt+Shift+{lower} on a terminal that sends {upper}",
+            );
+        }
+    }
+
+    /// C37: the reverse cycle resolves on both delivery forms, like every
+    /// other shifted letter. Noted by the C37 audit as the one thing no
+    /// input-layer test asserted — the render row and the app behaviour were
+    /// covered, but not the translation, which is exactly the layer C33's
+    /// cross-terminal split lived in.
+    #[test]
+    fn the_shifted_g_reverses_the_cycle_on_both_delivery_forms() {
+        assert_eq!(
+            translate(alt(KeyCode::Char('g'))),
+            InputResult::Action(Action::CycleLayout { forward: true }),
+        );
+        assert_eq!(
+            translate(alt_shift(KeyCode::Char('g'))),
+            InputResult::Action(Action::CycleLayout { forward: false }),
+            "the shift bit reverses it",
+        );
+        assert_eq!(
+            translate(alt(KeyCode::Char('G'))),
+            InputResult::Action(Action::CycleLayout { forward: false }),
+            "and so does a terminal that sends bare uppercase",
+        );
+    }
+
+    /// The unshifted half is untouched — C33 took the *shifted* letters,
+    /// which were a redundant second spelling of exactly this.
+    #[test]
+    fn the_unshifted_vim_letters_still_move_focus() {
+        for (c, dir) in [('h', Dir::Left), ('j', Dir::Down), ('k', Dir::Up), ('l', Dir::Right)] {
+            assert_eq!(
+                translate(alt(KeyCode::Char(c))),
+                InputResult::Action(Action::Focus(dir)),
+            );
+        }
+    }
+
+    /// C33's payoff for the escape hatch: because both delivery forms now
+    /// default to the same action, `twins` pairs them on its existing rule
+    /// ("same case-folded letter and both already default to the same
+    /// action") with no change to `twins` itself. Before C33 a remap of
+    /// `alt+shift+h` bound only the `('h', SHIFT)` form and silently
+    /// no-opped on terminals sending `'H'` — the exact failure `twins`'
+    /// own doc comment says must never happen.
+    #[test]
+    fn remapping_a_shifted_vim_letter_reaches_both_delivery_forms() {
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+shift+h": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            translate_with(alt_shift(KeyCode::Char('h')), &keymap),
+            InputResult::Action(Action::Quit),
+        );
+        assert_eq!(
+            translate_with(alt(KeyCode::Char('H')), &keymap),
+            InputResult::Action(Action::Quit),
+            "the uppercase delivery must move too, or the remap half-applies",
+        );
+    }
+
+    // ---- C34: no surface may spell a chord it did not resolve -----------
+
+    /// The literals a chord spelling is allowed to appear as in production
+    /// code, each because it is **handed to a resolver as a default**
+    /// rather than printed as-is.
+    ///
+    /// Why an allowlist rather than a ban: the two authoring sites below are
+    /// legitimate and permanent, so a flat ban would need suppressions that
+    /// mean nothing. Exact-match on the *whole* literal is what gives this
+    /// gate its teeth — a bare `"Alt+w"` is what a resolver argument looks
+    /// like, while a chord embedded in a sentence
+    /// (`"last pane — Alt+w again to quit roost"`) is what a hard-coded UI
+    /// string looks like, and only the first form can be listed here.
+    /// Every C34 deviation the design audit found was of the second form.
+    const CHORD_LITERALS: &[&str] = &[
+        // `Chord::label`, the producer every other surface resolves through.
+        "Alt+Shift+{key}",
+        "Alt+{key}",
+        // C9 hint-bar defaults, passed to `alt(..)` — the bar prints what
+        // the keymap returns and falls back to these only when they are
+        // still accurate.
+        "Alt+?",
+        "Alt+n",
+        "Alt+↵",
+        "Alt+s",
+        "Alt+←↓↑→",
+        "Alt+w",
+        "Alt+r",
+        "Alt+q",
+        "Alt+Shift+p",
+        // C15 `HelpKey::Family` shorthands, which give way to enumeration
+        // the moment any member moves.
+        "Alt+←↓↑→ / hjkl",
+        "Alt+Shift+←↓↑→",
+        "Alt+Shift+hjkl",
+        "Alt+1..9 / Alt+0",
+        "Alt+Shift+i / +m",
+        // The one authored `HelpKey::Text` row that names a chord: a mouse
+        // chord, outside config.json's grammar, so it cannot move (C34).
+        "Alt+click / o",
+    ];
+
+    /// C34's rule, made mechanical: *any chrome that names a chord derives
+    /// that name from the live keymap.*
+    ///
+    /// Two runtime gates already check that the help overlay covers every
+    /// bound chord, but neither can see a chord spelled into an arbitrary
+    /// `format!` somewhere else in the tree — which is exactly where the
+    /// design audit found C34's rule broken in five places (C10's confirm
+    /// flashes) plus two more surfaces. Each was caught by a human reading
+    /// code. This is the check that would have caught all seven.
+    ///
+    /// A new spelling fails here until it is either resolved or added to
+    /// `CHORD_LITERALS` — and adding it is the moment its author has to ask
+    /// whether the surface should be deriving instead.
+    ///
+    /// Not a proof: `format!("press {} now", "Alt+w")` would slip through.
+    /// It is a guardrail against the accident, not a defence against
+    /// deliberate circumvention.
+    #[test]
+    fn no_surface_spells_a_chord_it_did_not_resolve() {
+        use crate::ui::srcscan::{is_comment, production, src_files, string_literals};
+        let mut offenders = Vec::new();
+        for (path, text) in src_files() {
+            for (i, line) in production(&text).lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                for lit in string_literals(line) {
+                    if lit.contains("Alt+") && !CHORD_LITERALS.contains(&lit) {
+                        offenders.push(format!("{}:{}: {lit:?}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "C34: a chord spelled into a literal instead of resolved from the keymap.\n\
+             Resolve it (`input::chord_for` / `App::chord_label`), or add the literal to \
+             CHORD_LITERALS if it is a resolver default:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// The gate's own teeth, since a passing scan proves nothing about what
+    /// it would reject: the shapes C34's audit actually found must fail it.
+    #[test]
+    fn the_chord_gate_rejects_a_chord_buried_in_a_sentence() {
+        let caught = |lit: &str| lit.contains("Alt+") && !CHORD_LITERALS.contains(&lit);
+        // The five C10 flashes, verbatim from before they were resolved.
+        assert!(caught("last pane — Alt+w again to quit roost"));
+        assert!(caught("{} busy — Alt+w again to close"));
+        assert!(caught("{busy} {noun} busy — Alt+q again to quit"));
+        assert!(caught("no room to rearrange; stack a pane with Alt+s first"));
+        // C9's attention segment and C16's dead-pane bar (D2, D3).
+        assert!(caught("◆ {n} needs you · Alt+a"));
+        assert!(caught(" ✕ exited — Enter: relaunch/resume · Alt+w: close "));
+        // And a resolver default still passes, or the gate would be unusable.
+        assert!(!caught("Alt+w"));
+    }
+
+    // ---- F1: effective_bindings -----------------------------------------
+
+    /// The property the whole of F1 rests on: what `effective_bindings`
+    /// reports **is** what `translate_with` dispatches on. Swept over every
+    /// chord it returns rather than spot-checked, so a binding that renders
+    /// one way and fires another is a failure, not a gap in the test.
+    #[test]
+    fn every_reported_binding_is_what_the_chord_actually_does() {
+        let keymap = Keymap::default();
+        for (label, action) in effective_bindings(&keymap) {
+            let chord = parse_label(&label);
+            assert_eq!(
+                translate_with(chord, &keymap),
+                InputResult::Action(action),
+                "{label} is reported as {action:?} but does something else",
+            );
+        }
+    }
+
+    /// Rebuild a `KeyEvent` from a label, so the sweep above can press what
+    /// it read. The inverse of `Chord::label` for the forms that table
+    /// produces.
+    fn parse_label(label: &str) -> KeyEvent {
+        let rest = label.strip_prefix("Alt+").expect("every label is an Alt chord");
+        let (shift, key) = match rest.strip_prefix("Shift+") {
+            Some(k) => (true, k),
+            None => (false, rest),
+        };
+        let code = match key {
+            "Enter" => KeyCode::Enter,
+            "PgUp" => KeyCode::PageUp,
+            "↑" => KeyCode::Up,
+            "↓" => KeyCode::Down,
+            "←" => KeyCode::Left,
+            "→" => KeyCode::Right,
+            k => KeyCode::Char(k.chars().next().unwrap()),
+        };
+        let mut m = KeyModifiers::ALT;
+        if shift {
+            m |= KeyModifiers::SHIFT;
+        }
+        KeyEvent::new(code, m)
+    }
+
+    /// Each collapse rule, named. Without them the overlay would print one
+    /// physical key twice (rules 1 and 2) or advertise a chord nothing is
+    /// bound to (rule 3).
+    #[test]
+    fn one_physical_chord_is_reported_exactly_once() {
+        let labels: Vec<String> =
+            effective_bindings(&Keymap::default()).into_iter().map(|(l, _)| l).collect();
+        let has = |l: &str| labels.iter().any(|x| x == l);
+
+        // Rule 1 — letters keep the Alt+Shift+<lower> spelling.
+        assert!(has("Alt+Shift+p"), "the documented spelling survives");
+        assert!(!has("Alt+P"), "its uppercase-delivery twin does not");
+        // Rule 2 — punctuation keeps the glyph spelling, the mirror choice.
+        assert!(has("Alt+?"), "the documented spelling survives");
+        assert!(!has("Alt+Shift+/"), "its shifted-base twin does not");
+        // Rule 3 — an arm that never tested shift binds no shifted chord.
+        assert!(has("Alt+1"));
+        assert!(!has("Alt+Shift+1"), "nothing is bound to Alt+Shift+1");
+        // ... and where the two shift states really differ, both survive.
+        assert!(has("Alt+h") && has("Alt+Shift+h"), "focus and move are distinct");
+        assert!(has("Alt+←") && has("Alt+Shift+←"), "focus and resize are distinct");
+
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "no label appears twice");
+    }
+
+    /// The point of the exercise: a remap moves what the chrome will draw,
+    /// and a disable removes it. Before F1 the help overlay and hint bar
+    /// spelled their chords as `&'static str`, so neither could.
+    #[test]
+    fn a_remap_moves_the_reported_binding_and_a_disable_removes_it() {
+        let (keymap, diagnostics) = Keymap::parse(
+            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            "config.json",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let bindings = effective_bindings(&keymap);
+        let float: Vec<&String> =
+            bindings.iter().filter(|(_, a)| *a == Action::ToggleFloat).map(|(l, _)| l).collect();
+        assert_eq!(float, vec!["Alt+v"], "the float is on Alt+v now, and only there");
+        assert!(
+            !bindings.iter().any(|(l, _)| l == "Alt+f"),
+            "the disabled chord is gone entirely — it forwards to the pane now",
+        );
     }
 
     /// The literal `"disable"` keyword is never itself a valid action name,
@@ -1612,12 +2174,12 @@ mod tests {
     #[test]
     fn twin_derivation_finds_every_same_letter_same_action_default_chord() {
         let table = default_keymap();
-        for (&chord, &action) in &table {
+        for (&chord, &action) in table {
             let KeyCode::Char(c) = chord.code else {
                 continue;
             };
             let found = twins(chord.code, chord.shift);
-            for (&other, &other_action) in &table {
+            for (&other, &other_action) in table {
                 let KeyCode::Char(oc) = other.code else {
                     continue;
                 };
@@ -1631,3 +2193,5 @@ mod tests {
         }
     }
 }
+
+

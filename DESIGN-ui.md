@@ -65,7 +65,7 @@ adds a glyph or a colour.
 **Amendment 2026-08-06 (native selection):** **C29** (drag-select,
 double/triple-click, shift-click-extend over a pane whose app never asked
 for the mouse) is new — the client's standing macOS-parity requirement
-(`openspec/changes/best-in-class/PLAN.md`, Phase 2N, client requirement #1).
+(`docs/engagements/2026-08-07-best-in-class/PLAN.md`, Phase 2N, client requirement #1).
 It reuses C17's `Selection`/`highlight_selection` and
 C24's `finish_selection`/`grab_text` verbatim rather than forking them, adds
 no glyph and no colour, and needed no amendment to C23 or C24 (both verified
@@ -74,6 +74,28 @@ gesture is mouse-only — §8 gets a same-dated cross-reference note instead,
 since it names no chord). `main.rs` also now requests a deliberate subset of
 crossterm's mouse-capture modes (C29's own bullet); that is a startup-cost
 change, not a chrome one, and touches no contract's rendered output.
+
+**Amendment 2026-08-20 (reliability audit, second pass):** **C10** now paints
+a flash over the body's last row when the hint bar is not drawn. The flash
+had been a child of the hint bar, so hiding hints (`Alt+/`) or a terminal
+under 3 rows silenced every C10 message — refusals, copy results, the
+workspace-set-aside notice, and U22's confirm-arm prompts, which armed a
+destructive second press while saying nothing. Same text, same `attention()`
+styling, same single row, same function; no new glyph and no new colour. C6
+gains a clarification that a stack's `n` is always ≥ 2 (a stack of one is
+normalized to a `Pane`), so `"STACK · 1 PANES"` is unreachable rather than
+merely ungrammatical. Both found by the design-supervisor pass on the C2
+amendment below.
+
+**Amendment 2026-08-20 (reliability audit):** **C2**'s yield ladder is
+amended so that `save failed ✕` outranks tab *names* — the failure was
+previously dropped whole by "tabs win", which on an ordinary terminal with a
+few tabs made a permanently-failing save permanently invisible. The strip
+scrolls under U7 instead, always keeping the active tab, and the indicator
+yields after all rather than empty the bar. No new glyph and no new colour:
+the indicator, its `accent()` styling and its columns are unchanged — only
+which of two existing things yields to the other. Details, including the
+floor case, live in C2's own dated amendment.
 
 ---
 
@@ -117,8 +139,8 @@ should be read against C5's spinner amendment, not looked up as an accessor.
 
 | Token | ratatui expression | Where used in chrome |
 |---|---|---|
-| `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text |
-| `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…` |
+| `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text, the `¶` note marker and the focused badge's note headline (C32) |
+| `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…`, the note age tag (C32) |
 | `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders, tab separators `│`. Never text (see the legibility principle). |
 | `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, the Working spinner (C5, amended 2026-08-07 — one steady red, no second phase), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
 | `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, `raw` badge token (C23), `↑N` badge token (U3) |
@@ -212,7 +234,9 @@ red). Modifiers permitted, and what each is load-bearing for:
 - `REVERSED` — the three attention surfaces (C10/C11/C16), copy selection
   (C17), copy cursor (C24), search hits (C17 amendment).
 - `UNDERLINED` — the stack header rule (C6), the copy cursor inside a
-  selection and the current search hit (C24/C17).
+  selection and the current search hit (C24/C17), and the pane editor's
+  name row (C32, amended 2026-08-15 — the field's own rule, padded edge
+  to edge so it doubles as the name/note separator).
 
 Program output keeps whatever attributes it sent.
 
@@ -252,6 +276,14 @@ with their existing meanings. The tab bar's count cell (C2) holds a **digit or
 `raw` badge token, not a symbol. This inventory governs symbols; text tokens
 are governed by their own contracts. Any new *glyph* under `src/ui/` is still
 a DEVIATED.
+
+**[Amended 2026-08-15, C32]:** two glyphs added: `¶` U+00B6 — the note
+presence marker (C4 badge, C8 collapsed rows, and the roster through the
+shared row) — and `⋮` U+22EE, appended to it as `¶⋮` when a note has body
+lines under its headline. Both single-width (no badge-column or mouse-math
+hazard), both drawn in `ink()`, and both governed by C32's reveal-on-visit
+rule: they appear only on a pane carrying a parking note. No other new
+glyph is sanctioned.
 
 ---
 
@@ -356,6 +388,32 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
   *visible* tab is clickable. Clicks on the `…` cell or the status area must
   not switch tabs (clamp at the `main.rs:309` call site or inside `tab_at_x`).
   If tabs + status collide, the status area is dropped first (tabs win).
+  **[Amended 2026-08-20 — a failed save outranks tab names.]** "Tabs win" is
+  right for *context* — a cwd, a mode word, `saved ✓` — all of which you can
+  get another way. `save failed ✕` is not context: it is the only standing
+  sign that the workspace on disk is going stale, and this rule dropped it
+  *whole*, so on an ordinary 80-column terminal with five tabs roost could
+  fail every single write and show nothing at all. (The same audit gave
+  `App::save` a C10 flash on the ok→failed transition; that fires once, and a
+  standing signal that vanishes exactly when the terminal is busy is not a
+  standing signal.) On a failed save the ladder therefore inverts: the cwd
+  yields, then the mode word yields (the reverse of U15's usual order —
+  ZOOM/RAW/COPY can be rediscovered by pressing a key, "not reaching disk"
+  cannot), and finally the strip itself yields, scrolling under U7 with its
+  `…` markers rather than the indicator being dropped. The active tab is
+  always among the ones kept, so what is spent is other tabs' names,
+  temporarily and visibly. One floor: if even the active tab could not be
+  drawn beside the indicator, the indicator is dropped after all — a tab bar
+  with no tabs is not a trade worth making, and C10's flash has already
+  fired. **[Corrected 2026-08-20, same audit: that last clause was not yet
+  true when it was written.]** The flash was drawn only inside the hint bar,
+  so with hints hidden — `Alt+/`, or a terminal under 3 rows, and the narrow
+  terminal is exactly where this floor fires — neither signal reached the
+  user. C10 is amended in the same change to paint a flash over the body's
+  last row when the hint bar is not drawn, which is what makes the fallback
+  real rather than nominal.
+  `mouse::effective_status_width` takes `save_ok` and `active` for exactly
+  this; `status_fit` grows one failed-save-only rung.
 - Mouse unit tests (`mouse.rs:250–260`) are rewritten to the new offsets **in
   the same change** as the renderer (lockstep rule, §4).
 
@@ -398,7 +456,11 @@ Consequences for this contract's width math, all shared by
 - Overflow gains one rung *inside* the status area, **ahead** of the existing
   drop: full → `{MODE} · {save}` (the cwd yields first: the word is safety,
   the cwd is context you can also read off the pane) → no status area at all.
-  Tabs still win outright over whatever is left.
+  Tabs still win outright over whatever is left. **[Superseded 2026-08-20
+  for a failed save only — see this contract's dated amendment below: the
+  save indicator gains a further rung beneath the mode word and then the
+  *strip* yields to it, so "tabs win outright" now holds for a healthy save
+  and nothing else.]**
 - The wider area takes its columns from the tab hitboxes exactly as it takes
   them from the drawn tabs — `tab_at_x` is fed the fitted width, so clicks
   and pixels stay in lockstep (§4/§5).
@@ -644,6 +706,30 @@ folded into the text. No bg — the badge is a watermark over the pane's own
 last output, and `quiet()` is exactly the right shape for that: the user's
 ink, one rung back.
 
+**[Amended 2026-08-15, C32 — the note segment.]** A pane carrying a parking
+note (C32) grows a note segment between the identity text and the
+`raw`/`↑N`/glyph tail; identity keeps leading, so U2's id-first rule holds
+untouched and a narrow pane clips the note before the join key:
+- **Focused:** `"{id} {name} · ¶ {headline} ({age}) {glyph}"` — `¶` (or
+  `¶⋮` when the note has body lines under its headline) plus the note's
+  first line in `ink()`, one span; the `({age})` tag in `quiet()`. The
+  headline is the badge's one full-strength element — reveal-on-visit is
+  C32's display contract, and the focused pane is the visit. This is the
+  only chrome text that ever renders note *content*.
+- **Unfocused:** the bare marker, `"{id} {name} ¶ {glyph}"` — `¶`/`¶⋮` in
+  `ink()`, no headline, no age. Presence, never content.
+- The age tag is `render::age_word`: floored coarsest-sensible unit —
+  `now` under a minute, then `{n}m` / `{n}h` / `{n}d` — read from one
+  wall-clock sample per frame (C5's shared-read idiom, `now_unix_secs`).
+  A backwards clock clamps to `now`. Staleness confessing its age is the
+  design's whole defense against a Tuesday note lying on a Friday. A note
+  **missing its timestamp** (C32 always writes the pair together, so only
+  hand-edited state or a future writer can produce one) shows **no age tag
+  at all** rather than a fabricated `now` — an absent fact renders as
+  absent, never as fresh.
+- Width behavior unchanged: same parts pipeline (`clip_spans`), tail
+  trimmed first; no bg, no new colour, no BOLD.
+
 ### C5 — Status glyph system + spinner
 
 **Current:** glyphs from `status.rs:34–42`; colors `render.rs:282–290`
@@ -791,6 +877,18 @@ nothing announces "this region is a stack".
   shrunken expanded rect automatically.
 - Content: left `" STACK · {n} PANES"`, right `"ALT+↑↓ "` (right-aligned) —
   uppercase, fg `DIM`, no bg.
+  **[Clarified 2026-08-20, reliability audit.]** `n` is always ≥ 2: a stack
+  is a way of sharing one region between several panes, so a stack of one is
+  not a stack, and `layout.rs` normalizes it into a plain `Pane` wherever one
+  can arise — `remove_pane` for a stack that shrinks to one, `dedupe_pane_ids`
+  (reached from `Workspace::validate_and_repair`) for a `workspace.json` that
+  holds one outright or is left with one after duplicate ids are stripped.
+  So no singular label is contracted, and none is needed: `"STACK · 1 PANES"`
+  is unreachable rather than merely ungrammatical. This was not always true —
+  before the normalization, `toggle_stack` on a one-member stack also built a
+  `Split` with a single child, a shape the module states it never constructs.
+  The header a one-member stack drew was the visible half of that bug: a row
+  borrowed from the only pane it described.
 - Every cell of the header row (both texts and the fill between) carries
   `Modifier::UNDERLINED` — the cell-level translation of the mockup's 1px
   bottom rule.
@@ -873,6 +971,15 @@ focused = Black on status-color bg, unfocused = status-color fg.
   state word.
 - Right segment `quiet()`. Width-shedding order, the no-dup rule, the state
   words and the C23 `raw · ` prefix are all untouched.
+
+**[Amended 2026-08-15, C32]** A noted pane's right segment leads with a
+`¶ ` marker in its own `ink()` span (ahead of the C23 `raw · ` prefix's
+position in the string, i.e. `"¶ raw · {word} "` when both) — the C4
+marker's exact meaning here: presence of a parked note, never its text;
+collapsed rows and the roster stay reveal-on-visit surfaces. It rides the
+right segment, so a narrow row sheds it with the segment — the C32 marker
+is a courtesy, identity and status stay the row's priority. The roster's
+rows (C27) inherit it through the shared `collapsed_row_spans`.
 
 ### C9 — Hint bar
 
@@ -1074,6 +1181,47 @@ actually do in every case, not only N > 0. Pinned by
 `hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input`
 (render.rs).
 
+**[Amended 2026-08-15, C32]** The mode-word list gains `NOTE`, and the note
+editor gets its own pair list (the C13 shape, plus the vertical keys):
+`type note` · `↵ save` · `Shift+↵ new line` · `↑↓←→ move` · `Esc cancel` —
+65 columns rendered (`hint_pair_cols`), inside the 100-col floor beside the
+right segment.
+`Ctrl+↵`/`Alt+↵` are unhinted synonyms of `Shift+↵`, the same alias rule as
+everywhere else on this bar. The Normal-mode seven-pair list still gains
+nothing: `Alt+Shift+n` is discoverable via `Alt+?` (C15), and the badge's
+`¶` marker (C4) is its own advertisement.
+
+**[Amended 2026-08-19, C34 — the chord spellings on this bar are derived]**
+Every `Alt` key this contract quotes as bar text (the Normal seven, the
+raw-mode pair, the dead-focused list's `Alt+w`/`Alt+q`, and the right
+segment's `· Alt+a`) is now **resolved from the live keymap**, not printed
+from these strings. On a default keymap the bar is byte-identical to what
+this contract has always specified — the quotations below stay accurate as
+the *default* rendering — but under a `config.json` remap the bar correctly
+disagrees with them, which is the whole point (C34).
+
+Three consequences worth stating rather than inferring:
+- **The pair lists and the 100-column arithmetic are untouched.** The seven
+  Normal pairs, their U6 yield order, and every column count in this
+  contract describe the default keymap and still hold.
+- **A remap degrades through the machinery already here.** A longer resolved
+  label makes trailing pairs drop from the right, exactly as a narrow
+  terminal does — `fit_hint_pairs` is a prefix loop, so nothing clips. No
+  new rule was needed.
+- **A disabled chord drops its pair** rather than advertising a dead key.
+- **Mode-local keys stay literal** (`hjkl`, `v/V`, `Esc`, `n/N`, `↵`, `f`,
+  `y`): config.json cannot reach them, so they cannot go stale.
+
+**[Amended 2026-08-15 (later), C32 combined editor]** `NOTE` retires with
+its mode; the word for the combined pane editor is `EDIT`. Its pair list:
+`type name / note` · `↵ save` · `Shift+↵ new line` · `↑↓←→ move` ·
+`Esc cancel` — 72 columns rendered, still inside the floor. The Rename
+list's leading pair reads `type tab name` unconditionally (Tab is Rename's
+one target now). And one Normal-mode relabel, content otherwise untouched:
+`Alt+r rename` becomes **`Alt+r edit`** — the chord names and notes now,
+and "rename" would under-describe it; two columns narrower, so the
+seven-pair fit math only loosens.
+
 ### C10 — Flash message
 
 **Current:** `render.rs:56–64` — Black on Green BOLD.
@@ -1104,6 +1252,41 @@ worth checking (a missing native helper is the common half of "both channels
 lost"), and shortening the code to match the spec would have deleted
 information. Short-form `copy failed` mentions elsewhere in this doc refer
 to this full string.
+
+**[Amended 2026-08-20, reliability audit — a flash is not a hint.]** The
+flash was drawn only by `draw_hint_bar`, so it appeared only when the hint
+bar did. `hints_shown()` is false both when the user pressed `Alt+/` and when
+the terminal is under 3 rows — and in that state *every* C10 message reached
+nobody: all 38 of them, including C38's refusals ("no room to split"), U14's
+copy result, the startup notice that a `workspace.json` was set aside, and
+U22's confirm-arm prompts, so `Alt+w` armed a destructive second press —
+"last pane — Alt+w again to quit roost" — while showing nothing at all. That
+is precisely the hazard C2's 2026-07-27 amendment names for the mode word:
+a safety affordance made conditional on an unrelated toggle.
+
+With the hint bar not drawn and at least two rows of terminal, the flash now
+paints over the **body's last row** instead — clearing that row first. The
+clear is load-bearing, not tidiness: `attention()` is `REVERSED` and nothing
+else (§2 — a flash inverts the user's own pair rather than assuming a
+background roost does not own), and ratatui *patches* styles, so with no fg
+of its own the message takes the fg of whatever cells it lands on. On the
+hint bar those are empty. Over the body they carry the pane border drawn
+moments earlier in the same frame, and the message came out reversed in the
+border's colour: `RULE` under an unfocused pane (structure colour carrying
+text, banned by §2) and, under a focused one, `ACCENT` reversed —
+bit-identical to `attention_problem()`, so "copied 12 chars" rendered as
+C11/C16's reserved problem treatment. The cells past the message kept their
+border glyphs, reversed, leaving a ragged band. Clearing the row first makes
+both paths land on empty cells, which is what actually makes "same function,
+so they cannot drift" true of *styling* and not only of text and timing.
+The §2 chrome fixtures gained a hints-hidden flash in the same change: they
+had never exercised this surface, which is why every gate passed while it
+was wrong. Painted over, not by shrinking
+the body: the geometry the panes were laid out and PTY-resized to must not
+change for two seconds and back, and the row repaints itself from the pane
+beneath the moment the flash expires. Text, styling (`attention()`), timing
+and precedence are all unchanged — both paths call the same `draw_flash`, so
+they cannot drift. Modals still paint after it (C22 stacking order).
 
 **[Amended 2026-07-27, SPEC-ux U22]:** "timing unchanged" is superseded for
 confirm-arm prompts only: a flash that arms a destructive second-press
@@ -1144,6 +1327,23 @@ unchanged; what fires the bar, and what it says, are now contracted:
   Profiles > Keyboard, "Use Option as Meta Key"; `iTerm.app` → iTerm2 >
   Settings > Profiles > Keys, Left Option = `Esc+`. Anything else gets a
   terminal-agnostic line — never a menu path that terminal doesn't have.
+
+**[Amended 2026-08-20 — the bar is no longer hint-bar-only]** Styling,
+trigger and wording are untouched; where it may be *drawn* is not. The bar
+reached the screen only through `draw_hint_bar`, so `hints_shown()` gated it
+— false both under `Alt+/` and under 3 rows of terminal. The failure mode is
+circular and was the reason to fix this ahead of the rest of C11: if Alt
+really is being swallowed, `Alt+/` cannot bring the hint bar back, so the one
+sentence that explains why no chord works is unreachable by the only key that
+would reveal it. It now falls back to the body's last row on exactly the
+terms C10's flash does (same amendment, same `Clear`, same shared function
+per path, flash still winning over it), with one difference worth stating
+because it is a real cost rather than an oversight: this bar is
+**persistent**, so it holds that row for as long as the trap is detected
+rather than for two seconds. That is accepted because the trigger is already
+evidence-gated (U4/F1 above — the signature of a swallowed Option chord, not
+a mere absence of Alt), a user in that state has no working chords at all,
+and one Alt key ever — or the 8 s window closing — ends it.
 
 **[Amended 2026-07-27, theme inheritance; revised same day after the design
 supervisor's SG-1]** The bar is `attention_problem()`
@@ -1308,6 +1508,22 @@ has one; the feed's `offset` *is* its cursor, so both are "the wheel drives
 the selection"), and a click on a row jumps while a click outside dismisses,
 the picker's shape. Paste is swallowed, like every non-Rename modal.
 
+**[Amended 2026-08-15, C32]** The note editor is a **sixth** C12 modal. It
+takes the frame, backdrop, anchoring and stacking unchanged, and extends
+exactly two of the U8 answers to a second member: an outside **click** is
+swallowed, not a cancel (Rename's carve-out, same unsaved-work rationale
+with more at stake), and a **paste** belongs to its buffer — with the one
+filter difference contracted in C32: newlines survive as line breaks
+(CR/CRLF normalized) where Rename strips them, because in a multi-line
+field a pasted newline is content, not a commit. Wheel swallowed, like
+every non-feed/roster modal.
+
+**[Amended 2026-08-20]** U8 above contracts what a modal owns of the
+**mouse**. The keys are not C12's to answer: an Alt chord leaves every mode,
+modal or not, and that rule is **C24b**'s — amended the same day with the
+two chords a mode may keep and the gates that pin them. C12 adds nothing to
+it; a modal is a mode, and holds keys exactly as weakly as one.
+
 ### C13 — Rename dialog
 
 **Current:** `render.rs:153–168` — 44×3, Double/Cyan, plain input text.
@@ -1330,7 +1546,18 @@ the U8 rule that an outside click does not dismiss unsaved work.
 - **Motion is clamped, never wrapping.** `←` at the start and `→` at the
   end do nothing. A one-line field that teleported the caret between its
   ends on an overshoot would make every held arrow key a hazard.
-- **Hint bar** gains `←→ move` (45 columns, C9).
+- **Hint bar** gains `←→ move` (48 columns since the 2026-08-15
+  amendment — the leading pair reads `type tab name` now, C9).
+
+**[Amended 2026-08-15, C32 combined editor — Tab is the one target
+left.]** Pane renames moved into the combined pane editor (C32's dialog,
+where the name is the underlined first row); `Alt+r` opens that editor and
+`Alt+Shift+r` still opens this dialog for the tab. Everything above — the
+frame, the moving caret, char-indexing, the clamped single-line motion,
+U8's outside-click rule — is unchanged and now describes the tab dialog
+alone (heading ` rename tab `, hint list leading `type tab name`).
+`RenameTarget` keeps its enum shape with `Tab` as the sole variant, so the
+mode doesn't churn twice if a third single-line target ever appears.
 
 ### C14 — Picker (quick-launch)
 
@@ -1578,12 +1805,28 @@ So the cap goes, and with it the merges:
 - **Width rule, unchanged in substance:** one *column* must stay ≤ 80 or
   `centered_near` clamps and clips a description mid-word. Pinned by
   `one_help_column_fits_the_eighty_column_floor`.
+  **[Clarified 2026-08-19, C37 audit]** That test measures the **dialog rect**
+  (`help_layout(..).size.0` = column + 3 for border and padding), not the
+  column, so it is stricter than this bullet's wording: a column of 80 is
+  already a dialog of 83 and clamps at an 80-column terminal. The test is the
+  operative check; read this bullet as "the dialog must fit the floor", which
+  is what it was always defending.
 - **What replaces the cap as the binding check:**
   `every_bound_chord_is_documented_in_the_keymap` — every chord roost binds
   appears in the overlay. That assertion was *impossible* to write under the
   cap, where a new chord's options were "merge a row" or "go undocumented".
   It is the check that actually matters, and it only became available by
   removing the constraint that made it unsatisfiable.
+
+**[Amended 2026-08-20, F9 — the keymap filters]** `/` opens a type-ahead
+filter over the table, and while a query is open "any key closes it" no
+longer holds: printables type. That is a **larger** carve-out than the
+scroll amendment above, which is conditional and hands its keys back the
+moment they have nothing to do — the rules, the reason C27's roster rather
+than C15's own scrolling licenses it, and the four title/hint-bar wordings
+that announce it are contracted in **C39**. Everything on this page holds
+unchanged while the filter is closed, which is the default and, for a reader
+who never presses `/`, the only state.
 
 **[Amended 2026-08-06, PR #46 design audit (D2) — the mouse row grows]**
 C29's three new gestures had no discoverability surface at all:
@@ -1633,6 +1876,50 @@ the fleet is scriptable second). Covered by the existing width rule and
 `every_bound_chord_is_documented_in_the_keymap` gate (as a non-Alt surface
 it poses no new bindings).
 
+**[Amended 2026-08-20, floor stress — the key column must end in a space]**
+`draw_help_columns` draws a row as **two adjacent spans**, the key prefix and
+the description, with nothing between them: all the separation there is comes
+from the prefix's own padding. That padding was `format!(" {key:<18}")` — a
+*minimum* width, not a column. A key 18 cells or wider gets padded by nothing,
+and the description fuses straight onto it.
+
+It was already visible on the **default keymap**, in the group this contract's
+own PR #42 amendment added — and on two rows, not one: `roost send <id>
+"text"` (22) and `roost spawn ADAPTER` (19), rendering `…"text"type into that
+pane` and `…ADAPTERlaunch a new pane`. C34 then made the key column keymap-derived,
+so an enumerated family reaches 23 and `Alt+← / Alt+↓ / Alt+j …move focus (…)`
+joined them. None of these is a *clipping* failure — the row fits — which is
+why every width test passed over all three.
+
+**Rule:** a key column always ends in at least one space. Pad to the
+18-column grid when the key fits it, otherwise exactly one space. Rows under
+18 render byte-identically to before; only the ones that were unreadable move.
+Pinned by `a_key_column_never_fuses_to_its_description`, which asserts the
+*separator*, not the width — width was never what broke.
+
+**And the column it costs had to come from somewhere.** `HELP_COL_FLOOR` — the
+ceiling `elide_key` cuts against — read `80` from the start and was three
+columns too loose: `help_layout` asks for `content + 3` (two borders plus the
+column of air before the right one), so a column of 78 is a dialog of 81,
+clamped to the terminal with the air going first. It never bit only because
+the widest content the table could produce was exactly 77, the ceiling the
+constant should have named. Adding a column took it to 78 and, at 80×24 with
+`alt+h` disabled, `… move focus (…at an edge)` sat flush against the border.
+The constant is now **derived** — `HELP_FLOOR_COLS − HELP_DIALOG_CHROME` = 77
+— because the derivation is the part that was wrong, and `help_layout` uses
+the same `HELP_DIALOG_CHROME` rather than a bare `+ 3`.
+
+Both floor tests were rewritten in the same pass, because neither could have
+caught this: they asserted `layout.size.0 <= 80`, and `size.0` is
+`.min(body.width)`, so at an 80-column body it reports 80 whether the layout
+fit or was clamped down to it. **A tautology that reads like a gate is worse
+than no gate** — it makes the check look done. They now assert the *ask*
+(`content + HELP_DIALOG_CHROME`) against the floor.
+
+Found by the design audit of the padding fix, which measured the rendered row
+rather than trusting the arithmetic; the padding bug itself was found by a
+simulation agent stressing the design floor. Neither found the other's half.
+
 ### C30 — Sub-two-row floor notice — [Added 2026-08-06]
 
 **Current:** `render.rs:24–29` (`draw_too_small`) — when `area.height < 2`,
@@ -1681,6 +1968,19 @@ line and flashes the U14 copy outcome. Session-less panes (shells, agents
 dead before detection) keep the bar unchanged — `y` would copy nothing
 there, and both this bar and the C9 hint bar gate on the same predicate so
 they can't disagree.
+
+**[Amended 2026-08-19, C34 — the close chord is resolved]** The bar's
+`· Alt+w: close` is **derived from the live keymap**, not printed from the
+text quoted above; an unbound close drops the clause entirely rather than
+naming a key that does nothing. The quotation stays accurate as the default
+rendering.
+
+Why this bar specifically, beyond C34's general rule: the C9 hint bar sits
+**one screen row below it** and already derived the same chord, so before
+this a remap made two surfaces a single glance apart disagree about which key
+closes the pane. `Enter`, `f` and `y` stay literal — mode-local keys
+config.json cannot reach (C34's stated exemption), and the same predicate
+still gates `y` on both bars so they cannot disagree about *that* either.
 
 **[Amended 2026-07-27, theme inheritance]** The spawn-error line stays
 `accent()` on no bg. The action bar becomes `attention_problem()` instead
@@ -1971,6 +2271,36 @@ timestamps and ordinary text `quiet()`; a NeedsInput line's text `ink()` with
 an `accent()` `◆ ` prefix; the U25 selection marker `❯` `accent()`; the empty
 state `quiet()`. No fills anywhere in it.
 
+
+**[Amended 2026-08-20, floor stress — the overlay always has a frame]**
+`feed_overlay_size` subtracts four from the body in each axis, and nothing
+floored the result: a body four rows tall gave a **zero-height dialog**,
+which draws nothing — no border, no title, no rows. The body is two rows
+short of the terminal (tab bar and hint bar), so any terminal six rows or
+shorter was affected. `Alt+e` and C27's `Alt+Shift+a` still flipped the mode
+word and still offered `↑↓ select` in the hint bar, so the whole visible
+effect of the chord was one word changing: indistinguishable from a binding
+that does not work, at exactly the sizes where a user is least sure what
+they are looking at.
+
+C14's picker had answered this already — "an empty result still needs a
+frame to say so" — and these two never adopted it. Both axes are now floored
+at one cell. `centered_near` clamps the ask to the body, so the floor can
+never overflow a body smaller than the frame it asks for; a one-row dialog
+is its top border and title, which is enough to say *something opened*.
+
+Knowingly residual: at that size the hint bar still offers `↑↓ select` and
+`PgUp/Dn page` over an overlay with zero selectable rows. The floor's job is
+to prove the chord worked, not to make a two-row terminal a usable roster,
+and pruning the pairs would be C9's arithmetic rather than this one's — but
+it is the next thing to look at if the sub-eight-row case ever matters.
+Pinned by `the_fleet_overlays_always_have_a_frame_to_say_so_with` (geometry,
+every body size from 1×1 to 11×11) and `tests/small_terminal_overlays.rs` (a
+real roost at 40×8, 40×6, 40×5 and 40×4, looking for the overlay's title
+rather than a border glyph — the panes draw borders too, and a first draft
+that counted corners passed with the bug present because the *panes'*
+corners arrived between its two samples).
+
 ### C21 — Pane zoom (Alt+z) — [Added 2026-07-22, fleet features]
 
 **Current:** no zoom. Rendering walks every `PaneRect` of the active tab
@@ -2004,8 +2334,9 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
   expanded first (`expand_in_stacks`), then zoomed.
 - **Exits zoom** (exhaustive list): Alt+z again · any tab change (Alt+t,
   Alt+1..9, tab-bar click, cross-tab Alt+a) · any structural layout action —
-  Alt+n, picker launch, Alt+s, Alt+o, Alt+Shift+arrows, Alt+g — which exit
-  zoom *first, then apply*, so the layout never changes invisibly · the
+  Alt+n, picker launch, Alt+s, Alt+o, Alt+Shift+arrows, Alt+g,
+  Alt+Shift+g, Alt+Shift+hjkl — which exit zoom *first, then apply*, so the
+  layout never changes invisibly · the
   zoomed pane closing (Alt+w or control close). **Keeps zoom:** focus moves,
   same-tab Alt+a, entering/leaving scroll·copy·rename·help·feed modes, the
   float toggle (the float draws above the zoomed view, C22), control-plane
@@ -2019,6 +2350,17 @@ hit-testing walk the same list (`app.rs:1118–1128`, `main.rs:328–329`).
 - Unit tests: display list is `[focused @ body]` iff zoomed; each exit
   trigger clears the flag; focus-move-under-zoom retargets the display list;
   PTY resize targets.
+
+**[Amended 2026-08-19, C33 and C37]** The structural-action list above gains
+`Alt+Shift+hjkl`, and `Alt+Shift+g` on the same date for the same reason —
+C37's reverse cycle is as structural as C25's forward one, and this list is
+*enumerated by name*, so an omission makes it false rather than vague. Both
+were found by a design audit, which is the check that exists for exactly this. Recorded rather than left implied: the list is labelled
+*exhaustive*, so a new structural action that exits zoom without appearing
+here does not leave the contract vague — it makes it false. (Found by the
+design-supervisor audit of C33, which is the check that exists to catch
+exactly this.) C22 rule 3's sibling list takes the same addition on the same
+date.
 
 **[Amended 2026-07-27, SPEC-parity P5 — the round trip is lossless]** Zoom
 resizing the pane's PTY both ways is only safe because the resize itself now
@@ -2102,8 +2444,21 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   Worked example (audit fixture): 80×24 terminal → body 80×22 → float 48×13,
   centered. Recomputed on resize.
 - **Stacking order (topmost last), contracted:** tiled panes → zoomed view
-  (C21) → **float** → C12 modal overlays (rename/picker/help/feed). The
-  float never dims the workspace — it is a pane, not a modal.
+  (C21) → **float** → C10's body-row flash, when it is drawn there → C12
+  modal overlays (rename/picker/help/feed). The float never dims the
+  workspace — it is a pane, not a modal.
+  **[Amended 2026-08-20 — the flash's place named.]** C10's fallback (a
+  flash painted over the body's last row when the hint bar is not drawn)
+  had no place in this list, and two of its consequences were therefore
+  uncontracted rather than chosen. Both are now: it paints **above the
+  float**, so a float whose bottom border reaches the body's last row has
+  that one row overpainted for the flash's two seconds — right, because a
+  refusal or a confirm-arm prompt is about the whole session and the float
+  is one pane; and it paints **below modals** and inside `body`, so it is
+  dimmed by C12's backdrop along with everything else behind an open modal
+  — also right, since a modal owns the frame while it is up. Neither costs
+  the float or the modal any input: the flash is chrome with no hitbox
+  (`hit_test` reads `display_rects`, which the flash does not touch).
 - **Border/badge:** rendered exactly as a pane: `ACCENT` focused border
   whenever shown (it is focused whenever shown — next bullet), corner badge
   through the normal titled path → `scratch · shell {glyph}`. No new glyphs,
@@ -2116,12 +2471,19 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
      (that click then lands normally on what it hit). Focus returns to
      `prev_focus`.
   3. Structural pane actions — Alt+n, picker launch, Alt+s, Alt+o,
-     Alt+Shift+arrows, Alt+g, Alt+z — first hide the float and restore
+     Alt+Shift+arrows, Alt+g, Alt+Shift+g, Alt+Shift+hjkl, Alt+z — first hide
+     the float and restore
      `prev_focus`, *then* apply. (The float is outside the layout tree;
      without this, `spawn_child`'s empty-tab fallback at `app.rs:1425–1427`
      would wipe the tab's layout when asked to split a pane the tree doesn't
      contain.)
   4. Alt+w closes it for real (above); Alt+f hides it.
+
+  **[Amended 2026-08-19, C33 and C37]** Rule 3's list gains `Alt+Shift+hjkl`
+  and `Alt+Shift+g` — a swap and a reverse layout cycle are both structural
+  pane actions and hide the float like the rest. Same reasoning as C21's
+  amendment of the same date: a list this one enumerates by name is wrong,
+  not merely incomplete, when an action is missing from it.
 - **Mouse:** when shown, the float's rect is **first** in the hit-test list
   (`hit_test` takes the first match — the caller orders the slice; topmost
   wins). Wheel, clicks, drags, and copy-mode selection inside it behave as
@@ -2316,7 +2678,50 @@ calls that scroll mode, Alt+? in Help closes and reopens the overlay.
   explicit second Alt+r is a deliberate act, unlike U8's stray click, which
   still may not throw unsaved text away.
 
-### C25 — Canned layout cycle (Alt+g) — [Added 2026-07-22, fleet features]
+**[Amended 2026-08-20, the escape hatch is now a gate]** "Nothing else
+changes" above is the load-bearing half of this contract, and until now the
+only half with no test: it was one `if` at the top of `handle_mode_key` and
+an assertion nowhere. State it as the invariant it is — **an Alt chord
+always leaves the mode** — and name the complete list of chords a mode may
+keep, which is two:
+
+1. Its own **entry chord**, the bullets above. Consumed, and *exits*.
+2. **`Alt+Enter`** in the two multi-line editors — the note editor (C32) and
+   the composer (C36). Consumed, and **does not exit**: it breaks a line and
+   the dialog stays open. This is the tree's only *retained* Alt chord, and
+   the only admissible kind. Terminal.app spells Shift+Enter as exactly
+   those bytes (README's CSI-u collapse), so there it is the only spelling
+   of "break a line" the dialog can receive — the chord is the mode's **own
+   text**. That is the whole test a carve-out must pass; it is never a
+   shortcut for "this mode wants that key". Note the asymmetry with (1),
+   which is the point: an entry chord is a *way out*, a retained chord is
+   *content*.
+
+Everything else drops to `Mode::Normal` and dispatches globally, so `Alt+q`
+quits, `Alt+n` opens a pane and `Alt+1` switches tabs from inside any dialog
+— **out of any mode**, which is narrower than "from anywhere" and
+deliberately so: C23's raw pass-through (a raw pane in Normal mode) claims
+every Alt chord but its own toggle, and a C11 terminal that never sends ALT
+at all has no chord to route.
+
+Pinned three ways, all added 2026-08-20:
+- `the_only_alt_chords_a_mode_keeps_are_the_two_c24b_names` sweeps every
+  bound chord against every mode — 1,111 probes — and fails on any third
+  consumption. Sweeping the space rather than listing chords is what makes
+  it a gate: a mode that claims some future `Alt+x` is caught without anyone
+  remembering to test `Alt+x`.
+- `every_mode()` carries an exhaustive `match` over `Mode`, so a variant
+  cannot be added without that `match` failing to compile — which lands the
+  author in the one function that has to know about it.
+- `tests/modal_quit.rs` drives five real modals in a real PTY, asserting
+  each is on screen **before** pressing anything at it. That assertion is
+  the one worth keeping: a simulation agent reported `Alt+q` hanging in
+  every modal, and its harness had pressed the opening chord 100 ms after
+  spawn, before roost drew a frame. The modal never opened, so what it timed
+  was Normal mode against a deadline shorter than a real quit. A modal test
+  that never opened a modal reports on a screen it never reached.
+
+### C25 — Canned layout cycle (Alt+g / Alt+Shift+g) — [Added 2026-07-22, fleet features]
 
 **Current:** layout shape is built up manually (splits Alt+n/Alt+o, stacks
 Alt+s, ratios Alt+Shift+arrows); no way to snap the tab to a known-good
@@ -2326,6 +2731,10 @@ arrangement. Tree ops live in `layout.rs` (`toggle_stack :129–166`,
 
 **Target:**
 - New `Action::CycleLayout`, bound to **Alt+g**. Mnemonic: *arranGe / grid*.
+  **[Amended 2026-08-19, C37]** It carries a `forward: bool` now, and
+  `Alt+Shift+g` walks the same cycle backwards — see C37 for the arithmetic
+  and for why stepping back from the first arrangement wraps to the last
+  rather than restoring a pre-cycle layout.
   (Rejected alternatives, recorded: `Alt+Space` — tmux's next-layout key, but
   OS-captured as the window/system menu on GNOME and Windows Terminal;
   `Alt+[`/`Alt+]` — zellij's, but ESC-`[` *is* the CSI introducer byte pair,
@@ -2357,8 +2766,14 @@ arrangement. Tree ops live in `layout.rs` (`toggle_stack :129–166`,
   non-collapsed rect it would produce in the current body area is
   ≥ `MIN_SPLIT_COLS × MIN_SPLIT_ROWS` (36×10 — the existing split floors;
   collapsed 1-row stack bars are exempt by design). Alt+g applies the next
-  **fitting** arrangement, skipping unfit ones; the counter lands on what was
-  applied.
+  **fitting** arrangement, skipping unfit ones.
+
+  **[Corrected 2026-08-19, C37 audit]** This used to end "the counter lands on
+  what was applied", which is not what the code does and never was:
+  `layout_cycle` is set to `idx + 1`, i.e. **the arrangement to try next**, so
+  what is showing is `layout_cycle - 1`. The distinction is invisible while the
+  cycle only runs forward and is exactly what C37's reverse direction has to
+  reason about, which is how the error surfaced.
 - **Cycling is disabled** (press is a no-op, counter does not advance) when:
   `n < 2` → flash `one pane — nothing to arrange`; or no arrangement fits →
   flash `no room to rearrange`.
@@ -2777,7 +3192,7 @@ a pane whose app never asked for mouse reporting (`MouseProto::None`),
 (`App::on_click`) do anything. Selection exists only inside the modal
 `Alt+c` copy mode (C17/C24), reachable by nobody who doesn't already know
 the chord. The client's standing requirement
-(`openspec/changes/best-in-class/PLAN.md`, Phase 2N, client requirement #1)
+(`docs/engagements/2026-08-07-best-in-class/PLAN.md`, Phase 2N, client requirement #1)
 is that drag-select, double-click-word, triple-click-line and
 shift-click-extend work with **no new shortcuts to learn** — indistinguishable
 from a native macOS app — and that ⌘C always lands the emulator's own copy of
@@ -3441,6 +3856,146 @@ sanity check that a genuine edge still crosses) ·
 `cross_tab_focus_exits_zoom_like_any_other_tab_change` ·
 `float_rule2_focus_dir_does_not_cross_tabs_even_with_more_than_one`.
 
+### C32 — Pane parking notes (`Alt+Shift+n`) — [Added 2026-08-15, client request]
+
+**Problem being solved:** the client runs many tabs and panes, sleeps the
+laptop overnight (no quit, so no resurrection moment), and returns having
+forgotten each pane's *intent* — the transcript survives in the agent's own
+session, but "waiting on CI", "this approach is a dead end", "next: rebase
+then merge" do not. A name (`Alt+r`) says what a pane *is*; a note says
+where it *stands*.
+
+**Data:** `PaneSpec.note: Option<String>` + `PaneSpec.noted_at: Option<u64>`
+(unix seconds), both `#[serde(default)]` — a pre-C32 `workspace.json` loads
+untouched, and notes ride the existing auto-save/`Alt+u` clauses with no
+machinery of their own (pinned: `note_and_timestamp_roundtrip_through_json`,
+`pre_note_workspace_json_loads_with_no_note`,
+`undo_reopens_a_closed_pane_with_its_note`). Newlines separate lines; the
+**first line is the headline** every chrome surface shows; `noted_at` is
+set/cleared with `note`, never separately. The float (C22) takes a note
+in memory like any pane and loses it at quit — its own documented scope.
+
+**Editor (the C12 modal, C13's multi-line sibling):** `Alt+Shift+n` opens
+`Mode::Note` on the focused pane — prefilled, point at the very end,
+because the editor is also the note's *reader* (peek, edit and clear are
+one surface; there is no separate viewer). `pane` is pinned at open time.
+The dialog is Rename's 44-col width, one content row per line, growing to
+`NOTE_MAX_LINES` (8) instead of scrolling; heading `" pane note "`; all
+text `ink()`; the `▏` caret rides the cursor row (C13's `rename_field`).
+Keys: C13's editing vocabulary on the current row (insert at point,
+Backspace/Delete, Home/End per row, Ctrl+U/W), plus the vertical half —
+`↑↓` move rows keeping the column where they can; **`←→` flow across line
+ends** (the one C13 clamp deliberately relaxed: in a multi-line field a
+line edge is a seam, not a wall — C13's "never wrapping" stays true of
+single-line Rename); `Shift+↵` splits the line at the point (`Ctrl+↵`
+synonym; **`Alt+↵` is claimed inside this dialog only** — Terminal.app
+delivers Shift+↵ as exactly Alt+↵'s bytes, so on that terminal it is the
+only spelling of "newline" the dialog will ever receive; every other Alt
+chord still cancels out to the global bindings, U18's toggle-off
+included); and Backspace/Delete at a line edge join across it. At the cap
+a split is swallowed whole. A line wider than the field clips at the
+field's right edge, caret included — C13's own field behavior, accepted:
+the 8-line dialog interior is the honest bound of a parking note, not a
+document editor. `↵` commits; `Esc` and the U18 toggle-off cancel; an
+outside click is **swallowed, not a cancel** (C12's Rename carve-out,
+extended — see C12's 2026-08-15 amendment).
+
+**Commit:** whole-text trim (stray blank edge lines die — a headline of
+`""` would make the badge segment a lie; interior blanks are the author's
+call); empty result clears `note` + `noted_at` both — **the clear gesture
+is the acknowledgment**, C32's staleness hygiene alongside the age tag;
+non-empty sets both and re-stamps. Either way the workspace saves
+immediately (the overnight story is a disk write, not a mode).
+
+**Display is reveal-on-visit, contracted in the surface contracts:** the
+focused pane's badge reads its headline + age out; every other surface —
+unfocused badges, collapsed rows, roster rows — shows only a `¶` presence
+marker. No startup digest, no toast, no timer, nothing shouts: C4's
+amendment holds the badge forms and the age-tag rule, C8's the row marker,
+C9's the `NOTE` mode word and pair list, C12's the modal-family rules
+(outside click swallowed; paste keeps newlines). Deliberately **not**
+built: tab-level notes (entering a tab focuses its remembered pane, whose
+note is the tab's de facto status line), roster note *text* (against
+reveal-on-visit), and a `roost note <id>` control verb (natural follow-up;
+the data model already supports it).
+
+**Unit tests (`core::app::tests`):**
+`note_types_splits_saves_and_stamps` ·
+`note_opens_prefilled_and_an_empty_save_clears` ·
+`note_esc_and_toggle_off_both_cancel_without_touching_the_note` ·
+`note_alt_enter_splits_instead_of_opening_the_picker` ·
+`note_line_cap_swallows_the_split` ·
+`note_paste_weaves_lines_and_folds_overflow_at_the_cap` ·
+`note_backspace_at_line_start_joins_lines` ·
+`undo_reopens_a_closed_pane_with_its_note`; input:
+`alt_shift_n_notes_pane_alt_n_still_news`. **Render:**
+`focused_badge_reads_the_headline_in_ink_with_a_quiet_age` ·
+`unfocused_badge_shows_only_the_note_marker` ·
+`age_word_floors_to_the_coarsest_sensible_unit` ·
+`noted_collapsed_row_marks_the_right_segment` ·
+`note_dialog_height_tracks_its_line_count`; the §2 gates audit the new
+spans through the `noted badges` / `noted collapsed rows` / `note dialog`
+`chrome_buffers()` fixtures (C12's every-Mode-variant rule enforces the
+fixture's existence at compile time).
+
+**[Amended 2026-08-15 (later, client request) — the COMBINED pane editor:
+one dialog, one chord, two fields.]** Alt+Shift+n retires after one
+release (v0.1.7) and **`Alt+r` opens the pane's whole text surface**:
+the name as the dialog's first row, the note lines under it —
+`Mode::PaneEdit`, replacing `Mode::Note`. Motivation is chord economy (the
+client's: "I don't want the user to remember so many shortcut keys"): the
+feature's net new-chord count returns to zero, and `n` goes back to §8's
+free pool. Everything the original C32 contracts — storage, badge/row
+display, reveal-on-visit, U8 modal rules, the cap, paste, cancel semantics
+— carries over unchanged except as follows:
+
+- **The dialog** (` edit pane `, 44 cols, C12 frame): row 0 is the name,
+  **`ink()` + `UNDERLINED`, padded edge to edge** so the underline reads
+  as the field's rule and the name/note separator even when the name is
+  empty (stack_header_text's fill trick; §2 modifier inventory amended);
+  rows below are the note in plain `ink()`. Height = name + note lines +
+  frame (`lines + 3`), growing to `NOTE_MAX_LINES`. The point opens at
+  the **end of the name row** — Alt+r's rename muscle memory is preserved
+  keystroke for keystroke.
+- **The seam**: `↑↓` and `←→` cross between name and note freely (`←→`
+  flow across row ends); **edits never cross** — Backspace at the note's
+  top-left and Delete at the name's end are walls, so a typo can never
+  merge status text into identity. Inside the note, edge joins still work.
+- **Break key**: `Shift+↵` (`Ctrl+↵`/`Alt+↵` synonyms, the Alt-branch
+  carve-out unchanged) *descends* from the name row into the note — the
+  name is single-line by contract, so "line break" there means "start the
+  note", making name → headline → body one continuous typing flow. The
+  descent lands at the **headline's end** (the writing point of an
+  existing line), never at the name's column carried over. On note rows
+  it splits at the point, at the cap swallowed whole.
+- **Commit** (`↵`, from either field): name trims, empty clears the title
+  back to the adapter fallback (C13's rule, unchanged); note trims/joins
+  as before — and **`noted_at` re-stamps only when the note text actually
+  changed**. A pure rename can't refresh a stale note's age; an untouched
+  note keeps its honest timestamp; an emptied note still clears both.
+  Tightened from the original "every save re-stamps", which the combined
+  dialog would have turned into a lie.
+- **Paste** targets the row it lands on: name row = Rename's
+  printables-only filter (a name paste never descends); note rows = the
+  newline-preserving weave, unchanged.
+- **Chrome renames**: mode word `EDIT` (C9), Normal-bar pair `Alt+r edit`,
+  §8 row 12 covers both chords, the C15 keymap row reads "name + parking
+  note (first line shows on the badge)". Config names: `edit_pane` is
+  canonical; `rename_pane` and `note_pane` parse as aliases so v0.1.7
+  config.json remaps keep working.
+
+**Unit tests (combined):** `edit_pane_types_name_and_note_in_one_flow` ·
+`edit_pane_opens_prefilled_and_an_emptied_note_clears_only_the_note` ·
+`edit_pane_restamps_the_note_age_only_when_the_note_changed` ·
+`edit_pane_esc_and_toggle_off_both_cancel_without_touching_either_field` ·
+`edit_pane_alt_enter_breaks_instead_of_opening_the_picker` ·
+`edit_pane_line_cap_swallows_the_split` ·
+`edit_pane_note_paste_weaves_lines_and_folds_overflow_at_the_cap` ·
+`edit_pane_edits_never_cross_the_name_note_wall` ·
+`alt_shift_n_is_retired_back_to_the_free_pool` (input) ·
+`hint_pairs_rename_word_differs_tab_vs_pane_editor` (render); the
+`pane editor` chrome fixture replaces `note dialog`.
+
 ---
 
 ## 4. Pixel-idea translations (explicit)
@@ -3686,6 +4241,1117 @@ not a benchmark suite.
 
 ---
 
+### Open: a click on the picker's cwd column launches the wrong thing
+**[Added 2026-08-20, ADAPTER_COL audit]**
+
+`App::handle_modal_mouse`'s picker arm hit-tests **rows only**
+(`mouse::picker_row_at`) and calls `picker_launch(i)`. A click anywhere on
+row `i` — including on the *recent-directory* label in the second column —
+launches adapter `i` with whatever cwd was already selected. So clicking a
+directory does not choose that directory; it launches an adapter you may not
+have meant, into a directory you did not click.
+
+Pre-existing, and older than the constant that surfaced it. It is recorded
+now because C14's column geometry became *derivable* when `ADAPTER_COL`
+stopped being two numbers: a click's column can now be compared against it,
+which is what any fix would need.
+
+The fix is not obvious enough to guess at. C12's U8 click rules say the
+picker "launches the row clicked and cancels on a click outside" — written
+before there were two columns, and silent about which column. Three
+readings: a click on the cwd column *selects* that directory without
+launching (matching `←→`'s keyboard behaviour, and the picker's own
+two-column focus model); or it selects **and** launches, which is the
+fewest clicks but makes a mis-aimed click destructive; or the columns stay
+one hitbox and U8's sentence is amended to say so deliberately. The first
+matches the keyboard, which is usually roost's tie-breaker.
+
+Found by the design audit of the `ADAPTER_COL` fix — not by the fix, which
+touches no hit-testing.
+
+### ~~Open~~: the picker's adapter column has two widths and neither widens
+**[Added 2026-08-20, floor-stress audit · RESOLVED 2026-08-20]**
+
+`render.rs` defines `ADAPTER_COL` **twice, with different values**: 23 in
+`picker_dialog_width` (documented as 3-char row prefix + longest id + longest
+status suffix + slack) and 16 in the draw path, where it is the pad the
+adapter cell is filled to. Neither derives from the other, and the drawn row
+can exceed the smaller one: `" 1 opencode not found"` is 21 cells, so `pad`
+saturates to 0 and the cwd column shifts right, out of alignment with every
+other row.
+
+Not a fusion — the cwd column opens with its own selection marker, so a cell
+of separation survives — and not reachable unless an adapter is missing from
+`PATH`, which is why it has never been seen. But it is the §4/§5 lockstep
+smell in miniature: two constants with one name, one sizing the dialog and
+one drawing inside it, free to disagree. The fix is to derive both from one
+number; the reason it is filed rather than done is that it belongs to C14's
+sizing contract, not to the help overlay's, and the two arrived in the same
+audit only by proximity.
+
+Found by the design-supervisor sweep for the `{:<N}` minimum-width mistake
+that produced the C15 amendment above — the class, not the instance, which is
+what that sweep was for.
+
+**Resolved:** one module-scope `ADAPTER_COL = 23`, used by both the sizing
+and the draw loop, so the dialog is sized for exactly the column it draws.
+The reason for filing rather than fixing — that it belongs to C14's sizing
+contract rather than the help overlay's — turned out to be a reason to give
+it its own commit, not to leave it. `the_adapter_column_is_wide_enough_for_
+the_row_it_pads` walks the worst case (`picker_row_body(0, "opencode not
+found")`) instead of asserting the number, and re-checks that
+`picker_row_body` still produces it, so the worst case cannot quietly stop
+being the worst case. Reverting the constant to 16 reproduces the original
+misalignment by name.
+
+### ~~Open~~: the composer's `Exited` filter tier can never match
+**[Added 2026-08-20, simulation pass · RESOLVED 2026-08-20]**
+
+C36's `Tab` filter shares `ROSTER_STATUS_CYCLE` with C27's roster, which is
+deliberate — the composer shows a *target count* for the tier it names, and
+tiers that meant different things in the two places would make that count
+unreadable. But `broadcast_targets` excludes exited panes **unconditionally**
+(`rt.status() != AgentStatus::Exited`), so the cycle's `Exited` stop was
+structurally always "no panes" in the composer: a stop you could Tab onto
+that could never do anything, on any fleet.
+
+**Resolved: the composer skips it; the roster keeps it.** The two invariants
+turned out not to be in tension once the question was put precisely. What
+the sharing protects is that the tiers *name the same statuses in the same
+order* on both surfaces — not that both surfaces stop at all of them. A stop
+that can only ever mean "nobody" is not a filter, it is a hole in the cycle;
+and the roster is a *monitoring* surface, where "which of my panes died" is
+the whole point.
+
+**Precisely, though:** the tiers do not *mean* identically the same thing on
+both surfaces, and an earlier draft of this entry said they did. `None` is
+"every pane" in the roster and "every pane that can receive" in the composer,
+because `broadcast_targets` excludes exited panes whatever the filter says.
+That difference is inherent to the two surfaces' jobs rather than introduced
+here — the composer could never have targeted an exited pane — and the count
+stays honest either way, which is what C36 needs of it. Named by the design
+audit, which was right that the looser wording papered over it.
+
+So there is still exactly one definition of the tiers and their order
+(`ROSTER_STATUS_CYCLE`), stepped by one function, with the composer passing
+`deliverable_only` — rather than a second const free to drift, which is the
+shape the original C36 rationale was written to avoid.
+
+The skip is a **second step in the same direction**, never a fallback to
+`None`: `Tab` and `Shift+Tab` must stay exact inverses across the gap, and
+the naive fallback makes them agree at one point in the lap and diverge for
+the rest of it. Pinned by `the_composer_cycle_is_reversible_across_the_gap`,
+which is what the mutation check breaks.
+
+Found by a simulation agent reviewing C36 adversarially — it could not
+defeat the guard, and found this instead.
+
+### Open: an Alt chord discards an editor's unsaved buffer
+**[Added 2026-08-20, C24b amendment audit]**
+
+Found while contracting C24b's escape hatch, and deliberately **not** fixed
+there — the amendment documented and gated existing behaviour; this is a
+behaviour question that deserves its own answer.
+
+C24b's Rename bullet permits discarding an unsaved buffer on the entry
+chord, and justifies it narrowly: "an explicit second `Alt+r` is a
+deliberate act, unlike U8's stray click, which still may not throw unsaved
+text away." But the escape hatch discards on **every** Alt chord, not just
+the entry one. `Alt+n` while composing a broadcast (C36), or `Alt+1` in the
+note editor (C32), drops the text with no prompt and no undo — the same harm
+U8 named, arriving through the keyboard instead of the mouse, and without
+the deliberateness the Rename bullet leans on.
+
+The tension is real but the fix is not obvious, which is why it is recorded
+rather than guessed at. Three shapes, none free:
+- **Confirm on a dirty buffer.** Honest, but puts a dialog in front of
+  `Alt+q`, which U1 already guards — two confirms deep to quit is worse.
+- **Keep the buffer and restore it on re-entry.** No interruption, but adds
+  state that must be invalidated (which pane? which tab? how stale?), and a
+  composer that silently remembers last week's half-message is its own bug.
+- **Leave it.** Defensible for `Alt+q` (you asked to quit) and much less so
+  for `Alt+1`.
+
+Blocked on nothing but a decision. Whichever way it goes, C24b's amendment
+and its gates stand — they pin *which* chords a mode keeps, not what a mode
+throws away on the way out.
+
+### C33 — Move a pane within its tab (`Alt+Shift+hjkl`) — [Added 2026-08-19, comparative UX review]
+
+**Origin.** The comparative review against zellij / lazygit / gh dash
+(`docs/engagements/2026-08-19-comparative-ux-review/`) opened two findings
+that turn out to be one change. F8: roost could move a pane *between* tabs
+(C28) but not *within* one, so promoting an agent into main+stack's main slot
+meant closing and respawning it — zellij has a whole move mode for this. F2:
+`Alt+Shift+hjkl` was bound to nothing coherent. The shifted vim letters fell
+into the focus arms, which carry no `shift` guard, so a terminal delivering
+`('h', SHIFT)` moved focus left — a duplicate of plain `Alt+h` — while one
+delivering `'H'` matched nothing and forwarded meta-H into the agent. One
+physical chord, two behaviours, split by terminal.
+
+So four chords were being spent on a redundant second spelling of `Alt+hjkl`,
+in a table whose free unshifted pool (§8) is empty, while the verb that wanted
+them had no chord at all. C33 spends them on the verb.
+
+**The binding, and why it is not a new idiom.** C28 already established that
+the shifted sibling *carries the pane* the way the unshifted one *carries
+you*: `Alt+i`/`Alt+m` move you between tabs, `Alt+Shift+i`/`Alt+Shift+m` move
+the focused pane there. `Alt+hjkl` moves you within a tab; `Alt+Shift+hjkl`
+moves the pane within a tab is the same sentence on the other axis. Shifted-
+letter-carries-the-pane stops being a tab special case and becomes a rule that
+holds on both axes.
+
+Both delivery forms are bound (`Char('h')` + SHIFT and bare `Char('H')`, for
+all four letters), the same tolerance C23's `Alt+P`, C27's `Alt+A` and C28's
+`Alt+I`/`Alt+M` carry. That also repairs the escape hatch: `twins` pairs two
+`Char` chords exactly when they share a case-folded letter **and both already
+default to the same action**, so before C33 a `config.json` remap of
+`alt+shift+h` bound only one encoding and silently no-opped on terminals
+sending the other — the precise failure `twins`' own doc comment forbids. With
+both forms defaulting to `MovePane`, `twins` pairs them with no change to
+`twins` itself.
+
+**Swap, not re-parent.** The operation is `layout::swap_panes` — two `PaneId`s
+exchange slots and *nothing else changes*: every `Split`'s `dir` and `ratios`,
+every `Stack`'s arity, the whole shape is bit-identical afterwards. A true
+"move" (detach and reinsert) would change tree shape, could collapse a split
+to one child — the hazard `remove_pane` carries its own collapse rule for —
+and could reach nestings `Alt+g`'s canned cycle would never generate. There is
+no layout a swap can produce that a pair of splits couldn't already have
+built, which is why it needs no new invariant and no ratio arithmetic.
+
+**Direction comes from `layout::neighbor` — the same call `focus_dir` makes.**
+Deliberately not a second adjacency rule: "which pane is that way?" has one
+answer in roost, so the move can never disagree with the focus key that taught
+the user the direction.
+
+**Stacks need no special case.** Every stack member already owns a `PaneRect`
+(collapsed ones a single row, C8), so `Down` inside a stack finds the next
+member exactly as it finds the next split, and the gesture reorders the stack.
+One thing does need handling: `Stack`'s `expanded` is an **index**, not an id,
+so a bare id exchange would leave the moved pane collapsed and expand whichever
+pane it displaced — press "move down" and the pane you are reading shrinks to a
+title bar while a different one opens. `swap_panes` therefore carries the
+expanded slot with its pane, the same way `remove_pane` already repairs
+`expanded` itself rather than making callers remember to.
+
+**Focus follows the pane, for free.** The tree swaps two ids, so the focused id
+never changes — it simply occupies a different slot. No `set_focus` call, and
+therefore none of the spurious CSI O/I focus-report pairs `focus_dir_cross_tab`
+documents.
+
+**No cross-tab handoff at the edge — the one deliberate divergence from
+`focus_dir`.** C31 lets `Alt+←/→` continue into the next tab at a tab's edge;
+`Alt+Shift+hjkl` at an edge is a **no-op**. Three reasons. Moving a pane out of
+its tab is a structural edit rather than a look, so the recoverable failure is
+doing nothing. `Alt+Shift+i`/`Alt+Shift+m` (C28) already do exactly that job and
+name it. And C31's own rule — "tabs are roost's own horizontal axis, so only
+the two keys that already share that axis pick up tab-switching semantics" —
+would give `h`/`l` a cross-tab meaning that `j`/`k` could never have, splitting
+one chord family across two scopes. The handoff remains available as a later
+amendment if use argues for it; it is not the default because an accidental
+cross-tab move is the more expensive mistake.
+
+**Zoom and the float.** A swap joins `NewPane`/`ToggleStack`/`FlipSplit`/
+`Resize`/`CycleLayout` in `apply`'s structural-action guard: it exits zoom
+(C21 — the tab must never change invisibly behind a full-screen pane) and hides
+the float (C22 — the float has no position in the tiled tree, so no direction
+applies to it). The float is additionally excluded inside `move_pane_dir` on
+C22 rule 2's grounds.
+
+**Chrome.** §8 gains row 4b. C15's `LAYOUT` group gains one row, placed
+directly under `Alt+Shift+←↓↑→ resize` — the two shifted-direction chords sit
+adjacent so the one thing a reader must learn (**arrows resize, letters carry
+the pane**) is visible at a glance rather than inferred.
+
+**This is a different adjacency rule from C28's, deliberately** (caught by the
+design-supervisor audit of this contract, which found the first draft claiming
+C28's argument as its own). C28 seats a row under *its own unshifted form* —
+`Alt+Shift+i / +m` directly below `Alt+i / Alt+m`, both in `TABS` — so the
+pairing itself explains the chord. C33 cannot do that: `Alt+hjkl` is a focus
+verb and lives in `PANES`, while this is a layout verb and belongs in
+`LAYOUT`. What C33 seats itself under is therefore the chord it is most likely
+to be *confused with* rather than the one it derives from — the other
+shifted-direction chord — because the reader's live question at that row is
+"shift plus a direction did something different a moment ago, which is which?"
+The two rules share the tactic (teach by adjacency) and not the criterion
+(derivation vs. confusability); the older one should not be cited for the
+newer.
+
+The C9 hint bar's Normal-mode seven
+**gain nothing**: the 100-column arithmetic is unchanged and the chord is
+discoverable via `Alt+?`, exactly as C27 and C28 were.
+
+**Config.** Four new `NAMES` entries — `move_pane_left` / `_right` / `_up` /
+`_down` — so the chords can be remapped or disabled like any other.
+
+**Known gap, stated rather than left implicit.** C15's
+`every_bound_chord_is_documented_in_the_keymap` is a hand-kept list of chord
+literals checked against the hand-kept `HELP_GROUPS` text — both `const`,
+neither derived from `default_chord_action`. It did not and could not catch
+four newly bound chords; the list was extended by hand here. Deriving that gate
+from the effective keymap is F1 of the review that produced this contract, and
+is where the real fix belongs.
+
+### C34 — The chrome reads the live keymap (`config.json` awareness) — [Added 2026-08-19, comparative UX review F1]
+
+**The defect.** roost has shipped a keybinding escape hatch since v0.1.3:
+`config.json` can disable or remap any `Alt` chord, and `translate_with`
+applies it. Both surfaces that *teach* those chords ignored it. `HELP_GROUPS`
+(C15) was a `const` of `(&'static str, &'static str)` tuples and `hint_pairs`
+(C9) returned `&'static str` keys, so the README's own worked example —
+remapping away from the `Alt+f`/`Alt+b`/`Alt+d` readline collisions — produced
+a roost whose `Alt+?` still taught `Alt+f` and never mentioned the chord that
+replaced it. The one modal you open when you are lost was the one that could
+lie to you.
+
+**The check could not catch it, and was weaker than it looked.**
+`every_bound_chord_is_documented_in_the_keymap` was a hand-kept list of 27
+chord literals tested for containment against the hand-kept `HELP_GROUPS`
+text. Both sides `const`; neither derived from `default_chord_action`. It
+proved that one constant mentioned strings another constant was written to
+contain — nothing about the running binary under any configuration — and a
+newly bound chord passed it silently unless someone remembered to extend the
+list. C33 bound four chords and had to do exactly that, by hand, four days
+before this contract.
+
+**The rule.** *Any chrome that names a chord derives that name from the live
+keymap.* A surface may not spell a binding it did not ask the keymap for.
+
+**Scope, enumerated** (the C34 audit found the first draft asserting the rule
+universally while implementing it for two surfaces — so here is the list, and
+it is the list the rule is accountable to):
+- **C15** help-overlay rows — resolved.
+- **C9** hint-bar `Alt` pairs — resolved.
+- **C9** attention segment (`◆ N needs you · Alt+a`) — resolved. C9's own
+  amendment calls this "this feature's discoverability surface"; a surface
+  teaching a dead chord is worse than one teaching nothing, so an unbound
+  jump drops the `· chord` tail.
+- **C16** dead-pane bar (`· Alt+w: close`) — resolved. It and the C9 hint bar
+  one screen row below name the same chord, and before this only one derived
+  it.
+- **C10** confirm and refusal flashes (`Alt+w again to close`, `stack a pane
+  with Alt+s first`) — resolved, via `App::chord_label`. The confirms matter
+  most: "press X again" naming a dead X is a guard that cannot be satisfied
+  by the key it names, which is U1's hazard wearing a helpful face. Unbound
+  degrades to a bare "again", still true because the confirm is armed on the
+  *action* and a repeat by any route satisfies it.
+
+- **`roost keys`** (F11, the control CLI's one *local* verb) — the same
+  resolution, printed. It is not a socket verb: it reads `config.json` off
+  disk and answers with no running roost, because the moment you want to ask
+  "what did my dotfile do" is before launching, or because launching is what
+  is going wrong. Deriving it from `effective_bindings` is what made it a
+  printer rather than a feature; it also gives config.json's diagnostics a
+  home outside the TUI, which is the gap the review named — they used to
+  surface only as a startup toast, so a mistyped chord was found by catching
+  a transient message.
+
+**Not in scope, and why:** mode-local keys (`hjkl`, `v/V`, `Esc`, `n/N`,
+`↵`, `f`, `y`) and mouse verbs. config.json's grammar is `Alt` chords only
+(`Chord::parse` requires the prefix), so none of them can move and none can
+go stale. Only what can move is derived.
+
+**The width rule, and what C34 nearly cost it.** C15 requires one *column* to
+stay ≤ 80 or `centered_near` clamps and clips a description mid-word. Before
+C34 a row's key was authored text of known width, so that was a thing you
+checked once. Deriving it made it **unbounded**: an enumerated family grows
+with its membership, and the audit measured `{"keys":{"alt+h":"disable"}}`
+producing a 107-column column — reintroducing the precise failure C15's rule
+exists to prevent, by the mechanism meant to make the row truthful. (The
+pinning test had only ever exercised the default keymap: a default-only
+assertion about a quantity that had just stopped being constant.)
+
+So a resolved key column is **elided** to fit: cut at a `" / "` boundary with
+a trailing `…`, never mid-chord. **The key yields and the description never
+does** — a reader who sees two of eight chords still learns what the row is
+for and can widen the terminal for the rest, while a clipped description
+teaches nothing at any width. Pinned by
+`one_help_column_fits_the_floor_under_a_remap_too`, which sweeps the configs
+the audit measured rather than the default alone.
+
+**Mechanism.** `input::effective_bindings(&Keymap)` returns every
+`(label, action)` roost actually binds — the default table merged with
+config.json's overrides, which is the same merge `translate_with` dispatches
+on, asked as a question instead of answered one key at a time. `default_keymap`
+stops being `#[cfg(test)]` to serve it (memoized; the render path asks every
+frame).
+
+**One physical chord, one entry.** The sweep collapses three redundant
+spellings, or the overlay would print one key twice — or a key nobody can
+press:
+1. **Uppercase-delivery twins of a shifted letter.** Terminals disagree
+   (`('p', SHIFT)` vs bare `'P'`) and the table binds both (C23/C27/C28/C33).
+   Letters keep the `Alt+Shift+p` spelling.
+2. **Shifted-punctuation twins** — the same duality on the other half of the
+   keyboard (`('/', SHIFT)` vs `('?', no shift)`). Here the *glyph* spelling
+   wins (`Alt+?`, not `Alt+Shift+/`): mirror-image choices, each keeping the
+   half that reads naturally. The two rules are mutually exclusive by
+   construction — letters are excluded from rule 2 — because as symmetric
+   rules they would otherwise delete both halves of every letter pair.
+3. **Shift states no arm ever tested.** Most arms don't guard `shift`, so
+   `('1', SHIFT)` resolves to `GoToTab(0)`. Nothing is *bound* to
+   `Alt+Shift+1`; the arm ignores shift, and the unshifted spelling is the
+   chord.
+Each rule fires only when both spellings carry the same action — where they
+differ, both are real (`Alt+←` focuses, `Alt+Shift+←` resizes).
+
+**Row model (C15).** A help row declares the **actions** it documents, not a
+chord string:
+- `Chords(actions)` — print whatever is bound to them, joined by `" / "`.
+  A second chord for a documented action therefore documents *itself*.
+- `Family(spelling, actions)` — a compact hand-written spelling for a family
+  too wide to enumerate (`Alt+←↓↑→ / hjkl`, `Alt+1..9 / Alt+0`). The actions
+  are still declared, so the coverage sweep sees each one; the shorthand is
+  printed **only while every member is still on its default chord**. Move one
+  and the row enumerates the real chords — otherwise the shorthand would be
+  precisely the stale spelling this contract abolishes, merely a wider one.
+- `Text(key)` — authored text of known width: the C5 legend, the mouse-verb
+  rows, the control-CLI block. Named "names no chord" in this contract's
+  first draft, which the C34 audit found to be false of one row —
+  `Alt+click / o` is a `Text` row that does name a chord. It is correct
+  *behaviourally* (a mouse chord is not in config.json's grammar, so it
+  cannot move) but the criterion is authorship, not chord-freeness: `Text`
+  is what roost writes by hand, `Chords`/`Family` is what it resolves.
+A row whose every chord is disabled is **dropped**, and a group left with no
+rows drops its heading too: an empty titled block advertises a section that
+isn't there.
+
+**Hint bar (C9).** Same treatment for its `Alt` pairs, and a disabled chord
+drops its pair. **Mode-local keys stay literal** — `hjkl`, `v/V`, `Esc`,
+`n/N`, `↑↓` — and that is not an oversight: config.json's grammar is Alt
+chords only (`Chord::parse` requires the prefix), so those keys cannot move
+and cannot go stale. Only what can move is derived. C9's fit/yield machinery
+is untouched and absorbs the rest: a remap that lengthens a label simply
+makes pairs drop from the right, in the order U6 fixed.
+
+**Two spellings, deliberately.** `Chord::label` is *not* `Chord::parse`'s
+inverse. `parse` accepts config.json's grammar — lowercase, spelled out
+(`alt+pageup`) — because it is typed into a JSON file; `label` produces the
+chrome's vocabulary (`Alt+PgUp`, `Alt+←`), which is what the key table has
+always shown. Each register serves its own reader; the README documents the
+config one.
+
+**The rule is mechanical.** `no_surface_spells_a_chord_it_did_not_resolve`
+(`input.rs`) scans every production line under `src/` and fails on a string
+literal containing `Alt+` that is not on a short allowlist of **resolver
+defaults** — `Chord::label`'s two format strings, C9's `alt(..)` fallbacks,
+C15's `Family` shorthands, and the one authored mouse row.
+
+The allowlist matches the **whole literal**, which is what gives the gate its
+teeth: a bare `"Alt+w"` is what a resolver argument looks like, while a chord
+inside a sentence (`"last pane — Alt+w again to quit roost"`) is what a
+hard-coded surface looks like, and only the first form can be listed. Every
+deviation this contract's own audit found was of the second form — and every
+one of them was caught by a person reading code, which is the reviewing
+capacity this gate exists to stop spending. A new spelling now fails until it
+is either resolved or added to the list, and adding it is the moment its
+author has to ask whether the surface should be deriving instead.
+
+Not a proof — `format!("press {} now", "Alt+w")` would pass — and the
+contract claims no more than it does: a guardrail against the accident, not a
+defence against circumvention.
+
+Scanning source is the honest way to pin a rule about *what may be written*,
+the same argument §2's fixed-hue gate makes; the two now share one walker
+(`ui::srcscan`). Two things about that scanner were found by its own guard
+tests rather than reasoned out, and are worth knowing before touching it: the
+production/test cut must land on a test **module** (`#[cfg(test)]` also
+attaches to test-support items scattered through production code, and cutting
+at the first of those hid most of two files), and it must accept **any**
+test-gated `cfg` (`infra/qos.rs` gates its module on
+`all(test, target_os = "macos")`). A source scan that silently stops reading
+is worse than none.
+
+**What replaces the old check.** Three gates, none keeping a list of chords:
+- `every_bound_chord_is_documented_in_the_keymap` sweeps
+  `effective_bindings` and asserts every bound **action** is declared by some
+  row. Actions rather than spellings, because a `Family` legitimately draws a
+  string containing no single chord as a substring — and only ever draws it
+  while it is accurate.
+- `every_documented_row_names_an_action_roost_actually_binds` is the
+  converse, covering a failure mode that did not exist before: a row naming
+  an unbound action now renders nothing and **vanishes silently**, where the
+  old literal row would have stayed visible and merely lied.
+
+**Cost, recorded.** `HelpLine::Row` carries an owned `String`;
+`help_content_width` takes the resolved lines rather than reading the const;
+`help_layout`, `help_scroll_extent`, `dialog_rect` and `hint_pairs` take a
+`&Keymap`. `HelpLayout` gained a `content` field so the drawer stops
+recomputing a width that now costs a resolution pass.
+
+`effective_bindings` clones and sorts the default map on each call — one to
+two calls per frame in Normal mode, up to four while the help overlay is
+open. Left uncached deliberately: the memoization that matters
+(`default_keymap`'s `OnceLock`) covers the expensive half, the remainder is a
+~51-element sort whose cost does not register against the §6 firehose gate,
+and a keyed cache would need a lock in the render path to stay correct across
+the several keymaps a single test process uses. Recorded so a later pass
+measures rather than rediscovers.
+
+### C35 — Go back (`Alt+;`) — [Added 2026-08-19, comparative UX review F6]
+
+**The gap.** Every navigation chord roost had was absolute (`Alt+1..9`,
+`Alt+0`) or forward-directional (`Alt+a`, `Alt+i`/`Alt+m`, `Alt+hjkl`).
+Nothing returned you to the pane you were just on. At fleet scale the
+dominant motion is "check on B, come back to A", and `Alt+a` only ever walks
+*on* through the attention ring — on a two-pane hop it is the wrong tool, and
+across a tab switch there was nothing at all. tmux has had `prefix ;` for
+last-pane since forever; vim has `Ctrl-^`.
+
+**The chord, and why it costs nothing.** `Alt+;` — and the reason it was
+available is worth recording, because this table's own §8 accounting had
+declared the pool empty. That accounting enumerated **letters**. Outside
+`Alt+/` and `Alt+?` every punctuation chord was, and mostly still is, free
+(`;` `'` `,` `.` `]` `-` `=` `` ` ``). `Alt+[` remains rejected — `ESC [` is
+the CSI introducer (§8) — but the rest were never counted. So F7's leader key
+is **not** a prerequisite for this contract, and the "concrete feature needs
+a chord and finds none free" trigger has not fired here.
+
+`;` is also the right key rather than merely a free one: it is tmux's own
+last-pane binding, so the muscle memory already exists, and `M-;` is not a
+readline binding, so nothing in a shell pane loses a key.
+
+**One chokepoint.** `App::alternate` is maintained in `set_focus`, which
+`set_focus`'s own comment already establishes is where *every* focus move
+funnels — a click, an arrow, `Alt+a`, a tab switch, a roster jump. Recording
+there rather than per call site is what makes the trail complete without the
+next focus-moving feature having to remember to update it.
+
+**It toggles.** The pointer records every real transition, including the ones
+this chord causes, so A→B leaves A, going back to A leaves B, and pressing
+again returns to B. A stack would be the other design and is deliberately not
+it: "back" that sometimes goes somewhere new is worse than one that always
+goes to the same place.
+
+**Existence is checked at both ends, by one predicate.** `pane_exists`
+(tiled or float) guards both the record and the use:
+- **Recording** — `focused` initializes to a `0` sentinel that names no pane,
+  so without this the very first focus move would file a phantom and the
+  first press would report a pane that never existed. (Found by the
+  "nothing to go back to" test, which failed with the wrong message.)
+- **Using** — the pane can close while you are away. Landing focus on a dead
+  id would be a real bug.
+Sharing the predicate is deliberate: two ends that disagree about what
+"exists" means is how the phantom gets back in.
+
+**It flashes rather than no-oping.** No alternate yet, or an alternate that
+has closed, each say so. A navigation key that silently does nothing reads as
+broken, and the whole value of this one is confidence about where it lands.
+
+**Reuses `focus_attention_target`.** A cross-tab return switches tabs, expands
+a collapsed stack member and handles the float exactly as `Alt+a`'s jump does
+— "which pane" and "how do I get there" stay one answer each rather than two
+that can drift.
+
+**Chrome.** §8 gains row 10c. C15's `FLEET` group gains one row, directly
+under `Alt+a`: the two are the pair a fleet navigates with — one goes on to
+whoever needs you, the other comes back. Both the row and the chord spelling
+are resolved from the live keymap (C34), so this contract adds no literal and
+needed no allowlist entry — the C34 machinery absorbed a new chord with no
+manual bookkeeping. The C9 hint bar's Normal seven **gain nothing** (the
+100-column arithmetic is unchanged; `Alt+?` teaches it).
+
+**Config.** One new `NAMES` entry, `focus_alternate`.
+
+### C36 — Broadcast composer (`Alt+'`) — [Added 2026-08-19, comparative UX review F3]
+
+**The gap.** `roost send --all` has existed since the fleet-features round and
+was **CLI-only by design, no TUI key**. So the one verb roost is uniquely
+positioned for — say the same thing to every agent at once — was the one thing
+you had to leave roost to do. zellij's sync-input-to-tab is among its
+most-cited features and it isn't even aimed at agents; roost had the better
+version of it, built, and unreachable from the keyboard.
+
+**Not a sticky sync mode, and that is the design.** The obvious shape — a
+mode where every keystroke goes to every pane — is rejected. It is the
+unguarded-destructive shape U1 exists to prevent: you would have to *notice a
+mode indicator* to avoid typing a stray `Alt+q` into five agents, and U1's
+whole lesson is that a fleet-wide action must not depend on the user
+remembering what mode they are in. C36 is one composed message and one
+deliberate send.
+
+**The guard is the visible blast radius.** The dialog's title is
+`broadcast → N panes`, live: it moves as `Tab` cycles the status filter, and
+at zero it says **`broadcast → no panes`** outright. That count is the safety
+affordance — *not* a confirm-twice.
+
+*The zero case is carried by words, not by a colour.* The first draft styled
+the title `accent()` at zero; the design audit flagged it as unsanctioned —
+C12 specifies a modal title as `ink()`, no other dialog varies its title token
+by state, and §2's attention idiom is reversal rather than recolouring.
+Amending C12 for one dialog would have been the wrong trade when the words can
+simply say it, which is also unmissable in a way a colour is not. The tier
+glyph, by contrast, *does* carry its own C5 colour — C27's rule verbatim,
+since "a bare `ink()` glyph would read as no tier at all" — and the first
+draft discarded that style, which the same audit caught. A count you read at the moment of commit tells you something a
+second keypress cannot: **who**, and how many. The confirm-twice idiom (U1,
+U22) is right for closing one busy pane, where the question is "are you sure";
+here the question is "sure about whom", and only a count answers it.
+
+For that to be a guard rather than a decoration, the number and the send must
+come from **one predicate**: `App::broadcast_targets(actor, status)` — alive,
+not the float, within the actor's authority, matching the filter. The title
+counts it; the send writes to it. A guard that lies would be worse than none,
+so the two cannot be separate code paths. Pinned by
+`the_target_count_is_the_set_that_actually_receives`.
+
+**`Tab` is C27's filter, shared — minus one stop.** The composer and the
+roster step the same `ROSTER_STATUS_CYCLE` through the same function —
+extracted rather than copied, because the composer is showing a *count* for
+the filter it names, and a filter that meant something subtly different in
+each surface would make that count unreadable. "Send to the three panes that
+are `◆`" is now one gesture, and it composes two surfaces that already
+existed.
+
+**[Amended 2026-08-20]** The composer passes `deliverable_only` and so skips
+`Exited`. `broadcast_targets` excludes exited panes unconditionally, which
+made that stop structurally always "no panes" here — a stop you could Tab
+onto that could never do anything, on any fleet. What the sharing protects
+is that the tiers *mean the same thing and come in the same order* on both
+surfaces, not that both stop at all of them; a stop that can only ever mean
+"nobody" is a hole in the cycle rather than a filter. The roster keeps it,
+because "which of my panes died" is what a monitoring surface is for. Still
+one definition of the tiers, one stepping function, no second const free to
+drift. See §7 for the full reasoning, including why the skip must be a
+second step in the same direction rather than a fallback to `None`.
+
+**Keys are C32's.** `Enter` sends · `Shift+Enter` (or `Ctrl+Enter`, **or
+`Alt+Enter`**) breaks a line · `Tab`/`Shift+Tab` cycle the targets · `Esc`
+walks away having sent nothing · `Ctrl+U`/`Ctrl+W` and the motion keys are
+Rename's vocabulary. Multi-line matters: agent prompts are, and a composer
+that could only carry one line would push people back to the CLI for exactly
+the messages worth broadcasting.
+
+*This contract's first draft said "exactly C32's" and was wrong by one:*
+C32's `Alt+Enter` carve-out was `PaneEdit`-only, so on Terminal.app — where
+Shift+Enter arrives as `Alt+Enter` (README's CSI-u note) — the one chord that
+should break a line opened the quick-launch picker and **discarded the
+composed message**. Found by this contract's own design audit; the carve-out
+now covers both modes through one shared `broadcast_break`.
+
+**Capped at `BROADCAST_MAX_LINES`** (= C32's `NOTE_MAX_LINES`). The dialog is
+`lines + 2` rows tall and never scrolls, so an uncapped message pushes its own
+rows and the caret off the body with nothing to bring them back. At the cap
+the break is *refused* rather than partially applied: losing the split is
+recoverable, losing the text under it is not.
+
+**It submits.** Unlike `roost send --all`, where `--enter` is opt-in because a
+script may want to stage text, the composer always appends `\r`. A human who
+typed a message and pressed Enter has expressed the intent; typing into five
+agents and leaving five prompts un-submitted does the tedious half of the job
+and skips the half you opened it for.
+
+**Audited as `Actor::Local`** — a third actor variant beside `Fleet` and
+`Pane(id)`, added by this contract. It reaches every pane like `Fleet` and
+authenticates nothing (no token resolves to it; pressing a key inside roost
+*is* the credential). Separate purely for the audit trail: a keyboard
+broadcast logged as `fleet` would be indistinguishable from a token holder's,
+and attribution is that log's whole value. The C20 feed comes free, since it
+renders the same `ctl` lines — exactly one per broadcast, the property the
+control path already pins.
+
+**Chord.** `Alt+'`, which neighbours C35's `Alt+;`: the fleet's two
+punctuation verbs — go back, and speak to everyone. Punctuation costs the §8
+letter pool nothing (C35's amendment), so the leader key's trigger **still**
+has not fired.
+
+**Chrome.** §8 gains row 22. C15's `FLEET` group gains one row after the feed.
+C9's mode word gains `BROADCAST` and the composer gets its own pair list —
+**74 columns**, ordered `↵ send` · `Esc cancel` · `Tab who gets it` ·
+`Shift+↵ new line` · `type message`.
+
+That order is a safety property, not a style choice. 74 plus the 33-column
+needs-you segment overflows the 100-column floor, and U6's rule is that list
+order *is* yield order, so trailing pairs drop exactly when the fleet is busy
+— which is exactly when someone is composing a broadcast. The two that must
+survive therefore lead: what the dialog does, and how to leave without doing
+it. `type message` trails because a text field you are already typing into is
+the pair whose absence costs least. The motion keys are deliberately **not**
+on this bar, on C24's precedent: an eighth pair would push `Esc` off, and a
+bar that drops its escape hatch to advertise a convenience has its priorities
+backwards. They are C13/C32's shared vocabulary and the C15 overlay teaches
+them. Pinned by
+`hint_pairs_broadcast_leads_with_the_two_that_must_not_yield`. The dialog is C12's frame at C13's 44-column width — deliberately
+not wider, because the eye should be on the title's count, not sweeping a wide
+field. The Normal-mode seven gain nothing.
+
+**C12/U8 — the composer is a modal, and had to be told so.** Its first draft
+omitted `Mode::Broadcast` from `App::modal_active`, which is U8(b) verbatim:
+a click moved focus *under* the open dialog, and a paste landed in the **pane
+behind it**. Someone composing a fleet-wide message and pasting a snippet
+would have silently typed it into whichever agent happened to be focused. The
+highest-severity finding of this contract's design audit, and the reason
+`modal_active` is the single list every modal must join rather than a
+behaviour each one implements.
+
+**Config.** One new `NAMES` entry, `toggle_broadcast`.
+
+### C37 — Reverse the layout cycle (`Alt+Shift+g`) — [Added 2026-08-19, comparative UX review F10]
+
+**The gap.** C25's cycle is forward-only, so the arrangement you want can be
+two presses away and there is no way to step back to the one you just left.
+Every other cycle in roost goes both ways — `Alt+i`/`Alt+m` for tabs,
+`Tab`/`Shift+Tab` for the roster's status filter — and C28 established that a
+shifted chord is its unshifted sibling's inverse. zellij's swap-layout keys
+(`Alt+[` / `Alt+]`) are bidirectional for the same reason.
+
+**The arithmetic, since it is not obvious.** `layout_cycle` is the arrangement
+to try *next going forward*, so what is showing is `layout_cycle - 1` and
+stepping back starts two behind it. Forward tries `lc, lc+1, lc+2`; backward
+tries `lc+1, lc, lc-1` — the same sequence reversed, expressed as
+`(lc + if forward { step } else { 1 - step }).rem_euclid(3)`. Both directions
+share C25's skip-what-doesn't-fit rule, so a shape the terminal is too small
+for is passed over identically each way and the two can never disagree about
+which arrangements exist.
+
+**A ring, not an undo stack.** Stepping back from the first arrangement wraps
+to the last; it does **not** restore whatever custom layout the tab had before
+the first `Alt+g`. That layout is not one of the three canned arrangements, and
+remembering arbitrary trees is what `Alt+u` and the split chords are for. The
+inverse property therefore holds *from inside the ring*, which is the honest
+statement of it and what
+`reversing_the_layout_cycle_undoes_a_forward_step` asserts.
+
+**Arrangements compare by shape, not by tree.** `arrangement_for` re-derives
+from the live `pane_order`, which a previous step can have reordered, so two
+visits to "grid" are the same arrangement with the panes in different slots.
+Pre-existing C25 behaviour — the forward-only tests already assert shapes
+rather than trees — inherited here rather than introduced.
+
+**Chrome, and a merge that did not fit.** C15's `LAYOUT` group gains a
+**second row** rather than merging both directions into one. The merged form
+(`Alt+g / Alt+Shift+g` + "…(shift reverses)") put the **content column at
+exactly 80 and the dialog rect at 83**, failing
+`one_help_column_fits_the_eighty_column_floor`.
+
+*Which number matters is worth pinning down, because this contract's first
+draft said "83 columns" and blew past the distinction.* C15's rule is written
+about one **column**; its pinning test measures `help_layout(..).size.0`, the
+**dialog** — the column plus three cells of border and padding. The test is
+therefore the stricter of the two and is the operative check: a column of 80
+is already a dialog of 83, which `centered_near` clamps at an 80-column
+terminal. The merged row did not exceed the rule as literally worded; it
+exceeded what the rule exists to prevent. Two rows is also the more correct presentation: C28's
+adjacency rule seats a row under *its own unshifted form*, which is precisely
+what this is. The other kind of adjacency — seating a row under the chord it
+is most likely to be *confused with* — is **C33's** (`Alt+Shift+hjkl` under
+`Alt+Shift+←↓↑→`), and C33's own design audit is where the two rules were
+first told apart. An earlier draft of this paragraph credited that to C36;
+corrected by this contract's audit. C15's row cap was retired in 2026-07-28
+specifically so rows need not be merged to fit; this is the first change to
+take that at its word.
+
+**Config.** One new `NAMES` entry, `cycle_layout_back`. `cycle_layout` keeps
+its name and now means the forward direction explicitly.
+
+### C38 — A refusal says so — [Added 2026-08-20, simulation pass]
+
+**The gap.** Eight gestures refuse correctly and wordlessly. Pressing them
+changes nothing on screen, so "bound, but nothing to do here" is
+indistinguishable from "not bound at all" — and roost's own contracts
+already disagreed about whether that is acceptable. C35, shipped the same
+week as C33, states the rule outright: *"a navigation key that silently does
+nothing reads as broken, and the whole value of this one is confidence about
+where it lands."* C33's edge no-op is the same gesture family and says
+nothing. Found by a simulation agent comparing the two — the comparison is
+what makes the inconsistency visible, since each contract reads fine alone.
+
+**C33's silence was the outlier, not a decision**, and the tree already said
+so: `move_pane_to_tab` flashes its own refusals with the reason written into
+the code — *"a no-op you can see beats one you can't"* — and `focus_dir`
+flashes at its cross-tab boundary. C38 is less a new rule than the rule the
+rest of roost was already following, applied to the sites that missed it.
+(That evidence came from this contract's design audit, which went looking
+for whether the reading of C33 was fair. It is.)
+
+C33's defence of the no-op is **not** a defence of the silence. It argues
+that a swap must not cross tabs ("moving a pane out of its tab is a
+structural edit rather than a look, so the recoverable failure is doing
+nothing"), which is a claim about what the *layout* does. A flash moves
+nothing.
+
+**The rule.** When a gesture declines to act, it says why in a C10 flash —
+and where another chord *would* do what the user is reaching for, it names
+that chord, **but only when that chord would work**. A dead end that teaches
+the way out is worth more than one that merely reports itself; a dead end
+that hands you a second dead end is worth less than silence.
+
+| site | flash |
+|---|---|
+| `Alt+Shift+h/l` at a tab edge, with another tab | `at the tab's edge — {chord} moves it to the {next\|previous} tab` |
+| `Alt+Shift+h/l` at a tab edge, single tab | `at the tab's edge` |
+| `Alt+Shift+j/k` at a layout edge | `nothing {above\|below} to swap with` |
+| `Alt+Shift+hjkl` on the float | `the scratch pane sits outside the layout` |
+| `Alt+s` / `Alt+o` / `Alt+Shift+arrow`, tab has one pane | `nothing to {stack\|flip\|resize}: this tab has one pane — {chord} splits it` |
+| `Alt+s` / `Alt+o` / `Alt+Shift+arrow`, shape has no such move | `nothing to {stack\|flip\|resize} here` |
+| `Alt+1..9` past the last tab | `no tab {n}: this workspace has {n} {tab\|tabs}` |
+| `Alt+n` / picker launch, split refused | `no room to split — {side by side needs 36 columns, has 30 \| stacked needs 10 rows, has 7}` |
+
+Decisions inside that table, each load-bearing:
+
+- **The horizontal edge names `Alt+Shift+i`/`Alt+Shift+m`, resolved from the
+  live keymap, and only with somewhere to carry the pane to.** C33 declined
+  the cross-tab handoff *because* those chords "already do exactly that job
+  and name it" — and the moment the user needs to know that is the moment
+  they press the wrong one. Through `chord_clause`, never a literal: the C34
+  gate bans spelling one in `src/`, and a flash teaching a remapped-away
+  chord would be the exact drift C34 exists to prevent. Guarded on
+  `tabs.len() > 1` as well as on bound, because on the default single-tab
+  workspace the named chord immediately refuses with "only one tab".
+- **The vertical edge names nothing**, because there is nothing to name:
+  C31 makes tabs roost's horizontal axis, so `j`/`k` have no cross-tab
+  counterpart. Inventing one for symmetry would teach a chord that does not
+  exist.
+- **The three structural chords detect their no-op by comparing the tree,
+  not by the mutator's `bool`.** `layout::resize_pane` returns `true` at the
+  0.1/0.9 ratio clamp — "handled, no change" — so the bool does not mean
+  "changed", and trusting it would drop exactly the case a user leans on the
+  key for. One mechanism, no per-site special cases, and it cannot drift as
+  those mutators grow.
+- **A one-pane tab and an inapplicable shape get different sentences**,
+  because they need different things: the first needs a split (`Alt+n`,
+  named), the second needs a different key.
+- **The refused split names the axis that actually failed, and the number it
+  missed by.** `split_fit` picks the axis from the rect's aspect and tests
+  *that axis only*, so an earlier draft's "a pane needs 36×10" asserted a
+  rule the guard does not have — a 30×30 pane splits happily into two
+  30-wide halves. A helpful message that is false is the worst kind.
+- **A refusal flashes at the keypress, not inside `spawn_child`.** The
+  control CLI reaches the same refusal and reports it in its own `Reply`;
+  raising a TUI flash from an API call would put a message on screen that
+  nobody at the keyboard caused. The two surfaces **word it differently on
+  purpose** — an API client cannot widen a terminal, so its advice is "stack
+  a pane with `Alt+s` first" rather than the pane's shortfall. What they
+  share is that the refusal is *said*.
+
+**A success stays quiet.** Only the refusal speaks — the new pane, or the
+pane arriving in its new slot, is its own feedback, and a flash on every
+`Alt+n` would be noise that trains the eye to skip the bar. Pinned by
+`a_split_that_succeeds_stays_quiet` and
+`the_structural_chords_stay_quiet_when_they_do_something`.
+
+**`MovePane` left `apply`'s structural guard to make this work.** The guard
+hid the float before `move_pane_dir` ran, so `float_focused()` was always
+false there and this contract's float row was **dead code** — and what
+happened instead was worse than the silence C38 set out to fix: the float
+vanished and the swap landed on whichever pane it had been covering, moving
+a pane the user was not looking at. `MovePane` now joins `Alt+z` in refusing
+the float itself, by the same mechanism and for the same reason; C21's
+zoom exit moved into `move_pane_dir`, where it must run before `rects()`
+(under zoom `rects()` yields only the zoomed pane, so `neighbor` would find
+nothing). Found by this contract's own design audit, which probed the row
+rather than reading it.
+
+**Deliberately still silent.** `layout::swap_panes` returning `false` is
+unreachable — both ids came from `neighbor` — so it is a defensive branch,
+not a refusal a user can reach; giving it a voice would put an impossible
+sentence in the vocabulary. `go_to_tab`'s *same-tab* return is U11's
+deliberate no-op, not a refusal: `Alt+1` on tab 1 has done exactly what it
+says. The picker's Enter over an empty filtered list is left for now — the
+empty frame is already partial feedback, and the right answer is probably a
+line inside the dialog rather than a flash behind it.
+
+**Chrome.** Nothing new: C10's flash, C9's hint bar, no glyph, no colour.
+The longest flash measures 62 columns, inside both the 80-column floor and
+C9's 100-column budget; a flash takes the whole bar and returns, so C9's
+right-segment arithmetic is untouched. This contract adds sentences, not a
+surface.
+
+**Not in scope, and since resolved elsewhere.** The `Exited` tier of the
+composer's `Tab` filter (C36) was structurally always empty — a dead stop in
+the cycle rather than a silent refusal, so not C38's kind of problem. It was
+C36/C27's question and got C36/C27's answer: the composer now skips the
+tier, the roster keeps it, and §7 records why the two are not in tension.
+
+### C39 — The keymap filters (`/`) — [Added 2026-08-20, comparative UX review F9]
+
+**The gap.** The overlay is roost's longest list and its only unfilterable
+one. `Alt+?` draws thirty-odd rows in eight groups; finding "the one that
+moves a pane between tabs" means reading. Meanwhile roost already has
+type-ahead in C14's picker and C27's roster, and `/` search inside scroll
+mode (P21) — three surfaces where narrowing a list is a reflex, and the one
+surface whose entire job is *explaining roost* is the one that cannot.
+
+**The rule.** `/` opens a type-ahead filter. Typing narrows the table;
+`Backspace` widens it; `Esc` clears a query and then, pressed on an empty
+one, closes. The scroll keys keep working throughout. Matching is
+case-insensitive over **both** columns — key and description — because a
+reader is as likely to remember "the one with `g` in it" as "the layout
+one".
+
+**`Option<String>`, not `String`.** `None` is the un-filtered overlay and
+`Some("")` is a live but empty query (`/` then `Backspace`). They behave
+differently and must: under `None` every key still closes, `q` included;
+under `Some` every printable types. An empty string standing in for "not
+filtering" would make `/`-then-`Backspace` close the overlay on the next
+letter. Pinned by `the_help_overlay_is_unchanged_until_slash_opens_the_filter`.
+
+#### On the size of this carve-out — stated, not smuggled
+
+C15's scroll amendment earned its carve-out by being **conditional**:
+`help_scroll` reports whether it moved, a key that moved nothing falls
+through and dismisses, so on a terminal showing the whole table the
+amendment is invisible. It is tempting to present this one as the same
+shape. **It is not, and the difference should be read plainly:**
+
+- The scroll carve-out claims eight keys (`↑ ↓ j k PgUp PgDn Home End`),
+  conditionally, and hands them back the moment they have nothing to do.
+- This one claims **every printable key, unconditionally**, for as long as
+  the query is open. There is no "did nothing, fall through" available:
+  `Backspace` has to work when the query matches nothing, or a typo becomes
+  a trap.
+
+What licenses it is not the scroll precedent but **C27's roster**, which
+made exactly this trade first and wrote the reason into its hint bar: *"`q`
+is deliberately absent (the roster filters as you type, so a letter is
+filter text, U20's rule) — `Esc` is the way out."* C14's picker is the same
+rule again. So this is roost's own established idiom applied to the surface
+that lacked it — not a new liberty, and not an extension of a smaller one.
+
+Two things keep it honest:
+
+- **`/` is the only unconditional new key**, and only from the un-filtered
+  state. Everything else lives inside a state the user opened deliberately.
+- **A second `/` is text, not a second open.** A key meaning "open" in one
+  state and "type" in another is the ambiguity U20 already resolved for the
+  picker; a query can contain a slash.
+
+#### Where it announces itself
+
+Both C15 surfaces, because while a query is open "any key closes it" is
+false and a reader who cannot see why is stuck — on the one modal you open
+*because* you are lost.
+
+| state | title | hint bar |
+|---|---|---|
+| plain | `keys — / filters · any key closes` | `Alt+? all keys` · `/ filter` · `any key close` |
+| scrolled | `keys — 26/36 · ↑↓ more · / filters · any key closes` | `↑↓ PgUp/Dn read on` · `/ filter` · `any other key close` |
+| filtering | `keys — /mov · 4 shown · Esc clears` | `type filter` · `↑↓ PgUp/Dn read on` · `Esc clear · close` |
+| filtering, scrolled | `keys — /a · 26/31 · ↑↓ more · Esc clears` | as above |
+
+The filtered hint row is C27's roster pairs, for C27's reason. The
+unfiltered rows gain only `/ filter` — the affordance has to be visible or
+the feature does not exist, which is precisely the state P21 catalogued for
+scroll-mode search. All four rows stay inside C9's 100-column budget, and
+`the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls` measures
+every one of them rather than the two it used to.
+
+**All four wordings come from one function** (`help_title`), because the
+dialog's **width is floored by the title's** — see below — and a second
+spelling would let the floor guard a string the frame does not draw. §4/§5
+lockstep, applied to a modal's own heading.
+
+#### Consequences the first draft had to be told about
+
+- **The dialog is sized for the filtered table**, C14's picker rule applied
+  to the surface that borrowed its type-ahead: a query cutting 36 rows to 3
+  must not leave a 36-row frame around them.
+- **Editing the query resets `top` to 0.** A filtered list is a *new* list
+  and an old `top` can point past its end. C14 and C27 both put the cursor
+  at the start for the same reason.
+- **A dead-end scroll key must not close while filtering.** Un-filtered it
+  does — C15's conditional rule, untouched — but losing a live query to an
+  over-pressed `↓` is exactly the "the modal you open when you are lost is
+  the one with a surprising way out" failure that made U23 reject scrolling
+  in the first place.
+- **`/` is taught in the overlay's own `Alt+?` row** (`this keymap — /
+  filters it`), not only in §8 and the live title. C15's P21 precedent:
+  `/ search, n/N` rides the `Alt+c` row rather than taking one of its own,
+  because a key the overlay does not print is a key the overlay does not
+  teach. The C39 audit found `/` documented everywhere except the surface
+  whose job is documenting.
+- **Enter and Tab close a live query; Delete does not.** Delete is an
+  *edit* key and a reader reaching for it is erasing a typo — losing the
+  overlay would be the sharpest possible answer. It has nothing to delete
+  (the caret is always at the end of an append-only query), so it does
+  nothing, which is what Delete does at the end of any text field. Enter
+  and Tab have no meaning on a list with no cursor, so they read as "done"
+  — contracted deliberately rather than left as a fall-through.
+- **A group whose every row is filtered away contributes no heading**, the
+  rule `config.json`'s `disable` already put there. A heading that matched
+  while its rows did not would title an empty block.
+- **The 80-column floor holds under every query**, not just the empty one.
+  Filtering only removes rows, so the widest survivor is never wider than
+  the widest row overall — but that is an argument, and two prior audits
+  found this floor sitting at exactly its limit with zero slack, so
+  `the_help_dialog_fits_the_floor_under_every_query` checks instead.
+- **The dialog is never narrower than its own title**, which the filter is
+  what made possible. Before it, the table always contained its widest row,
+  so the frame was always wider than any heading. A query isolating one
+  *short* row breaks that: `/this keymap` left a 33-column dialog under a
+  44-column title, and `modal_frame` clipped it — hiding the one sentence
+  telling a filtering reader how to get out, on the surface they opened
+  because they were lost. `help_layout` floors its width on
+  `help_title`'s.
+
+  **Found by driving the overlay in a PTY, not by any unit test**, and the
+  reason is worth keeping: every test here looked at the frame *or* the
+  title, never at the two together. The same shape as the C15 padding bug —
+  each half correct, the pair wrong — and the second time on this branch
+  that the check which caught it was "render it and look".
+
+  **That floor is only half the answer, and the audit had to say so.** It
+  fixes *content narrower than the title*; a **body** narrower than the
+  title is the other half, and `.min(body.width)` re-admitted it — at the
+  80-column floor a 46-character query clamped and the frame truncated the
+  tail, losing `Esc clears` all over again. Widening cannot help when the
+  title already exceeds the terminal, so **the query elides** (`…`) and
+  everything after it survives: the count, and the way out. The query is
+  the right thing to cut because it is the one part the user can already
+  see themselves typing.
+- **The floor test asserts on the un-clamped `asked`, never on `size.0`.**
+  `size.0` is `.min(body.width)`, so at an 80-column body it reports 80
+  whether the dialog fitted or was cut down to it. C39's first floor gate
+  read `size.0` and therefore passed by construction — the third tautology
+  on this branch, written 160 lines below a corrected test in the same file
+  carrying the comment "assert on the ask instead", and five days after
+  C15's own amendment named the shape. `HelpLayout::asked` exists so the
+  honest assertion is the easy one.
+- **The filtering state has its own chrome fixture and its own C24b
+  probe.** `chrome_buffers` rendered only the un-filtered overlay, so §2's
+  gates never saw the filtering title or hint row; and `every_mode()` lists
+  one state per variant, so the sweeps never probed the one surface that
+  holds every printable key — precisely where C24b's rule is under real
+  pressure. A second list (`extra_mode_states`) covers surfaces-within-a-
+  variant without weakening `every_mode()`'s duplicate check, which is what
+  makes its exhaustive `match` mean anything.
+
+**[Amended 2026-08-20] The dead-pane keys join the table.** `↵` relaunch,
+`f` fresh and `y` copy-resume are **bare keys, not Alt chords** —
+`main.rs` claims them out of `InputResult::Forward` while the focused pane
+is dead — so §8 has no row for them and C34's chord sweep cannot reach
+them. The C9 bar advertised them and nothing else did: P21's case verbatim
+("a search nothing advertises is a search nobody finds"), on the one
+surface whose job is to prevent it. They now ride one row in `PANES`, next
+to the other recovery verb, which is how C15 has always absorbed a
+mode-local non-Alt key.
+
+`y` is listed unconditionally although the bar shows it only when there is
+a session to resume. The overlay is the whole keymap, not the keymap for
+this instant, and every other row here documents a key whose effect depends
+on context.
+
+`the_overlay_teaches_every_key_the_dead_pane_bar_advertises` is keyed off
+the **bar**, not a written list, because the bar is where a new dead-pane
+key would appear first. It walks both bars — `resumable` gates `y`, so the
+un-resumable one alone leaves out the key this amendment spends a paragraph
+on — and it matches each key against the overlay's **key columns**, not its
+text.
+
+That last part is the load-bearing one. The first version searched the
+joined overlay text for each key as a substring, and every letter a–z
+already appears in `HELP_GROUPS`'s prose — "close pane (confirm if busy)"
+alone supplies both `f` and `y`. A future dead-pane key added with no row
+would have passed silently; only `↵` was doing any work, by the accident of
+occurring once. Worse, the mutation check that "proved" the gate used an
+uppercase `Q`, which happens not to appear anywhere: **picking an
+unrepresentative mutant is how a vacuous check survives its own
+verification.** Both directions are now checked with a lowercase letter
+that does appear. Named by the C39 audit; a seventh instance of the shape
+in §7's list, with a rule of its own.
+
+**Not in scope.** The report's other half — ordering the groups by context
+— is deliberately not built. Two separate reasons, and both are worth
+recording because the report proposed it as the cheap alternative:
+
+- Its headline case ("copy mode leads with READING") is **unreachable**.
+  C24b's escape hatch sets `mode = Normal` before `Action::Help` runs, so
+  `Mode::Help` never learns what it was entered from, and `selection` is
+  cleared on the way too (verified against the running code, not reasoned).
+  Making it reachable means threading a predecessor mode through the escape
+  hatch contracted the same day.
+- Its *reachable* case — a dead focused pane — turns out to be a **no-op**.
+  `PANES` already leads `HELP_GROUPS`, and it already holds every overlay
+  row a dead pane cares about. Reordering would change nothing on screen.
+  What was actually missing there was not an order but a *row*, which is
+  the amendment above. Found by checking whether the reordering would do
+  anything before building it.
+
+### On gates that pass by construction
+**[Added 2026-08-20, after the eighth instance]**
+
+Eight assertions on this branch turned out to prove nothing, six of them
+the same shape — **a test asserting a bound on a value already clamped to
+that bound** — and two their generalisation: a comparison whose right side
+is satisfied by construction. Recorded here because the count is the argument — each one was
+found by a design audit or a deliberate sweep, never by CI, and each made a
+check look done when it was not.
+
+The instances, so the shape is recognisable:
+
+1. `help_dialog_fits_the_eighty_column_floor` — `size.0 <= 80` at an
+   80-column body, where `size.0` ends in `.min(body.width)`.
+2. `one_help_column_fits_the_eighty_column_floor` — the same, one test over.
+3. C39's `the_help_dialog_fits_the_floor_under_every_query` — the same
+   again, written *160 lines below* the corrected version of (1), which
+   carries the comment "assert on the ask instead".
+4. `help_fits_the_eighty_column_floor_and_reaches_every_row` — the width
+   half had been fixed; the **height** half (`size.1 <= body.height`, where
+   `size.1` is `min(tallest, body.height - 2) + 2`) was still vacuous.
+5. `help_dialog_clamps_to_the_screen_via_centered_near` — every assertion
+   vacuous, and the test's own comment stated the clamps before asserting
+   them. Two clamps covered for each other, so deleting either left it
+   green.
+7. `the_overlay_teaches_every_key_the_dead_pane_bar_advertises` — matched
+   single-character keys with `contains` over the whole overlay text, where
+   every letter a–z already appears. Only `↵` was load-bearing, by accident.
+   Not a clamp this time but the same family: **a comparison whose right
+   side is satisfied by construction.** Now matched against the key columns.
+8. `tests/help_filter.rs`'s Esc sequence — and the one that bit rather than
+   merely lying. Between the two Esc presses it waited for the screen to
+   contain `"/ "`, which `Alt+/` and the `Alt+?` row's own "`/` filters it"
+   already put there: the predicate was true before the first Esc was
+   parsed, so `wait_for` returned instantly and the second ESC byte went
+   out on the heels of the first. Two ESCs arriving together fuse into one
+   event, so only one Esc landed — the query cleared, the overlay stayed
+   open, **and CI went red on macOS while passing on Linux**. Now waits for
+   the *transition* (the query leaving the title), which the preceding
+   assertion has already proved starts false.
+6. `roster_window_follows_the_cursor_and_clamps` — `top + height <=
+   rows.len()` asserted after `roster_view`, which had just applied
+   `roster_top_clamped` (`top.min(len - height)`). The assertion restated
+   the clamp that produced the answer. This one is the clearest case of the
+   real cost: **`roster_top_clamped` had no test at all**, its
+   `saturating_sub` edge included, because the tautology had been standing
+   in for one. Breaking the clamp fails the direct test now and left the
+   caller's test green.
+
+Three rules follow, and they are cheap:
+
+- **Never assert on a value the production code clamped.** Assert on the
+  *ask* — the pre-clamp want. `HelpLayout::asked` exists for exactly this,
+  and a computed quantity that gets clamped on the way out should carry its
+  unclamped form when a test needs to bound it.
+- **When two mechanisms both enforce a property, a test of the property
+  tests neither.** (5) survived deleting `centered_near`'s clamp because
+  `help_layout` clamped too. Pick the input that makes exactly one of them
+  responsible — in that case, an anchor hugging an edge.
+- **Mutation-check the replacement, not just the original.** The first
+  rewrite of (5) asserted placement and *still* passed with the clamp
+  deleted, because a dialog centred on the whole body is inside it either
+  way. Only the mutation showed that; the assertion looked meaningful.
+- **A `wait_for` predicate is an assertion too, and a vacuous one races.**
+  (8) is the only entry here that failed rather than lied, and it is the
+  cheapest to prevent: a predicate that is already true when the wait
+  begins does not synchronise anything, so whatever the test does next
+  runs against unsettled state. Wait for a **transition** the preceding
+  step has proved starts false, never for a condition that merely holds
+  afterwards.
+- **Pick a *representative* mutant.** (7)'s gate matched single-character
+  keys with `contains` over the whole overlay text, where every letter a–z
+  already appears; the mutation that "proved" it used an uppercase `Q`,
+  which happens not to occur. The check was vacuous and its own
+  verification said otherwise. A mutant chosen for convenience tests the
+  mutant, not the gate.
+- **Test a clamp where it lives, not through a caller that applies it.**
+  (6)'s property was real; asserting it downstream of the clamp made it
+  unfalsifiable *and* hid that the clamp had no test. A pure helper with an
+  edge case (`saturating_sub`, `rem_euclid`, `.max(1)`) deserves its own.
+
+A test that cannot fail is worse than a missing one: the missing test is
+visible in coverage, and this one reads as a guarantee.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -3699,15 +5365,17 @@ shows only the C9-curated subsets.
 | 2 | `Alt+Enter` | quick-launch picker (pi / claude / shell) | C14 |
 | 3 | `Alt+←↓↑→ / hjkl` | move focus (`←`/`→` continue into the next/prev tab at an edge) | C31 |
 | 4 | `Alt+Shift+←↓↑→` | resize along that axis | — |
+| 4b | `Alt+Shift+hjkl` | **move this pane that way inside the tab (swaps with its neighbour)** | C33 |
 | 5 | `Alt+s` | toggle split ⇄ stack | C6–C8 |
 | 6 | `Alt+o` | flip split orientation | — |
-| 7 | `Alt+g` | **cycle layout: grid / main+stack / all-stack** | C25 |
+| 7 | `Alt+g / Alt+Shift+g` | **cycle layout: grid / main+stack / all-stack, forward / back** | C25/C37 |
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
 | 9 | `Alt+f` | **floating scratch shell (toggle)** | C22 |
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
+| 10c | `Alt+;` | **go back to the pane you came from (toggles)** | C35 |
 | 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one. `Tab`/`Shift+Tab` inside it cycle a status filter** | C27 |
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
-| 12 | `Alt+r / Alt+Shift+r` | rename pane / tab | C13 |
+| 12 | `Alt+r / Alt+Shift+r` | **edit pane (name + parking note, one dialog)** / rename tab | C32/C13 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
 | 13b | `Alt+i / Alt+m` | **previous / next tab (wraps)** | C2 |
 | 13c | `Alt+Shift+i / Alt+Shift+m` | **move this pane to the previous / next tab (wraps)** | C28 |
@@ -3717,7 +5385,7 @@ shows only the C9-curated subsets.
 | 17 | `Alt+PgUp` | scroll mode | — |
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
-| 20 | `Alt+?` | full keymap overlay (this table) | C15 |
+| 20 | `Alt+?` | full keymap overlay (this table); `/` filters it | C15, C39 |
 
 *Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
 terminals disagree about which half of that they report: some deliver
@@ -3730,6 +5398,25 @@ reason: one physical chord, two spellings on the wire. Reported from real
 use on macOS, where the unshifted arm was claiming the event first and row
 20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
+| 22 | `Alt+'` | **broadcast: type once, send to every pane (`Tab` picks who)** | C36 |
+
+[Amended 2026-08-19, C34: this table is still the canonical *list* of what
+roost binds by default, but it is no longer what the chrome *prints*. The
+C15 overlay and the C9 hint bar resolve every chord they name from the live
+keymap (defaults merged with config.json), so on a machine with a remap they
+correctly disagree with the rows below. The check that they cover this table
+is `every_bound_chord_is_documented_in_the_keymap`, rewritten as a sweep over
+`input::effective_bindings` — it keeps no list of chord literals, so a chord
+added here can no longer go undocumented by anyone forgetting to.]
+
+[Amended 2026-08-15, C32 combined editor: row 12's pane half is the
+combined editor now, and **row 12b (`Alt+Shift+n`, added earlier the same
+day) is withdrawn** — the chord lived exactly one release (v0.1.7) before
+`Alt+r` absorbed the note editor. `n`'s shifted form returns to the free
+pool: a terminal reporting it as `n`+SHIFT falls through to row 1's
+unshifted arm exactly as before v0.1.7, one reporting uppercase `N` takes
+U5's unbound-printable forward. Chord economy was the client's explicit
+ask; nothing else in this table moved.]
 
 [Amended 2026-07-22, supervisor SPEC-GAP: row 20 `Alt+?` was bound in
 translate() and advertised by C9's hint bar but missing from this canonical

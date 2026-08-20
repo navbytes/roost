@@ -272,11 +272,22 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // contention instead of queueing behind them (infra::qos module doc; the
     // agents themselves are deliberately NOT demoted).
     infra::qos::promote_input_loop_thread();
+    // A signal aimed at roost reaches roost alone — every pane is its own
+    // session — so the default "die on the spot" disposition would leave the
+    // whole fleet running detached. Turn SIGHUP/SIGTERM/SIGINT into an
+    // ordinary loop exit instead, so they get Alt+q's teardown.
+    infra::signals::install();
     let (tx, rx) = mpsc::sync_channel::<AppEvent>(EVENT_CHANNEL_BOUND);
 
     // Wire production adapters to the core's ports.
     let store = FsStore::default();
-    let ws = store.load()?.unwrap_or_else(|| {
+    // `load_reporting`, not `load`: a workspace.json that could not be read
+    // is set aside and startup continues with a fresh one — the right call
+    // (the whole tool is that file, so it must not brick launch), but the
+    // user must be told, or their fleet looks like it evaporated. Surfaced
+    // alongside the config diagnostics below.
+    let (loaded, workspace_diagnostic) = store.load_reporting()?;
+    let ws = loaded.unwrap_or_else(|| {
         core::workspace::Workspace::default_in(
             std::env::current_dir().unwrap_or_else(|_| "/".into()),
         )
@@ -346,6 +357,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         app.set_flash(msg);
     }
     if let Some(msg) = sock_err {
+        app.set_flash(msg);
+    }
+    // Last, so it wins the one flash slot: a lost workspace outranks a
+    // skipped key binding. It also goes to the feed, where it survives the
+    // flash timing out.
+    if let Some(msg) = workspace_diagnostic {
+        app.note_config_issue(msg.clone());
         app.set_flash(msg);
     }
 
@@ -559,7 +577,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         // status (or timed out) this iteration.
         app.poll_waiters();
 
-        if app.quit {
+        // Alt+q, or the host telling roost to go away (window closed, ssh
+        // dropped, `kill`). Both leave by the same door: `shutdown()` below
+        // saves the workspace and hangs up every pane.
+        if app.quit || infra::signals::terminating() {
             break;
         }
     }
@@ -713,7 +734,7 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
             .map(|f| f.width)
             .unwrap_or(0);
             if let Some(i) =
-                mouse::tab_at_x(&names, bar_width, status_w, app.ws.active_tab, me.column)
+                mouse::tab_at_x(&names, bar_width, status_w, app.last_save_ok(), app.ws.active_tab, me.column)
             {
                 app.apply(input::Action::GoToTab(i));
             }
@@ -1307,14 +1328,14 @@ mod tests {
         let mut app = mk_app();
         app.apply(Action::NewPane); // panes 1 | 2, focus 2
         let target = app.focused;
-        app.apply(Action::RenamePane);
+        app.apply(Action::EditPane);
         for c in "ZZZ".chars() {
             app.handle_mode_key(key(KeyCode::Char(c)));
         }
         handle_mouse(&mut app, click(5, 5)); // pane 1's area, outside the dialog
 
         assert_eq!(app.focused, target, "the click must not move focus beneath the modal");
-        assert!(matches!(app.mode, Mode::Rename { .. }), "the dialog must still be up");
+        assert!(matches!(app.mode, Mode::PaneEdit { .. }), "the dialog must still be up");
 
         app.handle_mode_key(key(KeyCode::Enter));
         assert_eq!(app.find_spec(target).and_then(|s| s.title.clone()), Some("ZZZ".into()));
@@ -1403,7 +1424,7 @@ mod tests {
     /// Every other modal swallows the wheel outright.
     #[test]
     fn the_wheel_is_swallowed_by_the_other_modals() {
-        for open in [Action::RenamePane, Action::QuickLaunch, Action::Help] {
+        for open in [Action::EditPane, Action::QuickLaunch, Action::Help] {
             let mut app = mk_app();
             let pane = app.focused;
             app.apply(open);
@@ -1557,12 +1578,12 @@ mod tests {
         // C15 (amended): the wheel reads on when the keymap is taller than
         // the overlay — it must not be mistaken for a dismissal, or the one
         // gesture for "show me more" would throw the list away.
-        let (visible, total) = ui::render::help_scroll_extent(app.body_area());
+        let (visible, total) = ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert!(visible < total, "this fixture's keymap is scrolled");
         handle_mouse(&mut app, wheel_down(rect.x + 1, rect.y + 1));
-        assert!(matches!(app.mode, Mode::Help { top } if top > 0), "the wheel scrolls the keymap");
+        assert!(matches!(app.mode, Mode::Help { top, .. } if top > 0), "the wheel scrolls the keymap");
         handle_mouse(&mut app, wheel_up(rect.x + 1, rect.y + 1));
-        assert!(matches!(app.mode, Mode::Help { top: 0 }), "…and back up");
+        assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "…and back up");
         handle_mouse(&mut app, click(rect.x + 1, rect.y + 1));
         assert!(matches!(app.mode, Mode::Normal), "any click dismisses help");
 

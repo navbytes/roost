@@ -34,7 +34,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -126,6 +126,24 @@ pub const OVERSIZE_LINE_MSG: &str = "message too large (max 64 KiB); split it or
 /// Cap concurrent client connections so a buggy/looping extension that
 /// reconnects rapidly can't spawn unbounded threads/FDs.
 const MAX_CONN: usize = 64;
+
+/// How many of `MAX_CONN` may be held at once by connections that have not
+/// yet sent a well-formed request.
+///
+/// Sized against `MAX_CONN`, not against real clients: a legitimate caller
+/// writes its request immediately, so it occupies a pre-auth slot for
+/// microseconds and this cap is invisible to it. What the cap bounds is a
+/// squatter's share of the thread pool — 16, never 64, so an authenticated
+/// connection (including a parked `wait`, which holds its connection open
+/// for its deferred reply) can always be *made*.
+///
+/// A cap alone would be worse than no cap, and shipping one alone was the
+/// mistake this file already records: 16 idle connections then permanently
+/// shed every arrival, the human's CLI included, at a quarter the cost the
+/// original bug needed. It is only safe paired with the eviction rule
+/// below — hitting the cap drops the OLDEST unpromoted connection instead
+/// of refusing the new one.
+const MAX_PENDING_CONN: usize = 16;
 
 /// Per-principal share of `MAX_CONN`, for connections that *have* sent a
 /// well-formed request. Must be at least `app.rs`'s `MAX_WAITS` (16, private
@@ -474,6 +492,29 @@ struct Limits {
     /// actually inserted — see `ConnGuard`'s doc comment for why that
     /// pairing is load-bearing.
     reporters: Mutex<HashMap<PaneId, usize>>,
+    /// Connections accepted but not yet promoted, oldest first.
+    ///
+    /// The registry exists so a squatter can be *displaced* rather than
+    /// merely timed out. Holding each one's socket handle is what makes that
+    /// possible: `shutdown` from the accept thread unblocks the connection
+    /// thread's `read` immediately, instead of waiting out
+    /// `PRE_AUTH_READ_TIMEOUT`.
+    pending: Mutex<Vec<PendingConn>>,
+    /// Monotonic id for `pending` entries — a connection is removed by id,
+    /// never by position, since the vector shifts under it.
+    next_seq: AtomicU64,
+}
+
+/// One accepted-but-unidentified connection, as the accept loop can see it.
+struct PendingConn {
+    seq: u64,
+    /// A `try_clone` of the connection, kept only to `shutdown` it.
+    stream: UnixStream,
+    /// True while this connection still owns its global slot. Eviction and
+    /// `ConnGuard::drop` both claim it with a `swap(false)`, so exactly one
+    /// of them releases the slot — no double-release if a connection is
+    /// evicted at the same moment it finishes on its own.
+    slot: Arc<AtomicBool>,
 }
 
 impl Limits {
@@ -483,7 +524,79 @@ impl Limits {
             per_principal: Mutex::new(HashMap::new()),
             buckets: Mutex::new(HashMap::new()),
             reporters: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Vec::new()),
+            next_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Record a freshly accepted connection as unpromoted. Returns its id
+    /// and the slot flag its `ConnGuard` must hold.
+    fn register_pending(&self, stream: UnixStream) -> (u64, Arc<AtomicBool>) {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let slot = Arc::new(AtomicBool::new(true));
+        lock(&self.pending).push(PendingConn { seq, stream, slot: slot.clone() });
+        (seq, slot)
+    }
+
+    /// Drop `seq` from the pending list — because it promoted, or because
+    /// it ended. Its slot flag is untouched: whoever owns the flag still
+    /// owns releasing the slot.
+    fn forget_pending(&self, seq: u64) {
+        lock(&self.pending).retain(|p| p.seq != seq);
+    }
+
+    /// Displace the oldest unpromoted connection, freeing its global slot
+    /// *synchronously* so the caller can take it. Returns false only when
+    /// there is nothing unpromoted left to displace — which means all
+    /// `MAX_CONN` slots are held by connections that identified themselves,
+    /// i.e. real load rather than squatting, and shedding is the honest
+    /// answer.
+    ///
+    /// Taking the slot here rather than waiting for the victim's thread to
+    /// notice is what makes this a *transfer*: the count never dips below
+    /// what is really open, and the newcomer's reservation cannot lose a
+    /// race to another arrival.
+    fn evict_oldest_pending(&self) -> bool {
+        let mut map = lock(&self.pending);
+        if map.is_empty() {
+            return false;
+        }
+        let victim = map.remove(0);
+        drop(map);
+        // Unblocks the victim's `read` at once; its guard then unwinds
+        // normally, finds the flag already claimed, and releases nothing.
+        let _ = victim.stream.shutdown(std::net::Shutdown::Both);
+        if victim.slot.swap(false, Ordering::SeqCst) {
+            self.release_global();
+            log_debug("displaced an unidentified connection to admit a new one");
+            true
+        } else {
+            // It finished on its own between the two locks: it released the
+            // slot itself, so one is free either way.
+            true
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        lock(&self.pending).len()
+    }
+
+    /// Take a global slot for a newly accepted connection, displacing the
+    /// oldest unidentified one if that is what it takes. False only when
+    /// every slot is held by a connection that identified itself.
+    fn admit(&self) -> bool {
+        // Over the pre-auth share: make room before even trying, so
+        // squatters converge on `MAX_PENDING_CONN` rather than `MAX_CONN`.
+        if self.pending_len() >= MAX_PENDING_CONN {
+            self.evict_oldest_pending();
+        }
+        if self.try_reserve_global() {
+            return true;
+        }
+        // Full. Displace a squatter and take the slot it was holding; if
+        // there is no squatter to displace, this is real load and the
+        // caller sheds.
+        self.evict_oldest_pending() && self.try_reserve_global()
     }
 
     /// Atomically check-and-increment the global connection cap in one step.
@@ -664,11 +777,22 @@ struct ConnGuard<'a> {
     principal: Option<String>,
     tx: SyncSender<AppEvent>,
     link_panes: HashMap<PaneId, String>,
+    /// This connection's entry in `Limits.pending`, while it has one.
+    pending_seq: Option<u64>,
+    /// Ownership of the global slot. `evict_oldest_pending` may claim it
+    /// first, in which case it already released the slot and this must not
+    /// release it again.
+    slot: Arc<AtomicBool>,
 }
 
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
-        self.limits.release_global();
+        if let Some(seq) = self.pending_seq.take() {
+            self.limits.forget_pending(seq);
+        }
+        if self.slot.swap(false, Ordering::SeqCst) {
+            self.limits.release_global();
+        }
         if let Some(token) = &self.principal {
             self.limits.release_principal(token);
         }
@@ -862,16 +986,44 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
         let limits = accept_limits;
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            // Shed load past the connection cap rather than spawning threads
-            // without bound.
-            if !limits.try_reserve_global() {
+            // Admit, displacing a squatter if that is what it takes.
+            //
+            // First-come-first-served on its own is what made the pre-auth
+            // deadline bound the *squatter* without bounding the *denial*:
+            // 64 connections that say nothing hold every slot, and
+            // reconnecting as each one recycles is free, so an arriving
+            // `roost list` is shed over and over. (Measured, before this:
+            // 2.07s and 21 refused attempts for a static pile; 12.1s and 118
+            // for one that retook its slots.)
+            //
+            // An unidentified connection is therefore evictable. Over the
+            // pre-auth share, or out of slots entirely, the oldest
+            // unpromoted connection is displaced and the newcomer takes its
+            // place — so a client that is about to identify itself always
+            // gets in, and only connections that have identified themselves
+            // are safe from being displaced. A legitimate caller writes its
+            // request immediately, so it is the oldest-unpromoted for
+            // microseconds; a squatter is, by definition, always older.
+            if !limits.admit() {
                 drop(stream);
-                // A wedged control plane (all 64 slots stuck) used to be
-                // silent right here too — log the shed so it's diagnosable
-                // instead of only visible as a client-side hang.
-                log_debug("shed a connection: MAX_CONN (64) already open");
+                // Nothing unpromoted left to displace: all 64 slots are held
+                // by connections that identified themselves. That is real
+                // load, not squatting, and shedding is the honest answer —
+                // logged, since a wedged control plane used to be silent
+                // right here and visible only as a client-side hang.
+                log_debug("shed a connection: MAX_CONN (64) open, all identified");
                 continue;
             }
+            // The handle the accept loop keeps purely so it can `shutdown`
+            // this connection if it turns out to be a squatter. A clone that
+            // fails costs only evictability, never admission.
+            let (pending_seq, conn_slot) = match stream.try_clone() {
+                Ok(handle) => {
+                    let (seq, slot) = limits.register_pending(handle);
+                    (Some(seq), slot)
+                }
+                Err(_) => (None, Arc::new(AtomicBool::new(true))),
+            };
             let limits = limits.clone();
             let tx = tx.clone();
             let tokens = tokens.clone();
@@ -884,6 +1036,8 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                     principal: None,
                     tx: tx.clone(),
                     link_panes: HashMap::new(),
+                    pending_seq,
+                    slot: conn_slot,
                 };
 
                 // Short until promoted (audit finding C1): an idle or
@@ -1010,7 +1164,20 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                         }
                         break;
                     }
-                    let Ok(line) = std::str::from_utf8(&buf) else { continue };
+                    let Ok(line) = std::str::from_utf8(&buf) else {
+                        // Charge it. The bucket's own contract, stated a few
+                        // lines below, is that *every* line costs a token
+                        // "well-formed or not" — and a line that isn't valid
+                        // UTF-8 is exactly the garbage it exists to bound.
+                        // Skipping the charge let a promoted connection spew
+                        // them without limit and without ever being
+                        // throttled: data keeps arriving, so `READ_TIMEOUT`
+                        // never fires and the pre-auth deadline no longer
+                        // applies. No reply, as before — it is not
+                        // control-shaped, so nobody is waiting on one.
+                        let _ = line_bucket.take();
+                        continue;
+                    };
                     let line = line.trim_end();
 
                     let control = parse_control(line);
@@ -1096,6 +1263,14 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                             if !promoted {
                                 promoted = true;
                                 let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
+                                // Identified: no longer evictable. This is
+                                // the whole point of the pre-auth pool —
+                                // work in flight, and parked `wait`s
+                                // especially, must never be displaced to
+                                // make room for a stranger.
+                                if let Some(seq) = guard.pending_seq.take() {
+                                    limits.forget_pending(seq);
+                                }
                             }
                             let principal = guard.principal.clone().expect("just set above");
                             // Reconnect-surviving rate limit: a command this
@@ -1421,7 +1596,14 @@ mod tests {
         let l = limits.clone();
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         let result = std::thread::spawn(move || {
-            let _guard = ConnGuard { limits: &l, principal: None, tx, link_panes: HashMap::new() };
+            let _guard = ConnGuard {
+                limits: &l,
+                principal: None,
+                tx,
+                link_panes: HashMap::new(),
+                pending_seq: None,
+                slot: Arc::new(AtomicBool::new(true)),
+            };
             panic!("simulated poisoned-mutex unwind mid-connection");
         })
         .join();
@@ -1807,6 +1989,16 @@ mod tests {
     /// squatter's `connect()` returning on the test side doesn't mean the
     /// server has accepted *and counted* it yet — that happens on a
     /// separately spawned thread per connection.
+    /// Spin until `cond` holds, or fail with `what` after five seconds.
+    fn poll_until(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[allow(dead_code)]
     fn poll_until_admitted(limits: &Limits, want: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while limits.global.load(Ordering::Relaxed) < want {
@@ -1922,18 +2114,27 @@ mod tests {
         let limits = spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "newcomer")]));
 
         // A full MAX_CONN worth of connections that never send anything —
-        // M3's original attack shape. There is no shared pre-auth counter
-        // for these to fill any more.
+        // M3's original attack shape.
         let mut silent = Vec::new();
         for _ in 0..MAX_CONN {
             silent.push(connect(&path));
         }
-        poll_until_admitted(&limits, MAX_CONN);
 
-        // A fresh, well-formed, AUTHENTICATED caller must still connect and
-        // get a reply — squatters recycle on the pre-auth deadline rather
-        // than holding the cap forever, so this must succeed well within a
-        // couple of `PRE_AUTH_READ_TIMEOUT` cycles, not eventually.
+        // They can no longer own the pool. Sixty-four squatters now hold
+        // `MAX_PENDING_CONN` slots between them, not `MAX_CONN`: past the
+        // pre-auth share each arrival displaces the oldest unidentified
+        // connection instead of joining it. The other 48 slots stay
+        // available to connections that identify themselves.
+        poll_until(
+            || limits.pending_len() <= MAX_PENDING_CONN
+                && limits.global.load(Ordering::Relaxed) <= MAX_PENDING_CONN,
+            "squatters were allowed past the pre-auth share",
+        );
+
+        // And the property that matters: a fresh, well-formed,
+        // AUTHENTICATED caller gets in — not eventually, but on an attempt
+        // or two, because it is never the oldest unidentified connection for
+        // more than the microseconds it takes to write its request.
         let deadline = Instant::now() + Duration::from_secs(10);
         let reply = try_request(&path, r#"{"token":"newcomer","method":"list"}"#, deadline);
         assert!(reply.get("ok").is_some(), "squatters must never lock out a fresh caller: {reply}");
@@ -1959,7 +2160,12 @@ mod tests {
         let limits = spawn_accept_loop(listener, fake_app(), seeded_reader(&[(1, "newcomer")]));
 
         spawn_drippers(&path, MAX_CONN);
-        poll_until_admitted(&limits, MAX_CONN);
+        // Same bound as the silent flood: a dripper never completes a line,
+        // so it never promotes, so it is always displaceable.
+        poll_until(
+            || limits.pending_len() <= MAX_PENDING_CONN,
+            "drippers were allowed past the pre-auth share",
+        );
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let reply = try_request(&path, r#"{"token":"newcomer","method":"list"}"#, deadline);

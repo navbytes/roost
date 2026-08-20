@@ -23,6 +23,34 @@ use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Slack subtracted from a promoted pane's "last seen as a shell" bound.
+///
+/// `observe_panes` reads the process tree on a `DETECT_INTERVAL` tick, so
+/// its view can lag the truth by up to one tick: an agent that started at T
+/// may still be observed as a shell a moment later, and its session file —
+/// written at T — would then fall just outside a strict bound and never be
+/// found. A few seconds of slack absorbs that while still excluding
+/// everything a previous run left behind, which is the whole point.
+const PROMOTION_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the filesystem fallback keeps looking for a pane's session file
+/// before giving up.
+///
+/// `pending_detect` was previously only cleared on success or when the pane
+/// vanished, so a pane whose agent never wrote a file roost could attribute
+/// stayed pending for the life of the process — and since no adapter
+/// overrides `detect_session`, each tick meant a full recursive walk of the
+/// whole session root (`~/.pi/agent/sessions`: every project, all history)
+/// stat-ing every file, twice a minute, forever.
+///
+/// A minute is far longer than any agent takes to create its session file,
+/// so giving up costs nothing real — and when it is wrong the failure is
+/// the safe one: the pane simply starts fresh next launch instead of
+/// resuming. The exact channel (the agent-side extension, design doc §6.1)
+/// does not go through `pending_detect` at all and keeps working after
+/// this expires.
+const DETECT_GIVE_UP: Duration = Duration::from_secs(60);
+
 /// F1: how long the "Alt keys aren't reaching roost" hint stays up after its
 /// most recent evidence (`App::alt_swallow_at`) — not since launch.
 /// `is_alt_swallow_char`'s evidence is real but not unambiguous (every
@@ -51,12 +79,21 @@ const HOST_TITLE_INTERVAL: Duration = Duration::from_millis(200);
 /// same shape as `pty::HOST_NOTIFY_CAP`.
 const DEAD_REASON_CAP: usize = 200;
 
-/// What a rename overlay is editing.
+/// What a rename overlay is editing. Pane renames moved into the combined
+/// C32 editor (`Mode::PaneEdit`) — `Tab` is the one target left, and the
+/// enum stays only so the mode's shape doesn't churn twice if a third
+/// single-line target ever appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameTarget {
-    Pane,
     Tab,
 }
+
+/// C32: the note editor's line cap. A parking note is a headline plus a
+/// few lines of "what's next" — eight is comfortably past the 2–3 the
+/// surface is for, while keeping the dialog a dialog (it must fit inside
+/// an 80×24 body with the C12 frame). At the cap, a newline is swallowed,
+/// not split; a paste's overflow joins the last line instead of vanishing.
+pub const NOTE_MAX_LINES: usize = 8;
 
 /// UI mode: non-Normal modes capture all keys (see handle_mode_key).
 pub enum Mode {
@@ -67,6 +104,30 @@ pub enum Mode {
     /// every motion, edit and the `▏` caret's position are all counted in
     /// what the user sees, and a byte index would split a multi-byte name.
     Rename { buffer: String, cursor: usize, target: RenameTarget },
+    /// C32 (amended): the combined pane editor (Alt+r) — the pane's whole
+    /// text surface in one dialog. `name` is the single-line title field;
+    /// `lines` is the parking note split on newlines, never empty (an
+    /// empty note edits as one empty line). `row` 0 is the name field,
+    /// `row` i>0 is `lines[i-1]`; `col` is a **char** index into the
+    /// current row for the same reason Rename's cursor is. Motion crosses
+    /// the name/note seam freely, **edits never do** — Backspace/Delete
+    /// at the boundary are walls, so the two fields can't merge by typo.
+    /// `pane` pins the editor's owner at open time, so the commit can
+    /// never land on a different pane than the dialog opened on.
+    PaneEdit { name: String, lines: Vec<String>, row: usize, col: usize, pane: PaneId },
+    /// C36: the broadcast composer (`Alt+'`). `lines` is the message being
+    /// written, split on newlines and never empty; `row` indexes it and
+    /// `col` is a **char** index into that row, for the same reason
+    /// Rename's cursor is. `status_filter` narrows the targets — the same
+    /// `Option<AgentStatus>` C27's roster cycles with `Tab`, and the reason
+    /// the dialog can show a live count of who is about to receive this.
+    ///
+    /// Deliberately **not** a sticky sync-input mode. A persistent "every
+    /// keystroke goes to five panes" state is the unguarded-destructive
+    /// shape U1 exists to prevent: you would have to notice a mode
+    /// indicator to avoid typing into a fleet. One composed message, one
+    /// deliberate send.
+    Broadcast { lines: Vec<String>, row: usize, col: usize, status_filter: Option<AgentStatus> },
     /// U20: the quick-launch picker. `selection` indexes the **filtered**
     /// adapter list (`filter` is the type-ahead query, empty = everything);
     /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
@@ -85,8 +146,17 @@ pub enum Mode {
     /// C15: the full-keymap overlay (Alt+?). `top` is the first visible
     /// content row — 0 whenever the keymap fits, which is the common case;
     /// the scroll keys only do anything on a terminal too short to show the
-    /// whole table at once. Every key that is not a scroll key dismisses it.
-    Help { top: usize },
+    /// whole table at once.
+    ///
+    /// **[F9] `filter` is the type-ahead query, and `None` is not the same
+    /// as `Some("")`.** `None` means the overlay is in its original state:
+    /// every key that is not a scroll key dismisses it. `Some(q)` means `/`
+    /// has opened the filter, and from then on printables type — including
+    /// `q`, which is why the two states have to be distinguishable rather
+    /// than an empty string standing in for "not filtering". An empty
+    /// `Some` is a real state: `/` then Backspace, still filtering, showing
+    /// everything.
+    Help { top: usize, filter: Option<String> },
     /// C20 activity-feed overlay; `offset` counts entries back from the
     /// newest (0 = live tail).
     Feed { offset: usize },
@@ -239,6 +309,13 @@ const FLASH_WINDOW: Duration = Duration::from_secs(2);
 /// left a silent final second where Alt+w/Alt+q still confirmed.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
+/// C14 / F8: what `picker_filtered` appends to an adapter that is not on
+/// `$PATH`. Public because `render.rs`'s `ADAPTER_COL` is sized for exactly
+/// this suffix on the longest registry id, and the gate that checks the
+/// column has to build the same worst case — two spellings of one suffix is
+/// how a column ends up sized for a row the picker no longer draws.
+pub const PICKER_MISSING_SUFFIX: &str = "not found";
+
 /// C29: the standard macOS double-click interval. Crossterm reports no click
 /// count at all, so roost derives double/triple-click itself, from the gap
 /// between two presses (`click_count`).
@@ -258,6 +335,19 @@ const UNDO_DEPTH: usize = 20;
 /// cap, enough parked waits could starve those of a slot to even report in
 /// on. Left well below that pool size so plenty always stay free.
 const MAX_WAITS: usize = 16;
+
+/// Parked `wait`s any single principal may hold at once.
+///
+/// The global cap alone let one caller take every slot: waiters are freed
+/// only by firing or timing out, so sixteen fire-and-forget waits with long
+/// timeouts denied the verb fleet-wide for up to 24 hours. A per-actor
+/// share means a pane can only ever starve itself.
+const MAX_WAITS_PER_ACTOR: usize = 4;
+
+/// Panes one `wait` may name. `poll_waiters` walks every id of every waiter
+/// on the UI thread each event-loop iteration, and the list arrives
+/// unbounded from the socket — see `register_waiter`.
+const MAX_WAIT_PANES: usize = 64;
 
 /// C20: activity-feed ring buffer capacity — oldest evicted first.
 const FEED_CAP: usize = 200;
@@ -337,6 +427,15 @@ pub struct App<B: PaneBackend> {
     /// `set_focus`, which is also where P10's `CSI I`/`CSI O` reports are
     /// produced; a bare write would move focus without telling the panes.
     pub focused: PaneId,
+    /// C35: the pane focus was on immediately before the current one — the
+    /// target of "go back". Maintained in `set_focus`, which every focus
+    /// move funnels through, so a click, an arrow, a tab switch and a
+    /// roster jump all leave the same trail.
+    ///
+    /// `None` until focus has moved once, and never equal to `focused`
+    /// (`set_focus` only records a real transition), so a toggle always
+    /// ping-pongs: A→B leaves A, going back to A leaves B.
+    alternate: Option<PaneId>,
     /// P10: does roost's own window hold the host terminal's focus? Starts
     /// **true** — a host that never reports focus (no mode 1004 support, a
     /// bare PTY, another multiplexer) must not leave every pane believing it
@@ -374,6 +473,16 @@ pub struct App<B: PaneBackend> {
     host_pixels: (u16, u16),
     /// Freshly launched agent panes we still owe a session id.
     pending_detect: HashMap<PaneId, SystemTime>,
+    /// When each pane was last observed running **no** agent — a plain
+    /// shell. The lower bound for a *promoted* pane's session detection.
+    ///
+    /// A pane promoted by the user typing `pi` at a shell prompt cannot own
+    /// a session file older than the last moment it was still a shell, so
+    /// this is the honest window. It used to be `SystemTime::UNIX_EPOCH` —
+    /// no bound at all — which let the scan claim the newest *unclaimed*
+    /// file in the project whenever it was written, i.e. a conversation
+    /// from days ago. See `PROMOTION_GRACE`.
+    last_shell_seen: HashMap<PaneId, SystemTime>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
     /// `$HOME`, resolved once at startup — `focused_cwd()`'s `~`-abbreviation
@@ -597,6 +706,7 @@ impl<B: PaneBackend> App<B> {
         // its fatal-if-unavailable mint) has to exist first.
         let mut app = Self {
             focused: 0,
+            alternate: None,
             host_focused: true,
             ws,
             runtimes: HashMap::new(),
@@ -613,6 +723,7 @@ impl<B: PaneBackend> App<B> {
             term_size,
             host_pixels,
             pending_detect: HashMap::new(),
+            last_shell_seen: HashMap::new(),
             last_detect: Instant::now(),
             sock_path,
             home: dirs::home_dir(),
@@ -683,12 +794,58 @@ impl<B: PaneBackend> App<B> {
     /// where it already installs the other startup-only pieces
     /// (`relayout`, the extension/socket flashes) — never by a test, which
     /// keeps `new`'s empty default: today's unconfigured behavior.
+    /// C34: the chord an action is currently on, for the C10 flashes that
+    /// name a key in a sentence. `None` when config.json disabled it —
+    /// callers drop the clause rather than instruct a key that does
+    /// nothing. The confirm flashes matter most here: "press X again to
+    /// close" naming a dead X is a guard that cannot be satisfied, which is
+    /// U1's hazard wearing a helpful face.
+    fn chord_label(&self, action: Action) -> Option<String> {
+        crate::ui::input::chord_for(&self.keymap, action)
+    }
+
+    /// The same, with the clause pre-formatted: `" · Alt+s"`-style inserts
+    /// collapse to nothing when the chord is unbound.
+    fn chord_clause(&self, action: Action, fmt: impl Fn(&str) -> String) -> String {
+        self.chord_label(action).map(|c| fmt(&c)).unwrap_or_default()
+    }
+
     pub fn set_keymap(&mut self, keymap: Keymap) {
         self.keymap = keymap;
     }
 
+    /// Persist the workspace, and **say so out loud the moment it starts
+    /// failing**.
+    ///
+    /// The failure used to reach exactly one surface: the tab bar's
+    /// right-aligned `saved ✓` / `save failed ✗` indicator. C2's yield
+    /// ladder drops that area *whole* when the tabs need the room, so on an
+    /// ordinary 80-column terminal with five tabs roost could fail every
+    /// single write — read-only state dir, full disk, wrong ownership — and
+    /// show nothing at all, until the user relaunched into a fleet hours
+    /// stale. The error text was discarded by `.is_ok()` on the way, so
+    /// even the indicator could not say *why*.
+    ///
+    /// A C10 flash takes the whole hint bar and cannot be crowded out.
+    /// Raised on the **transition** into failure, not on every save: a
+    /// persistent failure fires on every action, and re-flashing each time
+    /// would bury whatever else the bar was saying and make roost unusable
+    /// exactly when the user needs to read it. The indicator remains the
+    /// standing signal; this is the one that cannot be missed.
     fn save(&mut self) {
-        self.last_save_ok = self.store.save(&self.ws).is_ok();
+        let result = self.store.save(&self.ws);
+        let ok = result.is_ok();
+        if self.last_save_ok && !ok {
+            // Innermost cause: the outer layers are `anyhow` context naming
+            // the path, which the flash has no room for and the user
+            // already knows. "Permission denied" is the actionable half.
+            let why = result
+                .err()
+                .map(|e| e.chain().last().map(|c| c.to_string()).unwrap_or_else(|| e.to_string()))
+                .unwrap_or_default();
+            self.set_flash(format!("workspace NOT saved — {why}"));
+        }
+        self.last_save_ok = ok;
     }
 
     /// The pane area: below the tab bar (row 0), above the hint bar (last
@@ -872,11 +1029,34 @@ impl<B: PaneBackend> App<B> {
     /// outside `ws.tabs` — `ws.next_pane_id()` alone would eventually let a
     /// split reuse its id. The one allocator every spawn path goes through.
     fn alloc_pane_id(&self) -> PaneId {
+        // `next_pane_id` scans **live tabs**. Two other places own ids that
+        // are not in a live tab, and both must be counted or the id gets
+        // handed out twice.
         let base = self.ws.next_pane_id();
-        match &self.float {
+        let base = match &self.float {
             Some(f) => base.max(f.id + 1),
             None => base,
-        }
+        };
+        // The undo stack. A parked `Closed::Tab` is re-inserted **verbatim,
+        // with its original pane ids** (`undo_close`), and `spawn_active_tab`
+        // then builds runtimes for them — so if one of those ids has since
+        // been reissued, reopening the tab silently clobbers the live pane's
+        // entry in `runtimes`, `tokens`, `dead`, `pending_input` and `raw`,
+        // all of which are keyed by `PaneId` across every tab. Two panes end
+        // up on one PTY and one auth token.
+        //
+        // `Closed::Pane` needs no such guard: it stores only a `PaneSpec`
+        // (which carries no id) and `restore_pane` allocates a fresh one.
+        let parked = self
+            .undo
+            .iter()
+            .filter_map(|c| match c {
+                Closed::Tab { tab, .. } => tab.panes.keys().max().map(|id| id + 1),
+                Closed::Pane { .. } => None,
+            })
+            .max()
+            .unwrap_or(0);
+        base.max(parked)
     }
 
     /// Is `id` the float's pane?
@@ -1164,13 +1344,57 @@ impl<B: PaneBackend> App<B> {
         // made this non-deterministic). Claiming newest-spawned-first mirrors
         // file-creation order, so each pane gets its own file.
         pending.sort_by(|a, b| b.1.cmp(&a.1));
-        for (id, since) in pending {
+        // Drop anything past the give-up horizon before scanning for it.
+        // Checked against the pane's own `since` rather than a separate
+        // clock so the window means the same thing here as it does in the
+        // scan: how long we have been looking for *this* pane's file.
+        let now = SystemTime::now();
+        self.pending_detect.retain(|_, since| {
+            now.duration_since(*since).map(|age| age < DETECT_GIVE_UP).unwrap_or(true)
+        });
+        pending.retain(|(id, _)| self.pending_detect.contains_key(id));
+        for (id, since) in pending.clone() {
             let Some((spec, adapter)) = self.find_spec(id).and_then(|s| {
                 self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a))
             }) else {
                 self.pending_detect.remove(&id);
                 continue;
             };
+            // Two panes in *different projects* whose adapter gives them the
+            // same session root cannot be told apart by this scan at all:
+            // the root carries no cwd signal (codex buckets rollouts by
+            // date, `~/.codex/sessions` for every project), so the only
+            // thing separating the candidates is mtime order, which says
+            // nothing about whose they are. Decline rather than guess.
+            //
+            // **A wrong session is far worse than no session.** Losing a
+            // resume pointer costs the user a `--continue`; attaching a
+            // pane to another project's conversation corrupts work in it.
+            // Declining leaves the pane pending, so the exact channel (the
+            // agent-side extension) can still report it, and the scan
+            // retries the moment the ambiguity clears.
+            //
+            // Same-cwd concurrency is *not* ambiguous in this sense and is
+            // deliberately still allowed: both panes really are in that
+            // project, and the newest-first ordering above mirrors file
+            // creation order so each takes its own.
+            let root = adapter.session_root(&spec.cwd);
+            let ambiguous = root.is_some()
+                && pending.iter().any(|(other, _)| {
+                    *other != id
+                        && self.find_spec(*other).is_some_and(|o| {
+                            o.adapter == spec.adapter
+                                && o.cwd != spec.cwd
+                                && self
+                                    .registry
+                                    .get(o.adapter.as_str())
+                                    .and_then(|a| a.session_root(&o.cwd))
+                                    == root
+                        })
+                });
+            if ambiguous {
+                continue;
+            }
             // Session ids already owned by other panes — never re-assign one
             // (concurrent same-cwd launches otherwise cross-wire onto it).
             let taken = session_resolver::claimed_sessions(&self.ws);
@@ -1233,10 +1457,11 @@ impl<B: PaneBackend> App<B> {
                 }
             }
         }
-        // Drop entries for panes that no longer have a runtime (closed) —
-        // ids are never reused, so without this the map would grow by one
-        // stale entry per pane ever spawned over a long session. F3's
-        // visited-set is pruned on the same cadence, same reason.
+        // Backstop for panes that lost their runtime without going through
+        // `close_pane_id` (a tab removed with its panes, a workspace
+        // reload). The close path prunes all three itself — it has to, since
+        // ids ARE recycled (C23) and this pass only runs every
+        // `DETECT_INTERVAL`.
         self.last_status.retain(|id, _| self.runtimes.contains_key(id));
         self.needy_msgs.retain(|id, _| self.runtimes.contains_key(id));
         self.visited_waiting.retain(|id| self.runtimes.contains_key(id));
@@ -1262,6 +1487,10 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
+        // Panes observed running no agent this tick — `last_shell_seen`
+        // (collected here and written after the loop, since `find_spec_mut`
+        // holds `self`).
+        let mut still_shell: Vec<PaneId> = Vec::new();
         // D5: adapter flips collected here and pushed into the runtimes'
         // title-signal gate after the loop (`find_spec_mut` holds `self`).
         let mut retitle: Vec<(PaneId, bool)> = Vec::new();
@@ -1283,6 +1512,13 @@ impl<B: PaneBackend> App<B> {
             // Reflect the running agent: promote a shell that's now running pi
             // to the pi adapter; demote back to shell when the agent exits.
             let want = o.agent.unwrap_or_else(|| "shell".to_string());
+            // Not gated on a *transition*: a pane sitting at a shell prompt
+            // for an hour must keep moving this bound forward, or the
+            // window it eventually gets on promotion would reach back to
+            // whenever it last changed state.
+            if want == "shell" {
+                still_shell.push(id);
+            }
             if spec.adapter != want {
                 let demoting = want == "shell";
                 spec.adapter = want;
@@ -1308,11 +1544,43 @@ impl<B: PaneBackend> App<B> {
                 rt.set_title_signal(enabled);
             }
         }
+        let now = SystemTime::now();
+        for id in still_shell {
+            self.last_shell_seen.insert(id, now);
+        }
         // A newly-recognized agent needs its already-created session file
-        // located; a wide window (epoch) plus the taken-set finds it without
-        // cross-wiring against other panes.
+        // located — it was written moments before roost noticed, so `now()`
+        // would miss it. The bound is **the last tick this pane was still a
+        // shell**, minus `PROMOTION_GRACE` for observation lag.
+        //
+        // This used to be `SystemTime::UNIX_EPOCH`, on the reasoning that a
+        // wide window "plus the taken-set finds it without cross-wiring".
+        // The taken-set does not carry that weight: `claimed_sessions` only
+        // knows ids stored on *live* panes, so a conversation from a closed
+        // pane or an earlier run is unclaimed and therefore eligible. With
+        // no lower bound the scan took the newest such file whenever it was
+        // written, `set_session` committed it, and the pane was dropped from
+        // `pending_detect` — so the mistake was permanent, and the next
+        // relaunch resumed a conversation from days ago. Reported as "it
+        // loads the wrong session"; pinned by
+        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`.
         for id in promoted {
-            self.pending_detect.entry(id).or_insert(SystemTime::UNIX_EPOCH);
+            let floor = self
+                .last_shell_seen
+                .get(&id)
+                .copied()
+                .unwrap_or(now)
+                .checked_sub(PROMOTION_GRACE)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            // `max`, not `or_insert`: the window may only ever **tighten**.
+            // A pane that promotes, finds nothing (so stays pending),
+            // demotes when the agent exits, then promotes again hours later
+            // would otherwise keep its first floor — by then old enough to
+            // reach conversations from earlier in the same session.
+            self.pending_detect
+                .entry(id)
+                .and_modify(|f| *f = (*f).max(floor))
+                .or_insert(floor);
         }
         for cwd in visited {
             self.note_cwd(cwd);
@@ -1529,9 +1797,22 @@ impl<B: PaneBackend> App<B> {
     /// only within its own spawned subtree (itself included).
     fn may_target(&self, actor: Actor, target: PaneId) -> bool {
         match actor {
-            Actor::Fleet => true,
+            // C36: the human at the keyboard reaches every pane, same as
+            // the fleet token. They are separate variants so the audit can
+            // tell them apart, not because their reach differs.
+            Actor::Fleet | Actor::Local => true,
             Actor::Pane(a) => self.in_subtree(a, target),
         }
+    }
+
+    /// C35: does this id name a pane that exists right now — tiled or the
+    /// float? Used at both ends of the alternate pointer: recording (so
+    /// `focused`'s `0` initializer never becomes a phantom "previous pane"
+    /// on the first focus move) and using it (a pane can close while you are
+    /// away). One predicate rather than two, so the two ends cannot disagree
+    /// about what "exists" means.
+    fn pane_exists(&self, id: PaneId) -> bool {
+        self.tab_of(id).is_some() || self.float.as_ref().is_some_and(|f| f.id == id)
     }
 
     fn tab_of(&self, id: PaneId) -> Option<usize> {
@@ -1675,6 +1956,7 @@ impl<B: PaneBackend> App<B> {
     fn audit(&mut self, actor: Option<Actor>, summary: &str, ok: bool, detail: &str) {
         let principal = match actor {
             Some(Actor::Fleet) => "fleet".to_string(),
+            Some(Actor::Local) => "local".to_string(),
             Some(Actor::Pane(id)) => format!("pane:{id}"),
             None => "?".to_string(),
         };
@@ -1758,11 +2040,35 @@ impl<B: PaneBackend> App<B> {
                 .send(Reply::ok(serde_json::json!({ "pane": id, "status": self.status_str(id) })));
             return Ok("immediate");
         }
+        // A wait over more panes than any fleet has is not a wait, it is a
+        // load generator. `poll_waiters` runs on the **UI thread** every
+        // event-loop iteration and does `is_float` + `find_spec` +
+        // `may_target` + `pane_matches` for every id of every waiter; the
+        // list was unbounded and un-deduplicated, and ~32 000 ids fit in one
+        // 64 KiB control line. Sixteen such waits measured a 4.5x hit to
+        // control round-trip latency (21ms -> 94ms) sustained for the wait's
+        // whole timeout — the frame budget blown every frame, from sixteen
+        // requests. Bounded well above any real fleet.
+        if panes.len() > MAX_WAIT_PANES {
+            let msg = "too many panes in one wait";
+            let _ = reply.send(Reply::err(msg));
+            return Err(msg.into());
+        }
         // Cap concurrently parked waiters well below the socket's global
         // connection limit: rejecting here closes the connection right away,
         // freeing its slot back to the pool instead of holding it for the
         // full timeout (see MAX_WAITS).
-        if self.waiters.len() >= MAX_WAITS {
+        //
+        // **Per principal as well as globally.** A parked waiter is only
+        // ever freed by firing or timing out — nothing notices that the
+        // client hung up — so sixteen fire-and-forget waits with long
+        // timeouts held every global slot for up to 24 hours while holding
+        // no connection and no process, denying the verb to the entire
+        // fleet. A pane can do that with its own `$ROOST_TOKEN`, which puts
+        // it squarely outside its authority. With a per-actor share the
+        // worst a pane can do is starve itself.
+        let mine = self.waiters.iter().filter(|w| w.actor == actor).count();
+        if self.waiters.len() >= MAX_WAITS || mine >= MAX_WAITS_PER_ACTOR {
             let msg = "too many concurrent waits";
             let _ = reply.send(Reply::err(msg));
             return Err(msg.into());
@@ -1932,17 +2238,34 @@ impl<B: PaneBackend> App<B> {
         verb: &str,
     ) -> Reply {
         let owner = match actor {
-            Actor::Fleet => None,
+            Actor::Fleet | Actor::Local => None,
             Actor::Pane(a) => Some(a),
         };
+        // A control spawn must leave the human's view exactly as it found
+        // it — including the float. `spawn_child` focuses the pane it
+        // creates, and C22 rule 1 (enforced in `set_focus`) takes the float
+        // down when focus leaves it, so restoring `focused` alone put focus
+        // back on a float that was now hidden: a state the model does not
+        // have, and one `cycle_layout` then planted into the tab's layout
+        // tree as a pane with no spec. Save and restore both halves.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
+        let float_shown = self.float.as_ref().is_some_and(|f| f.shown);
         let id = self.spawn_child(adapter, cwd, owner);
+        if let Some(f) = &mut self.float {
+            f.shown = float_shown;
+        }
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
-            return Reply::err(format!(
-                "{verb} refused: not enough room to split; stack a pane with Alt+s first"
-            ));
+            // C38: the same refusal the TUI flashes, phrased for a caller
+            // rather than a reader — an API client cannot widen a terminal,
+            // so the actionable advice here is to stack rather than the
+            // pane's shortfall. The divergence is deliberate and contracted;
+            // what both surfaces must share is that the refusal is *said*.
+            let hint = self.chord_clause(Action::ToggleStack, |c| {
+                format!("; stack a pane with {c} first")
+            });
+            return Reply::err(format!("{verb} refused: not enough room to split{hint}"));
         };
         if let Some(text) = initial_input {
             let mut bytes = text.into_bytes();
@@ -1975,7 +2298,9 @@ impl<B: PaneBackend> App<B> {
         let target = match (pane, actor) {
             (Some(p), _) => p,
             (None, Actor::Pane(a)) => a,
-            (None, Actor::Fleet) => return Reply::err("fork requires a pane id for a fleet caller"),
+            (None, Actor::Fleet | Actor::Local) => {
+                return Reply::err("fork requires a pane id for a fleet caller")
+            }
         };
         // M1: forking the float would clone its spec into a brand-new real
         // pane (and surface its cwd in `list`) — refused before authz, same
@@ -2037,27 +2362,51 @@ impl<B: PaneBackend> App<B> {
     /// whose write call actually succeeded. There's no per-target id to
     /// validate (unlike send/read/close), so this never errors — zero
     /// matching panes is `ok` with count 0.
+    /// C36: every pane a broadcast by `actor` would reach — alive, not the
+    /// float, within the actor's authority — sorted for determinism.
+    ///
+    /// Factored out of `ctl_broadcast` so the TUI composer can *count* the
+    /// targets before sending (the visible blast radius that is C36's whole
+    /// safety affordance) using the identical predicate the send then uses.
+    /// A count that disagreed with the send would be worse than no count:
+    /// it would be a guard that lies.
+    ///
+    /// `status` narrows it further when the composer's filter is set — the
+    /// same `Option<AgentStatus>` idiom C27's roster cycles with `Tab`.
+    pub fn broadcast_targets(&self, actor: Actor, status: Option<AgentStatus>) -> Vec<PaneId> {
+        let mut targets: Vec<PaneId> = self
+            .runtimes
+            .iter()
+            .filter(|(&id, rt)| {
+                rt.status() != AgentStatus::Exited
+                    && !self.is_float(id)
+                    && self.may_target(actor, id)
+                    && status.is_none_or(|want| self.display_status(id) == Some(want))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        targets.sort_unstable();
+        targets
+    }
+
+    /// C36: write `bytes` to each of `targets`, returning the ones that took
+    /// it. The one place a broadcast actually delivers, shared by the
+    /// control verb and the TUI composer.
+    fn deliver_broadcast(&mut self, targets: &[PaneId], bytes: &[u8]) -> Vec<PaneId> {
+        targets
+            .iter()
+            .copied()
+            .filter(|id| self.runtimes.get_mut(id).is_some_and(|rt| rt.write_input(bytes)))
+            .collect()
+    }
+
     fn ctl_broadcast(&mut self, actor: Actor, text: &str, submit: bool) -> Reply {
         let mut bytes = text.as_bytes().to_vec();
         if submit {
             bytes.push(b'\r');
         }
-        let mut targets: Vec<PaneId> = Vec::new();
-        for (&id, rt) in self.runtimes.iter() {
-            if rt.status() != AgentStatus::Exited && !self.is_float(id) && self.may_target(actor, id)
-            {
-                targets.push(id);
-            }
-        }
-        targets.sort_unstable();
-        let mut sent: Vec<PaneId> = Vec::new();
-        for &id in &targets {
-            if let Some(rt) = self.runtimes.get_mut(&id) {
-                if rt.write_input(&bytes) {
-                    sent.push(id);
-                }
-            }
-        }
+        let targets = self.broadcast_targets(actor, None);
+        let sent = self.deliver_broadcast(&targets, &bytes);
         let count = sent.len();
         // Self-audit with the real count — the generic post-dispatch audit
         // in handle_control_msg only ever sees an opaque `Reply::Ok` (it
@@ -2140,7 +2489,18 @@ impl<B: PaneBackend> App<B> {
         // C21: closing the pane you're zoomed on ends the zoomed view —
         // there's nothing left to show full-screen. A control-plane close of
         // some *other* pane leaves an unrelated zoom alone.
-        if self.zoomed && id == self.focused {
+        //
+        // C22: the pane that is zoomed is not always the focused one. While
+        // the float is shown focus belongs to it — never to a tiled pane —
+        // so asking `id == self.focused` could not fire, and closing the
+        // pane actually being shown full-screen left `zoomed` set pointing
+        // at a pane that no longer exists. `display_rects` resolves the real
+        // target the same way; this must agree with it.
+        let zoom_target = match &self.float {
+            Some(f) if f.shown => f.prev_focus,
+            _ => self.focused,
+        };
+        if self.zoomed && id == zoom_target {
             self.exit_zoom();
         }
         let spec = self.ws.tabs[ti].panes.get(&id).cloned();
@@ -2169,6 +2529,17 @@ impl<B: PaneBackend> App<B> {
         // otherwise be inherited by an unrelated later pane that reuses
         // this id, silently switching it into raw mode.
         self.raw.remove(&id);
+        // Same reason again, for the three attention maps. These were pruned
+        // only by `diff_statuses` on the tick, under a comment asserting the
+        // opposite of the C23 note above — so for up to a `DETECT_INTERVAL`
+        // a pane taking this id inherited: F3's "you already looked at this"
+        // mark (silently absent from Alt+a though nobody ever saw it), a
+        // last status that makes its first observation read as a transition
+        // and prints a C20 feed line for a life it did not live, and the
+        // dead pane's pending question, attributed to it.
+        self.last_status.remove(&id);
+        self.needy_msgs.remove(&id);
+        self.visited_waiting.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         // U11: a closed pane is no longer anyone's focus memory — pane ids
@@ -2210,7 +2581,13 @@ impl<B: PaneBackend> App<B> {
         // routing keystrokes to a pane in a tab nobody's looking at. U11:
         // being moved onto a tab is a tab switch like any other, so honor
         // that tab's focus memory before falling back to its first pane.
-        if !self.ws.active_tab().panes.contains_key(&self.focused) {
+        // C22 rule 1 first: the float lives outside every tab's map by
+        // construction, so this test's answer for a focused float is always
+        // "not in this tab" — without the guard the fallback fired on every
+        // close while the float was up, pulling focus onto a tiled pane
+        // while the float stayed on screen, and the user's keystrokes went
+        // somewhere they could not see.
+        if !self.float_focused() && !self.ws.active_tab().panes.contains_key(&self.focused) {
             let active = self.ws.active_tab;
             let target = self
                 .tab_focus_target(active)
@@ -2462,6 +2839,52 @@ impl<B: PaneBackend> App<B> {
     /// to the pane *under* the dialog — live QA typed `PSTX` into a hidden
     /// shell while the dialog's own buffer ignored it.
     pub fn handle_paste(&mut self, text: &str) {
+        // U8(b) for C32: the pane editor owns the paste. On the name row
+        // it takes Rename's filter verbatim (printables only — a name is
+        // single-line, and no control byte may reach a title). On a note
+        // row, newlines are the one control character that survives —
+        // pasting a small checklist is the multi-line field's best entry
+        // path. CR/CRLF normalize to LF first; every other control char
+        // drops. Overflow past the line cap folds into the last line
+        // (space-joined) rather than vanishing: a clipped paste must
+        // still read as the text you pasted. The point lands after the
+        // insertion, ahead of whatever tail it split off.
+        if let Mode::PaneEdit { name, lines, row, col, .. } = &mut self.mode {
+            if *row == 0 {
+                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                let at = (*col).min(name.chars().count());
+                let byte = byte_at(name, at);
+                name.insert_str(byte, &clean);
+                *col = at + clean.chars().count();
+                return;
+            }
+            let clean = text.replace("\r\n", "\n").replace('\r', "\n");
+            let clean: String =
+                clean.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            let mut nrow = (*row - 1).min(lines.len().saturating_sub(1));
+            let at = byte_at(&lines[nrow], (*col).min(lines[nrow].chars().count()));
+            let tail = lines[nrow][at..].to_string();
+            lines[nrow].truncate(at);
+            let mut parts = clean.split('\n');
+            if let Some(first) = parts.next() {
+                lines[nrow].push_str(first);
+            }
+            for part in parts {
+                if lines.len() < NOTE_MAX_LINES {
+                    nrow += 1;
+                    lines.insert(nrow, part.to_string());
+                } else {
+                    if !lines[nrow].is_empty() && !part.is_empty() {
+                        lines[nrow].push(' ');
+                    }
+                    lines[nrow].push_str(part);
+                }
+            }
+            *col = lines[nrow].chars().count();
+            lines[nrow].push_str(&tail);
+            *row = nrow + 1;
+            return;
+        }
         if let Mode::Rename { buffer, cursor, .. } = &mut self.mode {
             // U16: a paste lands at the point, like typing does, and leaves
             // the point after what it inserted — a paste that always
@@ -2900,7 +3323,7 @@ impl<B: PaneBackend> App<B> {
         self.save();
     }
 
-    /// U8: is a modal overlay up? These five modes (the roster, C27, is a
+    /// U8: is a modal overlay up? These six modes (the roster, C27, is a
     /// C12 modal like the rest) own the whole non-keyboard input surface —
     /// mouse and paste alike — while they are active. Scroll/Copy are
     /// deliberately excluded: they draw no dialog, nothing is hidden
@@ -2910,10 +3333,15 @@ impl<B: PaneBackend> App<B> {
         matches!(
             self.mode,
             Mode::Rename { .. }
+                | Mode::PaneEdit { .. }
                 | Mode::Picker { .. }
                 | Mode::Help { .. }
                 | Mode::Feed { .. }
                 | Mode::Roster { .. }
+                // C36: omitting the composer here was U8(b) verbatim — a
+                // paste landed in the pane *behind* the dialog and a click
+                // moved focus under it. Found by the C36 design audit.
+                | Mode::Broadcast { .. }
         )
     }
 
@@ -2990,8 +3418,10 @@ impl<B: PaneBackend> App<B> {
         // buffer is unsaved work, and throwing it away on a stray click is
         // U8(a)'s harm inverted (the live QA script types `ZZZ`, clicks
         // another pane, and expects the commit to land on the pane the
-        // dialog opened on). Esc/Enter stay the ways out.
-        if matches!(self.mode, Mode::Rename { .. }) {
+        // dialog opened on). Esc/Enter stay the ways out. The note editor
+        // (C32) rides the same rule for the same reason, with more unsaved
+        // work at stake.
+        if matches!(self.mode, Mode::Rename { .. } | Mode::PaneEdit { .. }) {
             return;
         }
         if matches!(self.mode, Mode::Picker { .. }) {
@@ -3280,13 +3710,25 @@ impl<B: PaneBackend> App<B> {
         // deliberately excluded from the float rule — it gets its own
         // "can't zoom the float" no-op below instead of retargeting to
         // `prev_focus`.
+        //
+        // **[C38] `MovePane` left this list**, joining Alt+z for the same
+        // reason and by the same mechanism: it now refuses the float itself
+        // (`move_pane_dir`) rather than being retargeted onto `prev_focus`.
+        // While it was here the C38 float row could never fire — `hide_float`
+        // ran first, so `float_focused()` was always false by the time the
+        // check saw it — and worse, the behaviour it was written to replace
+        // was not silence but a *surprise*: the float vanished and the swap
+        // landed on whichever pane it had been covering. Found by the C38
+        // design audit, which probed the row instead of reading it. Zoom is
+        // still left, from inside `move_pane_dir` — under zoom `rects()`
+        // yields only the zoomed pane, so `neighbor` must run after.
         if matches!(
             action,
             Action::NewPane
                 | Action::ToggleStack
                 | Action::FlipSplit
                 | Action::Resize { .. }
-                | Action::CycleLayout
+                | Action::CycleLayout { .. }
         ) {
             self.exit_zoom();
             self.hide_float();
@@ -3294,10 +3736,15 @@ impl<B: PaneBackend> App<B> {
         match action {
             Action::Quit => self.quit_guarded(),
             Action::NewPane => {
-                self.spawn_child("shell", None, None);
+                if self.spawn_child("shell", None, None).is_none() {
+                    self.flash_no_room();
+                }
             }
             Action::ClosePane => self.close_pane(),
             Action::Focus(dir) => self.focus_dir(dir),
+            Action::MovePane(dir) => self.move_pane_dir(dir),
+            Action::FocusAlternate => self.focus_alternate(),
+            Action::ToggleBroadcast => self.toggle_broadcast(),
             Action::NewTab => self.new_tab(),
             Action::GoToTab(i) => self.go_to_tab(i),
             Action::NextTab => self.step_tab(1),
@@ -3306,27 +3753,56 @@ impl<B: PaneBackend> App<B> {
             Action::MovePaneToTab { forward } => {
                 self.move_pane_to_tab(if forward { 1 } else { -1 })
             }
+            // C38: each of these three declines silently on a tab the shape
+            // cannot apply to — overwhelmingly "this tab has one pane", and
+            // `Alt+s` is one of C9's advertised seven, so its silence is the
+            // most visible of the three. The refusal is detected by
+            // comparing the tree rather than by the mutator's `bool`,
+            // because the bool does not mean "changed": `resize_pane`
+            // returns `true` at the 0.1/0.9 clamp ("handled, no change"),
+            // which is a no-op the user has every reason to hear about.
+            // One rule, one mechanism, no per-site special cases.
             Action::ToggleStack => {
                 let focused = self.focused;
+                let before = self.ws.active_tab().layout.clone();
                 layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
+                self.flash_if_layout_unchanged(&before, "stack");
             }
             Action::FlipSplit => {
                 let focused = self.focused;
+                let before = self.ws.active_tab().layout.clone();
                 layout::flip_split(&mut self.ws.active_tab_mut().layout, focused);
+                self.flash_if_layout_unchanged(&before, "flip");
             }
             Action::Resize { horizontal, grow } => {
                 let delta = if grow { 0.04 } else { -0.04 };
                 let axis = if horizontal { SplitDir::Vertical } else { SplitDir::Horizontal };
                 let focused = self.focused;
+                let before = self.ws.active_tab().layout.clone();
                 layout::resize_pane(&mut self.ws.active_tab_mut().layout, focused, axis, delta);
+                self.flash_if_layout_unchanged(&before, "resize");
             }
-            Action::RenamePane => {
-                let current = self
-                    .find_spec(self.focused)
-                    .and_then(|s| s.title.clone())
-                    .unwrap_or_default();
-                let cursor = current.chars().count();
-                self.mode = Mode::Rename { buffer: current, cursor, target: RenameTarget::Pane };
+            Action::EditPane => {
+                // C32 (combined): opens prefilled — the editor IS the
+                // note's reader (peek, edit and clear are one surface), so
+                // both fields must arrive intact. The point opens at the
+                // end of the *name* row: renames are the muscle memory
+                // Alt+r inherits, and one Shift+↵/↓ reaches the note. A
+                // specless pane (dead mid-frame) has nowhere to keep
+                // either field; the chord just does nothing there.
+                let focused = self.focused;
+                if let Some(spec) = self.find_spec(focused) {
+                    let name = spec.title.clone().unwrap_or_default();
+                    let lines: Vec<String> = match &spec.note {
+                        Some(n) => n.lines().map(str::to_string).collect(),
+                        None => vec![String::new()],
+                    };
+                    // `str::lines` on "" yields no lines; the editor's
+                    // invariant is at least one note row.
+                    let lines = if lines.is_empty() { vec![String::new()] } else { lines };
+                    let col = name.chars().count();
+                    self.mode = Mode::PaneEdit { name, lines, row: 0, col, pane: focused };
+                }
             }
             Action::RenameTab => {
                 let current = self.ws.active_tab().name.clone();
@@ -3360,7 +3836,7 @@ impl<B: PaneBackend> App<B> {
             }
             Action::ToggleHints => self.hints = !self.hints,
             Action::Undo => self.undo_close(),
-            Action::Help => self.mode = Mode::Help { top: 0 },
+            Action::Help => self.mode = Mode::Help { top: 0, filter: None },
             Action::JumpAttention => self.jump_attention(),
             Action::ToggleRoster => self.toggle_roster(),
             Action::ToggleZoom => {
@@ -3373,7 +3849,7 @@ impl<B: PaneBackend> App<B> {
                     self.toggle_zoom();
                 }
             }
-            Action::CycleLayout => self.cycle_layout(),
+            Action::CycleLayout { forward } => self.cycle_layout(forward),
             Action::ToggleFeed => self.toggle_feed(),
             Action::ToggleFloat => self.toggle_float(),
             Action::ToggleRaw => self.toggle_raw(),
@@ -3417,7 +3893,14 @@ impl<B: PaneBackend> App<B> {
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
                 let first = self.pane_order().first().copied().unwrap_or(0);
                 self.set_focus(first);
-                self.restore_pane(spec);
+                if !self.restore_pane(spec.clone()) {
+                    // Refused for want of room. The close is NOT consumed:
+                    // put it back so the pane is still reopenable once the
+                    // user makes room, and say why nothing happened (C38).
+                    self.remember_closed(Closed::Pane { tab_index, spec });
+                    self.flash_no_room();
+                    return;
+                }
                 // U2: `restore_pane` allocated the pane's NEW id and left it
                 // focused — label with that id, not the closed one's.
                 let restored = self.focused;
@@ -3428,22 +3911,23 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// Insert `spec` as a new pane split off the focused pane, spawning it.
-    /// Shared by undo (reuses a saved spec, session and all).
-    fn restore_pane(&mut self, spec: PaneSpec) {
-        let id = self.alloc_pane_id();
+    /// Shared by undo (reuses a saved spec, session and all). Returns false
+    /// if the split was refused for want of room — nothing was mutated.
+    ///
+    /// C38: the fit test is `split_fit`, the same one `spawn_child` uses,
+    /// not a hand-rolled copy. This used to pick the axis from the rect's
+    /// aspect and then split unconditionally, so `Alt+u` would land a pane
+    /// in a slot `Alt+n` had just refused to open — under
+    /// `MIN_SPLIT_COLS`×`MIN_SPLIT_ROWS`, which is also the vt100 underflow
+    /// trigger, and it took the pane being split down there with it. Same
+    /// rect and the same keypress-level decision must give the same answer.
+    #[must_use]
+    fn restore_pane(&mut self, spec: PaneSpec) -> bool {
         let focused = self.focused;
-        let dir = self
-            .rects()
-            .iter()
-            .find(|pr| pr.id == focused)
-            .map(|pr| {
-                if pr.rect.width >= pr.rect.height * 3 {
-                    SplitDir::Vertical
-                } else {
-                    SplitDir::Horizontal
-                }
-            })
-            .unwrap_or(SplitDir::Vertical);
+        let target_rect =
+            self.rects().iter().find(|pr| pr.id == focused).map(|pr| pr.rect);
+        let Some(dir) = split_fit(target_rect) else { return false };
+        let id = self.alloc_pane_id();
         let tab = self.ws.active_tab_mut();
         tab.panes.insert(id, spec.clone());
         if !layout::split_pane(&mut tab.layout, focused, id, dir) {
@@ -3453,6 +3937,7 @@ impl<B: PaneBackend> App<B> {
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
+        true
     }
 
     /// P10: move roost's focus to `id`, telling the panes involved.
@@ -3472,6 +3957,28 @@ impl<B: PaneBackend> App<B> {
     /// would undo exactly what U9 fixed.
     fn set_focus(&mut self, id: PaneId) {
         let old = self.focused;
+        // C35: the trail "go back" follows. Recorded here rather than at each
+        // call site precisely because this is the one chokepoint — the
+        // comment below already says every focus move funnels through it, and
+        // a per-caller version would have to be remembered by the next
+        // feature that moves focus.
+        if old != id && self.pane_exists(old) {
+            self.alternate = Some(old);
+        }
+        // C22 rule 1: a shown float IS the focused pane, so focus landing on
+        // anything else means the float is no longer up. Enforced here, in
+        // the single writer of `self.focused`, rather than at each door: the
+        // rule was previously re-applied per call site, and the ones that
+        // forgot (C35's Alt+`` `` "go back" among them) left the float drawn
+        // over the body with the user's keystrokes going to a tiled pane
+        // underneath it. `shown` is cleared directly rather than through
+        // `hide_float`, which would re-route focus the caller has already
+        // decided.
+        if old != id && self.float_focused() && !self.is_float(id) {
+            if let Some(f) = &mut self.float {
+                f.shown = false;
+            }
+        }
         self.focused = id;
         // F3: landing focus on a pane that's currently in the ○ fallback
         // takes it out of `attention_ring`'s rotation — see
@@ -3537,6 +4044,166 @@ impl<B: PaneBackend> App<B> {
             return;
         }
         self.focus_dir_cross_tab(dir, &rects);
+    }
+
+    /// C33 (`Alt+Shift+hjkl`): swap the focused pane with its spatial
+    /// neighbour in `dir`, inside the active tab.
+    ///
+    /// Deliberately the same first two steps as `focus_dir` above — same
+    /// `rects()`, same `layout::neighbor` — so "which pane is that way?"
+    /// has exactly one answer in roost and the move can never disagree with
+    /// the focus key that taught the user the direction. Stacks need no
+    /// special case for the same reason: every member already carries its
+    /// own `PaneRect` (collapsed ones a single row), so `Down` inside a
+    /// stack finds the next member the way it finds the next split.
+    ///
+    /// **No cross-tab handoff at the edge.** `focus_dir` falls through to
+    /// `focus_dir_cross_tab`; this deliberately does not. Moving a pane out
+    /// of its tab is a structural edit rather than a look, `Alt+Shift+i`/
+    /// `Alt+Shift+m` (C28) already do exactly that and say so, and a no-op
+    /// is the recoverable failure — see DESIGN-ui.md C33 for the full
+    /// argument.
+    ///
+    /// The float is excluded on C22 rule 2's grounds, exactly as
+    /// `focus_dir` excludes it: it has no position in the tiled tree, so no
+    /// direction applies to it. Unlike `focus_dir` this does not *hide* the
+    /// float — `apply`'s structural-action guard above already did, so by
+    /// the time this runs a float-focused user has been returned to
+    /// `prev_focus` and the chord acts on that pane instead.
+    fn move_pane_dir(&mut self, dir: layout::Dir) {
+        // C38: every refusal here says so. C33 argued only that a swap must
+        // not *cross tabs* ("the recoverable failure is doing nothing") —
+        // never that it should do so wordlessly, and C35 had already
+        // written the opposite rule for the sibling gesture: "a navigation
+        // key that silently does nothing reads as broken". Found by a
+        // simulation agent comparing the two, which is the comparison that
+        // makes the inconsistency visible.
+        if self.float_focused() {
+            self.set_flash("the scratch pane sits outside the layout");
+            return;
+        }
+        // C21, from here rather than `apply`'s structural guard: the float
+        // check above has to see a float that is still shown, and `rects()`
+        // below has to see the whole tab rather than just the zoomed pane.
+        self.exit_zoom();
+        let rects = self.rects();
+        let Some(target) = layout::neighbor(&rects, self.focused, dir) else {
+            self.flash_move_edge(dir);
+            return;
+        };
+        let focused = self.focused;
+        let layout = &mut self.ws.active_tab_mut().layout;
+        if !layout::swap_panes(layout, focused, target) {
+            return;
+        }
+        // The focused id never changed — it just sits in a different slot —
+        // so focus follows the pane with no `set_focus` call (and no
+        // spurious CSI O/I pair, per `focus_dir_cross_tab`'s note). What it
+        // may need is expanding: swapping *into* a stack can land it in a
+        // collapsed slot, the same condition `focus_dir` calls this for.
+        layout::expand_in_stacks(layout, focused);
+        // No save/relayout here: `apply` does both on the way out, which is
+        // also what resizes each pane's PTY to the rect it just moved into
+        // (same as `FlipSplit`/`Resize`/`ToggleStack` — none of them persist
+        // by hand either).
+    }
+
+    /// C38: the shared no-op detector for the three structural chords that
+    /// reshape a tab (`Alt+s`, `Alt+o`, `Alt+Shift+arrows`).
+    ///
+    /// Compares the tree, not the mutator's return value. `resize_pane`
+    /// returns `true` at the 0.1/0.9 ratio clamp — "handled, no change" —
+    /// so trusting the bool would keep exactly the case a user is most
+    /// likely to lean on the key for. Comparing what actually happened is
+    /// also the rule that cannot drift as those mutators grow.
+    ///
+    /// The message distinguishes the two reasons, because they need
+    /// different things from the user: a single-pane tab needs a split
+    /// (`Alt+n`), while a shape that simply cannot take this verb — a
+    /// resize across an axis with no split on it, `Alt+o` on an unsplit
+    /// tab — needs a different key.
+    fn flash_if_layout_unchanged(&mut self, before: &LayoutNode, verb: &str) {
+        if format!("{before:?}") != format!("{:?}", self.ws.active_tab().layout) {
+            return;
+        }
+        if self.ws.active_tab().panes.len() < 2 {
+            let split = self.chord_clause(Action::NewPane, |c| format!(" — {c} splits it"));
+            self.set_flash(format!("nothing to {verb}: this tab has one pane{split}"));
+        } else {
+            self.set_flash(format!("nothing to {verb} here"));
+        }
+    }
+
+    /// C38: what a refused split says. `split_fit` returns `None` when the
+    /// pane being split is under `MIN_SPLIT_COLS`×`MIN_SPLIT_ROWS`, which
+    /// is also the trigger for the vt100 underflow crash — so the refusal
+    /// is right and only the silence was wrong. The message names the
+    /// threshold because that is the one fact that makes the next attempt
+    /// succeed: "widen it" is advice, "36×10" is an instruction.
+    ///
+    /// Deliberately raised at the two *keypress* sites (`Alt+n` and a
+    /// picker launch), not inside `spawn_child`. The control CLI reaches
+    /// the same refusal and already reports it in its own reply; setting a
+    /// TUI flash from an API call would put a message on screen that no one
+    /// at the keyboard caused.
+    fn flash_no_room(&mut self) {
+        // `split_fit` picks the axis from the rect's aspect and then tests
+        // **that axis only**, so "a pane needs 36×10" was not the guard's
+        // condition — a 30×30 pane splits happily into two 30-wide halves.
+        // Naming the axis that actually failed, with the number it missed
+        // by, is both true and the more useful sentence. Found by the C38
+        // design audit; the first draft asserted a rule the code does not
+        // have, which is the worst kind of helpful message.
+        let rect = self.split_target().and_then(|id| {
+            self.rects().iter().find(|pr| pr.id == id).map(|pr| pr.rect)
+        });
+        let detail = match rect {
+            Some(r) if r.width >= r.height * 3 => {
+                format!("{} needs {} columns, has {}", "side by side", layout::MIN_SPLIT_COLS, r.width)
+            }
+            Some(r) => {
+                format!("stacked needs {} rows, has {}", layout::MIN_SPLIT_ROWS, r.height)
+            }
+            None => "the pane is too small".to_string(),
+        };
+        self.set_flash(format!("no room to split — {detail}"));
+    }
+
+    /// C38: what `Alt+Shift+hjkl` says when there is nothing that way.
+    ///
+    /// Horizontally it names the chord that *does* cross tabs, so the dead
+    /// end teaches the way out rather than just reporting one — C33
+    /// declined the cross-tab handoff precisely because `Alt+Shift+i` /
+    /// `Alt+Shift+m` (C28) "already do exactly that job and name it", and
+    /// this is where the user is holding the question. Vertically there is
+    /// no such chord (tabs are roost's horizontal axis, C31), so the flash
+    /// only says what happened.
+    ///
+    /// The chord comes from `chord_clause`, never a literal: the C34 gate
+    /// bans spelling one in `src/`, and a flash that taught a remapped-away
+    /// chord would be the exact drift C34 exists to prevent.
+    fn flash_move_edge(&mut self, dir: layout::Dir) {
+        let (forward, whither) = match dir {
+            layout::Dir::Right => (true, "next"),
+            layout::Dir::Left => (false, "previous"),
+            _ => {
+                let whence = if matches!(dir, layout::Dir::Up) { "above" } else { "below" };
+                self.set_flash(format!("nothing {whence} to swap with"));
+                return;
+            }
+        };
+        // Named only when it would actually work. The clause was guarded on
+        // *bound*, which on the default single-tab workspace pointed at a
+        // chord that immediately refuses with "only one tab" — a dead end
+        // that hands you a second dead end. Found by the C38 design audit.
+        let carry = if self.ws.tabs.len() > 1 {
+            self.chord_clause(Action::MovePaneToTab { forward }, |c| {
+                format!(" — {c} moves it to the {whither} tab")
+            })
+        } else {
+            String::new()
+        };
+        self.set_flash(format!("at the tab's edge{carry}"));
     }
 
     /// C31: `Left`/`Right` off the edge of the active tab continue into the
@@ -3617,6 +4284,22 @@ impl<B: PaneBackend> App<B> {
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
     }
 
+    /// C22: the pane a split would actually be taken off — the focused one
+    /// when it is in the active tab's tree, else that tab's first pane.
+    ///
+    /// `self.focused` can be the float, which lives outside the tree, and
+    /// splitting "off" an id the tree does not contain is what trips
+    /// `split_pane`'s empty-tab fallback and wipes the whole tab's layout.
+    /// Shared by `spawn_child` and C38's refusal flash so the message can
+    /// never describe a different pane than the one that was refused.
+    fn split_target(&self) -> Option<PaneId> {
+        if self.ws.active_tab().panes.contains_key(&self.focused) {
+            Some(self.focused)
+        } else {
+            self.pane_order().first().copied()
+        }
+    }
+
     /// Split the focused pane and spawn a new one running `adapter`. `cwd`
     /// overrides the inherited working directory; `spawned_by` records the
     /// owner for the control-interface capability model. Returns the new pane
@@ -3638,11 +4321,7 @@ impl<B: PaneBackend> App<B> {
         // tree doesn't contain is exactly what trips `split_pane`'s
         // empty-tab fallback below and wipes the whole tab's layout — this
         // fallback closes that hole for every caller at once.
-        let split_target = if self.ws.active_tab().panes.contains_key(&self.focused) {
-            self.focused
-        } else {
-            self.pane_order().first().copied()?
-        };
+        let split_target = self.split_target()?;
         let cwd = cwd.unwrap_or_else(|| {
             self.ws
                 .active_tab()
@@ -3651,12 +4330,16 @@ impl<B: PaneBackend> App<B> {
                 .map(|s| s.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         });
-        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by };
+        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by, note: None, noted_at: None };
 
         // Split in the widest direction of the split target's rect. Refuses
         // (returns None) a split that would produce unusably tiny panes
-        // (also the trigger for the vt100 underflow crash) — silent no-op,
-        // the layout is left untouched.
+        // (also the trigger for the vt100 underflow crash), leaving the
+        // layout untouched. **Not silent any more** (C38): the refusal is
+        // reported by whoever asked — `flash_no_room` at the two keypress
+        // sites, `ctl_spawn_child`'s own `Reply` for the control plane —
+        // and deliberately not from here, so an API call cannot put a
+        // message on a screen nobody was typing at.
         let target_rect = self.rects().iter().find(|pr| pr.id == split_target).map(|pr| pr.rect);
         let dir = split_fit(target_rect)?;
 
@@ -3732,11 +4415,19 @@ impl<B: PaneBackend> App<B> {
         let armed = self.confirm_close.is_some_and(|t| t.elapsed() < CONFIRM_WINDOW);
         if (is_busy || would_quit) && !armed {
             self.confirm_close = Some(Instant::now());
+            // C34: the chord you are being told to press again is resolved.
+            // Unbound (config.json disabled it) drops to "again", which is
+            // still true however the repeat arrives — the confirm is armed
+            // on the action, not on one key.
+            let again = self
+                .chord_label(Action::ClosePane)
+                .map(|c| format!("{c} again"))
+                .unwrap_or_else(|| "again".to_string());
             let msg = if would_quit {
-                "last pane — Alt+w again to quit roost".to_string()
+                format!("last pane — {again} to quit roost")
             } else {
                 // U2: name which agent the close would interrupt.
-                format!("{} busy — Alt+w again to close", self.display_name(id))
+                format!("{} busy — {again} to close", self.display_name(id))
             };
             self.set_confirm_flash(msg);
             return;
@@ -3778,7 +4469,11 @@ impl<B: PaneBackend> App<B> {
         if busy > 0 && !armed {
             self.confirm_quit = Some(Instant::now());
             let noun = if busy == 1 { "agent" } else { "agents" };
-            self.set_confirm_flash(format!("{busy} {noun} busy — Alt+q again to quit"));
+            let again = self
+                .chord_label(Action::Quit)
+                .map(|c| format!("{c} again"))
+                .unwrap_or_else(|| "again".to_string());
+            self.set_confirm_flash(format!("{busy} {noun} busy — {again} to quit"));
             return;
         }
         self.quit = true;
@@ -3791,7 +4486,7 @@ impl<B: PaneBackend> App<B> {
         let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
-        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None });
+        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None, note: None, noted_at: None });
         self.ws.tabs.push(Tab {
             name: format!("tab{}", self.ws.tabs.len() + 1),
             layout: LayoutNode::Pane(id),
@@ -3829,6 +4524,14 @@ impl<B: PaneBackend> App<B> {
 
     fn go_to_tab(&mut self, i: usize) {
         if i >= self.ws.tabs.len() {
+            // C38: `Alt+5` on a two-tab workspace is literally C35's case —
+            // "a navigation key that silently does nothing reads as broken"
+            // — and the digit keys are the most guessed-at chords roost
+            // has. The count is the useful half: it says both that the key
+            // works and what the legal range is.
+            let n = self.ws.tabs.len();
+            let plural = if n == 1 { "tab" } else { "tabs" };
+            self.set_flash(format!("no tab {}: this workspace has {n} {plural}", i + 1));
             return;
         }
         // U11: the digit for the tab you're already on is a no-op. It used
@@ -4100,6 +4803,86 @@ impl<B: PaneBackend> App<B> {
         self.focus_attention_target(next);
     }
 
+    /// C36 (`Alt+'`): open the broadcast composer, or close it if it is
+    /// already open (C24b's uniform mode-entry toggle).
+    fn toggle_broadcast(&mut self) {
+        self.mode = match self.mode {
+            Mode::Broadcast { .. } => Mode::Normal,
+            _ => Mode::Broadcast {
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                status_filter: None,
+            },
+        };
+    }
+
+    /// C36: deliver the composed message to every pane the filter selects.
+    ///
+    /// `--enter` semantics deliberately: a broadcast that only *types* into
+    /// five agents and leaves each prompt sitting there un-submitted has
+    /// done the tedious half of the job and left the half you opened it for.
+    /// `roost send --all` makes submitting opt-in because a script may want
+    /// to stage text; a human who just typed a message and pressed Enter has
+    /// already expressed the intent.
+    ///
+    /// Audited as `Actor::Local`, so `control.log` and the C20 feed record a
+    /// keyboard broadcast as its own thing rather than as a token holder's.
+    fn send_broadcast(&mut self, text: &str, status: Option<AgentStatus>) {
+        if text.is_empty() {
+            self.set_flash("nothing to broadcast");
+            return;
+        }
+        let targets = self.broadcast_targets(Actor::Local, status);
+        if targets.is_empty() {
+            self.set_flash("no panes to broadcast to");
+            return;
+        }
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(b'\r');
+        let sent = self.deliver_broadcast(&targets, &bytes);
+        let count = sent.len();
+        let summary = method_summary(&Method::Broadcast {
+            text: text.to_string(),
+            submit: true,
+        });
+        self.audit(Some(Actor::Local), &summary, true, &format!("count={count}"));
+        let noun = if count == 1 { "pane" } else { "panes" };
+        self.set_flash(format!("broadcast to {count} {noun}"));
+    }
+
+    /// C35 (`Alt+;`): return to the pane focus was on before this one.
+    ///
+    /// The motion `Alt+a` cannot make. Every other navigation chord is
+    /// absolute (`Alt+1..9`) or forward-directional (`Alt+a`, `Alt+m`,
+    /// `Alt+hjkl`); at fleet scale the dominant move is "check on B, come
+    /// back to A", and roost had no key for the second half. tmux has had
+    /// `prefix ;` for last-pane since forever, vim has `Ctrl-^`.
+    ///
+    /// Reuses `focus_attention_target`, so a cross-tab return switches tabs,
+    /// expands a collapsed stack member and handles a float exactly as
+    /// `Alt+a`'s jump does — "which pane is that" and "how do I get there"
+    /// stay one answer each.
+    ///
+    /// A closed alternate flashes rather than no-oping silently: the whole
+    /// value of the chord is confidence about where it lands, so "the pane
+    /// you'd go back to is gone" is information, not noise.
+    fn focus_alternate(&mut self) {
+        let Some(target) = self.alternate else {
+            self.set_flash("no pane to go back to yet");
+            return;
+        };
+        if !self.pane_exists(target) {
+            self.alternate = None;
+            self.set_flash("the pane you were on has closed");
+            return;
+        }
+        if target == self.focused {
+            return;
+        }
+        self.focus_attention_target(target);
+    }
+
     /// Land focus on `target`, switching tabs first (go_to_tab semantics,
     /// lazy spawn included) when it lives outside the active one — which
     /// also exits zoom, per C21's tab-switch rule. A same-tab jump keeps
@@ -4127,7 +4910,16 @@ impl<B: PaneBackend> App<B> {
     /// skipping ones that don't fit the current body area. No-ops (without
     /// advancing the cycle counter) when there's nothing to arrange or
     /// nothing fits.
-    fn cycle_layout(&mut self) {
+    /// **[C37, 2026-08-19]** `forward` is false for `Alt+Shift+g`, which
+    /// walks the same cycle backwards.
+    ///
+    /// `layout_cycle` is the arrangement to try *next going forward*, so
+    /// what is showing is `layout_cycle - 1` and stepping back means
+    /// starting two behind it. The `1 - step` below is exactly that:
+    /// candidates `lc+1, lc, lc-1` — the forward order reversed, with the
+    /// same skip-what-doesn't-fit behaviour, so a shape the terminal is too
+    /// small for is passed over in both directions alike.
+    fn cycle_layout(&mut self, forward: bool) {
         let order = self.pane_order();
         if order.len() < 2 {
             self.set_flash("one pane — nothing to arrange");
@@ -4136,7 +4928,8 @@ impl<B: PaneBackend> App<B> {
         let focused = self.focused;
         let area = self.body_area();
         for step in 0..3 {
-            let idx = (self.layout_cycle + step) % 3;
+            let offset = if forward { step } else { 1 - step };
+            let idx = (self.layout_cycle as isize + offset).rem_euclid(3) as usize;
             let node = arrangement_for(idx, &order, focused);
             if layout::arrangement_fits(&node, area) {
                 self.ws.active_tab_mut().layout = node;
@@ -4144,7 +4937,9 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
         }
-        self.set_flash("no room to rearrange; stack a pane with Alt+s first");
+        let hint =
+            self.chord_clause(Action::ToggleStack, |c| format!("; stack a pane with {c} first"));
+        self.set_flash(format!("no room to rearrange{hint}"));
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -4288,9 +5083,7 @@ impl<B: PaneBackend> App<B> {
     /// to keep it visible.
     fn roster_cycle_status(&mut self, delta: isize) {
         let Mode::Roster { status_filter, .. } = &mut self.mode else { return };
-        let n = ROSTER_STATUS_CYCLE.len() as isize;
-        let at = ROSTER_STATUS_CYCLE.iter().position(|s| s == status_filter).unwrap_or(0) as isize;
-        *status_filter = ROSTER_STATUS_CYCLE[(at + delta).rem_euclid(n) as usize];
+        *status_filter = cycle_status_filter(*status_filter, delta < 0);
         self.roster_clamp_cursor();
     }
 
@@ -4317,7 +5110,9 @@ impl<B: PaneBackend> App<B> {
     /// C15: the keymap's paging step — half its visible height, at least one
     /// row. Same rule as C20/C27's shared `overlay_page`.
     fn help_page(&self) -> isize {
-        (crate::ui::render::help_scroll_extent(self.body_area()).0 / 2).max(1) as isize
+        let q = self.help_filter().map(str::to_string);
+        (crate::ui::render::help_scroll_extent(self.body_area(), &self.keymap, q.as_deref()).0 / 2)
+            .max(1) as isize
     }
 
     /// C15: move the keymap's window `delta` rows, clamped to the table.
@@ -4327,10 +5122,22 @@ impl<B: PaneBackend> App<B> {
     /// `handle_mode_key`: a scroll key that has nowhere to go is not a
     /// scroll key, so it falls through to "any key closes it" and the
     /// amendment stays invisible on any terminal that shows the whole table.
+    /// [F9] The live type-ahead query, or `None` while the filter is closed.
+    /// The distinction matters to callers too: `None` is "the overlay in its
+    /// original state", which is what keeps the amendment invisible.
+    pub fn help_filter(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Help { filter, .. } => filter.as_deref(),
+            _ => None,
+        }
+    }
+
     fn help_scroll(&mut self, delta: isize) -> bool {
-        let (visible, total) = crate::ui::render::help_scroll_extent(self.body_area());
+        let q = self.help_filter().map(str::to_string);
+        let (visible, total) =
+            crate::ui::render::help_scroll_extent(self.body_area(), &self.keymap, q.as_deref());
         let max = total.saturating_sub(visible) as isize;
-        let Mode::Help { top } = &mut self.mode else { return false };
+        let Mode::Help { top, .. } = &mut self.mode else { return false };
         let next = match delta {
             isize::MIN => 0,
             isize::MAX => max,
@@ -4457,7 +5264,9 @@ impl<B: PaneBackend> App<B> {
         self.mode = Mode::Normal;
         self.exit_zoom(); // C21: "picker launch" is a structural action
         self.hide_float(); // C22 rule 3: ditto
-        self.spawn_child(adapter, cwd.clone(), None);
+        if self.spawn_child(adapter, cwd.clone(), None).is_none() {
+            self.flash_no_room();
+        }
         // Launching into a directory is the strongest evidence it is one you
         // are working in — float it to the top of the column for next time.
         if let Some(cwd) = cwd {
@@ -4500,8 +5309,13 @@ impl<B: PaneBackend> App<B> {
     /// F8: the suffix is `" not found"` (the familiar shell idiom for "no
     /// such program on `$PATH`"), not "gone" — "gone" implies something
     /// that *was* here and disappeared, which is false for an adapter never
-    /// installed on this machine at all. Checked against `render.rs`'s
-    /// `ADAPTER_COL` for the longest id: `opencode` (8 chars).
+    /// installed on this machine at all.
+    ///
+    /// It is `PICKER_MISSING_SUFFIX` rather than a literal because C14's
+    /// `ADAPTER_COL` is sized for *this string on the longest registry id*,
+    /// and the gate that checks that has to build the same worst case. Two
+    /// spellings of one suffix is how the column gets sized for a row the
+    /// picker no longer draws — the ADAPTER_COL bug one level up.
     pub fn picker_filtered(&self) -> Vec<String> {
         self.picker_filtered_ids()
             .into_iter()
@@ -4509,7 +5323,7 @@ impl<B: PaneBackend> App<B> {
                 if adapter_installed(id, &self.registry) {
                     id.to_string()
                 } else {
-                    format!("{id} not found")
+                    format!("{id} {PICKER_MISSING_SUFFIX}")
                 }
             })
             .collect()
@@ -4585,6 +5399,8 @@ impl<B: PaneBackend> App<B> {
             session: None,
             title: Some("scratch".into()),
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
         self.set_focus(id);
@@ -4675,6 +5491,34 @@ impl<B: PaneBackend> App<B> {
         // would leave the pane you were reading frozen mid-history while scroll
         // keys silently drive a different pane.
         if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            // C32: Alt+Enter *inside the pane editor* is a line break, not
+            // a cancel into the quick-launch picker. Terminal.app reports
+            // Shift+Enter as exactly these bytes (ESC CR — the README's
+            // documented collapse), so on that terminal this is the only
+            // spelling of "newline" the dialog can ever receive; on CSI-u
+            // terminals it's a synonym for Shift+Enter. No other Alt chord
+            // is claimed — the rest still cancel out to the global
+            // bindings below, Alt+r's own toggle-off included.
+            if key.code == KeyCode::Enter {
+                match &mut self.mode {
+                    Mode::PaneEdit { lines, row, col, .. } => {
+                        pane_edit_break(lines, row, col);
+                        return true;
+                    }
+                    // C36: the composer needs the same carve-out. On
+                    // Terminal.app, Shift+Enter arrives as Alt+Enter
+                    // (README's CSI-u note), so without this the one chord
+                    // that should break a line instead opened the picker
+                    // and discarded the composed message. Found by the C36
+                    // design audit; C36's "keys are C32's, exactly" was an
+                    // overclaim until now.
+                    Mode::Broadcast { lines, row, col, .. } => {
+                        broadcast_break(lines, row, col);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             // U18: a mode's own entry chord toggles it OFF. C20's Alt+e had
             // this rule special-cased for the feed; every other mode fell
             // through to the global binding and *re-entered* — Alt+c in copy
@@ -4833,24 +5677,285 @@ impl<B: PaneBackend> App<B> {
                     KeyCode::End => *cursor = len,
                     KeyCode::Enter => {
                         let text = buffer.trim().to_string();
-                        match target {
-                            RenameTarget::Pane => {
-                                let focused = self.focused;
-                                if let Some(spec) = self.find_spec_mut(focused) {
-                                    // Empty clears back to the adapter name.
-                                    spec.title = if text.is_empty() { None } else { Some(text) };
-                                }
-                            }
-                            RenameTarget::Tab => {
-                                // A tab always needs a name; ignore an empty one.
-                                if !text.is_empty() {
-                                    self.ws.active_tab_mut().name = text;
-                                }
+                        // Tab is the one Rename target left (C32 absorbed
+                        // pane renames). A tab always needs a name; ignore
+                        // an empty one.
+                        let RenameTarget::Tab = target;
+                        if !text.is_empty() {
+                            self.ws.active_tab_mut().name = text;
+                        }
+                        self.save();
+                        self.mode = Mode::Normal;
+                    }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                true
+            }
+            Mode::Broadcast { lines, row, col, status_filter } => {
+                // C36: C32's editing vocabulary over a plain line buffer —
+                // no name row, so `row` indexes `lines` directly and the
+                // seam rules PaneEdit needs don't apply. Enter *sends*
+                // (Shift/Ctrl+Enter breaks a line, C32's convention), Tab
+                // cycles the target filter, Esc walks away having sent
+                // nothing.
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+                *row = (*row).min(lines.len().saturating_sub(1));
+                let len = lines[*row].chars().count();
+                *col = (*col).min(len);
+                match key.code {
+                    KeyCode::Enter if shift || ctrl => {
+                        broadcast_break(lines, row, col);
+                    }
+                    KeyCode::Enter => {
+                        let text = lines.join("\n").trim().to_string();
+                        let filter = *status_filter;
+                        self.mode = Mode::Normal;
+                        self.send_broadcast(&text, filter);
+                    }
+                    // C27's idiom: Tab cycles which statuses are targeted,
+                    // and the title's count moves with it — so the filter
+                    // is legible as "who gets this", not as a setting.
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let back = matches!(key.code, KeyCode::BackTab);
+                        // `deliverable_only`: the composer skips `Exited`,
+                        // which `broadcast_targets` filters out anyway — see
+                        // `step_status_filter`. The roster keeps it.
+                        *status_filter = step_status_filter(*status_filter, back, true);
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        let cur = &mut lines[*row];
+                        *cur = cur[byte_at(cur, *col)..].to_string();
+                        *col = 0;
+                    }
+                    KeyCode::Char('w') if ctrl => {
+                        let cur = &mut lines[*row];
+                        let at = byte_at(cur, *col);
+                        let head = erase_word(&cur[..at]);
+                        *col = head.chars().count();
+                        *cur = head + &cur[at..];
+                    }
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        let cur = &mut lines[*row];
+                        let at = byte_at(cur, *col);
+                        cur.insert(at, c);
+                        *col += 1;
+                    }
+                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
+                    KeyCode::Backspace => {
+                        if *col > 0 {
+                            *col -= 1;
+                            let cur = &mut lines[*row];
+                            let at = byte_at(cur, *col);
+                            cur.remove(at);
+                        } else if *row > 0 {
+                            let cur = lines.remove(*row);
+                            *row -= 1;
+                            *col = lines[*row].chars().count();
+                            lines[*row].push_str(&cur);
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if *col < len {
+                            let cur = &mut lines[*row];
+                            let at = byte_at(cur, *col);
+                            cur.remove(at);
+                        } else if *row + 1 < lines.len() {
+                            let next = lines.remove(*row + 1);
+                            lines[*row].push_str(&next);
+                        }
+                    }
+                    KeyCode::Left => {
+                        if *col > 0 {
+                            *col -= 1;
+                        } else if *row > 0 {
+                            *row -= 1;
+                            *col = lines[*row].chars().count();
+                        }
+                    }
+                    KeyCode::Right => {
+                        if *col < len {
+                            *col += 1;
+                        } else if *row + 1 < lines.len() {
+                            *row += 1;
+                            *col = 0;
+                        }
+                    }
+                    KeyCode::Up => {
+                        if *row > 0 {
+                            *row -= 1;
+                            *col = (*col).min(lines[*row].chars().count());
+                        }
+                    }
+                    KeyCode::Down => {
+                        if *row + 1 < lines.len() {
+                            *row += 1;
+                            *col = (*col).min(lines[*row].chars().count());
+                        }
+                    }
+                    KeyCode::Home => *col = 0,
+                    KeyCode::End => *col = len,
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                true
+            }
+            Mode::PaneEdit { name, lines, row, col, pane } => {
+                // C32 (combined): Rename's editing vocabulary on the
+                // current row — Ctrl+U/W, insert-at-point, Backspace/
+                // Delete, Home/End — where row 0 is the name and rows
+                // 1.. are the note; plus the vertical half: ↑↓ move rows,
+                // Shift+Enter (or Ctrl+Enter; Alt+Enter is caught in the
+                // Alt branch above) breaks — descend from the name, split
+                // inside the note — and ←→ flow across note line ends.
+                // Motion crosses the name/note seam; **edits never do**:
+                // Backspace at the note's top-left and Delete at the
+                // name's end are walls, so a typo can't merge status text
+                // into identity. Plain Enter commits both fields, Esc
+                // walks away.
+                let pane = *pane;
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+                // Same stale-point hygiene as Rename: clamp, never slice
+                // bad. Unified rows: 0 = name, 1..=lines.len() = note.
+                *row = (*row).min(lines.len());
+                let len = if *row == 0 {
+                    name.chars().count()
+                } else {
+                    lines[*row - 1].chars().count()
+                };
+                *col = (*col).min(len);
+                match key.code {
+                    KeyCode::Enter if shift || ctrl => {
+                        pane_edit_break(lines, row, col);
+                    }
+                    KeyCode::Enter => {
+                        // Whole-text trims: an empty name clears back to
+                        // the adapter fallback (Rename's rule); stray
+                        // blank note lines at either end die (a headline
+                        // of "" would make the badge segment a lie),
+                        // interior blanks are the author's call.
+                        let new_title = name.trim().to_string();
+                        let new_title =
+                            if new_title.is_empty() { None } else { Some(new_title) };
+                        let text = lines.join("\n").trim().to_string();
+                        let new_note = if text.is_empty() { None } else { Some(text) };
+                        if let Some(spec) = self.find_spec_mut(pane) {
+                            spec.title = new_title;
+                            // The age stamp answers "when did the *status*
+                            // last change" — a pure rename must not
+                            // refresh it, an unchanged note keeps its
+                            // honest age, and an emptied note clears the
+                            // stamp with itself (the acknowledgment
+                            // gesture).
+                            if spec.note != new_note {
+                                spec.noted_at = new_note.as_ref().map(|_| now_unix_secs());
+                                spec.note = new_note;
                             }
                         }
                         self.save();
                         self.mode = Mode::Normal;
                     }
+                    KeyCode::Char('u') if ctrl => {
+                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
+                        *cur = cur[byte_at(cur, *col)..].to_string();
+                        *col = 0;
+                    }
+                    KeyCode::Char('w') if ctrl => {
+                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
+                        let at = byte_at(cur, *col);
+                        let head = erase_word(&cur[..at]);
+                        *col = head.chars().count();
+                        *cur = head + &cur[at..];
+                    }
+                    KeyCode::Char(c)
+                        if key
+                            .modifiers
+                            .difference(crossterm::event::KeyModifiers::SHIFT)
+                            .is_empty() =>
+                    {
+                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
+                        let at = byte_at(cur, *col);
+                        cur.insert(at, c);
+                        *col += 1;
+                    }
+                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
+                    KeyCode::Backspace => {
+                        if *col > 0 {
+                            *col -= 1;
+                            let cur =
+                                if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
+                            let at = byte_at(cur, *col);
+                            cur.remove(at);
+                        } else if *row > 1 {
+                            // Note-internal join; row 1's left edge is the
+                            // wall — the note never merges into the name.
+                            let cur = lines.remove(*row - 1);
+                            *row -= 1;
+                            *col = lines[*row - 1].chars().count();
+                            lines[*row - 1].push_str(&cur);
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if *col < len {
+                            let cur =
+                                if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
+                            let at = byte_at(cur, *col);
+                            cur.remove(at);
+                        } else if *row >= 1 && *row < lines.len() {
+                            // Note-internal join; the name's end is the
+                            // wall in the other direction.
+                            let next = lines.remove(*row);
+                            lines[*row - 1].push_str(&next);
+                        }
+                    }
+                    // Motion crosses the seam — ←→ flow across row ends,
+                    // ↑↓ keep the column where they can.
+                    KeyCode::Left => {
+                        if *col > 0 {
+                            *col -= 1;
+                        } else if *row > 0 {
+                            *row -= 1;
+                            *col = if *row == 0 {
+                                name.chars().count()
+                            } else {
+                                lines[*row - 1].chars().count()
+                            };
+                        }
+                    }
+                    KeyCode::Right => {
+                        if *col < len {
+                            *col += 1;
+                        } else if *row < lines.len() {
+                            *row += 1;
+                            *col = 0;
+                        }
+                    }
+                    KeyCode::Up => {
+                        if *row > 0 {
+                            *row -= 1;
+                            let l = if *row == 0 {
+                                name.chars().count()
+                            } else {
+                                lines[*row - 1].chars().count()
+                            };
+                            *col = (*col).min(l);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if *row < lines.len() {
+                            *row += 1;
+                            *col = (*col).min(lines[*row - 1].chars().count());
+                        }
+                    }
+                    KeyCode::Home => *col = 0,
+                    KeyCode::End => *col = len,
                     KeyCode::Esc => self.mode = Mode::Normal,
                     _ => {}
                 }
@@ -5090,10 +6195,98 @@ impl<B: PaneBackend> App<B> {
                 // overlay exactly as it always did: the amendment costs
                 // nothing anywhere it isn't needed, and a reader on a short
                 // terminal is not dismissed for trying to read on.
+                //
+                // [F9] ...and except the filter, once `/` has opened it.
+                // The two carve-outs are deliberately different shapes and
+                // C15 says so: scrolling is *conditional* (a key that moved
+                // nothing falls through and closes), while the filter, once
+                // open, holds every printable. That is C27's roster rule
+                // ("a letter is filter text"), not a widening of the scroll
+                // rule, and it is confined to a state the title declares.
+                let filtering = matches!(&self.mode, Mode::Help { filter: Some(_), .. });
+
+                // `/` opens the filter — and only from the un-filtered
+                // state. Once filtering, `/` is a character like any other:
+                // a query can contain a slash, and a key that means "open"
+                // in one state and "type" in another is the ambiguity U20
+                // resolved the same way for the picker.
+                if !filtering && key.code == KeyCode::Char('/') {
+                    if let Mode::Help { filter, .. } = &mut self.mode {
+                        *filter = Some(String::new());
+                    }
+                    return true;
+                }
+
+                if filtering {
+                    // Delete is an *edit* key, and a reader reaching for it
+                    // is erasing a typo — closing the overlay instead is the
+                    // sharpest way there is to lose a query. It has nothing
+                    // to delete (the caret is always at the end of an
+                    // append-only query), so it does nothing, which is what
+                    // Delete does at the end of any text field. Found by the
+                    // C39 design audit, which called it the sharp one.
+                    if key.code == KeyCode::Delete {
+                        return true;
+                    }
+                    // Scrolling still works while filtering — none of these
+                    // are printable, so nothing is displaced. Handled below
+                    // by falling through to the shared `delta` match.
+                    let typed = match key.code {
+                        KeyCode::Char(c)
+                            if key
+                                .modifiers
+                                .difference(crossterm::event::KeyModifiers::SHIFT)
+                                .is_empty() =>
+                        {
+                            Some(Some(c))
+                        }
+                        KeyCode::Backspace => Some(None),
+                        _ => None,
+                    };
+                    if let Some(edit) = typed {
+                        if let Mode::Help { filter: Some(q), top } = &mut self.mode {
+                            match edit {
+                                Some(c) => q.push(c),
+                                None => {
+                                    q.pop();
+                                }
+                            }
+                            // The list under the query just changed length,
+                            // so a `top` from the old list can point past
+                            // the new one's end. Reset rather than clamp:
+                            // a filtered list is a new list, and C14/C27
+                            // both put the cursor at its start.
+                            *top = 0;
+                        }
+                        return true;
+                    }
+                    // Esc clears a query, then closes — two presses, the
+                    // roster's own way out. Clearing first means a typo
+                    // costs one key, not the whole overlay and the place
+                    // you had scrolled to.
+                    if key.code == KeyCode::Esc {
+                        let empty =
+                            matches!(&self.mode, Mode::Help { filter: Some(q), .. } if q.is_empty());
+                        if empty {
+                            self.mode = Mode::Normal;
+                        } else if let Mode::Help { filter, top } = &mut self.mode {
+                            *filter = Some(String::new());
+                            *top = 0;
+                        }
+                        return true;
+                    }
+                }
+
                 let step = self.help_page();
                 let delta = match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => 1,
-                    KeyCode::Up | KeyCode::Char('k') => -1,
+                    KeyCode::Down => 1,
+                    KeyCode::Up => -1,
+                    // `j`/`k` scroll only while the filter is closed. Once
+                    // it is open they are query text — the same trade C27's
+                    // roster makes for every letter, and the reason its
+                    // hint bar drops `q`.
+                    KeyCode::Char('j') if !filtering => 1,
+                    KeyCode::Char('k') if !filtering => -1,
                     // Space is deliberately NOT a page key. In a modal whose
                     // contract is "any key closes it", Space is the key a
                     // reader hits to make it go away — pressing it and
@@ -5108,7 +6301,12 @@ impl<B: PaneBackend> App<B> {
                         return true;
                     }
                 };
-                if !self.help_scroll(delta) {
+                if !self.help_scroll(delta) && !filtering {
+                    // While filtering, a scroll key that hit the end must
+                    // NOT close: the reader is mid-query, and losing it to
+                    // an over-pressed ↓ is the "modal you open when you are
+                    // lost is the one with a surprising way out" failure
+                    // C15 rejected scrolling over in the first place.
                     self.mode = Mode::Normal;
                 }
                 true
@@ -5465,14 +6663,15 @@ pub fn url_in_wrapped_rows(run: &[String], width: usize, row: usize, col: usize)
 fn mode_entry_action(mode: &Mode) -> Option<Action> {
     match mode {
         Mode::Normal => None,
-        Mode::Rename { target: RenameTarget::Pane, .. } => Some(Action::RenamePane),
-        Mode::Rename { target: RenameTarget::Tab, .. } => Some(Action::RenameTab),
+        Mode::Rename { .. } => Some(Action::RenameTab),
+        Mode::PaneEdit { .. } => Some(Action::EditPane),
         Mode::Picker { .. } => Some(Action::QuickLaunch),
         Mode::Scroll => Some(Action::ScrollMode),
         Mode::Copy { .. } => Some(Action::CopyMode),
         Mode::Help { .. } => Some(Action::Help),
         Mode::Feed { .. } => Some(Action::ToggleFeed),
         Mode::Roster { .. } => Some(Action::ToggleRoster),
+        Mode::Broadcast { .. } => Some(Action::ToggleBroadcast),
         // P21: the search prompt is entered with `/`, not an Alt chord, so
         // there is no chord for it to toggle off. Alt+PgUp while searching
         // therefore falls through to the global binding, exactly as it
@@ -5519,6 +6718,135 @@ pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
 /// accented word), and slicing one down the middle panics.
 fn byte_at(s: &str, at: usize) -> usize {
     s.char_indices().nth(at).map_or(s.len(), |(b, _)| b)
+}
+
+/// C32: Shift/Ctrl/Alt+Enter in the combined editor, shared by the mode
+/// arm and the Alt-branch carve-out so the spellings can never drift. On
+/// the name row (`row` 0) it *descends* into the note — the name is
+/// single-line by contract, so "line break" there means "start writing
+/// the note", which makes name → note one continuous typing flow. On a
+/// note row it splits at the point via `note_split_line`.
+/// C27/C36: one step through `ROSTER_STATUS_CYCLE` (worst-first, with
+/// `None` = every tier at both ends so cycling never dead-ends). Shared by
+/// the roster's `Tab` and the broadcast composer's, so the two surfaces
+/// cannot drift about what the tiers are or what order they come in — the
+/// composer is showing a *target count* for the filter it names, and a
+/// filter that meant something different in each place would make that
+/// count unreadable.
+fn cycle_status_filter(current: Option<AgentStatus>, back: bool) -> Option<AgentStatus> {
+    step_status_filter(current, back, false)
+}
+
+/// The same step, with `deliverable_only` dropping the one tier the
+/// broadcast composer can never act on.
+///
+/// `broadcast_targets` filters `Exited` unconditionally — a pane that is
+/// gone cannot receive anything — so on that surface the cycle's last stop
+/// was **structurally inert**: `Tab` landed on "exited", the title's live
+/// count read 0 whatever the workspace held, and Enter sent nothing. A stop
+/// that can only ever mean "nobody" is not a filter, it is a hole in the
+/// cycle. Found by the C36 design audit.
+///
+/// The roster keeps it, because the roster is a *monitoring* surface and
+/// "which of my panes died" is exactly what it is for. So the two surfaces
+/// still share one definition of what the tiers are and what order they
+/// come in — the property the shared function exists for — and differ by a
+/// single omission stated here rather than by a second const free to drift.
+///
+/// Skipping is a **second step in the same direction**, never a fallback to
+/// `None`: `Tab` and `Shift+Tab` have to stay inverses across the gap, and
+/// landing both on the same tier would break that at exactly one point in
+/// the lap.
+///
+/// **The double step assumes exactly one skipped tier.** Two adjacent
+/// skips would land on a skipped tier, and this would have to loop instead.
+/// One is all there is — `broadcast_targets` has one unconditional
+/// exclusion — and the assertion below fails loudly rather than returning a
+/// tier the caller cannot use, so a second exclusion added later cannot
+/// pass silently. Named by the design audit as an undocumented invariant.
+fn step_status_filter(
+    current: Option<AgentStatus>,
+    back: bool,
+    deliverable_only: bool,
+) -> Option<AgentStatus> {
+    let n = ROSTER_STATUS_CYCLE.len() as isize;
+    let at = ROSTER_STATUS_CYCLE.iter().position(|s| *s == current).unwrap_or(0) as isize;
+    let step = if back { -1 } else { 1 };
+    let next = ROSTER_STATUS_CYCLE[(at + step).rem_euclid(n) as usize];
+    if deliverable_only && next == Some(AgentStatus::Exited) {
+        let past = ROSTER_STATUS_CYCLE[(at + step * 2).rem_euclid(n) as usize];
+        debug_assert_ne!(
+            past,
+            Some(AgentStatus::Exited),
+            "the single-gap assumption broke: two skipped tiers need a loop, not a double step",
+        );
+        return past;
+    }
+    next
+}
+
+/// C36: split the composer's current line at the point.
+///
+/// **Capped at `BROADCAST_MAX_LINES`.** The dialog is `lines + 2` rows tall
+/// and `centered_near` clamps to the body, so without a cap a long enough
+/// message pushes its own rows — and the caret — off the bottom silently,
+/// with nothing to scroll them back. C32 caps its note for the same reason;
+/// this is that rule applied to the surface that borrowed its keys. At the
+/// cap the break is refused rather than partially applied: losing the split
+/// is recoverable, losing the text under it is not.
+fn broadcast_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
+    if lines.len() >= BROADCAST_MAX_LINES {
+        return;
+    }
+    let at = byte_at(&lines[*row], *col);
+    let tail = lines[*row].split_off(at);
+    lines.insert(*row + 1, tail);
+    *row += 1;
+    *col = 0;
+}
+
+fn pane_edit_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
+    if *row == 0 {
+        // Land at the headline's END, not at the name's column carried
+        // over: descending means "write the note now", and the writing
+        // point of an existing line is after its last character.
+        *row = 1;
+        *col = lines[0].chars().count();
+    } else {
+        let mut nrow = *row - 1;
+        note_split_line(lines, &mut nrow, col);
+        *row = nrow + 1;
+    }
+}
+
+/// C32: split the note line at the point. At `NOTE_MAX_LINES` the split
+/// is swallowed whole (no new line, nothing scrolled off the dialog);
+/// the clamps are the Rename arm's stale-point hygiene. `row`/`col` are
+/// **note-relative** (0 = the headline) — `pane_edit_break` converts from
+/// the editor's unified rows.
+fn note_split_line(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
+    if lines.len() >= NOTE_MAX_LINES {
+        return;
+    }
+    *row = (*row).min(lines.len() - 1);
+    let line = &mut lines[*row];
+    let at = byte_at(line, (*col).min(line.chars().count()));
+    let tail = line[at..].to_string();
+    line.truncate(at);
+    lines.insert(*row + 1, tail);
+    *row += 1;
+    *col = 0;
+}
+
+/// C32: wall-clock seconds for `noted_at`. A pre-1970 system clock yields
+/// 0 rather than a panic — the age tag then reads absurdly old, which is
+/// at least honest about the clock being broken. `pub` because the badge's
+/// age tag reads the same clock, once per frame (C5's shared-read idiom).
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// U17 word motions, shared shape: is cell `i` of `line` whitespace? Past the
@@ -5713,9 +7041,21 @@ fn rotate_audit_log(path: &std::path::Path, max: u64) {
 /// (C27), deliberately the same function so toggling between the two never
 /// resizes the frame. Pure so the 72×16 formula is unit-tested without a
 /// `Frame`.
+///
+/// **Floored at one cell in each axis.** The `saturating_sub(4)` reached 0
+/// on a body four rows tall — a terminal six rows tall, since the tab bar
+/// and hint bar take two — and a zero-height dialog draws *nothing*: no
+/// border, no title, no rows. The chord still flipped the mode word to
+/// `FEED`/`ROSTER` and the hint bar still offered `↑↓ select`, so pressing
+/// Alt+e or Alt+Shift+a at a small terminal changed one word on screen and
+/// left everything else alone — indistinguishable from a binding that does
+/// not work. The picker already had the answer, in `dialog_rect`: "an empty
+/// result still needs a frame to say so". These two never adopted it.
+/// `centered_near` clamps the ask to the body, so the floor can never
+/// overflow a body smaller than the frame it asks for.
 pub fn feed_overlay_size(body: Rect) -> (u16, u16) {
-    let w = body.width.saturating_sub(4).min(72);
-    let h = body.height.saturating_sub(4).min(16);
+    let w = body.width.saturating_sub(4).min(72).max(1);
+    let h = body.height.saturating_sub(4).min(16).max(1);
     (w, h)
 }
 
@@ -5751,6 +7091,11 @@ fn roster_rank(status: Option<AgentStatus>) -> u8 {
 /// this list, `Shift+Tab` back, wrapping both ways. Worst-first, same as
 /// `roster_rank`, with `None` ("every tier") at the front so the first press
 /// narrows from "everything" to the severity you'd actually go looking for.
+/// C36: the composer's line ceiling — the dialog grows a row per break and
+/// never scrolls, so this is what keeps it inside the body. Matches C32's
+/// note cap in spirit and in number.
+const BROADCAST_MAX_LINES: usize = NOTE_MAX_LINES;
+
 const ROSTER_STATUS_CYCLE: [Option<AgentStatus>; 6] = [
     None,
     Some(AgentStatus::NeedsInput),
@@ -7043,7 +8388,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         const ALT: KeyModifiers = KeyModifiers::ALT;
         let cases: [(Action, KeyEvent); 7] = [
-            (Action::RenamePane, KeyEvent::new(KeyCode::Char('r'), ALT)),
+            (Action::EditPane, KeyEvent::new(KeyCode::Char('r'), ALT)),
             (
                 Action::RenameTab,
                 KeyEvent::new(KeyCode::Char('r'), ALT.union(KeyModifiers::SHIFT)),
@@ -7124,21 +8469,21 @@ mod tests {
     fn the_keymap_scrolls_on_a_short_terminal_and_still_closes_on_any_other_key() {
         use crossterm::event::{KeyCode, KeyEvent};
         let (mut app, _) = mk_app(shell_ws());
-        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area());
+        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert!(visible < total, "this fixture's body is too short for the whole keymap");
 
         app.apply(Action::Help);
-        assert!(matches!(app.mode, Mode::Help { top: 0 }));
+        assert!(matches!(app.mode, Mode::Help { top: 0, .. }));
         app.handle_mode_key(KeyEvent::from(KeyCode::Down));
-        assert!(matches!(app.mode, Mode::Help { top: 1 }), "↓ read on");
+        assert!(matches!(app.mode, Mode::Help { top: 1, .. }), "↓ read on");
         app.handle_mode_key(KeyEvent::from(KeyCode::PageDown));
-        let Mode::Help { top } = app.mode else { panic!("PgDn kept it open") };
+        let Mode::Help { top, .. } = app.mode else { panic!("PgDn kept it open") };
         assert!(top > 1, "PgDn paged further than ↓ did");
         app.handle_mode_key(KeyEvent::from(KeyCode::Home));
-        assert!(matches!(app.mode, Mode::Help { top: 0 }), "Home went back to the first row");
+        assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "Home went back to the first row");
         app.handle_mode_key(KeyEvent::from(KeyCode::End));
         assert!(
-            matches!(app.mode, Mode::Help { top: t } if t == total - visible),
+            matches!(app.mode, Mode::Help { top: t, .. } if t == total - visible),
             "End went to the last screenful",
         );
         // …and at the bottom, ↓ has nowhere to go, so it closes — the same
@@ -7160,7 +8505,7 @@ mod tests {
         ws.tabs[0].name = "main".into();
         let (mut app, _) = mk_app(ws);
         app.on_resize(Size::new(120, 60), (0, 0));
-        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area());
+        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert_eq!(visible, total, "a tall body shows the whole keymap at once");
         for key in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Char('j')] {
             app.apply(Action::Help);
@@ -8602,11 +9947,17 @@ mod tests {
     fn paste_during_rename_fills_the_buffer_with_printables_only() {
         let (mut app, _) = mk_app(shell_ws());
         let id = app.focused;
-        app.apply(Action::RenamePane);
+        // C32: the pane editor's NAME row keeps Rename's filter verbatim —
+        // a pasted newline must not reach a title (nor descend into the
+        // note: a name paste is a name paste).
+        app.apply(Action::EditPane);
         app.handle_paste("api\n\x1b[0mbox\t");
         match &app.mode {
-            Mode::Rename { buffer, .. } => assert_eq!(buffer, "api[0mbox"),
-            _ => panic!("the rename dialog must still be up, holding the pasted text"),
+            Mode::PaneEdit { name, row, .. } => {
+                assert_eq!(name, "api[0mbox");
+                assert_eq!(*row, 0, "a name paste stays on the name row");
+            }
+            _ => panic!("the editor must still be up, holding the pasted text"),
         }
         assert!(app.runtimes.get(&id).unwrap().input.is_empty(), "the pane must see nothing");
         app.handle_mode_key(crossterm::event::KeyEvent::new(
@@ -8614,6 +9965,253 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert_eq!(app.find_spec(id).and_then(|s| s.title.clone()), Some("api[0mbox".into()));
+    }
+
+    // -- C32: the combined pane editor (name + parking note) --------------
+
+    /// The editor's fields and point, for the tests below. `row` is
+    /// unified: 0 = name, i>0 = note line i-1.
+    fn edit_state(app: &App<FakePane>) -> (String, Vec<String>, usize, usize) {
+        match &app.mode {
+            Mode::PaneEdit { name, lines, row, col, .. } => {
+                (name.clone(), lines.clone(), *row, *col)
+            }
+            _ => panic!("the pane editor must be up"),
+        }
+    }
+
+    fn shift_enter() -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    }
+
+    /// C32, the whole write path as one typing flow: name, Shift+Enter
+    /// (descends into the note), headline, Shift+Enter (splits), body,
+    /// Enter — both fields land on the spec, the note stamped, and the
+    /// workspace saved (the overnight story is a disk write, not a mode).
+    #[test]
+    fn edit_pane_types_name_and_note_in_one_flow() {
+        use crossterm::event::KeyCode;
+        let (mut app, store) = mk_app(shell_ws());
+        let id = app.focused;
+        app.apply(Action::EditPane);
+        type_query(&mut app, "auth-fix");
+        app.handle_mode_key(shift_enter());
+        type_query(&mut app, "tests green");
+        app.handle_mode_key(shift_enter());
+        type_query(&mut app, "next: merge");
+        let (name, lines, ..) = edit_state(&app);
+        assert_eq!(name, "auth-fix");
+        assert_eq!(lines, vec!["tests green".to_string(), "next: merge".to_string()]);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        let spec = app.find_spec(id).unwrap();
+        assert_eq!(spec.title.as_deref(), Some("auth-fix"));
+        assert_eq!(spec.note.as_deref(), Some("tests green\nnext: merge"));
+        assert!(spec.noted_at.is_some(), "a saved note carries its write time");
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(saved.tabs[0].panes[&id].note.as_deref(), Some("tests green\nnext: merge"));
+        assert_eq!(saved.tabs[0].panes[&id].title.as_deref(), Some("auth-fix"));
+    }
+
+    /// C32: the editor opens prefilled — both fields intact, point at the
+    /// end of the NAME row (renames are Alt+r's muscle memory) — and an
+    /// emptied note clears note + timestamp while the name survives: the
+    /// clear gesture acknowledges status without touching identity.
+    #[test]
+    fn edit_pane_opens_prefilled_and_an_emptied_note_clears_only_the_note() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let spec = app.ws.tabs[0].panes.get_mut(&id).unwrap();
+        spec.title = Some("web".into());
+        spec.note = Some("old line\nsecond".into());
+        spec.noted_at = Some(5);
+        app.apply(Action::EditPane);
+        let (name, lines, row, col) = edit_state(&app);
+        assert_eq!(name, "web");
+        assert_eq!(lines, vec!["old line".to_string(), "second".to_string()]);
+        assert_eq!((row, col), (0, 3), "the point opens at the end of the name");
+        // Walk down and empty both note lines (End first — Ctrl+U kills
+        // behind the point); the final join leaves one blank line.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::End);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::End);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        let spec = app.find_spec(id).unwrap();
+        assert_eq!(spec.title.as_deref(), Some("web"), "identity survives the clear");
+        assert!(spec.note.is_none(), "an empty note save clears the note");
+        assert!(spec.noted_at.is_none(), "…and its timestamp with it");
+    }
+
+    /// C32: the age stamp answers "when did the STATUS last change" — a
+    /// pure rename re-stamps nothing, an unchanged note keeps its honest
+    /// age, and only a real note edit refreshes it.
+    #[test]
+    fn edit_pane_restamps_the_note_age_only_when_the_note_changed() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let spec = app.ws.tabs[0].panes.get_mut(&id).unwrap();
+        spec.note = Some("waiting on CI".into());
+        spec.noted_at = Some(5);
+        // Open + save with no edits: the age must not refresh.
+        app.apply(Action::EditPane);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.find_spec(id).unwrap().noted_at, Some(5));
+        // Rename only: still no refresh.
+        app.apply(Action::EditPane);
+        type_query(&mut app, "x");
+        press(&mut app, KeyCode::Enter);
+        let spec = app.find_spec(id).unwrap();
+        assert_eq!(spec.title.as_deref(), Some("x"));
+        assert_eq!(spec.noted_at, Some(5), "a rename must not make a stale note look fresh");
+        // A real note edit: refreshed.
+        app.apply(Action::EditPane);
+        press(&mut app, KeyCode::Down);
+        type_query(&mut app, "!");
+        press(&mut app, KeyCode::Enter);
+        assert_ne!(app.find_spec(id).unwrap().noted_at, Some(5));
+    }
+
+    /// C32: Esc and the entry chord's toggle-off (U18, now Alt+r itself)
+    /// both cancel — typed edits die with the dialog, both stored fields
+    /// stay exactly as they were.
+    #[test]
+    fn edit_pane_esc_and_toggle_off_both_cancel_without_touching_either_field() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let spec = app.ws.tabs[0].panes.get_mut(&id).unwrap();
+        spec.title = Some("web".into());
+        spec.note = Some("keep me".into());
+        app.apply(Action::EditPane);
+        type_query(&mut app, " junk");
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        let spec = app.find_spec(id).unwrap();
+        assert_eq!(spec.title.as_deref(), Some("web"));
+        assert_eq!(spec.note.as_deref(), Some("keep me"));
+        app.apply(Action::EditPane);
+        type_query(&mut app, " junk");
+        let consumed = app
+            .handle_mode_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(consumed, "the toggle-off is handled, not forwarded");
+        assert!(matches!(app.mode, Mode::Normal));
+        let spec = app.find_spec(id).unwrap();
+        assert_eq!(spec.title.as_deref(), Some("web"));
+        assert_eq!(spec.note.as_deref(), Some("keep me"));
+    }
+
+    /// C32: Alt+Enter inside the dialog is a break, never a cancel into
+    /// the quick-launch picker — on Terminal.app it is the only bytes
+    /// Shift+Enter can arrive as. On the name row it descends; on a note
+    /// row it splits.
+    #[test]
+    fn edit_pane_alt_enter_breaks_instead_of_opening_the_picker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::EditPane);
+        type_query(&mut app, "ab");
+        let consumed =
+            app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(consumed);
+        let (name, lines, row, col) = edit_state(&app);
+        assert_eq!((name.as_str(), row, col), ("ab", 1, 0), "descended into the note");
+        type_query(&mut app, "cd");
+        let consumed =
+            app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(consumed);
+        let (_, lines, row, col) = edit_state(&app);
+        assert_eq!(lines, vec!["cd".to_string(), String::new()]);
+        assert_eq!((row, col), (2, 0), "split the note line");
+        let _ = lines;
+    }
+
+    /// C32: the note stops growing at NOTE_MAX_LINES — the split is
+    /// swallowed whole, nothing scrolls off and nothing is half-split.
+    #[test]
+    fn edit_pane_line_cap_swallows_the_split() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::EditPane);
+        for _ in 0..NOTE_MAX_LINES + 3 {
+            app.handle_mode_key(shift_enter());
+        }
+        assert_eq!(edit_state(&app).1.len(), NOTE_MAX_LINES);
+    }
+
+    /// C32 + U8(b): a note-row paste keeps its newlines as line breaks
+    /// (CR/CRLF normalized), other control bytes drop, and overflow past
+    /// the cap folds into the last line instead of vanishing.
+    #[test]
+    fn edit_pane_note_paste_weaves_lines_and_folds_overflow_at_the_cap() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::EditPane);
+        press(&mut app, KeyCode::Down); // onto the note
+        app.handle_paste("a\r\nb\rc\x1b[0m");
+        let (_, lines, row, col) = edit_state(&app);
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string(), "c[0m".to_string()]);
+        assert_eq!((row, col), (3, 4), "the point lands after the insertion");
+
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::EditPane);
+        press(&mut app, KeyCode::Down);
+        app.handle_paste("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+        let (_, lines, ..) = edit_state(&app);
+        assert_eq!(lines.len(), NOTE_MAX_LINES);
+        assert_eq!(lines[NOTE_MAX_LINES - 1], "8 9 10", "overflow folds, space-joined");
+    }
+
+    /// C32: motion crosses the name/note seam, edits never do — Backspace
+    /// at the note's top-left and Delete at the name's end are walls, so
+    /// a typo can't merge status text into identity (in either direction).
+    #[test]
+    fn edit_pane_edits_never_cross_the_name_note_wall() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let spec = app.ws.tabs[0].panes.get_mut(&id).unwrap();
+        spec.title = Some("web".into());
+        spec.note = Some("note".into());
+        app.apply(Action::EditPane);
+        // Delete at the name's end: wall.
+        press(&mut app, KeyCode::Delete);
+        // Backspace at the note's top-left: wall.
+        press(&mut app, KeyCode::Right); // seam-cross to (1, 0) — motion is allowed
+        let (.., row, col) = edit_state(&app);
+        assert_eq!((row, col), (1, 0));
+        press(&mut app, KeyCode::Backspace);
+        let (name, lines, ..) = edit_state(&app);
+        assert_eq!(name, "web");
+        assert_eq!(lines, vec!["note".to_string()]);
+        // …while inside the note, Backspace at a line edge still joins.
+        app.handle_mode_key(shift_enter());
+        press(&mut app, KeyCode::Backspace);
+        let (_, lines, ..) = edit_state(&app);
+        assert_eq!(lines, vec!["note".to_string()], "note-internal join still works");
+    }
+
+    /// C32: the note rides `PaneSpec`, so `Alt+u` restores it with the
+    /// pane — same clause as the session id, no separate machinery.
+    #[test]
+    fn undo_reopens_a_closed_pane_with_its_note() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+        let spec = app.ws.tabs[0].panes.get_mut(&id).unwrap();
+        spec.note = Some("parked: retry flaky e2e".into());
+        spec.noted_at = Some(7);
+        app.apply(Action::ClosePane);
+        app.apply(Action::Undo);
+        let restored = app.focused;
+        let spec = app.find_spec(restored).unwrap();
+        assert_eq!(spec.note.as_deref(), Some("parked: retry flaky e2e"));
+        assert_eq!(spec.noted_at, Some(7));
     }
 
     /// U16: `unix-word-rubout`'s exact boundary rule — trailing whitespace
@@ -8640,7 +10238,9 @@ mod tests {
     fn rename_honors_ctrl_w_and_ctrl_u_instead_of_typing_their_letters() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let (mut app, _) = mk_app(shell_ws());
-        app.apply(Action::RenamePane);
+        app.apply(Action::RenameTab);
+        // Wipe the prefilled tab name first (same reason as rename_typing).
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         for c in "abc def".chars() {
             app.handle_mode_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -8668,7 +10268,16 @@ mod tests {
 
     fn rename_typing(text: &str) -> App<FakePane> {
         let (mut app, _) = mk_app(shell_ws());
-        app.apply(Action::RenamePane);
+        // U16's single-line vocabulary lives on in the tab dialog (C32
+        // moved pane renames into the combined editor, which has its own
+        // tests below). The dialog prefills the current tab name ("main");
+        // Ctrl+U from the end wipes it so each test operates on exactly
+        // the text it types.
+        app.apply(Action::RenameTab);
+        app.handle_mode_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
         for c in text.chars() {
             app.handle_mode_key(key(c));
         }
@@ -8775,7 +10384,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let (mut app, _) = mk_app(shell_ws());
         let id = app.focused;
-        app.apply(Action::RenamePane);
+        app.apply(Action::EditPane);
         app.handle_mode_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
         for c in ['k', 'x', 'd'] {
             app.handle_mode_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
@@ -9716,7 +11325,10 @@ mod tests {
     fn rename_sets_title() {
         use crossterm::event::{KeyCode, KeyEvent};
         let (mut app, store) = mk_app(shell_ws());
-        app.apply(Action::RenamePane);
+        // C32: Alt+r opens the combined editor with the point on the name
+        // row, so the old rename flow — chord, type, Enter — is unchanged
+        // keystroke for keystroke.
+        app.apply(Action::EditPane);
         for c in "build".chars() {
             app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
         }
@@ -9786,6 +11398,1219 @@ mod tests {
         }
     }
 
+    /// A pane promoted to an agent must not claim a session from *before*
+    /// it was a shell.
+    ///
+    /// The reported workflow: open a shell pane, type `pi`. That is the
+    /// **promotion** path, and it seeds detection with `SystemTime::
+    /// UNIX_EPOCH` — no lower bound at all — so the scan takes the newest
+    /// unclaimed file in that cwd whenever it was written. Agent CLIs write
+    /// their session file *after* starting, so if the 2s tick lands in that
+    /// gap the newest unclaimed file is a **previous conversation**, and
+    /// `set_session` commits it and drops the pane from `pending_detect` —
+    /// permanently. The next quit/relaunch then resumes last week's
+    /// session, which is what "it loads the wrong session" looks like.
+    ///
+    /// The taken-set does not save this: `claimed_sessions` only knows ids
+    /// stored on live panes, so any conversation from a closed pane or an
+    /// earlier run is eligible.
+    #[test]
+    fn a_promoted_pane_never_claims_a_session_older_than_its_shell() {
+        let dir = std::env::temp_dir().join(format!("roost-promote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Last week's conversation in this project, sitting in the session
+        // root — unclaimed, because the pane that made it is long gone.
+        let old = dir.join("old.jsonl");
+        std::fs::write(&old, "").unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
+        std::fs::File::open(&old).unwrap().set_modified(long_ago).unwrap();
+
+        let mut panes = HashMap::new();
+        // Starts as a *shell* — the reported workflow is opening a pane and
+        // typing `pi` into it, which is what makes this the promotion path.
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Drive the **real** promotion path rather than hand-seeding the
+        // window: the first draft did the latter, and reverting the fix
+        // then left it green — it proved the scan honours a bound, not that
+        // promotion supplies one. Tick once seeing a plain shell (which
+        // records `last_shell_seen`), then again seeing the agent.
+        app.pending_detect.clear();
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
+        // `tick` self-throttles on `last_detect`, which `App::new` set to
+        // now — without this the call returns instantly and the assertion
+        // below passes having exercised nothing. (It did, on the first
+        // draft of this test.)
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        assert_eq!(
+            app.find_spec(1).unwrap().session,
+            None,
+            "claimed a conversation that predates the shell this pane was",
+        );
+
+        // ...and once the agent *does* write its file, the same pane picks
+        // it up. A bound that excluded everything would pass the assertion
+        // above while breaking detection outright.
+        let fresh = dir.join("fresh.jsonl");
+        std::fs::write(&fresh, "").unwrap();
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(1).unwrap().session.as_deref(),
+            Some("fresh"),
+            "the session this pane actually started must still be found",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C22: the float lives outside every tab's layout tree — including
+    /// when its id comes from the same pool a parked tab's panes do.
+    ///
+    /// `alloc_pane_id` guards the float and the undo stack separately; this
+    /// is the crossing case. Close a tab (parking its ids), open the float,
+    /// then reopen the tab: if the float took an id the tab is about to
+    /// bring back, `is_float` becomes true for a real tiled pane and both
+    /// share one entry in `runtimes`.
+    #[test]
+    fn the_float_never_takes_an_id_a_parked_tab_will_bring_back() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let parked: Vec<PaneId> =
+            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        for id in &parked {
+            app.close_pane_id(*id);
+        }
+        app.apply(Action::ToggleFloat);
+        let float_id = app.float.as_ref().expect("the float is up").id;
+        assert!(
+            !parked.contains(&float_id),
+            "the float took id {float_id}, which the parked tab still owns",
+        );
+
+        app.apply(Action::Undo);
+        let tree: Vec<PaneId> =
+            app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+        assert!(
+            !tree.contains(&float_id),
+            "C22: the float's id {float_id} is now a tiled pane too — tree {tree:?}",
+        );
+    }
+
+    /// F3/C20: a closed pane must not bequeath its attention state to
+    /// whatever pane next takes its id.
+    ///
+    /// `last_status`, `needy_msgs` and `visited_waiting` were pruned only on
+    /// the tick, under a comment claiming "ids are never reused" — which the
+    /// close path itself contradicts a thousand lines away, where `raw`,
+    /// `dead`, `tab_focus` and the token table are all pruned *at close*
+    /// precisely because ids ARE recycled (`alloc_pane_id` is a max+1, and a
+    /// closed pane's id is not parked). Close the highest-id pane and open
+    /// one inside the 2s `DETECT_INTERVAL` and the newborn inherits all
+    /// three: it is silently absent from Alt+a's fallback though nobody ever
+    /// looked at it, its first status observation reads as a *transition*
+    /// and prints a feed line for a life it did not live, and the dead
+    /// pane's question gets attributed to it.
+    #[test]
+    fn a_closed_panes_attention_state_does_not_outlive_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.set_focus(1);
+        app.apply(Action::JumpAttention); // visits pane 2 — marks it seen
+        app.needy_msgs.insert(2, "pick a database".into());
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick(); // `last_status[2]` = Waiting
+        assert!(app.visited_waiting.contains(&2), "setup: pane 2 was visited");
+        assert!(app.last_status.contains_key(&2), "setup: pane 2 has a status");
+
+        app.close_pane_id(2);
+
+        assert!(
+            !app.visited_waiting.contains(&2),
+            "F3: pane 2's `already looked at this` mark outlived the pane",
+        );
+        assert!(
+            !app.last_status.contains_key(&2),
+            "C20: pane 2's last status outlived the pane — the next pane to \
+             take id 2 would have its birth read as a transition",
+        );
+        assert!(
+            !app.needy_msgs.contains_key(&2),
+            "pane 2's question outlived the pane",
+        );
+    }
+
+    /// C38: Alt+u must respect the same floor Alt+n does.
+    ///
+    /// `restore_pane` hand-rolled the aspect test and never checked
+    /// `MIN_SPLIT_COLS`/`MIN_SPLIT_ROWS`, so undo would split a pane that
+    /// `spawn_child` had just refused to split — landing the reopened pane
+    /// in a slot too small to render in, and driving the *other* half under
+    /// the floor too. Same rect, same keypress-level decision, opposite
+    /// answer.
+    #[test]
+    fn undo_refuses_the_split_alt_n_just_refused() {
+        let (mut app, _) = mk_app(shell_ws());
+        // Something on the undo stack to reopen, taken while there is room.
+        app.apply(Action::NewPane);
+        let victim = app.focused;
+        app.close_pane_id(victim);
+
+        // Undo splits `pane_order().first()`, so shrink *that* pane until
+        // it is under the floor — Alt+n itself refuses on it here.
+        for _ in 0..12 {
+            let first = app.pane_order()[0];
+            app.set_focus(first);
+            if app.spawn_child("shell", None, None).is_none() {
+                break;
+            }
+        }
+        let first = app.pane_order()[0];
+        app.set_focus(first);
+        assert!(
+            app.spawn_child("shell", None, None).is_none(),
+            "setup: the first pane should be too small to split",
+        );
+        let before: Vec<PaneId> = app.pane_order();
+
+        app.apply(Action::Undo);
+
+        assert_eq!(
+            app.pane_order(),
+            before,
+            "Alt+u split a pane Alt+n had just refused to split",
+        );
+        assert!(
+            app.flash().is_some_and(|f| f.contains("no room")),
+            "the refusal is spoken, not silent: {:?}",
+            app.flash(),
+        );
+    }
+
+    /// C21/C22: closing the pane that is actually zoomed must end the zoom,
+    /// even when the float is covering it.
+    ///
+    /// `close_pane_id` asked `id == self.focused`, but while the float is
+    /// shown focus belongs to the float — never to a tiled pane — so the
+    /// test could not fire. `display_rects` already knows the real target is
+    /// `float.prev_focus`; the close path did not, so it left `zoomed` set
+    /// pointing at a pane that no longer exists, and the renderer was handed
+    /// a rect for it.
+    #[test]
+    fn closing_the_zoomed_pane_under_the_float_ends_the_zoom() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed(), "setup: pane 2 is zoomed");
+        let zoomed = app.focused;
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        app.close_pane_id(zoomed);
+
+        let live: Vec<PaneId> = app.ws.active_tab().panes.keys().copied().collect();
+        for pr in app.display_rects() {
+            assert!(
+                app.is_float(pr.id) || live.contains(&pr.id),
+                "the renderer was handed pane {} — gone from the tab {live:?}",
+                pr.id,
+            );
+        }
+    }
+
+    /// C22 rule 1: a shown float IS the focused pane. Closing some other
+    /// pane must not quietly take that away.
+    ///
+    /// The close path's "keep focus inside the tab on screen" fallback asked
+    /// whether `self.focused` is in the active tab's map. The float lives
+    /// outside every tab's map by construction, so while it was up the
+    /// answer was always no and the fallback fired on every close, yanking
+    /// focus off the float onto a tiled pane while the float stayed on
+    /// screen — keystrokes going to a pane the user cannot see.
+    #[test]
+    fn closing_a_pane_does_not_steal_focus_from_a_shown_float() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes
+        let victim = app.focused;
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        app.close_pane_id(victim);
+
+        if app.float.as_ref().is_some_and(|f| f.shown) {
+            assert!(
+                app.float_focused(),
+                "C22: the float is on screen but focus is on {}",
+                app.focused,
+            );
+        }
+    }
+
+    /// C22 rule 1, at the one chokepoint: every focus move off the float
+    /// takes the float down with it.
+    ///
+    /// The rule was enforced per call site, so each new focus path had to
+    /// remember it — and C35's "go back" did not. The float stayed drawn
+    /// over the body while keystrokes went to a tiled pane underneath.
+    #[test]
+    fn every_focus_move_off_the_float_hides_it() {
+        for (name, action) in [
+            ("FocusAlternate", Action::FocusAlternate),
+            ("Focus(Left)", Action::Focus(layout::Dir::Left)),
+            ("NextTab", Action::NextTab),
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::NewPane);
+            app.apply(Action::NewTab);
+            app.go_to_tab(0);
+            app.apply(Action::Focus(layout::Dir::Right));
+            app.apply(Action::Focus(layout::Dir::Left)); // give C35 an alternate
+            app.apply(Action::ToggleFloat);
+            assert!(app.float_focused(), "{name}: setup — the float has focus");
+
+            app.apply(action);
+
+            if !app.float_focused() {
+                assert!(
+                    !app.float.as_ref().is_some_and(|f| f.shown),
+                    "{name}: the float is still drawn but focus is on {}",
+                    app.focused,
+                );
+            }
+        }
+    }
+
+    /// A control spawn borrows focus and gives it back. It must give back
+    /// the float's visibility with it, or the pair ends up in a state the
+    /// model does not have: hidden and focused at the same time.
+    ///
+    /// From there `cycle_layout` — which arranges `pane_order()` around
+    /// whatever is focused — planted the float's id into the tab's layout
+    /// tree as a pane with no spec.
+    #[test]
+    fn a_control_spawn_gives_back_the_float_it_borrowed_focus_from() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        let ct = app.control_token().to_string();
+        app.handle_control(crate::core::control::Request {
+            token: ct,
+            method: crate::core::control::Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+            },
+        });
+
+        assert_eq!(app.focused, float_id, "focus was borrowed, not taken");
+        assert!(
+            app.float.as_ref().is_some_and(|f| f.shown),
+            "the float is focused but no longer drawn",
+        );
+
+        // The state that used to leak: a hidden-but-focused float becomes a
+        // ghost pane in the tree the moment anything arranges by focus.
+        app.apply(Action::CycleLayout { forward: true });
+        let tree: Vec<PaneId> = {
+            let mut v = Vec::new();
+            layout::pane_order(&app.ws.active_tab().layout, &mut v);
+            v
+        };
+        for id in &tree {
+            assert!(
+                app.ws.active_tab().panes.contains_key(id),
+                "pane {id} is in the tree with no spec — tree {tree:?}",
+            );
+        }
+    }
+
+    // -- the layout invariant fuzzer -----------------------------------------
+    //
+    // roost's structural state is three things that must agree: each tab's
+    // layout tree, its `panes` map, and the workspace-wide `runtimes` map —
+    // with the float sitting deliberately outside all three. Nearly every
+    // action moves at least two of them, and the crossings (zoom under a
+    // float, a control-plane close of a pane in another tab, undo after a
+    // tab was removed) are where they drift apart. Each such drift is
+    // invisible until it isn't: a pane in the tree with no spec, a runtime
+    // nothing can reach, a rect handed to the renderer for a pane that is
+    // gone.
+    //
+    // Hand-written tests cover the crossings someone thought of. This walks
+    // long random sequences and re-checks every invariant after every single
+    // operation, so the failure arrives with the exact trail that produced
+    // it. It has earned its runtime: the one-member stack, both float
+    // close-path crossings, C35's go-back, and the control-spawn float
+    // restore were all found here, none of them by reading the code.
+
+    fn inv_tree_ids(node: &LayoutNode) -> Vec<PaneId> {
+        let mut v = Vec::new();
+        layout::pane_order(node, &mut v);
+        v
+    }
+
+    fn inv_check_node(node: &LayoutNode, ctx: &str, tab: usize) {
+        match node {
+            LayoutNode::Pane(_) => {}
+            LayoutNode::Stack { children, expanded } => {
+                // >= 2, not merely non-empty (C6, clarified 2026-08-20): a
+                // stack of one is a pane, and `layout.rs` normalizes it into
+                // one wherever it can arise. The weaker assertion let the
+                // one-member stack that `toggle_stack` turns into a
+                // single-child `Split` walk right past this checker — the
+                // design audit had to find it by reading. Nothing guards a
+                // future construction path unless this does.
+                assert!(
+                    children.len() >= 2,
+                    "{ctx}: tab {tab} has a Stack with {} member(s) — a stack of one is a pane",
+                    children.len()
+                );
+                assert!(
+                    *expanded < children.len(),
+                    "{ctx}: tab {tab} stack expanded={expanded} out of range ({} members)",
+                    children.len()
+                );
+            }
+            LayoutNode::Split { children, ratios, .. } => {
+                assert!(
+                    children.len() >= 2,
+                    "{ctx}: tab {tab} has a Split with {} child(ren) — layout.rs says it never builds one",
+                    children.len()
+                );
+                assert_eq!(
+                    ratios.len(),
+                    children.len(),
+                    "{ctx}: tab {tab} split ratios {ratios:?} vs {} children",
+                    children.len()
+                );
+                for c in children {
+                    inv_check_node(c, ctx, tab);
+                }
+            }
+        }
+    }
+
+    /// THE invariant: per tab, the set of PaneIds in `layout` == the keys of
+    /// `panes`; ids are unique within a tab AND across tabs; the float is in
+    /// no tree.
+    fn inv_check(app: &App<FakePane>, ctx: &str) {
+        use std::collections::HashSet;
+        let mut global: HashMap<PaneId, usize> = HashMap::new();
+        for (i, tab) in app.ws.tabs.iter().enumerate() {
+            let ids = inv_tree_ids(&tab.layout);
+            let set: HashSet<PaneId> = ids.iter().copied().collect();
+            assert_eq!(set.len(), ids.len(), "{ctx}: tab {i} tree lists a pane twice: {ids:?}");
+            let keys: HashSet<PaneId> = tab.panes.keys().copied().collect();
+            assert_eq!(set, keys, "{ctx}: tab {i} tree ids {set:?} != panes map keys {keys:?}");
+            if let Some(f) = &app.float {
+                assert!(!set.contains(&f.id), "{ctx}: tab {i} tree contains the float's id {}", f.id);
+            }
+            for id in ids {
+                if let Some(prev) = global.insert(id, i) {
+                    panic!("{ctx}: pane {id} is in tab {prev} AND tab {i}");
+                }
+            }
+            inv_check_node(&tab.layout, ctx, i);
+        }
+        if app.float.as_ref().is_some_and(|f| !f.shown && f.id == app.focused) {
+            panic!("{ctx}: the float is HIDDEN but still focused");
+        }
+        // C22 rule 1: a shown float is the focused pane.
+        if app.float.as_ref().is_some_and(|f| f.shown) {
+            assert!(app.float_focused(), "{ctx}: the float is shown but focus is on {}", app.focused);
+        }
+        // Focus is always a real pane: the float, or a pane in the tab on screen.
+        assert!(
+            app.is_float(app.focused) || app.ws.active_tab().panes.contains_key(&app.focused),
+            "{ctx}: focused pane {} is in neither the active tab nor the float",
+            app.focused
+        );
+        // Nothing is drawn that does not exist.
+        let live: HashSet<PaneId> = app.ws.active_tab().panes.keys().copied().collect();
+        for pr in app.display_rects() {
+            assert!(
+                app.is_float(pr.id) || live.contains(&pr.id),
+                "{ctx}: display_rects hands the renderer pane {} — not in the active tab {live:?}",
+                pr.id
+            );
+        }
+        // (A pane that exists but is allocated no area is a real hazard,
+        // but at these densities — 20 panes in 58 rows — it is honest
+        // overcrowding rather than a bug. The one case that ISN'T is
+        // covered by `a_split_never_allocates_its_last_child_nothing`.)
+        // No runtime outlives its pane: `runtimes` is keyed by PaneId
+        // workspace-wide, and a leftover entry is a live child process
+        // nothing can reach.
+        let all_panes: HashSet<PaneId> =
+            app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+        let orphan_runtimes: Vec<PaneId> = app
+            .runtimes
+            .keys()
+            .copied()
+            .filter(|id| !all_panes.contains(id) && !app.is_float(*id))
+            .collect();
+        assert!(
+            orphan_runtimes.is_empty(),
+            "{ctx}: runtimes {orphan_runtimes:?} belong to no pane and no float"
+        );
+        // Split ratios describe a whole: they are renormalised on removal
+        // and traded on resize, so they always sum to 1.
+        fn inv_ratio_sums(node: &LayoutNode, ctx: &str) {
+            if let LayoutNode::Split { children, ratios, .. } = node {
+                let sum: f32 = ratios.iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 0.01,
+                    "{ctx}: split ratios {ratios:?} sum to {sum}, not 1"
+                );
+                for c in children {
+                    inv_ratio_sums(c, ctx);
+                }
+            }
+        }
+        for tab in &app.ws.tabs {
+            inv_ratio_sums(&tab.layout, ctx);
+        }
+    }
+
+    fn inv_app(cols: u16, rows: u16) -> App<FakePane> {
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(4096);
+        App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(cols, rows),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap()
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn inv_has_stack(node: &LayoutNode) -> bool {
+        match node {
+            LayoutNode::Pane(_) => false,
+            LayoutNode::Stack { .. } => true,
+            LayoutNode::Split { children, .. } => children.iter().any(inv_has_stack),
+        }
+    }
+
+    /// Long random operation sequences must never break the tree↔map
+    /// invariant.
+    #[test]
+    fn layout_tree_and_panes_map_never_diverge_under_random_operations() {
+        use crate::core::layout::Dir;
+        let dirs = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+        let mut coverage: HashMap<&'static str, usize> = HashMap::new();
+        let mut stacks_seen = 0usize;
+        let mut zoom_seen = 0usize;
+        let mut float_seen = 0usize;
+        let mut float_and_zoom = 0usize;
+        let mut multi_tab = 0usize;
+        let mut ops_total = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(12345));
+            let mut app = inv_app(200, 60);
+            let mut trail: Vec<String> = Vec::new();
+            'step: for step in 0..400 {
+                let would_quit = app.ws.tabs.len() == 1 && app.ws.active_tab().panes.len() == 1;
+                let (name, action) = loop {
+                    let pick = rng.below(40);
+                    let d = dirs[rng.below(4) as usize];
+                    let a = match pick {
+                        0..=3 => ("NewPane", Action::NewPane),
+                        4 | 5 => {
+                            if would_quit {
+                                continue;
+                            }
+                            ("ClosePane", Action::ClosePane)
+                        }
+                        6..=8 => ("Focus", Action::Focus(d)),
+                        9..=11 => ("MovePane", Action::MovePane(d)),
+                        12 => ("NewTab", Action::NewTab),
+                        13 => ("MovePaneToTab+", Action::MovePaneToTab { forward: true }),
+                        14 => ("MovePaneToTab-", Action::MovePaneToTab { forward: false }),
+                        15 => ("NextTab", Action::NextTab),
+                        16 => ("PrevTab", Action::PrevTab),
+                        17 | 18 => ("ToggleStack", Action::ToggleStack),
+                        19 => ("FlipSplit", Action::FlipSplit),
+                        20 => (
+                            "Resize",
+                            Action::Resize { horizontal: rng.below(2) == 0, grow: rng.below(2) == 0 },
+                        ),
+                        21 => ("Undo", Action::Undo),
+                        22 => ("ToggleZoom", Action::ToggleZoom),
+                        23 => ("CycleLayout+", Action::CycleLayout { forward: true }),
+                        24 => ("CycleLayout-", Action::CycleLayout { forward: false }),
+                        25 => ("ToggleFloat", Action::ToggleFloat),
+                        26 => ("GoToTab", Action::GoToTab(rng.below(4) as usize)),
+                        27 => {
+                            // Control-plane close of an arbitrary live pane
+                            // (the other close_pane_id caller). Refuses the
+                            // last pane itself, so nothing to guard here.
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let victim = all[rng.below(all.len() as u64) as usize];
+                            let ct = app.control_token().to_string();
+                            app.handle_control(crate::core::control::Request {
+                                token: ct,
+                                method: crate::core::control::Method::Close {
+                                    pane: victim,
+                                    force: true,
+                                },
+                            });
+                            *coverage.entry("CtlClose").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:CtlClose({victim})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        28 => {
+                            let (w, h) = match rng.below(4) {
+                                0 => (200u16, 60u16),
+                                1 => (120, 40),
+                                2 => (80, 24),
+                                _ => (60, 18),
+                            };
+                            app.on_resize(Size::new(w, h), (0, 0));
+                            *coverage.entry("Resize(term)").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:Term({w}x{h})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        29 => ("LastTab", Action::LastTab),
+                        30 => ("JumpAttention", Action::JumpAttention),
+                        31 => {
+                            // C27: jump to an arbitrary pane through the
+                            // roster's own path (tab switch + stack expand).
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let dest = all[rng.below(all.len() as u64) as usize];
+                            app.apply(Action::ToggleRoster);
+                            app.roster_jump(dest);
+                            *coverage.entry("RosterJump").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:RosterJump({dest})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        32 => {
+                            // Control-plane spawn: the other pane-creating
+                            // path, which allocates its own id.
+                            let ct = app.control_token().to_string();
+                            app.handle_control(crate::core::control::Request {
+                                token: ct,
+                                method: crate::core::control::Method::Spawn {
+                                    adapter: "shell".into(),
+                                    cwd: None,
+                                    initial_input: None,
+                                },
+                            });
+                            *coverage.entry("CtlSpawn").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:CtlSpawn"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        33 => {
+                            // U25: jump out of the activity feed (the third
+                            // `focus_attention_target` caller).
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let dest = all[rng.below(all.len() as u64) as usize];
+                            app.push_feed("fuzz".into(), false, Some(dest));
+                            app.apply(Action::ToggleFeed);
+                            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                                crossterm::event::KeyCode::Enter,
+                            ));
+                            app.mode = Mode::Normal;
+                            *coverage.entry("FeedJump").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:FeedJump({dest})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        34 | 35 => ("ToggleFloat", Action::ToggleFloat),
+                        36 | 37 => ("ToggleZoom", Action::ToggleZoom),
+                        _ => ("FocusAlternate", Action::FocusAlternate),
+                    };
+                    break a;
+                };
+                trail.push(format!("{step}:{name}"));
+                *coverage.entry(name).or_default() += 1;
+                ops_total += 1;
+                app.apply(action);
+                if app.zoomed() {
+                    zoom_seen += 1;
+                }
+                if app.float.as_ref().is_some_and(|f| f.shown) {
+                    float_seen += 1;
+                    if app.zoomed() {
+                        float_and_zoom += 1;
+                    }
+                }
+                if app.ws.tabs.len() > 1 {
+                    multi_tab += 1;
+                }
+                if app.ws.tabs.iter().any(|t| inv_has_stack(&t.layout)) {
+                    stacks_seen += 1;
+                }
+                inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                assert!(!app.quit, "seed {seed}: quit unexpectedly at [{}]", trail.join(","));
+            }
+        }
+        let mut cov: Vec<_> = coverage.iter().collect();
+        cov.sort();
+        println!("ops={ops_total} coverage={cov:?}");
+        println!(
+            "states: stack-present={stacks_seen} zoomed={zoom_seen} float-shown={float_seen} float+zoom={float_and_zoom} multi-tab={multi_tab}"
+        );
+        assert!(stacks_seen > 1000, "generator never reached stacks");
+        assert!(zoom_seen > 1000, "generator never reached zoom");
+        assert!(float_seen > 1000, "generator never reached the float");
+        assert!(float_and_zoom > 100, "generator never crossed the float with zoom");
+        assert!(multi_tab > 1000, "generator never reached multiple tabs");
+    }
+
+
+    /// One principal must not be able to deny `wait` to the whole fleet.
+    ///
+    /// A parked waiter is freed only by firing or timing out — nothing
+    /// notices the client hung up — so 16 fire-and-forget waits held every
+    /// global slot for up to 24 hours while holding no connection and no
+    /// process. A pane can send them with its own `$ROOST_TOKEN`, which is
+    /// squarely outside its authority.
+    #[test]
+    fn one_principal_cannot_park_every_wait_slot() {
+        let (mut app, _) = mk_app(shell_ws());
+        let pane = app.focused;
+        let mut keep = Vec::new();
+
+        // One pane spams waits with its own token's authority.
+        let mut parked = 0;
+        for _ in 0..MAX_WAITS * 2 {
+            let (tx, rx) = mpsc::channel();
+            if app
+                .register_waiter(Actor::Pane(pane), vec![pane], "exited", Some(60_000), tx)
+                .is_ok_and(|why| why == "parked")
+            {
+                parked += 1;
+            }
+            keep.push(rx);
+        }
+        assert!(
+            parked <= MAX_WAITS_PER_ACTOR,
+            "one principal parked {parked} waits — it can hold every global slot",
+        );
+
+        // ...and the fleet can still use the verb.
+        let (tx, _rx) = mpsc::channel();
+        let got = app.register_waiter(
+            Actor::Fleet,
+            vec![pane],
+            "exited",
+            Some(60_000),
+            tx,
+        );
+        assert_eq!(got.as_deref(), Ok("parked"), "the verb is denied to everyone else");
+    }
+
+    /// A `wait` naming more panes than any fleet has is a load generator:
+    /// `poll_waiters` walks every id of every waiter on the **UI thread**,
+    /// every event-loop iteration, for the wait's whole timeout.
+    #[test]
+    fn a_wait_cannot_name_an_unbounded_pane_list() {
+        let (mut app, _) = mk_app(shell_ws());
+        let pane = app.focused;
+        let (tx, _rx) = mpsc::channel();
+        let huge: Vec<PaneId> = vec![pane; 20_000];
+        assert!(
+            app.register_waiter(Actor::Fleet, huge, "exited", Some(60_000), tx)
+                .is_err(),
+            "a 20,000-id wait was accepted; it is re-walked on the UI thread every frame",
+        );
+    }
+
+    /// Detection must give up eventually.
+    ///
+    /// `pending_detect` is only ever removed from on success
+    /// (`set_session`) or when the pane disappears. A pane whose agent
+    /// never writes a session file roost can attribute — it exited early,
+    /// it is an adapter with no session root reachable, or the scan keeps
+    /// declining as ambiguous — stays pending **forever**, and every 2s
+    /// tick runs `session_files_since` over the whole session root for it.
+    ///
+    /// No adapter overrides `detect_session`, so that is a full recursive
+    /// walk stat-ing every file under e.g. `~/.pi/agent/sessions` — every
+    /// project, all history — twice a minute, for the life of the process.
+    #[test]
+    fn detection_stops_retrying_a_pane_that_will_never_resolve() {
+        let dir = std::env::temp_dir().join(format!("roost-giveup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "detect".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Pending since well past any plausible agent startup, and the
+        // session root is empty, so no scan will ever succeed.
+        app.pending_detect.clear();
+        app.pending_detect.insert(1, SystemTime::now() - Duration::from_secs(3600));
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        assert!(
+            !app.pending_detect.contains_key(&1),
+            "still pending an hour on — roost will rescan the whole session root \
+             every 2 seconds for the rest of the process's life",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pane id parked on the undo stack must not be handed out again.
+    ///
+    /// `Workspace::next_pane_id` takes the max over **live tabs only**, and
+    /// `alloc_pane_id` additionally guards the float — but a tab sitting on
+    /// the undo stack still owns its pane ids, and nothing accounts for
+    /// them. Close a tab, open enough panes to reach its ids, then `Alt+u`:
+    /// the restored tab's panes collide with live ones.
+    ///
+    /// That is not cosmetic. `App::runtimes` is keyed by `PaneId` **across
+    /// all tabs**, as are `tokens`, `dead`, `pending_input` and `raw` — so
+    /// two panes sharing an id share one PTY, one auth token and one
+    /// status. Keystrokes meant for one reach the other.
+    #[test]
+    fn a_pane_id_parked_on_the_undo_stack_is_never_reused() {
+        let (mut app, _) = mk_app(shell_ws());
+        // A second tab, so closing it parks a whole Tab on the undo stack.
+        app.apply(Action::NewTab);
+        let parked: Vec<PaneId> =
+            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        assert!(!parked.is_empty(), "the new tab has a pane");
+
+        // Close it: its last pane going means the tab is parked whole.
+        for id in &parked {
+            app.close_pane_id(*id);
+        }
+        assert_eq!(app.ws.tabs.len(), 1, "the tab is gone");
+
+        // Now open panes until we would reach the parked ids.
+        for _ in 0..parked.len() + 2 {
+            app.apply(Action::NewPane);
+        }
+        let live: Vec<PaneId> = app
+            .ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.keys().copied())
+            .collect();
+        for id in &parked {
+            assert!(
+                !live.contains(id),
+                "pane id {id} is parked on the undo stack and was handed out again — \
+                 restoring that tab would put two panes on one runtime. live={live:?}",
+            );
+        }
+
+        // And the consequence, so the claim above is demonstrated rather
+        // than asserted: reopening puts the tab back with its original ids.
+        app.apply(Action::Undo);
+        let mut seen: HashMap<PaneId, usize> = HashMap::new();
+        for t in &app.ws.tabs {
+            for id in t.panes.keys() {
+                *seen.entry(*id).or_insert(0) += 1;
+            }
+        }
+        let dupes: Vec<PaneId> =
+            seen.iter().filter(|(_, n)| **n > 1).map(|(id, _)| *id).collect();
+        assert!(
+            dupes.is_empty(),
+            "after reopening, pane id(s) {dupes:?} exist in two tabs at once — \
+             `runtimes`, `tokens` and `dead` are all keyed by PaneId across tabs, \
+             so those panes share one PTY and one auth token",
+        );
+    }
+
+    /// The promotion floor must never be *loosened* by a later promotion.
+    ///
+    /// `pending_detect.entry(id).or_insert(floor)` keeps whatever bound is
+    /// already there. A pane that promotes, fails to find a file (so stays
+    /// pending), demotes when the agent exits, and promotes again hours
+    /// later would keep the **first** floor — by then old enough to reach
+    /// conversations from earlier in the session. The window must only ever
+    /// tighten.
+    #[test]
+    fn a_second_promotion_tightens_the_detection_floor_it_never_loosens() {
+        let dir = std::env::temp_dir().join(format!("roost-refloor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        let tick = |app: &mut App<FakePane>, agent: Option<&str>| {
+            app.runtimes.get_mut(&1).unwrap().observation = Some(crate::ports::Observation {
+                cwd: None,
+                agent: agent.map(String::from),
+            });
+            app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+            app.tick();
+        };
+
+        // Shell → agent: promoted, nothing on disk, so it stays pending.
+        tick(&mut app, None);
+        tick(&mut app, Some("detect"));
+        let first_floor = *app.pending_detect.get(&1).expect("pending after promotion");
+
+        // The agent exits (demote), the pane sits as a shell, then the user
+        // launches it again much later.
+        tick(&mut app, None);
+        app.last_shell_seen.insert(1, SystemTime::now() + Duration::from_secs(3600));
+        tick(&mut app, Some("detect"));
+
+        let second_floor = *app.pending_detect.get(&1).expect("pending after re-promotion");
+        assert!(
+            second_floor > first_floor,
+            "the second promotion kept the first floor ({first_floor:?}), so its window \
+             still reaches back to conversations from before the agent was relaunched",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same guarantee when the pane **changes directory first** — open
+    /// a pane, `cd` into a project, then launch the agent.
+    ///
+    /// This is the sharper version of the reported workflow: the directory
+    /// you move into is one you have worked in before, so its session root
+    /// is full of previous conversations. `observe_panes` follows the live
+    /// cwd, so the scan is correctly scoped to the *new* project — which is
+    /// exactly why an unbounded window would hand the pane that project's
+    /// most recent old conversation.
+    #[test]
+    fn a_pane_that_cds_before_launching_still_gets_its_own_session() {
+        let old_dir = std::env::temp_dir().join(format!("roost-cd-a-{}", std::process::id()));
+        let new_dir = std::env::temp_dir().join(format!("roost-cd-b-{}", std::process::id()));
+        for d in [&old_dir, &new_dir] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // A conversation from last week in the project we are about to
+        // `cd` into.
+        let stale = new_dir.join("lastweek.jsonl");
+        std::fs::write(&stale, "").unwrap();
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
+            .unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: old_dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Tick 1: still a shell, but now in the new directory.
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: Some(new_dir.clone()), agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.find_spec(1).unwrap().cwd, new_dir, "the pane followed the cd");
+
+        // Tick 2: the agent is up, its session file not yet written.
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: Some(new_dir.clone()), agent: Some("detect".into()) });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(1).unwrap().session,
+            None,
+            "claimed last week's conversation from the directory it cd'd into",
+        );
+
+        // Tick 3: the agent writes its file, and the pane claims that.
+        std::fs::write(new_dir.join("mine.jsonl"), "").unwrap();
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("mine"));
+
+        for d in [&old_dir, &new_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Adapter with a **global** session root that claims every file for
+    /// every cwd — codex's shape (`~/.codex/sessions`, bucketed by date,
+    /// `owns_session_file` true by design because the path carries no cwd
+    /// signal at all).
+    struct UnscopedAdapter(PathBuf);
+    impl crate::agents::AgentAdapter for UnscopedAdapter {
+        fn id(&self) -> &'static str {
+            "unscoped"
+        }
+        fn launch(&self, cwd: &std::path::Path) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd)
+        }
+        fn resume(&self, cwd: &std::path::Path, session: &str) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd).arg(session)
+        }
+        fn resume_flag(&self) -> &'static str {
+            "--resume"
+        }
+        fn session_root(&self, _cwd: &std::path::Path) -> Option<PathBuf> {
+            Some(self.0.clone()) // global: the same root for every project
+        }
+    }
+
+    /// Two panes in **different projects** must never be handed each
+    /// other's conversation.
+    ///
+    /// An adapter whose session root is global (codex) gives the scan no
+    /// cwd signal, so when two panes are mid-detection at once the only
+    /// thing separating them is arrival order — and a session file's mtime
+    /// says nothing about which project it belongs to. The taken-set stops
+    /// one id reaching two panes; it does nothing about the *wrong* id
+    /// reaching a pane.
+    ///
+    /// Guiding principle for this tool: **a wrong session is far worse than
+    /// no session.** Losing a resume pointer costs the user `--continue`;
+    /// attaching a pane to another project's conversation corrupts work.
+    #[test]
+    fn an_unscoped_adapter_never_hands_a_pane_another_projects_session() {
+        let root = std::env::temp_dir().join(format!("roost-unscoped-{}", std::process::id()));
+        let a_dir = root.join("proj-a");
+        let b_dir = root.join("proj-b");
+        let _ = std::fs::remove_dir_all(&root);
+        for d in [&root, &a_dir, &b_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Two sessions land in the one global root, moments apart. Nothing
+        // in either path says which project it came from.
+        let base = SystemTime::now();
+        for (name, offset) in [("first", 10u64), ("second", 20)] {
+            let f = root.join(format!("{name}.jsonl"));
+            std::fs::write(&f, "").unwrap();
+            std::fs::File::open(&f)
+                .unwrap()
+                .set_modified(base + Duration::from_millis(offset))
+                .unwrap();
+        }
+
+        let mut panes = HashMap::new();
+        for (id, dir) in [(1 as PaneId, &a_dir), (2 as PaneId, &b_dir)] {
+            panes.insert(
+                id,
+                PaneSpec {
+                    adapter: "unscoped".into(),
+                    cwd: dir.clone(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
+            );
+        }
+        let layout = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("unscoped", Box::new(UnscopedAdapter(root.clone())));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        app.pending_detect.clear();
+        app.pending_detect.insert(1, base);
+        app.pending_detect.insert(2, base);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let a = app.find_spec(1).unwrap().session.clone();
+        let b = app.find_spec(2).unwrap().session.clone();
+        assert!(
+            a.is_none() && b.is_none(),
+            "two panes in different projects were each handed a session from a \
+             global root that cannot say which project it belongs to: \
+             pane1(proj-a)={a:?} pane2(proj-b)={b:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn tick_lets_each_concurrently_launched_pane_claim_its_own_session_file() {
         // Two panes launched into the same cwd around the same time share
@@ -9807,8 +12632,8 @@ mod tests {
         std::fs::File::open(&file_b).unwrap().set_modified(base + Duration::from_millis(20)).unwrap();
 
         let mut panes = HashMap::new();
-        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
-        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
+        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
+        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
         let layout = LayoutNode::Split {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],
@@ -9876,9 +12701,11 @@ mod tests {
                 session: Some("b".into()), // already claimed before this tick
                 title: None,
                 spawned_by: None,
+                note: None,
+                noted_at: None,
             },
         );
-        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None });
+        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
         let layout = LayoutNode::Split {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],
@@ -11050,7 +13877,14 @@ mod tests {
                 .position(|r| matches!(r, RosterRow::Pane { id } if *id == roster_cursor(app)))
                 .expect("the cursor is on a row");
             assert!(at >= top && at < top + height, "the cursor is inside the window");
-            assert!(top + height <= rows.len(), "and the window never runs past the end");
+            // "the window never runs past the end" used to be asserted
+            // here as `top + height <= rows.len()` — which is
+            // `roster_top_clamped`'s own postcondition (`top.min(len -
+            // height)`), applied unconditionally by `roster_view` on the
+            // line above. It could not fail. The property is real, so it
+            // moved to `roster_top_clamped`'s own test, where the clamp is
+            // the thing under test rather than the thing supplying the
+            // answer. Sixth instance of the shape; see DESIGN-ui.md §7.
             top
         };
         let (rows, _) = app.roster_view();
@@ -11093,6 +13927,962 @@ mod tests {
         assert_eq!(app.display_rects().len(), app.rects().len());
     }
 
+    /// C34: the confirm flashes name the chord you are being told to press
+    /// again, and before C34 they spelled it as a literal — so under a
+    /// remap the guard instructed a key that does nothing. That is U1's
+    /// hazard wearing a helpful face: a confirmation that cannot be
+    /// satisfied by the key it names.
+    #[test]
+    fn the_close_confirm_names_the_live_chord() {
+        use crate::ui::input::Keymap;
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+v": "close_pane"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let (mut app, _) = mk_app(shell_ws());
+        app.set_keymap(keymap);
+        app.apply(Action::ClosePane); // last pane ⇒ arms the quit confirm
+        let flash = app.flash().unwrap_or_default().to_string();
+        assert!(flash.contains("Alt+v again"), "names the live chord: {flash}");
+        assert!(!flash.contains("Alt+w"), "and not the default: {flash}");
+    }
+
+    /// And with the chord disabled entirely the sentence stays true rather
+    /// than naming nothing: the confirm is armed on the *action*, so a
+    /// repeat by any route satisfies it.
+    #[test]
+    fn the_close_confirm_drops_the_chord_when_it_is_unbound() {
+        use crate::ui::input::Keymap;
+        let (keymap, _) = Keymap::parse(r#"{"keys": {"alt+w": "disable"}}"#, "config.json");
+        let (mut app, _) = mk_app(shell_ws());
+        app.set_keymap(keymap);
+        app.apply(Action::ClosePane);
+        let flash = app.flash().unwrap_or_default().to_string();
+        assert!(flash.contains("again to quit roost"), "still instructive: {flash}");
+        assert!(!flash.contains("Alt+"), "but names no dead key: {flash}");
+    }
+
+    // ---- C37: reverse the layout cycle (Alt+Shift+g) ---------------------
+
+    /// Which of C25's three arrangements a tab is showing.
+    ///
+    /// The cycle compares by *shape*, not by tree: `arrangement_for`
+    /// re-derives from the live `pane_order`, which a previous step can
+    /// have reordered, so two visits to "grid" are the same arrangement
+    /// with the panes in different slots. That is pre-existing C25
+    /// behaviour — the forward-only tests already assert shapes rather than
+    /// trees — and C37 inherits it rather than introducing it.
+    fn arrangement_kind(layout: &LayoutNode) -> &'static str {
+        match layout {
+            LayoutNode::Stack { .. } => "all-stack",
+            LayoutNode::Split { ratios, .. } if ratios == &vec![0.6, 0.4] => "main+stack",
+            LayoutNode::Split { .. } => "grid",
+            LayoutNode::Pane(_) => "single",
+        }
+    }
+
+    /// The property that makes a reverse cycle worth a chord at all: from
+    /// inside the ring it is the *inverse*. Forward then back lands on the
+    /// arrangement you started from, at every point — otherwise it is just
+    /// a second way to go forward, and with three arrangements that buys
+    /// nothing.
+    ///
+    /// "From inside the ring" is the contract, not a test convenience: a
+    /// tab's layout before the first `Alt+g` is whatever splitting left it,
+    /// which is **not** one of the three canned arrangements.
+    /// `layout_cycle` is a position in a three-item ring, not an undo
+    /// stack, so stepping back from the first wraps to the last rather than
+    /// restoring a pre-cycle custom layout. Anything else would need the
+    /// cycle to remember arbitrary layouts, which is what `Alt+u` and the
+    /// split chords are for.
+    #[test]
+    fn reversing_the_layout_cycle_undoes_a_forward_step() {
+        let (mut app, _) = mk_app(shell_ws()); // 100x30 fits all three shapes
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout { forward: true }); // enter the ring
+
+        for _ in 0..3 {
+            let before = arrangement_kind(&app.ws.tabs[0].layout);
+            app.apply(Action::CycleLayout { forward: true });
+            assert_ne!(arrangement_kind(&app.ws.tabs[0].layout), before, "forward moved");
+            app.apply(Action::CycleLayout { forward: false });
+            assert_eq!(
+                arrangement_kind(&app.ws.tabs[0].layout),
+                before,
+                "back returns to the arrangement forward left",
+            );
+        }
+    }
+
+    /// Walking backwards reaches all three arrangements and closes the
+    /// ring, so the reverse direction is a full traversal rather than a
+    /// one-step nudge that then sticks.
+    #[test]
+    fn the_reverse_cycle_visits_every_arrangement() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout { forward: true }); // enter the ring
+
+        let start = arrangement_kind(&app.ws.tabs[0].layout);
+        let mut seen = vec![start];
+        for _ in 0..2 {
+            app.apply(Action::CycleLayout { forward: false });
+            seen.push(arrangement_kind(&app.ws.tabs[0].layout));
+        }
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "three distinct arrangements going back: {seen:?}");
+
+        app.apply(Action::CycleLayout { forward: false });
+        assert_eq!(arrangement_kind(&app.ws.tabs[0].layout), start, "and the ring closes");
+    }
+
+    /// The skip-what-doesn't-fit rule (C25) applies in reverse too: a shape
+    /// the terminal is too small for is passed over going back exactly as
+    /// it is going forward, so the two directions can't disagree about
+    /// which arrangements exist.
+    #[test]
+    fn the_reverse_cycle_skips_shapes_that_do_not_fit() {
+        // Narrow enough that main+stack cannot fit, as the forward-only
+        // sibling test already establishes for this geometry.
+        let (mut app, _) = mk_app(shell_ws());
+        // The same geometry the forward-only sibling test uses: body ~80x20,
+        // where main+stack's 0.4 column falls under the split floor.
+        app.on_resize(Size::new(80, 22), (0, 0));
+        app.apply(Action::NewPane);
+        app.apply(Action::CycleLayout { forward: false });
+        // Whatever it landed on must be a shape that actually fits — the
+        // reverse walk never installs an arrangement forward would refuse.
+        assert!(
+            layout::arrangement_fits(&app.ws.tabs[0].layout, app.body_area()),
+            "the reverse walk only installs shapes that fit",
+        );
+    }
+
+    // ---- C36: broadcast composer (Alt+') --------------------------------
+
+    /// The verb roost was uniquely positioned for and you had to leave roost
+    /// to use: one message, every reachable pane, submitted.
+    #[test]
+    fn broadcast_sends_the_composed_message_to_every_reachable_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes
+
+        app.apply(Action::ToggleBroadcast);
+        for c in "ship it".chars() {
+            app.handle_mode_key(key(c));
+        }
+        press(&mut app, crossterm::event::KeyCode::Enter);
+
+        assert!(matches!(app.mode, Mode::Normal), "sending closes the composer");
+        for id in app.pane_order() {
+            assert!(
+                app.runtimes.get(&id).unwrap().input.ends_with(b"ship it\r"),
+                "pane {id} got the message, submitted",
+            );
+        }
+        assert!(app.flash().unwrap_or_default().contains("broadcast to 3 panes"), "{:?}", app.flash());
+    }
+
+    /// C36's safety affordance is the *visible target count*, so the count
+    /// the title shows and the set the send writes to must be the same
+    /// predicate — a guard that lies is worse than no guard. Both go
+    /// through `broadcast_targets`; this pins that they agree, including
+    /// under a status filter.
+    #[test]
+    fn the_target_count_is_the_set_that_actually_receives() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        let order = app.pane_order();
+        // Put exactly one pane in NeedsInput.
+        let marked = order[1];
+        app.runtimes.get_mut(&marked).unwrap().set_extension_status(AgentStatus::NeedsInput);
+
+        let filtered = app.broadcast_targets(Actor::Local, Some(AgentStatus::NeedsInput));
+        assert_eq!(filtered, vec![marked], "the filter selects exactly the ◆ pane");
+
+        app.apply(Action::ToggleBroadcast);
+        if let Mode::Broadcast { status_filter, .. } = &mut app.mode {
+            *status_filter = Some(AgentStatus::NeedsInput);
+        }
+        for c in "only you".chars() {
+            app.handle_mode_key(key(c));
+        }
+        press(&mut app, crossterm::event::KeyCode::Enter);
+
+        assert!(app.flash().unwrap_or_default().contains("broadcast to 1 pane"), "{:?}", app.flash());
+        for id in order {
+            let got = app.runtimes.get(&id).unwrap().input.ends_with(b"only you\r");
+            assert_eq!(got, id == marked, "pane {id} received iff it was targeted");
+        }
+    }
+
+    /// Esc is a real abort: nothing is written. The composer exists so that
+    /// a fleet-wide send is always a deliberate act.
+    #[test]
+    fn escaping_the_composer_sends_nothing() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleBroadcast);
+        for c in "never".chars() {
+            app.handle_mode_key(key(c));
+        }
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        for id in app.pane_order() {
+            let got = String::from_utf8_lossy(&app.runtimes.get(&id).unwrap().input).into_owned();
+            assert!(!got.contains("never"), "pane {id} got nothing");
+        }
+    }
+
+    /// Shift+Enter breaks a line rather than sending — C32's convention,
+    /// and the reason the composer can carry a multi-line agent prompt at
+    /// all. Plain Enter after it still sends the whole thing.
+    #[test]
+    fn shift_enter_breaks_a_line_instead_of_sending() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleBroadcast);
+        app.handle_mode_key(key('a'));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_mode_key(key('b'));
+        match &app.mode {
+            Mode::Broadcast { lines, row, .. } => {
+                assert_eq!(lines, &vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(*row, 1);
+            }
+            _ => panic!("still composing, not sent"),
+        }
+    }
+
+    /// C36 audits as `Actor::Local`, not `Fleet`: attribution is the audit
+    /// log's whole value, and a keyboard broadcast logged as a token
+    /// holder's would be indistinguishable from one. The C20 feed comes
+    /// along for free because it renders the same ctl lines.
+    #[test]
+    fn a_keyboard_broadcast_is_audited_as_local_and_reaches_the_feed() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleBroadcast);
+        app.handle_mode_key(key('x'));
+        press(&mut app, crossterm::event::KeyCode::Enter);
+
+        let ctl: Vec<&FeedEntry> =
+            app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        assert_eq!(ctl.len(), 1, "exactly one ctl line, as the control path also guarantees");
+        assert!(ctl[0].text.contains("local"), "attributed to the human, not the fleet: {:?}", ctl[0].text);
+    }
+
+    /// C12/U8, and the highest-severity thing the C36 audit found: the
+    /// composer was not a modal to the mouse or to paste. `modal_active`
+    /// omitted it, so a click moved focus under the open dialog and — the
+    /// dangerous half — a paste landed in the **pane behind it**. Someone
+    /// composing a fleet-wide message and pasting a snippet would have
+    /// silently typed it into whichever agent happened to be focused.
+    #[test]
+    fn the_composer_is_a_modal_to_the_mouse_and_to_paste() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let focused = app.focused;
+        app.apply(Action::ToggleBroadcast);
+        assert!(app.modal_active(), "the composer takes the mouse/paste path");
+
+        app.handle_paste("pasted");
+        for id in app.pane_order() {
+            let got = String::from_utf8_lossy(&app.runtimes.get(&id).unwrap().input).into_owned();
+            assert!(!got.contains("pasted"), "pane {id} must not receive a paste meant for the dialog");
+        }
+        assert_eq!(app.focused, focused, "and focus did not move beneath it");
+    }
+
+    /// C36/D2: on Terminal.app, Shift+Enter arrives as Alt+Enter, so
+    /// without the same carve-out C32 has, the one chord that should break
+    /// a line instead opened the quick-launch picker and discarded the
+    /// composed message. "Keys are C32's, exactly" was an overclaim until
+    /// this passed.
+    #[test]
+    fn alt_enter_breaks_a_composer_line_rather_than_opening_the_picker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleBroadcast);
+        app.handle_mode_key(key('a'));
+        app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        app.handle_mode_key(key('b'));
+        match &app.mode {
+            Mode::Broadcast { lines, .. } => {
+                assert_eq!(lines, &vec!["a".to_string(), "b".to_string()]);
+            }
+            _ => panic!("Alt+Enter left the composer — it opened the picker and ate the message"),
+        }
+    }
+
+    /// C36: the dialog grows a row per break and never scrolls, so an
+    /// uncapped message pushes its own rows and the caret off the body with
+    /// no way back. The break is refused at the cap rather than partly
+    /// applied — losing the split is recoverable, losing the text is not.
+    #[test]
+    fn the_composer_stops_growing_at_its_line_cap() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleBroadcast);
+        for _ in 0..(BROADCAST_MAX_LINES + 5) {
+            app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        }
+        match &app.mode {
+            Mode::Broadcast { lines, .. } => assert_eq!(lines.len(), BROADCAST_MAX_LINES),
+            _ => panic!("still composing"),
+        }
+    }
+
+    // ---- C35: go back (Alt+;) -------------------------------------------
+
+    /// The motion the fleet actually makes: check on B, come back to A. And
+    /// it must *ping-pong* — pressing it twice returns you where you
+    /// started — which falls out of recording the trail on every real focus
+    /// transition rather than only on the toggle.
+    #[test]
+    fn back_returns_to_the_previous_pane_and_toggles() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus 2
+        app.apply(Action::Focus(Dir::Left));
+        assert_eq!(app.focused, 1);
+
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, 2, "back goes to where focus came from");
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, 1, "and again returns — it is a toggle, not a stack");
+    }
+
+    /// The case that motivates the chord over `Alt+a`: the pane you were on
+    /// is in another tab. Reusing `focus_attention_target` means the tab
+    /// switch comes for free and behaves exactly like the jump's.
+    #[test]
+    fn back_returns_across_a_tab_switch() {
+        let (mut app, _) = mk_app(shell_ws());
+        let first = app.focused;
+        app.apply(Action::NewTab);
+        let second_tab = app.ws.active_tab;
+        assert_ne!(second_tab, 0, "the fixture really switched tabs");
+
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, first, "focus is back on the original pane");
+        assert_eq!(app.ws.active_tab, 0, "and the tab came with it");
+    }
+
+    /// Before focus has ever moved there is nothing to go back to, and the
+    /// chord says so rather than doing nothing — a navigation key that
+    /// silently no-ops reads as broken.
+    #[test]
+    fn back_with_nowhere_to_go_flashes() {
+        let (mut app, _) = mk_app(shell_ws());
+        let focused = app.focused;
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, focused);
+        assert!(
+            app.flash().unwrap_or_default().contains("no pane to go back to"),
+            "{:?}",
+            app.flash()
+        );
+    }
+
+    /// The alternate can die while you are away. Landing focus on a closed
+    /// pane id would be a real bug, so the pointer is validated on use and
+    /// cleared — the whole value of this chord is confidence about where it
+    /// puts you.
+    #[test]
+    fn back_to_a_closed_pane_flashes_instead_of_landing_on_a_dead_id() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // 1|2, focus 2
+        app.apply(Action::Focus(Dir::Left)); // focus 1, alternate 2
+        let doomed = 2;
+        app.close_pane_id(doomed);
+
+        app.apply(Action::FocusAlternate);
+        assert_eq!(app.focused, 1, "focus did not move to the closed pane");
+        assert!(
+            app.flash().unwrap_or_default().contains("has closed"),
+            "{:?}",
+            app.flash()
+        );
+    }
+
+    // ---- C33: move a pane within its tab (Alt+Shift+hjkl) ---------------
+
+    /// The core gesture: the focused pane trades places with its spatial
+    /// neighbour, and focus follows it — for free, because the tree swaps
+    /// two ids and the focused id never changes.
+    #[test]
+    fn moving_a_pane_swaps_it_with_its_neighbour_and_focus_follows() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2 side by side, focus = 2 (right)
+
+        let left_before = app.rects().iter().min_by_key(|p| p.rect.x).unwrap().id;
+        assert_eq!(left_before, 1);
+
+        app.apply(Action::MovePane(Dir::Left));
+
+        let left_after = app.rects().iter().min_by_key(|p| p.rect.x).unwrap().id;
+        assert_eq!(left_after, 2, "pane 2 took the left slot");
+        assert_eq!(app.focused, 2, "focus rode along with the pane it moved");
+    }
+
+    /// C33's stated edge rule, and the one deliberate divergence from
+    /// `focus_dir`: `Alt+←/→` continues into the next tab at an edge (C31),
+    /// but moving a pane there does **not** — `Alt+Shift+i`/`Alt+Shift+m`
+    /// (C28) are the chords that take a pane out of its tab, and they say
+    /// so. A no-op is the recoverable failure.
+    #[test]
+    fn moving_a_pane_off_the_tabs_edge_is_a_no_op_not_a_cross_tab_move() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // tab 2
+        app.apply(Action::NewPane); // tab 2 holds panes 2|3, focus = 3 (right)
+        let tab_before = app.ws.active_tab;
+        let panes_before = app.ws.active_tab().panes.len();
+
+        app.apply(Action::MovePane(Dir::Right)); // already at the right edge
+
+        assert_eq!(app.ws.active_tab, tab_before, "the tab did not change");
+        assert_eq!(
+            app.ws.active_tab().panes.len(),
+            panes_before,
+            "and the pane did not leave the tab",
+        );
+        assert_eq!(app.focused, 3);
+    }
+
+    /// C38: `Alt+Shift+hjkl` on the float refuses and says why — and it can
+    /// actually reach that refusal.
+    ///
+    /// It could not when C38 shipped: `apply`'s structural guard hid the
+    /// float for `MovePane` *before* `move_pane_dir` ran, so
+    /// `float_focused()` was always false and the contract's third row was
+    /// dead code. What happened instead was worse than the silence C38 set
+    /// out to fix — the float vanished and the swap landed on whichever
+    /// pane it had been covering, so the gesture moved a pane the user was
+    /// not looking at. Found by the C38 design audit, which probed the row
+    /// rather than reading it.
+    #[test]
+    fn moving_the_float_refuses_instead_of_hiding_it_and_moving_something_else() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2 in the tab
+        let before = format!("{:?}", app.ws.active_tab().layout);
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "the float is up and focused");
+
+        app.apply(Action::MovePane(Dir::Left));
+
+        assert!(app.float_focused(), "the float is still up — the chord refused it");
+        assert_eq!(
+            format!("{:?}", app.ws.active_tab().layout),
+            before,
+            "and nothing behind it moved",
+        );
+        assert_eq!(
+            app.flash(),
+            Some("the scratch pane sits outside the layout"),
+        );
+    }
+
+    /// C38: the edge no-op **says so**, and horizontally it names the chord
+    /// that does cross tabs — the dead end teaches the way out.
+    ///
+    /// C33 defended the no-op ("the recoverable failure is doing nothing"),
+    /// which is an argument about the *swap*, not about the silence. C35
+    /// had already written the opposite rule for the sibling gesture: "a
+    /// navigation key that silently does nothing reads as broken." Two
+    /// contracts that shipped the same week disagreed, and a user pressing
+    /// `Alt+Shift+h` at an edge could not tell "bound but nowhere to go"
+    /// from "not bound".
+    #[test]
+    fn moving_a_pane_off_the_edge_names_the_chord_that_would_work() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // a second tab, so the carry chord is usable
+        app.apply(Action::NewPane); // panes 2|3 here, focus 3 (right)
+
+        app.apply(Action::MovePane(Dir::Right)); // at the right edge
+        let right = app.flash().expect("the edge speaks").to_string();
+        assert!(right.contains("edge"), "{right}");
+        let carry = app
+            .chord_label(Action::MovePaneToTab { forward: true })
+            .expect("the cross-tab chord is bound by default");
+        assert!(right.contains(&carry), "the flash names {carry}: {right}");
+        assert!(right.contains("next tab"), "and which way it goes: {right}");
+
+        // Vertically there is no cross-tab chord to name (C31: tabs are the
+        // horizontal axis), so the flash reports and offers nothing.
+        app.apply(Action::MovePane(Dir::Up));
+        let up = app.flash().expect("the edge speaks").to_string();
+        assert_eq!(up, "nothing above to swap with");
+    }
+
+    /// C38: with nowhere to carry the pane *to*, the flash offers nothing.
+    ///
+    /// The clause was guarded on whether the chord was **bound**, not on
+    /// whether it would work — so on the default single-tab workspace the
+    /// edge flash named `Alt+Shift+i`, which then refuses with "only one
+    /// tab": a dead end handing you a second dead end. Found by the C38
+    /// design audit.
+    #[test]
+    fn the_edge_flash_offers_nothing_when_there_is_no_other_tab() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // one tab, panes 1|2, focus 2
+
+        app.apply(Action::MovePane(Dir::Right));
+        assert_eq!(app.flash(), Some("at the tab's edge"));
+    }
+
+    /// C38: `Alt+5` on a two-tab workspace says so, and says what the range
+    /// is. The digit keys are the most guessed-at chords roost has, and
+    /// this is C35's own case verbatim.
+    #[test]
+    fn a_tab_digit_past_the_end_says_how_many_tabs_there_are() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // two tabs now
+
+        app.apply(Action::GoToTab(4)); // "Alt+5"
+        assert_eq!(app.flash(), Some("no tab 5: this workspace has 2 tabs"));
+        assert_eq!(app.ws.active_tab, 1, "and it did not move");
+
+        // Singular reads correctly too — the common case is one tab.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::GoToTab(2));
+        assert_eq!(app.flash(), Some("no tab 3: this workspace has 1 tab"));
+    }
+
+    /// C38: the three structural chords say so when the tab's shape has
+    /// nothing for them, rather than looking unbound. Detected by comparing
+    /// the tree — `resize_pane` returns `true` at the ratio clamp ("handled,
+    /// no change"), so the mutator's bool is not the question.
+    #[test]
+    fn the_structural_chords_say_when_a_tab_has_nothing_for_them() {
+        let (mut app, _) = mk_app(shell_ws()); // one pane
+
+        for (action, verb) in [
+            (Action::ToggleStack, "stack"),
+            (Action::FlipSplit, "flip"),
+            (Action::Resize { horizontal: true, grow: true }, "resize"),
+        ] {
+            app.set_flash("stale");
+            app.apply(action);
+            let flash = app.flash().expect("{verb} speaks").to_string();
+            assert!(flash.starts_with(&format!("nothing to {verb}")), "{flash}");
+            assert!(flash.contains("one pane"), "it says why: {flash}");
+            let split = app.chord_label(Action::NewPane).expect("Alt+n is bound");
+            assert!(flash.contains(&split), "and what to press: {flash}");
+        }
+    }
+
+    /// ...and once the tab has a shape they apply to, they stay quiet.
+    #[test]
+    fn the_structural_chords_stay_quiet_when_they_do_something() {
+        // A fresh tab per verb: run in sequence they interfere honestly —
+        // `Alt+s` turns the split into a stack, and `Alt+o` then has
+        // nothing to flip and correctly says so. That is the code being
+        // right, so each verb gets the shape it applies to.
+        for action in [
+            Action::ToggleStack,
+            Action::FlipSplit,
+            Action::Resize { horizontal: true, grow: true },
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::NewPane); // a real split to work on
+            app.flash = None;
+            app.apply(action);
+            assert!(app.flash().is_none(), "{:?}: {:?}", action, app.flash());
+        }
+    }
+
+    /// The composer's `Tab` must never stop on a tier it cannot deliver to.
+    ///
+    /// `broadcast_targets` filters `Exited` unconditionally — a pane that is
+    /// gone cannot receive anything — so the shared cycle's last stop was
+    /// structurally inert on that surface: `Tab` landed on "exited", the
+    /// title's live count read 0, and Enter sent nothing. Recorded from the
+    /// C36 design audit; this is the check that it was real.
+    #[test]
+    fn the_composer_never_stops_on_a_tier_it_cannot_send_to() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleBroadcast);
+
+        // A full lap of Tab, from every starting point.
+        let mut seen = Vec::new();
+        for _ in 0..ROSTER_STATUS_CYCLE.len() + 2 {
+            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                crossterm::event::KeyCode::Tab,
+            ));
+            let Mode::Broadcast { status_filter, .. } = app.mode else {
+                panic!("still composing")
+            };
+            seen.push(status_filter);
+        }
+        assert!(
+            !seen.contains(&Some(AgentStatus::Exited)),
+            "Tab stopped on a tier with nothing to send to: {seen:?}",
+        );
+        // And it still reaches every tier it *can* send to, in both
+        // directions — skipping a stop must not shorten the lap.
+        for want in [None, Some(AgentStatus::NeedsInput), Some(AgentStatus::Idle)] {
+            assert!(seen.contains(&want), "{want:?} is unreachable now: {seen:?}");
+        }
+    }
+
+    /// `Tab` and `Shift+Tab` stay exact inverses **across the skipped
+    /// tier**, which is the part a skip is most likely to break: a naive
+    /// "if you land on Exited, go to None" would make the two directions
+    /// agree at one point in the lap and diverge for the rest of it.
+    #[test]
+    fn the_composer_cycle_is_reversible_across_the_gap() {
+        for &start in &ROSTER_STATUS_CYCLE {
+            if start == Some(AgentStatus::Exited) {
+                continue; // not a state the composer can be in
+            }
+            let fwd = step_status_filter(start, false, true);
+            assert_eq!(
+                step_status_filter(fwd, true, true),
+                start,
+                "forward then back from {start:?} landed on {:?}",
+                step_status_filter(fwd, true, true),
+            );
+            let back = step_status_filter(start, true, true);
+            assert_eq!(
+                step_status_filter(back, false, true),
+                start,
+                "back then forward from {start:?} landed on {:?}",
+                step_status_filter(back, false, true),
+            );
+        }
+    }
+
+    /// ...while the roster keeps it, because the roster is a monitoring
+    /// surface: "which of my panes died" is exactly what it is for. The two
+    /// cycles share one definition and differ by one documented omission.
+    #[test]
+    fn the_roster_still_filters_to_exited_panes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleRoster);
+        let mut seen = Vec::new();
+        for _ in 0..ROSTER_STATUS_CYCLE.len() {
+            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                crossterm::event::KeyCode::Tab,
+            ));
+            let Mode::Roster { status_filter, .. } = app.mode else { panic!("still rostering") };
+            seen.push(status_filter);
+        }
+        assert!(seen.contains(&Some(AgentStatus::Exited)), "{seen:?}");
+    }
+
+    // -- F9: the help overlay's type-ahead filter ---------------------------
+
+    fn help_key(app: &mut App<FakePane>, code: crossterm::event::KeyCode) {
+        app.handle_mode_key(crossterm::event::KeyEvent::from(code));
+    }
+
+    fn help_type(app: &mut App<FakePane>, s: &str) {
+        for c in s.chars() {
+            help_key(app, crossterm::event::KeyCode::Char(c));
+        }
+    }
+
+    fn open_help(app: &mut App<FakePane>) {
+        app.apply(Action::Help);
+        assert!(matches!(app.mode, Mode::Help { filter: None, .. }), "opens unfiltered");
+    }
+
+    /// [F9] The whole point of `Option<String>` rather than a bare `String`:
+    /// until `/` is pressed the overlay behaves exactly as it did before the
+    /// amendment, so every key still closes it — `/`'s neighbours included.
+    #[test]
+    fn the_help_overlay_is_unchanged_until_slash_opens_the_filter() {
+        use crossterm::event::KeyCode;
+        for code in [KeyCode::Char('a'), KeyCode::Char('q'), KeyCode::Char('?'), KeyCode::Enter] {
+            let (mut app, _) = mk_app(shell_ws());
+            open_help(&mut app);
+            help_key(&mut app, code);
+            assert!(
+                matches!(app.mode, Mode::Normal),
+                "{code:?} must still close an unfiltered overlay",
+            );
+        }
+    }
+
+    /// `/` opens the filter and typing narrows it; `q` types rather than
+    /// closing, which is the trade C27's roster already makes.
+    #[test]
+    fn slash_opens_the_filter_and_letters_type_into_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_key(&mut app, crossterm::event::KeyCode::Char('/'));
+        assert_eq!(app.help_filter(), Some(""), "`/` opens an empty query, not a closed one");
+
+        help_type(&mut app, "quit");
+        assert_eq!(app.help_filter(), Some("quit"), "`q` typed instead of closing");
+        assert!(matches!(app.mode, Mode::Help { .. }), "still open");
+
+        help_key(&mut app, crossterm::event::KeyCode::Backspace);
+        assert_eq!(app.help_filter(), Some("qui"));
+    }
+
+    /// A second `/` is *text*, not a second open. A key that means "open"
+    /// in one state and "type" in another is the ambiguity U20 already
+    /// resolved for the picker.
+    #[test]
+    fn a_slash_inside_the_query_is_a_character() {
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "//");
+        assert_eq!(app.help_filter(), Some("/"), "the first opened, the second typed");
+    }
+
+    /// Esc clears a query, then closes — two presses. Clearing first means
+    /// a typo costs one key rather than the overlay and the place you had
+    /// scrolled to.
+    #[test]
+    fn esc_clears_the_query_before_it_closes_the_overlay() {
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/layout");
+        assert_eq!(app.help_filter(), Some("layout"));
+
+        help_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert_eq!(app.help_filter(), Some(""), "the first Esc clears");
+        assert!(matches!(app.mode, Mode::Help { .. }), "and does not close");
+
+        help_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal), "the second closes");
+    }
+
+    /// Editing the query resets the scroll. A filtered list is a *new* list,
+    /// and a `top` from the old one can point past the new one's end — C14
+    /// and C27 both put the cursor at the start for the same reason.
+    #[test]
+    fn editing_the_query_returns_to_the_top_of_the_new_list() {
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        app.mode = Mode::Help { top: 4, filter: Some(String::new()) };
+        help_type(&mut app, "t");
+        assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "typing went back to the top");
+
+        app.mode = Mode::Help { top: 4, filter: Some("tab".into()) };
+        help_key(&mut app, crossterm::event::KeyCode::Backspace);
+        assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "so did backspacing");
+    }
+
+    /// A scroll key that hits the end must **not** close while filtering.
+    /// Un-filtered it does — that is C15's conditional carve-out and it is
+    /// unchanged — but losing a live query to an over-pressed ↓ is exactly
+    /// the "the modal you open when you are lost is the one with a
+    /// surprising way out" failure C15 rejected scrolling over.
+    #[test]
+    fn a_dead_end_scroll_key_closes_an_unfiltered_overlay_but_not_a_filtered_one() {
+        // `End` first: at 100×30 the keymap *does* scroll, so a bare ↓
+        // moves and proves nothing. The dead end is the bottom of the list,
+        // where the next ↓ has nowhere to go — which is the case C15's
+        // conditional carve-out is actually about.
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_key(&mut app, crossterm::event::KeyCode::End);
+        assert!(matches!(app.mode, Mode::Help { .. }), "End scrolled rather than closing");
+        help_key(&mut app, crossterm::event::KeyCode::Down);
+        assert!(matches!(app.mode, Mode::Normal), "unfiltered: ↓ that moved nothing closes");
+
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/tab");
+        help_key(&mut app, crossterm::event::KeyCode::End);
+        help_key(&mut app, crossterm::event::KeyCode::Down);
+        assert!(
+            matches!(app.mode, Mode::Help { filter: Some(_), .. }),
+            "filtering: ↓ that moved nothing must keep the query",
+        );
+    }
+
+    /// [C39] Delete must not close a live query — a reader reaching for it
+    /// is erasing a typo, and losing the overlay is the sharpest possible
+    /// answer. Enter and Tab *do* close, deliberately: neither has a
+    /// meaning here (the filtered list has no cursor to act on), so they
+    /// read as "done", and the alternative is a key that silently does
+    /// nothing on a surface whose whole point is answering questions.
+    #[test]
+    fn delete_edits_the_query_while_enter_and_tab_deliberately_close() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/tab");
+        help_key(&mut app, KeyCode::Delete);
+        assert_eq!(app.help_filter(), Some("tab"), "Delete left the query alone…");
+        assert!(matches!(app.mode, Mode::Help { .. }), "…and did not close the overlay");
+
+        for code in [KeyCode::Enter, KeyCode::Tab] {
+            let (mut app, _) = mk_app(shell_ws());
+            open_help(&mut app);
+            help_type(&mut app, "/tab");
+            help_key(&mut app, code);
+            assert!(matches!(app.mode, Mode::Normal), "{code:?} closes, by contract");
+        }
+    }
+
+    /// `j`/`k` scroll while the filter is closed and type while it is open.
+    /// The same trade C27's roster makes for every letter.
+    #[test]
+    fn j_and_k_become_query_text_once_the_filter_is_open() {
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/jk");
+        assert_eq!(app.help_filter(), Some("jk"));
+    }
+
+    /// C27: the roster's scroll clamp, tested directly rather than through
+    /// a caller that applies it and then asserts its postcondition.
+    ///
+    /// `roster_window_follows_the_cursor_and_clamps` used to carry
+    /// `top + height <= rows.len()` after calling `roster_view`, which
+    /// clamps — so the assertion restated the clamp it had just run. That
+    /// left the clamp itself, including its `saturating_sub` edge, with no
+    /// test at all: the tautology had been standing in for one.
+    #[test]
+    fn the_roster_scroll_clamp_keeps_the_window_inside_the_list() {
+        // The ordinary case: a window smaller than the list.
+        assert_eq!(roster_top_clamped(0, 20, 5), 0, "the top of a long list stays put");
+        assert_eq!(roster_top_clamped(15, 20, 5), 15, "the last legal top is reachable");
+        assert_eq!(roster_top_clamped(99, 20, 5), 15, "past the end clamps to it");
+        for top in 0..30 {
+            let t = roster_top_clamped(top, 20, 5);
+            assert!(t + 5 <= 20, "top {top} clamped to {t}, which runs past the end");
+        }
+
+        // The edge the `saturating_sub` exists for: a window taller than
+        // the list. There is nothing to scroll, so the only legal top is 0
+        // — an underflow here would wrap to usize::MAX and scroll a short
+        // roster off its own bottom.
+        assert_eq!(roster_top_clamped(0, 3, 10), 0);
+        assert_eq!(roster_top_clamped(7, 3, 10), 0, "a taller window pins the top at 0");
+        assert_eq!(roster_top_clamped(1, 0, 10), 0, "and an empty list has nowhere to go");
+    }
+
+    /// The flash resolves its chord through the live keymap. A literal
+    /// would survive a remap and teach a key that no longer exists — the
+    /// drift C34 was built to end, and the reason `flash_move_edge` goes
+    /// through `chord_clause`.
+    #[test]
+    fn the_edge_flash_follows_a_remapped_cross_tab_chord() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        let (keymap, diags) =
+            Keymap::parse(r#"{"keys": {"alt+shift+m": "disable"}}"#, "config.json");
+        assert!(diags.is_empty(), "{diags:?}");
+        app.set_keymap(keymap);
+        app.apply(Action::NewPane);
+
+        app.apply(Action::MovePane(Dir::Right));
+        let flash = app.flash().expect("the edge still speaks").to_string();
+        assert_eq!(
+            flash, "at the tab's edge",
+            "with the chord unbound the clause collapses rather than naming a dead key",
+        );
+    }
+
+    /// C38: a refused split says why, and names the threshold — the one
+    /// fact that makes the next attempt succeed. `spawn_child` has always
+    /// refused a split that would produce unusable panes (it is also the
+    /// vt100 underflow trigger); until now the sixth `Alt+n` on a small
+    /// terminal simply did nothing.
+    #[test]
+    fn a_refused_split_says_why_and_names_the_threshold() {
+        let (mut app, _) = mk_app(shell_ws());
+        // Split until the layout refuses, exactly as a user leaning on
+        // Alt+n would.
+        while app.spawn_child("shell", None, None).is_some() {}
+        app.set_flash("stale");
+
+        app.apply(Action::NewPane);
+        let flash = app.flash().expect("the refusal speaks").to_string();
+        assert!(flash.contains("no room"), "{flash}");
+        // The axis `split_fit` actually tested, with the number it missed by
+        // — not both dimensions, which is a rule the guard does not have (a
+        // 30×30 pane splits fine into two 30-wide halves).
+        let vertical = flash.contains("columns");
+        let want = if vertical { layout::MIN_SPLIT_COLS } else { layout::MIN_SPLIT_ROWS };
+        assert!(flash.contains(&want.to_string()), "the threshold is actionable: {flash}");
+        assert!(
+            flash.contains("columns") != flash.contains("rows"),
+            "exactly one axis is named — the one that failed: {flash}",
+        );
+    }
+
+    /// ...and a split that *works* says nothing. A flash on every Alt+n
+    /// would be noise, and the pane appearing is its own feedback.
+    #[test]
+    fn a_split_that_succeeds_stays_quiet() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        assert!(app.flash().is_none(), "{:?}", app.flash());
+    }
+
+    /// Inside a stack the gesture reorders — no special case in the app, it
+    /// falls out of every stack member owning its own `PaneRect`. The moved
+    /// pane must still be the expanded one afterwards (layout's
+    /// `expanded`-follows-the-swap rule), or "move down" would collapse the
+    /// pane you are reading.
+    #[test]
+    fn moving_a_pane_inside_a_stack_reorders_it_and_keeps_it_expanded() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes
+        app.apply(Action::ToggleStack); // ... collapsed into one stack
+        let moved = app.focused;
+
+        let order_before: Vec<_> = app.rects().iter().map(|p| p.id).collect();
+        let i_before = order_before.iter().position(|&id| id == moved).unwrap();
+        assert!(i_before > 0, "this fixture needs a member above the focused one");
+
+        app.apply(Action::MovePane(Dir::Up));
+
+        let order_after: Vec<_> = app.rects().iter().map(|p| p.id).collect();
+        let i_after = order_after.iter().position(|&id| id == moved).unwrap();
+        assert_eq!(i_after, i_before - 1, "the pane moved one slot up the stack");
+        assert_eq!(app.focused, moved, "focus stayed on it");
+        // It is also still the *expanded* member, so "move up" never
+        // collapses the pane you are reading. Note this assertion cannot
+        // fail on its own: `move_pane_dir`'s `expand_in_stacks` call would
+        // re-expand the focused pane even if `swap_panes` had left the
+        // index behind (verified by mutation — this test stays green with
+        // layout's rule removed). The rule itself is pinned where it lives,
+        // by `layout::tests::swapping_inside_one_stack_carries_the_expanded_
+        // slot_with_the_pane`; this line pins the *user-visible* outcome
+        // through whichever of the two produces it.
+        assert!(
+            !app.rects().iter().find(|p| p.id == moved).unwrap().collapsed,
+            "the moved pane is the expanded member",
+        );
+    }
+
+    /// C21/C22: a swap is a structural layout edit, so it leaves zoom the
+    /// way `FlipSplit`/`Resize`/`CycleLayout` do — the tab must never change
+    /// invisibly behind a full-screen pane.
+    #[test]
+    fn moving_a_pane_leaves_zoom_first() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        app.apply(Action::MovePane(Dir::Left));
+        assert!(!app.zoomed(), "a structural edit exits zoom");
+    }
+
     #[test]
     fn zoom_follows_focus_when_focus_moves_within_the_tab() {
         let (mut app, _) = mk_app(shell_ws());
@@ -11111,7 +14901,7 @@ mod tests {
         for id in [1u64, 2, 3] {
             panes.insert(
                 id,
-                PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+                PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
             );
         }
         let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
@@ -11136,7 +14926,7 @@ mod tests {
             Action::ToggleStack,
             Action::FlipSplit,
             Action::Resize { horizontal: true, grow: true },
-            Action::CycleLayout,
+            Action::CycleLayout { forward: true },
             Action::NewTab,
         ];
         for action in triggers {
@@ -11193,7 +14983,7 @@ mod tests {
             for &id in ids {
                 panes.insert(
                     id,
-                    PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+                    PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
                 );
             }
             let children = ids.iter().map(|&id| LayoutNode::Pane(id)).collect::<Vec<_>>();
@@ -11345,7 +15135,7 @@ mod tests {
     #[test]
     fn cross_tab_focus_lands_on_the_already_expanded_stack_member_at_the_destination() {
         fn spec() -> PaneSpec {
-            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None }
+            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None }
         }
         let mut panes0 = HashMap::new();
         panes0.insert(1, spec());
@@ -11788,19 +15578,19 @@ mod tests {
         app.apply(Action::NewPane);
         app.apply(Action::NewPane); // 3 panes total
 
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
 
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         match &app.ws.tabs[0].layout {
             LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.6, 0.4]),
             other => panic!("expected a main+stack split, got {other:?}"),
         }
 
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
 
-        app.apply(Action::CycleLayout); // wraps back to grid
+        app.apply(Action::CycleLayout { forward: true }); // wraps back to grid
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
     }
 
@@ -11810,20 +15600,20 @@ mod tests {
         app.on_resize(Size::new(80, 22), (0, 0)); // body ~80x20: main+stack's 0.4 column (32) < the 36 floor
         app.apply(Action::NewPane); // 2 panes
 
-        app.apply(Action::CycleLayout); // 1st: grid (0.5/0.5) fits
+        app.apply(Action::CycleLayout { forward: true }); // 1st: grid (0.5/0.5) fits
         match &app.ws.tabs[0].layout {
             LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]),
             other => panic!("expected grid (0.5/0.5 split), got {other:?}"),
         }
 
-        app.apply(Action::CycleLayout); // 2nd: main+stack unfit here → skipped → all-stack applied
+        app.apply(Action::CycleLayout { forward: true }); // 2nd: main+stack unfit here → skipped → all-stack applied
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
     }
 
     #[test]
     fn cycle_layout_noop_when_fewer_than_two_panes() {
         let (mut app, _) = mk_app(shell_ws()); // 1 pane
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Pane(_)));
         assert_eq!(app.flash(), Some("one pane — nothing to arrange"));
     }
@@ -11835,7 +15625,7 @@ mod tests {
         app.apply(Action::NewPane); // 3 panes, organically nested splits
         app.on_resize(Size::new(30, 10), (0, 0)); // body far below the 36x10 floor for any arrangement
         let before = format!("{:?}", app.ws.tabs[0].layout);
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
         assert_eq!(app.flash(), Some("no room to rearrange; stack a pane with Alt+s first"));
     }
@@ -11847,7 +15637,7 @@ mod tests {
         app.apply(Action::NewPane);
         let focused = app.focused;
         for _ in 0..3 {
-            app.apply(Action::CycleLayout);
+            app.apply(Action::CycleLayout { forward: true });
             assert_eq!(app.focused, focused);
         }
     }
@@ -11856,7 +15646,7 @@ mod tests {
     fn cycle_layout_persists_like_any_layout_edit() {
         let (mut app, store) = mk_app(shell_ws());
         app.apply(Action::NewPane);
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         let saved = store.0.lock().unwrap().clone().unwrap();
         match &saved.tabs[0].layout {
             LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]), // grid, n=2
@@ -12002,6 +15792,8 @@ mod tests {
             session: None,
             title: None,
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         assert_eq!(display_name_live(&spec, None), "pi · rqa-work");
         spec.title = Some("worker1".into());
@@ -12025,6 +15817,8 @@ mod tests {
             session: None,
             title: None,
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         // No title anywhere: the adapter/cwd fallback, unchanged.
         assert_eq!(display_name_live(&spec, None), "claude · rqa-work");
@@ -12051,6 +15845,8 @@ mod tests {
             session: None,
             title: None,
             spawned_by: None,
+            note: None,
+            noted_at: None,
         };
         let ps1 = Some("user@host: ~/rqa-work");
         assert_eq!(display_name_live(&spec, ps1), "shell · rqa-work");
@@ -12544,6 +16340,36 @@ mod tests {
         assert_eq!(feed_overlay_size(Rect::new(0, 1, 20, 6)), (16, 2));
     }
 
+    /// C12/C27: the feed and roster never resolve to a **zero-sized** rect.
+    /// `saturating_sub(4)` reached 0 at a body four rows tall — a terminal
+    /// six rows tall, since the tab bar and hint bar take two — and a
+    /// zero-height dialog draws nothing at all. The chord still flipped the
+    /// mode word to `FEED`/`ROSTER` and the hint bar still offered
+    /// `↑↓ select`, so pressing Alt+e or Alt+Shift+a at a small terminal
+    /// changed one word on screen and nothing else: indistinguishable from
+    /// a broken binding. The picker had the answer already ("an empty
+    /// result still needs a frame to say so", `dialog_rect`); these two
+    /// were the surfaces that never adopted it. Found by a simulation agent
+    /// sweeping terminal sizes, which pinned the cutoff at height 6.
+    #[test]
+    fn the_fleet_overlays_always_have_a_frame_to_say_so_with() {
+        // A body with no cells is C30's territory (`draw_too_small`
+        // pre-empts the whole chrome below two rows), and nothing can be
+        // drawn there by anyone — so the invariant starts at one cell.
+        for h in 1..12u16 {
+            for w in 1..12u16 {
+                let (ow, oh) = feed_overlay_size(Rect::new(0, 0, w, h));
+                assert!(
+                    ow >= 1 && oh >= 1,
+                    "a {w}x{h} body gives a {ow}x{oh} overlay — it would draw nothing",
+                );
+                // And it never asks for more than the body can hold, which
+                // is what kept `centered_near`'s clamp arithmetic safe.
+                assert!(ow <= w && oh <= h, "{w}x{h} → {ow}x{oh} overflows the body");
+            }
+        }
+    }
+
     // -- C22 floating scratch pane --------------------------------------------
 
     #[test]
@@ -12626,9 +16452,9 @@ mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
-        app.apply(Action::RenamePane);
-        assert!(matches!(app.mode, Mode::Rename { target: RenameTarget::Pane, .. }));
-        // The buffer starts prefilled with the current title ("scratch",
+        app.apply(Action::EditPane);
+        assert!(matches!(app.mode, Mode::PaneEdit { .. }));
+        // The name row starts prefilled with the current title ("scratch",
         // like any titled pane) — clear it before typing the replacement.
         for _ in 0.."scratch".len() {
             app.handle_mode_key(KeyEvent::from(KeyCode::Backspace));
@@ -12722,7 +16548,7 @@ mod tests {
         app.apply(Action::NewPane);
         app.apply(Action::ToggleFloat);
         assert!(app.float.as_ref().unwrap().shown);
-        app.apply(Action::CycleLayout);
+        app.apply(Action::CycleLayout { forward: true });
         assert!(!app.float.as_ref().unwrap().shown);
         assert_eq!(app.pane_order().len(), 2, "the real 2-pane tab is untouched");
     }
@@ -13119,7 +16945,7 @@ mod tests {
         app.apply(Action::ToggleRaw);
         assert!(app.raw_routing_active());
 
-        app.mode = Mode::Help { top: 0 };
+        app.mode = Mode::Help { top: 0, filter: None };
         assert!(!app.raw_routing_active(), "only applies in Normal mode");
         app.mode = Mode::Normal;
         assert!(app.raw_routing_active());
@@ -13305,5 +17131,255 @@ mod tests {
         assert_eq!(sel.anchor, (3, 4));
         assert_eq!(sel.cursor, (5, 6));
         assert_eq!(copy_cursor(&app), (5, 6));
+    }
+
+    // -- U1/C12: the mode escape hatch --------------------------------------
+
+    /// Every `Mode` this test must cover, one of each variant.
+    ///
+    /// The `match` below is the point, and its limit is worth stating
+    /// exactly: it is exhaustive over `Mode`, so adding a variant fails to
+    /// compile *here* — which lands the author in this function, holding
+    /// the list they need to extend. It cannot force them to extend it.
+    /// That is still the strongest guarantee available (Rust exposes no
+    /// variant count to assert against), and it matters more than usual
+    /// because the rule this feeds is a **negative** one — "no mode may
+    /// swallow an Alt chord" — so a mode that skipped the list would break
+    /// it in silence, the shape the C36 audit already caught once with
+    /// `Alt+Enter`. The duplicate check below is the other half: a list
+    /// that gained an entry by copy-paste covers one fewer variant than
+    /// its length suggests.
+    fn every_mode() -> Vec<(&'static str, Mode)> {
+        let modes = vec![
+            ("Normal", Mode::Normal),
+            ("Rename", Mode::Rename { buffer: "x".into(), cursor: 1, target: RenameTarget::Tab }),
+            (
+                "PaneEdit",
+                Mode::PaneEdit {
+                    name: "x".into(),
+                    lines: vec![String::new()],
+                    row: 0,
+                    col: 0,
+                    pane: 1,
+                },
+            ),
+            (
+                "Broadcast",
+                Mode::Broadcast {
+                    lines: vec![String::new()],
+                    row: 0,
+                    col: 0,
+                    status_filter: None,
+                },
+            ),
+            (
+                "Picker",
+                Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
+            ),
+            ("Scroll", Mode::Scroll),
+            ("Copy", Mode::Copy { cursor: (0, 0) }),
+            ("Help", Mode::Help { top: 0, filter: None }),
+            ("Feed", Mode::Feed { offset: 0 }),
+            (
+                "Roster",
+                Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None },
+            ),
+            ("Search", Mode::Search { copy_cursor: None }),
+        ];
+        for (_, m) in &modes {
+            // Exhaustiveness guard — add the new variant to the list above.
+            match m {
+                Mode::Normal
+                | Mode::Rename { .. }
+                | Mode::PaneEdit { .. }
+                | Mode::Broadcast { .. }
+                | Mode::Picker { .. }
+                | Mode::Scroll
+                | Mode::Copy { .. }
+                | Mode::Help { .. }
+                | Mode::Feed { .. }
+                | Mode::Roster { .. }
+                | Mode::Search { .. } => {}
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (label, m) in &modes {
+            assert!(
+                seen.insert(std::mem::discriminant(m)),
+                "{label}: listed twice — the list covers fewer variants than it looks",
+            );
+        }
+        modes
+    }
+
+    /// States that are a **second key surface inside one variant**, and so
+    /// have to be swept even though `every_mode()` already lists the
+    /// variant once.
+    ///
+    /// Kept separate rather than added to `every_mode()`, whose duplicate
+    /// check is the mechanism that makes its exhaustive `match` mean
+    /// something — a second `Mode::Help` there fails that check, correctly.
+    /// One list answers "is every variant covered", this one answers "is
+    /// every distinct key surface covered", and they are different
+    /// questions.
+    ///
+    /// C39's filtering overlay is the first entry and the reason this
+    /// exists: it holds every printable key, so it is precisely where
+    /// C24b's rule is under real pressure, and the sweeps were proving
+    /// nothing about it. Named by the C39 design audit.
+    fn extra_mode_states() -> Vec<(&'static str, Mode)> {
+        vec![("Help (filtering)", Mode::Help { top: 0, filter: Some("pane".into()) })]
+    }
+
+    /// Every mode surface the C24b sweeps must cover: one of each variant,
+    /// plus the second surfaces above.
+    fn every_key_surface() -> Vec<(&'static str, Mode)> {
+        let mut all = every_mode();
+        all.extend(extra_mode_states());
+        all
+    }
+
+    /// `handle_mode_key`'s central promise: an Alt chord is never consumed
+    /// by a mode, it drops the mode and yields to the global bindings —
+    /// "Alt+q must quit from anywhere". Enforced by a single `if` at the
+    /// top of that function, and until now asserted nowhere.
+    ///
+    /// C24b's "nothing else changes" bullet, at the one instance that
+    /// matters most. Written after a simulation agent reported Alt+q
+    /// hanging inside every modal. It does not — its harness pressed the
+    /// chord 100 ms after spawn, before roost had drawn anything, so no
+    /// modal was ever open, and the 1 s deadline was under the real quit
+    /// time. The report was wrong; that the rule had no test was not.
+    #[test]
+    fn no_mode_swallows_an_alt_chord() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (label, m) in every_key_surface() {
+            let (mut app, _) = mk_app(shell_ws());
+            app.mode = m;
+            let consumed =
+                app.handle_mode_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
+            assert!(
+                !consumed,
+                "{label}: swallowed Alt+q instead of yielding to the global bindings",
+            );
+            assert!(
+                matches!(app.mode, Mode::Normal),
+                "{label}: yielded the chord but stayed in the mode",
+            );
+        }
+    }
+
+    /// The contract in full, not just its most important instance: **every**
+    /// Alt chord leaves every mode. C24b names the complete list of chords
+    /// a mode may consume, and it is two — the mode's own entry chord
+    /// (which also *exits*) and `Alt+Enter` in the two multi-line editors
+    /// (which does **not**: it breaks a line and the dialog stays open, the
+    /// tree's one retained Alt chord, because Terminal.app spells
+    /// Shift+Enter that way). Anything else a mode holds on to fails here.
+    ///
+    /// Sweeping the whole chord space rather than listing chords is what
+    /// makes this a gate: a mode that claims some future `Alt+x` is caught
+    /// without anyone remembering to test `Alt+x`.
+    #[test]
+    fn the_only_alt_chords_a_mode_keeps_are_the_two_c24b_names() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut codes: Vec<KeyCode> =
+            (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
+        codes.extend([
+            KeyCode::Enter,
+            KeyCode::PageUp,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+        ]);
+        let mut swept = 0;
+        // `Mode` is deliberately not `Clone` (a mode owns buffers), so each
+        // probe rebuilds the list and takes its own copy of the variant.
+        for i in 0..every_key_surface().len() {
+            let (label, m) = every_key_surface().swap_remove(i);
+            let entry = mode_entry_action(&m);
+            let editor = matches!(m, Mode::PaneEdit { .. } | Mode::Broadcast { .. });
+            for &code in &codes {
+                for shift in [false, true] {
+                    let mut mods = KeyModifiers::ALT;
+                    if shift {
+                        mods |= KeyModifiers::SHIFT;
+                    }
+                    let key = KeyEvent::new(code, mods);
+                    let (mut app, _) = mk_app(shell_ws());
+                    let Some(action) = bound_action(key, &app) else { continue };
+                    swept += 1;
+                    app.mode = every_key_surface().swap_remove(i).1;
+                    if !app.handle_mode_key(key) {
+                        assert!(
+                            matches!(app.mode, Mode::Normal),
+                            "{label}: yielded {action:?} but stayed in the mode",
+                        );
+                        continue;
+                    }
+                    // Consumed. Only C12's two are allowed to.
+                    let is_entry = Some(&action) == entry.as_ref();
+                    let is_editor_newline = editor && code == KeyCode::Enter;
+                    assert!(
+                        is_entry || is_editor_newline,
+                        "{label}: consumed the Alt chord for {action:?} — C24b lets a \
+                         mode keep only its own entry chord and, in the two multi-line \
+                         editors, Alt+Enter",
+                    );
+                    // The two consumptions differ, and C24b turns on the
+                    // difference: an entry chord is a *way out*, so it must
+                    // leave the mode; a retained chord is *content*, so it
+                    // must not. Asserting only the first would let the
+                    // editors' Alt+Enter start closing the dialog it exists
+                    // to type into, with nothing to say so.
+                    if is_entry {
+                        assert!(
+                            matches!(app.mode, Mode::Normal),
+                            "{label}: its entry chord must toggle the mode off (U18)",
+                        );
+                    } else {
+                        assert!(
+                            !matches!(app.mode, Mode::Normal),
+                            "{label}: Alt+Enter is a line break, not a way out — the \
+                             editor must still be open",
+                        );
+                    }
+                }
+            }
+        }
+        // The sweep is worthless if `bound_action` stopped resolving
+        // anything — it would pass by testing nothing at all.
+        assert!(swept > 200, "the chord sweep found almost nothing ({swept}) — check it");
+    }
+
+    /// What `translate` makes of `key` against the default keymap, or None
+    /// if nothing is bound to it.
+    fn bound_action(key: crossterm::event::KeyEvent, app: &App<FakePane>) -> Option<Action> {
+        match crate::ui::input::translate_with(key, app.keymap()) {
+            crate::ui::input::InputResult::Action(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// And the end of that path: the yielded chord really does quit. A
+    /// quiet fleet quits on the first press (U1), so one `apply` is the
+    /// whole story — the busy-fleet confirm has its own tests.
+    #[test]
+    fn alt_q_quits_from_every_mode() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (label, m) in every_key_surface() {
+            let (mut app, _) = mk_app(shell_ws());
+            app.mode = m;
+            let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
+            if !app.handle_mode_key(key) {
+                if let crate::ui::input::InputResult::Action(a) =
+                    crate::ui::input::translate_with(key, app.keymap())
+                {
+                    app.apply(a);
+                }
+            }
+            assert!(app.quit, "{label}: Alt+q did not quit");
+        }
     }
 }

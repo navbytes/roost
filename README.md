@@ -8,7 +8,7 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, codex,
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-0.1.6-informational.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.1.9-informational.svg)](Cargo.toml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
 <img src="docs/roost-hero.png" alt="Screenshot of roost running in iTerm2: a single focused shell pane in ~/workspace, showing the ink-and-paper chrome — accent-red focused border, tab bar with save status, a top-right corner badge, and the bottom hint bar." width="800">
@@ -88,8 +88,8 @@ Or build from source, if you'd rather (needs a Rust toolchain):
 mise use -g "cargo:https://github.com/navbytes/roost@branch:main"
 ```
 
-Pin a version by appending it, e.g. `github:navbytes/roost@0.1.6`, or swap
-`@branch:main` for `@tag:v0.1.6` on the cargo backend. Drop `-g` to pin roost
+Pin a version by appending it, e.g. `github:navbytes/roost@0.1.9`, or swap
+`@branch:main` for `@tag:v0.1.9` on the cargo backend. Drop `-g` to pin roost
 per-project in that directory's `mise.toml` instead of globally.
 
 Only one roost runs per workspace at a time — a second instance on the same
@@ -137,15 +137,18 @@ you're in.
 | `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
 | `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
 | `Alt+Shift+arrow` | resize along that axis |
+| `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
-| `Alt+g` | cycle layout: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
+| `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
 | `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |
 | `Alt+f` | toggle the floating scratch shell (readline forward-word collision — already swallowed; raw mode below gets it back) |
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
+| `Alt+;` | go back to the pane you came from — toggles, and follows across tabs (tmux's `prefix ;`) |
 | `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |
+| `Alt+'` | broadcast — compose one message, send it to every pane (`Tab` picks who: all, or one status tier); the title shows how many will get it |
 | `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
-| `Alt+r` | rename pane |
+| `Alt+r` | edit pane — name and parking note in one dialog; the note's first line shows on the badge |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
 | `Alt+t`, `Alt+1..9`, `Alt+0` | new tab / go to tab / go to the last tab |
 | `Alt+i` / `Alt+m` | previous / next tab (wraps — the route to tabs past the ninth) |
@@ -156,7 +159,7 @@ you're in.
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
 | `Alt+Shift+p` | raw pass-through for the focused pane — same chord exits it |
 | `Alt+/` | toggle the shortcut hint bar |
-| `Alt+?` | show the full keymap (any key closes it) |
+| `Alt+?` | show the full keymap (`/` filters it, any key closes it) |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 
 A shortcut hint bar runs along the bottom by default (zellij-style), showing
@@ -177,7 +180,23 @@ file — the default — and roost behaves exactly as documented above.
 ```
 
 A value is `"disable"` (the chord passes straight through to the pane, like
-an unbound key) or a snake_case `Action` name (see `src/ui/input.rs`). A
+an unbound key) or a snake_case `Action` name — **`roost keys` prints every
+one of them**, alongside the chord it is currently on:
+
+```console
+$ roost keys | head -3
+Alt+/	toggle_hints
+Alt+0	last_tab
+Alt+1	go_to_tab_1
+```
+
+It reads `config.json` directly and needs no running roost, so it answers
+before you launch: remapped and disabled chords are marked `config.json`, and
+an entry roost had to skip is named on stderr with a non-zero exit — so a
+dotfile test can gate on it instead of you catching a startup toast.
+**`Alt+?` and the hint bar follow your remaps** — both read the live keymap,
+so they show the chord you bound and stop showing the one you disabled,
+rather than teaching the defaults at you. A
 chord entry covers however your terminal happens to report that key (e.g.
 `alt+shift+p` and `alt+P` are the same chord), so one entry is enough
 regardless of which encoding your terminal uses. A chord listed twice keeps
@@ -251,7 +270,7 @@ mouse regardless, and copy mode is there if you need it.
 
 ## Fleet features
 
-Nine keyboard-first additions for running more agents at once, plus one
+Ten keyboard-first additions for running more agents at once, plus one
 CLI-only escape hatch — all Alt-only, same layer as everything above.
 
 - **Jump to attention (`Alt+a`).** Jumps to the next pane whose status is
@@ -316,6 +335,23 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   sessions intact, but re-split off the focused pane rather than at their
   original geometry. The undo stack holds the last 20 closes and is
   session-only (cleared on quit).
+- **Pane notes, inside `Alt+r`.** The edit dialog holds the pane's whole
+  text surface — the name on its underlined first row, and under it a
+  **parking note**: where this pane stands and what's next, written before
+  you close the lid, read the next morning without a ritual. The note's
+  **first line shows in the focused pane's corner badge** with an age tag
+  (`14h`, `2d` — a stale note confesses instead of lying), and every other
+  pane that carries one shows a bare `¶` (`¶⋮` when there's more under the
+  first line), so walking your tabs and panes reveals each note where
+  you're already looking. Nothing is ever shown all at once. `Shift+Enter`
+  moves from name to note and adds lines (up to 8; multi-line pastes work
+  too); `Enter` saves both fields — the age re-stamps only when the note
+  actually changed, so renaming can't make a stale note look fresh —
+  and emptying the note (`Ctrl+U` + `Enter`) clears it ("handled")
+  without touching the name. Notes live in `workspace.json` next to the
+  session id, so they survive quits and reboots, and `Alt+u` restores a
+  note with its closed pane. No chord to learn: `Alt+r` was already the
+  rename key, and it still is.
 - **Broadcast.** `roost send --all TEXT [--enter]` types into every running
   pane at once — CLI/control-plane only, deliberately no TUI key so a
   fat-fingered `Alt` chord can't blast the whole fleet. See
@@ -378,7 +414,10 @@ Each pane also carries a faint **corner badge**, top-right (iTerm2-style):
 `name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
 (pi, claude, codex, gemini, opencode, or shell) when unnamed, and the glyph is the pane's live
 status. A cell TUI can't do true translucency, so it's rendered dim rather
-than see-through; the inner app's content still draws underneath it.
+than see-through; the inner app's content still draws underneath it. A pane
+with an `Alt+r` note adds a `¶` here — and on the focused pane, the
+note's first line and age, full-strength: the one thing in the badge that
+isn't dim.
 
 ## Appearance
 

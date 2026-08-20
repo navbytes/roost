@@ -14,8 +14,10 @@ use crate::core::app::{
     TabSummary,
 };
 use crate::core::status::AgentStatus;
-use crate::core::layout::{self, PaneRect};
+use crate::core::layout::{self, Dir, PaneRect};
 use crate::ports::PaneBackend;
+use crate::core::control::Actor;
+use crate::ui::input::{self, Action, Keymap};
 use crate::ui::mouse;
 use crate::ui::theme;
 
@@ -38,6 +40,9 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // the clock to tick past a frame boundary mid-draw and split a frame
     // across two different spinner glyphs.
     let spinner: char = theme::spinner_frame(app.elapsed());
+    // C32: the badge age tags share one wall-clock read per frame, for the
+    // same no-split-frame reason as the spinner above.
+    let now: u64 = crate::core::app::now_unix_secs();
 
     draw_tab_bar(f, app, tab_bar, spinner);
 
@@ -66,12 +71,44 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     // singleton, or disjoint tiled rects that never overlap each other).
     let rects = app.display_rects();
     for pr in rects.iter().rev() {
-        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), spinner);
+        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), spinner, now);
     }
 
     if app.hints_shown() {
         let hint_bar = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
         draw_hint_bar(f, app, hint_bar);
+    } else if area.height >= 2 {
+        // **[C10, 2026-08-20]** A flash is not a hint, and must not be
+        // hostage to whether hints are shown. `hints_shown()` is false both
+        // when the user pressed Alt+/ and when the terminal is under 3 rows
+        // — and in that state every C10 message reached nobody: all 38 of
+        // them, including C38's refusals ("no room to split"), U14's copy
+        // result, the startup notice that a workspace.json was set aside,
+        // and — worst — U22's confirm-arm prompts, so `Alt+w` armed a
+        // destructive second press while showing no "again to close" at
+        // all. Exactly the hazard C2's own dated amendment names for the
+        // mode word: a safety affordance made conditional on an unrelated
+        // toggle.
+        //
+        // Painted OVER the body's last row rather than by shrinking the
+        // body: the geometry the panes were laid out and PTY-resized to must
+        // not change for two seconds and back, and the row repaints itself
+        // from the pane beneath the moment the flash expires. Nothing new is
+        // drawn — same text, same `attention()` styling, same single row as
+        // the hint-bar path, because it is literally the same function.
+        //
+        // **[C11, same amendment]** and the Alt-trap warning with it, in the
+        // same precedence the hint bar uses (flash first). It is the worse
+        // half of the two: if Alt really is being swallowed, `Alt+/` cannot
+        // bring the hint bar back, so the one sentence explaining why no
+        // chord works was unreachable by the only key that would reveal it.
+        // Unlike the flash this bar is persistent, so it does cost a row of
+        // pane content for as long as it holds — but `show_alt_hint` is
+        // evidence-gated (U4/F1: the signature of a swallowed Option chord,
+        // not merely an absence of Alt), and a user in that state needs the
+        // sentence more than the row.
+        let last = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+        let _ = draw_flash(f, app, last) || draw_alt_warning(f, app, last);
     }
 
     // Anchor floating dialogs near the focused pane rather than dead-center
@@ -114,103 +151,187 @@ fn draw_too_small(f: &mut Frame, area: Rect) {
 /// (`App::resume_command_line` is Some) — adds `y copy resume` to the dead
 /// branch, ahead of `Alt+w`/`Alt+q` in the yield order: those two are
 /// discoverable everywhere, `y` exists only on this bar.
+/// **[F1, 2026-08-19]** Pairs are `(String, &'static str)` now, and every
+/// **Alt** key on this bar is resolved from the live keymap rather than
+/// compiled in — the hint bar had the same defect as the help overlay, and
+/// it is the surface a user reads *most*, on every frame.
+///
+/// Mode-local keys (`hjkl`, `v/V`, `Esc`, `↑↓`, `n/N` …) stay literal, and
+/// that is not an oversight: config.json's grammar is Alt chords only
+/// (`Chord::parse` requires the `alt+` prefix), so those keys cannot be
+/// remapped and cannot go stale. Only what can move is derived.
 fn hint_pairs(
     mode: &Mode,
     focused_dead: bool,
     resumable: bool,
     focused_raw: bool,
     help_scrolled: bool,
-) -> Vec<(&'static str, &'static str)> {
+    keymap: &Keymap,
+) -> Vec<(String, &'static str)> {
+    let b = input::effective_bindings(keymap);
+    // A literal pair: a key config.json cannot touch.
+    let lit = |k: &str, d: &'static str| (k.to_string(), d);
+    // An Alt pair, resolved. `None` — every chord for it disabled — drops
+    // the pair off the bar, the same rule the help overlay's rows follow.
+    let alt = |actions: &'static [Action], spelling: &'static str, d: &'static str| {
+        // The hint bar has its own fit/yield machinery (pairs drop whole from
+        // the right), so a long label needs no elision here — C9 absorbs it.
+        help_key_text(&HelpKey::Family(spelling, actions), "", &b).map(|k| (k, d))
+    };
     match mode {
         // C24: keyboard cursor + mouse drag — every Copy-mode key is on this
         // bar (a binding nothing advertises may as well not exist).
         Mode::Copy { .. } => vec![
-            ("hjkl", "move"),
-            ("w/b/e", "word"),
-            ("0/$", "ends"),
-            ("v/V", "mark"),
-            ("y/↵", "yank"),
+            lit("hjkl", "move"),
+            lit("w/b/e", "word"),
+            lit("0/$", "ends"),
+            lit("v/V", "mark"),
+            lit("y/↵", "yank"),
             // `o` opens the URL under the cursor — the keyboard half of Alt+click.
-            ("o", "open"),
-            ("drag", "select"),
-            ("Esc", "exit"),
+            lit("o", "open"),
+            lit("drag", "select"),
+            lit("Esc", "exit"),
         ],
+        // [F9] Filtering displaces "any key closes", so the hint bar has to
+        // say what replaced it — C27's roster pairs exactly, for the same
+        // reason its comment gives: a letter is filter text now, so `Esc`
+        // is the way out and the bar must lead with that.
+        Mode::Help { filter: Some(_), .. } => {
+            vec![
+                lit("type", "filter"),
+                lit("↑↓ PgUp/Dn", "read on"),
+                lit("Esc", "clear · close"),
+            ]
+        }
         Mode::Help { .. } if help_scrolled => {
-            vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]
+            vec![
+                lit("↑↓ PgUp/Dn", "read on"),
+                lit("/", "filter"),
+                lit("any other key", "close"),
+            ]
         }
-        Mode::Help { .. } => vec![("Alt+?", "all keys"), ("any key", "close")],
-        // 45 columns.
-        Mode::Rename { target, .. } => {
-            let what = match target {
-                RenameTarget::Pane => "pane name",
-                RenameTarget::Tab => "tab name",
-            };
-            vec![("type", what), ("←→", "move"), ("↵", "save"), ("Esc", "cancel")]
+        Mode::Help { .. } => {
+            let mut pairs = Vec::new();
+            pairs.extend(alt(&[Action::Help], "Alt+?", "all keys"));
+            pairs.push(lit("/", "filter"));
+            pairs.push(lit("any key", "close"));
+            pairs
         }
+        // 48 columns. Tab is Rename's one remaining target (C32).
+        Mode::Rename { .. } => {
+            vec![lit("type", "tab name"), lit("←→", "move"), lit("↵", "save"), lit("Esc", "cancel")]
+        }
+        // C32 (combined), 72 columns. `Shift+↵` names the break — descend
+        // from the name row, split inside the note (Ctrl/Alt+↵ are
+        // unhinted synonyms, same rule as every alias on this bar).
+        // C36, **74 columns** — and ordered by U6's rule that list order
+        // *is* yield order, because 74 plus the 33-column needs-you
+        // segment overflows the 100-col floor and trailing pairs drop.
+        // The two that must survive a busy fleet lead: `↵ send` (what the
+        // dialog is for) and `Esc cancel` (the escape hatch C24's list
+        // refused to let yield). `type message` trails — a text field you
+        // are already typing into is the pair whose absence costs least.
+        // The motion keys are deliberately absent, on C24's precedent:
+        // an eighth pair would push `Esc` off, and they are C13/C32's
+        // shared vocabulary, taught by the C15 overlay.
+        Mode::Broadcast { .. } => vec![
+            lit("↵", "send"),
+            lit("Esc", "cancel"),
+            lit("Tab", "who gets it"),
+            lit("Shift+↵", "new line"),
+            lit("type", "message"),
+        ],
+        Mode::PaneEdit { .. } => vec![
+            lit("type", "name / note"),
+            lit("↵", "save"),
+            lit("Shift+↵", "new line"),
+            lit("↑↓←→", "move"),
+            lit("Esc", "cancel"),
+        ],
         // 71 columns, inside the floor. `j/k` are filter text now, not on
         // this bar.
         Mode::Picker { .. } => vec![
-            ("↑↓", "choose"),
-            ("↵", "open"),
-            ("1..9", "launch"),
-            ("type", "filter"),
-            ("←→", "dir"),
-            ("Esc", "cancel"),
+            lit("↑↓", "choose"),
+            lit("↵", "open"),
+            lit("1..9", "launch"),
+            lit("type", "filter"),
+            lit("←→", "dir"),
+            lit("Esc", "cancel"),
         ],
         // 59 columns — comfortably inside the 100-col floor alongside the
         // right segment.
         Mode::Scroll => vec![
-            ("↑↓", "scroll"),
-            ("PgUp/Dn", "page"),
-            ("/", "search"),
-            ("n/N", "next"),
-            ("Esc", "exit"),
+            lit("↑↓", "scroll"),
+            lit("PgUp/Dn", "page"),
+            lit("/", "search"),
+            lit("n/N", "next"),
+            lit("Esc", "exit"),
         ],
         // The search prompt's own list. `↵ keep`/`Esc cancel` are the two
         // exits and lead the yield order; the hits-walking pair trails
         // because it's the one that keeps working after the prompt closes
         // (and is advertised again on the Scroll list once it does).
         Mode::Search { .. } => {
-            vec![("type", "filter"), ("↵", "keep"), ("Esc", "cancel"), ("n/N", "next")]
+            vec![lit("type", "filter"), lit("↵", "keep"), lit("Esc", "cancel"), lit("n/N", "next")]
         }
         Mode::Feed { .. } => vec![
-            ("↑↓", "select"),
-            ("PgUp/Dn", "page"),
-            ("↵", "go to pane"),
-            ("q/Esc", "close"),
+            lit("↑↓", "select"),
+            lit("PgUp/Dn", "page"),
+            lit("↵", "go to pane"),
+            lit("q/Esc", "close"),
         ],
         // 68 columns, inside the 100-col floor beside the right segment. `q`
         // is deliberately absent (the roster filters as you type, so a
         // letter is filter text, U20's rule) — `Esc` is the way out.
         Mode::Roster { .. } => vec![
-            ("↑↓", "select"),
-            ("PgUp/Dn", "page"),
-            ("↵", "go to pane"),
-            ("type", "filter"),
-            ("Tab", "status"),
-            ("Esc", "close"),
+            lit("↑↓", "select"),
+            lit("PgUp/Dn", "page"),
+            lit("↵", "go to pane"),
+            lit("type", "filter"),
+            lit("Tab", "status"),
+            lit("Esc", "close"),
         ],
         Mode::Normal if focused_dead => {
-            let mut pairs = vec![("↵", "relaunch"), ("f", "fresh — drops resume")];
+            let mut pairs = vec![lit("↵", "relaunch"), lit("f", "fresh — drops resume")];
             if resumable {
-                pairs.push(("y", "copy resume"));
+                pairs.push(lit("y", "copy resume"));
             }
-            pairs.extend([("Alt+w", "close"), ("Alt+q", "quit")]);
+            pairs.extend(alt(&[Action::ClosePane], "Alt+w", "close"));
+            pairs.extend(alt(&[Action::Quit], "Alt+q", "quit"));
             pairs
         }
-        Mode::Normal if focused_raw => vec![("Alt+Shift+p", "exit raw")],
+        // C23: the one pair on a raw pane's bar — and the one whose
+        // accuracy matters most, since it is the only advertised way out of
+        // a mode that swallows everything else. Resolved, not compiled in.
+        Mode::Normal if focused_raw => alt(&[Action::ToggleRaw], "Alt+Shift+p", "exit raw")
+            .into_iter()
+            .collect(),
         // Pairs drop whole from the right, so `Alt+? keys` leads (the way to
         // everything else once it's dropped) and `Alt+r rename` trails
         // (costs nothing when gone — still findable under Alt+?).
-        Mode::Normal => vec![
-            ("Alt+?", "keys"),
-            ("Alt+n", "new"),
-            ("Alt+↵", "launch"),
-            ("Alt+s", "stack"),
-            ("Alt+←↓↑→", "focus"),
-            ("Alt+w", "close"),
-            ("Alt+r", "rename"),
-        ],
+        Mode::Normal => {
+            // C9's seven, in the yield order U6 fixed: pairs drop whole from
+            // the right, so `Alt+? keys` leads (the route to everything a
+            // narrow bar just dropped) and the edit pair trails.
+            const FOCUS: &[Action] = &[
+                Action::Focus(Dir::Left),
+                Action::Focus(Dir::Down),
+                Action::Focus(Dir::Up),
+                Action::Focus(Dir::Right),
+            ];
+            [
+                alt(&[Action::Help], "Alt+?", "keys"),
+                alt(&[Action::NewPane], "Alt+n", "new"),
+                alt(&[Action::QuickLaunch], "Alt+↵", "launch"),
+                alt(&[Action::ToggleStack], "Alt+s", "stack"),
+                alt(FOCUS, "Alt+←↓↑→", "focus"),
+                alt(&[Action::ClosePane], "Alt+w", "close"),
+                alt(&[Action::EditPane], "Alt+r", "edit"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        }
     }
 }
 
@@ -223,12 +344,14 @@ fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
         Mode::Normal if zoomed => "ZOOM",
         Mode::Normal => "NORMAL",
         Mode::Rename { .. } => "RENAME",
+        Mode::PaneEdit { .. } => "EDIT",
         Mode::Picker { .. } => "PICKER",
         Mode::Scroll => "SCROLL",
         Mode::Copy { .. } => "COPY",
         Mode::Help { .. } => "HELP",
         Mode::Feed { .. } => "FEED",
         Mode::Roster { .. } => "ROSTER",
+        Mode::Broadcast { .. } => "BROADCAST",
         Mode::Search { .. } => "SEARCH",
     }
 }
@@ -257,13 +380,20 @@ fn hint_bar_right_spans(
     query: Option<String>,
     position: Option<String>,
     word: &str,
+    jump_chord: Option<String>,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if let Some((n, needs_input)) = attention {
+        // C34: the chord is resolved, not spelled. C9's own amendment calls
+        // this segment "this feature's discoverability surface" — a surface
+        // that teaches a dead chord after a remap is worse than one that
+        // teaches nothing, so an unbound jump drops the `· chord` tail
+        // rather than naming a key that does nothing.
+        let tail = jump_chord.map(|c| format!(" · {c}")).unwrap_or_default();
         let (text, style) = if needs_input {
-            (format!("◆ {n} needs you · Alt+a"), theme::accent())
+            (format!("◆ {n} needs you{tail}"), theme::accent())
         } else {
-            (format!("○ {n} your turn · Alt+a"), theme::ink())
+            (format!("○ {n} your turn{tail}"), theme::ink())
         };
         spans.push(Span::styled(text, style));
         spans.push(Span::raw("  "));
@@ -308,11 +438,11 @@ fn hint_pair_cols(key: &str, label: &str) -> u16 {
 
 /// How many leading hint pairs fit alongside the right segment (C9 yield
 /// order: pairs drop whole, from the right, before the segment ever yields).
-fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u16) -> usize {
+fn fit_hint_pairs<K: AsRef<str>>(hints: &[(K, &'static str)], right_w: u16, width: u16) -> usize {
     let budget = width.saturating_sub(right_w);
     let mut used = 0u16;
     for (i, (key, label)) in hints.iter().enumerate() {
-        let w = hint_pair_cols(key, label);
+        let w = hint_pair_cols(key.as_ref(), label);
         if used + w > budget {
             return i;
         }
@@ -321,26 +451,57 @@ fn fit_hint_pairs(hints: &[(&'static str, &'static str)], right_w: u16, width: u
     hints.len()
 }
 
+/// C10: paint the flash into `area`, or report that there was none.
+///
+/// One function for both the places a flash can land — the hint bar when it
+/// is drawn, and the body's last row when it is not — so the two can never
+/// disagree about a flash's text or styling.
+///
+/// The `Clear` is what makes that true, and it is not decoration.
+/// `theme::attention()` is REVERSED and nothing else — deliberately, so the
+/// flash inverts the user's own fg/bg pair instead of assuming a background
+/// roost does not own (§2). Ratatui *patches* styles rather than replacing
+/// them, so with no fg of its own the message takes the fg of whatever cells
+/// it lands on. On the hint bar those cells are empty and the result is the
+/// intended `Reset` + reverse. Over the body's last row they carry the pane
+/// border drawn moments earlier in the same frame, and the message came out
+/// reversed in the *border's* colour: `RULE` (structure colour carrying
+/// text, banned by §2) under an unfocused pane, and under a focused one
+/// `ACCENT` reversed — bit-identical to `attention_problem()`, so "copied 12
+/// chars" rendered as C11/C16's reserved problem treatment. The cells past
+/// the message kept their border glyphs, reversed, leaving a ragged band.
+/// Found by the design-supervisor pass on this very change; the fixture that
+/// would have caught it mechanically is added alongside.
+fn draw_flash<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
+    let Some(msg) = app.flash() else { return false };
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(format!(" {msg} ")).style(theme::attention()), area);
+    true
+}
+
+/// C11/U4: paint the Alt-trap warning into `area`, or report that there is
+/// nothing to warn about. Same shape and same reasons as `draw_flash` — one
+/// function for both the hint bar and the body's last row, and the `Clear`
+/// so the cells past the message do not keep their border glyphs under the
+/// reversal (`attention_problem()` names its own fg, so unlike the flash the
+/// *text* could not inherit, but the ragged band could).
+fn draw_alt_warning<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
+    if !app.show_alt_hint() {
+        return false;
+    }
+    // Same bar, per-terminal wording — the app knows the host's TERM_PROGRAM
+    // and picks the real menu path where there is one. A problem bar, so the
+    // red-tinted reversal, not the neutral one.
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()), area);
+    true
+}
+
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // Flash wins the bar over the alt-warning: a transient action result
     // (e.g. "copied") takes over the bar briefly rather than being swallowed
     // by a persistent problem bar for its entire window.
-    if let Some(msg) = app.flash() {
-        f.render_widget(
-            Paragraph::new(format!(" {msg} ")).style(theme::attention()),
-            area,
-        );
-        return;
-    }
-
-    if app.show_alt_hint() {
-        // C11/U4: same bar, per-terminal wording — the app knows the host's
-        // TERM_PROGRAM and picks the real menu path where there is one. A
-        // problem bar, so the red-tinted reversal, not the neutral one.
-        f.render_widget(
-            Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()),
-            area,
-        );
+    if draw_flash(f, app, area) || draw_alt_warning(f, app, area) {
         return;
     }
 
@@ -350,10 +511,12 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // and "◆ N needs you" the fleet's primary signal — trailing pairs drop
     // whole until the segment fits.
     let focused_raw = app.is_raw(app.focused);
-    let (help_visible, help_total) = help_scroll_extent(app.body_area());
+    let (help_visible, help_total) =
+        help_scroll_extent(app.body_area(), app.keymap(), app.help_filter());
     let resumable = app.focused_dead() && app.resume_command_line(app.focused).is_some();
     let scrolled = help_visible < help_total;
-    let hints = hint_pairs(&app.mode, app.focused_dead(), resumable, focused_raw, scrolled);
+    let hints =
+        hint_pairs(&app.mode, app.focused_dead(), resumable, focused_raw, scrolled, app.keymap());
     // U3: Scroll mode's right segment shows where in history the view sits
     // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
     // can never report a phantom row the grid refused (U9's overshoot).
@@ -373,6 +536,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
         query,
         position,
         mode_word(&app.mode, app.zoomed(), focused_raw),
+        input::chord_for(app.keymap(), Action::JumpAttention),
     );
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
 
@@ -495,17 +659,36 @@ fn picker_cwd_label(path: &std::path::Path) -> String {
     }
 }
 
-/// C14 (U20): the picker dialog's width — the adapter column (a fixed
-/// width, as before the cwd column existed) plus the widest cwd label, plus
-/// the gap and the two border columns. `centered_near` still clamps it to
-/// the screen. Pure so the sizing and the drawing can't drift.
+/// C14 (U20): the picker's adapter column — the 3-char row prefix
+/// (`picker_row_body`'s `" {digit} "`) + the registry's longest id
+/// (`opencode`, 8) + the missing-adapter suffix (`" not found"`, 10, see
+/// `App::picker_filtered` and `PICKER_MISSING_SUFFIX`) + the selection
+/// marker the pad formula subtracts (1) + **1 column of slack**.
 ///
-/// `ADAPTER_COL` = 23: the 3-char row prefix (`picker_row_body`'s
-/// `" {digit} "`) + the registry's longest id (`opencode`, 8 chars) + the
-/// longest status suffix (`" not found"`, 10 chars, see `picker_filtered`) +
-/// 2 columns of slack.
+/// That last term used to read "2 columns of slack" and did not count the
+/// marker, so the stated derivation summed to one more than the constant
+/// actually leaves. Caught by the design audit; the arithmetic was right
+/// and only the sentence was wrong, which is the kind of error that
+/// survives because nobody re-adds a comment.
+///
+/// **One constant, because there were two.** `picker_dialog_width` sized
+/// the dialog for 23 while `draw_mode_overlay` padded its rows to 16 — same
+/// name, same intent, free to disagree, and they did. Any row wider than 16
+/// (`" 1 opencode not found"` is 21) got no padding at all, so its cwd
+/// label started six columns right of every other row's: a ragged column in
+/// exactly the case the dialog was sized to accommodate. Found by sweeping
+/// for the class of the C15 padding bug rather than its instance — a
+/// minimum-width pad standing in for a column is the same mistake twice.
+const ADAPTER_COL: u16 = 23;
+
+/// C14 (U20): the picker dialog's width — the adapter column plus the
+/// widest cwd label, plus the gap and the two border columns.
+/// `centered_near` still clamps it to the screen. Pure so the sizing and
+/// the drawing can't drift.
+///
+/// `ADAPTER_COL` is the shared constant below — the same number that pads
+/// each row, so the dialog is sized for exactly the column it draws.
 fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
-    const ADAPTER_COL: u16 = 23;
     let widest = cwds
         .iter()
         .map(|p| mouse::display_width(&picker_cwd_label(p)))
@@ -523,28 +706,167 @@ fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
 /// The help overlay's key-column prefix: the key label left-padded to a
 /// fixed column so every description lines up underneath it. Shared by the
 /// width computation and the row-rendering loop below so they can't drift.
+///
+/// **The trailing space is load-bearing, and `{key:<18}` did not guarantee
+/// one.** `draw_help_columns` draws this prefix and the description as two
+/// adjacent spans with nothing between them, so all the separation there is
+/// comes from this padding — and `{:<18}` is a *minimum* width, not a
+/// column: a key 18 or more wide gets padded by nothing and the description
+/// fuses straight onto it. On the default keymap **two** control-CLI rows
+/// did this: `roost send <id> "text"` (22) rendered `…"text"type into that
+/// pane`, and `roost spawn ADAPTER` (19) rendered `…ADAPTERlaunch a new
+/// pane`. After C34 made the key column keymap-derived, an enumerated
+/// family reaches 23 and did the same to `move focus`. Found by a
+/// simulation agent stressing the 80-column floor, which is where it is
+/// ugliest, but it was never width-dependent — the fusion happens at any
+/// terminal size.
+///
+/// So: pad to the 18-column grid when the key fits it, and otherwise fall
+/// back to exactly one space. Rows under 18 render byte-identically to
+/// before; only the ones that were broken move. `elide_key` and
+/// `help_content_width` both measure through here, so the extra column is
+/// accounted for in the floor rather than smuggled past it — see
+/// `HELP_COL_FLOOR`, which had to be corrected in the same pass: it read 80
+/// where the dialog can only draw 77, and this extra column was what finally
+/// made three columns of slop matter.
 fn help_key_prefix(key: &str) -> String {
-    format!(" {key:<18}")
+    let pad = (18usize).saturating_sub(mouse::display_width(key) as usize).max(1);
+    format!(" {key}{}", " ".repeat(pad))
+}
+
+/// F1: the chord table with no config.json applied — what `HelpKey::Family`
+/// compares against to decide whether its compact spelling is still true.
+/// Memoized; it is a pure function of the compiled-in table.
+fn default_bindings() -> &'static [(String, Action)] {
+    static B: std::sync::OnceLock<Vec<(String, Action)>> = std::sync::OnceLock::new();
+    B.get_or_init(|| input::effective_bindings(&Keymap::default()))
+}
+
+/// F1: the chords currently bound to `actions`, joined by `" / "` in the
+/// order the row declared them. `None` when **none** of them is bound —
+/// every chord disabled in config.json — which drops the row from the
+/// overlay entirely: a row teaching a key that no longer exists is worse
+/// than no row.
+fn join_chords(actions: &[Action], bindings: &[(String, Action)]) -> Option<String> {
+    let mut labels = Vec::new();
+    for a in actions {
+        for (label, bound) in bindings {
+            if bound == a {
+                labels.push(label.as_str());
+            }
+        }
+    }
+    (!labels.is_empty()).then(|| labels.join(" / "))
+}
+
+/// C15's 80-column floor, expressed as what one *column of content* may
+/// measure — which is **not 80**. `help_layout` asks for `content + 3` (two
+/// borders plus the column of air before the right one), so a column of 78
+/// is a dialog of 81, `centered_near` clamps it to the terminal, and the air
+/// goes first: a row that spends the full width ends flush against the
+/// border. 80 − 2 borders − 1 air = 77.
+///
+/// It read `80` from the start, three columns too loose, and never bit
+/// because the widest content the table could produce was exactly 77 — the
+/// ceiling this constant should have named. Then C38's sibling fix (a key
+/// column always ends in a space) added one column to the over-wide rows and
+/// the slack was gone: at 80×24 with `alt+h` disabled, `…j … move focus (…at
+/// an edge)` sat against the border. Found by the design audit of that fix,
+/// measured rather than reasoned.
+///
+/// So it is derived here rather than restated, because the derivation is the
+/// part that was wrong.
+const HELP_COL_FLOOR: u16 = HELP_FLOOR_COLS - HELP_DIALOG_CHROME;
+
+/// The terminal width C15's floor is written against.
+const HELP_FLOOR_COLS: u16 = 80;
+
+/// What `help_layout` adds to a column of content: a border each side, and
+/// one column of air before the right one so a full-width row can breathe.
+/// The key column already opens with a space, which is the left-hand air.
+const HELP_DIALOG_CHROME: u16 = 3;
+
+/// C34/C15: keep a resolved key column inside the floor by eliding **the
+/// key**, never the description.
+///
+/// Before C34 a row's key was authored text of known width, so the floor
+/// was a thing you checked once. It is derived now, and an enumerated
+/// family is unbounded: disabling `Alt+←` alone makes the focus row spell
+/// eight chords and pushes its column to 107, which at an 80-column
+/// terminal clips the description — the exact failure C15's width rule
+/// exists to prevent, reintroduced by the mechanism meant to make the row
+/// truthful. (Found by the design-supervisor audit of C34, measured rather
+/// than predicted.)
+///
+/// The key yields because the description is the row's irreplaceable half:
+/// a reader who sees two of eight chords still learns what the row is for
+/// and can widen the terminal for the rest, while a clipped description
+/// teaches nothing at any width. Elision lands on a `" / "` boundary so a
+/// chord is never shown half-spelled, and `…` marks that more exist. A
+/// single chord that still doesn't fit is left alone: that is authored
+/// width, not something this function created.
+fn elide_key(key: String, desc: &str) -> String {
+    let fits = |k: &str| {
+        mouse::display_width(&help_key_prefix(k)) + mouse::display_width(desc) <= HELP_COL_FLOOR
+    };
+    if fits(&key) {
+        return key;
+    }
+    let parts: Vec<&str> = key.split(" / ").collect();
+    (1..parts.len())
+        .rev()
+        .map(|n| format!("{} …", parts[..n].join(" / ")))
+        .find(|candidate| fits(candidate))
+        .unwrap_or(key)
+}
+
+/// F1: a row's key column, resolved against the live keymap.
+fn help_key_text(key: &HelpKey, desc: &str, bindings: &[(String, Action)]) -> Option<String> {
+    match key {
+        // Authored text of known width — the control-CLI block and the
+        // legends. Not elided: it names no chord this function resolved, so
+        // there is no " / " here that is safe to cut.
+        HelpKey::Text(s) => Some((*s).to_string()),
+        HelpKey::Chords(actions) => join_chords(actions, bindings).map(|k| elide_key(k, desc)),
+        HelpKey::Family(spelling, actions) => {
+            let live = join_chords(actions, bindings)?;
+            // The compact spelling is a display shorthand for the default
+            // chords and nothing else. If any member moved, it is no longer
+            // a description of this keymap, so enumerate what is really
+            // bound instead.
+            if join_chords(actions, default_bindings()).as_deref() == Some(live.as_str()) {
+                Some((*spelling).to_string())
+            } else {
+                Some(elide_key(live, desc))
+            }
+        }
+    }
 }
 
 /// C15: the keymap's content width — the widest row
 /// (key column + description). One *column* of it; the overlay may draw two
 /// side by side, which `help_layout` decides. Pure so the sizing has a
 /// unit-test seam.
-fn help_content_width() -> u16 {
-    HELP_GROUPS
+fn help_content_width(lines: &[HelpLine]) -> u16 {
+    lines
         .iter()
-        .flat_map(|g| g.rows.iter())
-        .map(|(k, d)| mouse::display_width(&help_key_prefix(k)) + mouse::display_width(d))
+        .filter_map(|l| match l {
+            HelpLine::Row(k, d) => {
+                Some(mouse::display_width(&help_key_prefix(k)) + mouse::display_width(d))
+            }
+            HelpLine::Head(_) => None,
+        })
         .max()
         .unwrap_or(0)
 }
 
 /// C15: one line of the drawn keymap — a group heading or a chord row.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The row's key column is owned rather than `&'static`: since F1 it is
+/// resolved from the live keymap, not compiled in.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum HelpLine {
     Head(&'static str),
-    Row(&'static str, &'static str),
+    Row(String, &'static str),
 }
 
 /// C15: the keymap flattened into drawable lines, in group order — each
@@ -552,11 +874,26 @@ enum HelpLine {
 /// underlined heading is the separator (C6's idiom, exactly as C27's roster
 /// stacks its groups), and a blank row per group would cost six rows of a
 /// table that already has to scroll on a short terminal.
-fn help_lines() -> Vec<HelpLine> {
+fn help_lines(keymap: &Keymap, filter: &str) -> Vec<HelpLine> {
+    let bindings = input::effective_bindings(keymap);
     let mut out = Vec::new();
     for g in HELP_GROUPS {
+        let rows: Vec<HelpLine> = g
+            .rows
+            .iter()
+            .filter_map(|r| {
+                help_key_text(&r.key, r.desc, &bindings).map(|k| HelpLine::Row(k, r.desc))
+            })
+            .filter(|l| help_row_matches(l, filter))
+            .collect();
+        // A group whose every chord was disabled in config.json contributes
+        // no heading either — an empty titled block advertises a section
+        // that isn't there.
+        if rows.is_empty() {
+            continue;
+        }
         out.push(HelpLine::Head(g.title));
-        out.extend(g.rows.iter().map(|(k, d)| HelpLine::Row(k, d)));
+        out.extend(rows);
     }
     out
 }
@@ -571,6 +908,27 @@ struct HelpLayout {
     height: u16,
     /// The dialog rect's size, borders included.
     size: (u16, u16),
+    /// One column's content width. Carried rather than recomputed by the
+    /// drawer: since F1 deriving it means resolving every row against the
+    /// keymap, and doing that twice per frame to reach the same number is
+    /// waste the old `&'static` table didn't have to think about.
+    content: u16,
+    /// The width the dialog **asked for**, before `.min(body.width)`.
+    ///
+    /// The only honest thing for a floor test to assert on. `size.0` is
+    /// already clamped, so at an 80-column body it reports 80 whether the
+    /// layout fitted or was cut down to it — a gate on it passes by
+    /// construction. C15's 2026-08-20 amendment named that shape ("a
+    /// tautology that reads like a gate is worse than no gate") and C39's
+    /// first floor test reintroduced it in this file anyway.
+    ///
+    /// Read only by tests — it exists so a floor gate has something honest
+    /// to assert on, which is a job nothing in the draw path needs. The
+    /// allow is narrow and deliberate rather than a `#[cfg(test)]` field,
+    /// because a struct that changes shape between builds is a worse trade
+    /// than one unused field.
+    #[allow(dead_code)]
+    asked: u16,
 }
 
 /// C15: lay the keymap out for `body`, taking **the
@@ -585,9 +943,9 @@ struct HelpLayout {
 ///
 /// The split point is a group boundary, chosen to balance the two columns,
 /// so a group is never sawn in half across the gutter.
-fn help_layout(body: Rect) -> HelpLayout {
-    let lines = help_lines();
-    let content = help_content_width();
+fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout {
+    let lines = help_lines(keymap, filter.unwrap_or(""));
+    let content = help_content_width(&lines);
     let avail_h = body.height.saturating_sub(2); // the dialog's borders
     let one_fits = lines.len() as u16 <= avail_h;
     let two_wide_enough = content * 2 + HELP_GUTTER + 2 <= body.width;
@@ -602,8 +960,109 @@ fn help_layout(body: Rect) -> HelpLayout {
     let height = tallest.min(avail_h);
     // +1 so a row that spends the full content width still has a column of
     // air before the right border (the key column already opens with one).
-    let w = content * columns.len() as u16 + HELP_GUTTER * (columns.len() as u16 - 1) + 3;
-    HelpLayout { columns, height, size: (w.min(body.width), height + 2) }
+    let w = content * columns.len() as u16
+        + HELP_GUTTER * (columns.len() as u16 - 1)
+        + HELP_DIALOG_CHROME;
+    // [F9] ...and never narrower than its own title. Before the filter the
+    // table always contained its widest row, so the frame was always wider
+    // than any heading and this could not arise. A query isolating one
+    // short row breaks that: `/this keymap` leaves a 33-column dialog under
+    // a 44-column title, which `modal_frame` then clips — the overlay would
+    // hide the very sentence telling a filtering reader how to get out.
+    // Found by driving it in a PTY; no unit test was looking at the title
+    // and the frame together.
+    let tallest_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    let title = help_title(
+        filter,
+        tallest_rows,
+        tallest_rows,
+        tallest_rows > height as usize,
+        body.width.saturating_sub(2),
+    );
+    let title_w = mouse::display_width(&title) + 2; // the two border columns
+    // `asked` is the un-clamped want, carried so a floor test can assert on
+    // it: `size.0` is `.min(body.width)` and therefore reports the body's
+    // width whether the dialog fitted or was cut down to it. Asserting on
+    // `size.0` is the tautology C15's own 2026-08-20 amendment named — and
+    // that this field exists is the second time it had to be named.
+    let asked = w.max(title_w);
+    HelpLayout { columns, height, size: (asked.min(body.width), height + 2), content, asked }
+}
+
+/// [F9] C39's four title wordings, in one place — because the dialog's
+/// **width** has to be floored by the title's, and a second spelling of the
+/// title would let the floor guard a string the frame does not draw. That
+/// is §4/§5 lockstep applied to a modal's own heading.
+///
+/// `shown` is the last visible row's index (the scrolled counter's left
+/// half); pass `total` for the worst case when the caller does not know
+/// `top` yet — the count only ever gets narrower, never wider.
+///
+/// `avail` is the widest the title may be. **The query is what gives**, and
+/// it is elided rather than truncated by the frame: everything after it —
+/// the count, and critically `Esc clears` — is how a filtering reader gets
+/// out, so clipping from the right removes exactly the wrong end. Widening
+/// the dialog cannot help here: at the 80-column floor a 46-character query
+/// exceeds the whole terminal, so *something* must give and it has to be
+/// the part the user can already see themselves typing.
+fn help_title(
+    filter: Option<&str>,
+    shown: usize,
+    total: usize,
+    scrolled: bool,
+    avail: u16,
+) -> String {
+    let (head, tail) = match (filter, scrolled) {
+        (Some(_), true) => (" keys — /", format!(" · {shown}/{total} · ↑↓ more · Esc clears ")),
+        (Some(_), false) => (" keys — /", format!(" · {total} shown · Esc clears ")),
+        (None, true) => {
+            return format!(" keys — {shown}/{total} · ↑↓ more · / filters · any key closes ");
+        }
+        (None, false) => return " keys — / filters · any key closes ".to_string(),
+    };
+    let q = filter.unwrap_or("");
+    let fixed = mouse::display_width(head) + mouse::display_width(&tail);
+    let room = avail.saturating_sub(fixed);
+    format!("{head}{}{tail}", elide_to(q, room))
+}
+
+/// Cut `text` to `room` columns, marking the cut with `…` when it bites.
+/// Room for nothing at all yields nothing at all — an ellipsis alone says
+/// less than the count and exit hint it would be stealing space from.
+fn elide_to(text: &str, room: u16) -> String {
+    if mouse::display_width(text) <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let keep = room.saturating_sub(1) as usize;
+    let cut: String = text.chars().take(keep).collect();
+    format!("{cut}…")
+}
+
+/// [F9] Does this row survive the type-ahead query? Case-insensitive over
+/// **both** columns — the key and its description — because a reader
+/// reaching for the filter is as likely to remember "the one with `g` in
+/// it" as "the layout one". An empty query keeps everything, so the
+/// un-filtered overlay costs no special case anywhere.
+///
+/// Headings are matched by their own rows, not by their text: a group
+/// whose every row was filtered away contributes no heading either
+/// (`help_lines` already drops an empty group), and a heading that matched
+/// while its rows did not would title an empty block. That is the same
+/// rule config.json's `disable` already put there.
+fn help_row_matches(line: &HelpLine, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let needle = filter.to_lowercase();
+    match line {
+        HelpLine::Row(key, desc) => {
+            key.to_lowercase().contains(&needle) || desc.to_lowercase().contains(&needle)
+        }
+        HelpLine::Head(_) => true,
+    }
 }
 
 /// Columns are separated by this many blank cells.
@@ -617,7 +1076,7 @@ const HELP_GUTTER: u16 = 2;
 /// uppercase, `quiet()`, underlined across its own column so it reads as a
 /// rule rather than as another chord.
 fn draw_help_columns(f: &mut Frame, layout: &HelpLayout, top: usize, inner: Rect) {
-    let content = help_content_width();
+    let content = layout.content;
     for (i, column) in layout.columns.iter().enumerate() {
         let x = inner.x + i as u16 * (content + HELP_GUTTER);
         if x >= inner.x + inner.width {
@@ -654,8 +1113,8 @@ fn draw_help_columns(f: &mut Frame, layout: &HelpLayout, top: usize, inner: Rect
 /// the keymap can move. Equal values mean the whole table is on screen and
 /// the scroll keys have nothing to do (`Mode::Help`'s "any key closes it"
 /// then holds unamended).
-pub fn help_scroll_extent(body: Rect) -> (usize, usize) {
-    let l = help_layout(body);
+pub fn help_scroll_extent(body: Rect, keymap: &Keymap, filter: Option<&str>) -> (usize, usize) {
+    let l = help_layout(body, keymap, filter);
     (l.height as usize, l.columns.iter().map(|c| c.len()).max().unwrap_or(0))
 }
 
@@ -674,10 +1133,50 @@ fn help_split_point(lines: &[HelpLine]) -> usize {
         .unwrap_or(lines.len())
 }
 
+/// C15/F1: how a help row spells its key column.
+///
+/// Before F1 every row was a `(&'static str, &'static str)` tuple, so the
+/// overlay's chord spellings were compiled-in literals and a `config.json`
+/// remap left them teaching a chord that no longer worked. A row now
+/// declares the *actions* it documents, and the spelling is resolved from
+/// the live keymap at draw time.
+enum HelpKey {
+    /// Spell whatever chords are bound to these actions, joined by `" / "`.
+    /// The common case.
+    Chords(&'static [Action]),
+    /// A compact hand-written spelling for a family too wide to enumerate
+    /// (`Alt+←↓↑→ / hjkl`, `Alt+1..9 / Alt+0`).
+    ///
+    /// The actions are still declared, so the coverage sweep sees every one
+    /// of them — only the *rendering* is by hand. And the compact form is
+    /// printed **only while every action in the family is still on its
+    /// default chord**: remap one and the row enumerates the real chords
+    /// instead, because `Alt+←↓↑→ / hjkl` would otherwise be exactly the
+    /// stale spelling F1 exists to abolish, merely a wider one.
+    Family(&'static str, &'static [Action]),
+    /// Binds nothing: a legend line or a control-CLI reference row.
+    Text(&'static str),
+}
+
+struct HelpRow {
+    key: HelpKey,
+    desc: &'static str,
+}
+
+const fn chords(actions: &'static [Action], desc: &'static str) -> HelpRow {
+    HelpRow { key: HelpKey::Chords(actions), desc }
+}
+const fn family(spelling: &'static str, actions: &'static [Action], desc: &'static str) -> HelpRow {
+    HelpRow { key: HelpKey::Family(spelling, actions), desc }
+}
+const fn reference(key: &'static str, desc: &'static str) -> HelpRow {
+    HelpRow { key: HelpKey::Text(key), desc }
+}
+
 /// C15: one titled block of the keymap.
 struct HelpGroup {
     title: &'static str,
-    rows: &'static [(&'static str, &'static str)],
+    rows: &'static [HelpRow],
 }
 
 /// C15/§8: the canonical key table, **grouped by what
@@ -710,82 +1209,191 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "PANES",
         rows: &[
-            ("Alt+n", "new shell pane (auto split)"),
-            ("Alt+Enter", "picker: 1..9 launch · type filters · ←→ recent cwd"),
-            ("Alt+←↓↑→ / hjkl", "move focus (←/→ continue to next/prev tab at an edge)"),
-            ("Alt+r", "rename this pane"),
-            ("Alt+w", "close pane (confirm if busy)"),
-            ("Alt+u", "reopen the last pane or tab you closed"),
-            ("Alt+Shift+p", "raw pass-through for this pane (same chord exits)"),
+            chords(&[Action::NewPane], "new shell pane (auto split)"),
+            chords(&[Action::QuickLaunch], "picker: 1..9 launch · type filters · ←→ recent cwd"),
+            family(
+                "Alt+←↓↑→ / hjkl",
+                &[
+                    Action::Focus(Dir::Left),
+                    Action::Focus(Dir::Down),
+                    Action::Focus(Dir::Up),
+                    Action::Focus(Dir::Right),
+                ],
+                "move focus (←/→ continue to next/prev tab at an edge)",
+            ),
+            chords(&[Action::EditPane], "name + parking note (first line shows on the badge)"),
+            chords(&[Action::ClosePane], "close pane (confirm if busy)"),
+            chords(&[Action::Undo], "reopen the last pane or tab you closed"),
+            // [F9] The dead-pane keys, which the overlay did not teach at
+            // all. They are bare keys rather than Alt chords — `main.rs`
+            // claims them from `InputResult::Forward` while the focused
+            // pane is dead — so §8 has no row for them and the C34 sweep
+            // does not cover them; the C9 bar advertised them and nothing
+            // else did. That is P21's case verbatim ("a search nothing
+            // advertises is a search nobody finds"), and C15 answered it
+            // the same way: fold the mode-local keys into the group that
+            // owns them, next to the other recovery verb.
+            //
+            // `y` is listed unconditionally though the bar shows it only
+            // when there is a session to resume: the overlay is the whole
+            // keymap, not the keymap for this instant, and every other row
+            // here documents a key whose effect depends on context.
+            HelpRow {
+                key: HelpKey::Text("↵ / f / y"),
+                // The description mirrors the key column's `/`, which is
+                // what every other positionally-mapped row here does — and
+                // it matters more than usual, because `·` elsewhere in this
+                // table separates independent clauses *of one key*. Using
+                // both spellings in one row inverted the table's own
+                // convention. Named by the C39 audit.
+                desc: "dead pane: relaunch / fresh (drops resume) / copy resume",
+            },
+            chords(&[Action::ToggleRaw], "raw pass-through for this pane (same chord exits)"),
         ],
     },
     HelpGroup {
         title: "LAYOUT",
         rows: &[
-            ("Alt+Shift+←↓↑→", "resize along that axis"),
-            ("Alt+s", "toggle split ⇄ stack"),
-            ("Alt+o", "flip this split's orientation"),
-            ("Alt+g", "cycle layout: grid / main+stack / all-stack"),
-            ("Alt+z", "zoom the focused pane (view only)"),
-            ("Alt+f", "floating scratch shell"),
+            family(
+                "Alt+Shift+←↓↑→",
+                &[
+                    Action::Resize { horizontal: true, grow: false },
+                    Action::Resize { horizontal: false, grow: true },
+                    Action::Resize { horizontal: false, grow: false },
+                    Action::Resize { horizontal: true, grow: true },
+                ],
+                "resize along that axis",
+            ),
+            // C33 sits directly under the resize row on purpose: the two
+            // shifted-direction chords are adjacent, so the one thing a
+            // reader has to learn — arrows resize, letters carry the pane —
+            // is visible in a single glance rather than inferred. This is a
+            // *different* criterion from C28's adjacency in TABS (which
+            // seats a row under its own unshifted form): C33 seats itself
+            // under the chord it is most likely to be confused with. Same
+            // tactic, different rule — see C33 in DESIGN-ui.md.
+            family(
+                "Alt+Shift+hjkl",
+                &[
+                    Action::MovePane(Dir::Left),
+                    Action::MovePane(Dir::Down),
+                    Action::MovePane(Dir::Up),
+                    Action::MovePane(Dir::Right),
+                ],
+                "move this pane that way (swaps with its neighbour)",
+            ),
+            chords(&[Action::ToggleStack], "toggle split ⇄ stack"),
+            chords(&[Action::FlipSplit], "flip this split's orientation"),
+            chords(
+                &[Action::CycleLayout { forward: true }],
+                "cycle layout: grid / main+stack / all-stack",
+            ),
+            // C37 sits directly under its own unshifted form, which is
+            // C28's actual rule (the C33 audit drew the distinction: C28
+            // pairs a row with the chord it is the shifted *form of*, not
+            // merely one it could be confused with). Two rows rather than
+            // one merged row because C15's cap was retired precisely so
+            // rows need not be merged to fit — and merging these two did
+            // push the column to 83, past the 80-col floor.
+            chords(&[Action::CycleLayout { forward: false }], "the same cycle, backwards"),
+            chords(&[Action::ToggleZoom], "zoom the focused pane (view only)"),
+            chords(&[Action::ToggleFloat], "floating scratch shell"),
         ],
     },
     HelpGroup {
         title: "TABS",
         rows: &[
-            ("Alt+t", "new tab"),
-            ("Alt+1..9 / Alt+0", "go to that tab / the last one"),
-            ("Alt+i / Alt+m", "previous / next tab (wraps)"),
+            chords(&[Action::NewTab], "new tab"),
+            family(
+                "Alt+1..9 / Alt+0",
+                &[
+                    Action::GoToTab(0),
+                    Action::GoToTab(1),
+                    Action::GoToTab(2),
+                    Action::GoToTab(3),
+                    Action::GoToTab(4),
+                    Action::GoToTab(5),
+                    Action::GoToTab(6),
+                    Action::GoToTab(7),
+                    Action::GoToTab(8),
+                    Action::LastTab,
+                ],
+                "go to that tab / the last one",
+            ),
+            chords(&[Action::PrevTab, Action::NextTab], "previous / next tab (wraps)"),
             // C28: the shifted siblings sit directly under the chords they
             // are the shifted form of — the pairing *is* the explanation.
-            ("Alt+Shift+i / +m", "move this pane to the previous / next tab"),
-            ("Alt+Shift+r", "rename this tab"),
+            family(
+                "Alt+Shift+i / +m",
+                &[
+                    Action::MovePaneToTab { forward: false },
+                    Action::MovePaneToTab { forward: true },
+                ],
+                "move this pane to the previous / next tab",
+            ),
+            chords(&[Action::RenameTab], "rename this tab"),
         ],
     },
     HelpGroup {
         title: "FLEET",
         rows: &[
-            ("Alt+a", "jump to the next pane that needs you"),
-            ("Alt+Shift+a", "roster: every pane, grouped by tab · Tab filters by status"),
-            ("Alt+e", "activity feed (status / spawns / exits / control)"),
+            chords(&[Action::JumpAttention], "jump to the next pane that needs you"),
+            // C35 sits under the jump because they are the pair a fleet
+            // navigates with: one goes on to whoever needs you, the other
+            // comes back to where you were.
+            chords(&[Action::FocusAlternate], "back to the pane you came from"),
+            chords(
+                &[Action::ToggleRoster],
+                "roster: every pane, grouped by tab · Tab filters by status",
+            ),
+            chords(&[Action::ToggleFeed], "activity feed (status / spawns / exits / control)"),
+            chords(
+                &[Action::ToggleBroadcast],
+                "broadcast: type once, send to every pane · Tab picks who",
+            ),
         ],
     },
     HelpGroup {
         title: "READING",
         rows: &[
-            ("Alt+PgUp", "scroll back — `/` searches, n/N step the hits"),
-            ("Alt+c", "copy mode: hjkl wbe 0$ · v/V select · y yank · o URL"),
+            chords(&[Action::ScrollMode], "scroll back — `/` searches, n/N step the hits"),
+            chords(&[Action::CopyMode], "copy mode: hjkl wbe 0$ · v/V select · y yank · o URL"),
         ],
     },
     HelpGroup {
         title: "SESSION",
         rows: &[
-            ("Alt+/", "toggle the hint bar"),
-            ("Alt+?", "this keymap"),
-            ("Alt+q", "quit (workspace saved; sessions live)"),
+            chords(&[Action::ToggleHints], "toggle the hint bar"),
+            // C39's `/` is folded into the row that already owns this
+            // surface, which is C15's own P21 precedent (`/ search, n/N`
+            // rides the `Alt+c` row rather than taking one). A key that
+            // appears in §8 and in the live title but in no printed row is
+            // a key the overlay does not actually teach.
+            chords(&[Action::Help], "this keymap — / filters it"),
+            chords(&[Action::Quit], "quit (workspace saved; sessions live)"),
         ],
     },
     HelpGroup {
         title: "READING THE SCREEN",
         rows: &[
-            ("status", "⠋ working ◆ needs you ○ waiting · idle ✕ exited"),
+            reference("status", "⠋ working ◆ needs you ○ waiting · idle ✕ exited"),
             // D2 (PR #46 design audit, C29 amendment): widened for native
             // selection — a chord (Shift+click) gets a row here by C15's
             // own stated rule ("Alt+click gets its own row because it is a
             // chord"), applied to the mouse verb that is now also one.
-            ("mouse", "wheel scrolls · click focuses · drag/2x/3x/shift selects"),
-            ("Alt+click / o", "open the URL under the pointer / copy cursor"),
+            reference("mouse", "wheel scrolls · click focuses · drag/2x/3x/shift selects"),
+            reference("Alt+click / o", "open the URL under the pointer / copy cursor"),
         ],
     },
     HelpGroup {
         title: "CONTROL CLI",
         rows: &[
-            ("<id>", "same id shown on each pane's badge"),
-            ("roost send <id> \"text\"", "type into that pane (--enter submits)"),
-            ("roost read <id>", "print its current screen"),
-            ("roost status", "list every pane and its status"),
-            ("roost spawn ADAPTER", "launch a new pane"),
-            ("roost wait <id>", "block until its turn ends"),
+            reference("<id>", "same id shown on each pane's badge"),
+            reference("roost send <id> \"text\"", "type into that pane (--enter submits)"),
+            reference("roost read <id>", "print its current screen"),
+            reference("roost status", "list every pane and its status"),
+            reference("roost spawn ADAPTER", "launch a new pane"),
+            reference("roost wait <id>", "block until its turn ends"),
         ],
     },
 ];
@@ -819,7 +1427,7 @@ pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
         .find(|pr| pr.id == app.focused)
         .map(|pr| pr.rect)
         .unwrap_or(body);
-    dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
+    dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds(), app.keymap())
 }
 
 /// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
@@ -834,6 +1442,7 @@ fn dialog_rect(
     anchor: Rect,
     rows: usize,
     cwds: &[std::path::PathBuf],
+    keymap: &Keymap,
 ) -> Option<Rect> {
     match mode {
         // Copy mode has no centered overlay — the cursor/selection are
@@ -842,6 +1451,19 @@ fn dialog_rect(
         // stays fully visible while the query narrows.
         Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => None,
         Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
+        // C32 (combined): Rename's width; one row for the name plus one
+        // per note line — the dialog grows a row per Shift+↵ (to
+        // NOTE_MAX_LINES) instead of scrolling.
+        Mode::PaneEdit { lines, .. } => {
+            Some(centered_near(anchor, body, 44, lines.len() as u16 + 3))
+        }
+        // C36: C13's width, one row per message line. Wider than the pane
+        // editor would be tempting, but a broadcast is read at the moment
+        // of sending and the eye should be on the title's target count,
+        // not sweeping a wide field.
+        Mode::Broadcast { lines, .. } => {
+            Some(centered_near(anchor, body, 44, lines.len() as u16 + 2))
+        }
         Mode::Picker { .. } => {
             // U20: as tall as the longer of the two columns (a filter can
             // shrink the adapter side below the cwd side), never shorter
@@ -849,8 +1471,13 @@ fn dialog_rect(
             let h = rows.max(cwds.len()).max(1) as u16 + 2;
             Some(centered_near(anchor, body, picker_dialog_width(cwds), h))
         }
-        Mode::Help { .. } => {
-            let (w, h) = help_layout(body).size;
+        Mode::Help { filter, .. } => {
+            // The dialog is sized for the *filtered* table: a query that
+            // cuts 30 rows to 3 must not leave a 30-row frame around them,
+            // which is C14's picker rule (its dialog shrinks to the filtered
+            // adapter list) applied to the surface that borrowed its
+            // type-ahead.
+            let (w, h) = help_layout(body, keymap, filter.as_deref()).size;
             Some(centered_near(anchor, body, w, h))
         }
         Mode::Feed { .. } => {
@@ -878,22 +1505,91 @@ fn draw_mode_overlay<B: PaneBackend>(
     spinner: char,
 ) {
     let Some(rect) =
-        dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds())
+        dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds(), app.keymap())
     else {
         return;
     };
     match &app.mode {
         Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => {}
         Mode::Rename { buffer, cursor, target } => {
-            let heading = match target {
-                RenameTarget::Pane => " rename pane ",
-                RenameTarget::Tab => " rename tab ",
-            };
-            let inner = modal_frame(f, body, rect, Line::from(heading).style(theme::ink()));
+            // Tab is the one target left (C32 absorbed pane renames).
+            let RenameTarget::Tab = target;
+            let inner =
+                modal_frame(f, body, rect, Line::from(" rename tab ").style(theme::ink()));
             f.render_widget(
                 Paragraph::new(rename_field(buffer, *cursor)).style(theme::ink()),
                 inner,
             );
+        }
+        // C32 (combined): the pane editor — Rename's frame and field
+        // idiom; the name row on top, one row per note line under it, the
+        // `▏` caret riding the cursor row only. The name row is
+        // UNDERLINED and padded edge to edge (stack_header_text's fill
+        // trick), so the underline doubles as the name/note separator —
+        // C6's header idiom, zero rows spent — and stays visible even
+        // with an empty name. Everything `ink()`: it is all input, and
+        // quiet input can't be proofread (C13's own rule).
+        Mode::PaneEdit { name, lines, row, col, .. } => {
+            let inner =
+                modal_frame(f, body, rect, Line::from(" edit pane ").style(theme::ink()));
+            let name_text =
+                if *row == 0 { rename_field(name, *col) } else { name.clone() };
+            let pad =
+                (inner.width as usize).saturating_sub(mouse::display_width(&name_text) as usize);
+            let mut rendered: Vec<Line> = vec![Line::from(Span::styled(
+                format!("{name_text}{}", " ".repeat(pad)),
+                theme::ink().add_modifier(Modifier::UNDERLINED),
+            ))];
+            rendered.extend(lines.iter().enumerate().map(|(i, l)| {
+                if i + 1 == *row {
+                    Line::from(rename_field(l, *col))
+                } else {
+                    Line::from(l.clone())
+                }
+            }));
+            f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
+        }
+        // C36: the composer. The title carries the **live target count**,
+        // and that count is the contract's safety affordance — a visible
+        // blast radius at the moment of commit, in place of a
+        // confirm-twice. It moves with `Tab`, so the filter reads as "who
+        // gets this" rather than as a setting.
+        Mode::Broadcast { lines, row, col, status_filter } => {
+            let targets = app.broadcast_targets(Actor::Local, *status_filter).len();
+            // The zero case is carried by **words**, not by a colour. The
+            // C36 audit flagged the first draft's conditional `accent()`
+            // title: C12 says a modal title is `ink()`, no other dialog
+            // varies its title token by state, and §2's attention idiom is
+            // reversal rather than recolouring. Saying "no panes" outright
+            // is both unmissable and inside the existing contracts — the
+            // same "words beat a colour" instinct C16's bar text follows.
+            let who = match targets {
+                0 => " broadcast → no panes ".to_string(),
+                1 => " broadcast → 1 pane ".to_string(),
+                n => format!(" broadcast → {n} panes "),
+            };
+            let mut title = vec![Span::styled(who, theme::ink())];
+            // C27's rule, verbatim: the tier glyph carries its own C5
+            // colour, because "a bare `ink()` glyph would read as no tier
+            // at all". The first draft discarded the style and printed a
+            // colourless ◆ (audit D3).
+            if let Some(tier) = status_filter {
+                let (glyph, style, _) = theme::status_style(*tier);
+                title.push(Span::styled(format!("{glyph} "), style));
+            }
+            let inner = modal_frame(f, body, rect, Line::from(title));
+            let rendered: Vec<Line> = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if i == *row {
+                        Line::from(rename_field(l, *col))
+                    } else {
+                        Line::from(l.clone())
+                    }
+                })
+                .collect();
+            f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
         }
         Mode::Picker { selection, filter, cwd, on_cwd } => {
             let items = app.picker_filtered();
@@ -913,7 +1609,7 @@ fn draw_mode_overlay<B: PaneBackend>(
             // its selection with `❯`; the other shows its selection in
             // `ink` without the marker, so what will actually be launched
             // is readable from either side.
-            const ADAPTER_COL: usize = 16;
+            let adapter_col = ADAPTER_COL as usize;
             let rows = items.len().max(cwds.len());
             let lines: Vec<Line> = (0..rows)
                 .map(|i| {
@@ -921,12 +1617,12 @@ fn draw_mode_overlay<B: PaneBackend>(
                     match items.get(i) {
                         Some(item) => {
                             let text = picker_row_body(i, item);
-                            let pad = ADAPTER_COL.saturating_sub(mouse::display_width(&text) as usize + 1);
+                            let pad = adapter_col.saturating_sub(mouse::display_width(&text) as usize + 1);
                             let (marker, style) = row_marks(i == *selection, !*on_cwd);
                             spans.push(marker);
                             spans.push(Span::styled(format!("{text}{}", " ".repeat(pad)), style));
                         }
-                        None => spans.push(Span::raw(" ".repeat(ADAPTER_COL))),
+                        None => spans.push(Span::raw(" ".repeat(adapter_col))),
                     }
                     if let Some(path) = cwds.get(i) {
                         let (marker, style) = row_marks(i == *cwd, *on_cwd);
@@ -938,23 +1634,31 @@ fn draw_mode_overlay<B: PaneBackend>(
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
         }
-        Mode::Help { top } => {
+        Mode::Help { top, filter } => {
             // C15 (amended): the §8 key table, grouped, in as few columns as
             // fit and scrolled when even those don't. `HELP_GROUPS` is the
             // single source and `help_layout` the single geometry — the same
             // call `dialog_rect` above made for this rect.
-            let layout = help_layout(body);
-            let (visible, total) = help_scroll_extent(body);
+            let layout = help_layout(body, app.keymap(), filter.as_deref());
+            let (visible, total) = help_scroll_extent(body, app.keymap(), filter.as_deref());
             let top = (*top).min(total.saturating_sub(visible));
             // The title says how to leave — and, only when the table doesn't
             // fit, that there is more of it and which keys reach it. A
             // terminal showing everything says nothing about scrolling,
             // because there is nothing to scroll.
-            let heading = if total > visible {
-                format!(" keys — {}/{} · ↑↓ more · any key closes ", (top + visible).min(total), total)
-            } else {
-                " keys — any key to close ".to_string()
-            };
+            // [F9] The title is where the filter announces itself, exactly
+            // as C14's picker and C27's roster do — and it has to, because
+            // while a query is open "any key closes" is no longer true and
+            // a reader who cannot see why would be stuck. The un-filtered
+            // wordings below are untouched, so the amendment is invisible
+            // until `/` is pressed.
+            let heading = help_title(
+                filter.as_deref(),
+                (top + visible).min(total),
+                total,
+                total > visible,
+                body.width.saturating_sub(2),
+            );
             let inner = modal_frame(f, body, rect, Line::from(heading).style(theme::ink()));
             draw_help_columns(f, &layout, top, inner);
         }
@@ -1095,6 +1799,7 @@ fn roster_row_spans<B: PaneBackend>(
                 &adapter,
                 has_title,
                 app.is_raw(id),
+                spec.and_then(|s| s.note.as_ref()).is_some(),
                 spinner,
             ));
             spans
@@ -1217,10 +1922,10 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner
     let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
     let fit = mouse::status_fit(tab_status_word(app), cwd.as_deref(), saved, &names, area.width);
     let status_w = fit.map(|f| f.width).unwrap_or(0);
-    let show_status = mouse::effective_status_width(&names, area.width, status_w) > 0;
+    let show_status = mouse::effective_status_width(&names, area.width, status_w, saved, app.ws.active_tab) > 0;
     // U7: the drawn window — scrolled so the active tab is always visible.
     // `tab_at_x` reads the same layout, so hitboxes follow the scroll.
-    let strip = mouse::tab_strip(&names, area.width, status_w, app.ws.active_tab);
+    let strip = mouse::tab_strip(&names, area.width, status_w, saved, app.ws.active_tab);
 
     let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 4);
     let mut used = 0u16;
@@ -1497,10 +2202,11 @@ fn draw_pane<B: PaneBackend>(
     pr: PaneRect,
     stack_expanded: bool,
     spinner: char,
+    now: u64,
 ) {
     let focused = app.focused == pr.id;
     let raw = app.is_raw(pr.id);
-    let (status, name, has_title, adapter) = {
+    let (status, name, has_title, adapter, note) = {
         // find_spec, not the active tab's map directly: C22 learns the
         // float here too (its spec lives on the `Float`, not `Tab::panes`).
         let spec = app.find_spec(pr.id);
@@ -1521,7 +2227,22 @@ fn draw_pane<B: PaneBackend>(
         // indistinguishable at a glance; a pane publishing a live task line
         // now says what it's doing.
         let name = if spec.is_some() { app.display_name(pr.id) } else { "?".into() };
-        (status, name, has_title, adapter)
+        // C32: the badge's note segment — headline + age on the focused
+        // pane, a bare `¶` elsewhere; `¶⋮` marks a body under the
+        // headline. Built here because only draw_pane knows focus.
+        let note = spec.and_then(|s| {
+            s.note.as_ref().map(|n| {
+                let mut ls = n.lines();
+                let headline = ls.next().unwrap_or_default().to_string();
+                BadgeNote {
+                    headline,
+                    more: ls.next().is_some(),
+                    age: s.noted_at.map(|t| age_word(t, now)),
+                    focused,
+                }
+            })
+        });
+        (status, name, has_title, adapter, note)
     };
 
     if pr.collapsed {
@@ -1538,6 +2259,7 @@ fn draw_pane<B: PaneBackend>(
             &adapter,
             has_title,
             raw,
+            note.is_some(),
             spinner,
         );
         f.render_widget(Paragraph::new(Line::from(spans)), pr.rect);
@@ -1624,7 +2346,9 @@ fn draw_pane<B: PaneBackend>(
     let (base_glyph, glyph_style, spins) = theme::status_style(status);
     let glyph = badge_glyph(spins, scrolled, spinner, base_glyph);
     let text = badge_text(pr.id, &name, &adapter, has_title);
-    if let Some((rect, spans)) = corner_badge(inner, &text, raw, scrolled, glyph, glyph_style) {
+    if let Some((rect, spans)) =
+        corner_badge(inner, &text, note.as_ref(), raw, scrolled, glyph, glyph_style)
+    {
         f.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
 
@@ -1636,7 +2360,10 @@ fn draw_pane<B: PaneBackend>(
             lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
         }
         let resumable = app.resume_command_line(pr.id).is_some();
-        lines.push(Line::from(Span::raw(dead_bar_text(resumable))));
+        lines.push(Line::from(Span::raw(dead_bar_text(
+            resumable,
+            input::chord_for(app.keymap(), Action::ClosePane).as_deref(),
+        ))));
         let n = lines.len() as u16;
         let y = inner.y + inner.height.saturating_sub(n);
         let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
@@ -1653,10 +2380,16 @@ fn draw_pane<B: PaneBackend>(
 /// `y: copy resume` rides the bar only when the pane has a session pointer
 /// — same predicate as the hint bar's `resumable` (`App::resume_command_line`),
 /// so the two surfaces can't disagree about whether `y` does anything.
-fn dead_bar_text(resumable: bool) -> String {
+/// C34: `close` is resolved. This bar and the C9 hint bar one screen row
+/// below name the same chord, and before C34 only one of them derived it —
+/// so a remap made two surfaces on one screen disagree. An unbound close
+/// drops the clause; `Enter`/`f`/`y` stay literal because they are
+/// mode-local keys config.json cannot reach (C34's stated exemption).
+fn dead_bar_text(resumable: bool, close_chord: Option<&str>) -> String {
     let copy_hint = if resumable { " · y: copy resume" } else { "" };
+    let close = close_chord.map(|c| format!(" · {c}: close")).unwrap_or_default();
     format!(
-        " {} exited — Enter: relaunch/resume · f: fresh (drops resume){copy_hint} · Alt+w: close ",
+        " {} exited — Enter: relaunch/resume · f: fresh (drops resume){copy_hint}{close} ",
         theme::GLYPH_EXITED
     )
 }
@@ -1695,6 +2428,11 @@ fn paint_stack_edge(f: &mut Frame, rect: Rect) {
 /// (`row_word`/`row_status_style`), not a corpse. `spinner` is resolved from
 /// `status` in here (Working substitutes the current spinner frame) rather
 /// than by every caller.
+///
+/// C32: `noted` grows the right segment a leading `¶ ` in `ink()` — the
+/// C4 marker's exact meaning here (presence of a parked note, never its
+/// text: collapsed rows and the roster stay reveal-on-visit surfaces).
+/// It rides the right segment, so narrow rows shed it with the segment.
 #[allow(clippy::too_many_arguments)]
 fn collapsed_row_spans(
     width: u16,
@@ -1705,6 +2443,7 @@ fn collapsed_row_spans(
     adapter: &str,
     has_title: bool,
     raw: bool,
+    noted: bool,
     spinner: char,
 ) -> Vec<Span<'static>> {
     let (base_glyph, glyph_style, spins) = row_status_style(status);
@@ -1728,12 +2467,18 @@ fn collapsed_row_spans(
         format!("{} ", row_word(status))
     };
     let right = if raw { format!("raw · {right}") } else { right };
-    let right_w = mouse::display_width(&right);
+    // C32: the note marker leads the right segment, its own `ink()` span so
+    // it stays findable in a column of quiet state words.
+    let marker_w: u16 = if noted { 2 } else { 0 }; // "¶ "
+    let right_w = mouse::display_width(&right) + marker_w;
 
     if width >= left_w + right_w {
         let pad = width - left_w - right_w;
         let mut spans: Vec<Span> = left.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
         spans.push(Span::raw(" ".repeat(pad as usize)));
+        if noted {
+            spans.push(Span::styled("¶ ", theme::ink()));
+        }
         spans.push(Span::styled(right, theme::quiet()));
         spans
     } else {
@@ -1765,6 +2510,34 @@ fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
     );
 }
 
+/// C4's note segment data (C32): what the badge says about a parked note.
+/// `headline` is the note's first line, `more` marks a body under it (the
+/// `⋮`), `age` is the pre-rendered age tag — `None` when the note has no
+/// timestamp (hand-edited state): an absent fact renders as absent, never
+/// as a fabricated `now` — and `focused` picks between the two forms: the
+/// focused pane reads its note out, everything else shows a bare marker.
+/// Built by `draw_pane`, consumed by `corner_badge`.
+struct BadgeNote {
+    headline: String,
+    more: bool,
+    age: Option<String>,
+    focused: bool,
+}
+
+/// C4 (C32): the note age tag — the coarsest sensible unit, floored:
+/// `now` under a minute, then `5m` / `3h` / `2d`. This is how a stale
+/// note confesses instead of reading as current. A clock that moved
+/// backwards clamps to `now` rather than underflowing. Pure.
+fn age_word(noted_at: u64, now: u64) -> String {
+    let s = now.saturating_sub(noted_at);
+    match s {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
 /// Top-right corner badge (C4): pane name (+ adapter, when titled) and the
 /// status glyph, right-aligned with one column of breathing room. Two-tone:
 /// the text is `quiet`, the glyph carries its own C5 status style. A raw
@@ -1774,9 +2547,19 @@ fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
 /// glyph-adjacent (after `raw`), same `accent_quiet` family. Returns the
 /// 1-row rect and the clipped spans — or `None` if the pane is too small to
 /// be worth badging. Pure so it can be unit-tested.
+///
+/// C32: a pane with a parking note grows a note segment after the identity
+/// text — on the focused pane `¶ {headline} ({age})`, headline in `ink()`
+/// (the badge's one full-strength element: reveal-on-visit is the note's
+/// whole display story, and quiet input you're hunting for is input you
+/// cannot find), age in `quiet`; on an unfocused pane just the `¶` marker
+/// in `ink()` — presence, not content. `¶⋮` when a body sits under the
+/// headline. Identity leads and the note trails it, so C4's id-first rule
+/// holds untouched and a narrow pane clips the note before the join key.
 fn corner_badge(
     inner: Rect,
     text: &str,
+    note: Option<&BadgeNote>,
     raw: bool,
     scrolled: usize,
     glyph: char,
@@ -1788,11 +2571,24 @@ fn corner_badge(
     let max = inner.width.saturating_sub(1);
     // One space of breathing room on the right edge (the trailing space in
     // the glyph part).
-    let mut parts: Vec<(String, Style)> = Vec::with_capacity(4);
-    if raw || scrolled > 0 {
+    let mut parts: Vec<(String, Style)> = Vec::with_capacity(6);
+    let noted_focused = note.is_some_and(|n| n.focused);
+    if raw || scrolled > 0 || noted_focused {
         parts.push((format!(" {text} · "), theme::quiet()));
     } else {
         parts.push((format!(" {text} "), theme::quiet()));
+    }
+    if let Some(n) = note {
+        let marker = if n.more { "¶⋮" } else { "¶" };
+        if n.focused {
+            parts.push((format!("{marker} {}", n.headline), theme::ink()));
+            match &n.age {
+                Some(age) => parts.push((format!(" ({age}) "), theme::quiet())),
+                None => parts.push((" ".into(), theme::quiet())),
+            }
+        } else {
+            parts.push((format!("{marker} "), theme::ink()));
+        }
     }
     if raw {
         let token = if scrolled > 0 { "raw · " } else { "raw " };
@@ -2025,11 +2821,39 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 mod tests {
     use crate::App;
     use super::{
-        badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_style,
-        collapsed_row_spans, corner_badge, feed_entry_spans, feed_window,
-        help_content_width, help_layout, help_lines, hint_bar_right_spans, hint_pairs, mode_word,
-        push_tab_spans, should_place_cursor, stack_header_text, state_word, HelpLine, HELP_GROUPS,
+        age_word, badge_text, blit_screen, cell_in_selection, centered_near,
+        collapsed_name_style, collapsed_row_spans, corner_badge, dialog_rect, feed_entry_spans,
+        feed_window, help_content_width, help_layout, help_lines, hint_bar_right_spans,
+        mode_word, push_tab_spans, should_place_cursor, stack_header_text,
+        state_word, BadgeNote, HelpKey, HelpLine, HELP_GROUPS,
     };
+    use crate::ui::input::{self, Action, Keymap};
+
+    /// F1: `hint_pairs` takes a keymap now. Every test below is about the
+    /// *content* of a bar rather than about remapping, so they go through
+    /// this default-keymap wrapper and keep reading as they did — the
+    /// remap behaviour has its own tests.
+    fn hint_pairs(
+        mode: &Mode,
+        focused_dead: bool,
+        resumable: bool,
+        focused_raw: bool,
+        help_scrolled: bool,
+    ) -> Vec<(String, &'static str)> {
+        super::hint_pairs(mode, focused_dead, resumable, focused_raw, help_scrolled,
+            &Keymap::default())
+    }
+
+    /// Build an expected pair list. Keys are owned since F1 (they are
+    /// resolved, not compiled in), and writing `.to_string()` on every
+    /// literal would drown the lists this file is meant to make readable.
+    fn p(pairs: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
+        pairs.iter().map(|(k, d)| ((*k).to_string(), *d)).collect()
+    }
+
+    fn one(k: &str, d: &'static str) -> (String, &'static str) {
+        (k.to_string(), d)
+    }
     use crate::core::app::{Mode, RenameTarget, RosterRow};
     use crate::core::status::AgentStatus;
     use crate::ui::mouse;
@@ -2073,7 +2897,7 @@ mod tests {
     fn badge_is_two_toned_and_right_aligned_on_top_row() {
         // inner content area at (1,1) sized 40x20 (borders excluded)
         let inner = Rect::new(1, 1, 40, 20);
-        let (rect, spans) = corner_badge(inner, "claude", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
+        let (rect, spans) = corner_badge(inner, "claude", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         assert_eq!(rect.y, inner.y); // top row of the content
         assert_eq!(rect.height, 1);
         // right edge: badge ends one col shy of the inner right edge is fine;
@@ -2090,7 +2914,7 @@ mod tests {
     fn badge_clips_and_drops_the_glyph_first_when_pane_too_small() {
         let inner = Rect::new(0, 0, 6, 5);
         let (rect, spans) =
-            corner_badge(inner, "a-very-long-name", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
+            corner_badge(inner, "a-very-long-name", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         assert!(total <= 5); // width-1 breathing room
         assert!(rect.x >= inner.x && rect.x + rect.width <= inner.x + inner.width);
@@ -2105,7 +2929,7 @@ mod tests {
         // overflow the pane by several columns (D1). The fix must stop
         // clipping on a display-width boundary and never split a glyph.
         let inner = Rect::new(0, 0, 5, 5); // budget = inner.width - 1 = 4
-        let (rect, spans) = corner_badge(inner, "日本語", false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+        let (rect, spans) = corner_badge(inner, "日本語", None, false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let rendered_width: u16 = spans.iter().map(|s| mouse::display_width(&s.content)).sum();
         assert!(rendered_width <= 4, "clipped badge must fit its column budget, got {rendered_width}");
         assert!(rect.width <= 4);
@@ -2137,9 +2961,9 @@ mod tests {
 
     #[test]
     fn no_badge_for_tiny_or_empty() {
-        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
+        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
     }
 
     // -- C23 raw indication ---------------------------------------------------
@@ -2148,7 +2972,7 @@ mod tests {
     fn badge_gains_a_raw_token_in_its_own_quiet_red() {
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "scratch · shell", true, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+            corner_badge(inner, "scratch · shell", None, true, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" scratch · shell · raw {} ", theme::GLYPH_IDLE));
         let raw_span = spans.iter().find(|s| s.content.as_ref() == "raw ").expect("raw token span");
@@ -2160,7 +2984,7 @@ mod tests {
     #[test]
     fn badge_without_raw_has_no_raw_token() {
         let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) = corner_badge(inner, "pi", false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+        let (_, spans) = corner_badge(inner, "pi", None, false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("raw"));
     }
@@ -2173,7 +2997,7 @@ mod tests {
         // quiet-red family as the raw token, glyph-adjacent.
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", false, 42, theme::GLYPH_WORKING, theme::accent()).unwrap();
+            corner_badge(inner, "3 pi", None, false, 42, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · ↑42 {} ", theme::GLYPH_WORKING));
         let token = spans.iter().find(|s| s.content.as_ref() == "↑42 ").expect("↑N token span");
@@ -2185,7 +3009,7 @@ mod tests {
         // raw · ↑N — input state first, then view state, then the glyph.
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", true, 7, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+            corner_badge(inner, "3 pi", None, true, 7, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · raw · ↑7 {} ", theme::GLYPH_IDLE));
     }
@@ -2194,9 +3018,149 @@ mod tests {
     fn badge_at_live_tail_has_no_scrolled_token() {
         let inner = Rect::new(0, 0, 40, 20);
         let (_, spans) =
-            corner_badge(inner, "3 pi", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
+            corner_badge(inner, "3 pi", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains('↑'), "{text}");
+    }
+
+    // -- C32: the badge's note segment ------------------------------------
+
+    /// C32: the focused pane's badge reads its note out — headline in
+    /// `ink()` (the badge's one full-strength element), age tag `quiet` —
+    /// after the identity text, so C4's id-first rule holds and a narrow
+    /// pane clips the note before the join key.
+    #[test]
+    fn focused_badge_reads_the_headline_in_ink_with_a_quiet_age() {
+        let inner = Rect::new(0, 0, 60, 20);
+        let note = BadgeNote {
+            headline: "tests green, PR up".into(),
+            more: false,
+            age: Some("14h".into()),
+            focused: true,
+        };
+        let (_, spans) =
+            corner_badge(inner, "3 api", Some(&note), false, 0, theme::GLYPH_WAITING, theme::ink())
+                .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 api · ¶ tests green, PR up (14h) {} ", theme::GLYPH_WAITING));
+        let headline =
+            spans.iter().find(|s| s.content.as_ref().contains("tests green")).unwrap();
+        assert_eq!(headline.style, theme::ink(), "the headline is the badge's loud element");
+        let age = spans.iter().find(|s| s.content.as_ref().contains("(14h)")).unwrap();
+        assert_eq!(age.style, theme::quiet(), "the age tag stays quiet");
+
+        // A note missing its timestamp (hand-edited state) shows NO age tag
+        // — an absent fact renders as absent, never as a fabricated "now".
+        let unstamped = BadgeNote { age: None, ..note };
+        let (_, spans) = corner_badge(
+            inner,
+            "3 api",
+            Some(&unstamped),
+            false,
+            0,
+            theme::GLYPH_WAITING,
+            theme::ink(),
+        )
+        .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 api · ¶ tests green, PR up {} ", theme::GLYPH_WAITING));
+    }
+
+    /// C32: an unfocused pane's badge marks presence, never content — a
+    /// bare `¶` in `ink()` (`¶⋮` when a body exists), no headline, no age.
+    /// Reveal-on-visit is the display contract.
+    #[test]
+    fn unfocused_badge_shows_only_the_note_marker() {
+        let inner = Rect::new(0, 0, 60, 20);
+        let note = BadgeNote {
+            headline: "tests green, PR up".into(),
+            more: false,
+            age: Some("14h".into()),
+            focused: false,
+        };
+        let (_, spans) =
+            corner_badge(inner, "3 api", Some(&note), false, 0, theme::GLYPH_IDLE, theme::quiet())
+                .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" 3 api ¶ {} ", theme::GLYPH_IDLE));
+        let marker = spans.iter().find(|s| s.content.as_ref() == "¶ ").unwrap();
+        assert_eq!(marker.style, theme::ink(), "the marker is findable, not dim");
+
+        // A body under the headline shows as ¶⋮ — "there's more here".
+        let deeper = BadgeNote { more: true, ..note };
+        let (_, spans) =
+            corner_badge(inner, "3 api", Some(&deeper), false, 0, theme::GLYPH_IDLE, theme::quiet())
+                .unwrap();
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("¶⋮"), "{text}");
+    }
+
+    /// C32: the age tag's units — floored, coarsest-sensible, "now" under
+    /// a minute; a backwards clock clamps instead of underflowing.
+    #[test]
+    fn age_word_floors_to_the_coarsest_sensible_unit() {
+        assert_eq!(age_word(100, 100), "now");
+        assert_eq!(age_word(100, 159), "now");
+        assert_eq!(age_word(100, 160), "1m");
+        assert_eq!(age_word(0, 59 * 60), "59m");
+        assert_eq!(age_word(0, 3600), "1h");
+        assert_eq!(age_word(0, 86399), "23h");
+        assert_eq!(age_word(0, 86400), "1d");
+        assert_eq!(age_word(0, 86400 * 3 + 7), "3d");
+        assert_eq!(age_word(500, 100), "now", "a clock that moved backwards clamps");
+    }
+
+    /// C32: a noted collapsed row's right segment leads with `¶ ` in its
+    /// own `ink()` span — presence only, same meaning as the unfocused
+    /// badge marker — and sheds with the segment when narrow.
+    #[test]
+    fn noted_collapsed_row_marks_the_right_segment() {
+        let spans = collapsed_row_spans(
+            40,
+            false,
+            Some(AgentStatus::Idle),
+            2,
+            "api",
+            "shell",
+            false,
+            false,
+            true,
+            theme::GLYPH_WORKING,
+        );
+        let marker = spans.iter().find(|s| s.content.as_ref() == "¶ ").expect("marker span");
+        assert_eq!(marker.style, theme::ink());
+        // Narrow: the whole right segment — marker included — sheds.
+        let spans = collapsed_row_spans(
+            8,
+            false,
+            Some(AgentStatus::Idle),
+            2,
+            "api",
+            "shell",
+            false,
+            false,
+            true,
+            theme::GLYPH_WORKING,
+        );
+        assert!(spans.iter().all(|s| !s.content.as_ref().contains('¶')));
+    }
+
+    /// C32: the note dialog is Rename's width, one content row per line —
+    /// it grows a row per Shift+↵ instead of scrolling.
+    #[test]
+    fn note_dialog_height_tracks_its_line_count() {
+        let body = Rect::new(0, 0, 100, 30);
+        let mk = |n: usize| Mode::PaneEdit {
+            name: String::new(),
+            lines: vec![String::new(); n],
+            row: 0,
+            col: 0,
+            pane: 1,
+        };
+        let one = dialog_rect(&mk(1), body, body, 0, &[], &Keymap::default()).unwrap();
+        assert_eq!((one.width, one.height), (44, 4), "name row + one note line");
+        let five = dialog_rect(&mk(5), body, body, 0, &[], &Keymap::default()).unwrap();
+        assert_eq!(five.height, 8);
     }
 
     #[test]
@@ -2215,12 +3179,12 @@ mod tests {
     fn hint_bar_right_carries_the_scroll_position_ahead_of_the_mode_word() {
         // U3: `↑N/M` rides inside the right segment (quiet), so C9's yield
         // machinery covers it — and it only exists when a position is given.
-        let spans = hint_bar_right_spans(None, None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(None, None, Some("↑12/300".into()), "SCROLL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "↑12/300 SCROLL ");
         assert_eq!(spans[0].style, theme::quiet());
 
-        let spans = hint_bar_right_spans(Some((2, true)), None, Some("↑12/300".into()), "SCROLL");
+        let spans = hint_bar_right_spans(Some((2, true)), None, Some("↑12/300".into()), "SCROLL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 2 needs you · Alt+a  ↑12/300 SCROLL ");
     }
@@ -2230,12 +3194,12 @@ mod tests {
     /// a real ◆ still reads as more urgent.
     #[test]
     fn hint_bar_right_segment_renders_the_waiting_fallback_one_step_back_from_needs_input() {
-        let spans = hint_bar_right_spans(Some((3, false)), None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, false)), None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "○ 3 your turn · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::ink());
 
-        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::accent());
@@ -2252,7 +3216,7 @@ mod tests {
         let lines: Vec<String> = ["alpha beta", "beta beta"].map(String::from).to_vec();
         let mut s = Search::over(lines, "beta", 1);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/beta{} 2/3 SEARCH ", theme::RENAME_CURSOR));
         assert_eq!(spans[0].style, theme::ink(), "the typed query is legible, not dim");
@@ -2262,7 +3226,7 @@ mod tests {
         // empty result is the answer, not the absence of one.
         s = Search::over(vec!["alpha beta".into()], "gamma", 0);
         let (query, position) = super::search_segment(Some(&s));
-        let spans = hint_bar_right_spans(None, query, position, "SEARCH");
+        let spans = hint_bar_right_spans(None, query, position, "SEARCH", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!("/gamma{} 0/0 SEARCH ", theme::RENAME_CURSOR));
 
@@ -2360,7 +3324,7 @@ mod tests {
     #[test]
     fn collapsed_row_shows_right_segment_when_it_fits() {
         let spans =
-            collapsed_row_spans(40, false, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(40, false, Some(AgentStatus::Working), 2, "pi", "pi", true, false, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("pi · working "));
     }
@@ -2372,7 +3336,7 @@ mod tests {
         // right segment is the bare state word — "your turn", not
         // "shell · your turn". [DESIGN-ui.md amended 2026-07-22, ux #3.]
         let spans =
-            collapsed_row_spans(40, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(40, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, false, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("your turn "));
         assert!(!text.contains("shell ·"));
@@ -2385,7 +3349,7 @@ mod tests {
         // nothing more (U2: the id rides with the name on the left).
         let left_w = 5 + name.chars().count() as u16;
         let spans =
-            collapsed_row_spans(left_w, false, Some(AgentStatus::Idle), 2, name, "shell", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(left_w, false, Some(AgentStatus::Idle), 2, name, "shell", true, false, false, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" · 2 {name}"));
         assert!(!text.contains("shell"));
@@ -2400,6 +3364,7 @@ mod tests {
             2,
             "a-very-long-pane-name",
             "shell",
+            false,
             true,
             false,
             theme::GLYPH_WORKING,
@@ -2412,19 +3377,19 @@ mod tests {
     #[test]
     fn collapsed_row_focused_marker_is_accent() {
         let spans =
-            collapsed_row_spans(40, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(40, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, false, theme::GLYPH_WORKING);
         assert_eq!(spans[0].content.as_ref(), theme::MARKER_ACTIVE.to_string());
         assert_eq!(spans[0].style, theme::accent());
     }
 
     #[test]
     fn collapsed_row_raw_gains_the_prefix_ahead_of_the_usual_right_segment() {
-        let titled = collapsed_row_spans(60, false, Some(AgentStatus::Working), 2, "pi", "pi", true, true, theme::GLYPH_WORKING);
+        let titled = collapsed_row_spans(60, false, Some(AgentStatus::Working), 2, "pi", "pi", true, true, false, theme::GLYPH_WORKING);
         let text: String = titled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · pi · working "), "{text}");
 
         let untitled =
-            collapsed_row_spans(60, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, true, theme::GLYPH_WORKING);
+            collapsed_row_spans(60, false, Some(AgentStatus::Waiting), 2, "shell", "shell", false, true, false, theme::GLYPH_WORKING);
         let text: String = untitled.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.ends_with("raw · your turn "), "{text}");
     }
@@ -2444,15 +3409,15 @@ mod tests {
         // last, `Alt+r rename` last so it drops first.
         assert_eq!(
             hint_pairs(&Mode::Normal, false, false, false, false),
-            vec![
+            p(&[
                 ("Alt+?", "keys"),
                 ("Alt+n", "new"),
                 ("Alt+↵", "launch"),
                 ("Alt+s", "stack"),
                 ("Alt+←↓↑→", "focus"),
                 ("Alt+w", "close"),
-                ("Alt+r", "rename"),
-            ],
+                ("Alt+r", "edit"),
+            ]),
         );
     }
 
@@ -2465,19 +3430,19 @@ mod tests {
     #[test]
     fn the_help_pair_is_the_last_hint_to_yield_and_rename_the_first() {
         let pairs = hint_pairs(&Mode::Normal, false, false, false, false);
-        let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
+        let pw = |x: &(String, &str)| super::hint_pair_cols(&x.0, x.1);
         let right_w = " ◆ 1 needs you · Alt+a  NORMAL ".chars().count() as u16 - 1;
 
         let shown = super::fit_hint_pairs(&pairs, right_w, 120);
         assert_eq!(shown, pairs.len() - 1, "exactly one pair yields at 120 cols");
-        assert!(!pairs[..shown].contains(&("Alt+r", "rename")), "rename drops first");
-        assert!(pairs[..shown].contains(&("Alt+?", "keys")), "the help pair survives");
+        assert!(!pairs[..shown].contains(&one("Alt+r", "edit")), "the edit pair drops first");
+        assert!(pairs[..shown].contains(&one("Alt+?", "keys")), "the help pair survives");
 
         // Squeeze until a single pair is left: it must be the help pair.
         let width = right_w + pw(&pairs[0]);
         let shown = super::fit_hint_pairs(&pairs, right_w, width);
         assert_eq!(shown, 1);
-        assert_eq!(pairs[0], ("Alt+?", "keys"));
+        assert_eq!(pairs[0], one("Alt+?", "keys"));
     }
 
     /// C24's list as amended by U17: the mode's whole vocabulary, and it
@@ -2488,7 +3453,7 @@ mod tests {
         let pairs = hint_pairs(&Mode::Copy { cursor: (0, 0) }, false, false, false, false);
         assert_eq!(
             pairs,
-            vec![
+            p(&[
                 ("hjkl", "move"),
                 ("w/b/e", "word"),
                 ("0/$", "ends"),
@@ -2497,10 +3462,10 @@ mod tests {
                 ("o", "open"),
                 ("drag", "select"),
                 ("Esc", "exit"),
-            ],
+            ]),
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        let right_w = super::hint_bar_right_spans(None, None, None, "COPY")
+        let right_w = super::hint_bar_right_spans(None, None, None, "COPY", Some("Alt+a".into()))
             .iter()
             .map(|s| mouse::display_width(&s.content))
             .sum::<u16>();
@@ -2513,7 +3478,7 @@ mod tests {
     #[test]
     fn hint_pairs_focused_raw_normal_is_exactly_one_pair() {
         // C23: every other hint would be a lie — nothing else is intercepted.
-        assert_eq!(hint_pairs(&Mode::Normal, false, false, true, false), vec![("Alt+Shift+p", "exit raw")]);
+        assert_eq!(hint_pairs(&Mode::Normal, false, false, true, false), p(&[("Alt+Shift+p", "exit raw")]));
     }
 
     #[test]
@@ -2524,13 +3489,13 @@ mod tests {
         // not a raw-exit hint nothing would honor.
         assert_eq!(
             hint_pairs(&Mode::Normal, true, false, true, false),
-            vec![("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")],
+            p(&[("↵", "relaunch"), ("f", "fresh — drops resume"), ("Alt+w", "close"), ("Alt+q", "quit")]),
         );
     }
 
     #[test]
     fn hint_bar_right_omits_needs_segment_at_zero() {
-        let spans = hint_bar_right_spans(None, None, None, "NORMAL");
+        let spans = hint_bar_right_spans(None, None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "NORMAL ");
         assert!(!text.contains('◆'));
@@ -2538,7 +3503,7 @@ mod tests {
 
     #[test]
     fn hint_bar_right_shows_aggregate_before_mode_word_when_nonzero() {
-        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL");
+        let spans = hint_bar_right_spans(Some((3, true)), None, None, "NORMAL", Some("Alt+a".into()));
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "◆ 3 needs you · Alt+a  NORMAL ");
         assert_eq!(spans[0].style, theme::accent());
@@ -2550,43 +3515,78 @@ mod tests {
     /// description decides it.
     #[test]
     fn help_content_width_fits_the_widest_row() {
-        let widest = HELP_GROUPS
+        // F1: measured over the *resolved* lines, since a row's key column
+        // is no longer a compiled-in literal.
+        let lines = help_lines(&Keymap::default(), "");
+        let widest = lines
             .iter()
-            .flat_map(|g| g.rows.iter())
-            .max_by_key(|(k, d)| {
-                mouse::display_width(&super::help_key_prefix(k)) + mouse::display_width(d)
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => {
+                    Some(mouse::display_width(&super::help_key_prefix(k)) + mouse::display_width(d))
+                }
+                HelpLine::Head(_) => None,
             })
+            .max()
             .expect("the keymap has rows");
-        assert_eq!(
-            help_content_width(),
-            mouse::display_width(&super::help_key_prefix(widest.0))
-                + mouse::display_width(widest.1),
-        );
+        assert_eq!(help_content_width(&lines), widest);
     }
 
+    /// C15: on a terminal too narrow for the keymap, the dialog is placed
+    /// **inside** the body rather than merely reporting a size that fits.
+    ///
+    /// Every assertion in this test used to be vacuous. It read
+    /// `w <= body.width` from `help_layout`, which ends in
+    /// `.min(body.width)`; then `rect.width <= body.width` from
+    /// `centered_near`, which opens with `width.min(bounds.width)`. Both
+    /// hold by construction — the test's own comment said so and then
+    /// asserted them anyway — so if either clamp were deleted the other
+    /// would cover for it and this would still pass.
+    ///
+    /// What can actually go wrong is the *placement* arithmetic
+    /// (`.clamp(bounds.x, bounds.x + bounds.width - w)`), so that is what
+    /// this asserts now — with an **anchor hugging the right edge**, since
+    /// a dialog centred on the body is inside it whether that clamp runs or
+    /// not. The first rewrite missed that and still survived deleting the
+    /// clamp; only the edge anchor makes the assertion bite. Found by
+    /// sweeping for the shape three audits had already caught on this
+    /// branch, then by mutation-testing the replacement.
     #[test]
     fn help_dialog_clamps_to_the_screen_via_centered_near() {
-        // `help_layout` clamps its own width to the body, and
-        // `centered_near` clamps the placement — same as every other modal
-        // (C15's anchoring is unchanged).
         let body = Rect::new(0, 1, 30, 20);
-        let (w, h) = help_layout(body).size;
-        assert!(w <= body.width);
-        let rect = centered_near(body, body, w, h);
-        assert!(rect.width <= body.width && rect.height <= body.height);
+        let layout = help_layout(body, &Keymap::default(), None);
+        assert!(
+            layout.asked > body.width,
+            "the keymap must not fit this body, or the width clamp is untested: asked {}",
+            layout.asked,
+        );
+        let (w, h) = layout.size;
+        // A pane against the right edge: centring the dialog on it alone
+        // would put most of it off-screen.
+        let anchor = Rect::new(24, 1, 6, 20);
+        let rect = centered_near(anchor, body, w, h);
+        assert!(rect.x >= body.x, "placed off the left edge: {rect:?}");
+        assert!(
+            rect.x + rect.width <= body.x + body.width,
+            "spilled past the right edge: {rect:?} in {body:?}",
+        );
+        assert!(rect.y >= body.y, "placed above the body: {rect:?}");
+        assert!(
+            rect.y + rect.height <= body.y + body.height,
+            "spilled past the bottom: {rect:?} in {body:?}",
+        );
     }
 
     #[test]
     fn mode_word_matches_c9_table() {
         assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
         assert_eq!(
-            mode_word(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false),
+            mode_word(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false),
             "RENAME"
         );
         assert_eq!(mode_word(&Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false }, false, false), "PICKER");
         assert_eq!(mode_word(&Mode::Scroll, false, false), "SCROLL");
         assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false), "COPY");
-        assert_eq!(mode_word(&Mode::Help { top: 0 }, false, false), "HELP");
+        assert_eq!(mode_word(&Mode::Help { top: 0, filter: None }, false, false), "HELP");
     }
 
     #[test]
@@ -2596,7 +3596,7 @@ mod tests {
         assert_eq!(mode_word(&Mode::Normal, true, false), "ZOOM");
         assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
         assert_eq!(mode_word(&Mode::Scroll, true, false), "SCROLL");
-        assert_eq!(mode_word(&Mode::Help { top: 0 }, true, false), "HELP");
+        assert_eq!(mode_word(&Mode::Help { top: 0, filter: None }, true, false), "HELP");
     }
 
     #[test]
@@ -2615,7 +3615,7 @@ mod tests {
         // via the SAME `hint_pair_cols` the draw path uses — a +3/+4 drift
         // here once let the whole segment drop at widths 111-116 (D2).
         let pairs = hint_pairs(&Mode::Normal, false, false, false, false);
-        let pw = |p: &(&str, &str)| super::hint_pair_cols(p.0, p.1);
+        let pw = |x: &(String, &str)| super::hint_pair_cols(&x.0, x.1);
         let all_w: u16 = pairs.iter().map(&pw).sum();
 
         // Roomy bar, no right segment: everything fits.
@@ -2647,12 +3647,12 @@ mod tests {
         let dead = hint_pairs(&Mode::Normal, true, false, false, false);
         assert_eq!(
             dead,
-            vec![
+            p(&[
                 ("↵", "relaunch"),
                 ("f", "fresh — drops resume"),
                 ("Alt+w", "close"),
                 ("Alt+q", "quit"),
-            ],
+            ]),
         );
         // A live pane never offers "relaunch"; a dead one never offers "new".
         assert_ne!(dead, hint_pairs(&Mode::Normal, false, false, false, false));
@@ -2661,13 +3661,13 @@ mod tests {
         // lives on this bar). A session-less pane must NOT advertise it.
         assert_eq!(
             hint_pairs(&Mode::Normal, true, true, false, false),
-            vec![
+            p(&[
                 ("↵", "relaunch"),
                 ("f", "fresh — drops resume"),
                 ("y", "copy resume"),
                 ("Alt+w", "close"),
                 ("Alt+q", "quit"),
-            ],
+            ]),
         );
     }
 
@@ -2676,11 +3676,11 @@ mod tests {
     #[test]
     fn dead_bar_text_offers_copy_resume_only_when_resumable() {
         assert_eq!(
-            super::dead_bar_text(false),
+            super::dead_bar_text(false, Some("Alt+w")),
             " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · Alt+w: close "
         );
         assert_eq!(
-            super::dead_bar_text(true),
+            super::dead_bar_text(true, Some("Alt+w")),
             " ✕ exited — Enter: relaunch/resume · f: fresh (drops resume) · y: copy resume · Alt+w: close "
         );
     }
@@ -2691,13 +3691,51 @@ mod tests {
     fn hint_pairs_feed_mode_lists_every_key_the_feed_answers_to() {
         assert_eq!(
             hint_pairs(&Mode::Feed { offset: 0 }, false, false, false, false),
-            vec![
+            p(&[
                 ("↑↓", "select"),
                 ("PgUp/Dn", "page"),
                 ("↵", "go to pane"),
                 ("q/Esc", "close"),
-            ],
+            ]),
         );
+    }
+
+    /// C36/C9: the composer's list, its column figure, and — the part that
+    /// matters — its **yield order**. At the 100-col floor with the
+    /// needs-you segment up, trailing pairs drop, so the order is a safety
+    /// property rather than a style choice: `↵ send` and `Esc cancel` must
+    /// still be on the bar when the fleet is busy, which is exactly when
+    /// someone is composing a broadcast. (The C36 audit found C9 had never
+    /// been amended for this mode and nothing pinned the list.)
+    #[test]
+    fn hint_pairs_broadcast_leads_with_the_two_that_must_not_yield() {
+        let mode = Mode::Broadcast {
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+            status_filter: None,
+        };
+        let pairs = hint_pairs(&mode, false, false, false, false);
+        assert_eq!(
+            pairs,
+            p(&[
+                ("↵", "send"),
+                ("Esc", "cancel"),
+                ("Tab", "who gets it"),
+                ("Shift+↵", "new line"),
+                ("type", "message"),
+            ]),
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        assert_eq!(cols, 74, "C36 quotes 74 columns");
+
+        // The property the order exists for: with the needs-you segment up
+        // at the floor, what survives is send and cancel.
+        let right_w = " ◆ 3 needs you · Alt+a  BROADCAST ".chars().count() as u16 - 1;
+        let shown = super::fit_hint_pairs(&pairs, right_w, 100);
+        assert!(shown >= 2, "at least send and cancel survive a busy fleet");
+        assert_eq!(pairs[0], one("↵", "send"));
+        assert_eq!(pairs[1], one("Esc", "cancel"));
     }
 
     /// C27/C9: the roster's own list, and the 68-column number the contract
@@ -2711,14 +3749,14 @@ mod tests {
         let pairs = hint_pairs(&mode, false, false, false, false);
         assert_eq!(
             pairs,
-            vec![
+            p(&[
                 ("↑↓", "select"),
                 ("PgUp/Dn", "page"),
                 ("↵", "go to pane"),
                 ("type", "filter"),
                 ("Tab", "status"),
                 ("Esc", "close"),
-            ],
+            ]),
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
         assert_eq!(cols, 81, "C27 quotes 81 columns");
@@ -2726,18 +3764,49 @@ mod tests {
         assert!(!pairs.iter().any(|(k, _)| k.contains('q')), "`q` filters, it does not close");
     }
 
-    /// C15 (amended): the hint bar tells the truth in both cases. A keymap
-    /// that fits is closed by any key and says so; a scrolled one advertises
-    /// the reading keys and narrows the claim to "any *other* key", because
-    /// the arrows have stopped closing it.
+    /// C15 (amended): the hint bar tells the truth in all three states. A
+    /// keymap that fits is closed by any key and says so; a scrolled one
+    /// advertises the reading keys and narrows the claim to "any *other*
+    /// key", because the arrows have stopped closing it; a **filtered** one
+    /// drops the claim entirely, because a letter is query text now.
+    ///
+    /// [F9] That last row is C27's roster pairs, and for the reason the
+    /// roster's own comment gives: once typing filters, `Esc` is the way
+    /// out and the bar has to lead with it. A bar still promising "any key
+    /// closes" over a live query would be the one lie this surface cannot
+    /// afford — it is the surface you open *because* you are lost.
     #[test]
     fn the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls() {
-        let whole = hint_pairs(&Mode::Help { top: 0 }, false, false, false, false);
-        assert_eq!(whole, vec![("Alt+?", "all keys"), ("any key", "close")]);
-        let scrolled = hint_pairs(&Mode::Help { top: 0 }, false, false, false, true);
-        assert_eq!(scrolled, vec![("↑↓ PgUp/Dn", "read on"), ("any other key", "close")]);
-        let cols: u16 = scrolled.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
-        assert!(cols < 100, "the scrolled row still fits beside the right segment: {cols}");
+        let whole = hint_pairs(&Mode::Help { top: 0, filter: None }, false, false, false, false);
+        assert_eq!(whole, p(&[("Alt+?", "all keys"), ("/", "filter"), ("any key", "close")]));
+        let scrolled = hint_pairs(&Mode::Help { top: 0, filter: None }, false, false, false, true);
+        assert_eq!(
+            scrolled,
+            p(&[("↑↓ PgUp/Dn", "read on"), ("/", "filter"), ("any other key", "close")]),
+        );
+        let filtered = hint_pairs(
+            &Mode::Help { top: 0, filter: Some("mov".into()) },
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            filtered,
+            p(&[("type", "filter"), ("↑↓ PgUp/Dn", "read on"), ("Esc", "clear · close")]),
+        );
+        assert!(
+            !filtered.iter().any(|(_, l)| l.contains("any key")),
+            "a live query means `any key closes` is false — the bar must not still say it",
+        );
+        // C9's budget, at the floor, for every state. The `/` pair is new
+        // width on two rows that were already sized; if it did not fit, the
+        // affordance would have to go somewhere else rather than be shipped
+        // over the floor.
+        for (what, row) in [("whole", &whole), ("scrolled", &scrolled), ("filtered", &filtered)] {
+            let cols: u16 = row.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+            assert!(cols < 100, "{what} row must fit beside the right segment: {cols}");
+        }
     }
 
     #[test]
@@ -2752,14 +3821,28 @@ mod tests {
         assert_eq!(mode_word(&Mode::Feed { offset: 0 }, true, false), "FEED");
     }
 
+    /// C32: the tab dialog and the combined pane editor lead their hint
+    /// lists with different words — the bar always says which one is up.
     #[test]
-    fn hint_pairs_rename_word_differs_pane_vs_tab() {
-        let pane =
-            hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane }, false, false, false, false);
+    fn hint_pairs_rename_word_differs_tab_vs_pane_editor() {
         let tab =
             hint_pairs(&Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab }, false, false, false, false);
-        assert_eq!(pane[0], ("type", "pane name"));
-        assert_eq!(tab[0], ("type", "tab name"));
+        let editor = hint_pairs(
+            &Mode::PaneEdit {
+                name: String::new(),
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                pane: 1,
+            },
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(tab[0], one("type", "tab name"));
+        assert_eq!(editor[0], one("type", "name / note"));
+        assert!(editor.iter().any(|x| x.1 == "new line"));
     }
 
     #[test]
@@ -2884,7 +3967,7 @@ mod tests {
     #[test]
     fn collapsed_row_spans_at_zero_width_is_empty_not_panicking() {
         let spans =
-            collapsed_row_spans(0, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, theme::GLYPH_WORKING);
+            collapsed_row_spans(0, true, Some(AgentStatus::Working), 2, "pi", "pi", true, false, false, theme::GLYPH_WORKING);
         assert!(spans.is_empty());
     }
 
@@ -2981,26 +4064,296 @@ mod tests {
     // -- C15/§8 help overlay ---------------------------------------------------
 
     /// §8's table and the drawn keymap are the same table: **every chord
-    /// roost binds appears in the overlay**. This is the check the old ≤20
-    /// cap made impossible to state — under a cap, a new chord's options
-    /// were "merge a row" or "go undocumented", and the second is exactly
-    /// what a keymap must never do.
+    /// roost binds is documented by the overlay**.
+    ///
+    /// **[Rewritten by F1, 2026-08-19.]** This used to be a hand-kept list
+    /// of 27 chord literals checked for containment against the hand-kept
+    /// `HELP_GROUPS` text — both `const`, neither derived from
+    /// `default_chord_action`. It therefore proved only that one constant
+    /// mentioned strings another constant was written to contain: it said
+    /// nothing about the running binary, and a newly bound chord passed it
+    /// silently unless someone remembered to extend the list by hand. C33
+    /// bound four chords and had to do exactly that.
+    ///
+    /// It is a real sweep now, over the same merged table `translate_with`
+    /// dispatches on. It checks **actions rather than chord spellings**,
+    /// deliberately: a row may legitimately draw a family shorthand
+    /// (`Alt+←↓↑→ / hjkl`) that contains no single chord as a substring, and
+    /// that shorthand is only ever drawn while it is an accurate
+    /// description of the defaults (`help_key_text`, pinned by
+    /// `a_family_spelling_gives_way_once_one_of_its_chords_moves`). So
+    /// "which chords does this row account for" is a question about the
+    /// actions it declares, and asking it that way needs no list to keep.
     #[test]
     fn every_bound_chord_is_documented_in_the_keymap() {
-        let text = HELP_GROUPS
+        let documented: Vec<Action> = HELP_GROUPS
             .iter()
             .flat_map(|g| g.rows.iter())
-            .map(|(k, d)| format!("{k} {d}"))
+            .flat_map(|r| match &r.key {
+                HelpKey::Chords(a) | HelpKey::Family(_, a) => *a,
+                HelpKey::Text(_) => &[],
+            })
+            .copied()
+            .collect();
+        for (label, action) in input::effective_bindings(&Keymap::default()) {
+            assert!(
+                documented.contains(&action),
+                "roost binds {label} to {action:?} and no keymap row documents it",
+            );
+        }
+    }
+
+    /// The converse, and the failure mode the coverage sweep cannot see: a
+    /// row that declares an action **nothing binds** renders nothing and
+    /// vanishes from the overlay silently. Before F1 that could not happen
+    /// (rows were literal text, so a stale row stayed visible and merely
+    /// lied); now a typo'd or orphaned row is invisible instead, which is
+    /// quieter and therefore worth a gate of its own.
+    #[test]
+    fn every_documented_row_names_an_action_roost_actually_binds() {
+        let bound: Vec<Action> =
+            input::effective_bindings(&Keymap::default()).into_iter().map(|(_, a)| a).collect();
+        for group in HELP_GROUPS {
+            for row in group.rows {
+                let (HelpKey::Chords(actions) | HelpKey::Family(_, actions)) = &row.key else {
+                    continue; // a legend or CLI reference row names no chord
+                };
+                for action in *actions {
+                    assert!(
+                        bound.contains(action),
+                        "{}'s row {:?} declares {action:?}, which no chord binds — \
+                         the row would silently vanish from the overlay",
+                        group.title,
+                        row.desc,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The property that makes the coverage gate above sufficient rather
+    /// than merely necessary: a row draws **every** chord bound to the
+    /// actions it declares, so a second chord for a documented action
+    /// documents itself. Verified by remapping a free key onto `Quit` and
+    /// watching the existing row grow — no table edit involved.
+    ///
+    /// This is why the gate can check actions instead of keeping a list of
+    /// chord spellings: the two questions "is this action documented" and
+    /// "is this chord documented" only came apart under the old `&'static`
+    /// table, where a row named one fixed chord no matter what was bound.
+    #[test]
+    fn a_second_chord_for_a_documented_action_documents_itself() {
+        let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+x": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let quit_row = help_lines(&keymap, "")
+            .into_iter()
+            .find_map(|l| match l {
+                HelpLine::Row(k, d) if d.starts_with("quit") => Some(k),
+                _ => None,
+            })
+            .expect("a quit row");
+        assert_eq!(quit_row, "Alt+q / Alt+x", "the row grew the new chord on its own");
+    }
+
+    /// C34/C15, the regression the design-supervisor audit of C34 caught by
+    /// measuring instead of assuming: a row's key column became
+    /// keymap-derived and therefore **unbounded**, so disabling one focus
+    /// chord made the row enumerate eight and pushed the column from 77 to
+    /// 107 — clipping the description at an 80-column terminal, the exact
+    /// failure C15's width rule exists to prevent.
+    ///
+    /// The old pin only ever exercised `Keymap::default()`, which is a
+    /// default-only assertion about a quantity that is no longer constant.
+    /// This one sweeps the configs the audit actually measured.
+    #[test]
+    fn one_help_column_fits_the_floor_under_a_remap_too() {
+        for cfg in [
+            r#"{}"#,
+            // The README's own worked example.
+            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            // The four the audit measured at 99, 107, 107 and 123.
+            r#"{"keys": {"alt+1": "disable"}}"#,
+            r#"{"keys": {"alt+h": "disable"}}"#,
+            r#"{"keys": {"alt+left": "disable"}}"#,
+            r#"{"keys": {"alt+b": "focus_left"}}"#,
+        ] {
+            let (keymap, diagnostics) = Keymap::parse(cfg, "config.json");
+            assert!(diagnostics.is_empty(), "{cfg}: {diagnostics:?}");
+            // Measure the *content*, and against the ceiling the dialog can
+            // actually draw — not `layout.size.0`, which is
+            // `.min(body.width)` and therefore says "≤ 80" whether the
+            // layout fit or was clamped down to it. That tautology is why
+            // the sibling floor test could not see the audit's finding.
+            let w = help_content_width(&help_lines(&keymap, ""));
+            let floor = super::HELP_FLOOR_COLS;
+            assert!(
+                w + super::HELP_DIALOG_CHROME <= floor,
+                "{cfg} makes a column {w} wide, so the dialog asks for {} at an \
+                 {floor}-column terminal and is clamped — the column of air before the \
+                 right border goes first",
+                w + super::HELP_DIALOG_CHROME,
+            );
+        }
+    }
+
+    /// A key column always ends in a space, so the description can never
+    /// fuse to it.
+    ///
+    /// `draw_help_columns` draws the prefix and the description as two
+    /// adjacent spans with nothing between them — the separation is
+    /// entirely the prefix's padding. `{key:<18}` supplies it only while
+    /// the key is *under* 18 wide, because that is a minimum width, not a
+    /// column: at 18 or more it pads by nothing and the two spans abut.
+    /// Before C34 no key reached 18, so the distinction never came up; an
+    /// enumerated family reaches 24 easily, and at exactly 80×24 the focus
+    /// row rendered `Alt+← / Alt+↓ / Alt+j …move focus (…)`. Found by a
+    /// simulation agent stressing the design floor.
+    #[test]
+    fn a_key_column_never_fuses_to_its_description() {
+        for cfg in [
+            r#"{}"#,
+            r#"{"keys": {"alt+h": "disable"}}"#,
+            r#"{"keys": {"alt+left": "disable"}}"#,
+            r#"{"keys": {"alt+1": "disable"}}"#,
+            r#"{"keys": {"alt+b": "focus_left"}}"#,
+        ] {
+            let (keymap, _) = Keymap::parse(cfg, "config.json");
+            for line in help_lines(&keymap, "") {
+                let HelpLine::Row(k, d) = line else { continue };
+                let rendered = format!("{}{d}", super::help_key_prefix(&k));
+                assert!(
+                    super::help_key_prefix(&k).ends_with(' '),
+                    "{cfg}: no separator between key and description — {rendered:?}",
+                );
+            }
+        }
+    }
+
+    /// Elision cuts the *key*, never the description, and lands on a chord
+    /// boundary so no chord is shown half-spelled.
+    #[test]
+    fn an_over_wide_key_column_elides_at_a_chord_boundary() {
+        let (keymap, _) = Keymap::parse(r#"{"keys": {"alt+h": "disable"}}"#, "config.json");
+        let focus = help_lines(&keymap, "")
+            .into_iter()
+            .find_map(|l| match l {
+                HelpLine::Row(k, d) if d.starts_with("move focus") => Some(k),
+                _ => None,
+            })
+            .expect("a focus row");
+        assert!(focus.ends_with(" …"), "elision is marked: {focus}");
+        for chord in focus.trim_end_matches(" …").split(" / ") {
+            assert!(chord.starts_with("Alt+"), "no chord is cut mid-spelling: {focus}");
+        }
+        // And the description survived intact — it is the half that cannot
+        // be reconstructed by widening the terminal.
+        let full = help_lines(&keymap, "")
+            .into_iter()
+            .any(|l| matches!(l, HelpLine::Row(_, d)
+                if d == "move focus (←/→ continue to next/prev tab at an edge)"));
+        assert!(full, "the description is never what yields");
+    }
+
+    /// C34/D2: C9's attention segment is the jump chord's discoverability
+    /// surface, and it spelled `Alt+a` as a literal — so after a remap it
+    /// taught a dead chord. An unbound jump drops the tail rather than
+    /// naming a key that does nothing.
+    #[test]
+    fn the_attention_segment_names_the_live_jump_chord() {
+        let text = |chord: Option<String>| {
+            super::hint_bar_right_spans(Some((2, true)), None, None, "NORMAL", chord)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert!(text(Some("Alt+v".into())).contains("· Alt+v"), "the remapped chord");
+        assert!(!text(Some("Alt+v".into())).contains("Alt+a"), "and not the default");
+        let unbound = text(None);
+        assert!(unbound.contains("2 needs you"), "the count still reports");
+        assert!(!unbound.contains(" · "), "but no chord is advertised: {unbound}");
+    }
+
+    /// C34/D3: the dead-pane bar and the hint bar one screen row below name
+    /// the same close chord. Before C34 only the hint bar derived it, so a
+    /// remap made two surfaces on one screen disagree.
+    #[test]
+    fn the_dead_pane_bar_names_the_live_close_chord() {
+        assert!(super::dead_bar_text(false, Some("Alt+v")).contains("· Alt+v: close"));
+        let unbound = super::dead_bar_text(false, None);
+        assert!(!unbound.contains("close"), "an unbound close drops the clause: {unbound}");
+        assert!(unbound.contains("relaunch"), "the mode-local keys stay: {unbound}");
+    }
+
+    /// F1's headline behaviour, end to end: remap a chord in config.json and
+    /// the overlay teaches the new key and stops teaching the old one.
+    /// Before F1 both surfaces were `&'static str` literals and this was
+    /// impossible — the README's own escape-hatch example produced a roost
+    /// whose `Alt+?` still taught `Alt+f`.
+    #[test]
+    fn a_remapped_chord_is_taught_at_its_new_key() {
+        let (keymap, diagnostics) = Keymap::parse(
+            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            "config.json",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let drawn = help_lines(&keymap, "")
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Head(_) => None,
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        for chord in [
-            "Alt+n", "Alt+Enter", "Alt+r", "Alt+w", "Alt+u", "Alt+Shift+p", "Alt+Shift+←↓↑→",
-            "Alt+s", "Alt+o", "Alt+g", "Alt+z", "Alt+f", "Alt+t", "Alt+1..9", "Alt+0", "Alt+i",
-            "Alt+m", "Alt+Shift+i", "Alt+Shift+r", "Alt+a", "Alt+Shift+a", "Alt+e", "Alt+PgUp",
-            "Alt+c", "Alt+/", "Alt+?", "Alt+q",
-        ] {
-            assert!(text.contains(chord), "the keymap must document {chord:?}");
-        }
+        assert!(drawn.contains("Alt+v floating scratch shell"), "taught at its new chord");
+        assert!(
+            !drawn.contains("Alt+f "),
+            "and not at the old one — that key forwards to the pane now",
+        );
+    }
+
+    /// A row whose every chord is disabled leaves the overlay rather than
+    /// standing there naming nothing.
+    #[test]
+    fn a_fully_disabled_row_leaves_the_overlay() {
+        let (keymap, _) = Keymap::parse(r#"{"keys": {"alt+e": "disable"}}"#, "config.json");
+        let drawn = help_lines(&keymap, "")
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Head(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!drawn.contains("activity feed"), "the feed row is gone with its chord");
+    }
+
+    /// A `Family`'s compact spelling is a shorthand for the default chords
+    /// and nothing else, so it survives only while they all hold. Move one
+    /// and the row enumerates what is really bound — otherwise
+    /// `Alt+←↓↑→ / hjkl` would be precisely the stale spelling F1 abolished,
+    /// just a wider one.
+    #[test]
+    fn a_family_spelling_gives_way_once_one_of_its_chords_moves() {
+        let compact = |keymap: &Keymap| {
+            help_lines(keymap, "").iter().any(|l| {
+                matches!(l, HelpLine::Row(k, _) if k == "Alt+←↓↑→ / hjkl")
+            })
+        };
+        assert!(compact(&Keymap::default()), "the defaults render compactly");
+
+        let (moved, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+b": "focus_left"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(!compact(&moved), "a moved member retires the shorthand");
+        let drawn = help_lines(&moved, "")
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, _) => Some(k.clone()),
+                HelpLine::Head(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drawn.contains("Alt+b"), "the real chord is named instead");
     }
 
     /// C28's pair is documented as a pair, directly under the chords it is
@@ -3008,15 +4361,22 @@ mod tests {
     /// makes the tab chord take the pane with you").
     #[test]
     fn the_tabs_group_teaches_the_move_pane_chords_under_their_unshifted_siblings() {
+        // F1: rows resolve their key column from the keymap, so this walks
+        // the drawn lines rather than the const table — which is also the
+        // stronger check: adjacency in the *table* would not prove adjacency
+        // in what the reader sees.
+        let bindings = input::effective_bindings(&Keymap::default());
         let tabs = HELP_GROUPS.iter().find(|g| g.title == "TABS").expect("a TABS group");
-        let step = tabs.rows.iter().position(|(k, _)| *k == "Alt+i / Alt+m").expect("the step row");
-        let move_row = tabs
+        let keys: Vec<String> = tabs
             .rows
             .iter()
-            .position(|(k, _)| k.starts_with("Alt+Shift+i"))
-            .expect("the move row");
+            .filter_map(|r| super::help_key_text(&r.key, r.desc, &bindings))
+            .collect();
+        let step = keys.iter().position(|k| k == "Alt+i / Alt+m").expect("the step row");
+        let move_row =
+            keys.iter().position(|k| k.starts_with("Alt+Shift+i")).expect("the move row");
         assert_eq!(move_row, step + 1, "the shifted pair sits directly under the unshifted one");
-        assert!(tabs.rows[move_row].1.contains("move this pane"));
+        assert!(tabs.rows[move_row].desc.contains("move this pane"));
     }
 
     /// U23: the legend is the C5 glyph table, not a hand-copied lookalike —
@@ -3024,13 +4384,13 @@ mod tests {
     /// teaching a symbol roost no longer draws.
     #[test]
     fn help_legend_row_matches_the_theme_glyph_table() {
-        let (key, desc) = HELP_GROUPS
-            .iter()
-            .flat_map(|g| g.rows.iter())
-            .find(|(k, _)| *k == "status")
-            .copied()
+        let desc = help_lines(&Keymap::default(), "")
+            .into_iter()
+            .find_map(|l| match l {
+                HelpLine::Row(k, d) if k == "status" => Some(d),
+                _ => None,
+            })
             .expect("the overlay carries a status-glyph legend row");
-        assert_eq!(key, "status");
         assert_eq!(desc, super::status_legend_text());
         // The two glyphs the live-QA drive greps the frame for.
         assert!(
@@ -3044,17 +4404,18 @@ mod tests {
     /// columns that fit, never columns for their own sake.
     #[test]
     fn help_takes_the_fewest_columns_that_fit() {
-        let lines = help_lines().len() as u16;
-        let content = help_content_width();
+        let all = help_lines(&Keymap::default(), "");
+        let lines = all.len() as u16;
+        let content = help_content_width(&all);
 
         // Tall enough for the whole table: one column, however wide the
         // terminal is.
         let tall = Rect::new(0, 1, content * 4, lines + 2);
-        assert_eq!(help_layout(tall).columns.len(), 1, "a body that fits stays one column");
+        assert_eq!(help_layout(tall, &Keymap::default(), None).columns.len(), 1, "a body that fits stays one column");
 
         // Too short, and wide enough for two: two columns.
         let wide = Rect::new(0, 1, content * 2 + super::HELP_GUTTER + 2, lines / 2 + 2);
-        let two = help_layout(wide);
+        let two = help_layout(wide, &Keymap::default(), None);
         assert_eq!(two.columns.len(), 2, "a short, wide body splits");
         assert_eq!(
             two.columns.iter().map(|c| c.len()).sum::<usize>(),
@@ -3065,9 +4426,9 @@ mod tests {
         // Too short and too narrow: one column, and it scrolls (see
         // `help_scroll_extent`).
         let narrow = Rect::new(0, 1, content + 2, 12);
-        let one = help_layout(narrow);
+        let one = help_layout(narrow, &Keymap::default(), None);
         assert_eq!(one.columns.len(), 1);
-        let (visible, total) = super::help_scroll_extent(narrow);
+        let (visible, total) = super::help_scroll_extent(narrow, &Keymap::default(), None);
         assert!(visible < total, "a narrow, short body scrolls rather than dropping rows");
     }
 
@@ -3075,9 +4436,9 @@ mod tests {
     /// with half its chords in the other is worse than either arrangement.
     #[test]
     fn a_second_column_always_starts_on_a_group_heading() {
-        let content = help_content_width();
+        let content = help_content_width(&help_lines(&Keymap::default(), ""));
         let wide = Rect::new(0, 1, content * 2 + super::HELP_GUTTER + 2, 14);
-        let layout = help_layout(wide);
+        let layout = help_layout(wide, &Keymap::default(), None);
         assert_eq!(layout.columns.len(), 2);
         assert!(
             matches!(layout.columns[1].first(), Some(HelpLine::Head(_))),
@@ -3096,12 +4457,23 @@ mod tests {
     #[test]
     fn help_fits_the_eighty_column_floor_and_reaches_every_row() {
         let body = Rect::new(0, 1, 80, 22); // 80×24 minus the two bars
-        let layout = help_layout(body);
-        assert!(layout.size.0 <= 80, "the keymap is {} cols wide", layout.size.0);
-        assert!(layout.size.1 <= body.height);
-        let (visible, total) = super::help_scroll_extent(body);
-        assert_eq!(total, help_lines().len(), "one column at the floor holds the whole table");
-        assert!(visible >= 1);
+        let layout = help_layout(body, &Keymap::default(), None);
+        // `size.0` is already `.min(body.width)` here, so it can only ever
+        // report 80 — assert on the ask instead.
+        let asked = layout.content + super::HELP_DIALOG_CHROME;
+        assert!(asked <= body.width, "the keymap asks for {asked} cols at the floor");
+        // `size.1` is `min(tallest, body.height - 2) + 2`, so `size.1 <=
+        // body.height` held by construction — the height half of this test
+        // was still the tautology the width half had already been fixed
+        // for. What the test's own name claims is *reachability*, so
+        // assert that: scrolling to the bottom must put the last row on
+        // screen. `visible >= 1` was as far as it got.
+        let (visible, total) = super::help_scroll_extent(body, &Keymap::default(), None);
+        assert_eq!(total, help_lines(&Keymap::default(), "").len(), "one column at the floor holds the whole table");
+        assert!(visible >= 1, "at least one row is on screen");
+        assert!(total > visible, "the floor is the case where it scrolls");
+        let max_top = total - visible;
+        assert_eq!(max_top + visible, total, "scrolled to the bottom, the last row is visible");
     }
 
     /// U20: the picker's accelerator has to be visible to be pressed, and
@@ -3166,6 +4538,259 @@ mod tests {
         assert_eq!(marker.content.as_ref(), " ");
         assert_eq!(style, theme::quiet());
     }
+    /// [F9] Every key the dead-pane hint bar advertises is taught by the
+    /// overlay too.
+    ///
+    /// The dead-pane keys (`↵` relaunch, `f` fresh, `y` copy resume) are
+    /// bare keys, not Alt chords — `main.rs` claims them out of
+    /// `InputResult::Forward` while the focused pane is dead — so §8 has no
+    /// row for them and C34's chord sweep does not reach them. They were
+    /// advertised on the C9 bar and documented nowhere else: P21's case
+    /// verbatim, and the one C15 exists to prevent.
+    ///
+    /// This is the gate that would have caught it, and it is deliberately
+    /// keyed off the **bar** rather than a written list — the bar is where
+    /// a new dead-pane key would appear first.
+    #[test]
+    fn the_overlay_teaches_every_key_the_dead_pane_bar_advertises() {
+        // Both bars: `resumable` gates whether `y` is offered, and the
+        // un-resumable one alone was the whole test — leaving `y`, the key
+        // C39 spends a paragraph justifying as unconditional, outside the
+        // assertion set entirely. Found by the C39 audit.
+        let mut keys: Vec<String> = Vec::new();
+        for resumable in [false, true] {
+            for (k, _) in hint_pairs(&Mode::Normal, true, resumable, false, false) {
+                if !k.starts_with("Alt+") && !keys.contains(&k) {
+                    keys.push(k); // Alt chords are C34's sweep, not this one
+                }
+            }
+        }
+        assert!(keys.len() >= 3, "the dead-pane bar must offer ↵, f and y: {keys:?}");
+
+        // Match the **key columns**, not the whole overlay text. The first
+        // version searched the joined rows for each key as a substring —
+        // and every letter a–z already appears in `HELP_GROUPS`'s prose
+        // ("close pane (confirm if busy)" alone supplies both `f` and `y`),
+        // so a future dead-pane key added with no row would have passed
+        // silently. Only `↵` was load-bearing, by the accident of occurring
+        // once. The mutation check that "proved" the gate used an uppercase
+        // `Q`, which happens not to appear — picking an unrepresentative
+        // mutant is how a vacuous check survives its own verification.
+        let key_columns: Vec<String> = help_lines(&Keymap::default(), "")
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, _) => Some(k.clone()),
+                HelpLine::Head(_) => None,
+            })
+            .collect();
+        for k in keys {
+            assert!(
+                key_columns.iter().any(|col| col.split(['/', ' ']).any(|tok| tok == k)),
+                "the dead-pane bar offers {k:?} and no overlay row has it in its key \
+                 column — a key nothing but the bar advertises is a key nobody finds \
+                 (P21). Key columns: {key_columns:?}",
+            );
+        }
+    }
+
+    /// [F9] The query actually narrows the table, matching on **both**
+    /// columns, and an empty query changes nothing at all.
+    #[test]
+    fn the_help_filter_narrows_on_the_key_and_the_description() {
+        let km = Keymap::default();
+        let all = help_lines(&km, "");
+        let rows = |q: &str| {
+            help_lines(&km, q)
+                .into_iter()
+                .filter(|l| matches!(l, HelpLine::Row(..)))
+                .count()
+        };
+        let total = rows("");
+        assert!(total > 20, "the unfiltered keymap is the whole table: {total}");
+        assert_eq!(help_lines(&km, "").len(), all.len(), "an empty query is a no-op");
+
+        // A description word.
+        let by_desc = rows("stack");
+        assert!(by_desc > 0 && by_desc < total, "`stack` narrows but does not empty: {by_desc}");
+
+        // A key fragment — the reader who remembers the chord, not the word.
+        let by_key = rows("Alt+Shift");
+        assert!(by_key > 0 && by_key < total, "`Alt+Shift` narrows: {by_key}");
+
+        // Case-insensitive, or half the chords are unreachable by typing.
+        assert_eq!(rows("alt+shift"), by_key, "the query is case-insensitive");
+
+        // A query that matches nothing leaves nothing — including headings,
+        // which must not survive their own rows.
+        assert_eq!(
+            help_lines(&km, "zzzzz-no-such-thing").len(),
+            0,
+            "an empty result draws no orphan headings",
+        );
+    }
+
+    /// [C39] A query that matches nothing still draws a frame that says so
+    /// — C14's rule ("an empty result still needs a frame to say so"), and
+    /// the bug this branch already fixed for the roster and the feed, where
+    /// a zero-height dialog left the chord looking unbound.
+    ///
+    /// It works here for a reason worth pinning rather than relying on: the
+    /// width floor is the *title's*, and the title is never empty, so an
+    /// empty table still has a frame wide enough to read. The design audit
+    /// found the behaviour correct and the guard missing.
+    #[test]
+    fn a_query_matching_nothing_still_draws_a_frame_that_says_so() {
+        let body = Rect::new(0, 0, 120, 40);
+        let km = Keymap::default();
+        let layout = help_layout(body, &km, Some("zzzzz-no-such-thing"));
+        assert_eq!(layout.columns.iter().map(|c| c.len()).max().unwrap_or(0), 0, "nothing matched");
+        assert_eq!(layout.size.1, 2, "two border rows — a frame, not a void");
+        let title = super::help_title(Some("zzzzz-no-such-thing"), 0, 0, false, body.width - 2);
+        assert!(title.contains("0 shown"), "and it says the result is empty: {title:?}");
+        assert!(title.contains("Esc clears"), "and how to leave: {title:?}");
+        assert!(
+            layout.size.0 as usize >= mouse::display_width(&title) as usize + 2,
+            "the frame is wide enough to read that: {} vs {title:?}",
+            layout.size.0,
+        );
+    }
+
+    /// [F9] The dialog is sized for the *filtered* table — C14's picker rule
+    /// applied to the surface that borrowed its type-ahead. A query cutting
+    /// 36 rows to 3 must not leave a 36-row frame around them.
+    #[test]
+    fn the_filtered_help_dialog_shrinks_to_what_it_shows() {
+        let body = Rect::new(0, 0, 120, 40);
+        let km = Keymap::default();
+        let whole = help_layout(body, &km, None).size.1;
+        let narrow = help_layout(body, &km, Some("stack")).size.1;
+        assert!(narrow < whole, "the frame followed the filter: {narrow} vs {whole}");
+        assert!(narrow >= 3, "and still has a frame to say so");
+    }
+
+    /// [F9] The dialog is never narrower than the title it draws.
+    ///
+    /// Before the filter the table always contained its widest row, so the
+    /// frame was always wider than any heading and this could not arise. A
+    /// query isolating one short row breaks that — `/this keymap` leaves a
+    /// 33-column dialog under a 44-column title, and `modal_frame` clips
+    /// it, hiding the very sentence that tells a filtering reader how to
+    /// get out. Found by driving the overlay in a PTY; every unit test here
+    /// looked at the frame or the title, never at both.
+    #[test]
+    fn a_filtered_dialog_is_never_narrower_than_its_own_title() {
+        let body = Rect::new(0, 0, 120, 40);
+        let km = Keymap::default();
+        // Queries chosen to isolate the *short* rows — the ones that used
+        // to leave a frame too narrow for the heading above them.
+        for q in ["this keymap", "hint bar", "toggle the hint", "quit", "zoom"] {
+            let layout = help_layout(body, &km, Some(q));
+            let rows = layout.columns.iter().map(|c| c.len()).max().unwrap_or(0);
+            let title =
+                super::help_title(Some(q), rows, rows, rows > layout.height as usize, body.width - 2);
+            assert!(
+                layout.size.0 as usize >= mouse::display_width(&title) as usize + 2,
+                "query {q:?}: a {}-column dialog under a {}-column title — {title:?} clips",
+                layout.size.0,
+                mouse::display_width(&title),
+            );
+        }
+    }
+
+    /// [F9] The 80-column floor holds for every query, not just the empty
+    /// one — asserted on the **ask**, not on `size.0`.
+    ///
+    /// The first version of this test read `size.0 <= 80` at an 80-column
+    /// body. `size.0` is `.min(body.width)`, so it could only ever report
+    /// 80: the gate passed by construction. C15's own 2026-08-20 amendment
+    /// had already named that exact shape — "a tautology that reads like a
+    /// gate is worse than no gate" — and the corrected version of it sits
+    /// 160 lines above this one in the same file, with a comment saying
+    /// "assert on the ask instead". The design audit caught it anyway.
+    /// Third time on this branch; the lesson is that a floor test must
+    /// never read a clamped value, however it is spelled.
+    #[test]
+    fn the_help_dialog_fits_the_floor_under_every_query() {
+        let floor = Rect::new(0, 0, 80, 24);
+        let km = Keymap::default();
+        for q in ["", "a", "alt", "Alt+Shift", "pane", "e", "/", "this keymap"] {
+            let layout = help_layout(floor, &km, Some(q));
+            assert!(
+                layout.asked <= floor.width,
+                "query {q:?} asked for {} columns, past the {}-column floor",
+                layout.asked,
+                floor.width,
+            );
+        }
+    }
+
+    /// [F9] ...and a query longer than the terminal cannot push the title
+    /// past the floor either — the query elides, the exit hint survives.
+    ///
+    /// `help_layout` floors the dialog on the title's width, but that only
+    /// answers *content narrower than the title*. A body narrower than the
+    /// title is the other half, and the `.min(body.width)` re-admitted it:
+    /// at the floor a 46-character query clamped and `modal_frame`
+    /// truncated the tail — losing "Esc clears", the one thing a filtering
+    /// reader needs. Nothing widened the dialog because nothing could;
+    /// the query had to give instead. Found by the C39 design audit, which
+    /// also found why no test saw it (the floor gate above was vacuous).
+    #[test]
+    fn a_query_wider_than_the_terminal_elides_and_keeps_the_way_out() {
+        let floor = Rect::new(0, 0, 80, 24);
+        let km = Keymap::default();
+        let long = "a".repeat(120);
+        for scrolled in [false, true] {
+            let title = super::help_title(Some(&long), 3, 40, scrolled, floor.width - 2);
+            assert!(
+                mouse::display_width(&title) <= floor.width - 2,
+                "the title outgrew the terminal: {} cols",
+                mouse::display_width(&title),
+            );
+            assert!(title.contains("Esc clears"), "the way out survived: {title:?}");
+            assert!(title.contains('…'), "and the cut is marked: {title:?}");
+        }
+        // The layout agrees — it builds the same title through the same
+        // function, which is why there is only one.
+        let layout = help_layout(floor, &km, Some(&long));
+        assert!(layout.asked <= floor.width, "asked for {} at the floor", layout.asked);
+    }
+
+    /// C14 (U20): every picker row's cwd column starts at the same place,
+    /// including the widest adapter row the dialog is sized for.
+    ///
+    /// The pad target and the width constant used to be two constants with
+    /// one name — 16 in the draw loop, 23 in the sizing — so a row wider
+    /// than 16 got no padding and shoved its cwd label right.
+    ///
+    /// The worst case is **derived from the live registry**, not spelled.
+    /// The first version of this test wrote `"opencode not found"` while
+    /// its own docstring claimed to walk the registry — so a seventh
+    /// adapter with a 9-character id would have under-padded the column
+    /// again with the test still green. That is the same "tautology that
+    /// reads like a gate" this branch has already fixed twice; the design
+    /// audit caught it a third time, here.
+    #[test]
+    fn the_adapter_column_is_wide_enough_for_the_row_it_pads() {
+        // The longest id the picker can list, annotated the way
+        // `App::picker_filtered` annotates an adapter missing from `$PATH`
+        // (any id can be, so the suffix applies to the longest), at the
+        // accelerator prefix that makes the row longest.
+        let longest = crate::agents::picker_ids()
+            .into_iter()
+            .max_by_key(|id| mouse::display_width(id))
+            .expect("the registry lists at least one adapter");
+        let suffix = crate::core::app::PICKER_MISSING_SUFFIX;
+        let worst = super::picker_row_body(0, &format!("{longest} {suffix}"));
+        assert!(
+            mouse::display_width(&worst) + 1 <= super::ADAPTER_COL,
+            "the worst-case row {worst:?} ({} cols + 1 marker) overflows the column \
+it pads to ({}), so its cwd label would start further right than every other \
+row's — widen ADAPTER_COL",
+            mouse::display_width(&worst),
+            super::ADAPTER_COL,
+        );
+    }
 
     /// C14 (U20): the dialog grows to fit the widest cwd label, and stays
     /// the pre-U20 32 columns when there is no cwd column to show.
@@ -3196,14 +4821,14 @@ mod tests {
         );
         assert_eq!(
             pairs,
-            vec![
+            p(&[
                 ("↑↓", "choose"),
                 ("↵", "open"),
                 ("1..9", "launch"),
                 ("type", "filter"),
                 ("←→", "dir"),
                 ("Esc", "cancel"),
-            ],
+            ]),
         );
         let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
         assert_eq!(cols, 71, "C9: the picker list must stay inside the 100-col floor");
@@ -3220,10 +4845,12 @@ mod tests {
     /// actually has to know they exist.
     #[test]
     fn help_rows_document_every_mouse_verb() {
-        let text = HELP_GROUPS
+        let text = help_lines(&Keymap::default(), "")
             .iter()
-            .flat_map(|g| g.rows.iter())
-            .map(|(k, d)| format!("{k} {d}"))
+            .filter_map(|l| match l {
+                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Head(_) => None,
+            })
             .collect::<Vec<_>>()
             .join("\n");
         for token in ["mouse", "wheel", "click", "drag", "2x", "3x", "shift", "Alt+click", "URL"] {
@@ -3237,8 +4864,14 @@ mod tests {
     /// stop. The reference rows are long; this is their guard rail.
     #[test]
     fn one_help_column_fits_the_eighty_column_floor() {
-        let w = help_layout(Rect::new(0, 1, 200, 200)).size.0;
-        assert!(w <= 80, "the keymap is {w} cols wide; the 80-col floor would clip it");
+        // The default-keymap case. Remapped keymaps — where the width is no
+        // longer constant — are swept by
+        // `one_help_column_fits_the_floor_under_a_remap_too`.
+        // Laid out in unbounded space, so `size.0` is the width the dialog
+        // *asked* for rather than what a clamp allowed it — the distinction
+        // the remap sweep above spells out.
+        let w = help_layout(Rect::new(0, 1, 200, 200), &Keymap::default(), None).size.0;
+        assert!(w <= super::HELP_FLOOR_COLS, "the keymap is {w} cols wide; the floor would clip it");
     }
 
     /// ux P2-15: the overlay used to teach every chord and never mention
@@ -3252,8 +4885,15 @@ mod tests {
             .iter()
             .find(|g| g.title == "CONTROL CLI")
             .expect("a CONTROL CLI group");
-        let text =
-            cli.rows.iter().map(|(k, d)| format!("{k} {d}")).collect::<Vec<_>>().join("\n");
+        let bindings = input::effective_bindings(&Keymap::default());
+        let text = cli
+            .rows
+            .iter()
+            .filter_map(|r| {
+                super::help_key_text(&r.key, r.desc, &bindings).map(|k| format!("{k} {}", r.desc))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         for verb in ["roost send", "roost read", "roost status", "roost spawn", "roost wait"] {
             assert!(text.contains(verb), "the control-CLI group must mention {verb:?}");
         }
@@ -3393,6 +5033,23 @@ mod tests {
         app.set_flash("copied 12 chars");
         out.push(("flash", snap(&mut app)));
 
+        // The *other* place a flash lands (C10, amended 2026-08-20): with
+        // the hint bar hidden it paints over the body's last row. This
+        // fixture is the point — the gates below never saw that surface, so
+        // a flash inheriting the pane border's colour passed every one of
+        // them. It does not pass them now.
+        let mut app = three_panes();
+        app.apply(Action::ToggleHints);
+        app.set_flash("copied 12 chars");
+        out.push(("flash, hint bar hidden", snap(&mut app)));
+
+        // ...and the C11 bar on that same surface, for the same reason.
+        let mut app = three_panes();
+        app.apply(Action::ToggleHints);
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
+        assert!(app.show_alt_hint());
+        out.push(("alt-trap warning bar, hint bar hidden", snap(&mut app)));
+
         let mut app = three_panes();
         // F1's evidence: a swallowed Option chord (Option+n -> '˜' with no
         // Alt modifier), not just any key.
@@ -3424,7 +5081,8 @@ mod tests {
             ("picker", Action::QuickLaunch),
             ("activity feed", Action::ToggleFeed),
             ("fleet roster", Action::ToggleRoster),
-            ("rename dialog", Action::RenamePane),
+            ("broadcast composer", Action::ToggleBroadcast),
+            ("rename dialog", Action::RenameTab),
             ("scroll mode", Action::ScrollMode),
             ("copy mode", Action::CopyMode),
             ("raw pane", Action::ToggleRaw),
@@ -3452,10 +5110,60 @@ mod tests {
             out.push(("fleet roster, filtered and reordered", snap(&mut app)));
         }
 
+        // [C39] Same reason, one surface later: the "help overlay" fixture
+        // above is unfiltered, so the §2 gates below never saw the
+        // filtering title or the hint row that replaces "any key closes".
+        // Both are chrome roost draws and neither was covered. Named by the
+        // C39 design audit.
+        {
+            let mut app = three_panes();
+            app.apply(Action::Help);
+            for c in "/pane".chars() {
+                app.handle_mode_key(crossterm::event::KeyEvent::from(
+                    crossterm::event::KeyCode::Char(c),
+                ));
+            }
+            assert_eq!(app.help_filter(), Some("pane"), "fixture must actually be filtering");
+            out.push(("help overlay, filtering", snap(&mut app)));
+        }
+
         let mut app = three_panes();
         app.apply(Action::ToggleZoom);
         app.apply(Action::ToggleHints); // the tab bar picks up the mode word
         out.push(("zoom with the hint bar hidden", snap(&mut app)));
+
+        // C32: parked notes, both badge forms at once — the focused pane's
+        // headline + age segment and an unfocused pane's bare `¶` — plus
+        // the same two panes as collapsed rows (the right segment's marker),
+        // so the §2 gates audit every note span the chrome can draw.
+        {
+            let mut app = three_panes();
+            let first = app.pane_order()[0];
+            let focused = app.focused;
+            assert_ne!(first, focused, "fixture needs an unfocused noted pane");
+            let spec = app.ws.tabs[0].panes.get_mut(&first).unwrap();
+            spec.note = Some("waiting on CI".into());
+            spec.noted_at = Some(0);
+            let spec = app.ws.tabs[0].panes.get_mut(&focused).unwrap();
+            spec.note = Some("tests green, PR up\nnext: rebase onto main".into());
+            spec.noted_at = Some(0);
+            out.push(("noted badges, focused and not", snap(&mut app)));
+            app.apply(Action::ToggleStack);
+            out.push(("noted collapsed rows", snap(&mut app)));
+        }
+
+        // C32: the combined pane editor, prefilled with a name and a
+        // two-line note so the underlined name row, the caret row and a
+        // plain row are all drawn.
+        {
+            let mut app = three_panes();
+            let focused = app.focused;
+            let spec = app.ws.tabs[0].panes.get_mut(&focused).unwrap();
+            spec.note = Some("tests green, PR up\nnext: rebase onto main".into());
+            spec.noted_at = Some(0);
+            app.apply(Action::EditPane);
+            out.push(("pane editor", snap(&mut app)));
+        }
 
         // C16: a dead pane's action bar. The fixture omitted every
         // pane-overlay state, which is exactly how a span-styled (rather than
@@ -3598,12 +5306,14 @@ mod tests {
                 // The baseline: every fixture is Normal-mode chrome.
                 Mode::Normal => None,
                 Mode::Rename { .. } => Some("rename dialog"),
+                Mode::PaneEdit { .. } => Some("pane editor"),
                 Mode::Picker { .. } => Some("picker"),
                 Mode::Scroll => Some("scroll mode"),
                 Mode::Copy { .. } => Some("copy mode"),
                 Mode::Help { .. } => Some("help overlay"),
                 Mode::Feed { .. } => Some("activity feed"),
                 Mode::Roster { .. } => Some("fleet roster"),
+                Mode::Broadcast { .. } => Some("broadcast composer"),
                 Mode::Search { .. } => Some("scrollback search"),
             }
         }
@@ -3612,13 +5322,26 @@ mod tests {
         // arbitrary placeholders.
         let samples = [
             Mode::Normal,
-            Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Pane },
+            Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab },
+            Mode::PaneEdit {
+                name: String::new(),
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                pane: 1,
+            },
             Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
             Mode::Scroll,
             Mode::Copy { cursor: (0, 0) },
-            Mode::Help { top: 0 },
+            Mode::Help { top: 0, filter: None },
             Mode::Feed { offset: 0 },
             Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None },
+            Mode::Broadcast {
+                lines: vec![String::new()],
+                row: 0,
+                col: 0,
+                status_filter: None,
+            },
             Mode::Search { copy_cursor: None },
         ];
         let names: Vec<&str> = chrome_buffers().iter().map(|(n, _)| *n).collect();
@@ -3812,6 +5535,66 @@ mod tests {
             (0..100).filter_map(|x| term.backend().buffer().cell((x, 0)).map(|c| c.symbol().to_string())).collect();
         assert!(row.contains("ZOOM · "), "tab bar row was: {row:?}");
         assert!(row.trim_end().ends_with(theme::SAVED), "the save word still trails: {row:?}");
+    }
+
+    /// C10/C11 (2026-08-20): neither message may be hostage to whether the
+    /// hint bar is drawn. Both used to reach the screen only through
+    /// `draw_hint_bar`, so `Alt+/` silenced every refusal, every copy
+    /// result, every confirm-arm prompt, and the one sentence explaining a
+    /// terminal that swallows Alt — which `Alt+/` itself cannot then undo.
+    #[test]
+    fn a_hidden_hint_bar_does_not_silence_the_flash_or_the_alt_trap_warning() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        fn last_row(app: &mut App<crate::ports::fakes::FakePane>) -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            (0..100)
+                .filter_map(|x| term.backend().buffer().cell((x, 29)).map(|c| c.symbol().to_string()))
+                .collect()
+        }
+
+        // A flash, with the bar hidden.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        assert!(!app.hints_shown(), "setup: the hint bar is not drawn");
+        app.set_flash("no room to split — stacked needs 10 rows, has 4");
+        assert!(
+            last_row(&mut app).contains("no room to split"),
+            "the refusal never reached the screen: {:?}",
+            last_row(&mut app),
+        );
+
+        // U22's confirm-arm prompt is a flash too — the case where silence
+        // costs the user a pane rather than a message.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        app.apply(Action::ClosePane); // arms, and flashes "… again to …"
+        let row = last_row(&mut app);
+        assert!(row.contains("again"), "the confirm prompt never reached the screen: {row:?}");
+
+        // The C11 bar, with the bar hidden — the one Alt+/ cannot restore.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
+        assert!(app.show_alt_hint(), "setup: the alt trap is detected");
+        let row = last_row(&mut app);
+        assert!(!row.trim().is_empty(), "the alt-trap warning never reached the screen");
+        assert_eq!(
+            row.trim(),
+            app.alt_hint_line().trim(),
+            "the same sentence the hint bar would have carried",
+        );
+
+        // Flash still wins over the warning, exactly as on the hint bar.
+        app.set_flash("copied 12 chars");
+        assert!(
+            last_row(&mut app).contains("copied 12 chars"),
+            "flash must outrank the persistent warning here too",
+        );
     }
 
     /// Asserts `text` sits flush against the pane's top-right border
@@ -4220,7 +6003,7 @@ mod tests {
 
         // A 30-row terminal cannot hold the whole table, so the title has to
         // own up to it — the alternative is a list that just stops.
-        let (visible, total) = super::help_scroll_extent(app.body_area());
+        let (visible, total) = super::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert!(visible < total, "the fixture is genuinely scrolled");
         assert!(frame.contains(&format!("/{total}")), "the title counts the rows:\n{frame}");
         assert!(frame.contains("↑↓ more"), "…and names the keys that reach them:\n{frame}");
@@ -4363,6 +6146,7 @@ mod tests {
             "shell",
             false,
             false,
+            false,
             theme::GLYPH_WORKING,
         )
         .iter()
@@ -4438,8 +6222,8 @@ mod tests {
             let mut term = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
             term.draw(|f| super::draw(f, &mut app)).unwrap();
             // …and scrolled to its end, where `top` is at its largest.
-            let (visible, total) = super::help_scroll_extent(app.body_area());
-            app.mode = Mode::Help { top: total.saturating_sub(visible) };
+            let (visible, total) = super::help_scroll_extent(app.body_area(), app.keymap(), None);
+            app.mode = Mode::Help { top: total.saturating_sub(visible), filter: None };
             term.draw(|f| super::draw(f, &mut app)).unwrap();
         }
     }
@@ -4587,4 +6371,58 @@ mod tests {
             vec!["日", " ", "本", " ", " ", " ", " ", " ", " ", " "],
         );
     }
+
+    /// C10 (2026-08-20): a flash is not a hint. It must reach the user
+    /// whether or not the hint bar is drawn.
+    ///
+    /// With hints hidden every C10 message reached nobody — C38's refusals,
+    /// U14's copy result, the workspace-set-aside notice, and worst of all
+    /// U22's confirm-arm prompts: `Alt+w` armed a destructive second press
+    /// and said nothing at all. Same hazard C2's dated amendment names for
+    /// the mode word, one contract over.
+    #[test]
+    fn a_flash_reaches_the_user_with_the_hint_bar_hidden() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let last_row = |app: &mut App<crate::ports::fakes::FakePane>| -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..100).filter_map(|x| buf.cell((x, 29)).map(|c| c.symbol().to_string())).collect()
+        };
+
+        // One pane, so U22's sharpest case: Alt+w arms "last pane — press
+        // again to QUIT ROOST". With hints hidden this armed silently, and
+        // the second press took the whole session with it.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        assert!(!app.hints_shown(), "setup: the hint bar is hidden");
+
+        app.apply(Action::ClosePane);
+        let flash = app.flash().expect("setup: Alt+w armed a confirm prompt").to_string();
+        assert!(flash.contains("quit"), "setup: the prompt warns about quitting: {flash}");
+        assert!(!app.quit, "setup: the first press only arms");
+
+        let row = last_row(&mut app);
+        assert!(
+            row.contains("last pane"),
+            "the confirm prompt never reached the screen: {row:?} (wanted {flash:?})",
+        );
+
+        // ...and it is the flash doing that, not a permanent band of chrome
+        // over the pane: same app, same hidden hint bar, nothing flashing.
+        let mut quiet = mk_app(Size::new(100, 30));
+        quiet.apply(Action::ToggleHints);
+        assert!(quiet.flash().is_none(), "setup: nothing is flashing");
+        let after = last_row(&mut quiet);
+        assert!(
+            !after.contains("last pane"),
+            "the body's last row is chrome even with no flash: {after:?}",
+        );
+    }
+
 }
+
+

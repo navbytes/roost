@@ -43,6 +43,24 @@ pub fn maybe_run() -> Option<i32> {
         println!("roost {}", env!("CARGO_PKG_VERSION"));
         return Some(0);
     }
+    // F11: `keys` is deliberately **not** in `VERBS`. Every verb there is a
+    // control-socket request against a *running* roost; this one reads
+    // config.json off disk and answers without one — you ask it precisely
+    // when roost isn't up, or when you want to know what your dotfile did
+    // before launching. Routing it through the socket would make the one
+    // question you can ask about a config require the program the config
+    // configures to already be running.
+    if verb == "keys" {
+        if args[1..].iter().any(|a| a == "--help" || a == "-h") {
+            println!("{KEYS_HELP}");
+            return Some(0);
+        }
+        if let Some(bad) = args[1..].first() {
+            eprintln!("roost keys: unexpected argument: {bad}\n\n{KEYS_HELP}");
+            return Some(2);
+        }
+        return Some(run_keys());
+    }
     if !VERBS.contains(&verb.as_str()) {
         // Same convention as a bad flag inside a known verb: hard error,
         // instead of falling through to the TUI (which used to seize the
@@ -161,6 +179,8 @@ roost — control a running instance:
   roost close PANE [--force]
   roost wait PANE... [--until STATUS] [--timeout SEC]
   roost VERB --help              (a verb's own usage)
+and locally, with no running instance:
+  roost keys                     (the effective keymap, config.json applied)
   roost --help | -h
   roost --version | -V
 (run `roost` with no args to launch the multiplexer)
@@ -462,6 +482,82 @@ fn send_request(sock: &Path, req: &serde_json::Value) -> std::io::Result<serde_j
     reader.read_line(&mut resp)?;
     serde_json::from_str(resp.trim())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+const KEYS_HELP: &str = "\
+roost keys
+Print the keymap this machine actually runs: roost's defaults with
+config.json's overrides applied, the same merge the TUI dispatches on.
+
+Needs no running roost — it reads config.json directly, which is the state
+you want to check *before* launching.
+
+Output is `chord<TAB>action`, one per line, with a third column naming
+config.json for anything it changed. The action names are config.json's own,
+so a line can be pasted back into a \"keys\" block.
+
+Exit codes: 0 ok / 2 config.json had entries roost had to skip (named on
+stderr; the printed table is what roost would really run).";
+
+/// F11: print the effective keymap and say what config.json changed.
+///
+/// The review that asked for this (`docs/engagements/2026-08-19-…`) named the
+/// gap precisely: config.json's diagnostics surfaced *only* as a startup
+/// toast inside the TUI, so a mistyped chord in a dotfile was discovered by
+/// launching roost and catching a transient message. zellij has
+/// `setup --check`, lazygit has `--config`; roost had no way to ask.
+///
+/// Cheap to build only because C34 exists: `effective_bindings` is the
+/// default-plus-overrides merge, already written, already the same one
+/// `translate_with` dispatches on. This function is a printer.
+fn run_keys() -> i32 {
+    use crate::ui::input::{action_name, effective_bindings, Keymap};
+
+    let (keymap, diagnostics) = crate::infra::config::load_keymap();
+    let defaults = effective_bindings(&Keymap::default());
+    let live = effective_bindings(&keymap);
+
+    let mut rows: Vec<(String, String, &str)> = Vec::new();
+    for (chord, action) in &live {
+        // Changed by config.json if this exact (chord, action) pair isn't
+        // one of the defaults — covers both a remap onto a free chord and a
+        // rebinding of a chord that already did something else.
+        let from_config = !defaults.iter().any(|(c, a)| c == chord && a == action);
+        let note = if from_config { "config.json" } else { "" };
+        rows.push((chord.clone(), action_name(action), note));
+    }
+    // Disabled chords are the other half of the answer, and the half a table
+    // of live bindings structurally cannot show: "why doesn't Alt+f work"
+    // is exactly the question this command gets asked.
+    for (chord, _) in &defaults {
+        if !live.iter().any(|(c, _)| c == chord) {
+            rows.push((chord.clone(), "disabled".to_string(), "config.json"));
+        }
+    }
+    rows.sort();
+
+    // Tab-separated and *not* column-padded. Padding before a tab looks
+    // tidier in a terminal and quietly breaks the thing this format is for:
+    // `cut -f1` would hand back `"Alt+q     "`. A caller who wants columns
+    // has `column -t`; a caller who wants fields cannot un-pad them.
+    for (chord, action, note) in &rows {
+        if note.is_empty() {
+            println!("{chord}\t{action}");
+        } else {
+            println!("{chord}\t{action}\t{note}");
+        }
+    }
+
+    if diagnostics.is_empty() {
+        return 0;
+    }
+    // Diagnostics to stderr so the table above still pipes cleanly, and a
+    // non-zero exit so a dotfile test can gate on it — the whole point of
+    // being able to ask this outside the TUI.
+    for d in &diagnostics {
+        eprintln!("roost keys: {d}");
+    }
+    2
 }
 
 #[cfg(test)]

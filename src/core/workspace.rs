@@ -23,6 +23,19 @@ pub struct PaneSpec {
     /// panes in its own spawned subtree, but not panes it didn't create.
     #[serde(default)]
     pub spawned_by: Option<PaneId>,
+    /// The pane's parking note (the Alt+r editor): where this pane stands and
+    /// what's next, left for a future session of the person. Newlines
+    /// separate lines; the **first line is the headline** chrome shows —
+    /// the C4 badge renders headline + age on the focused pane and a bare
+    /// `¶` elsewhere. `None` = no note (an empty save clears back to this).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// When `note` was last saved, unix seconds — feeds the badge's age tag
+    /// (`5m`/`3h`/`2d`), which is how a stale note confesses its age
+    /// instead of reading as current. Set and cleared with `note`, never
+    /// separately.
+    #[serde(default)]
+    pub noted_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +58,7 @@ impl Workspace {
         let mut panes = HashMap::new();
         panes.insert(
             1,
-            PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None },
+            PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None, note: None, noted_at: None },
         );
         Workspace {
             version: 1,
@@ -94,6 +107,17 @@ impl Workspace {
     /// minimal shell spec so it renders and spawns instead of being a blank
     /// hole. A well-formed workspace is unchanged. Also clamps `active_tab`.
     pub fn validate_and_repair(&mut self) {
+        // A pane id keys `runtimes` globally, so one id in two positions —
+        // repeated inside a tree, or shared between two tabs — means both
+        // draw and type through a single PTY, `tab_of` answers with
+        // whichever tab comes first, and closing either takes the other with
+        // it. Keep the first occurrence, drop the rest; the per-tab
+        // reconciliation below then drops the orphaned specs, and an emptied
+        // tab goes with the `retain` further down.
+        let mut seen: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+        for tab in &mut self.tabs {
+            crate::core::layout::dedupe_pane_ids(&mut tab.layout, &mut seen);
+        }
         for tab in &mut self.tabs {
             let mut ids = Vec::new();
             crate::core::layout::pane_order(&tab.layout, &mut ids);
@@ -106,6 +130,8 @@ impl Workspace {
                     session: None,
                     title: None,
                     spawned_by: None,
+                    note: None,
+                    noted_at: None,
                 });
             }
         }
@@ -129,6 +155,84 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pane id must name exactly one pane. `workspace.json` is a plain
+    /// file the user can edit (and the format roost's own repair pass exists
+    /// to survive), but the repair reconciled each tab's `panes` map against
+    /// its own layout only — it never asked whether an id appeared twice.
+    ///
+    /// One id in two trees means one entry in `runtimes`, so both positions
+    /// drive a single PTY: the pane draws in two places, keystrokes aimed at
+    /// one land in both, `tab_of` answers with whichever tab comes first,
+    /// and closing either takes the other with it. The same holds for an id
+    /// repeated inside a single tab.
+    /// C6: a one-member stack must not survive a load.
+    ///
+    /// `remove_pane` collapses a stack that *shrinks* to one member, but a
+    /// `workspace.json` can hold one outright — and so can a stack whose
+    /// other members were duplicate ids the repair pass stripped. Either way
+    /// the renderer gets a `StackHeader { n: 1 }`: a header row reading
+    /// "STACK · 1 PANES", stolen from the only pane it describes.
+    #[test]
+    fn a_one_member_stack_does_not_survive_a_load() {
+        for (what, json) in [
+            (
+                "written that way",
+                r#"{"version":1,"active_tab":0,"tabs":[
+                    {"name":"main","layout":{"stack":{"children":[1],"expanded":0}},
+                     "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}}]}"#,
+            ),
+            (
+                "left that way by the duplicate-id repair",
+                r#"{"version":1,"active_tab":0,"tabs":[
+                    {"name":"main","layout":{"stack":{"children":[1,1,1],"expanded":0}},
+                     "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}}]}"#,
+            ),
+        ] {
+            let mut ws: Workspace = serde_json::from_str(json).expect("parses");
+            ws.validate_and_repair();
+            assert!(
+                matches!(ws.tabs[0].layout, LayoutNode::Pane(1)),
+                "{what}: a stack of one reached the renderer: {:?}",
+                ws.tabs[0].layout,
+            );
+        }
+    }
+
+    #[test]
+    fn a_repaired_workspace_never_has_one_id_in_two_places() {
+        let json = r#"{"version":1,"active_tab":0,"tabs":[
+            {"name":"main","layout":{"split":{"dir":"vertical","ratios":[0.5,0.5],
+             "children":[{"pane":1},{"pane":1}]}},
+             "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}},
+            {"name":"api","layout":{"split":{"dir":"vertical","ratios":[0.5,0.5],
+             "children":[{"pane":1},{"pane":2}]}},
+             "panes":{"1":{"adapter":"shell","cwd":"/tmp"},
+                      "2":{"adapter":"shell","cwd":"/tmp"}}}]}"#;
+        let mut ws: Workspace = serde_json::from_str(json).expect("parses");
+        ws.validate_and_repair();
+
+        let mut all = Vec::new();
+        for tab in &ws.tabs {
+            let mut ids = Vec::new();
+            crate::core::layout::pane_order(&tab.layout, &mut ids);
+            for id in &ids {
+                assert!(
+                    tab.panes.contains_key(id),
+                    "tab {} has {id} in its layout with no spec",
+                    tab.name,
+                );
+            }
+            all.extend(ids);
+        }
+        let mut uniq = all.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(all.len(), uniq.len(), "one id names two panes: {all:?}");
+        // The duplicate is dropped, not the pane: the first occurrence and
+        // every distinct id survive.
+        assert!(all.contains(&1) && all.contains(&2), "repair lost a real pane: {all:?}");
+    }
 
     #[test]
     fn default_has_one_shell_pane() {
@@ -163,7 +267,7 @@ mod tests {
         // Orphan spec: a pane id with no place in the layout tree.
         ws.tabs[0].panes.insert(
             5,
-            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None },
+            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
         );
         // Orphan layout leaf: the layout references pane 1, but drop its spec.
         ws.tabs[0].panes.remove(&1);
@@ -207,5 +311,36 @@ mod tests {
         let back: Workspace = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tabs[0].name, "main");
         assert!(back.tabs[0].panes[&1].session.is_none());
+    }
+
+    /// A parking note — newlines included — survives the save/load cycle,
+    /// timestamp attached. This is the whole overnight story: the note is
+    /// ordinary `PaneSpec` data, so it rides the same auto-save the
+    /// session id does.
+    #[test]
+    fn note_and_timestamp_roundtrip_through_json() {
+        let mut ws = Workspace::default_in(PathBuf::from("/tmp"));
+        let spec = ws.tabs[0].panes.get_mut(&1).unwrap();
+        spec.note = Some("tests green, PR up\nnext: rebase, merge".into());
+        spec.noted_at = Some(1_755_200_000);
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: Workspace = serde_json::from_str(&json).unwrap();
+        let spec = &back.tabs[0].panes[&1];
+        assert_eq!(spec.note.as_deref(), Some("tests green, PR up\nnext: rebase, merge"));
+        assert_eq!(spec.noted_at, Some(1_755_200_000));
+    }
+
+    /// A workspace.json written before notes existed loads with both fields
+    /// `None` — `#[serde(default)]`, pinned so the fields can never become
+    /// load-breaking for the state file everyone already has on disk.
+    #[test]
+    fn pre_note_workspace_json_loads_with_no_note() {
+        let json = r#"{"version":1,"active_tab":0,"tabs":[{"name":"main",
+            "layout":{"pane":1},
+            "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}}]}"#;
+        let back: Workspace = serde_json::from_str(json).unwrap();
+        let spec = &back.tabs[0].panes[&1];
+        assert!(spec.note.is_none());
+        assert!(spec.noted_at.is_none());
     }
 }

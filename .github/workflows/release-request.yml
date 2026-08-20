@@ -1,0 +1,45 @@
+name: Release request
+
+# The PR-mergeable spelling of "cut a release". Touching
+# .github/release-request on main (normally via a squash-merged PR)
+# dispatches the Release workflow, which builds and publishes the version
+# in Cargo.toml, creating its tag (see release.yml's dispatch path).
+#
+# Exists because neither refs/tags/* pushes nor the workflow-dispatch API
+# are reachable from every place a release gets prepared (the v0.1.7
+# release: credentials that could merge PRs but nothing else). A PR merge
+# is a push by the merging user, so this hop runs — and its GITHUB_TOKEN
+# may carry actions:write, which the dispatch call needs. The dispatch is
+# one of the two event types exempt from the no-workflows-from-
+# GITHUB_TOKEN-events recursion guard, so release.yml really does run.
+#
+# Idempotent: if the crate version is already tagged, the request is a
+# no-op — a stray touch of the sentinel can't re-release or fail red.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/release-request'
+
+permissions:
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Dispatch Release unless this version is already tagged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+          if git ls-remote --exit-code origin "refs/tags/v${version}" >/dev/null 2>&1; then
+            echo "v${version} is already tagged — nothing to do."
+            exit 0
+          fi
+          echo "Requesting release of v${version}."
+          gh workflow run release.yml --ref main

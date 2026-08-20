@@ -288,6 +288,15 @@ pub trait PaneBackend: Sized {
 pub trait StateStore {
     fn load(&self) -> Result<Option<Workspace>>;
     fn save(&self, ws: &Workspace) -> Result<()>;
+
+    /// `load`, plus one human-readable sentence when the stored state could
+    /// not be used as-is and had to be set aside. Losing a workspace is the
+    /// one failure roost cannot be quiet about — resurrection is the whole
+    /// product — so the composition root asks for the reason and shows it.
+    /// Default: nothing to report, for stores that cannot be corrupt.
+    fn load_reporting(&self) -> Result<(Option<Workspace>, Option<String>)> {
+        Ok((self.load()?, None))
+    }
 }
 
 #[cfg(test)]

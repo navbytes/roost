@@ -2,10 +2,19 @@ name: Release
 
 # Builds release binaries and publishes a GitHub Release when a `vX.Y.Z` tag
 # is pushed. Never runs on a normal push or PR — see ci.yml for that.
+#
+# Also runnable by hand (workflow_dispatch): same build, same release, but
+# the tag (`v` + Cargo.toml's version) is *created by* the release step at
+# this run's commit instead of arriving as the trigger. Exists because a
+# release isn't always prepared somewhere that can push refs/tags/* — the
+# v0.1.7 release was staged by credentials that could merge PRs but not
+# push tags. Dispatch from the commit to be released (normally main's HEAD,
+# right after the version-bump PR lands).
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -30,8 +39,11 @@ jobs:
       # Cheap guard against shipping a binary whose --version-equivalent
       # (the crate version baked into the tarball name) doesn't match what
       # was actually tagged — a mismatch here would silently break the
-      # cargo-binstall pkg-url template in Cargo.toml.
+      # cargo-binstall pkg-url template in Cargo.toml. Only meaningful on a
+      # tag push: a dispatch run *derives* its tag from Cargo.toml, so there
+      # is nothing for the crate version to disagree with.
       - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
           tag_version="${GITHUB_REF_NAME#v}"
@@ -50,7 +62,9 @@ jobs:
         # in Cargo.toml — no separate strip step needed here.
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          # The crate version, not the ref name: identical on a tag push
+          # (the guard above), and the only version there is on a dispatch.
+          version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
           pkg="roost-${version}-${{ matrix.target }}"
           mkdir "$pkg"
           cp "target/${{ matrix.target }}/release/roost" "$pkg/"
@@ -92,11 +106,28 @@ jobs:
         working-directory: dist
         run: cat -- *.tar.gz.sha256 > SHA256SUMS.txt
 
+      # The tag being released — the pushed tag, or (dispatch) `v` + the
+      # crate version, which action-gh-release below then creates at this
+      # run's commit. Written to GITHUB_ENV so the release and formula-sync
+      # steps read the same answer.
+      - name: Resolve release tag
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          else
+            version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+            echo "RELEASE_TAG=v$version" >> "$GITHUB_ENV"
+          fi
+
       # No artifact signing yet.
       # TODO: sign release artifacts (e.g. cosign or minisign) once a
       # signing key is provisioned.
       - uses: softprops/action-gh-release@v3
         with:
+          # Explicit on both paths; on a dispatch run this is what creates
+          # the tag (at this run's commit) rather than expecting one.
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS.txt
@@ -106,8 +137,17 @@ jobs:
       # Keep navbytes/homebrew-tap tracking this release: render
       # Formula/roost.rb from dist/SHA256SUMS.txt and push it to the tap.
       # Skipped when HOMEBREW_TAP_TOKEN is unset (see the job env above).
+      # RELEASE_TAG arrives from the resolve step's GITHUB_ENV.
       - name: Sync Homebrew formula (navbytes/homebrew-tap)
         if: env.HOMEBREW_TAP_TOKEN != ''
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: bash scripts/update-homebrew-formula.sh
+
+      # The skip above must be LOUD, not silent: v0.1.6 and v0.1.7 both
+      # released green while the tap quietly stayed behind (the secret has
+      # never been configured), and the gap only surfaced when a brew
+      # install served the old version. A warning annotation on the run's
+      # summary makes "release ok, tap NOT synced" readable at a glance.
+      - name: Warn that the tap was NOT synced
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: |
+          echo "::warning title=Homebrew tap not synced::HOMEBREW_TAP_TOKEN is unset, so Formula/roost.rb in navbytes/homebrew-tap was NOT updated for ${RELEASE_TAG}. Add the secret (fine-grained PAT, contents:write on navbytes/homebrew-tap — see packaging/README.md) or sync by hand (scripts/update-homebrew-formula.sh)."

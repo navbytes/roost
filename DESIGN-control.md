@@ -153,6 +153,16 @@ protect.
    scoped to the pane's own subtree (see Open decisions §3 for the resolved
    in-pane trust model).
 4. **Reports and commands do not share an authorization surface.**
+
+   **[Amended 2026-08-19, DESIGN-ui.md C36 — a third actor.]** `Actor` gains
+   `Local`: the human at the keyboard, reaching every pane exactly as `Fleet`
+   does. It is **not an authorization change** — no token resolves to it,
+   `TokenTable::resolve` never returns it, and it is unreachable from the
+   socket. A chord pressed inside roost is already the strongest credential
+   there is; the variant exists so the **audit trail can tell the two apart**.
+   Logging a keyboard broadcast as `fleet` would make a human's action
+   indistinguishable from a token holder's in `control.log` and the C20 feed,
+   and attribution is the whole reason that log exists. Audited as `local`.
 5. **Reads are scoped + consented.** Owner-created panes only; no in-pane read
    verb; no all-panes passive stream without explicit consent.
 6. **Rate-limited + per-principal connection cap** (not just the global
@@ -204,8 +214,54 @@ protect.
      is still set — it's what makes that loop tick on a genuinely silent
      connection rather than block forever inside one `read()` — but it no
      longer has to *be* the deadline. A pile of squatters, silent or
-     dripping, now recycles within the 2s deadline of connecting either way;
-     nobody else is ever blocked from getting in.
+     dripping, now recycles within the 2s deadline of connecting either way.
+   - **Pre-auth pool (16) with oldest-first displacement.** *(Finding from
+     the 2026-08-20 reliability audit.)* The sentence that stood here —
+     "nobody else is ever blocked from getting in" — was false, and
+     measurably so. Recycling within 2s is not the same as never blocking:
+     while 64 squatters hold the pool every other client is shed, so a
+     legitimate `roost list` waits out the deadline. Measured against a real
+     instance: 64 silent connections cost a legitimate client **2.07s and 21
+     refused attempts**; a squatter that retook each slot as it recycled
+     stretched that to **12.1s and 118 refused attempts**. The deadline
+     bounds how long any *one* squatter is subsidised; it does not bound the
+     denial, because reconnecting is free. Sustained, that was a
+     control-plane denial of service available to any local process that can
+     reach the socket — including a hostile process inside a pane, precisely
+     the principal the per-pane tokens exist to contain. The tokens always
+     held (nothing can be *driven* without one); what was deniable was access
+     itself.
+
+     The fix is two rules that only work together. **A connection that has
+     not identified itself is evictable**, and at most `MAX_PENDING_CONN`
+     (16) of `MAX_CONN` may be unidentified at once. Past that share — or
+     with the pool full — an arrival displaces the OLDEST unpromoted
+     connection and takes its slot, rather than being shed. A cap alone
+     would repeat this file's own recorded mistake (16 idle connections
+     permanently shedding every arrival, cheaper than the bug it replaced);
+     displacement alone would leave squatters holding 64 threads. Together:
+     a caller about to identify itself always gets in, because a legitimate
+     client is the oldest-unpromoted for the microseconds it takes to write
+     its request, while a squatter is by definition always older.
+     **Promotion makes a connection un-displaceable** — work in flight, and
+     parked `wait`s especially, are never sacrificed for a stranger.
+
+     `Limits.pending` holds a `try_clone` of each unpromoted socket purely so
+     the accept thread can `shutdown` it, which unblocks the victim's `read`
+     at once instead of waiting out `PRE_AUTH_READ_TIMEOUT`; an
+     `Arc<AtomicBool>` per connection is claimed with a `swap(false)` by
+     whichever of eviction and `ConnGuard::drop` gets there first, so the
+     slot is released exactly once. Displacement releases the slot
+     synchronously, making it a transfer rather than a race.
+
+     Same measurement after the fix: **27ms, first attempt**, under the
+     sustained flood. Gated end to end by `tests/control_plane_squatters.rs`.
+
+     What this does *not* do: distinguish a squatter from a first-time
+     legitimate client before either has authenticated. Nothing can —
+     same-uid peer credentials do not help, because a hostile pane has them
+     too. A flood still costs arriving clients an extra connect attempt now
+     and then. The denial is bounded, not abolished.
    - **Per-principal pool, 20**, alongside the unchanged global 64 — a
      connection is promoted here, and onto the generous `READ_TIMEOUT` (30s),
      the instant it sends its first well-formed request. Must be at least

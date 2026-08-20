@@ -46,16 +46,33 @@ impl AgentAdapter for PiAdapter {
     }
 
     /// pi stores sessions in a per-cwd subdirectory whose name is the path
-    /// with separators turned to dashes (and some dash-wrapping). Rather than
-    /// hardcode that private encoding, compare the file's parent dir to the
-    /// cwd with all non-alphanumerics stripped — robust to pi's exact dash
-    /// convention while still scoping detection to this pane's project.
+    /// with separators turned to dashes (and some dash-wrapping). Rather
+    /// than hardcode that private encoding, compare the file's parent dir
+    /// to the cwd as a **sequence of alphanumeric runs** — robust to pi's
+    /// exact dash convention while still scoping detection to this project.
+    ///
+    /// The runs are compared as a list, not concatenated. Concatenating
+    /// (the original spelling: strip every non-alphanumeric from both
+    /// sides) made `/home/me/my-project` and `/home/me/myproject` the same
+    /// key, so a pane in either project matched the other's session files —
+    /// and with several projects open at once that is a live way to resume
+    /// a conversation from the wrong one.
+    ///
+    /// **Still lossy, unavoidably.** pi's encoding uses the same character
+    /// for a separator as for a dash inside a directory name, so
+    /// `/home/me/my/project` and `/home/me/my-project` both encode to
+    /// `-home-me-my-project` and remain indistinguishable from the
+    /// directory name alone. That collision is pi's to disambiguate, not
+    /// roost's; the one this fixes is the one roost invented.
     fn owns_session_file(&self, path: &Path, cwd: &Path) -> bool {
-        let key = |s: &str| -> String {
-            s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+        let runs = |s: &str| -> Vec<String> {
+            s.split(|c: char| !c.is_alphanumeric())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_lowercase())
+                .collect()
         };
         match path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-            Some(dir) => key(dir) == key(&cwd.to_string_lossy()),
+            Some(dir) => runs(dir) == runs(&cwd.to_string_lossy()),
             None => false,
         }
     }
@@ -64,6 +81,22 @@ impl AgentAdapter for PiAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `owns_session_file` strips **every** non-alphanumeric from both
+    /// sides, so two project paths that differ only in punctuation
+    /// normalize to the same key — and each pane then matches the other
+    /// project's session files.
+    #[test]
+    fn two_projects_differing_only_in_punctuation_must_not_share_sessions() {
+        let a = PiAdapter;
+        // pi's own directory encoding for /home/me/my-project.
+        let f = Path::new("/h/.pi/agent/sessions/-home-me-my-project/2026-01-01T00-00-00-000Z_aaaa.jsonl");
+        assert!(a.owns_session_file(f, Path::new("/home/me/my-project")), "its own project matches");
+        assert!(
+            !a.owns_session_file(f, Path::new("/home/me/myproject")),
+            "a different project whose path differs only by a dash must NOT match",
+        );
+    }
 
     #[test]
     fn extracts_bare_uuid_from_pi_filename() {
