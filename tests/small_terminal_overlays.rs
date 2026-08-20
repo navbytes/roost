@@ -33,11 +33,16 @@ fn opens_visibly(what: &str, chord: &[u8], mode_word: &str, title: &str, rows: u
     let cwd = std::env::temp_dir().to_str().unwrap().to_string();
     let ws = harness::two_panes(&cwd);
     let Some(mut h) = spawn_or_skip_sized(what, &ws, &[], rows, cols) else { return };
-    assert!(h.settle(Duration::from_secs(5)), "{what}: roost never drew a first frame");
+    // 10 s, not 5: roost spawns *login* shells (P18), and a user rc that
+    // sources something slow (nvm, on this sandbox) puts ~1 s of startup
+    // noise ahead of the first frame. The deadline is a liveness check, not
+    // a latency budget — nothing here measures speed, so the only thing a
+    // tight one buys is a flake on a loaded CI runner.
+    assert!(h.settle(Duration::from_secs(10)), "{what}: roost never drew a first frame");
     // Both panes painted, so the screen this compares against is the real
     // steady state rather than a half-drawn one.
     assert!(
-        h.wait_for(Duration::from_secs(5), |s| s.contents().matches('┌').count() >= 2).is_some(),
+        h.wait_for(Duration::from_secs(10), |s| s.contents().matches('┌').count() >= 2).is_some(),
         "{what}: the panes never drew at {cols}x{rows}:\n{}",
         h.screen().contents(),
     );

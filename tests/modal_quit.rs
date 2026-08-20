@@ -40,7 +40,12 @@ fn workspace() -> String {
 /// test itself demonstrate.
 fn quits_from(what: &str, chord: &[u8], mode_word: &str) {
     let Some(mut h) = spawn_or_skip(what, &workspace()) else { return };
-    assert!(h.settle(Duration::from_secs(5)), "{what}: roost never drew a first frame");
+    // 10 s, not 5: roost spawns *login* shells (P18), and a user rc that
+    // sources something slow (nvm, on this sandbox) puts ~1 s of startup
+    // noise ahead of the first frame. The deadline is a liveness check, not
+    // a latency budget — nothing here measures speed, so the only thing a
+    // tight one buys is a flake on a loaded CI runner.
+    assert!(h.settle(Duration::from_secs(10)), "{what}: roost never drew a first frame");
 
     assert!(
         !h.screen().contents().contains(mode_word),
@@ -50,7 +55,7 @@ fn quits_from(what: &str, chord: &[u8], mode_word: &str) {
 
     h.write_bytes(chord);
     assert!(
-        h.wait_for(Duration::from_secs(3), |s| s.contents().contains(mode_word)).is_some(),
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains(mode_word)).is_some(),
         "{what}: the modal never opened — {mode_word:?} is not on screen, so what \
          follows would be testing Normal mode:\n{}",
         h.screen().contents(),

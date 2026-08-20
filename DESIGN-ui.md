@@ -4126,28 +4126,38 @@ Found by the design-supervisor sweep for the `{:<N}` minimum-width mistake
 that produced the C15 amendment above — the class, not the instance, which is
 what that sweep was for.
 
-### Open: the composer's `Exited` filter tier can never match
-**[Added 2026-08-20, simulation pass]**
+### ~~Open~~: the composer's `Exited` filter tier can never match
+**[Added 2026-08-20, simulation pass · RESOLVED 2026-08-20]**
 
 C36's `Tab` filter shares `ROSTER_STATUS_CYCLE` with C27's roster, which is
 deliberate — the composer shows a *target count* for the tier it names, and
 tiers that meant different things in the two places would make that count
 unreadable. But `broadcast_targets` excludes exited panes **unconditionally**
-(`rt.status() != AgentStatus::Exited`), so the cycle's `Exited` stop is
-structurally always "no panes" in the composer: a stop you can Tab onto that
-can never do anything, on any fleet.
+(`rt.status() != AgentStatus::Exited`), so the cycle's `Exited` stop was
+structurally always "no panes" in the composer: a stop you could Tab onto
+that could never do anything, on any fleet.
 
-Nothing is wrong — the count is honest and the send is a correct no-op. It is
-a dead option riding along on an enum shared between two surfaces whose
-eligibility rules differ, which the sharing rationale did not anticipate.
+**Resolved: the composer skips it; the roster keeps it.** The two invariants
+turned out not to be in tension once the question was put precisely. What
+the sharing protects is that the tiers *mean the same thing and come in the
+same order* on both surfaces — not that both surfaces stop at all of them.
+A stop that can only ever mean "nobody" is not a filter, it is a hole in the
+cycle; and the roster is a *monitoring* surface, where "which of my panes
+died" is the whole point.
 
-The fix is small either way and the question is which invariant matters more:
-skip the tier in the composer (the cycles then differ by one stop, but every
-stop in each is reachable), or keep them identical (one stop is inert, and a
-user learns to skip it). Recorded rather than guessed at, because the shared
-cycle was a deliberate C36 decision and this is the first evidence against it.
-Found by a simulation agent reviewing C36 adversarially — it could not defeat
-the guard, and found this instead.
+So there is still exactly one definition of the tiers and their order
+(`ROSTER_STATUS_CYCLE`), stepped by one function, with the composer passing
+`deliverable_only` — rather than a second const free to drift, which is the
+shape the original C36 rationale was written to avoid.
+
+The skip is a **second step in the same direction**, never a fallback to
+`None`: `Tab` and `Shift+Tab` must stay exact inverses across the gap, and
+the naive fallback makes them agree at one point in the lap and diverge for
+the rest of it. Pinned by `the_composer_cycle_is_reversible_across_the_gap`,
+which is what the mutation check breaks.
+
+Found by a simulation agent reviewing C36 adversarially — it could not
+defeat the guard, and found this instead.
 
 ### Open: an Alt chord discards an editor's unsaved buffer
 **[Added 2026-08-20, C24b amendment audit]**
@@ -4599,12 +4609,25 @@ counts it; the send writes to it. A guard that lies would be worse than none,
 so the two cannot be separate code paths. Pinned by
 `the_target_count_is_the_set_that_actually_receives`.
 
-**`Tab` is C27's filter, shared.** The composer and the roster cycle the same
-`ROSTER_STATUS_CYCLE` through the same `cycle_status_filter` — extracted here
-rather than copied, because the composer is showing a *count* for the filter
-it names, and a filter that meant something subtly different in each surface
-would make that count unreadable. "Send to the three panes that are `◆`" is
-now one gesture, and it composes two surfaces that already existed.
+**`Tab` is C27's filter, shared — minus one stop.** The composer and the
+roster step the same `ROSTER_STATUS_CYCLE` through the same function —
+extracted rather than copied, because the composer is showing a *count* for
+the filter it names, and a filter that meant something subtly different in
+each surface would make that count unreadable. "Send to the three panes that
+are `◆`" is now one gesture, and it composes two surfaces that already
+existed.
+
+**[Amended 2026-08-20]** The composer passes `deliverable_only` and so skips
+`Exited`. `broadcast_targets` excludes exited panes unconditionally, which
+made that stop structurally always "no panes" here — a stop you could Tab
+onto that could never do anything, on any fleet. What the sharing protects
+is that the tiers *mean the same thing and come in the same order* on both
+surfaces, not that both stop at all of them; a stop that can only ever mean
+"nobody" is a hole in the cycle rather than a filter. The roster keeps it,
+because "which of my panes died" is what a monitoring surface is for. Still
+one definition of the tiers, one stepping function, no second const free to
+drift. See §7 for the full reasoning, including why the skip must be a
+second step in the same direction rather than a fallback to `None`.
 
 **Keys are C32's.** `Enter` sends · `Shift+Enter` (or `Ctrl+Enter`, **or
 `Alt+Enter`**) breaks a line · `Tab`/`Shift+Tab` cycle the targets · `Esc`
@@ -4848,11 +4871,11 @@ C9's 100-column budget; a flash takes the whole bar and returns, so C9's
 right-segment arithmetic is untouched. This contract adds sentences, not a
 surface.
 
-**Not in scope.** The `Exited` tier of the composer's `Tab` filter (C36) is
-structurally always empty — `broadcast_targets` excludes exited panes
-unconditionally — so it is a dead stop in the cycle rather than a silent
-refusal. Recorded in §7; it wants a decision about whether the two surfaces
-may offer different tiers, which is C36/C27's question, not this one's.
+**Not in scope, and since resolved elsewhere.** The `Exited` tier of the
+composer's `Tab` filter (C36) was structurally always empty — a dead stop in
+the cycle rather than a silent refusal, so not C38's kind of problem. It was
+C36/C27's question and got C36/C27's answer: the composer now skips the
+tier, the roster keeps it, and §7 records why the two are not in tension.
 
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
