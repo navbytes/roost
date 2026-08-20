@@ -178,6 +178,17 @@ impl Reply {
 /// `handle_control_msg` (the dispatch-time check) and sock.rs's door (the
 /// pre-dispatch admission check) so the two can never say something
 /// different for the same failure — same pattern as `sock::OVERSIZE_LINE_MSG`.
+/// `wait`'s default deadline when the caller names none, and the ceiling
+/// any `--timeout` is clamped to — so a parked reply can never live forever.
+///
+/// Named here, in the protocol vocabulary both ends share, because the
+/// client needs the same numbers: `cli::run` sizes its own read deadline
+/// from them, and a client that gave up before the server's answer was due
+/// would report a wedged roost that was doing exactly what it was asked.
+pub const WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
+/// See `WAIT_DEFAULT_TIMEOUT_MS`.
+pub const WAIT_MAX_TIMEOUT_MS: u64 = 24 * 3600 * 1000;
+
 pub const UNAUTHORIZED_MSG: &str = "unauthorized: unknown or missing token";
 
 /// 16 CSPRNG bytes from /dev/urandom, hex-encoded. `None` if urandom is

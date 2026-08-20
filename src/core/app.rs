@@ -2074,7 +2074,11 @@ impl<B: PaneBackend> App<B> {
             return Err(msg.into());
         }
         // Default 5 min, capped at 24 h, so a parked reply can't live forever.
-        let ms = timeout_ms.unwrap_or(300_000).min(24 * 3600 * 1000);
+        // Both numbers live in `core::control` — the client sizes its own
+        // read deadline from them (`cli::reply_timeout`).
+        let ms = timeout_ms
+            .unwrap_or(crate::core::control::WAIT_DEFAULT_TIMEOUT_MS)
+            .min(crate::core::control::WAIT_MAX_TIMEOUT_MS);
         let deadline = Instant::now() + Duration::from_millis(ms);
         self.waiters.push(Waiter { actor, panes, until, reply, deadline });
         Ok("parked")

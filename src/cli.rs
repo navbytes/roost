@@ -18,6 +18,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::infra::sock::{socket_path, OVERSIZE_LINE_MSG};
 use crate::infra::store::FsStore;
@@ -163,9 +164,18 @@ fn status_hook(
     if let Some(m) = message {
         msg["message"] = serde_json::Value::String(m);
     }
-    let _ = write_line(&sock, &msg); // best-effort: a hook must never fail loudly
+    // Best-effort: a hook must never fail loudly — and never hang either.
+    // This runs inside the agent's own process on every status transition,
+    // so a roost that stopped reading its socket must not stall the agent.
+    let _ = write_line(&sock, &msg, HOOK_WRITE_TIMEOUT);
     0
 }
+
+/// A status hook runs inside the agent's own process, on its own critical
+/// path, and its whole contract is "cheap and silent". A roost that has
+/// stopped draining its socket must cost it a couple of seconds at most,
+/// never a stall.
+const HOOK_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "\
 roost — control a running instance:
@@ -225,7 +235,8 @@ fn run(args: &[String]) -> i32 {
         }
     };
     let sock = std::env::var_os("ROOST_SOCK").map(Into::into).unwrap_or_else(socket_path);
-    match send_request(&sock, &req) {
+    let deadline = reply_timeout(verb, &req);
+    match send_request(&sock, &req, deadline) {
         Ok(reply) => {
             if let Some(ok) = reply.get("ok") {
                 println!("{}", serde_json::to_string_pretty(ok).unwrap_or_default());
@@ -244,6 +255,22 @@ fn run(args: &[String]) -> i32 {
                 // gets.
                 if err == OVERSIZE_LINE_MSG { 2 } else { 1 }
             }
+        }
+        // A timeout is not "cannot reach": the connection was made and the
+        // request went out. Saying so is the difference between a script
+        // author looking for a running roost and looking at a wedged one.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            eprintln!(
+                "roost: connected, but no reply within {}s — the running roost is wedged or \
+                 saturated.",
+                deadline.as_secs()
+            );
+            1
         }
         Err(e) => {
             eprintln!("roost: cannot reach a running roost ({e}). Is one open in this workspace?");
@@ -466,8 +493,16 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 /// connected stream so a caller that wants a reply (control verbs, via
 /// `send_request`) can keep reading it; a fire-and-forget caller (the
 /// `__status` hook, via `status_hook`) just drops it.
-fn write_line(sock: &Path, msg: &serde_json::Value) -> std::io::Result<UnixStream> {
+fn write_line(
+    sock: &Path,
+    msg: &serde_json::Value,
+    timeout: Duration,
+) -> std::io::Result<UnixStream> {
     let mut stream = UnixStream::connect(sock)?;
+    // A server that accepts and then never reads would otherwise block this
+    // write forever, the same way a server that never replies used to block
+    // the read below.
+    stream.set_write_timeout(Some(timeout))?;
     let mut line = serde_json::to_string(msg).unwrap_or_default();
     line.push('\n');
     stream.write_all(line.as_bytes())?;
@@ -475,8 +510,51 @@ fn write_line(sock: &Path, msg: &serde_json::Value) -> std::io::Result<UnixStrea
     Ok(stream)
 }
 
-fn send_request(sock: &Path, req: &serde_json::Value) -> std::io::Result<serde_json::Value> {
-    let stream = write_line(sock, req)?;
+/// How long the client waits for a reply to any verb but `wait`.
+///
+/// roost answers a control request on its event loop, which turns over at
+/// ~30 Hz, so a normal reply is a frame away. This is the server's own
+/// `READ_TIMEOUT` — the longest the far end is ever willing to wait on
+/// *us* — reused as the longest we wait on it.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Slack on top of `wait`'s own deadline, so the client's timer can never
+/// fire before the reply it is waiting for is even due.
+const WAIT_REPLY_SLACK: Duration = Duration::from_secs(10);
+
+/// How long the client should wait for a reply to `req`.
+///
+/// `wait` is the one verb that legitimately blocks — it parks until its
+/// panes reach a status or its own deadline fires (`App::register_waiter`,
+/// whose default and ceiling are `control::WAIT_*_TIMEOUT_MS`). Every other
+/// verb is answered in a frame.
+fn reply_timeout(verb: &str, req: &serde_json::Value) -> Duration {
+    if verb != "wait" {
+        return REPLY_TIMEOUT;
+    }
+    let ms = req
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(crate::core::control::WAIT_DEFAULT_TIMEOUT_MS)
+        .min(crate::core::control::WAIT_MAX_TIMEOUT_MS);
+    Duration::from_millis(ms).saturating_add(WAIT_REPLY_SLACK)
+}
+
+/// Send `req` and read the one-line reply, giving up after `timeout`.
+///
+/// The deadline is the point. `infra::sock` is hardened at every step — a 2 s
+/// pre-auth read, a 30 s read, a 5 s write — and the client had none at all,
+/// so a roost whose event loop was wedged left `roost list` blocked forever:
+/// no output, no exit status, nothing for a script to recover from. The
+/// timeouts are per-syscall rather than a wall-clock budget, which is exact
+/// enough here: the request is one small line and the reply is one line.
+fn send_request(
+    sock: &Path,
+    req: &serde_json::Value,
+    timeout: Duration,
+) -> std::io::Result<serde_json::Value> {
+    let stream = write_line(sock, req, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
     reader.read_line(&mut resp)?;
@@ -712,6 +790,91 @@ mod tests {
                 "{v}'s help must lead with its own usage"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_timeout_tests {
+    use super::{reply_timeout, send_request, REPLY_TIMEOUT, WAIT_REPLY_SLACK};
+    use crate::core::control::{WAIT_DEFAULT_TIMEOUT_MS, WAIT_MAX_TIMEOUT_MS};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// Every verb but `wait` is answered in a frame, so they share one
+    /// deadline; `wait` gets its own, whatever the caller asked for — a
+    /// client that gave up first would report a wedged roost that was doing
+    /// exactly what it was told.
+    #[test]
+    fn wait_gets_its_own_deadline_and_every_other_verb_the_default() {
+        let plain = serde_json::json!({"method": "list"});
+        assert_eq!(reply_timeout("list", &plain), REPLY_TIMEOUT);
+        assert_eq!(reply_timeout("read", &plain), REPLY_TIMEOUT);
+
+        // No --timeout: the server's own default, plus slack.
+        let bare_wait = serde_json::json!({"method": "wait"});
+        assert_eq!(
+            reply_timeout("wait", &bare_wait),
+            Duration::from_millis(WAIT_DEFAULT_TIMEOUT_MS) + WAIT_REPLY_SLACK
+        );
+
+        // An explicit one is honoured...
+        let long = serde_json::json!({"method": "wait", "timeout_ms": 900_000});
+        assert_eq!(
+            reply_timeout("wait", &long),
+            Duration::from_millis(900_000) + WAIT_REPLY_SLACK
+        );
+
+        // ...and clamped exactly where the server clamps it, so `--timeout`
+        // of u64::MAX (which `cli_wait_timeout_saturates_instead_of_
+        // overflowing` pins as reachable) cannot overflow the Duration.
+        let absurd = serde_json::json!({"method": "wait", "timeout_ms": u64::MAX});
+        assert_eq!(
+            reply_timeout("wait", &absurd),
+            Duration::from_millis(WAIT_MAX_TIMEOUT_MS) + WAIT_REPLY_SLACK
+        );
+    }
+
+    /// A roost that accepts the connection and then never answers must cost
+    /// the client its deadline, not the rest of the day. Before this, a
+    /// wedged event loop left `roost list` blocked forever: no output, no
+    /// exit status, nothing a script could recover from.
+    #[test]
+    fn a_server_that_never_replies_costs_the_deadline_and_no_more() {
+        let dir = std::env::temp_dir().join(format!("roost-cli-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path: PathBuf = dir.join("t.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // Accept, read the request, and then say nothing at all — the
+        // wedged-event-loop shape. Holding the stream is what keeps the
+        // client's read from seeing EOF and returning early.
+        let held = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the client connects");
+            // Long enough to outlast the client's 300 ms deadline several
+            // times over, short enough not to pad the suite.
+            std::thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+
+        let req = serde_json::json!({"token": "t", "method": "list"});
+        let started = Instant::now();
+        let err = send_request(&path, &req, Duration::from_millis(300))
+            .expect_err("a server that never replies must not resolve");
+        let took = started.elapsed();
+
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "the failure must read as a timeout, not something else: {err:?} ({:?})",
+            err.kind()
+        );
+        assert!(took < Duration::from_secs(3), "gave up after {took:?}, deadline was 300ms");
+
+        let _ = held.join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
