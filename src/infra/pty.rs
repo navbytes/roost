@@ -1115,6 +1115,44 @@ impl PaneBackend for PtyPane {
 
     fn on_exit(&mut self) {
         self.status.on_exit();
+        // Sweep the session **first, and unconditionally** — before the reap
+        // below, not inside it.
+        //
+        // This used to sit inside `if let Ok(Some(_)) = try_wait()`, i.e. it
+        // only ran if the child had already become reapable by the time
+        // roost got round to the EOF. It very often has not: the master
+        // reaches EOF when the last *slave fd* closes, which happens while
+        // the child is still exiting, and on a loaded machine the event loop
+        // lands squarely inside that window. The sweep was then skipped
+        // outright and everything the pane had backgrounded lived on —
+        // exactly the failure the sweep was added for, just intermittent
+        // instead of total. It made `tests/orphan_after_exit.rs` flaky on
+        // CI (two failures in eleven runs of main) and is reproducible on
+        // demand with a pane that `exec`s into a child holding no tty fd.
+        //
+        // Doing it here is also the *safer* half of the old branch, not a
+        // relaxation. At this instant the pane's process either still exists
+        // (as in that repro) or is a zombie roost has not yet reaped —
+        // either way the pid is unambiguously still the pane's. Inside the
+        // old branch the reap had just completed, which is the one moment
+        // the OS is free to recycle it.
+        //
+        // EOF is roost's definition of a dead pane everywhere else (the
+        // status flips to Exited, the exited bar appears), so a child that
+        // closed its terminal and kept running is one roost has already
+        // called dead; sweeping what it left behind is that same call,
+        // applied consistently.
+        if let Some(pid) = self.pid {
+            for member in session_members(pid) {
+                if member != pid {
+                    // Safety: kill(2) with a pid from this pane's own
+                    // session and a plain signal number.
+                    unsafe {
+                        libc::kill(member as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+        }
         // The PTY hit EOF because the child closed it — almost always because
         // it exited. Reap it now (non-blocking) so a pane left sitting in its
         // "exited" state doesn't hold a zombie. If the child somehow closed the
@@ -1126,39 +1164,8 @@ impl PaneBackend for PtyPane {
         // libc::kill on `self.pid.is_some()` (and run again unconditionally
         // on every runtime during App::shutdown), can't signal it.
         if let Ok(Some(_)) = self.child.try_wait() {
-            // Sweep the session **here**, before the pid is cleared.
-            //
-            // `kill()` gates both its group kill and its session sweep on
-            // `self.pid`, so once this line nulls it every cleanup path
-            // becomes a no-op — and a pane's shell exiting on its own is
-            // the *normal* way a pane dies. Anything the pane put in
-            // another process group (`sleep 600 &`, an agent's daemonized
-            // helper) then survived closing the pane, respawning it, and
-            // quitting roost entirely, with nothing left on screen to
-            // mention it.
-            //
-            // It has to happen at this instant rather than later. Keeping
-            // the sid around to sweep at close time would work, but the
-            // pid-reuse race the group kill already accepts is only
-            // tolerable because its window is microseconds — a sid held
-            // from a shell that exited at breakfast and swept when the pane
-            // is closed after lunch is a different proposition entirely,
-            // and could signal a wholly unrelated process. Sweeping now,
-            // one statement after the reap, keeps the window exactly where
-            // the existing code already accepts it.
-            //
-            // `!= pid` for the same reason the `kill()` sweep does it: the
-            // leader is already reaped, and re-signalling a dead pid is
-            // precisely the hazard being avoided.
-            if let Some(pid) = self.pid {
-                for member in session_members(pid) {
-                    if member != pid {
-                        unsafe {
-                            libc::kill(member as libc::pid_t, libc::SIGKILL);
-                        }
-                    }
-                }
-            }
+            // The sweep above already ran; this branch now only lets go of
+            // the pid.
             self.pid = None;
         }
     }
@@ -1528,6 +1535,106 @@ mod tests {
         assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
         // The first notification of a pane's life is never rate-limited.
         assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+    }
+
+    /// The EOF sweep must not depend on winning the reap race.
+    ///
+    /// `on_exit` runs when the *master* hits EOF, which happens as the last
+    /// slave fd closes — while the child is still exiting. The sweep used to
+    /// sit inside `if let Ok(Some(_)) = try_wait()`, so whenever roost got
+    /// there first it was skipped outright and every backgrounded job the
+    /// pane had started lived on. Intermittent by construction: two failures
+    /// in eleven runs of main on CI, always in `tests/orphan_after_exit.rs`,
+    /// never reproducible on demand.
+    ///
+    /// This makes it deterministic. The pane `exec`s into a `sleep` whose
+    /// three fds are redirected off the tty: no fd holds the slave open, so
+    /// the master EOFs, and the pane's pid is unambiguously still running
+    /// when `on_exit` fires — the exact state the old branch declined to
+    /// sweep in.
+    #[test]
+    fn the_eof_sweep_runs_even_when_the_pane_has_not_been_reaped_yet() {
+        use crate::agents::CommandSpec;
+        use crate::core::event::AppEvent;
+        use crate::ports::PaneBackend;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(256);
+        let spec = CommandSpec::new("sh", &std::env::temp_dir());
+        let Ok(mut pt) = super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx) else {
+            eprintln!("SKIP eof-sweep gate: no pty available");
+            return;
+        };
+        // A job in its own right with its fds off the pty — neither the
+        // pane's process group nor the terminal's foreground group, so only
+        // the session sweep reaches it — then `exec` into something that
+        // holds no tty fd either, so the master EOFs with the pid alive.
+        // `B''G=` so the shell's echo of the command line cannot be mistaken
+        // for its output.
+        pt.write_input_raw(
+            b"sleep 60 </dev/null >/dev/null 2>&1 & echo B''G=$!\n              exec sleep 20 </dev/null >/dev/null 2>&1\n",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut bg = None;
+        while std::time::Instant::now() < deadline && bg.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            while let Ok(AppEvent::Output(_, bytes)) = rx.try_recv() {
+                pt.process_output(&bytes);
+            }
+            bg = pt
+                .parser
+                .screen()
+                .contents()
+                .split("BG=")
+                .nth(1)
+                .and_then(|t| t.split_whitespace().next())
+                .and_then(|t| t.parse::<u32>().ok());
+        }
+        let Some(bg) = bg else {
+            pt.kill();
+            eprintln!("SKIP eof-sweep gate: the pane never reported its job");
+            return;
+        };
+        // Let the `exec` land, then pin the precondition: this is the race,
+        // not a pane that has already been reaped.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            matches!(pt.child.try_wait(), Ok(None)),
+            "setup: the pane's pid must still be running when on_exit fires"
+        );
+
+        pt.on_exit();
+
+        // A killed process lingers as a zombie until its new parent reaps
+        // it, and `kill -0` succeeds for a zombie — so the state is what is
+        // asked, with the same short grace `tests/harness` uses.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut alive = true;
+        while alive && std::time::Instant::now() < deadline {
+            alive = running(bg);
+            if alive {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        // Safety: SIGKILL to a pid this test created.
+        unsafe { libc::kill(bg as libc::pid_t, libc::SIGKILL) };
+        pt.kill();
+        assert!(!alive, "the backgrounded job {bg} outlived the pane's EOF");
+    }
+
+    /// Is `pid` a *running* process? `kill -0` alone is not that question —
+    /// it succeeds for a zombie, which holds nothing and is only waiting to
+    /// be collected. Same reasoning (and the same fix) as
+    /// `tests/harness::is_alive`.
+    fn running(pid: u32) -> bool {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let state = String::from_utf8_lossy(&out.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     /// P2: and the **desktop** channel is gated too, on the same interval.
