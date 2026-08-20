@@ -1260,13 +1260,48 @@ impl<B: PaneBackend> App<B> {
         // made this non-deterministic). Claiming newest-spawned-first mirrors
         // file-creation order, so each pane gets its own file.
         pending.sort_by(|a, b| b.1.cmp(&a.1));
-        for (id, since) in pending {
+        for (id, since) in pending.clone() {
             let Some((spec, adapter)) = self.find_spec(id).and_then(|s| {
                 self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a))
             }) else {
                 self.pending_detect.remove(&id);
                 continue;
             };
+            // Two panes in *different projects* whose adapter gives them the
+            // same session root cannot be told apart by this scan at all:
+            // the root carries no cwd signal (codex buckets rollouts by
+            // date, `~/.codex/sessions` for every project), so the only
+            // thing separating the candidates is mtime order, which says
+            // nothing about whose they are. Decline rather than guess.
+            //
+            // **A wrong session is far worse than no session.** Losing a
+            // resume pointer costs the user a `--continue`; attaching a
+            // pane to another project's conversation corrupts work in it.
+            // Declining leaves the pane pending, so the exact channel (the
+            // agent-side extension) can still report it, and the scan
+            // retries the moment the ambiguity clears.
+            //
+            // Same-cwd concurrency is *not* ambiguous in this sense and is
+            // deliberately still allowed: both panes really are in that
+            // project, and the newest-first ordering above mirrors file
+            // creation order so each takes its own.
+            let root = adapter.session_root(&spec.cwd);
+            let ambiguous = root.is_some()
+                && pending.iter().any(|(other, _)| {
+                    *other != id
+                        && self.find_spec(*other).is_some_and(|o| {
+                            o.adapter == spec.adapter
+                                && o.cwd != spec.cwd
+                                && self
+                                    .registry
+                                    .get(o.adapter.as_str())
+                                    .and_then(|a| a.session_root(&o.cwd))
+                                    == root
+                        })
+                });
+            if ambiguous {
+                continue;
+            }
             // Session ids already owned by other panes — never re-assign one
             // (concurrent same-cwd launches otherwise cross-wire onto it).
             let taken = session_resolver::claimed_sessions(&self.ws);
@@ -1443,7 +1478,15 @@ impl<B: PaneBackend> App<B> {
                 .unwrap_or(now)
                 .checked_sub(PROMOTION_GRACE)
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            self.pending_detect.entry(id).or_insert(floor);
+            // `max`, not `or_insert`: the window may only ever **tighten**.
+            // A pane that promotes, finds nothing (so stays pending),
+            // demotes when the agent exits, then promotes again hours later
+            // would otherwise keep its first floor — by then old enough to
+            // reach conversations from earlier in the same session.
+            self.pending_detect
+                .entry(id)
+                .and_modify(|f| *f = (*f).max(floor))
+                .or_insert(floor);
         }
         for cwd in visited {
             self.note_cwd(cwd);
@@ -11282,6 +11325,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The promotion floor must never be *loosened* by a later promotion.
+    ///
+    /// `pending_detect.entry(id).or_insert(floor)` keeps whatever bound is
+    /// already there. A pane that promotes, fails to find a file (so stays
+    /// pending), demotes when the agent exits, and promotes again hours
+    /// later would keep the **first** floor — by then old enough to reach
+    /// conversations from earlier in the session. The window must only ever
+    /// tighten.
+    #[test]
+    fn a_second_promotion_tightens_the_detection_floor_it_never_loosens() {
+        let dir = std::env::temp_dir().join(format!("roost-refloor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        let tick = |app: &mut App<FakePane>, agent: Option<&str>| {
+            app.runtimes.get_mut(&1).unwrap().observation = Some(crate::ports::Observation {
+                cwd: None,
+                agent: agent.map(String::from),
+            });
+            app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+            app.tick();
+        };
+
+        // Shell → agent: promoted, nothing on disk, so it stays pending.
+        tick(&mut app, None);
+        tick(&mut app, Some("detect"));
+        let first_floor = *app.pending_detect.get(&1).expect("pending after promotion");
+
+        // The agent exits (demote), the pane sits as a shell, then the user
+        // launches it again much later.
+        tick(&mut app, None);
+        app.last_shell_seen.insert(1, SystemTime::now() + Duration::from_secs(3600));
+        tick(&mut app, Some("detect"));
+
+        let second_floor = *app.pending_detect.get(&1).expect("pending after re-promotion");
+        assert!(
+            second_floor > first_floor,
+            "the second promotion kept the first floor ({first_floor:?}), so its window \
+             still reaches back to conversations from before the agent was relaunched",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The same guarantee when the pane **changes directory first** — open
     /// a pane, `cd` into a project, then launch the agent.
     ///
@@ -11368,6 +11488,121 @@ mod tests {
         for d in [&old_dir, &new_dir] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// Adapter with a **global** session root that claims every file for
+    /// every cwd — codex's shape (`~/.codex/sessions`, bucketed by date,
+    /// `owns_session_file` true by design because the path carries no cwd
+    /// signal at all).
+    struct UnscopedAdapter(PathBuf);
+    impl crate::agents::AgentAdapter for UnscopedAdapter {
+        fn id(&self) -> &'static str {
+            "unscoped"
+        }
+        fn launch(&self, cwd: &std::path::Path) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd)
+        }
+        fn resume(&self, cwd: &std::path::Path, session: &str) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd).arg(session)
+        }
+        fn resume_flag(&self) -> &'static str {
+            "--resume"
+        }
+        fn session_root(&self, _cwd: &std::path::Path) -> Option<PathBuf> {
+            Some(self.0.clone()) // global: the same root for every project
+        }
+    }
+
+    /// Two panes in **different projects** must never be handed each
+    /// other's conversation.
+    ///
+    /// An adapter whose session root is global (codex) gives the scan no
+    /// cwd signal, so when two panes are mid-detection at once the only
+    /// thing separating them is arrival order — and a session file's mtime
+    /// says nothing about which project it belongs to. The taken-set stops
+    /// one id reaching two panes; it does nothing about the *wrong* id
+    /// reaching a pane.
+    ///
+    /// Guiding principle for this tool: **a wrong session is far worse than
+    /// no session.** Losing a resume pointer costs the user `--continue`;
+    /// attaching a pane to another project's conversation corrupts work.
+    #[test]
+    fn an_unscoped_adapter_never_hands_a_pane_another_projects_session() {
+        let root = std::env::temp_dir().join(format!("roost-unscoped-{}", std::process::id()));
+        let a_dir = root.join("proj-a");
+        let b_dir = root.join("proj-b");
+        let _ = std::fs::remove_dir_all(&root);
+        for d in [&root, &a_dir, &b_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Two sessions land in the one global root, moments apart. Nothing
+        // in either path says which project it came from.
+        let base = SystemTime::now();
+        for (name, offset) in [("first", 10u64), ("second", 20)] {
+            let f = root.join(format!("{name}.jsonl"));
+            std::fs::write(&f, "").unwrap();
+            std::fs::File::open(&f)
+                .unwrap()
+                .set_modified(base + Duration::from_millis(offset))
+                .unwrap();
+        }
+
+        let mut panes = HashMap::new();
+        for (id, dir) in [(1 as PaneId, &a_dir), (2 as PaneId, &b_dir)] {
+            panes.insert(
+                id,
+                PaneSpec {
+                    adapter: "unscoped".into(),
+                    cwd: dir.clone(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
+            );
+        }
+        let layout = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("unscoped", Box::new(UnscopedAdapter(root.clone())));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        app.pending_detect.clear();
+        app.pending_detect.insert(1, base);
+        app.pending_detect.insert(2, base);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let a = app.find_spec(1).unwrap().session.clone();
+        let b = app.find_spec(2).unwrap().session.clone();
+        assert!(
+            a.is_none() && b.is_none(),
+            "two panes in different projects were each handed a session from a \
+             global root that cannot say which project it belongs to: \
+             pane1(proj-a)={a:?} pane2(proj-b)={b:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
