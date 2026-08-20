@@ -190,7 +190,25 @@ This is the "hybrid" model made concrete: where we control an extension API, sta
   - The bound is **the last tick the pane was observed running no agent**
     (`last_shell_seen`), minus a few seconds for observation lag: a promoted
     pane cannot own a session file older than the moment it was still a
-    shell. Reported from real use as "it loads the wrong session".
+    shell. Reported from real use as "it loads the wrong session". The bound
+    only ever tightens — a later promotion never restores an earlier one's
+    window.
+  - **When the root cannot attribute a file to a pane, decline.** Some
+    adapters' session roots are global (codex: `~/.codex/sessions`, bucketed
+    by date, the same directory for every project), so two panes in
+    different projects mid-detection cannot be told apart — the only thing
+    separating the candidates is mtime order, which says nothing about whose
+    they are. roost skips the scan and leaves the pane pending rather than
+    guessing. **A wrong session is far worse than no session:** losing a
+    resume pointer costs a `--continue`; attaching a pane to another
+    project's conversation corrupts work in it. Same-cwd concurrency is not
+    ambiguous in this sense and is still resolved, newest-spawn-first.
+  - **The scan gives up after a minute** (`DETECT_GIVE_UP`). No adapter
+    overrides `detect_session`, so every retry is a full recursive walk of
+    the session root stat-ing every file; a pane that never resolves used to
+    keep that running every 2s for the life of the process. Giving up costs
+    nothing real — the file appears within seconds if it appears at all —
+    and the failure is the safe one: start fresh rather than resume wrong.
 - Title channel (D5): Claude Code also publishes its state in the terminal title — a braille spinner frame (`⠧ …`) while a turn runs, `✳ …` at rest. Roost parses title changes into a screen-derived Working/Waiting signal that ranks between hook reports and byte heuristics: never consulted while a status-socket link is live, ranked below the bell (a blocked agent's one remaining "needs you" signal must win), never able to touch NeedsInput/Exited, and a Working title decays like a report once stale *and* silent — an *animating* spinner refreshes the clock every frame, so only a frozen (hung) spinner ever decays, and conversely a live spinner sustains a quiet hook-reported Working past its usual decay (a long silent tool call between one-shot hooks). The whole channel sits behind an app-pushed gate — enabled only while an agent actually runs in the pane (spawn adapter + `observe_panes` promote/demote, which also clears the stored signal on demote): a vt100 title outlives the process that set it, so without the gate an exited agent's leftover `✳` would veto Working for every later shell command in that pane. The gate is what makes the channel safe; the ranking is what keeps claude panes honest **between** their one-shot hook connections — a keystroke echo on a resting pane no longer paints a phantom ●, and a lost `Stop` hook settles the moment the title flips to rest.
 
 ### 6.3 Heuristic fallback (any adapter, incl. plain `shell`)

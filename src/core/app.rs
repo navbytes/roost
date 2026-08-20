@@ -33,6 +33,24 @@ const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 /// everything a previous run left behind, which is the whole point.
 const PROMOTION_GRACE: Duration = Duration::from_secs(10);
 
+/// How long the filesystem fallback keeps looking for a pane's session file
+/// before giving up.
+///
+/// `pending_detect` was previously only cleared on success or when the pane
+/// vanished, so a pane whose agent never wrote a file roost could attribute
+/// stayed pending for the life of the process — and since no adapter
+/// overrides `detect_session`, each tick meant a full recursive walk of the
+/// whole session root (`~/.pi/agent/sessions`: every project, all history)
+/// stat-ing every file, twice a minute, forever.
+///
+/// A minute is far longer than any agent takes to create its session file,
+/// so giving up costs nothing real — and when it is wrong the failure is
+/// the safe one: the pane simply starts fresh next launch instead of
+/// resuming. The exact channel (the agent-side extension, design doc §6.1)
+/// does not go through `pending_detect` at all and keeps working after
+/// this expires.
+const DETECT_GIVE_UP: Duration = Duration::from_secs(60);
+
 /// F1: how long the "Alt keys aren't reaching roost" hint stays up after its
 /// most recent evidence (`App::alt_swallow_at`) — not since launch.
 /// `is_alt_swallow_char`'s evidence is real but not unambiguous (every
@@ -1283,6 +1301,15 @@ impl<B: PaneBackend> App<B> {
         // made this non-deterministic). Claiming newest-spawned-first mirrors
         // file-creation order, so each pane gets its own file.
         pending.sort_by(|a, b| b.1.cmp(&a.1));
+        // Drop anything past the give-up horizon before scanning for it.
+        // Checked against the pane's own `since` rather than a separate
+        // clock so the window means the same thing here as it does in the
+        // scan: how long we have been looking for *this* pane's file.
+        let now = SystemTime::now();
+        self.pending_detect.retain(|_, since| {
+            now.duration_since(*since).map(|age| age < DETECT_GIVE_UP).unwrap_or(true)
+        });
+        pending.retain(|(id, _)| self.pending_detect.contains_key(id));
         for (id, since) in pending.clone() {
             let Some((spec, adapter)) = self.find_spec(id).and_then(|s| {
                 self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a))
@@ -11343,6 +11370,73 @@ mod tests {
             app.find_spec(1).unwrap().session.as_deref(),
             Some("fresh"),
             "the session this pane actually started must still be found",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Detection must give up eventually.
+    ///
+    /// `pending_detect` is only ever removed from on success
+    /// (`set_session`) or when the pane disappears. A pane whose agent
+    /// never writes a session file roost can attribute — it exited early,
+    /// it is an adapter with no session root reachable, or the scan keeps
+    /// declining as ambiguous — stays pending **forever**, and every 2s
+    /// tick runs `session_files_since` over the whole session root for it.
+    ///
+    /// No adapter overrides `detect_session`, so that is a full recursive
+    /// walk stat-ing every file under e.g. `~/.pi/agent/sessions` — every
+    /// project, all history — twice a minute, for the life of the process.
+    #[test]
+    fn detection_stops_retrying_a_pane_that_will_never_resolve() {
+        let dir = std::env::temp_dir().join(format!("roost-giveup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "detect".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Pending since well past any plausible agent startup, and the
+        // session root is empty, so no scan will ever succeed.
+        app.pending_detect.clear();
+        app.pending_detect.insert(1, SystemTime::now() - Duration::from_secs(3600));
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        assert!(
+            !app.pending_detect.contains_key(&1),
+            "still pending an hour on — roost will rescan the whole session root \
+             every 2 seconds for the rest of the process's life",
         );
 
         let _ = std::fs::remove_dir_all(&dir);
