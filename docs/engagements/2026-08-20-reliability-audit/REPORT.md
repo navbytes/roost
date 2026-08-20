@@ -6,10 +6,10 @@ four items that needed them (see "Resolved after review"). Everything below
 was reproduced
 before it was reported, fixed with a test, and mutation-checked (the fix was
 reverted and the test confirmed to fail). Branch:
-`claude/ui-ux-keybindings-analysis-3hqs3v`, twenty-one commits on top of
+`claude/ui-ux-keybindings-analysis-3hqs3v`, twenty-four commits on top of
 v0.1.9.
 
-Suite at the end of the audit: **940 unit + all integration suites passing**,
+Suite at the end of the audit: **943 unit + all integration suites passing**,
 two pre-existing environmental failures (both assume a non-root user;
 `chmod 000` does not stop root, so they fail in this container and pass on a
 normal machine). Clippy unchanged at its 8-warning baseline.
@@ -305,10 +305,10 @@ indicator is dropped after all.
 No new glyph, no new colour, no column change — only which of two existing
 things yields. DESIGN-ui.md carries the dated C2 amendment.
 
-**Still outstanding:** CLAUDE.md requires a design-supervisor audit for any
-`src/ui/**` change. This one has not had it — the change is inside C2's own
-contract and adds nothing to §2's inventory, but the audit is the project's
-rule, not mine to waive.
+**Audited.** Two design-supervisor passes ran on this (see "What the design
+audit found" below). C2 came back ALIGNED; the passes found one off-by-one in
+my floor, one still-reachable one-member stack, and — chasing a sentence I had
+written to justify an edge case — a much larger bug of their own.
 
 ### C. `~/.claude/projects` encoding — roost's was simply wrong
 `82097ff` · `src/agents/claude.rs`
@@ -337,12 +337,102 @@ Your own listing is now the test fixture. One residual uncertainty, noted in
 the code: non-ASCII is mapped one dash per `char`, which is the consistent
 reading of the rule but the one case your listing could not confirm.
 
-### D. One-member stack chrome — still open, by design
-The illegal *tree* is fixed (finding 11), so the state should no longer be
-reachable. The chrome that exposed it — a header reading "STACK · 1 PANES" —
-is in `src/ui/render.rs` and still says that if it ever is. Untouched for the
-same reason as B's outstanding item: CLAUDE.md wants a design-supervisor pass
-there.
+### D. One-member stack chrome — closed, and the chrome needed no change
+`3ec7e2f` · `src/core/layout.rs`, `src/core/workspace.rs`, `DESIGN-ui.md`
+
+The audit checked reachability rather than taking finding 11's word for it,
+and found the state still reachable: `remove_pane` collapses a stack that
+*shrinks* to one, but a `workspace.json` can hold one outright, and the
+duplicate-id repair (finding 13) can leave one. Both reached the renderer as
+`StackHeader { n: 1 }`. Normalizing in `dedupe_pane_ids` — which
+`validate_and_repair` runs over every tab — covers both.
+
+C6 turned out to specify no n=1 label at all, so `"STACK · 1 PANES"` was
+unspecified rather than drift, and the conformant fix was in `layout.rs`, not
+the chrome. C6 now states that `n` is always ≥ 2.
+
+---
+
+## What the design audit found
+
+The pass CLAUDE.md requires for `src/ui/**` changes, run twice. Both times it
+found things reading the code had not.
+
+**C2 itself: ALIGNED.** Ladder, the 9-part tab composition, `+8` widths, and
+the §4/§5 lockstep between `draw_tab_bar`/`tab_strip`/`tab_at_x` all hold.
+U7, U15, C10's reasoning and §2's inventory clean; U15 needs no amendment.
+
+**The floor was one column tight** (`3ec7e2f`). `tab_scroll_start` never
+scrolls past tab 0, so with tab 0 active no leading `…` is drawn — the floor
+charged for one anyway and dropped the indicator while the tab still fit
+exactly.
+
+**Every C10 flash was invisible whenever hints were hidden** (`3ec7e2f`,
+`d709047`). This started as a footnote — the audit observed that C2's floor
+was justified by "the flash has already fired", which was not true, because
+`draw_hint_bar` was the only thing that painted a flash. `hints_shown()` is
+false both under `Alt+/` and under 3 rows of terminal, and in that state
+**none of the 38 `set_flash` call sites reached the user**: C38's refusals,
+U14's copy result, the workspace-set-aside notice, and worst, U22's
+confirm-arm prompts — `Alt+w` armed *"last pane — Alt+w again to quit
+roost"* while showing nothing at all, and the second press quit roost. The
+same hazard C2's own 2026-07-27 amendment names for the mode word: a safety
+affordance made conditional on an unrelated toggle.
+
+A flash now paints over the body's last row when the hint bar is not drawn —
+painted over, not by shrinking the body, so the geometry the panes were
+PTY-resized to does not change for two seconds and back.
+
+**And that fix was itself wrong** (`d709047`). The second pass caught it.
+`theme::attention()` is `REVERSED` and nothing else, deliberately (§2: a
+flash inverts the user's own pair rather than assuming a background roost
+does not own). Ratatui *patches* styles, so with no fg of its own the message
+took the fg of whatever it landed on — the pane border drawn moments earlier
+in the same frame. Under an unfocused pane that is `RULE` carrying text,
+banned outright by §2; under a focused one it is `ACCENT` reversed, which is
+bit-identical to `attention_problem()`, so "copied 12 chars" rendered as
+C11/C16's reserved *problem* treatment. Cells past the message kept their
+border glyphs, reversed. Clearing the row first fixes all of it, and is what
+makes "one shared function, so the two paths cannot drift" true of styling
+rather than only of text and timing.
+
+**The fixture is the durable half.** §2's four chrome gates never exercised
+this surface — the fixture list had only the hints-*shown* flash — so every
+gate passed while it was wrong. A hints-hidden flash is now in the list, and
+it fails two gates the instant the clear is removed. Likewise the layout
+fuzzer asserted only `!children.is_empty()` for a `Stack`, so a one-member
+stack walked past it; it now asserts `>= 2` and catches the reverted collapse
+immediately.
+
+**Spec gaps closed:** `DESIGN-ui.md`'s "tabs still win outright" and
+`SPEC-ux.md`'s ordering note carry supersede markers; C6 states `n ≥ 2`; C22's
+stacking order names the flash's place (above the float, below modals, dimmed
+by C12's backdrop — all three now chosen rather than merely true); C10 records
+that the row is cleared and why.
+
+---
+
+## Open — one decision left
+
+### C11's alt-trap warning is still hint-bar-only
+`src/ui/render.rs` · surfaced by the second audit pass (SG-A)
+
+The bar that tells you your terminal is swallowing Alt chords draws only when
+the hint bar does — the identical bug just fixed for C10, in the adjacent
+contract. It is worse in one way: if Alt really is being swallowed, `Alt+/`
+cannot bring the hint bar back, so the warning explaining why nothing works
+is unreachable by the only key that would reveal it.
+
+I did not fix it, because it is not the same shape of fix. A flash is
+transient — two seconds of the body's last row, then the row comes back. The
+alt-trap bar is *persistent*, so overlaying it costs a row of pane content
+indefinitely, and that is a taste call about what is permanently on screen
+rather than a bug fix.
+
+**Recommendation:** overlay it the same way, but only while `show_alt_hint()`
+holds — which is already evidence-gated (U4/F1: it fires on the signature of
+a swallowed Option chord, not on any missing Alt). A user in that state has
+a broken keyboard path and needs the sentence more than the row.
 
 ---
 
