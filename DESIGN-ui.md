@@ -5088,24 +5088,64 @@ lockstep, applied to a modal's own heading.
   variant without weakening `every_mode()`'s duplicate check, which is what
   makes its exhaustive `match` mean anything.
 
-**Not in scope.** The report's other half — ordering the groups by context,
-so a dead-focused pane's overlay leads with the dead-pane verbs — is
-deliberately not built here. Its headline case ("copy mode leads with
-READING") is **unreachable**: C24b's escape hatch sets `mode = Normal`
-before `Action::Help` runs, so `Mode::Help` never learns what it was
-entered from, and `selection` is cleared on the way too (verified, not
-reasoned). Making it reachable means threading a predecessor mode through
-the escape hatch contracted the same day. The *workspace*-state half (a dead
-focused pane) needs none of that and stays available; it is simply a much
-smaller win than filtering, and worth its own decision rather than a
-tail-end of this one.
+**[Amended 2026-08-20] The dead-pane keys join the table.** `↵` relaunch,
+`f` fresh and `y` copy-resume are **bare keys, not Alt chords** —
+`main.rs` claims them out of `InputResult::Forward` while the focused pane
+is dead — so §8 has no row for them and C34's chord sweep cannot reach
+them. The C9 bar advertised them and nothing else did: P21's case verbatim
+("a search nothing advertises is a search nobody finds"), on the one
+surface whose job is to prevent it. They now ride one row in `PANES`, next
+to the other recovery verb, which is how C15 has always absorbed a
+mode-local non-Alt key.
+
+`y` is listed unconditionally although the bar shows it only when there is
+a session to resume. The overlay is the whole keymap, not the keymap for
+this instant, and every other row here documents a key whose effect depends
+on context.
+
+`the_overlay_teaches_every_key_the_dead_pane_bar_advertises` is keyed off
+the **bar**, not a written list, because the bar is where a new dead-pane
+key would appear first. It walks both bars — `resumable` gates `y`, so the
+un-resumable one alone leaves out the key this amendment spends a paragraph
+on — and it matches each key against the overlay's **key columns**, not its
+text.
+
+That last part is the load-bearing one. The first version searched the
+joined overlay text for each key as a substring, and every letter a–z
+already appears in `HELP_GROUPS`'s prose — "close pane (confirm if busy)"
+alone supplies both `f` and `y`. A future dead-pane key added with no row
+would have passed silently; only `↵` was doing any work, by the accident of
+occurring once. Worse, the mutation check that "proved" the gate used an
+uppercase `Q`, which happens not to appear anywhere: **picking an
+unrepresentative mutant is how a vacuous check survives its own
+verification.** Both directions are now checked with a lowercase letter
+that does appear. Named by the C39 audit; a seventh instance of the shape
+in §7's list, with a rule of its own.
+
+**Not in scope.** The report's other half — ordering the groups by context
+— is deliberately not built. Two separate reasons, and both are worth
+recording because the report proposed it as the cheap alternative:
+
+- Its headline case ("copy mode leads with READING") is **unreachable**.
+  C24b's escape hatch sets `mode = Normal` before `Action::Help` runs, so
+  `Mode::Help` never learns what it was entered from, and `selection` is
+  cleared on the way too (verified against the running code, not reasoned).
+  Making it reachable means threading a predecessor mode through the escape
+  hatch contracted the same day.
+- Its *reachable* case — a dead focused pane — turns out to be a **no-op**.
+  `PANES` already leads `HELP_GROUPS`, and it already holds every overlay
+  row a dead pane cares about. Reordering would change nothing on screen.
+  What was actually missing there was not an order but a *row*, which is
+  the amendment above. Found by checking whether the reordering would do
+  anything before building it.
 
 ### On gates that pass by construction
-**[Added 2026-08-20, after the sixth instance]**
+**[Added 2026-08-20, after the eighth instance]**
 
-Six assertions on this branch turned out to prove nothing, all the same
-shape: **a test asserting a bound on a value that was already clamped to
-that bound.** Recorded here because the count is the argument — each one was
+Eight assertions on this branch turned out to prove nothing, six of them
+the same shape — **a test asserting a bound on a value already clamped to
+that bound** — and two their generalisation: a comparison whose right side
+is satisfied by construction. Recorded here because the count is the argument — each one was
 found by a design audit or a deliberate sweep, never by CI, and each made a
 check look done when it was not.
 
@@ -5124,6 +5164,21 @@ The instances, so the shape is recognisable:
    vacuous, and the test's own comment stated the clamps before asserting
    them. Two clamps covered for each other, so deleting either left it
    green.
+7. `the_overlay_teaches_every_key_the_dead_pane_bar_advertises` — matched
+   single-character keys with `contains` over the whole overlay text, where
+   every letter a–z already appears. Only `↵` was load-bearing, by accident.
+   Not a clamp this time but the same family: **a comparison whose right
+   side is satisfied by construction.** Now matched against the key columns.
+8. `tests/help_filter.rs`'s Esc sequence — and the one that bit rather than
+   merely lying. Between the two Esc presses it waited for the screen to
+   contain `"/ "`, which `Alt+/` and the `Alt+?` row's own "`/` filters it"
+   already put there: the predicate was true before the first Esc was
+   parsed, so `wait_for` returned instantly and the second ESC byte went
+   out on the heels of the first. Two ESCs arriving together fuse into one
+   event, so only one Esc landed — the query cleared, the overlay stayed
+   open, **and CI went red on macOS while passing on Linux**. Now waits for
+   the *transition* (the query leaving the title), which the preceding
+   assertion has already proved starts false.
 6. `roster_window_follows_the_cursor_and_clamps` — `top + height <=
    rows.len()` asserted after `roster_view`, which had just applied
    `roster_top_clamped` (`top.min(len - height)`). The assertion restated
@@ -5147,6 +5202,19 @@ Three rules follow, and they are cheap:
   rewrite of (5) asserted placement and *still* passed with the clamp
   deleted, because a dialog centred on the whole body is inside it either
   way. Only the mutation showed that; the assertion looked meaningful.
+- **A `wait_for` predicate is an assertion too, and a vacuous one races.**
+  (8) is the only entry here that failed rather than lied, and it is the
+  cheapest to prevent: a predicate that is already true when the wait
+  begins does not synchronise anything, so whatever the test does next
+  runs against unsettled state. Wait for a **transition** the preceding
+  step has proved starts false, never for a condition that merely holds
+  afterwards.
+- **Pick a *representative* mutant.** (7)'s gate matched single-character
+  keys with `contains` over the whole overlay text, where every letter a–z
+  already appears; the mutation that "proved" it used an uppercase `Q`,
+  which happens not to occur. The check was vacuous and its own
+  verification said otherwise. A mutant chosen for convenience tests the
+  mutant, not the gate.
 - **Test a clamp where it lives, not through a caller that applies it.**
   (6)'s property was real; asserting it downstream of the clamp made it
   unfalsifiable *and* hid that the clamp had no test. A pure helper with an

@@ -858,6 +858,13 @@ struct HelpLayout {
     /// construction. C15's 2026-08-20 amendment named that shape ("a
     /// tautology that reads like a gate is worse than no gate") and C39's
     /// first floor test reintroduced it in this file anyway.
+    ///
+    /// Read only by tests — it exists so a floor gate has something honest
+    /// to assert on, which is a job nothing in the draw path needs. The
+    /// allow is narrow and deliberate rather than a `#[cfg(test)]` field,
+    /// because a struct that changes shape between builds is a worse trade
+    /// than one unused field.
+    #[allow(dead_code)]
     asked: u16,
 }
 
@@ -1154,6 +1161,30 @@ const HELP_GROUPS: &[HelpGroup] = &[
             chords(&[Action::EditPane], "name + parking note (first line shows on the badge)"),
             chords(&[Action::ClosePane], "close pane (confirm if busy)"),
             chords(&[Action::Undo], "reopen the last pane or tab you closed"),
+            // [F9] The dead-pane keys, which the overlay did not teach at
+            // all. They are bare keys rather than Alt chords — `main.rs`
+            // claims them from `InputResult::Forward` while the focused
+            // pane is dead — so §8 has no row for them and the C34 sweep
+            // does not cover them; the C9 bar advertised them and nothing
+            // else did. That is P21's case verbatim ("a search nothing
+            // advertises is a search nobody finds"), and C15 answered it
+            // the same way: fold the mode-local keys into the group that
+            // owns them, next to the other recovery verb.
+            //
+            // `y` is listed unconditionally though the bar shows it only
+            // when there is a session to resume: the overlay is the whole
+            // keymap, not the keymap for this instant, and every other row
+            // here documents a key whose effect depends on context.
+            HelpRow {
+                key: HelpKey::Text("↵ / f / y"),
+                // The description mirrors the key column's `/`, which is
+                // what every other positionally-mapped row here does — and
+                // it matters more than usual, because `·` elsewhere in this
+                // table separates independent clauses *of one key*. Using
+                // both spellings in one row inverted the table's own
+                // convention. Named by the C39 audit.
+                desc: "dead pane: relaunch / fresh (drops resume) / copy resume",
+            },
             chords(&[Action::ToggleRaw], "raw pass-through for this pane (same chord exits)"),
         ],
     },
@@ -4444,6 +4475,61 @@ mod tests {
         assert_eq!(marker.content.as_ref(), " ");
         assert_eq!(style, theme::quiet());
     }
+    /// [F9] Every key the dead-pane hint bar advertises is taught by the
+    /// overlay too.
+    ///
+    /// The dead-pane keys (`↵` relaunch, `f` fresh, `y` copy resume) are
+    /// bare keys, not Alt chords — `main.rs` claims them out of
+    /// `InputResult::Forward` while the focused pane is dead — so §8 has no
+    /// row for them and C34's chord sweep does not reach them. They were
+    /// advertised on the C9 bar and documented nowhere else: P21's case
+    /// verbatim, and the one C15 exists to prevent.
+    ///
+    /// This is the gate that would have caught it, and it is deliberately
+    /// keyed off the **bar** rather than a written list — the bar is where
+    /// a new dead-pane key would appear first.
+    #[test]
+    fn the_overlay_teaches_every_key_the_dead_pane_bar_advertises() {
+        // Both bars: `resumable` gates whether `y` is offered, and the
+        // un-resumable one alone was the whole test — leaving `y`, the key
+        // C39 spends a paragraph justifying as unconditional, outside the
+        // assertion set entirely. Found by the C39 audit.
+        let mut keys: Vec<String> = Vec::new();
+        for resumable in [false, true] {
+            for (k, _) in hint_pairs(&Mode::Normal, true, resumable, false, false) {
+                if !k.starts_with("Alt+") && !keys.contains(&k) {
+                    keys.push(k); // Alt chords are C34's sweep, not this one
+                }
+            }
+        }
+        assert!(keys.len() >= 3, "the dead-pane bar must offer ↵, f and y: {keys:?}");
+
+        // Match the **key columns**, not the whole overlay text. The first
+        // version searched the joined rows for each key as a substring —
+        // and every letter a–z already appears in `HELP_GROUPS`'s prose
+        // ("close pane (confirm if busy)" alone supplies both `f` and `y`),
+        // so a future dead-pane key added with no row would have passed
+        // silently. Only `↵` was load-bearing, by the accident of occurring
+        // once. The mutation check that "proved" the gate used an uppercase
+        // `Q`, which happens not to appear — picking an unrepresentative
+        // mutant is how a vacuous check survives its own verification.
+        let key_columns: Vec<String> = help_lines(&Keymap::default(), "")
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Row(k, _) => Some(k.clone()),
+                HelpLine::Head(_) => None,
+            })
+            .collect();
+        for k in keys {
+            assert!(
+                key_columns.iter().any(|col| col.split(['/', ' ']).any(|tok| tok == k)),
+                "the dead-pane bar offers {k:?} and no overlay row has it in its key \
+                 column — a key nothing but the bar advertises is a key nobody finds \
+                 (P21). Key columns: {key_columns:?}",
+            );
+        }
+    }
+
     /// [F9] The query actually narrows the table, matching on **both**
     /// columns, and an empty query changes nothing at all.
     #[test]

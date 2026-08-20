@@ -423,7 +423,7 @@ continue-into-the-next-tab rule.
 
 ---
 
-## F9 · Low · **PARTLY RESOLVED 2026-08-20 (C39)** · `Alt+?` neither filters nor knows where you are
+## F9 · Low · **RESOLVED 2026-08-20 (C39)** · `Alt+?` neither filters nor knows where you are
 
 **What.** The overlay is one global scrolling table. roost already has
 type-ahead filtering in two other dialogs (C14's picker per U20, C27's roster)
@@ -452,12 +452,21 @@ What licenses it is **C27's roster**, which made exactly this trade first and
 wrote the reason into its hint bar ("a letter is filter text, U20's rule").
 C39 says that plainly rather than borrowing the smaller precedent.
 
-**The cheap alternative was half wrong, and the wrong half was the headline.**
-"Copy mode leads with READING" is unreachable: C24b's escape hatch sets
-`mode = Normal` before `Action::Help` runs, so `Mode::Help` never learns
-where it came from — verified against the running code, not reasoned. The
-*workspace*-state half (a dead focused pane) needs no such state and remains
-available; it is left as its own decision, being a much smaller win.
+**The cheap alternative was wrong in both halves**, which is the more
+useful finding. "Copy mode leads with READING" is unreachable: C24b's
+escape hatch sets `mode = Normal` before `Action::Help` runs, so
+`Mode::Help` never learns where it came from — verified against the running
+code, not reasoned. And the *reachable* half — a dead focused pane — is a
+**no-op**: `PANES` already leads `HELP_GROUPS` and already holds every
+overlay row a dead pane cares about, so reordering would change nothing on
+screen.
+
+Checking that before building it turned up the real gap underneath. The
+dead-pane keys `↵`/`f`/`y` are bare keys, not Alt chords, so §8 has no row
+for them and C34's sweep cannot reach them — the C9 bar advertised them and
+**the overlay never mentioned them at all**. Not an ordering problem: a
+missing row. Fixed under C39, with a gate keyed off the bar rather than a
+list, so the next dead-pane key cannot arrive undocumented.
 
 ---
 
