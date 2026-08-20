@@ -4102,8 +4102,36 @@ not a benchmark suite.
 
 ---
 
-### Open: the picker's adapter column has two widths and neither widens
-**[Added 2026-08-20, floor-stress audit]**
+### Open: a click on the picker's cwd column launches the wrong thing
+**[Added 2026-08-20, ADAPTER_COL audit]**
+
+`App::handle_modal_mouse`'s picker arm hit-tests **rows only**
+(`mouse::picker_row_at`) and calls `picker_launch(i)`. A click anywhere on
+row `i` — including on the *recent-directory* label in the second column —
+launches adapter `i` with whatever cwd was already selected. So clicking a
+directory does not choose that directory; it launches an adapter you may not
+have meant, into a directory you did not click.
+
+Pre-existing, and older than the constant that surfaced it. It is recorded
+now because C14's column geometry became *derivable* when `ADAPTER_COL`
+stopped being two numbers: a click's column can now be compared against it,
+which is what any fix would need.
+
+The fix is not obvious enough to guess at. C12's U8 click rules say the
+picker "launches the row clicked and cancels on a click outside" — written
+before there were two columns, and silent about which column. Three
+readings: a click on the cwd column *selects* that directory without
+launching (matching `←→`'s keyboard behaviour, and the picker's own
+two-column focus model); or it selects **and** launches, which is the
+fewest clicks but makes a mis-aimed click destructive; or the columns stay
+one hitbox and U8's sentence is amended to say so deliberately. The first
+matches the keyboard, which is usually roost's tie-breaker.
+
+Found by the design audit of the `ADAPTER_COL` fix — not by the fix, which
+touches no hit-testing.
+
+### ~~Open~~: the picker's adapter column has two widths and neither widens
+**[Added 2026-08-20, floor-stress audit · RESOLVED 2026-08-20]**
 
 `render.rs` defines `ADAPTER_COL` **twice, with different values**: 23 in
 `picker_dialog_width` (documented as 3-char row prefix + longest id + longest
@@ -4126,28 +4154,58 @@ Found by the design-supervisor sweep for the `{:<N}` minimum-width mistake
 that produced the C15 amendment above — the class, not the instance, which is
 what that sweep was for.
 
-### Open: the composer's `Exited` filter tier can never match
-**[Added 2026-08-20, simulation pass]**
+**Resolved:** one module-scope `ADAPTER_COL = 23`, used by both the sizing
+and the draw loop, so the dialog is sized for exactly the column it draws.
+The reason for filing rather than fixing — that it belongs to C14's sizing
+contract rather than the help overlay's — turned out to be a reason to give
+it its own commit, not to leave it. `the_adapter_column_is_wide_enough_for_
+the_row_it_pads` walks the worst case (`picker_row_body(0, "opencode not
+found")`) instead of asserting the number, and re-checks that
+`picker_row_body` still produces it, so the worst case cannot quietly stop
+being the worst case. Reverting the constant to 16 reproduces the original
+misalignment by name.
+
+### ~~Open~~: the composer's `Exited` filter tier can never match
+**[Added 2026-08-20, simulation pass · RESOLVED 2026-08-20]**
 
 C36's `Tab` filter shares `ROSTER_STATUS_CYCLE` with C27's roster, which is
 deliberate — the composer shows a *target count* for the tier it names, and
 tiers that meant different things in the two places would make that count
 unreadable. But `broadcast_targets` excludes exited panes **unconditionally**
-(`rt.status() != AgentStatus::Exited`), so the cycle's `Exited` stop is
-structurally always "no panes" in the composer: a stop you can Tab onto that
-can never do anything, on any fleet.
+(`rt.status() != AgentStatus::Exited`), so the cycle's `Exited` stop was
+structurally always "no panes" in the composer: a stop you could Tab onto
+that could never do anything, on any fleet.
 
-Nothing is wrong — the count is honest and the send is a correct no-op. It is
-a dead option riding along on an enum shared between two surfaces whose
-eligibility rules differ, which the sharing rationale did not anticipate.
+**Resolved: the composer skips it; the roster keeps it.** The two invariants
+turned out not to be in tension once the question was put precisely. What
+the sharing protects is that the tiers *name the same statuses in the same
+order* on both surfaces — not that both surfaces stop at all of them. A stop
+that can only ever mean "nobody" is not a filter, it is a hole in the cycle;
+and the roster is a *monitoring* surface, where "which of my panes died" is
+the whole point.
 
-The fix is small either way and the question is which invariant matters more:
-skip the tier in the composer (the cycles then differ by one stop, but every
-stop in each is reachable), or keep them identical (one stop is inert, and a
-user learns to skip it). Recorded rather than guessed at, because the shared
-cycle was a deliberate C36 decision and this is the first evidence against it.
-Found by a simulation agent reviewing C36 adversarially — it could not defeat
-the guard, and found this instead.
+**Precisely, though:** the tiers do not *mean* identically the same thing on
+both surfaces, and an earlier draft of this entry said they did. `None` is
+"every pane" in the roster and "every pane that can receive" in the composer,
+because `broadcast_targets` excludes exited panes whatever the filter says.
+That difference is inherent to the two surfaces' jobs rather than introduced
+here — the composer could never have targeted an exited pane — and the count
+stays honest either way, which is what C36 needs of it. Named by the design
+audit, which was right that the looser wording papered over it.
+
+So there is still exactly one definition of the tiers and their order
+(`ROSTER_STATUS_CYCLE`), stepped by one function, with the composer passing
+`deliverable_only` — rather than a second const free to drift, which is the
+shape the original C36 rationale was written to avoid.
+
+The skip is a **second step in the same direction**, never a fallback to
+`None`: `Tab` and `Shift+Tab` must stay exact inverses across the gap, and
+the naive fallback makes them agree at one point in the lap and diverge for
+the rest of it. Pinned by `the_composer_cycle_is_reversible_across_the_gap`,
+which is what the mutation check breaks.
+
+Found by a simulation agent reviewing C36 adversarially — it could not
+defeat the guard, and found this instead.
 
 ### Open: an Alt chord discards an editor's unsaved buffer
 **[Added 2026-08-20, C24b amendment audit]**
@@ -4599,12 +4657,25 @@ counts it; the send writes to it. A guard that lies would be worse than none,
 so the two cannot be separate code paths. Pinned by
 `the_target_count_is_the_set_that_actually_receives`.
 
-**`Tab` is C27's filter, shared.** The composer and the roster cycle the same
-`ROSTER_STATUS_CYCLE` through the same `cycle_status_filter` — extracted here
-rather than copied, because the composer is showing a *count* for the filter
-it names, and a filter that meant something subtly different in each surface
-would make that count unreadable. "Send to the three panes that are `◆`" is
-now one gesture, and it composes two surfaces that already existed.
+**`Tab` is C27's filter, shared — minus one stop.** The composer and the
+roster step the same `ROSTER_STATUS_CYCLE` through the same function —
+extracted rather than copied, because the composer is showing a *count* for
+the filter it names, and a filter that meant something subtly different in
+each surface would make that count unreadable. "Send to the three panes that
+are `◆`" is now one gesture, and it composes two surfaces that already
+existed.
+
+**[Amended 2026-08-20]** The composer passes `deliverable_only` and so skips
+`Exited`. `broadcast_targets` excludes exited panes unconditionally, which
+made that stop structurally always "no panes" here — a stop you could Tab
+onto that could never do anything, on any fleet. What the sharing protects
+is that the tiers *mean the same thing and come in the same order* on both
+surfaces, not that both stop at all of them; a stop that can only ever mean
+"nobody" is a hole in the cycle rather than a filter. The roster keeps it,
+because "which of my panes died" is what a monitoring surface is for. Still
+one definition of the tiers, one stepping function, no second const free to
+drift. See §7 for the full reasoning, including why the skip must be a
+second step in the same direction rather than a fallback to `None`.
 
 **Keys are C32's.** `Enter` sends · `Shift+Enter` (or `Ctrl+Enter`, **or
 `Alt+Enter`**) breaks a line · `Tab`/`Shift+Tab` cycle the targets · `Esc`
@@ -4848,11 +4919,11 @@ C9's 100-column budget; a flash takes the whole bar and returns, so C9's
 right-segment arithmetic is untouched. This contract adds sentences, not a
 surface.
 
-**Not in scope.** The `Exited` tier of the composer's `Tab` filter (C36) is
-structurally always empty — `broadcast_targets` excludes exited panes
-unconditionally — so it is a dead stop in the cycle rather than a silent
-refusal. Recorded in §7; it wants a decision about whether the two surfaces
-may offer different tiers, which is C36/C27's question, not this one's.
+**Not in scope, and since resolved elsewhere.** The `Exited` tier of the
+composer's `Tab` filter (C36) was structurally always empty — a dead stop in
+the cycle rather than a silent refusal, so not C38's kind of problem. It was
+C36/C27's question and got C36/C27's answer: the composer now skips the
+tier, the roster keeps it, and §7 records why the two are not in tension.
 
 ## 8. Key table — [Added 2026-07-22, fleet features]
 

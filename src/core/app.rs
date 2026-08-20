@@ -272,6 +272,13 @@ const FLASH_WINDOW: Duration = Duration::from_secs(2);
 /// left a silent final second where Alt+w/Alt+q still confirmed.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
+/// C14 / F8: what `picker_filtered` appends to an adapter that is not on
+/// `$PATH`. Public because `render.rs`'s `ADAPTER_COL` is sized for exactly
+/// this suffix on the longest registry id, and the gate that checks the
+/// column has to build the same worst case — two spellings of one suffix is
+/// how a column ends up sized for a row the picker no longer draws.
+pub const PICKER_MISSING_SUFFIX: &str = "not found";
+
 /// C29: the standard macOS double-click interval. Crossterm reports no click
 /// count at all, so roost derives double/triple-click itself, from the gap
 /// between two presses (`click_count`).
@@ -5000,8 +5007,13 @@ impl<B: PaneBackend> App<B> {
     /// F8: the suffix is `" not found"` (the familiar shell idiom for "no
     /// such program on `$PATH`"), not "gone" — "gone" implies something
     /// that *was* here and disappeared, which is false for an adapter never
-    /// installed on this machine at all. Checked against `render.rs`'s
-    /// `ADAPTER_COL` for the longest id: `opencode` (8 chars).
+    /// installed on this machine at all.
+    ///
+    /// It is `PICKER_MISSING_SUFFIX` rather than a literal because C14's
+    /// `ADAPTER_COL` is sized for *this string on the longest registry id*,
+    /// and the gate that checks that has to build the same worst case. Two
+    /// spellings of one suffix is how the column gets sized for a row the
+    /// picker no longer draws — the ADAPTER_COL bug one level up.
     pub fn picker_filtered(&self) -> Vec<String> {
         self.picker_filtered_ids()
             .into_iter()
@@ -5009,7 +5021,7 @@ impl<B: PaneBackend> App<B> {
                 if adapter_installed(id, &self.registry) {
                     id.to_string()
                 } else {
-                    format!("{id} not found")
+                    format!("{id} {PICKER_MISSING_SUFFIX}")
                 }
             })
             .collect()
@@ -5405,7 +5417,10 @@ impl<B: PaneBackend> App<B> {
                     // is legible as "who gets this", not as a setting.
                     KeyCode::Tab | KeyCode::BackTab => {
                         let back = matches!(key.code, KeyCode::BackTab);
-                        *status_filter = cycle_status_filter(*status_filter, back);
+                        // `deliverable_only`: the composer skips `Exited`,
+                        // which `broadcast_targets` filters out anyway — see
+                        // `step_status_filter`. The roster keeps it.
+                        *status_filter = step_status_filter(*status_filter, back, true);
                     }
                     KeyCode::Char('u') if ctrl => {
                         let cur = &mut lines[*row];
@@ -6324,9 +6339,55 @@ fn byte_at(s: &str, at: usize) -> usize {
 /// filter that meant something different in each place would make that
 /// count unreadable.
 fn cycle_status_filter(current: Option<AgentStatus>, back: bool) -> Option<AgentStatus> {
+    step_status_filter(current, back, false)
+}
+
+/// The same step, with `deliverable_only` dropping the one tier the
+/// broadcast composer can never act on.
+///
+/// `broadcast_targets` filters `Exited` unconditionally — a pane that is
+/// gone cannot receive anything — so on that surface the cycle's last stop
+/// was **structurally inert**: `Tab` landed on "exited", the title's live
+/// count read 0 whatever the workspace held, and Enter sent nothing. A stop
+/// that can only ever mean "nobody" is not a filter, it is a hole in the
+/// cycle. Found by the C36 design audit.
+///
+/// The roster keeps it, because the roster is a *monitoring* surface and
+/// "which of my panes died" is exactly what it is for. So the two surfaces
+/// still share one definition of what the tiers are and what order they
+/// come in — the property the shared function exists for — and differ by a
+/// single omission stated here rather than by a second const free to drift.
+///
+/// Skipping is a **second step in the same direction**, never a fallback to
+/// `None`: `Tab` and `Shift+Tab` have to stay inverses across the gap, and
+/// landing both on the same tier would break that at exactly one point in
+/// the lap.
+///
+/// **The double step assumes exactly one skipped tier.** Two adjacent
+/// skips would land on a skipped tier, and this would have to loop instead.
+/// One is all there is — `broadcast_targets` has one unconditional
+/// exclusion — and the assertion below fails loudly rather than returning a
+/// tier the caller cannot use, so a second exclusion added later cannot
+/// pass silently. Named by the design audit as an undocumented invariant.
+fn step_status_filter(
+    current: Option<AgentStatus>,
+    back: bool,
+    deliverable_only: bool,
+) -> Option<AgentStatus> {
     let n = ROSTER_STATUS_CYCLE.len() as isize;
     let at = ROSTER_STATUS_CYCLE.iter().position(|s| *s == current).unwrap_or(0) as isize;
-    ROSTER_STATUS_CYCLE[(at + if back { -1 } else { 1 }).rem_euclid(n) as usize]
+    let step = if back { -1 } else { 1 };
+    let next = ROSTER_STATUS_CYCLE[(at + step).rem_euclid(n) as usize];
+    if deliverable_only && next == Some(AgentStatus::Exited) {
+        let past = ROSTER_STATUS_CYCLE[(at + step * 2).rem_euclid(n) as usize];
+        debug_assert_ne!(
+            past,
+            Some(AgentStatus::Exited),
+            "the single-gap assumption broke: two skipped tiers need a loop, not a double step",
+        );
+        return past;
+    }
+    next
 }
 
 /// C36: split the composer's current line at the point.
@@ -12825,6 +12886,86 @@ mod tests {
             app.apply(action);
             assert!(app.flash().is_none(), "{:?}: {:?}", action, app.flash());
         }
+    }
+
+    /// The composer's `Tab` must never stop on a tier it cannot deliver to.
+    ///
+    /// `broadcast_targets` filters `Exited` unconditionally — a pane that is
+    /// gone cannot receive anything — so the shared cycle's last stop was
+    /// structurally inert on that surface: `Tab` landed on "exited", the
+    /// title's live count read 0, and Enter sent nothing. Recorded from the
+    /// C36 design audit; this is the check that it was real.
+    #[test]
+    fn the_composer_never_stops_on_a_tier_it_cannot_send_to() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleBroadcast);
+
+        // A full lap of Tab, from every starting point.
+        let mut seen = Vec::new();
+        for _ in 0..ROSTER_STATUS_CYCLE.len() + 2 {
+            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                crossterm::event::KeyCode::Tab,
+            ));
+            let Mode::Broadcast { status_filter, .. } = app.mode else {
+                panic!("still composing")
+            };
+            seen.push(status_filter);
+        }
+        assert!(
+            !seen.contains(&Some(AgentStatus::Exited)),
+            "Tab stopped on a tier with nothing to send to: {seen:?}",
+        );
+        // And it still reaches every tier it *can* send to, in both
+        // directions — skipping a stop must not shorten the lap.
+        for want in [None, Some(AgentStatus::NeedsInput), Some(AgentStatus::Idle)] {
+            assert!(seen.contains(&want), "{want:?} is unreachable now: {seen:?}");
+        }
+    }
+
+    /// `Tab` and `Shift+Tab` stay exact inverses **across the skipped
+    /// tier**, which is the part a skip is most likely to break: a naive
+    /// "if you land on Exited, go to None" would make the two directions
+    /// agree at one point in the lap and diverge for the rest of it.
+    #[test]
+    fn the_composer_cycle_is_reversible_across_the_gap() {
+        for &start in &ROSTER_STATUS_CYCLE {
+            if start == Some(AgentStatus::Exited) {
+                continue; // not a state the composer can be in
+            }
+            let fwd = step_status_filter(start, false, true);
+            assert_eq!(
+                step_status_filter(fwd, true, true),
+                start,
+                "forward then back from {start:?} landed on {:?}",
+                step_status_filter(fwd, true, true),
+            );
+            let back = step_status_filter(start, true, true);
+            assert_eq!(
+                step_status_filter(back, false, true),
+                start,
+                "back then forward from {start:?} landed on {:?}",
+                step_status_filter(back, false, true),
+            );
+        }
+    }
+
+    /// ...while the roster keeps it, because the roster is a monitoring
+    /// surface: "which of my panes died" is exactly what it is for. The two
+    /// cycles share one definition and differ by one documented omission.
+    #[test]
+    fn the_roster_still_filters_to_exited_panes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleRoster);
+        let mut seen = Vec::new();
+        for _ in 0..ROSTER_STATUS_CYCLE.len() {
+            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                crossterm::event::KeyCode::Tab,
+            ));
+            let Mode::Roster { status_filter, .. } = app.mode else { panic!("still rostering") };
+            seen.push(status_filter);
+        }
+        assert!(seen.contains(&Some(AgentStatus::Exited)), "{seen:?}");
     }
 
     /// The flash resolves its chord through the live keymap. A literal
