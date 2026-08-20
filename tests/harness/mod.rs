@@ -250,8 +250,29 @@ impl Harness {
     /// This is the golden-frame seam: a future frame/cell-color assertion
     /// calls this before reading `screen()`, exactly like this fn already
     /// does internally.
+    ///
+    /// **Two reads of a screen nothing has been written to also agree.**
+    /// Every caller opens with `assert!(h.settle(...), "initial frame never
+    /// settled")` and reads the answer as "roost has painted"; without the
+    /// wait below it could return `true` in 40 ms having seen roost emit
+    /// nothing at all, and any assertion made straight afterwards races the
+    /// first frame. (Caught by `tests/panic_shutdown.rs`, whose next line
+    /// asks whether roost is in the alternate screen — it was, and the
+    /// harness had simply not seen the sequence yet.) Existing scenarios all
+    /// happen to follow `settle` with a `wait_for`, which hid it.
+    ///
+    /// The wait is on **raw output**, not on the screen: roost's first bytes
+    /// are mode-setting sequences that leave no mark on the grid, and a
+    /// scenario whose settled screen is legitimately blank must still be
+    /// able to settle.
     pub fn settle(&mut self, timeout: Duration) -> bool {
         let start = Instant::now();
+        while self.host_bytes().is_empty() {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let mut prev = self.screen().contents();
         loop {
             std::thread::sleep(Duration::from_millis(40));
