@@ -1010,7 +1010,20 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                         }
                         break;
                     }
-                    let Ok(line) = std::str::from_utf8(&buf) else { continue };
+                    let Ok(line) = std::str::from_utf8(&buf) else {
+                        // Charge it. The bucket's own contract, stated a few
+                        // lines below, is that *every* line costs a token
+                        // "well-formed or not" — and a line that isn't valid
+                        // UTF-8 is exactly the garbage it exists to bound.
+                        // Skipping the charge let a promoted connection spew
+                        // them without limit and without ever being
+                        // throttled: data keeps arriving, so `READ_TIMEOUT`
+                        // never fires and the pre-auth deadline no longer
+                        // applies. No reply, as before — it is not
+                        // control-shaped, so nobody is waiting on one.
+                        let _ = line_bucket.take();
+                        continue;
+                    };
                     let line = line.trim_end();
 
                     let control = parse_control(line);

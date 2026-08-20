@@ -336,6 +336,19 @@ const UNDO_DEPTH: usize = 20;
 /// on. Left well below that pool size so plenty always stay free.
 const MAX_WAITS: usize = 16;
 
+/// Parked `wait`s any single principal may hold at once.
+///
+/// The global cap alone let one caller take every slot: waiters are freed
+/// only by firing or timing out, so sixteen fire-and-forget waits with long
+/// timeouts denied the verb fleet-wide for up to 24 hours. A per-actor
+/// share means a pane can only ever starve itself.
+const MAX_WAITS_PER_ACTOR: usize = 4;
+
+/// Panes one `wait` may name. `poll_waiters` walks every id of every waiter
+/// on the UI thread each event-loop iteration, and the list arrives
+/// unbounded from the socket — see `register_waiter`.
+const MAX_WAIT_PANES: usize = 64;
+
 /// C20: activity-feed ring buffer capacity — oldest evicted first.
 const FEED_CAP: usize = 200;
 
@@ -2026,11 +2039,35 @@ impl<B: PaneBackend> App<B> {
                 .send(Reply::ok(serde_json::json!({ "pane": id, "status": self.status_str(id) })));
             return Ok("immediate");
         }
+        // A wait over more panes than any fleet has is not a wait, it is a
+        // load generator. `poll_waiters` runs on the **UI thread** every
+        // event-loop iteration and does `is_float` + `find_spec` +
+        // `may_target` + `pane_matches` for every id of every waiter; the
+        // list was unbounded and un-deduplicated, and ~32 000 ids fit in one
+        // 64 KiB control line. Sixteen such waits measured a 4.5x hit to
+        // control round-trip latency (21ms -> 94ms) sustained for the wait's
+        // whole timeout — the frame budget blown every frame, from sixteen
+        // requests. Bounded well above any real fleet.
+        if panes.len() > MAX_WAIT_PANES {
+            let msg = "too many panes in one wait";
+            let _ = reply.send(Reply::err(msg));
+            return Err(msg.into());
+        }
         // Cap concurrently parked waiters well below the socket's global
         // connection limit: rejecting here closes the connection right away,
         // freeing its slot back to the pool instead of holding it for the
         // full timeout (see MAX_WAITS).
-        if self.waiters.len() >= MAX_WAITS {
+        //
+        // **Per principal as well as globally.** A parked waiter is only
+        // ever freed by firing or timing out — nothing notices that the
+        // client hung up — so sixteen fire-and-forget waits with long
+        // timeouts held every global slot for up to 24 hours while holding
+        // no connection and no process, denying the verb to the entire
+        // fleet. A pane can do that with its own `$ROOST_TOKEN`, which puts
+        // it squarely outside its authority. With a per-actor share the
+        // worst a pane can do is starve itself.
+        let mine = self.waiters.iter().filter(|w| w.actor == actor).count();
+        if self.waiters.len() >= MAX_WAITS || mine >= MAX_WAITS_PER_ACTOR {
             let msg = "too many concurrent waits";
             let _ = reply.send(Reply::err(msg));
             return Err(msg.into());
@@ -11403,6 +11440,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One principal must not be able to deny `wait` to the whole fleet.
+    ///
+    /// A parked waiter is freed only by firing or timing out — nothing
+    /// notices the client hung up — so 16 fire-and-forget waits held every
+    /// global slot for up to 24 hours while holding no connection and no
+    /// process. A pane can send them with its own `$ROOST_TOKEN`, which is
+    /// squarely outside its authority.
+    #[test]
+    fn one_principal_cannot_park_every_wait_slot() {
+        let (mut app, _) = mk_app(shell_ws());
+        let pane = app.focused;
+        let mut keep = Vec::new();
+
+        // One pane spams waits with its own token's authority.
+        let mut parked = 0;
+        for _ in 0..MAX_WAITS * 2 {
+            let (tx, rx) = mpsc::channel();
+            if app
+                .register_waiter(Actor::Pane(pane), vec![pane], "exited", Some(60_000), tx)
+                .is_ok_and(|why| why == "parked")
+            {
+                parked += 1;
+            }
+            keep.push(rx);
+        }
+        assert!(
+            parked <= MAX_WAITS_PER_ACTOR,
+            "one principal parked {parked} waits — it can hold every global slot",
+        );
+
+        // ...and the fleet can still use the verb.
+        let (tx, _rx) = mpsc::channel();
+        let got = app.register_waiter(
+            Actor::Fleet,
+            vec![pane],
+            "exited",
+            Some(60_000),
+            tx,
+        );
+        assert_eq!(got.as_deref(), Ok("parked"), "the verb is denied to everyone else");
+    }
+
+    /// A `wait` naming more panes than any fleet has is a load generator:
+    /// `poll_waiters` walks every id of every waiter on the **UI thread**,
+    /// every event-loop iteration, for the wait's whole timeout.
+    #[test]
+    fn a_wait_cannot_name_an_unbounded_pane_list() {
+        let (mut app, _) = mk_app(shell_ws());
+        let pane = app.focused;
+        let (tx, _rx) = mpsc::channel();
+        let huge: Vec<PaneId> = vec![pane; 20_000];
+        assert!(
+            app.register_waiter(Actor::Fleet, huge, "exited", Some(60_000), tx)
+                .is_err(),
+            "a 20,000-id wait was accepted; it is re-walked on the UI thread every frame",
+        );
     }
 
     /// Detection must give up eventually.
