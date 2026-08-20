@@ -3853,7 +3853,14 @@ impl<B: PaneBackend> App<B> {
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
                 let first = self.pane_order().first().copied().unwrap_or(0);
                 self.set_focus(first);
-                self.restore_pane(spec);
+                if !self.restore_pane(spec.clone()) {
+                    // Refused for want of room. The close is NOT consumed:
+                    // put it back so the pane is still reopenable once the
+                    // user makes room, and say why nothing happened (C38).
+                    self.remember_closed(Closed::Pane { tab_index, spec });
+                    self.flash_no_room();
+                    return;
+                }
                 // U2: `restore_pane` allocated the pane's NEW id and left it
                 // focused — label with that id, not the closed one's.
                 let restored = self.focused;
@@ -3864,22 +3871,23 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// Insert `spec` as a new pane split off the focused pane, spawning it.
-    /// Shared by undo (reuses a saved spec, session and all).
-    fn restore_pane(&mut self, spec: PaneSpec) {
-        let id = self.alloc_pane_id();
+    /// Shared by undo (reuses a saved spec, session and all). Returns false
+    /// if the split was refused for want of room — nothing was mutated.
+    ///
+    /// C38: the fit test is `split_fit`, the same one `spawn_child` uses,
+    /// not a hand-rolled copy. This used to pick the axis from the rect's
+    /// aspect and then split unconditionally, so `Alt+u` would land a pane
+    /// in a slot `Alt+n` had just refused to open — under
+    /// `MIN_SPLIT_COLS`×`MIN_SPLIT_ROWS`, which is also the vt100 underflow
+    /// trigger, and it took the pane being split down there with it. Same
+    /// rect and the same keypress-level decision must give the same answer.
+    #[must_use]
+    fn restore_pane(&mut self, spec: PaneSpec) -> bool {
         let focused = self.focused;
-        let dir = self
-            .rects()
-            .iter()
-            .find(|pr| pr.id == focused)
-            .map(|pr| {
-                if pr.rect.width >= pr.rect.height * 3 {
-                    SplitDir::Vertical
-                } else {
-                    SplitDir::Horizontal
-                }
-            })
-            .unwrap_or(SplitDir::Vertical);
+        let target_rect =
+            self.rects().iter().find(|pr| pr.id == focused).map(|pr| pr.rect);
+        let Some(dir) = split_fit(target_rect) else { return false };
+        let id = self.alloc_pane_id();
         let tab = self.ws.active_tab_mut();
         tab.panes.insert(id, spec.clone());
         if !layout::split_pane(&mut tab.layout, focused, id, dir) {
@@ -3889,6 +3897,7 @@ impl<B: PaneBackend> App<B> {
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
+        true
     }
 
     /// P10: move roost's focus to `id`, telling the panes involved.
@@ -11472,6 +11481,53 @@ mod tests {
         assert!(
             !tree.contains(&float_id),
             "C22: the float's id {float_id} is now a tiled pane too — tree {tree:?}",
+        );
+    }
+
+    /// C38: Alt+u must respect the same floor Alt+n does.
+    ///
+    /// `restore_pane` hand-rolled the aspect test and never checked
+    /// `MIN_SPLIT_COLS`/`MIN_SPLIT_ROWS`, so undo would split a pane that
+    /// `spawn_child` had just refused to split — landing the reopened pane
+    /// in a slot too small to render in, and driving the *other* half under
+    /// the floor too. Same rect, same keypress-level decision, opposite
+    /// answer.
+    #[test]
+    fn undo_refuses_the_split_alt_n_just_refused() {
+        let (mut app, _) = mk_app(shell_ws());
+        // Something on the undo stack to reopen, taken while there is room.
+        app.apply(Action::NewPane);
+        let victim = app.focused;
+        app.close_pane_id(victim);
+
+        // Undo splits `pane_order().first()`, so shrink *that* pane until
+        // it is under the floor — Alt+n itself refuses on it here.
+        for _ in 0..12 {
+            let first = app.pane_order()[0];
+            app.set_focus(first);
+            if app.spawn_child("shell", None, None).is_none() {
+                break;
+            }
+        }
+        let first = app.pane_order()[0];
+        app.set_focus(first);
+        assert!(
+            app.spawn_child("shell", None, None).is_none(),
+            "setup: the first pane should be too small to split",
+        );
+        let before: Vec<PaneId> = app.pane_order();
+
+        app.apply(Action::Undo);
+
+        assert_eq!(
+            app.pane_order(),
+            before,
+            "Alt+u split a pane Alt+n had just refused to split",
+        );
+        assert!(
+            app.flash().is_some_and(|f| f.contains("no room")),
+            "the refusal is spoken, not silent: {:?}",
+            app.flash(),
         );
     }
 
