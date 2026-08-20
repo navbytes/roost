@@ -1,12 +1,15 @@
 # Reliability audit — findings
 
 **Scope.** "The most important thing about this tool is reliability. Do a
-thorough investigation and find all bugs." Everything below was reproduced
+thorough investigation and find all bugs." — followed by decisions on the
+four items that needed them (see "Resolved after review"). Everything below
+was reproduced
 before it was reported, fixed with a test, and mutation-checked (the fix was
 reverted and the test confirmed to fail). Branch:
-`claude/ui-ux-keybindings-analysis-3hqs3v`, sixteen commits on top of v0.1.9.
+`claude/ui-ux-keybindings-analysis-3hqs3v`, twenty-one commits on top of
+v0.1.9.
 
-Suite at the end of the audit: **935 unit + all integration suites passing**,
+Suite at the end of the audit: **940 unit + all integration suites passing**,
 two pre-existing environmental failures (both assume a non-root user;
 `chmod 000` does not stop root, so they fail in this container and pass on a
 normal machine). Clippy unchanged at its 8-warning baseline.
@@ -125,6 +128,14 @@ of the process — and since no adapter overrides `detect_session`, each tick
 meant a full recursive walk of `~/.pi/agent/sessions` (every project, all
 history), stat-ing every file, forever. Now bounded by a 60s give-up horizon.
 
+### 9b. Claude Code panes never resumed at all in many directories
+`82097ff` · `src/agents/claude.rs` — see item C below for the full story.
+
+The encoded session-directory name did not match what Claude Code writes, so
+for any project path containing a character outside `[A-Za-z0-9-]` other than
+`/`, `.`, ` ` and `_`, roost looked in a directory that does not exist and the
+pane silently always started fresh.
+
 ---
 
 ## High — structural state drifting apart
@@ -241,61 +252,97 @@ A line that failed UTF-8 decoding `continue`d before being charged to
 
 ---
 
-## Open — needs your decision, not more investigation
+## Resolved after review — the four items that needed your call
 
-### A. Control-plane denial of service (measured)
-`20da213` corrects the spec; **the code is unchanged.**
+### A. Control-plane denial of service — mitigated
+`53b1b3a` · `src/infra/sock.rs`, `DESIGN-control.md` · gated by
+`tests/control_plane_squatters.rs`
 
 `DESIGN-control.md` claimed a pile of squatters leaves "nobody else ever
-blocked from getting in". That is measurably false. Against a real instance:
+blocked from getting in". Measured against a real instance, that was false:
 
-| attack | cost to a legitimate `roost list` |
-|---|---|
-| 64 silent connections, held | **2.07 s**, 21 refused attempts |
-| squatter retaking each slot as it recycles | **12.1 s**, 118 refused attempts |
+| attack | before | after |
+|---|---|---|
+| 64 silent connections, held | 2.07 s, 21 refused attempts | — |
+| squatter retaking each slot as it recycles | 12.1 s, 118 refused attempts | **27 ms, 1 attempt** |
 
-and it got in at that point only because the probe's retake loop was not
-tight. The 2s pre-auth deadline bounds how long any *one* squatter is
-subsidised; it does not bound the denial, because reconnecting is free.
+The 2s pre-auth deadline bounded how long any *one* squatter was subsidised;
+it did not bound the denial, because reconnecting is free. Sustained, that was
+a control-plane DoS available to any local process that can reach the socket —
+including a hostile process inside a pane, precisely the principal the
+per-pane tokens exist to contain.
 
-Sustained, this is a control-plane DoS available to any local process that
-can reach the socket — **including a hostile process inside a pane**, which is
-precisely the principal the per-pane tokens exist to contain. The tokens still
-hold (nothing can be *driven* without one); what is deniable is access itself.
+Two rules that only work together: **a connection that has not identified
+itself is evictable**, and at most `MAX_PENDING_CONN` (16) of `MAX_CONN` may
+be unidentified at once. Past that share, or with the pool full, an arrival
+displaces the *oldest* unpromoted connection and takes its slot instead of
+being shed. A cap alone would have repeated the mistake `DESIGN-control.md`
+already records (16 idle connections permanently shedding every arrival, at a
+quarter the cost of the bug it replaced); displacement alone would leave
+squatters holding 64 threads. **Promotion makes a connection
+un-displaceable**, so work in flight — parked `wait`s especially — is never
+sacrificed for a stranger.
 
-**The decision:** a pre-auth pool sized separately from `MAX_CONN` would bound
-the blast radius to unauthenticated callers and leave promoted connections
-(including parked `wait`s) untouched. But no scheme distinguishes a squatter
-from a first-time legitimate client before either has authenticated — same-uid
-peer credentials do not help, because the hostile pane has them too. **This is
-mitigable, not closable**, and it changes a documented cap, so it is your call.
-My recommendation: take the mitigation; a bounded window for unauthenticated
-callers is strictly better than a shared one, and the residual risk is
-acceptable for a local-only socket.
+This bounds the denial; it does not abolish it. Nothing distinguishes a
+squatter from a first-time legitimate client before either has
+authenticated, and same-uid peer credentials do not help because a hostile
+pane has them too. A flood still costs arriving clients an occasional extra
+connect attempt.
 
-### B. Should the failed-save indicator outrank tab names?
-Finding 15 added a flash, which cannot be crowded out. The *standing*
-indicator can still be dropped whole by C2's yield ladder. Making it outrank
-tab names is a C2 contract change — yours to make.
+### B. A failed save now outranks tab names
+`1094032` · `src/ui/mouse.rs`, `src/ui/render.rs`, `DESIGN-ui.md`
 
-### C. `~/.claude/projects` encoding — needs one command from you
-roost's `encode_cwd` maps `/`, `.`, space and `_` all to `-`. If Claude Code's
-real naming is narrower, roost over-maps and two projects can collide the way
-finding 7 did for pi. I cannot verify this from here. Please run:
+C2's "tabs win" is right for context — a cwd, a mode word, `saved ✓`. It was
+wrong for `save failed ✕`, the only standing sign that the workspace on disk
+is going stale, which it dropped *whole*. On a failed save the ladder now
+inverts: cwd yields, then the mode word yields (the reverse of U15's usual
+order — ZOOM/RAW/COPY can be rediscovered by pressing a key, "not reaching
+disk" cannot), then the strip itself scrolls under U7. The active tab is
+always kept, so what is spent is other tabs' names, temporarily and visibly.
+Floor: if even the active tab could not be drawn beside the indicator, the
+indicator is dropped after all.
+
+No new glyph, no new colour, no column change — only which of two existing
+things yields. DESIGN-ui.md carries the dated C2 amendment.
+
+**Still outstanding:** CLAUDE.md requires a design-supervisor audit for any
+`src/ui/**` change. This one has not had it — the change is inside C2's own
+contract and adds nothing to §2's inventory, but the audit is the project's
+rule, not mine to waive.
+
+### C. `~/.claude/projects` encoding — roost's was simply wrong
+`82097ff` · `src/agents/claude.rs`
+
+Your listing settled it, and in the opposite direction to my guess: roost was
+not *over*-mapping and colliding, it was **under**-mapping and missing the
+directory entirely.
+
+`encode_cwd` named four characters — `/`, `.`, ` `, `_` — and passed
+everything else through. Claude Code replaces *every* character that is not an
+ASCII letter, digit or dash. Not one of your 44 directory names contains a
+character outside `[A-Za-z0-9-]`, and
 
 ```
-ls ~/.claude/projects
+/Users/naveen/Downloads/IconKitchen-Output (2)/MotoPark…
 ```
 
-and paste the output. If any directory name contains a character roost would
-have mapped to `-`, this is finding 7 again for a second adapter.
+appears there as `-Users-naveen-Downloads-IconKitchen-Output--2--MotoPark…` —
+the parens mapped to dashes, where roost would have looked for
+`…Output-(2)-MotoPark…`. That directory does not exist, `read_dir` returns
+NotFound, and the pane silently never resumes. No error, no flash: it just
+always starts fresh. Parens in a path are not exotic; neither are `&`, `+`,
+`'`, `,` or `#`.
 
-### D. One-member stack chrome
-Finding 11 fixed the illegal *tree*. The chrome that produced it — a header
-reading "STACK · 1 PANES" — lives in `src/ui/render.rs`, which CLAUDE.md says
-gets a design-supervisor audit before it changes. I have not touched it; the
-collapse fix means the state should no longer be reachable, but the grammar
-bug is still in the code path if it ever is.
+Your own listing is now the test fixture. One residual uncertainty, noted in
+the code: non-ASCII is mapped one dash per `char`, which is the consistent
+reading of the rule but the one case your listing could not confirm.
+
+### D. One-member stack chrome — still open, by design
+The illegal *tree* is fixed (finding 11), so the state should no longer be
+reachable. The chrome that exposed it — a header reading "STACK · 1 PANES" —
+is in `src/ui/render.rs` and still says that if it ever is. Untouched for the
+same reason as B's outstanding item: CLAUDE.md wants a design-supervisor pass
+there.
 
 ---
 
