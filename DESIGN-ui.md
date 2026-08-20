@@ -5100,6 +5100,49 @@ focused pane) needs none of that and stays available; it is simply a much
 smaller win than filtering, and worth its own decision rather than a
 tail-end of this one.
 
+### On gates that pass by construction
+**[Added 2026-08-20, after the fifth instance]**
+
+Five assertions on this branch turned out to prove nothing, all the same
+shape: **a test asserting a bound on a value that was already clamped to
+that bound.** Recorded here because the count is the argument — each one was
+found by a design audit or a deliberate sweep, never by CI, and each made a
+check look done when it was not.
+
+The instances, so the shape is recognisable:
+
+1. `help_dialog_fits_the_eighty_column_floor` — `size.0 <= 80` at an
+   80-column body, where `size.0` ends in `.min(body.width)`.
+2. `one_help_column_fits_the_eighty_column_floor` — the same, one test over.
+3. C39's `the_help_dialog_fits_the_floor_under_every_query` — the same
+   again, written *160 lines below* the corrected version of (1), which
+   carries the comment "assert on the ask instead".
+4. `help_fits_the_eighty_column_floor_and_reaches_every_row` — the width
+   half had been fixed; the **height** half (`size.1 <= body.height`, where
+   `size.1` is `min(tallest, body.height - 2) + 2`) was still vacuous.
+5. `help_dialog_clamps_to_the_screen_via_centered_near` — every assertion
+   vacuous, and the test's own comment stated the clamps before asserting
+   them. Two clamps covered for each other, so deleting either left it
+   green.
+
+Three rules follow, and they are cheap:
+
+- **Never assert on a value the production code clamped.** Assert on the
+  *ask* — the pre-clamp want. `HelpLayout::asked` exists for exactly this,
+  and a computed quantity that gets clamped on the way out should carry its
+  unclamped form when a test needs to bound it.
+- **When two mechanisms both enforce a property, a test of the property
+  tests neither.** (5) survived deleting `centered_near`'s clamp because
+  `help_layout` clamped too. Pick the input that makes exactly one of them
+  responsible — in that case, an anchor hugging an edge.
+- **Mutation-check the replacement, not just the original.** The first
+  rewrite of (5) asserted placement and *still* passed with the clamp
+  deleted, because a dialog centred on the whole body is inside it either
+  way. Only the mutation showed that; the assertion looked meaningful.
+
+A test that cannot fail is worse than a missing one: the missing test is
+visible in coverage, and this one reads as a guarantee.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —

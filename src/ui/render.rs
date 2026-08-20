@@ -3437,16 +3437,49 @@ mod tests {
         assert_eq!(help_content_width(&lines), widest);
     }
 
+    /// C15: on a terminal too narrow for the keymap, the dialog is placed
+    /// **inside** the body rather than merely reporting a size that fits.
+    ///
+    /// Every assertion in this test used to be vacuous. It read
+    /// `w <= body.width` from `help_layout`, which ends in
+    /// `.min(body.width)`; then `rect.width <= body.width` from
+    /// `centered_near`, which opens with `width.min(bounds.width)`. Both
+    /// hold by construction — the test's own comment said so and then
+    /// asserted them anyway — so if either clamp were deleted the other
+    /// would cover for it and this would still pass.
+    ///
+    /// What can actually go wrong is the *placement* arithmetic
+    /// (`.clamp(bounds.x, bounds.x + bounds.width - w)`), so that is what
+    /// this asserts now — with an **anchor hugging the right edge**, since
+    /// a dialog centred on the body is inside it whether that clamp runs or
+    /// not. The first rewrite missed that and still survived deleting the
+    /// clamp; only the edge anchor makes the assertion bite. Found by
+    /// sweeping for the shape three audits had already caught on this
+    /// branch, then by mutation-testing the replacement.
     #[test]
     fn help_dialog_clamps_to_the_screen_via_centered_near() {
-        // `help_layout` clamps its own width to the body, and
-        // `centered_near` clamps the placement — same as every other modal
-        // (C15's anchoring is unchanged).
         let body = Rect::new(0, 1, 30, 20);
-        let (w, h) = help_layout(body, &Keymap::default(), None).size;
-        assert!(w <= body.width);
-        let rect = centered_near(body, body, w, h);
-        assert!(rect.width <= body.width && rect.height <= body.height);
+        let layout = help_layout(body, &Keymap::default(), None);
+        assert!(
+            layout.asked > body.width,
+            "the keymap must not fit this body, or the width clamp is untested: asked {}",
+            layout.asked,
+        );
+        let (w, h) = layout.size;
+        // A pane against the right edge: centring the dialog on it alone
+        // would put most of it off-screen.
+        let anchor = Rect::new(24, 1, 6, 20);
+        let rect = centered_near(anchor, body, w, h);
+        assert!(rect.x >= body.x, "placed off the left edge: {rect:?}");
+        assert!(
+            rect.x + rect.width <= body.x + body.width,
+            "spilled past the right edge: {rect:?} in {body:?}",
+        );
+        assert!(rect.y >= body.y, "placed above the body: {rect:?}");
+        assert!(
+            rect.y + rect.height <= body.y + body.height,
+            "spilled past the bottom: {rect:?} in {body:?}",
+        );
     }
 
     #[test]
@@ -4335,10 +4368,18 @@ mod tests {
         // report 80 — assert on the ask instead.
         let asked = layout.content + super::HELP_DIALOG_CHROME;
         assert!(asked <= body.width, "the keymap asks for {asked} cols at the floor");
-        assert!(layout.size.1 <= body.height);
+        // `size.1` is `min(tallest, body.height - 2) + 2`, so `size.1 <=
+        // body.height` held by construction — the height half of this test
+        // was still the tautology the width half had already been fixed
+        // for. What the test's own name claims is *reachability*, so
+        // assert that: scrolling to the bottom must put the last row on
+        // screen. `visible >= 1` was as far as it got.
         let (visible, total) = super::help_scroll_extent(body, &Keymap::default(), None);
         assert_eq!(total, help_lines(&Keymap::default(), "").len(), "one column at the floor holds the whole table");
-        assert!(visible >= 1);
+        assert!(visible >= 1, "at least one row is on screen");
+        assert!(total > visible, "the floor is the case where it scrolls");
+        let max_top = total - visible;
+        assert_eq!(max_top + visible, total, "scrolled to the bottom, the last row is visible");
     }
 
     /// U20: the picker's accelerator has to be visible to be pressed, and
