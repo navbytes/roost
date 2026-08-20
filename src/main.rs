@@ -272,6 +272,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // contention instead of queueing behind them (infra::qos module doc; the
     // agents themselves are deliberately NOT demoted).
     infra::qos::promote_input_loop_thread();
+    // A signal aimed at roost reaches roost alone — every pane is its own
+    // session — so the default "die on the spot" disposition would leave the
+    // whole fleet running detached. Turn SIGHUP/SIGTERM/SIGINT into an
+    // ordinary loop exit instead, so they get Alt+q's teardown.
+    infra::signals::install();
     let (tx, rx) = mpsc::sync_channel::<AppEvent>(EVENT_CHANNEL_BOUND);
 
     // Wire production adapters to the core's ports.
@@ -559,7 +564,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         // status (or timed out) this iteration.
         app.poll_waiters();
 
-        if app.quit {
+        // Alt+q, or the host telling roost to go away (window closed, ssh
+        // dropped, `kill`). Both leave by the same door: `shutdown()` below
+        // saves the workspace and hangs up every pane.
+        if app.quit || infra::signals::terminating() {
             break;
         }
     }

@@ -34,5 +34,6 @@ pub mod perf;
 pub mod pty;
 pub mod qos;
 pub mod queries;
+pub mod signals;
 pub mod sock;
 pub mod store;
