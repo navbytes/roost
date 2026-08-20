@@ -115,9 +115,27 @@ impl Workspace {
         // reconciliation below then drops the orphaned specs, and an emptied
         // tab goes with the `retain` further down.
         let mut seen: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
-        for tab in &mut self.tabs {
-            crate::core::layout::dedupe_pane_ids(&mut tab.layout, &mut seen);
-        }
+        // `dedupe_pane_ids` answers "this subtree is now empty", which is how
+        // a parent knows to drop the child. The **root** has no parent, and
+        // this call site used to throw the answer away — so a tab whose whole
+        // layout is a bare `Pane` holding an id an earlier tab already
+        // claimed survived deduping untouched, and the reconciliation below
+        // then minted it a fresh spec. The duplicate this pass exists to
+        // remove, recreated one loop later, and with it every consequence the
+        // comment above lists. (Only the bare-root shape escaped: a duplicate
+        // inside a `Split` or `Stack` is removed by its parent, and a
+        // container left empty reports empty in turn.)
+        let emptied: Vec<bool> = self
+            .tabs
+            .iter_mut()
+            .map(|tab| crate::core::layout::dedupe_pane_ids(&mut tab.layout, &mut seen))
+            .collect();
+        let mut i = 0;
+        self.tabs.retain(|_| {
+            let keep = !emptied[i];
+            i += 1;
+            keep
+        });
         for tab in &mut self.tabs {
             let mut ids = Vec::new();
             crate::core::layout::pane_order(&tab.layout, &mut ids);
@@ -149,6 +167,125 @@ impl Workspace {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
+    }
+}
+
+/// `workspace.json` is the one file the whole tool is, and it is
+/// hand-editable — so `validate_and_repair` is the boundary where an
+/// arbitrary one becomes a workspace roost can run. These generate
+/// structurally valid but deliberately broken files and check that what
+/// comes out the other side satisfies every invariant the rest of the code
+/// then assumes.
+#[cfg(test)]
+mod repair_fuzz {
+    use serde_json::json;
+
+    /// A tab whose entire layout is one pane an earlier tab already claimed.
+    ///
+    /// `dedupe_pane_ids` answers "this subtree is now empty" so a parent can
+    /// drop the child — but a root has no parent, and `validate_and_repair`
+    /// used to discard that answer. The tab survived deduping untouched and
+    /// the reconciliation then minted it a fresh spec, so the id ended up in
+    /// two tabs: one PTY drawn in two places, keystrokes landing in both,
+    /// `tab_of` answering with whichever comes first, and closing either
+    /// taking the other with it. Exactly the failure the dedupe pass was
+    /// added for, through the one shape it could not reach.
+    #[test]
+    fn a_tab_that_is_only_a_duplicate_pane_does_not_survive_the_repair() {
+        let raw = r#"{"version":1,"active_tab":0,"tabs":[
+            {"name":"a","layout":{"split":{"dir":"vertical","ratios":[],
+              "children":[{"pane":3},{"pane":0}]}},"panes":{}},
+            {"name":"b","layout":{"pane":0},"panes":{"0":{"adapter":"pi","cwd":"/tmp"}}}
+        ]}"#;
+        let mut ws: super::Workspace = serde_json::from_str(raw).unwrap();
+        ws.validate_and_repair();
+        let mut owner = std::collections::HashMap::new();
+        for (i, tab) in ws.tabs.iter().enumerate() {
+            let mut ids = Vec::new();
+            crate::core::layout::pane_order(&tab.layout, &mut ids);
+            for id in ids {
+                if let Some(prev) = owner.insert(id, i) {
+                    panic!("pane {id} is in tab {prev} and tab {i} after the repair");
+                }
+            }
+        }
+    }
+
+    struct R(u64);
+    impl R {
+        fn n(&mut self, m: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % m.max(1)
+        }
+    }
+
+    /// A layout tree with every shape a hand-edited file can hold: duplicate
+    /// ids drawn from a tiny pool, containers with zero and one child,
+    /// `ratios` that do not match `children`, and `expanded` out of range.
+    fn node(r: &mut R, depth: u32) -> serde_json::Value {
+        if depth == 0 || r.n(3) == 0 {
+            return json!({ "pane": r.n(4) });
+        }
+        let kids: Vec<_> = (0..r.n(4)).map(|_| node(r, depth - 1)).collect();
+        if r.n(2) == 0 {
+            let ratios: Vec<f64> = (0..r.n(5)).map(|_| r.n(100) as f64 / 100.0).collect();
+            json!({"split": {
+                "dir": if r.n(2) == 0 { "vertical" } else { "horizontal" },
+                "ratios": ratios,
+                "children": kids,
+            }})
+        } else {
+            json!({"stack": { "children": kids, "expanded": r.n(6) }})
+        }
+    }
+
+    /// Whatever goes in, what comes out must satisfy every invariant the
+    /// rest of roost assumes of a loaded workspace — the same set
+    /// `core::app`'s layout fuzzer re-checks after each of its operations,
+    /// asked here of the parse-and-repair boundary instead.
+    #[test]
+    fn any_workspace_repairs_into_one_roost_can_run() {
+        let mut r = R(0xC0FFEE123);
+        let mut parsed = 0u32;
+        for _ in 0..15_000u32 {
+            let tabs: Vec<_> = (0..r.n(4))
+                .map(|_| {
+                    let mut panes = serde_json::Map::new();
+                    for _ in 0..r.n(5) {
+                        panes.insert(
+                            r.n(4).to_string(),
+                            json!({"adapter": "shell", "cwd": "/tmp"}),
+                        );
+                    }
+                    json!({"name": "t", "layout": node(&mut r, 3), "panes": panes})
+                })
+                .collect();
+            let raw = json!({"version": 1, "active_tab": r.n(6), "tabs": tabs}).to_string();
+            let Ok(mut ws) = serde_json::from_str::<super::Workspace>(&raw) else { continue };
+            parsed += 1;
+            ws.validate_and_repair();
+
+            assert!(!ws.tabs.is_empty(), "a repair always leaves a tab to show: {raw}");
+            assert!(ws.active_tab < ws.tabs.len(), "active_tab names a real tab: {raw}");
+            let _ = ws.active_tab(); // the accessor that documents the two above
+            let mut owner = std::collections::HashMap::new();
+            for (i, tab) in ws.tabs.iter().enumerate() {
+                let mut ids = Vec::new();
+                crate::core::layout::pane_order(&tab.layout, &mut ids);
+                let tree: std::collections::HashSet<_> = ids.iter().copied().collect();
+                assert_eq!(tree.len(), ids.len(), "a tree lists a pane twice: {raw}");
+                let keys: std::collections::HashSet<_> = tab.panes.keys().copied().collect();
+                assert_eq!(tree, keys, "tree ids and panes map disagree: {raw}");
+                for id in ids {
+                    if let Some(prev) = owner.insert(id, i) {
+                        panic!("pane {id} is in tab {prev} AND tab {i}: {raw}");
+                    }
+                }
+            }
+        }
+        eprintln!("workspace repair fuzz: {parsed} adversarial workspaces");
     }
 }
 
