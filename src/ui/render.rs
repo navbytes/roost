@@ -4973,6 +4973,131 @@ row's — widen ADAPTER_COL",
 
     // -- full draw() smoke tests at degenerate sizes (fleet features pass) --
 
+    /// `draw()` must not panic at any geometry, in any state.
+    ///
+    /// A panic in the renderer runs on the event-loop thread and unwinds out
+    /// of `run()`, which is a fleet incident, not a bad frame (see
+    /// `tests/panic_shutdown.rs`). The chrome is full of arithmetic on
+    /// widths that can go to zero — `saturating_sub` almost everywhere, and
+    /// "almost" is what this is for. The layout fuzzer in `core::app` walks
+    /// the same action space but only checks *state* invariants; nothing
+    /// rendered a single frame of what it built.
+    ///
+    /// So: the same random walk, plus the overlays and modes (which the
+    /// layout fuzzer barely touches, because they change no structure), and
+    /// a real `draw()` into a `TestBackend` after every step — at a geometry
+    /// redrawn from a deliberately hostile set each time, 1x1 included.
+    #[test]
+    fn draw_never_panics_at_any_geometry_or_state() {
+        use crate::core::layout::Dir;
+        use crate::ui::input::Action;
+        use crossterm::event::{KeyCode, KeyEvent};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        // Everything from a terminal nobody can use to one nobody has.
+        const GEOM: &[(u16, u16)] = &[
+            (1, 1), (2, 1), (1, 2), (3, 2), (4, 3), (6, 2), (10, 3),
+            (20, 4), (37, 7), (80, 24), (120, 40), (200, 60), (300, 80),
+        ];
+
+        struct Lcg(u64);
+        impl Lcg {
+            fn below(&mut self, n: u64) -> u64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (self.0 >> 16) % n
+            }
+        }
+
+        let dirs = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+        let keys = [
+            KeyCode::Char('a'), KeyCode::Char('/'), KeyCode::Char('中'), KeyCode::Enter,
+            KeyCode::Esc, KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right,
+            KeyCode::Backspace, KeyCode::Tab, KeyCode::Char('y'), KeyCode::Char('n'),
+        ];
+        let mut frames = 0u64;
+        for seed in 0..30u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7));
+            let mut app = mk_app(Size::new(120, 40));
+            for _ in 0..120 {
+                let d = dirs[rng.below(4) as usize];
+                let action = match rng.below(24) {
+                    0 | 1 => Action::NewPane,
+                    2 => Action::ClosePane,
+                    3 => Action::Focus(d),
+                    4 => Action::MovePane(d),
+                    5 => Action::NewTab,
+                    6 => Action::NextTab,
+                    7 => Action::ToggleStack,
+                    8 => Action::FlipSplit,
+                    9 => Action::Resize { horizontal: rng.below(2) == 0, grow: rng.below(2) == 0 },
+                    10 => Action::ToggleZoom,
+                    11 => Action::ToggleFloat,
+                    12 => Action::CycleLayout { forward: rng.below(2) == 0 },
+                    13 => Action::ToggleRoster,
+                    14 => Action::ToggleFeed,
+                    15 => Action::Help,
+                    16 => Action::EditPane,
+                    17 => Action::RenameTab,
+                    18 => Action::QuickLaunch,
+                    19 => Action::ScrollMode,
+                    20 => Action::CopyMode,
+                    21 => Action::ToggleBroadcast,
+                    22 => Action::ToggleHints,
+                    _ => Action::Undo,
+                };
+                app.apply(action);
+                // Names and notes are what the width arithmetic actually
+                // measures: a wide glyph counts two columns, a combining
+                // mark none, and a long one has to be truncated somewhere.
+                // Typing them in through the dialogs would take the whole
+                // walk, so plant them directly.
+                if rng.below(6) == 0 {
+                    const NASTY: &[&str] = &[
+                        "",
+                        " ",
+                        "中文中文中文中文",
+                        "e\u{0301}\u{0301}\u{0301}",
+                        "\u{1f600}\u{1f600}\u{1f600}",
+                        "a\u{fe0f}",
+                        "................................................................",
+                        "\u{200d}\u{200d}",
+                        "tab",
+                    ];
+                    let pick = NASTY[rng.below(NASTY.len() as u64) as usize].to_string();
+                    let t = rng.below(app.ws.tabs.len() as u64) as usize;
+                    if rng.below(2) == 0 {
+                        app.ws.tabs[t].name = pick;
+                    } else {
+                        let ids: Vec<u64> = app.ws.tabs[t].panes.keys().copied().collect();
+                        if let Some(id) = ids.get(rng.below(ids.len().max(1) as u64) as usize) {
+                            let spec = app.ws.tabs[t].panes.get_mut(id).unwrap();
+                            if rng.below(2) == 0 {
+                                spec.title = Some(pick);
+                            } else {
+                                spec.note = Some(pick);
+                            }
+                        }
+                    }
+                }
+                // Modes own the keyboard; drive them the way main.rs does so
+                // the overlays reach their filtered / mid-edit states.
+                for _ in 0..rng.below(3) {
+                    let k = KeyEvent::from(keys[rng.below(keys.len() as u64) as usize]);
+                    app.handle_mode_key(k);
+                }
+                let (w, h) = GEOM[rng.below(GEOM.len() as u64) as usize];
+                app.on_resize(Size::new(w, h), (0, 0));
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| super::draw(f, &mut app)).unwrap();
+                frames += 1;
+                app.quit = false; // a random Quit must not end the walk
+            }
+        }
+        eprintln!("render sweep: {frames} frames");
+    }
+
     fn mk_app(size: ratatui::layout::Size) -> App<crate::ports::fakes::FakePane> {
         use crate::agents;
         use crate::core::control::TokenTable;

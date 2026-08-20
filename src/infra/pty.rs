@@ -1830,6 +1830,68 @@ mod tests {
         pt.kill();
     }
 
+    /// No sequence of bytes a pane emits may panic the per-chunk path.
+    ///
+    /// `tests/vt100_panics.rs` sweeps the terminal parser; this sweeps
+    /// everything `PtyPane::process_output` does *around* it on the same
+    /// bytes, which is where roost's own code lives: the bell counter, the
+    /// `QueryResponder` (which parses DA/DSR/DECRQM/XTWINOPS/kitty
+    /// out of the same stream and writes replies back), the synchronized-
+    /// output snapshot, W3 effect routing with its host-output caps, and the
+    /// title→status channel. All of it runs on the event-loop thread, so a
+    /// panic in any of it is the fleet incident `tests/panic_shutdown.rs`
+    /// describes, not a bad frame.
+    ///
+    /// Drives a real `PtyPane` (over a `sleep` child, which reads nothing
+    /// and writes nothing, so the only bytes in play are the ones fed here)
+    /// rather than the pieces in isolation — the interactions are the point.
+    /// Skips where no pty is available, like every other spawn-backed test.
+    #[test]
+    fn no_byte_sequence_panics_the_pane_output_path() {
+        use crate::agents::CommandSpec;
+        use crate::core::event::AppEvent;
+        use crate::ports::PaneBackend;
+        let vocab: &[&[u8]] = &[
+            b"\x1b[", b"\x1b]", b"\x1b", b"\x07", b"\x9b", b"\x1bP", b"\x1b_", b"\x1b^", b"\x1bX",
+            b";", b"?", b":", b"0", b"1", b"9", b"999999999", b"-1", b"2147483648",
+            b"H", b"J", b"K", b"m", b"r", b"h", b"l", b"n", b"t", b"S", b"T", b"L", b"M", b"@",
+            b"P", b"X", b"d", b"G", b"A", b"B", b"C", b"D", b"E", b"F", b"g", b"c", b"q", b"p",
+            b"$", b"\"", b"b", b"Z", b"I", b"`", b"a", b"e", b"f", b"s", b"u", b"W", b"|", b"'",
+            b"\x1b[c", b"\x1b[>c", b"\x1b[5n", b"\x1b[6n", b"\x1b[?6n", b"\x1b[?1$p", b"\x1b[?2026$p",
+            b"\x1b[14t", b"\x1b[16t", b"\x1b[18t", b"\x1b[>0q", b"\x1bP+q544e\x1b\\",
+            b"\x1b[?u", b"\x1b[=1;1u", b"\x1b[>1u", b"\x1b[<u", b"\x1b[?1049h", b"\x1b[?2026h",
+            b"\x1b]0;t\x07", b"\x1b]2;\xe4\xb8\xad\x07", b"\x1b]52;c;aGk=\x07", b"\x1b]9;hi\x07",
+            b"\x1b]777;notify;a;b\x07", b"\x1b]52;c;", b"\x1b]11;?\x07", b"\x1b]10;?\x1b\\",
+            b"\r", b"\n", b"\t", b"\x08", b"\x0b", b"\x0c", b"\x0e", b"\x0f", b"\x00",
+            "\u{1f600}".as_bytes(), "\u{4e2d}".as_bytes(), "\u{0301}".as_bytes(), "\u{fe0f}".as_bytes(),
+            "\u{200d}".as_bytes(), b"\xff\xfe", b"\xc3", b"\xed\xa0\x80", b"abc", b"     ",
+        ];
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(65536);
+        std::thread::spawn(move || while rx.recv().is_ok() {});
+        let spec = CommandSpec::new("sleep", &std::env::temp_dir()).arg("300");
+        let mut pt = match super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIP pane-output sweep: {e}");
+                return;
+            }
+        };
+        let mut st: u64 = 0x243F6A8885A308D3;
+        let mut next = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        for _ in 0..120_000u64 {
+            match next() % 400 {
+                0 => { let r = 1 + (next() % 60) as u16; let c = 1 + (next() % 200) as u16; pt.resize(r, c, ((next()%2000) as u16, (next()%2000) as u16)); }
+                1 => { let _ = pt.screen().map(|s| s.contents()); }
+                2 => { let _ = pt.take_effects(); }
+                3 => { pt.set_scrollback((next() % 300) as usize); }
+                4 => pt.scroll_by(((next() % 40) as i32) - 20),
+                5 => { let _ = pt.status(); let _ = pt.cursor_shape(); let _ = pt.alternate_screen(); }
+                _ => pt.process_output(vocab[(next() as usize) % vocab.len()]),
+            }
+        }
+        pt.kill();
+    }
+
     /// Every caller of `session_members` walks its result straight into
     /// `SIGKILL`, so a sid that names init's session — the one every daemon
     /// on the machine belongs to — must come back empty rather than come
