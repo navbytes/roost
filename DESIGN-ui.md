@@ -4079,6 +4079,29 @@ not a benchmark suite.
 
 ---
 
+### Open: the composer's `Exited` filter tier can never match
+**[Added 2026-08-20, simulation pass]**
+
+C36's `Tab` filter shares `ROSTER_STATUS_CYCLE` with C27's roster, which is
+deliberate — the composer shows a *target count* for the tier it names, and
+tiers that meant different things in the two places would make that count
+unreadable. But `broadcast_targets` excludes exited panes **unconditionally**
+(`rt.status() != AgentStatus::Exited`), so the cycle's `Exited` stop is
+structurally always "no panes" in the composer: a stop you can Tab onto that
+can never do anything, on any fleet.
+
+Nothing is wrong — the count is honest and the send is a correct no-op. It is
+a dead option riding along on an enum shared between two surfaces whose
+eligibility rules differ, which the sharing rationale did not anticipate.
+
+The fix is small either way and the question is which invariant matters more:
+skip the tier in the composer (the cycles then differ by one stop, but every
+stop in each is reachable), or keep them identical (one stop is inert, and a
+user learns to skip it). Recorded rather than guessed at, because the shared
+cycle was a deliberate C36 decision and this is the first evidence against it.
+Found by a simulation agent reviewing C36 adversarially — it could not defeat
+the guard, and found this instead.
+
 ### Open: an Alt chord discards an editor's unsaved buffer
 **[Added 2026-08-20, C24b amendment audit]**
 
@@ -4664,6 +4687,73 @@ take that at its word.
 
 **Config.** One new `NAMES` entry, `cycle_layout_back`. `cycle_layout` keeps
 its name and now means the forward direction explicitly.
+
+### C38 — A refusal says so — [Added 2026-08-20, simulation pass]
+
+**The gap.** Three gestures refuse correctly and wordlessly. Pressing them
+changes nothing on screen, so "bound, but nothing to do here" is
+indistinguishable from "not bound at all" — and roost's own contracts
+already disagreed about whether that is acceptable. C35, shipped the same
+week as C33, states the rule outright: *"a navigation key that silently does
+nothing reads as broken, and the whole value of this one is confidence about
+where it lands."* C33's edge no-op is the same gesture family and says
+nothing. Found by a simulation agent comparing the two — the comparison is
+what makes the inconsistency visible, since each contract reads fine alone.
+
+C33's defence of the no-op is **not** a defence of the silence. It argues
+that a swap must not cross tabs ("moving a pane out of its tab is a
+structural edit rather than a look, so the recoverable failure is doing
+nothing"), which is a claim about what the *layout* does. A flash moves
+nothing.
+
+**The rule.** When a gesture declines to act, it says why in a C10 flash —
+and where another chord *would* do what the user is reaching for, it names
+that chord. A dead end that teaches the way out is worth more than one that
+merely reports itself.
+
+| site | flash |
+|---|---|
+| `Alt+Shift+h/l` at a tab edge | `at the tab's edge — {chord} moves it to the {next\|previous} tab` |
+| `Alt+Shift+j/k` at a layout edge | `nothing {above\|below} to swap with` |
+| `Alt+Shift+hjkl` on the float | `the scratch pane sits outside the layout` |
+| `Alt+n` / picker launch, split refused | `no room to split — a pane needs 36×10` |
+
+Four decisions inside that table, each load-bearing:
+
+- **The horizontal edge names `Alt+Shift+i`/`Alt+Shift+m`, resolved from the
+  live keymap.** C33 declined the cross-tab handoff *because* those chords
+  "already do exactly that job and name it" — and the moment the user needs
+  to know that is the moment they press the wrong one. Through
+  `chord_clause`, never a literal: the C34 gate bans spelling a chord in
+  `src/`, and a flash teaching a remapped-away key is the drift C34 exists
+  to end. With the chord unbound the clause collapses and the flash still
+  says `at the tab's edge` — no dead key, no dangling em-dash.
+- **The vertical edge names nothing**, because there is nothing to name:
+  C31 makes tabs roost's horizontal axis, so `j`/`k` have no cross-tab
+  counterpart. Inventing one for symmetry would teach a chord that does not
+  exist.
+- **The refused split names the threshold**, not the advice. "Widen the
+  terminal" is a suggestion; `36×10` is the number that makes the next
+  attempt work, and it comes from `MIN_SPLIT_COLS`/`MIN_SPLIT_ROWS` rather
+  than being restated.
+- **A refusal flashes at the keypress, not inside `spawn_child`.** The
+  control CLI reaches the same refusal and reports it in its own reply;
+  raising a TUI flash from an API call would put a message on screen that
+  nobody at the keyboard caused.
+
+**A success stays quiet.** Only the refusal speaks — the new pane, or the
+pane arriving in its new slot, is its own feedback, and a flash on every
+`Alt+n` would be noise that trains the eye to skip the bar. Pinned by
+`a_split_that_succeeds_stays_quiet`.
+
+**Chrome.** Nothing new: C10's flash, C9's hint bar, no glyph, no colour.
+This contract adds a sentence, not a surface.
+
+**Not in scope.** The `Exited` tier of the composer's `Tab` filter (C36) is
+structurally always empty — `broadcast_targets` excludes exited panes
+unconditionally — so it is a dead stop in the cycle rather than a silent
+refusal. Recorded in §7; it wants a decision about whether the two surfaces
+may offer different tiers, which is C36/C27's question, not this one's.
 
 ## 8. Key table — [Added 2026-07-22, fleet features]
 

@@ -552,8 +552,44 @@ Three things follow, and only one of them is about the report.
    is the marker precisely because overlay body text like "keys" or "shell"
    also sits in the always-visible hint bar.
 
+**Three real bugs came back from the other agents, all of the same shape:
+roost working correctly and looking broken.** None crashes, none clips, and
+every existing test passed over all three — which is the pattern worth
+naming. Width tests measure width; geometry tests measure geometry; nothing
+was measuring *legibility*.
+
+1. **The help overlay's key column fused to its description**, on the
+   **default** keymap: `roost send <id> "text"type into that pane`.
+   `format!(" {key:<18}")` is a minimum width, not a column, so a key 18
+   cells or wider gets no padding at all — and `draw_help_columns` puts
+   nothing between the two spans. C34 then made the key column
+   keymap-derived, so an enumerated family reached 24 and did the same to
+   `move focus`. The 80-column floor holds in both cases, which is exactly
+   why the floor tests never saw it: the row *fits*, it just cannot be read.
+2. **The roster and activity feed drew nothing at six rows or fewer.**
+   `feed_overlay_size` subtracts four per axis with no floor, so a four-row
+   body gave a zero-height dialog. The chord still flipped the mode word and
+   the hint bar still offered `↑↓ select` — the entire visible effect of
+   `Alt+Shift+a` was one word changing. C14's picker had answered this
+   already ("an empty result still needs a frame to say so"); these two
+   never adopted it.
+3. **Three gestures refused correctly and wordlessly**, and roost's own
+   contracts disagreed about whether that was acceptable: C35 states the
+   rule ("a navigation key that silently does nothing reads as broken") and
+   C33, shipped the same week, has a silent edge no-op. Now **C38**: a
+   refusal says why, and where another chord would do the job it names that
+   chord — `Alt+Shift+h` at a tab edge points at `Alt+Shift+m`, resolved
+   from the live keymap. C33's defence of the no-op turns out to be a
+   defence of *not moving the pane*, never of the silence.
+
+The comparison is what found (3): each contract reads fine alone. That is an
+argument for reviewing features in cohorts rather than one PR at a time.
+
 Everything else the pass touched — 35 chords, rapid-fire sequences, orphan
-cleanup, 50+ CLI and config cases — came back clean.
+cleanup, 50+ CLI and config cases, every modal at five terminal sizes, resize
+below the floor and back, and an adversarial attempt to make C36's target
+count disagree with its delivery (including a real cross-process status race
+against an open composer) — came back clean.
 
 ---
 

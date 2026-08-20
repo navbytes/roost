@@ -3448,7 +3448,9 @@ impl<B: PaneBackend> App<B> {
         match action {
             Action::Quit => self.quit_guarded(),
             Action::NewPane => {
-                self.spawn_child("shell", None, None);
+                if self.spawn_child("shell", None, None).is_none() {
+                    self.flash_no_room();
+                }
             }
             Action::ClosePane => self.close_pane(),
             Action::Focus(dir) => self.focus_dir(dir),
@@ -3743,11 +3745,20 @@ impl<B: PaneBackend> App<B> {
     /// the time this runs a float-focused user has been returned to
     /// `prev_focus` and the chord acts on that pane instead.
     fn move_pane_dir(&mut self, dir: layout::Dir) {
+        // C38: every refusal here says so. C33 argued only that a swap must
+        // not *cross tabs* ("the recoverable failure is doing nothing") —
+        // never that it should do so wordlessly, and C35 had already
+        // written the opposite rule for the sibling gesture: "a navigation
+        // key that silently does nothing reads as broken". Found by a
+        // simulation agent comparing the two, which is the comparison that
+        // makes the inconsistency visible.
         if self.float_focused() {
+            self.set_flash("the scratch pane sits outside the layout");
             return;
         }
         let rects = self.rects();
         let Some(target) = layout::neighbor(&rects, self.focused, dir) else {
+            self.flash_move_edge(dir);
             return;
         };
         let focused = self.focused;
@@ -3765,6 +3776,55 @@ impl<B: PaneBackend> App<B> {
         // also what resizes each pane's PTY to the rect it just moved into
         // (same as `FlipSplit`/`Resize`/`ToggleStack` — none of them persist
         // by hand either).
+    }
+
+    /// C38: what a refused split says. `split_fit` returns `None` when the
+    /// pane being split is under `MIN_SPLIT_COLS`×`MIN_SPLIT_ROWS`, which
+    /// is also the trigger for the vt100 underflow crash — so the refusal
+    /// is right and only the silence was wrong. The message names the
+    /// threshold because that is the one fact that makes the next attempt
+    /// succeed: "widen it" is advice, "36×10" is an instruction.
+    ///
+    /// Deliberately raised at the two *keypress* sites (`Alt+n` and a
+    /// picker launch), not inside `spawn_child`. The control CLI reaches
+    /// the same refusal and already reports it in its own reply; setting a
+    /// TUI flash from an API call would put a message on screen that no one
+    /// at the keyboard caused.
+    fn flash_no_room(&mut self) {
+        self.set_flash(format!(
+            "no room to split — a pane needs {}×{}",
+            layout::MIN_SPLIT_COLS,
+            layout::MIN_SPLIT_ROWS,
+        ));
+    }
+
+    /// C38: what `Alt+Shift+hjkl` says when there is nothing that way.
+    ///
+    /// Horizontally it names the chord that *does* cross tabs, so the dead
+    /// end teaches the way out rather than just reporting one — C33
+    /// declined the cross-tab handoff precisely because `Alt+Shift+i` /
+    /// `Alt+Shift+m` (C28) "already do exactly that job and name it", and
+    /// this is where the user is holding the question. Vertically there is
+    /// no such chord (tabs are roost's horizontal axis, C31), so the flash
+    /// only says what happened.
+    ///
+    /// The chord comes from `chord_clause`, never a literal: the C34 gate
+    /// bans spelling one in `src/`, and a flash that taught a remapped-away
+    /// chord would be the exact drift C34 exists to prevent.
+    fn flash_move_edge(&mut self, dir: layout::Dir) {
+        let (forward, whither) = match dir {
+            layout::Dir::Right => (true, "next"),
+            layout::Dir::Left => (false, "previous"),
+            _ => {
+                let whence = if matches!(dir, layout::Dir::Up) { "above" } else { "below" };
+                self.set_flash(format!("nothing {whence} to swap with"));
+                return;
+            }
+        };
+        let carry = self.chord_clause(Action::MovePaneToTab { forward }, |c| {
+            format!(" — {c} moves it to the {whither} tab")
+        });
+        self.set_flash(format!("at the tab's edge{carry}"));
     }
 
     /// C31: `Left`/`Right` off the edge of the active tab continue into the
@@ -4787,7 +4847,9 @@ impl<B: PaneBackend> App<B> {
         self.mode = Mode::Normal;
         self.exit_zoom(); // C21: "picker launch" is a structural action
         self.hide_float(); // C22 rule 3: ditto
-        self.spawn_child(adapter, cwd.clone(), None);
+        if self.spawn_child(adapter, cwd.clone(), None).is_none() {
+            self.flash_no_room();
+        }
         // Launching into a directory is the strongest evidence it is one you
         // are working in — float it to the top of the column for next time.
         if let Some(cwd) = cwd {
@@ -12510,6 +12572,92 @@ mod tests {
             "and the pane did not leave the tab",
         );
         assert_eq!(app.focused, 3);
+    }
+
+    /// C38: the edge no-op **says so**, and horizontally it names the chord
+    /// that does cross tabs — the dead end teaches the way out.
+    ///
+    /// C33 defended the no-op ("the recoverable failure is doing nothing"),
+    /// which is an argument about the *swap*, not about the silence. C35
+    /// had already written the opposite rule for the sibling gesture: "a
+    /// navigation key that silently does nothing reads as broken." Two
+    /// contracts that shipped the same week disagreed, and a user pressing
+    /// `Alt+Shift+h` at an edge could not tell "bound but nowhere to go"
+    /// from "not bound".
+    #[test]
+    fn moving_a_pane_off_the_edge_names_the_chord_that_would_work() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus 2 (right)
+
+        app.apply(Action::MovePane(Dir::Right)); // at the right edge
+        let right = app.flash().expect("the edge speaks").to_string();
+        assert!(right.contains("edge"), "{right}");
+        let carry = app
+            .chord_label(Action::MovePaneToTab { forward: true })
+            .expect("the cross-tab chord is bound by default");
+        assert!(right.contains(&carry), "the flash names {carry}: {right}");
+        assert!(right.contains("next tab"), "and which way it goes: {right}");
+
+        // Vertically there is no cross-tab chord to name (C31: tabs are the
+        // horizontal axis), so the flash reports and offers nothing.
+        app.apply(Action::MovePane(Dir::Up));
+        let up = app.flash().expect("the edge speaks").to_string();
+        assert_eq!(up, "nothing above to swap with");
+    }
+
+    /// The flash resolves its chord through the live keymap. A literal
+    /// would survive a remap and teach a key that no longer exists — the
+    /// drift C34 was built to end, and the reason `flash_move_edge` goes
+    /// through `chord_clause`.
+    #[test]
+    fn the_edge_flash_follows_a_remapped_cross_tab_chord() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        let (keymap, diags) =
+            Keymap::parse(r#"{"keys": {"alt+shift+m": "disable"}}"#, "config.json");
+        assert!(diags.is_empty(), "{diags:?}");
+        app.set_keymap(keymap);
+        app.apply(Action::NewPane);
+
+        app.apply(Action::MovePane(Dir::Right));
+        let flash = app.flash().expect("the edge still speaks").to_string();
+        assert_eq!(
+            flash, "at the tab's edge",
+            "with the chord unbound the clause collapses rather than naming a dead key",
+        );
+    }
+
+    /// C38: a refused split says why, and names the threshold — the one
+    /// fact that makes the next attempt succeed. `spawn_child` has always
+    /// refused a split that would produce unusable panes (it is also the
+    /// vt100 underflow trigger); until now the sixth `Alt+n` on a small
+    /// terminal simply did nothing.
+    #[test]
+    fn a_refused_split_says_why_and_names_the_threshold() {
+        let (mut app, _) = mk_app(shell_ws());
+        // Split until the layout refuses, exactly as a user leaning on
+        // Alt+n would.
+        while app.spawn_child("shell", None, None).is_some() {}
+        app.set_flash("stale");
+
+        app.apply(Action::NewPane);
+        let flash = app.flash().expect("the refusal speaks").to_string();
+        assert!(flash.contains("no room"), "{flash}");
+        assert!(
+            flash.contains(&layout::MIN_SPLIT_COLS.to_string())
+                && flash.contains(&layout::MIN_SPLIT_ROWS.to_string()),
+            "the threshold is the actionable part: {flash}",
+        );
+    }
+
+    /// ...and a split that *works* says nothing. A flash on every Alt+n
+    /// would be noise, and the pane appearing is its own feedback.
+    #[test]
+    fn a_split_that_succeeds_stays_quiet() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        assert!(app.flash().is_none(), "{:?}", app.flash());
     }
 
     /// Inside a stack the gesture reorders — no special case in the app, it
