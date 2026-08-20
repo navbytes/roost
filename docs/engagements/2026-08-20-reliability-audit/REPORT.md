@@ -6,10 +6,10 @@ four items that needed them (see "Resolved after review"). Everything below
 was reproduced
 before it was reported, fixed with a test, and mutation-checked (the fix was
 reverted and the test confirmed to fail). Branch:
-`claude/ui-ux-keybindings-analysis-3hqs3v`, twenty-four commits on top of
+`claude/ui-ux-keybindings-analysis-3hqs3v`, twenty-six commits on top of
 v0.1.9.
 
-Suite at the end of the audit: **943 unit + all integration suites passing**,
+Suite at the end of the audit: **944 unit + all integration suites passing**,
 two pre-existing environmental failures (both assume a non-root user;
 `chmod 000` does not stop root, so they fail in this container and pass on a
 normal machine). Clippy unchanged at its 8-warning baseline.
@@ -412,27 +412,38 @@ that the row is cleared and why.
 
 ---
 
-## Open — one decision left
+## Nothing open
 
-### C11's alt-trap warning is still hint-bar-only
-`src/ui/render.rs` · surfaced by the second audit pass (SG-A)
+Every item that needed a decision has had one.
 
-The bar that tells you your terminal is swallowing Alt chords draws only when
-the hint bar does — the identical bug just fixed for C10, in the adjacent
-contract. It is worse in one way: if Alt really is being swallowed, `Alt+/`
-cannot bring the hint bar back, so the warning explaining why nothing works
-is unreachable by the only key that would reveal it.
+### C11's Alt-trap warning — closed
+`7fa5fa9` · `src/ui/render.rs`, `DESIGN-ui.md`
 
-I did not fix it, because it is not the same shape of fix. A flash is
-transient — two seconds of the body's last row, then the row comes back. The
-alt-trap bar is *persistent*, so overlaying it costs a row of pane content
-indefinitely, and that is a taste call about what is permanently on screen
-rather than a bug fix.
+The last one. The bar telling you your terminal is swallowing Alt chords drew
+only when the hint bar did — the identical bug just fixed for C10, in the
+adjacent contract, and circular in a way C10's was not: if Alt really is
+being swallowed, `Alt+/` cannot bring the hint bar back, so the one sentence
+explaining why no chord works could not be summoned by the one chord that
+would summon it.
 
-**Recommendation:** overlay it the same way, but only while `show_alt_hint()`
-holds — which is already evidence-gated (U4/F1: it fires on the signature of
-a swallowed Option chord, not on any missing Alt). A user in that state has
-a broken keyboard path and needs the sentence more than the row.
+It now falls back to the body's last row on exactly C10's terms — same shared
+function per path, same `Clear`, flash still winning over it. The one real
+difference is stated in the contract rather than glossed: this bar is
+**persistent**, so it holds that row while the trap is detected rather than
+for two seconds. Accepted because the trigger is already evidence-gated
+(U4/F1: the signature of a swallowed Option chord, not a mere absence of
+Alt), a user in that state has no working chords at all, and one Alt key ever
+— or the 8 s window closing — ends it.
+
+Both mutations are caught. Dropping the overlay fails the behavioural test
+and a §2 gate. Dropping the `Clear` fails on precisely the ragged band the
+auditor predicted, with the assertion printing the surviving border glyphs
+verbatim:
+
+```
+left:  "Alt keys aren't reaching roost? … (send Esc+) ───┘"
+right: "Alt keys aren't reaching roost? … (send Esc+)"
+```
 
 ---
 
