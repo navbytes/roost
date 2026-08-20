@@ -581,8 +581,15 @@ fn picker_cwd_label(path: &std::path::Path) -> String {
 
 /// C14 (U20): the picker's adapter column — the 3-char row prefix
 /// (`picker_row_body`'s `" {digit} "`) + the registry's longest id
-/// (`opencode`, 8) + the longest status suffix (`" not found"`, 10, see
-/// `picker_filtered`) + 2 columns of slack.
+/// (`opencode`, 8) + the missing-adapter suffix (`" not found"`, 10, see
+/// `App::picker_filtered` and `PICKER_MISSING_SUFFIX`) + the selection
+/// marker the pad formula subtracts (1) + **1 column of slack**.
+///
+/// That last term used to read "2 columns of slack" and did not count the
+/// marker, so the stated derivation summed to one more than the constant
+/// actually leaves. Caught by the design audit; the arithmetic was right
+/// and only the sentence was wrong, which is the kind of error that
+/// survives because nobody re-adds a comment.
 ///
 /// **One constant, because there were two.** `picker_dialog_width` sized
 /// the dialog for 23 while `draw_mode_overlay` padded its rows to 16 — same
@@ -4221,28 +4228,40 @@ mod tests {
         assert_eq!(marker.content.as_ref(), " ");
         assert_eq!(style, theme::quiet());
     }
-
     /// C14 (U20): every picker row's cwd column starts at the same place,
     /// including the widest adapter row the dialog is sized for.
     ///
     /// The pad target and the width constant used to be two constants with
     /// one name — 16 in the draw loop, 23 in the sizing — so a row wider
-    /// than 16 got no padding and shoved its cwd label right. This walks
-    /// the whole worst case rather than asserting the number: the longest
-    /// registry id with the longest status suffix, at the accelerator
-    /// prefix that makes it longest.
+    /// than 16 got no padding and shoved its cwd label right.
+    ///
+    /// The worst case is **derived from the live registry**, not spelled.
+    /// The first version of this test wrote `"opencode not found"` while
+    /// its own docstring claimed to walk the registry — so a seventh
+    /// adapter with a 9-character id would have under-padded the column
+    /// again with the test still green. That is the same "tautology that
+    /// reads like a gate" this branch has already fixed twice; the design
+    /// audit caught it a third time, here.
     #[test]
     fn the_adapter_column_is_wide_enough_for_the_row_it_pads() {
-        let widest = format!(" 1 {}", "opencode not found");
+        // The longest id the picker can list, annotated the way
+        // `App::picker_filtered` annotates an adapter missing from `$PATH`
+        // (any id can be, so the suffix applies to the longest), at the
+        // accelerator prefix that makes the row longest.
+        let longest = crate::agents::picker_ids()
+            .into_iter()
+            .max_by_key(|id| mouse::display_width(id))
+            .expect("the registry lists at least one adapter");
+        let suffix = crate::core::app::PICKER_MISSING_SUFFIX;
+        let worst = super::picker_row_body(0, &format!("{longest} {suffix}"));
         assert!(
-            super::mouse::display_width(&widest) + 1 <= super::ADAPTER_COL,
-            "the worst-case row ({} cols + marker) overflows the column it pads to ({}),              so its cwd label starts further right than every other row's",
-            super::mouse::display_width(&widest),
+            mouse::display_width(&worst) + 1 <= super::ADAPTER_COL,
+            "the worst-case row {worst:?} ({} cols + 1 marker) overflows the column \
+it pads to ({}), so its cwd label would start further right than every other \
+row's — widen ADAPTER_COL",
+            mouse::display_width(&worst),
             super::ADAPTER_COL,
         );
-        // ...and `picker_row_body` really does produce it, so the string
-        // above cannot quietly stop being the worst case.
-        assert_eq!(super::picker_row_body(0, "opencode not found"), widest);
     }
 
     /// C14 (U20): the dialog grows to fit the widest cwd label, and stays

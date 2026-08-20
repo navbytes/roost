@@ -272,6 +272,13 @@ const FLASH_WINDOW: Duration = Duration::from_secs(2);
 /// left a silent final second where Alt+w/Alt+q still confirmed.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
+/// C14 / F8: what `picker_filtered` appends to an adapter that is not on
+/// `$PATH`. Public because `render.rs`'s `ADAPTER_COL` is sized for exactly
+/// this suffix on the longest registry id, and the gate that checks the
+/// column has to build the same worst case — two spellings of one suffix is
+/// how a column ends up sized for a row the picker no longer draws.
+pub const PICKER_MISSING_SUFFIX: &str = "not found";
+
 /// C29: the standard macOS double-click interval. Crossterm reports no click
 /// count at all, so roost derives double/triple-click itself, from the gap
 /// between two presses (`click_count`).
@@ -5000,8 +5007,13 @@ impl<B: PaneBackend> App<B> {
     /// F8: the suffix is `" not found"` (the familiar shell idiom for "no
     /// such program on `$PATH`"), not "gone" — "gone" implies something
     /// that *was* here and disappeared, which is false for an adapter never
-    /// installed on this machine at all. Checked against `render.rs`'s
-    /// `ADAPTER_COL` for the longest id: `opencode` (8 chars).
+    /// installed on this machine at all.
+    ///
+    /// It is `PICKER_MISSING_SUFFIX` rather than a literal because C14's
+    /// `ADAPTER_COL` is sized for *this string on the longest registry id*,
+    /// and the gate that checks that has to build the same worst case. Two
+    /// spellings of one suffix is how the column gets sized for a row the
+    /// picker no longer draws — the ADAPTER_COL bug one level up.
     pub fn picker_filtered(&self) -> Vec<String> {
         self.picker_filtered_ids()
             .into_iter()
@@ -5009,7 +5021,7 @@ impl<B: PaneBackend> App<B> {
                 if adapter_installed(id, &self.registry) {
                     id.to_string()
                 } else {
-                    format!("{id} not found")
+                    format!("{id} {PICKER_MISSING_SUFFIX}")
                 }
             })
             .collect()
@@ -6350,6 +6362,13 @@ fn cycle_status_filter(current: Option<AgentStatus>, back: bool) -> Option<Agent
 /// `None`: `Tab` and `Shift+Tab` have to stay inverses across the gap, and
 /// landing both on the same tier would break that at exactly one point in
 /// the lap.
+///
+/// **The double step assumes exactly one skipped tier.** Two adjacent
+/// skips would land on a skipped tier, and this would have to loop instead.
+/// One is all there is — `broadcast_targets` has one unconditional
+/// exclusion — and the assertion below fails loudly rather than returning a
+/// tier the caller cannot use, so a second exclusion added later cannot
+/// pass silently. Named by the design audit as an undocumented invariant.
 fn step_status_filter(
     current: Option<AgentStatus>,
     back: bool,
@@ -6360,7 +6379,13 @@ fn step_status_filter(
     let step = if back { -1 } else { 1 };
     let next = ROSTER_STATUS_CYCLE[(at + step).rem_euclid(n) as usize];
     if deliverable_only && next == Some(AgentStatus::Exited) {
-        return ROSTER_STATUS_CYCLE[(at + step * 2).rem_euclid(n) as usize];
+        let past = ROSTER_STATUS_CYCLE[(at + step * 2).rem_euclid(n) as usize];
+        debug_assert_ne!(
+            past,
+            Some(AgentStatus::Exited),
+            "the single-gap assumption broke: two skipped tiers need a loop, not a double step",
+        );
+        return past;
     }
     next
 }

@@ -4102,6 +4102,34 @@ not a benchmark suite.
 
 ---
 
+### Open: a click on the picker's cwd column launches the wrong thing
+**[Added 2026-08-20, ADAPTER_COL audit]**
+
+`App::handle_modal_mouse`'s picker arm hit-tests **rows only**
+(`mouse::picker_row_at`) and calls `picker_launch(i)`. A click anywhere on
+row `i` — including on the *recent-directory* label in the second column —
+launches adapter `i` with whatever cwd was already selected. So clicking a
+directory does not choose that directory; it launches an adapter you may not
+have meant, into a directory you did not click.
+
+Pre-existing, and older than the constant that surfaced it. It is recorded
+now because C14's column geometry became *derivable* when `ADAPTER_COL`
+stopped being two numbers: a click's column can now be compared against it,
+which is what any fix would need.
+
+The fix is not obvious enough to guess at. C12's U8 click rules say the
+picker "launches the row clicked and cancels on a click outside" — written
+before there were two columns, and silent about which column. Three
+readings: a click on the cwd column *selects* that directory without
+launching (matching `←→`'s keyboard behaviour, and the picker's own
+two-column focus model); or it selects **and** launches, which is the
+fewest clicks but makes a mis-aimed click destructive; or the columns stay
+one hitbox and U8's sentence is amended to say so deliberately. The first
+matches the keyboard, which is usually roost's tie-breaker.
+
+Found by the design audit of the `ADAPTER_COL` fix — not by the fix, which
+touches no hit-testing.
+
 ### ~~Open~~: the picker's adapter column has two widths and neither widens
 **[Added 2026-08-20, floor-stress audit · RESOLVED 2026-08-20]**
 
@@ -4150,11 +4178,20 @@ that could never do anything, on any fleet.
 
 **Resolved: the composer skips it; the roster keeps it.** The two invariants
 turned out not to be in tension once the question was put precisely. What
-the sharing protects is that the tiers *mean the same thing and come in the
-same order* on both surfaces — not that both surfaces stop at all of them.
-A stop that can only ever mean "nobody" is not a filter, it is a hole in the
-cycle; and the roster is a *monitoring* surface, where "which of my panes
-died" is the whole point.
+the sharing protects is that the tiers *name the same statuses in the same
+order* on both surfaces — not that both surfaces stop at all of them. A stop
+that can only ever mean "nobody" is not a filter, it is a hole in the cycle;
+and the roster is a *monitoring* surface, where "which of my panes died" is
+the whole point.
+
+**Precisely, though:** the tiers do not *mean* identically the same thing on
+both surfaces, and an earlier draft of this entry said they did. `None` is
+"every pane" in the roster and "every pane that can receive" in the composer,
+because `broadcast_targets` excludes exited panes whatever the filter says.
+That difference is inherent to the two surfaces' jobs rather than introduced
+here — the composer could never have targeted an exited pane — and the count
+stays honest either way, which is what C36 needs of it. Named by the design
+audit, which was right that the looser wording papered over it.
 
 So there is still exactly one definition of the tiers and their order
 (`ROSTER_STATUS_CYCLE`), stepped by one function, with the composer passing
