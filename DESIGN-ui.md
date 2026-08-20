@@ -1750,6 +1750,50 @@ the fleet is scriptable second). Covered by the existing width rule and
 `every_bound_chord_is_documented_in_the_keymap` gate (as a non-Alt surface
 it poses no new bindings).
 
+**[Amended 2026-08-20, floor stress — the key column must end in a space]**
+`draw_help_columns` draws a row as **two adjacent spans**, the key prefix and
+the description, with nothing between them: all the separation there is comes
+from the prefix's own padding. That padding was `format!(" {key:<18}")` — a
+*minimum* width, not a column. A key 18 cells or wider gets padded by nothing,
+and the description fuses straight onto it.
+
+It was already visible on the **default keymap**, in the group this contract's
+own PR #42 amendment added — and on two rows, not one: `roost send <id>
+"text"` (22) and `roost spawn ADAPTER` (19), rendering `…"text"type into that
+pane` and `…ADAPTERlaunch a new pane`. C34 then made the key column keymap-derived,
+so an enumerated family reaches 23 and `Alt+← / Alt+↓ / Alt+j …move focus (…)`
+joined them. None of these is a *clipping* failure — the row fits — which is
+why every width test passed over all three.
+
+**Rule:** a key column always ends in at least one space. Pad to the
+18-column grid when the key fits it, otherwise exactly one space. Rows under
+18 render byte-identically to before; only the ones that were unreadable move.
+Pinned by `a_key_column_never_fuses_to_its_description`, which asserts the
+*separator*, not the width — width was never what broke.
+
+**And the column it costs had to come from somewhere.** `HELP_COL_FLOOR` — the
+ceiling `elide_key` cuts against — read `80` from the start and was three
+columns too loose: `help_layout` asks for `content + 3` (two borders plus the
+column of air before the right one), so a column of 78 is a dialog of 81,
+clamped to the terminal with the air going first. It never bit only because
+the widest content the table could produce was exactly 77, the ceiling the
+constant should have named. Adding a column took it to 78 and, at 80×24 with
+`alt+h` disabled, `… move focus (…at an edge)` sat flush against the border.
+The constant is now **derived** — `HELP_FLOOR_COLS − HELP_DIALOG_CHROME` = 77
+— because the derivation is the part that was wrong, and `help_layout` uses
+the same `HELP_DIALOG_CHROME` rather than a bare `+ 3`.
+
+Both floor tests were rewritten in the same pass, because neither could have
+caught this: they asserted `layout.size.0 <= 80`, and `size.0` is
+`.min(body.width)`, so at an 80-column body it reports 80 whether the layout
+fit or was clamped down to it. **A tautology that reads like a gate is worse
+than no gate** — it makes the check look done. They now assert the *ask*
+(`content + HELP_DIALOG_CHROME`) against the floor.
+
+Found by the design audit of the padding fix, which measured the rendered row
+rather than trusting the arithmetic; the padding bug itself was found by a
+simulation agent stressing the design floor. Neither found the other's half.
+
 ### C30 — Sub-two-row floor notice — [Added 2026-08-06]
 
 **Current:** `render.rs:24–29` (`draw_too_small`) — when `area.height < 2`,
@@ -1779,33 +1823,6 @@ chrome.
   and `every_chrome_word_is_drawn_in_ink_the_user_already_reads` audit it.
   A 0-height area test is implicitly covered by the `if area.height == 0`
   guard at `:92`.
-
-**[Amended 2026-08-20, floor stress — the key column must end in a space]**
-`draw_help_columns` draws a row as **two adjacent spans**, the key prefix
-and the description, with nothing between them: all the separation there is
-comes from the prefix's own padding. That padding was `format!(" {key:<18}")`
-— a *minimum* width, not a column. A key 18 cells or wider gets padded by
-nothing, and the description fuses straight onto it.
-
-It was already visible on the **default keymap**, in the group this
-contract's own PR #42 amendment added: `roost send <id> "text"` is 22 cells,
-and the row rendered `roost send <id> "text"type into that pane`. C34 then
-made the key column keymap-derived, so an enumerated family reaches 24 and
-`Alt+← / Alt+↓ / Alt+j …move focus (…)` joined it. Neither is a clipping
-failure — the 80-column floor holds in both cases — which is why the floor
-tests never saw it: the row *fits*, it just isn't readable.
-
-**Rule:** a key column always ends in at least one space. Pad to the
-18-column grid when the key fits it, otherwise exactly one space. Rows under
-18 render byte-identically to before; only the ones that were unreadable
-move. `elide_key` and `help_content_width` both measure through
-`help_key_prefix`, so the extra column is inside the floor rather than
-smuggled past it. Pinned by `a_key_column_never_fuses_to_its_description`,
-which sweeps the same remaps the C34 audit measured — and asserts the
-*separator*, not the width, because width was never the thing that broke.
-
-Found by a simulation agent stressing the design floor, which is where the
-fusion is ugliest but not where it lives: it happens at every terminal size.
 
 ### C16 — Dead-pane overlay
 
@@ -2145,6 +2162,12 @@ frame to say so" — and these two never adopted it. Both axes are now floored
 at one cell. `centered_near` clamps the ask to the body, so the floor can
 never overflow a body smaller than the frame it asks for; a one-row dialog
 is its top border and title, which is enough to say *something opened*.
+
+Knowingly residual: at that size the hint bar still offers `↑↓ select` and
+`PgUp/Dn page` over an overlay with zero selectable rows. The floor's job is
+to prove the chord worked, not to make a two-row terminal a usable roster,
+and pruning the pairs would be C9's arithmetic rather than this one's — but
+it is the next thing to look at if the sub-eight-row case ever matters.
 Pinned by `the_fleet_overlays_always_have_a_frame_to_say_so_with` (geometry,
 every body size from 1×1 to 11×11) and `tests/small_terminal_overlays.rs` (a
 real roost at 40×8, 40×6, 40×5 and 40×4, looking for the overlay's title
@@ -4078,6 +4101,30 @@ not a benchmark suite.
   configurable keys for any of the above (zero-config stands).
 
 ---
+
+### Open: the picker's adapter column has two widths and neither widens
+**[Added 2026-08-20, floor-stress audit]**
+
+`render.rs` defines `ADAPTER_COL` **twice, with different values**: 23 in
+`picker_dialog_width` (documented as 3-char row prefix + longest id + longest
+status suffix + slack) and 16 in the draw path, where it is the pad the
+adapter cell is filled to. Neither derives from the other, and the drawn row
+can exceed the smaller one: `" 1 opencode not found"` is 21 cells, so `pad`
+saturates to 0 and the cwd column shifts right, out of alignment with every
+other row.
+
+Not a fusion — the cwd column opens with its own selection marker, so a cell
+of separation survives — and not reachable unless an adapter is missing from
+`PATH`, which is why it has never been seen. But it is the §4/§5 lockstep
+smell in miniature: two constants with one name, one sizing the dialog and
+one drawing inside it, free to disagree. The fix is to derive both from one
+number; the reason it is filed rather than done is that it belongs to C14's
+sizing contract, not to the help overlay's, and the two arrived in the same
+audit only by proximity.
+
+Found by the design-supervisor sweep for the `{:<N}` minimum-width mistake
+that produced the C15 amendment above — the class, not the instance, which is
+what that sweep was for.
 
 ### Open: the composer's `Exited` filter tier can never match
 **[Added 2026-08-20, simulation pass]**
