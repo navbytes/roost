@@ -210,7 +210,10 @@ fn merge_claude_hooks(settings_path: &Path, exe: &str) -> Option<String> {
     // would leak exactly what the original was locked down to protect.
     if let Some(raw) = &raw {
         let bak = settings_path.with_extension("json.bak");
-        if !bak.exists() && std::fs::write(&bak, raw).is_ok() {
+        // Durable, not just written: this snapshot is the entire recovery
+        // story for the merge below, and a copy that never reached the disk
+        // is worth nothing on exactly the crash it exists for.
+        if !bak.exists() && write_durable(&bak, raw.as_bytes()).is_ok() {
             if let Ok(meta) = std::fs::metadata(settings_path) {
                 let _ = std::fs::set_permissions(&bak, meta.permissions());
             }
@@ -333,20 +336,46 @@ fn shell_quote(s: &str) -> String {
 /// are copied over explicitly before the rename — otherwise an existing
 /// 0600 file (settings.json can hold `env`/`apiKeyHelper` secrets) would be
 /// silently downgraded to whatever the process umask produces.
+///
+/// And the bytes are fsynced before the rename, for the reason
+/// `infra::store::FsStore::save` spells out for `workspace.json`: without a
+/// real durability barrier the rename can reach the disk before the data
+/// does, so a power cut or kernel panic leaves the target truncated or
+/// zero-length. That file is `~/.claude/settings.json` — the user's own
+/// config, hooks, `env` and `apiKeyHelper`, which roost is a guest in — so
+/// the outcome is worse here than it was for roost's own state. The
+/// directory's own fsync stays best-effort on the same reasoning as there:
+/// losing it means the *previous* contents come back, which is intact.
 fn write_atomic(target: &Path, contents: &str) -> Option<()> {
     let real = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let mut tmp = real.as_os_str().to_os_string();
     tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, contents).ok()?;
+    write_durable(&tmp, contents.as_bytes()).ok()?;
     if let Ok(meta) = std::fs::metadata(&real) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
     let renamed = std::fs::rename(&tmp, &real);
     if renamed.is_err() {
         let _ = std::fs::remove_file(&tmp); // don't litter a pid-tagged tmp file behind on failure
+        return None;
     }
-    renamed.ok()
+    if let Some(dir) = real.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Some(())
+}
+
+/// Write `bytes` to `path` and fsync them. **Not** `Write::flush`, which on
+/// a `std::fs::File` is a no-op that reads like a durability barrier and is
+/// not one — the same trap `infra::store` documents.
+fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 #[cfg(test)]
