@@ -166,6 +166,39 @@ mod tests {
     /// one land in both, `tab_of` answers with whichever tab comes first,
     /// and closing either takes the other with it. The same holds for an id
     /// repeated inside a single tab.
+    /// C6: a one-member stack must not survive a load.
+    ///
+    /// `remove_pane` collapses a stack that *shrinks* to one member, but a
+    /// `workspace.json` can hold one outright — and so can a stack whose
+    /// other members were duplicate ids the repair pass stripped. Either way
+    /// the renderer gets a `StackHeader { n: 1 }`: a header row reading
+    /// "STACK · 1 PANES", stolen from the only pane it describes.
+    #[test]
+    fn a_one_member_stack_does_not_survive_a_load() {
+        for (what, json) in [
+            (
+                "written that way",
+                r#"{"version":1,"active_tab":0,"tabs":[
+                    {"name":"main","layout":{"stack":{"children":[1],"expanded":0}},
+                     "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}}]}"#,
+            ),
+            (
+                "left that way by the duplicate-id repair",
+                r#"{"version":1,"active_tab":0,"tabs":[
+                    {"name":"main","layout":{"stack":{"children":[1,1,1],"expanded":0}},
+                     "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}}]}"#,
+            ),
+        ] {
+            let mut ws: Workspace = serde_json::from_str(json).expect("parses");
+            ws.validate_and_repair();
+            assert!(
+                matches!(ws.tabs[0].layout, LayoutNode::Pane(1)),
+                "{what}: a stack of one reached the renderer: {:?}",
+                ws.tabs[0].layout,
+            );
+        }
+    }
+
     #[test]
     fn a_repaired_workspace_never_has_one_id_in_two_places() {
         let json = r#"{"version":1,"active_tab":0,"tabs":[

@@ -187,6 +187,20 @@ pub fn dedupe_pane_ids(node: &mut LayoutNode, seen: &mut HashSet<PaneId>) -> boo
             *node = child;
         }
     }
+    // ...and the same normalization `remove_pane` does, for the same reason.
+    // `remove_pane` covers a stack that *shrank* to one member; this covers
+    // the two ways one can arrive already that size — a `workspace.json`
+    // holding `{"stack":{"children":[1]}}` outright, and a stack whose other
+    // members were all duplicates stripped by the loop above. Both reach the
+    // renderer as a `StackHeader { n: 1 }`, which reads "STACK · 1 PANES"
+    // and steals the row from the only member it describes. Found by the C6
+    // design audit (D2), which checked reachability rather than taking the
+    // `remove_pane` fix's word for it.
+    if let LayoutNode::Stack { children, .. } = node {
+        if children.len() == 1 {
+            *node = LayoutNode::Pane(children[0]);
+        }
+    }
     empty
 }
 

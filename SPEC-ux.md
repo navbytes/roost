@@ -295,7 +295,11 @@ pseudo-states — leads the tab bar's right status segment,
 shared with the existing segment via the new `mouse::status_fit`, which also
 gives the area one extra yield rung: the cwd drops before the mode word (C2
 amended 2026-07-27), and `tab_at_x` is fed the same fitted width so tab
-hitboxes stay in lockstep with what's drawn.
+hitboxes stay in lockstep with what's drawn. **[Amended 2026-08-20 — the
+ordering inverts on a failed save: `save failed ✕` outranks the mode word and
+then the tab strip itself, which scrolls under U7 rather than let the
+indicator be dropped. ZOOM/RAW/COPY can be rediscovered by pressing a key;
+"not reaching disk" cannot. See C2's dated amendment in DESIGN-ui.md.]**
 
 ## P2 — polish
 

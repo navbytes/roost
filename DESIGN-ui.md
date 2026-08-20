@@ -75,6 +75,18 @@ since it names no chord). `main.rs` also now requests a deliberate subset of
 crossterm's mouse-capture modes (C29's own bullet); that is a startup-cost
 change, not a chrome one, and touches no contract's rendered output.
 
+**Amendment 2026-08-20 (reliability audit, second pass):** **C10** now paints
+a flash over the body's last row when the hint bar is not drawn. The flash
+had been a child of the hint bar, so hiding hints (`Alt+/`) or a terminal
+under 3 rows silenced every C10 message — refusals, copy results, the
+workspace-set-aside notice, and U22's confirm-arm prompts, which armed a
+destructive second press while saying nothing. Same text, same `attention()`
+styling, same single row, same function; no new glyph and no new colour. C6
+gains a clarification that a stack's `n` is always ≥ 2 (a stack of one is
+normalized to a `Pane`), so `"STACK · 1 PANES"` is unreachable rather than
+merely ungrammatical. Both found by the design-supervisor pass on the C2
+amendment below.
+
 **Amendment 2026-08-20 (reliability audit):** **C2**'s yield ladder is
 amended so that `save failed ✕` outranks tab *names* — the failure was
 previously dropped whole by "tabs win", which on an ordinary terminal with a
@@ -392,7 +404,14 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
   always among the ones kept, so what is spent is other tabs' names,
   temporarily and visibly. One floor: if even the active tab could not be
   drawn beside the indicator, the indicator is dropped after all — a tab bar
-  with no tabs is not a trade worth making, and the flash has already fired.
+  with no tabs is not a trade worth making, and C10's flash has already
+  fired. **[Corrected 2026-08-20, same audit: that last clause was not yet
+  true when it was written.]** The flash was drawn only inside the hint bar,
+  so with hints hidden — `Alt+/`, or a terminal under 3 rows, and the narrow
+  terminal is exactly where this floor fires — neither signal reached the
+  user. C10 is amended in the same change to paint a flash over the body's
+  last row when the hint bar is not drawn, which is what makes the fallback
+  real rather than nominal.
   `mouse::effective_status_width` takes `save_ok` and `active` for exactly
   this; `status_fit` grows one failed-save-only rung.
 - Mouse unit tests (`mouse.rs:250–260`) are rewritten to the new offsets **in
@@ -437,7 +456,11 @@ Consequences for this contract's width math, all shared by
 - Overflow gains one rung *inside* the status area, **ahead** of the existing
   drop: full → `{MODE} · {save}` (the cwd yields first: the word is safety,
   the cwd is context you can also read off the pane) → no status area at all.
-  Tabs still win outright over whatever is left.
+  Tabs still win outright over whatever is left. **[Superseded 2026-08-20
+  for a failed save only — see this contract's dated amendment below: the
+  save indicator gains a further rung beneath the mode word and then the
+  *strip* yields to it, so "tabs win outright" now holds for a healthy save
+  and nothing else.]**
 - The wider area takes its columns from the tab hitboxes exactly as it takes
   them from the drawn tabs — `tab_at_x` is fed the fitted width, so clicks
   and pixels stay in lockstep (§4/§5).
@@ -854,6 +877,18 @@ nothing announces "this region is a stack".
   shrunken expanded rect automatically.
 - Content: left `" STACK · {n} PANES"`, right `"ALT+↑↓ "` (right-aligned) —
   uppercase, fg `DIM`, no bg.
+  **[Clarified 2026-08-20, reliability audit.]** `n` is always ≥ 2: a stack
+  is a way of sharing one region between several panes, so a stack of one is
+  not a stack, and `layout.rs` normalizes it into a plain `Pane` wherever one
+  can arise — `remove_pane` for a stack that shrinks to one, `dedupe_pane_ids`
+  (reached from `Workspace::validate_and_repair`) for a `workspace.json` that
+  holds one outright or is left with one after duplicate ids are stripped.
+  So no singular label is contracted, and none is needed: `"STACK · 1 PANES"`
+  is unreachable rather than merely ungrammatical. This was not always true —
+  before the normalization, `toggle_stack` on a one-member stack also built a
+  `Split` with a single child, a shape the module states it never constructs.
+  The header a one-member stack drew was the visible half of that bug: a row
+  borrowed from the only pane it described.
 - Every cell of the header row (both texts and the fill between) carries
   `Modifier::UNDERLINED` — the cell-level translation of the mockup's 1px
   bottom rule.
@@ -1217,6 +1252,25 @@ worth checking (a missing native helper is the common half of "both channels
 lost"), and shortening the code to match the spec would have deleted
 information. Short-form `copy failed` mentions elsewhere in this doc refer
 to this full string.
+
+**[Amended 2026-08-20, reliability audit — a flash is not a hint.]** The
+flash was drawn only by `draw_hint_bar`, so it appeared only when the hint
+bar did. `hints_shown()` is false both when the user pressed `Alt+/` and when
+the terminal is under 3 rows — and in that state *every* C10 message reached
+nobody: all 38 of them, including C38's refusals ("no room to split"), U14's
+copy result, the startup notice that a `workspace.json` was set aside, and
+U22's confirm-arm prompts, so `Alt+w` armed a destructive second press —
+"last pane — Alt+w again to quit roost" — while showing nothing at all. That
+is precisely the hazard C2's 2026-07-27 amendment names for the mode word:
+a safety affordance made conditional on an unrelated toggle.
+
+With the hint bar not drawn and at least two rows of terminal, the flash now
+paints over the **body's last row** instead. Painted over, not by shrinking
+the body: the geometry the panes were laid out and PTY-resized to must not
+change for two seconds and back, and the row repaints itself from the pane
+beneath the moment the flash expires. Text, styling (`attention()`), timing
+and precedence are all unchanged — both paths call the same `draw_flash`, so
+they cannot drift. Modals still paint after it (C22 stacking order).
 
 **[Amended 2026-07-27, SPEC-ux U22]:** "timing unchanged" is superseded for
 confirm-arm prompts only: a flash that arms a destructive second-press

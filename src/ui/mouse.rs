@@ -206,9 +206,15 @@ pub fn effective_status_width(
     if save_ok {
         return 0;
     }
-    // Plus one column for the left `…` the strip needs once it scrolls.
+    // Plus the column the left `…` costs — but only when the strip can
+    // actually scroll. `tab_scroll_start` cannot move past tab 0, so an
+    // active tab of 0 always draws at `x0 = 0` with no leading marker;
+    // charging for one there dropped the indicator while the active tab
+    // still fit exactly (`["main","api"]`, a 28-column bar: 28-14 = 14, tab
+    // 0 needs 14). Found by the C2 design audit.
     let active_w = names.get(active).map(|n| tab_width(active, n)).unwrap_or(0);
-    if bar_width.saturating_sub(status_width) >= active_w.saturating_add(1) {
+    let marker = u16::from(active > 0);
+    if bar_width.saturating_sub(status_width) >= active_w.saturating_add(marker) {
         status_width
     } else {
         0
@@ -1065,6 +1071,37 @@ mod tests {
         assert!(
             (strip.start..strip.end).contains(&active),
             "the active tab was scrolled off to make room: {strip:?}",
+        );
+    }
+
+    /// The floor is exactly "the active tab does not fit", not one column
+    /// tighter. `tab_scroll_start` never scrolls past tab 0, so with tab 0
+    /// active there is no leading `…` to pay for — charging for one anyway
+    /// dropped the indicator while the tab still fit exactly. (C2 design
+    /// audit, D1.)
+    #[test]
+    fn the_floor_does_not_charge_for_a_marker_that_is_never_drawn() {
+        let names: Vec<String> = ["main", "api"].iter().map(|s| s.to_string()).collect();
+        let fail_w = status_width(None, None, false);
+        let tab0 = tab_width(0, "main");
+        let bar = fail_w + tab0; // room for the indicator and tab 0, exactly
+
+        assert_eq!(
+            effective_status_width(&names, bar, fail_w, false, 0),
+            fail_w,
+            "tab 0 fits beside the indicator; nothing is scrolled off, so no `…` is drawn",
+        );
+        let strip = tab_strip(&names, bar, fail_w, false, 0);
+        assert!(!strip.left_marker, "no leading marker with tab 0 active: {strip:?}");
+        assert!((strip.start..strip.end).contains(&0), "tab 0 is drawn: {strip:?}");
+
+        // With a later tab active the strip really does scroll, and the
+        // marker really is drawn — so it must still be paid for.
+        let tab1 = tab_width(1, "api");
+        assert_eq!(
+            effective_status_width(&names, fail_w + tab1, fail_w, false, 1),
+            0,
+            "tab 1 needs its leading `…` column too, and there is no room for it",
         );
     }
 

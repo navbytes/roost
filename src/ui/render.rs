@@ -77,6 +77,27 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
     if app.hints_shown() {
         let hint_bar = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
         draw_hint_bar(f, app, hint_bar);
+    } else if area.height >= 2 {
+        // **[C10, 2026-08-20]** A flash is not a hint, and must not be
+        // hostage to whether hints are shown. `hints_shown()` is false both
+        // when the user pressed Alt+/ and when the terminal is under 3 rows
+        // — and in that state every C10 message reached nobody: all 38 of
+        // them, including C38's refusals ("no room to split"), U14's copy
+        // result, the startup notice that a workspace.json was set aside,
+        // and — worst — U22's confirm-arm prompts, so `Alt+w` armed a
+        // destructive second press while showing no "again to close" at
+        // all. Exactly the hazard C2's own dated amendment names for the
+        // mode word: a safety affordance made conditional on an unrelated
+        // toggle.
+        //
+        // Painted OVER the body's last row rather than by shrinking the
+        // body: the geometry the panes were laid out and PTY-resized to must
+        // not change for two seconds and back, and the row repaints itself
+        // from the pane beneath the moment the flash expires. Nothing new is
+        // drawn — same text, same `attention()` styling, same single row as
+        // the hint-bar path, because it is literally the same function.
+        let last = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+        draw_flash(f, app, last);
     }
 
     // Anchor floating dialogs near the focused pane rather than dead-center
@@ -419,15 +440,22 @@ fn fit_hint_pairs<K: AsRef<str>>(hints: &[(K, &'static str)], right_w: u16, widt
     hints.len()
 }
 
+/// C10: paint the flash into `area`, or report that there was none.
+///
+/// One function for both the places a flash can land — the hint bar when it
+/// is drawn, and the body's last row when it is not — so the two can never
+/// disagree about a flash's text or styling.
+fn draw_flash<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
+    let Some(msg) = app.flash() else { return false };
+    f.render_widget(Paragraph::new(format!(" {msg} ")).style(theme::attention()), area);
+    true
+}
+
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // Flash wins the bar over the alt-warning: a transient action result
     // (e.g. "copied") takes over the bar briefly rather than being swallowed
     // by a persistent problem bar for its entire window.
-    if let Some(msg) = app.flash() {
-        f.render_widget(
-            Paragraph::new(format!(" {msg} ")).style(theme::attention()),
-            area,
-        );
+    if draw_flash(f, app, area) {
         return;
     }
 
@@ -6231,6 +6259,58 @@ row's — widen ADAPTER_COL",
             vec!["日", " ", "本", " ", " ", " ", " ", " ", " ", " "],
         );
     }
+
+    /// C10 (2026-08-20): a flash is not a hint. It must reach the user
+    /// whether or not the hint bar is drawn.
+    ///
+    /// With hints hidden every C10 message reached nobody — C38's refusals,
+    /// U14's copy result, the workspace-set-aside notice, and worst of all
+    /// U22's confirm-arm prompts: `Alt+w` armed a destructive second press
+    /// and said nothing at all. Same hazard C2's dated amendment names for
+    /// the mode word, one contract over.
+    #[test]
+    fn a_flash_reaches_the_user_with_the_hint_bar_hidden() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let last_row = |app: &mut App<crate::ports::fakes::FakePane>| -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..100).filter_map(|x| buf.cell((x, 29)).map(|c| c.symbol().to_string())).collect()
+        };
+
+        // One pane, so U22's sharpest case: Alt+w arms "last pane — press
+        // again to QUIT ROOST". With hints hidden this armed silently, and
+        // the second press took the whole session with it.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        assert!(!app.hints_shown(), "setup: the hint bar is hidden");
+
+        app.apply(Action::ClosePane);
+        let flash = app.flash().expect("setup: Alt+w armed a confirm prompt").to_string();
+        assert!(flash.contains("quit"), "setup: the prompt warns about quitting: {flash}");
+        assert!(!app.quit, "setup: the first press only arms");
+
+        let row = last_row(&mut app);
+        assert!(
+            row.contains("last pane"),
+            "the confirm prompt never reached the screen: {row:?} (wanted {flash:?})",
+        );
+
+        // ...and it is the flash doing that, not a permanent band of chrome
+        // over the pane: same app, same hidden hint bar, nothing flashing.
+        let mut quiet = mk_app(Size::new(100, 30));
+        quiet.apply(Action::ToggleHints);
+        assert!(quiet.flash().is_none(), "setup: nothing is flashing");
+        let after = last_row(&mut quiet);
+        assert!(
+            !after.contains("last pane"),
+            "the body's last row is chrome even with no flash: {after:?}",
+        );
+    }
+
 }
 
 
