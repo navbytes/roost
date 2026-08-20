@@ -393,8 +393,24 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // mirror only writes on a real change.
     let mut host_cursor_shape: Option<u8> = None;
 
-    let loop_result: Result<()> = (|| {
+    // A panic must not orphan the fleet. Every pane is `setsid`'d into its
+    // own session, so nothing roost spawned dies with roost — and a panic
+    // unwinds straight past the `app.shutdown()` below, leaving every agent
+    // running detached with no terminal attached to it. That is the same
+    // outcome `infra::signals` was added to prevent for SIGHUP/SIGTERM,
+    // reached by a bug instead of a signal (and `tests/vt100_panics.rs`
+    // records one that a pane could trigger by printing an emoji). Catch it
+    // here so the teardown still runs, then re-raise unchanged: the hook
+    // installed above has already restored the terminal and printed the
+    // message, and `resume_unwind` does not run it twice.
+    let panic_at = infra::test_panic_after().map(|d| Instant::now() + d);
+    let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
     loop {
+        // Test hatch only (`infra::test_panic_after`): `panic_at` is `None`
+        // on every real run, so this is one `Option` compare per frame.
+        if panic_at.is_some_and(|deadline| Instant::now() >= deadline) {
+            panic!("ROOST_TEST_PANIC_AFTER_MS: deliberate panic, gating fleet teardown");
+        }
         terminal.draw(|f| ui::render::draw(f, &mut app))?;
 
         // Drain ALL pending terminal events this tick, not just one. During a
@@ -585,16 +601,23 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         }
     }
     Ok(())
-    })();
+    }));
 
-    // Always run shutdown — even if the loop bailed with an error via `?` — so
-    // agents are killed/reaped and the workspace saved, never left orphaned.
-    app.shutdown();
+    // Always tear the fleet down — whether the loop returned, bailed with an
+    // error via `?`, or panicked — so agents are killed and reaped, never
+    // left orphaned. Only the ordinary paths save: see `App::kill_fleet`.
+    match &loop_result {
+        Ok(_) => app.shutdown(),
+        Err(_) => app.kill_fleet(),
+    }
     if let Some(p) = &sock_cleanup {
         infra::sock::cleanup(p);
     }
     let _ = std::fs::remove_file(&control_token_path);
-    loop_result
+    match loop_result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// The host window's pixel geometry (width, height) via the winsize ioctl —
