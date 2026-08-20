@@ -62,15 +62,37 @@ impl Row {
     pub fn truncate(&mut self, len: u16) {
         self.cells.truncate(usize::from(len));
         self.wrapped = false;
-        let last_cell = &mut self.cells[usize::from(len) - 1];
-        if last_cell.is_wide() {
-            last_cell.clear(*last_cell.attrs());
-        }
+        self.repair_last_wide();
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::cell::Cell) {
         self.cells.resize(usize::from(len), cell);
         self.wrapped = false;
+        self.repair_last_wide();
+    }
+
+    /// roost hardening: a wide cell keeps its other half in the next column,
+    /// so a shrink that leaves the base in the new *last* column leaves a
+    /// half-glyph whose continuation no longer exists. `Screen::text` reads
+    /// that continuation back through `.unwrap()` whenever it draws over
+    /// such a cell, so the next character written there panicked the parser
+    /// — and a panic on the event loop unwinds past `App::shutdown`, taking
+    /// roost down and leaving every agent running.
+    ///
+    /// `truncate` already did this repair and `resize` did not, which is the
+    /// whole bug: `Grid::resize_to` narrows its rows through `resize`. Any
+    /// pane that does not reflow — the alternate screen, or an app holding a
+    /// scroll region — kept the literal truncation, so `"se中"` at three
+    /// columns plus one more keystroke was enough.
+    ///
+    /// Truncating the half-glyph is exactly what the shrink already did to
+    /// its other half.
+    fn repair_last_wide(&mut self) {
+        if let Some(last) = self.cells.last_mut() {
+            if last.is_wide() {
+                last.clear(*last.attrs());
+            }
+        }
     }
 
     pub fn wrap(&mut self, wrap: bool) {
