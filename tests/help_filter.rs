@@ -49,17 +49,35 @@ fn slash_narrows_the_keymap_and_the_title_says_so() {
     // A real narrowing: a group with no matching row is gone entirely.
     assert!(!after.contains("READING THE SCREEN"), "the query removed groups:\n{after}");
 
-    // Esc clears, a second Esc closes — and the overlay is really gone.
+    // Esc clears, a second Esc closes.
+    //
+    // The wait between them is load-bearing, and getting it wrong is what
+    // made this test fail on macOS and pass on Linux. It first waited for
+    // the screen to contain `"/ "` — which `Alt+/` and this very row's
+    // "`/` filters it" already put there, so the predicate was true before
+    // the first Esc was even parsed. `wait_for` returned instantly and the
+    // second ESC byte went out on the heels of the first; two ESCs arriving
+    // together fuse into one event (roost's README documents the same
+    // fusion for ESC+key), so only one Esc landed: the query cleared and
+    // the overlay stayed open.
+    //
+    // Wait for the *transition* instead — the query leaving the title — so
+    // the first Esc is provably handled before the second is sent.
     h.write_bytes(b"\x1b");
     assert!(
-        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("/ ")).is_some()
-            || h.screen().contents().contains("HELP"),
-        "the first Esc kept the overlay open:\n{}",
+        h.wait_for(Duration::from_secs(10), |s| !s.contents().contains("/stack")).is_some(),
+        "the first Esc did not clear the query:\n{}",
         h.screen().contents(),
     );
+    assert!(
+        h.screen().contents().contains("HELP"),
+        "...and it must clear the query without closing the overlay:\n{}",
+        h.screen().contents(),
+    );
+
     h.write_bytes(b"\x1b");
     assert!(
-        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("NORMAL")).is_some(),
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("NORMAL")).is_some(),
         "the second Esc did not close the overlay:\n{}",
         h.screen().contents(),
     );

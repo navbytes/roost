@@ -5140,12 +5140,12 @@ recording because the report proposed it as the cheap alternative:
   anything before building it.
 
 ### On gates that pass by construction
-**[Added 2026-08-20, after the seventh instance]**
+**[Added 2026-08-20, after the eighth instance]**
 
-Seven assertions on this branch turned out to prove nothing, six of them
+Eight assertions on this branch turned out to prove nothing, six of them
 the same shape — **a test asserting a bound on a value already clamped to
-that bound** — and the seventh its generalisation: a comparison whose right
-side is satisfied by construction. Recorded here because the count is the argument — each one was
+that bound** — and two their generalisation: a comparison whose right side
+is satisfied by construction. Recorded here because the count is the argument — each one was
 found by a design audit or a deliberate sweep, never by CI, and each made a
 check look done when it was not.
 
@@ -5169,6 +5169,16 @@ The instances, so the shape is recognisable:
    every letter a–z already appears. Only `↵` was load-bearing, by accident.
    Not a clamp this time but the same family: **a comparison whose right
    side is satisfied by construction.** Now matched against the key columns.
+8. `tests/help_filter.rs`'s Esc sequence — and the one that bit rather than
+   merely lying. Between the two Esc presses it waited for the screen to
+   contain `"/ "`, which `Alt+/` and the `Alt+?` row's own "`/` filters it"
+   already put there: the predicate was true before the first Esc was
+   parsed, so `wait_for` returned instantly and the second ESC byte went
+   out on the heels of the first. Two ESCs arriving together fuse into one
+   event, so only one Esc landed — the query cleared, the overlay stayed
+   open, **and CI went red on macOS while passing on Linux**. Now waits for
+   the *transition* (the query leaving the title), which the preceding
+   assertion has already proved starts false.
 6. `roster_window_follows_the_cursor_and_clamps` — `top + height <=
    rows.len()` asserted after `roster_view`, which had just applied
    `roster_top_clamped` (`top.min(len - height)`). The assertion restated
@@ -5192,6 +5202,13 @@ Three rules follow, and they are cheap:
   rewrite of (5) asserted placement and *still* passed with the clamp
   deleted, because a dialog centred on the whole body is inside it either
   way. Only the mutation showed that; the assertion looked meaningful.
+- **A `wait_for` predicate is an assertion too, and a vacuous one races.**
+  (8) is the only entry here that failed rather than lied, and it is the
+  cheapest to prevent: a predicate that is already true when the wait
+  begins does not synchronise anything, so whatever the test does next
+  runs against unsettled state. Wait for a **transition** the preceding
+  step has proved starts false, never for a condition that merely holds
+  afterwards.
 - **Pick a *representative* mutant.** (7)'s gate matched single-character
   keys with `contains` over the whole overlay text, where every letter a–z
   already appears; the mutation that "proved" it used an uppercase `Q`,
