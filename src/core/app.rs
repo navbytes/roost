@@ -11800,7 +11800,18 @@ mod tests {
         match node {
             LayoutNode::Pane(_) => {}
             LayoutNode::Stack { children, expanded } => {
-                assert!(!children.is_empty(), "{ctx}: tab {tab} has an empty Stack node");
+                // >= 2, not merely non-empty (C6, clarified 2026-08-20): a
+                // stack of one is a pane, and `layout.rs` normalizes it into
+                // one wherever it can arise. The weaker assertion let the
+                // one-member stack that `toggle_stack` turns into a
+                // single-child `Split` walk right past this checker — the
+                // design audit had to find it by reading. Nothing guards a
+                // future construction path unless this does.
+                assert!(
+                    children.len() >= 2,
+                    "{ctx}: tab {tab} has a Stack with {} member(s) — a stack of one is a pane",
+                    children.len()
+                );
                 assert!(
                     *expanded < children.len(),
                     "{ctx}: tab {tab} stack expanded={expanded} out of range ({} members)",

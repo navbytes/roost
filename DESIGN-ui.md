@@ -1265,7 +1265,23 @@ is precisely the hazard C2's 2026-07-27 amendment names for the mode word:
 a safety affordance made conditional on an unrelated toggle.
 
 With the hint bar not drawn and at least two rows of terminal, the flash now
-paints over the **body's last row** instead. Painted over, not by shrinking
+paints over the **body's last row** instead — clearing that row first. The
+clear is load-bearing, not tidiness: `attention()` is `REVERSED` and nothing
+else (§2 — a flash inverts the user's own pair rather than assuming a
+background roost does not own), and ratatui *patches* styles, so with no fg
+of its own the message takes the fg of whatever cells it lands on. On the
+hint bar those are empty. Over the body they carry the pane border drawn
+moments earlier in the same frame, and the message came out reversed in the
+border's colour: `RULE` under an unfocused pane (structure colour carrying
+text, banned by §2) and, under a focused one, `ACCENT` reversed —
+bit-identical to `attention_problem()`, so "copied 12 chars" rendered as
+C11/C16's reserved problem treatment. The cells past the message kept their
+border glyphs, reversed, leaving a ragged band. Clearing the row first makes
+both paths land on empty cells, which is what actually makes "same function,
+so they cannot drift" true of *styling* and not only of text and timing.
+The §2 chrome fixtures gained a hints-hidden flash in the same change: they
+had never exercised this surface, which is why every gate passed while it
+was wrong. Painted over, not by shrinking
 the body: the geometry the panes were laid out and PTY-resized to must not
 change for two seconds and back, and the row repaints itself from the pane
 beneath the moment the flash expires. Text, styling (`attention()`), timing
@@ -2411,8 +2427,21 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   Worked example (audit fixture): 80×24 terminal → body 80×22 → float 48×13,
   centered. Recomputed on resize.
 - **Stacking order (topmost last), contracted:** tiled panes → zoomed view
-  (C21) → **float** → C12 modal overlays (rename/picker/help/feed). The
-  float never dims the workspace — it is a pane, not a modal.
+  (C21) → **float** → C10's body-row flash, when it is drawn there → C12
+  modal overlays (rename/picker/help/feed). The float never dims the
+  workspace — it is a pane, not a modal.
+  **[Amended 2026-08-20 — the flash's place named.]** C10's fallback (a
+  flash painted over the body's last row when the hint bar is not drawn)
+  had no place in this list, and two of its consequences were therefore
+  uncontracted rather than chosen. Both are now: it paints **above the
+  float**, so a float whose bottom border reaches the body's last row has
+  that one row overpainted for the flash's two seconds — right, because a
+  refusal or a confirm-arm prompt is about the whole session and the float
+  is one pane; and it paints **below modals** and inside `body`, so it is
+  dimmed by C12's backdrop along with everything else behind an open modal
+  — also right, since a modal owns the frame while it is up. Neither costs
+  the float or the modal any input: the flash is chrome with no hitbox
+  (`hit_test` reads `display_rects`, which the flash does not touch).
 - **Border/badge:** rendered exactly as a pane: `ACCENT` focused border
   whenever shown (it is focused whenever shown — next bullet), corner badge
   through the normal titled path → `scratch · shell {glyph}`. No new glyphs,

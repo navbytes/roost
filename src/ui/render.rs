@@ -445,8 +445,25 @@ fn fit_hint_pairs<K: AsRef<str>>(hints: &[(K, &'static str)], right_w: u16, widt
 /// One function for both the places a flash can land — the hint bar when it
 /// is drawn, and the body's last row when it is not — so the two can never
 /// disagree about a flash's text or styling.
+///
+/// The `Clear` is what makes that true, and it is not decoration.
+/// `theme::attention()` is REVERSED and nothing else — deliberately, so the
+/// flash inverts the user's own fg/bg pair instead of assuming a background
+/// roost does not own (§2). Ratatui *patches* styles rather than replacing
+/// them, so with no fg of its own the message takes the fg of whatever cells
+/// it lands on. On the hint bar those cells are empty and the result is the
+/// intended `Reset` + reverse. Over the body's last row they carry the pane
+/// border drawn moments earlier in the same frame, and the message came out
+/// reversed in the *border's* colour: `RULE` (structure colour carrying
+/// text, banned by §2) under an unfocused pane, and under a focused one
+/// `ACCENT` reversed — bit-identical to `attention_problem()`, so "copied 12
+/// chars" rendered as C11/C16's reserved problem treatment. The cells past
+/// the message kept their border glyphs, reversed, leaving a ragged band.
+/// Found by the design-supervisor pass on this very change; the fixture that
+/// would have caught it mechanically is added alongside.
 fn draw_flash<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
     let Some(msg) = app.flash() else { return false };
+    f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(format!(" {msg} ")).style(theme::attention()), area);
     true
 }
@@ -4997,6 +5014,16 @@ row's — widen ADAPTER_COL",
         let mut app = three_panes();
         app.set_flash("copied 12 chars");
         out.push(("flash", snap(&mut app)));
+
+        // The *other* place a flash lands (C10, amended 2026-08-20): with
+        // the hint bar hidden it paints over the body's last row. This
+        // fixture is the point — the gates below never saw that surface, so
+        // a flash inheriting the pane border's colour passed every one of
+        // them. It does not pass them now.
+        let mut app = three_panes();
+        app.apply(Action::ToggleHints);
+        app.set_flash("copied 12 chars");
+        out.push(("flash, hint bar hidden", snap(&mut app)));
 
         let mut app = three_panes();
         // F1's evidence: a swallowed Option chord (Option+n -> '˜' with no
