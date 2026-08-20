@@ -125,6 +125,58 @@ pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
     empty
 }
 
+/// Strip any pane leaf whose id has already been seen, keeping the FIRST
+/// occurrence, pruning whatever that empties. Returns true if `node` itself
+/// is now empty and its parent should drop it — same contract as
+/// `remove_pane`, which this deliberately mirrors rather than reusing:
+/// `remove_pane` removes *every* occurrence of an id, which for a repeated
+/// id would delete the pane instead of the duplicate.
+///
+/// `seen` is threaded across every tab by `Workspace::validate_and_repair`,
+/// so it catches an id repeated inside one tree and an id shared between two
+/// tabs with the same pass. A pane id keys `runtimes` globally: one id in
+/// two positions means both drive a single PTY.
+pub fn dedupe_pane_ids(node: &mut LayoutNode, seen: &mut HashSet<PaneId>) -> bool {
+    let empty = match node {
+        LayoutNode::Pane(id) => !seen.insert(*id),
+        LayoutNode::Stack { children, expanded } => {
+            children.retain(|id| seen.insert(*id));
+            if !children.is_empty() && *expanded >= children.len() {
+                *expanded = children.len() - 1;
+            }
+            children.is_empty()
+        }
+        LayoutNode::Split { children, ratios, .. } => {
+            let mut i = 0;
+            while i < children.len() {
+                if dedupe_pane_ids(&mut children[i], seen) {
+                    children.remove(i);
+                    if i < ratios.len() {
+                        ratios.remove(i);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let sum: f32 = ratios.iter().sum();
+            if sum > 0.0 {
+                for r in ratios.iter_mut() {
+                    *r /= sum;
+                }
+            }
+            children.is_empty()
+        }
+    };
+    let collapse = matches!(node, LayoutNode::Split { children, .. } if children.len() == 1);
+    if collapse {
+        if let LayoutNode::Split { children, .. } = node {
+            let child = children.remove(0);
+            *node = child;
+        }
+    }
+    empty
+}
+
 /// Alt+s: if `target` is in a stack, explode the stack back into an even
 /// split; otherwise collapse the innermost split that directly contains
 /// `target` into a stack of all its leaf panes (with `target` expanded).

@@ -281,7 +281,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
     // Wire production adapters to the core's ports.
     let store = FsStore::default();
-    let ws = store.load()?.unwrap_or_else(|| {
+    // `load_reporting`, not `load`: a workspace.json that could not be read
+    // is set aside and startup continues with a fresh one — the right call
+    // (the whole tool is that file, so it must not brick launch), but the
+    // user must be told, or their fleet looks like it evaporated. Surfaced
+    // alongside the config diagnostics below.
+    let (loaded, workspace_diagnostic) = store.load_reporting()?;
+    let ws = loaded.unwrap_or_else(|| {
         core::workspace::Workspace::default_in(
             std::env::current_dir().unwrap_or_else(|_| "/".into()),
         )
@@ -351,6 +357,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         app.set_flash(msg);
     }
     if let Some(msg) = sock_err {
+        app.set_flash(msg);
+    }
+    // Last, so it wins the one flash slot: a lost workspace outranks a
+    // skipped key binding. It also goes to the feed, where it survives the
+    // flash timing out.
+    if let Some(msg) = workspace_diagnostic {
+        app.note_config_issue(msg.clone());
         app.set_flash(msg);
     }
 

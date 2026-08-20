@@ -107,6 +107,17 @@ impl Workspace {
     /// minimal shell spec so it renders and spawns instead of being a blank
     /// hole. A well-formed workspace is unchanged. Also clamps `active_tab`.
     pub fn validate_and_repair(&mut self) {
+        // A pane id keys `runtimes` globally, so one id in two positions —
+        // repeated inside a tree, or shared between two tabs — means both
+        // draw and type through a single PTY, `tab_of` answers with
+        // whichever tab comes first, and closing either takes the other with
+        // it. Keep the first occurrence, drop the rest; the per-tab
+        // reconciliation below then drops the orphaned specs, and an emptied
+        // tab goes with the `retain` further down.
+        let mut seen: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+        for tab in &mut self.tabs {
+            crate::core::layout::dedupe_pane_ids(&mut tab.layout, &mut seen);
+        }
         for tab in &mut self.tabs {
             let mut ids = Vec::new();
             crate::core::layout::pane_order(&tab.layout, &mut ids);
@@ -144,6 +155,51 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pane id must name exactly one pane. `workspace.json` is a plain
+    /// file the user can edit (and the format roost's own repair pass exists
+    /// to survive), but the repair reconciled each tab's `panes` map against
+    /// its own layout only — it never asked whether an id appeared twice.
+    ///
+    /// One id in two trees means one entry in `runtimes`, so both positions
+    /// drive a single PTY: the pane draws in two places, keystrokes aimed at
+    /// one land in both, `tab_of` answers with whichever tab comes first,
+    /// and closing either takes the other with it. The same holds for an id
+    /// repeated inside a single tab.
+    #[test]
+    fn a_repaired_workspace_never_has_one_id_in_two_places() {
+        let json = r#"{"version":1,"active_tab":0,"tabs":[
+            {"name":"main","layout":{"split":{"dir":"vertical","ratios":[0.5,0.5],
+             "children":[{"pane":1},{"pane":1}]}},
+             "panes":{"1":{"adapter":"shell","cwd":"/tmp"}}},
+            {"name":"api","layout":{"split":{"dir":"vertical","ratios":[0.5,0.5],
+             "children":[{"pane":1},{"pane":2}]}},
+             "panes":{"1":{"adapter":"shell","cwd":"/tmp"},
+                      "2":{"adapter":"shell","cwd":"/tmp"}}}]}"#;
+        let mut ws: Workspace = serde_json::from_str(json).expect("parses");
+        ws.validate_and_repair();
+
+        let mut all = Vec::new();
+        for tab in &ws.tabs {
+            let mut ids = Vec::new();
+            crate::core::layout::pane_order(&tab.layout, &mut ids);
+            for id in &ids {
+                assert!(
+                    tab.panes.contains_key(id),
+                    "tab {} has {id} in its layout with no spec",
+                    tab.name,
+                );
+            }
+            all.extend(ids);
+        }
+        let mut uniq = all.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(all.len(), uniq.len(), "one id names two panes: {all:?}");
+        // The duplicate is dropped, not the pane: the first occurrence and
+        // every distinct id survive.
+        assert!(all.contains(&1) && all.contains(&2), "repair lost a real pane: {all:?}");
+    }
 
     #[test]
     fn default_has_one_shell_pane() {
