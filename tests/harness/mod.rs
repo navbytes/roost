@@ -297,6 +297,22 @@ impl Harness {
         &self.state_dir
     }
 
+    /// Wait for roost to exit on its own — no keystroke, no signal. The
+    /// seam a scenario needs when what ends the process is roost itself
+    /// (`tests/panic_shutdown.rs`), rather than a quit the harness sent.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Quit roost the way a user would and wait for it to exit. Returns the
     /// elapsed time on a clean exit; force-kills the process and returns
     /// `None` if it's still alive after `timeout` (the historical

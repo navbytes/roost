@@ -6471,6 +6471,21 @@ impl<B: PaneBackend> App<B> {
     /// Clean shutdown: save workspace, kill children (their sessions live on).
     pub fn shutdown(&mut self) {
         self.save();
+        self.kill_fleet();
+    }
+
+    /// The teardown half of `shutdown`, without the save.
+    ///
+    /// Split out for the panic path (`main.rs`'s `run`): a panic unwinds
+    /// straight *past* `shutdown`, and roost dying while every agent keeps
+    /// running detached is the exact failure `tests/signal_shutdown.rs`
+    /// exists to prevent — reached by a bug instead of a signal.
+    ///
+    /// The save is deliberately not part of it. A panic can have left the
+    /// workspace mid-mutation, and roost writes on every mutating action, so
+    /// the copy on disk is at most one action old: writing again is all
+    /// downside.
+    pub fn kill_fleet(&mut self) {
         // Graceful stop: SIGHUP everything (agents flush their final turn like
         // a closed terminal would allow), a short grace window, then the
         // guaranteed SIGKILL + reap for anything that ignored the hangup.

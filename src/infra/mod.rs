@@ -24,6 +24,21 @@ pub(crate) fn host_io_disabled() -> bool {
     std::env::var_os("ROOST_TEST_NO_HOST_IO").is_some_and(|v| v != "0")
 }
 
+/// Test hatch, same family and same reasoning as `ROOST_TEST_NO_HOST_IO`
+/// above: panic the event loop this many milliseconds after it starts.
+///
+/// The property it gates cannot be reached any other way. "An unforeseen
+/// panic must still tear the fleet down" is only observable by causing one
+/// in the *real* binary, from the outside, with live panes and a
+/// backgrounded job to count afterwards — and the whole point is that no
+/// input reaches it deliberately (`tests/vt100_panics.rs` exists to keep it
+/// that way). Read once, before the loop; unset — every real run — costs
+/// one env lookup at startup and nothing else.
+pub(crate) fn test_panic_after() -> Option<std::time::Duration> {
+    let raw = std::env::var("ROOST_TEST_PANIC_AFTER_MS").ok()?;
+    raw.parse().ok().map(std::time::Duration::from_millis)
+}
+
 pub mod clipboard;
 pub mod config;
 pub mod extension;
