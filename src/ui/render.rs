@@ -2745,10 +2745,19 @@ fn blit_screen(f: &mut Frame, screen: &vt100::Screen, inner: Rect) {
     let buf = f.buffer_mut();
     for row in 0..inner.height.min(rows) {
         for col in 0..visible_cols {
-            let Some(cell) = screen.cell(row, col) else { continue };
             let x = inner.x + col;
             let y = inner.y + row;
             let Some(out) = buf.cell_mut((x, y)) else { continue };
+            // No cell means blank, and it has to be *painted* blank: the
+            // buffer is not cleared between frames, so skipping the write
+            // would leave whatever the last frame drew there. Reachable
+            // since banked scrollback rows are trimmed to their contents
+            // (`Row::shrink_to_contents`) — every column past a short
+            // history line answers `None` here.
+            let Some(cell) = screen.cell(row, col) else {
+                out.reset();
+                continue;
+            };
             if cell.is_wide_continuation() {
                 // Owned by the glyph on its left. Left at the buffer's reset
                 // default — exactly what ratatui's own wide-grapheme layout

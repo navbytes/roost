@@ -130,6 +130,48 @@ impl Row {
         &self.cells[..end]
     }
 
+    /// roost: shed the untouched tail of a row on its way into history.
+    ///
+    /// A live row is exactly `cols` cells wide because every draw indexes it
+    /// by column. A **banked** row is never written to again — the
+    /// scrollback is read-only from the moment `Grid` pushes into it — so
+    /// the cells past its last visible one are pure padding, and at 36 bytes
+    /// a `Cell` that padding is most of the memory roost holds. A
+    /// 200-column pane was paying 7.2 KB for every line of history
+    /// regardless of its length: 34 MB per pane once the 5,000-row
+    /// scrollback filled, measured, and it scales with the window's width.
+    ///
+    /// "Last visible" is the last cell with contents **or** with non-default
+    /// attributes. `ESC[K` erases to end of line *with the current attrs*,
+    /// so an app painting a coloured bar leaves a run of cells that hold no
+    /// character and are still real output; trimming on contents alone would
+    /// drop that colour from history the moment the line scrolled off. A
+    /// line whose tail was never touched has default attrs there and trims
+    /// exactly as if the rule were `content_cells`'.
+    ///
+    /// It cannot cut a wide glyph in half either: a continuation cell
+    /// carries the continuation bit in `len`, so `has_contents` is true for
+    /// it and the trim stops after it, not between the halves.
+    ///
+    /// Readers must treat a column past the end as blank. `Row::get` already
+    /// answers `None` there, which is what `extract_selection` and
+    /// `write_contents` already do the right thing with; the pane blit is
+    /// the one place that had to learn it.
+    pub fn shrink_to_contents(&mut self) {
+        let default = crate::attrs::Attrs::default();
+        let end = self
+            .cells
+            .iter()
+            .rposition(|c| c.has_contents() || *c.attrs() != default)
+            .map_or(0, |i| i + 1);
+        if end < self.cells.len() {
+            // `to_vec` rather than `truncate`: truncating keeps the original
+            // capacity, so nothing is actually freed. This reallocates at
+            // the exact length, which is the entire point.
+            self.cells = self.cells[..end].to_vec();
+        }
+    }
+
     /// roost (SPEC-parity P5): does this row hold nothing at all? A rewrap
     /// that has to shed rows sheds these — from below the cursor — before it
     /// banks anything into history.
