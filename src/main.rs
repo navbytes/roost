@@ -93,12 +93,13 @@ fn main() -> Result<()> {
         }
     };
 
+    let mut terminal = ratatui::init();
     // Restore the terminal on panic — otherwise a crash (even one deep in a
     // dependency) leaves the user in raw mode / the alternate screen with
-    // mouse capture on, i.e. a wrecked terminal. Do this before init.
+    // mouse capture on, i.e. a wrecked terminal. Deliberately *after*
+    // `ratatui::init()`, which installs a restoring hook of its own — see
+    // `install_panic_hook`.
     install_panic_hook();
-
-    let mut terminal = ratatui::init();
     // Without mouse capture the hosting terminal consumes wheel events and
     // scrolls its own buffer — content *outside* the TUI. Capture them.
     // C29: a deliberate subset of crossterm's blanket `EnableMouseCapture` —
@@ -227,9 +228,40 @@ fn acquire_instance_lock() -> std::result::Result<std::fs::File, String> {
     Ok(file)
 }
 
+/// Hand the terminal back on a panic — but only from the thread that owns it.
+///
+/// roost runs real work on several other threads: a reader and a writer per
+/// pane, the socket's accept loop and a thread per connection (which parse
+/// untrusted input from panes), the notification reapers. **None of those
+/// panicking ends the process**, so restoring the terminal there leaves the
+/// alternate screen and raw mode off while the event loop carries on drawing
+/// into the user's shell scrollback — keystrokes line-buffered, Alt+q no
+/// longer reaching roost. The hook's whole job is "put the terminal back on
+/// the way out", and a background thread is not on the way out.
+///
+/// Installed **after** `ratatui::init()`, which is load-bearing: `init`
+/// installs a hook of its own that calls `ratatui::restore()` and then
+/// chains, on any thread. Installed first, roost's hook would sit *inside*
+/// that one and could not stop it — measured, a background-thread panic
+/// emitted `ESC[?1049l` and dropped raw mode with roost still running and
+/// still painting. Being outermost is what makes the decision roost's.
 fn install_panic_hook() {
-    let original = std::panic::take_hook();
+    // Whatever is installed right now: ratatui's restoring hook, with the
+    // default beneath it.
+    let restoring = std::panic::take_hook();
+    // `take_hook` always leaves the *default* hook behind, so taking it a
+    // second time yields a plain "print the panic" with no terminal side
+    // effects at all — exactly what a thread that is not on the way out
+    // should get.
+    let plain = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != ui_thread {
+            // Still report it — a dead reader thread or a wedged connection
+            // is worth a line on stderr — just don't touch the terminal.
+            plain(info);
+            return;
+        }
         // Pop keyboard enhancement unconditionally: if none was pushed the
         // terminal ignores it, and leaving it set would wedge the user's shell
         // into the kitty protocol after a crash.
@@ -251,8 +283,10 @@ fn install_panic_hook() {
         // P6: and the window title roost took over, so a crash doesn't
         // strand the user's tab named after a pane that no longer exists.
         reset_host_title();
+        // Belt and braces: `restoring` is ratatui's own hook and already
+        // does this, but roost's contract here should not depend on that.
         ratatui::restore();
-        original(info);
+        restoring(info);
     }));
 }
 
@@ -404,6 +438,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // installed above has already restored the terminal and printed the
     // message, and `resume_unwind` does not run it twice.
     let panic_at = infra::test_panic_after().map(|d| Instant::now() + d);
+    // Test hatch only (`infra::test_panic_thread_after`): the background-
+    // thread half of the same contract — the hook must leave the terminal
+    // alone, and roost must carry on.
+    if let Some(delay) = infra::test_panic_thread_after() {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            panic!("ROOST_TEST_PANIC_THREAD_AFTER_MS: deliberate background-thread panic");
+        });
+    }
     let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
     loop {
         // Test hatch only (`infra::test_panic_after`): `panic_at` is `None`
