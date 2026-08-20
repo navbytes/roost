@@ -117,13 +117,12 @@ fn a_panic_on_a_background_thread_leaves_the_terminal_alone() {
             return;
         }
     };
-    // Wait for a painted frame, not just for `settle` — two agreeing reads
-    // of a screen nothing has been written to yet also "settle".
-    assert!(
-        h.wait_for(Duration::from_secs(10), |s| s.alternate_screen()).is_some(),
-        "setup: roost never entered the alternate screen"
-    );
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+    // Not a tautology: `settle` now waits for roost to have emitted
+    // something before agreeing, which is exactly what makes this readable
+    // straight afterwards. It was written as a `wait_for` loop first,
+    // because `settle` used to return before the first frame.
+    assert!(h.screen().alternate_screen(), "setup: roost draws in the alternate screen");
 
     // Wait out the hatch, plus room for the hook to have done damage.
     std::thread::sleep(Duration::from_millis(4000));
