@@ -233,12 +233,7 @@ impl Grid {
         let banked = rows.len().saturating_sub(want);
         if banked > 0 {
             for row in rows.drain(..banked) {
-                if self.scrollback_len > 0 {
-                    self.scrollback.push_back(row);
-                }
-            }
-            while self.scrollback.len() > self.scrollback_len {
-                self.scrollback.pop_front();
+                self.bank(row);
             }
             if self.scrollback_offset > 0 {
                 // A scrolled-back view stays pinned on the rows it was
@@ -491,16 +486,31 @@ impl Grid {
         }
     }
 
+    /// roost: push one row into history, trimmed and capped.
+    ///
+    /// The single door into the scrollback, so the trim can never be
+    /// forgotten on one of the two paths that bank rows (ordinary scrolling
+    /// here, and the rewrap in `resize_to`). See
+    /// `Row::shrink_to_contents` for what the trim is and why a banked row
+    /// can afford it.
+    fn bank(&mut self, mut row: crate::row::Row) {
+        if self.scrollback_len == 0 {
+            return;
+        }
+        row.shrink_to_contents();
+        self.scrollback.push_back(row);
+        while self.scrollback.len() > self.scrollback_len {
+            self.scrollback.pop_front();
+        }
+    }
+
     pub fn scroll_up(&mut self, count: u16) {
         for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
             if self.scrollback_len > 0 && !self.scroll_region_active() {
-                self.scrollback.push_back(removed);
-                while self.scrollback.len() > self.scrollback_len {
-                    self.scrollback.pop_front();
-                }
+                self.bank(removed);
                 if self.scrollback_offset > 0 {
                     self.scrollback_offset =
                         self.scrollback.len().min(self.scrollback_offset + 1);
