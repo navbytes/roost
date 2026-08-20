@@ -122,6 +122,85 @@ pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
             *node = child;
         }
     }
+    // A stack of one is a pane. Splits have always collapsed at one child;
+    // stacks did not, and the leftover `Stack { children: [x] }` was not just
+    // cosmetic chrome ("STACK · 1 PANES", a header row stolen from the only
+    // member). `toggle_stack` explodes a stack into an even split of its
+    // members, so Alt+s on a stack of one built a `Split` with a single
+    // child — a shape the rest of this module states it never constructs and
+    // does not handle. Close panes out of a stack until one is left, press
+    // Alt+s, and the tree is illegal. Collapse here, where stacks shrink.
+    if let LayoutNode::Stack { children, .. } = node {
+        if children.len() == 1 {
+            *node = LayoutNode::Pane(children[0]);
+        }
+    }
+    empty
+}
+
+/// Strip any pane leaf whose id has already been seen, keeping the FIRST
+/// occurrence, pruning whatever that empties. Returns true if `node` itself
+/// is now empty and its parent should drop it — same contract as
+/// `remove_pane`, which this deliberately mirrors rather than reusing:
+/// `remove_pane` removes *every* occurrence of an id, which for a repeated
+/// id would delete the pane instead of the duplicate.
+///
+/// `seen` is threaded across every tab by `Workspace::validate_and_repair`,
+/// so it catches an id repeated inside one tree and an id shared between two
+/// tabs with the same pass. A pane id keys `runtimes` globally: one id in
+/// two positions means both drive a single PTY.
+pub fn dedupe_pane_ids(node: &mut LayoutNode, seen: &mut HashSet<PaneId>) -> bool {
+    let empty = match node {
+        LayoutNode::Pane(id) => !seen.insert(*id),
+        LayoutNode::Stack { children, expanded } => {
+            children.retain(|id| seen.insert(*id));
+            if !children.is_empty() && *expanded >= children.len() {
+                *expanded = children.len() - 1;
+            }
+            children.is_empty()
+        }
+        LayoutNode::Split { children, ratios, .. } => {
+            let mut i = 0;
+            while i < children.len() {
+                if dedupe_pane_ids(&mut children[i], seen) {
+                    children.remove(i);
+                    if i < ratios.len() {
+                        ratios.remove(i);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let sum: f32 = ratios.iter().sum();
+            if sum > 0.0 {
+                for r in ratios.iter_mut() {
+                    *r /= sum;
+                }
+            }
+            children.is_empty()
+        }
+    };
+    let collapse = matches!(node, LayoutNode::Split { children, .. } if children.len() == 1);
+    if collapse {
+        if let LayoutNode::Split { children, .. } = node {
+            let child = children.remove(0);
+            *node = child;
+        }
+    }
+    // ...and the same normalization `remove_pane` does, for the same reason.
+    // `remove_pane` covers a stack that *shrank* to one member; this covers
+    // the two ways one can arrive already that size — a `workspace.json`
+    // holding `{"stack":{"children":[1]}}` outright, and a stack whose other
+    // members were all duplicates stripped by the loop above. Both reach the
+    // renderer as a `StackHeader { n: 1 }`, which reads "STACK · 1 PANES"
+    // and steals the row from the only member it describes. Found by the C6
+    // design audit (D2), which checked reachability rather than taking the
+    // `remove_pane` fix's word for it.
+    if let LayoutNode::Stack { children, .. } = node {
+        if children.len() == 1 {
+            *node = LayoutNode::Pane(children[0]);
+        }
+    }
     empty
 }
 
@@ -469,12 +548,29 @@ pub fn compute_rects_and_headers(
             };
             let mut offset = 0u16;
             let n = children.len();
+            // Running sum of the ratios consumed so far — see the size
+            // computation below for why the boundaries must be cumulative.
+            let mut acc = 0.0f32;
             for (i, child) in children.iter().enumerate() {
                 let ratio = ratios.get(i).copied().unwrap_or(1.0 / n as f32);
+                // Size from the **cumulative** ratio, not each ratio rounded
+                // on its own. Independent rounding accumulates: sixteen equal
+                // children of a 58-row body each rounded to 4 leaves the last
+                // one 58 - 15*4 = -2 → 0, and a zero-area subtree returns
+                // early from this walk, so that pane gets no rect, no PTY
+                // resize and no pixels. It vanishes off-screen while its
+                // process keeps running — reachable by exploding a stack of
+                // 16 with Alt+s.
+                //
+                // Cumulative boundaries make each child the *difference*
+                // between two rounded edges, so the parts always sum to the
+                // whole and the error per child stays under one cell.
+                acc += ratio;
                 let size = if i == n - 1 {
                     total.saturating_sub(offset)
                 } else {
-                    ((total as f32 * ratio).round() as u16).min(total.saturating_sub(offset))
+                    let edge = ((total as f32 * acc).round() as u16).min(total);
+                    edge.saturating_sub(offset)
                 };
                 let rect = match dir {
                     SplitDir::Vertical => Rect::new(area.x + offset, area.y, size, area.height),
@@ -633,6 +729,48 @@ pub fn arrangement_fits(node: &LayoutNode, area: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// Every pane in a split gets a rect. None may be rounded out of
+    /// existence.
+    ///
+    /// Each child used to be sized `round(total * ratio)` **independently**,
+    /// so rounding-up accumulated across the split and the last child was
+    /// handed whatever was left — which for an even split of many children
+    /// is nothing. A zero-area subtree returns early from
+    /// `compute_rects_and_headers`, so that pane gets no rect, no PTY
+    /// resize and no pixels: it vanishes off-screen while its process keeps
+    /// running.
+    ///
+    /// Reachable by exploding a large stack (`Alt+s` on a stack of 16).
+    #[test]
+    fn no_child_of_a_split_is_rounded_out_of_existence() {
+        for n in 2..=32usize {
+            let ids: Vec<PaneId> = (1..=n as PaneId).collect();
+            let node = LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![1.0 / n as f32; n],
+                children: ids.iter().map(|id| LayoutNode::Pane(*id)).collect(),
+            };
+            // A body that cannot divide evenly by `n` is the whole point.
+            let area = Rect::new(0, 0, 200, 58);
+            let mut out = Vec::new();
+            compute_rects(&node, area, &mut out);
+            let drawn: Vec<PaneId> = out.iter().map(|pr| pr.id).collect();
+            assert_eq!(
+                drawn.len(),
+                n,
+                "{n} panes in a {}x{} split, only {} got a rect: heights {:?}",
+                area.width,
+                area.height,
+                drawn.len(),
+                out.iter().map(|pr| pr.rect.height).collect::<Vec<_>>(),
+            );
+            // ...and they must tile the area exactly, with no gap or overlap.
+            let covered: u16 = out.iter().map(|pr| pr.rect.height).sum();
+            assert_eq!(covered, area.height, "{n} panes do not tile the body exactly");
+        }
+    }
 
     fn tree() -> LayoutNode {
         LayoutNode::Split {
@@ -864,6 +1002,28 @@ mod tests {
         assert_eq!(expanded.rect.height, 17); // 20 − 1 header − 2 collapsed
         let total: u16 = out.iter().map(|p| p.rect.height).sum::<u16>() + headers[0].rect.height;
         assert_eq!(total, 20);
+    }
+
+    /// A stack of one is a pane, and must become one — a `Split` never
+    /// carries a single child, and `toggle_stack` on a one-member stack
+    /// would build exactly that.
+    #[test]
+    fn a_stack_shrunk_to_one_member_stops_being_a_stack() {
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        remove_pane(&mut node, 3);
+        remove_pane(&mut node, 2);
+        assert!(
+            matches!(node, LayoutNode::Pane(1)),
+            "a stack of one is a pane, not {node:?}",
+        );
+
+        // ...and the illegal shape it used to make: Alt+s on that stack.
+        let mut stack = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        remove_pane(&mut stack, 2);
+        toggle_stack(&mut stack, 1);
+        if let LayoutNode::Split { children, .. } = &stack {
+            panic!("Alt+s built a Split with {} child(ren): {stack:?}", children.len());
+        }
     }
 
     #[test]

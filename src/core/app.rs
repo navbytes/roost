@@ -23,6 +23,34 @@ use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Slack subtracted from a promoted pane's "last seen as a shell" bound.
+///
+/// `observe_panes` reads the process tree on a `DETECT_INTERVAL` tick, so
+/// its view can lag the truth by up to one tick: an agent that started at T
+/// may still be observed as a shell a moment later, and its session file —
+/// written at T — would then fall just outside a strict bound and never be
+/// found. A few seconds of slack absorbs that while still excluding
+/// everything a previous run left behind, which is the whole point.
+const PROMOTION_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the filesystem fallback keeps looking for a pane's session file
+/// before giving up.
+///
+/// `pending_detect` was previously only cleared on success or when the pane
+/// vanished, so a pane whose agent never wrote a file roost could attribute
+/// stayed pending for the life of the process — and since no adapter
+/// overrides `detect_session`, each tick meant a full recursive walk of the
+/// whole session root (`~/.pi/agent/sessions`: every project, all history)
+/// stat-ing every file, twice a minute, forever.
+///
+/// A minute is far longer than any agent takes to create its session file,
+/// so giving up costs nothing real — and when it is wrong the failure is
+/// the safe one: the pane simply starts fresh next launch instead of
+/// resuming. The exact channel (the agent-side extension, design doc §6.1)
+/// does not go through `pending_detect` at all and keeps working after
+/// this expires.
+const DETECT_GIVE_UP: Duration = Duration::from_secs(60);
+
 /// F1: how long the "Alt keys aren't reaching roost" hint stays up after its
 /// most recent evidence (`App::alt_swallow_at`) — not since launch.
 /// `is_alt_swallow_char`'s evidence is real but not unambiguous (every
@@ -308,6 +336,19 @@ const UNDO_DEPTH: usize = 20;
 /// on. Left well below that pool size so plenty always stay free.
 const MAX_WAITS: usize = 16;
 
+/// Parked `wait`s any single principal may hold at once.
+///
+/// The global cap alone let one caller take every slot: waiters are freed
+/// only by firing or timing out, so sixteen fire-and-forget waits with long
+/// timeouts denied the verb fleet-wide for up to 24 hours. A per-actor
+/// share means a pane can only ever starve itself.
+const MAX_WAITS_PER_ACTOR: usize = 4;
+
+/// Panes one `wait` may name. `poll_waiters` walks every id of every waiter
+/// on the UI thread each event-loop iteration, and the list arrives
+/// unbounded from the socket — see `register_waiter`.
+const MAX_WAIT_PANES: usize = 64;
+
 /// C20: activity-feed ring buffer capacity — oldest evicted first.
 const FEED_CAP: usize = 200;
 
@@ -432,6 +473,16 @@ pub struct App<B: PaneBackend> {
     host_pixels: (u16, u16),
     /// Freshly launched agent panes we still owe a session id.
     pending_detect: HashMap<PaneId, SystemTime>,
+    /// When each pane was last observed running **no** agent — a plain
+    /// shell. The lower bound for a *promoted* pane's session detection.
+    ///
+    /// A pane promoted by the user typing `pi` at a shell prompt cannot own
+    /// a session file older than the last moment it was still a shell, so
+    /// this is the honest window. It used to be `SystemTime::UNIX_EPOCH` —
+    /// no bound at all — which let the scan claim the newest *unclaimed*
+    /// file in the project whenever it was written, i.e. a conversation
+    /// from days ago. See `PROMOTION_GRACE`.
+    last_shell_seen: HashMap<PaneId, SystemTime>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
     /// `$HOME`, resolved once at startup — `focused_cwd()`'s `~`-abbreviation
@@ -672,6 +723,7 @@ impl<B: PaneBackend> App<B> {
             term_size,
             host_pixels,
             pending_detect: HashMap::new(),
+            last_shell_seen: HashMap::new(),
             last_detect: Instant::now(),
             sock_path,
             home: dirs::home_dir(),
@@ -762,8 +814,38 @@ impl<B: PaneBackend> App<B> {
         self.keymap = keymap;
     }
 
+    /// Persist the workspace, and **say so out loud the moment it starts
+    /// failing**.
+    ///
+    /// The failure used to reach exactly one surface: the tab bar's
+    /// right-aligned `saved ✓` / `save failed ✗` indicator. C2's yield
+    /// ladder drops that area *whole* when the tabs need the room, so on an
+    /// ordinary 80-column terminal with five tabs roost could fail every
+    /// single write — read-only state dir, full disk, wrong ownership — and
+    /// show nothing at all, until the user relaunched into a fleet hours
+    /// stale. The error text was discarded by `.is_ok()` on the way, so
+    /// even the indicator could not say *why*.
+    ///
+    /// A C10 flash takes the whole hint bar and cannot be crowded out.
+    /// Raised on the **transition** into failure, not on every save: a
+    /// persistent failure fires on every action, and re-flashing each time
+    /// would bury whatever else the bar was saying and make roost unusable
+    /// exactly when the user needs to read it. The indicator remains the
+    /// standing signal; this is the one that cannot be missed.
     fn save(&mut self) {
-        self.last_save_ok = self.store.save(&self.ws).is_ok();
+        let result = self.store.save(&self.ws);
+        let ok = result.is_ok();
+        if self.last_save_ok && !ok {
+            // Innermost cause: the outer layers are `anyhow` context naming
+            // the path, which the flash has no room for and the user
+            // already knows. "Permission denied" is the actionable half.
+            let why = result
+                .err()
+                .map(|e| e.chain().last().map(|c| c.to_string()).unwrap_or_else(|| e.to_string()))
+                .unwrap_or_default();
+            self.set_flash(format!("workspace NOT saved — {why}"));
+        }
+        self.last_save_ok = ok;
     }
 
     /// The pane area: below the tab bar (row 0), above the hint bar (last
@@ -947,11 +1029,34 @@ impl<B: PaneBackend> App<B> {
     /// outside `ws.tabs` — `ws.next_pane_id()` alone would eventually let a
     /// split reuse its id. The one allocator every spawn path goes through.
     fn alloc_pane_id(&self) -> PaneId {
+        // `next_pane_id` scans **live tabs**. Two other places own ids that
+        // are not in a live tab, and both must be counted or the id gets
+        // handed out twice.
         let base = self.ws.next_pane_id();
-        match &self.float {
+        let base = match &self.float {
             Some(f) => base.max(f.id + 1),
             None => base,
-        }
+        };
+        // The undo stack. A parked `Closed::Tab` is re-inserted **verbatim,
+        // with its original pane ids** (`undo_close`), and `spawn_active_tab`
+        // then builds runtimes for them — so if one of those ids has since
+        // been reissued, reopening the tab silently clobbers the live pane's
+        // entry in `runtimes`, `tokens`, `dead`, `pending_input` and `raw`,
+        // all of which are keyed by `PaneId` across every tab. Two panes end
+        // up on one PTY and one auth token.
+        //
+        // `Closed::Pane` needs no such guard: it stores only a `PaneSpec`
+        // (which carries no id) and `restore_pane` allocates a fresh one.
+        let parked = self
+            .undo
+            .iter()
+            .filter_map(|c| match c {
+                Closed::Tab { tab, .. } => tab.panes.keys().max().map(|id| id + 1),
+                Closed::Pane { .. } => None,
+            })
+            .max()
+            .unwrap_or(0);
+        base.max(parked)
     }
 
     /// Is `id` the float's pane?
@@ -1239,13 +1344,57 @@ impl<B: PaneBackend> App<B> {
         // made this non-deterministic). Claiming newest-spawned-first mirrors
         // file-creation order, so each pane gets its own file.
         pending.sort_by(|a, b| b.1.cmp(&a.1));
-        for (id, since) in pending {
+        // Drop anything past the give-up horizon before scanning for it.
+        // Checked against the pane's own `since` rather than a separate
+        // clock so the window means the same thing here as it does in the
+        // scan: how long we have been looking for *this* pane's file.
+        let now = SystemTime::now();
+        self.pending_detect.retain(|_, since| {
+            now.duration_since(*since).map(|age| age < DETECT_GIVE_UP).unwrap_or(true)
+        });
+        pending.retain(|(id, _)| self.pending_detect.contains_key(id));
+        for (id, since) in pending.clone() {
             let Some((spec, adapter)) = self.find_spec(id).and_then(|s| {
                 self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a))
             }) else {
                 self.pending_detect.remove(&id);
                 continue;
             };
+            // Two panes in *different projects* whose adapter gives them the
+            // same session root cannot be told apart by this scan at all:
+            // the root carries no cwd signal (codex buckets rollouts by
+            // date, `~/.codex/sessions` for every project), so the only
+            // thing separating the candidates is mtime order, which says
+            // nothing about whose they are. Decline rather than guess.
+            //
+            // **A wrong session is far worse than no session.** Losing a
+            // resume pointer costs the user a `--continue`; attaching a
+            // pane to another project's conversation corrupts work in it.
+            // Declining leaves the pane pending, so the exact channel (the
+            // agent-side extension) can still report it, and the scan
+            // retries the moment the ambiguity clears.
+            //
+            // Same-cwd concurrency is *not* ambiguous in this sense and is
+            // deliberately still allowed: both panes really are in that
+            // project, and the newest-first ordering above mirrors file
+            // creation order so each takes its own.
+            let root = adapter.session_root(&spec.cwd);
+            let ambiguous = root.is_some()
+                && pending.iter().any(|(other, _)| {
+                    *other != id
+                        && self.find_spec(*other).is_some_and(|o| {
+                            o.adapter == spec.adapter
+                                && o.cwd != spec.cwd
+                                && self
+                                    .registry
+                                    .get(o.adapter.as_str())
+                                    .and_then(|a| a.session_root(&o.cwd))
+                                    == root
+                        })
+                });
+            if ambiguous {
+                continue;
+            }
             // Session ids already owned by other panes — never re-assign one
             // (concurrent same-cwd launches otherwise cross-wire onto it).
             let taken = session_resolver::claimed_sessions(&self.ws);
@@ -1308,10 +1457,11 @@ impl<B: PaneBackend> App<B> {
                 }
             }
         }
-        // Drop entries for panes that no longer have a runtime (closed) —
-        // ids are never reused, so without this the map would grow by one
-        // stale entry per pane ever spawned over a long session. F3's
-        // visited-set is pruned on the same cadence, same reason.
+        // Backstop for panes that lost their runtime without going through
+        // `close_pane_id` (a tab removed with its panes, a workspace
+        // reload). The close path prunes all three itself — it has to, since
+        // ids ARE recycled (C23) and this pass only runs every
+        // `DETECT_INTERVAL`.
         self.last_status.retain(|id, _| self.runtimes.contains_key(id));
         self.needy_msgs.retain(|id, _| self.runtimes.contains_key(id));
         self.visited_waiting.retain(|id| self.runtimes.contains_key(id));
@@ -1337,6 +1487,10 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
+        // Panes observed running no agent this tick — `last_shell_seen`
+        // (collected here and written after the loop, since `find_spec_mut`
+        // holds `self`).
+        let mut still_shell: Vec<PaneId> = Vec::new();
         // D5: adapter flips collected here and pushed into the runtimes'
         // title-signal gate after the loop (`find_spec_mut` holds `self`).
         let mut retitle: Vec<(PaneId, bool)> = Vec::new();
@@ -1358,6 +1512,13 @@ impl<B: PaneBackend> App<B> {
             // Reflect the running agent: promote a shell that's now running pi
             // to the pi adapter; demote back to shell when the agent exits.
             let want = o.agent.unwrap_or_else(|| "shell".to_string());
+            // Not gated on a *transition*: a pane sitting at a shell prompt
+            // for an hour must keep moving this bound forward, or the
+            // window it eventually gets on promotion would reach back to
+            // whenever it last changed state.
+            if want == "shell" {
+                still_shell.push(id);
+            }
             if spec.adapter != want {
                 let demoting = want == "shell";
                 spec.adapter = want;
@@ -1383,11 +1544,43 @@ impl<B: PaneBackend> App<B> {
                 rt.set_title_signal(enabled);
             }
         }
+        let now = SystemTime::now();
+        for id in still_shell {
+            self.last_shell_seen.insert(id, now);
+        }
         // A newly-recognized agent needs its already-created session file
-        // located; a wide window (epoch) plus the taken-set finds it without
-        // cross-wiring against other panes.
+        // located — it was written moments before roost noticed, so `now()`
+        // would miss it. The bound is **the last tick this pane was still a
+        // shell**, minus `PROMOTION_GRACE` for observation lag.
+        //
+        // This used to be `SystemTime::UNIX_EPOCH`, on the reasoning that a
+        // wide window "plus the taken-set finds it without cross-wiring".
+        // The taken-set does not carry that weight: `claimed_sessions` only
+        // knows ids stored on *live* panes, so a conversation from a closed
+        // pane or an earlier run is unclaimed and therefore eligible. With
+        // no lower bound the scan took the newest such file whenever it was
+        // written, `set_session` committed it, and the pane was dropped from
+        // `pending_detect` — so the mistake was permanent, and the next
+        // relaunch resumed a conversation from days ago. Reported as "it
+        // loads the wrong session"; pinned by
+        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`.
         for id in promoted {
-            self.pending_detect.entry(id).or_insert(SystemTime::UNIX_EPOCH);
+            let floor = self
+                .last_shell_seen
+                .get(&id)
+                .copied()
+                .unwrap_or(now)
+                .checked_sub(PROMOTION_GRACE)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            // `max`, not `or_insert`: the window may only ever **tighten**.
+            // A pane that promotes, finds nothing (so stays pending),
+            // demotes when the agent exits, then promotes again hours later
+            // would otherwise keep its first floor — by then old enough to
+            // reach conversations from earlier in the same session.
+            self.pending_detect
+                .entry(id)
+                .and_modify(|f| *f = (*f).max(floor))
+                .or_insert(floor);
         }
         for cwd in visited {
             self.note_cwd(cwd);
@@ -1847,11 +2040,35 @@ impl<B: PaneBackend> App<B> {
                 .send(Reply::ok(serde_json::json!({ "pane": id, "status": self.status_str(id) })));
             return Ok("immediate");
         }
+        // A wait over more panes than any fleet has is not a wait, it is a
+        // load generator. `poll_waiters` runs on the **UI thread** every
+        // event-loop iteration and does `is_float` + `find_spec` +
+        // `may_target` + `pane_matches` for every id of every waiter; the
+        // list was unbounded and un-deduplicated, and ~32 000 ids fit in one
+        // 64 KiB control line. Sixteen such waits measured a 4.5x hit to
+        // control round-trip latency (21ms -> 94ms) sustained for the wait's
+        // whole timeout — the frame budget blown every frame, from sixteen
+        // requests. Bounded well above any real fleet.
+        if panes.len() > MAX_WAIT_PANES {
+            let msg = "too many panes in one wait";
+            let _ = reply.send(Reply::err(msg));
+            return Err(msg.into());
+        }
         // Cap concurrently parked waiters well below the socket's global
         // connection limit: rejecting here closes the connection right away,
         // freeing its slot back to the pool instead of holding it for the
         // full timeout (see MAX_WAITS).
-        if self.waiters.len() >= MAX_WAITS {
+        //
+        // **Per principal as well as globally.** A parked waiter is only
+        // ever freed by firing or timing out — nothing notices that the
+        // client hung up — so sixteen fire-and-forget waits with long
+        // timeouts held every global slot for up to 24 hours while holding
+        // no connection and no process, denying the verb to the entire
+        // fleet. A pane can do that with its own `$ROOST_TOKEN`, which puts
+        // it squarely outside its authority. With a per-actor share the
+        // worst a pane can do is starve itself.
+        let mine = self.waiters.iter().filter(|w| w.actor == actor).count();
+        if self.waiters.len() >= MAX_WAITS || mine >= MAX_WAITS_PER_ACTOR {
             let msg = "too many concurrent waits";
             let _ = reply.send(Reply::err(msg));
             return Err(msg.into());
@@ -2024,8 +2241,19 @@ impl<B: PaneBackend> App<B> {
             Actor::Fleet | Actor::Local => None,
             Actor::Pane(a) => Some(a),
         };
+        // A control spawn must leave the human's view exactly as it found
+        // it — including the float. `spawn_child` focuses the pane it
+        // creates, and C22 rule 1 (enforced in `set_focus`) takes the float
+        // down when focus leaves it, so restoring `focused` alone put focus
+        // back on a float that was now hidden: a state the model does not
+        // have, and one `cycle_layout` then planted into the tab's layout
+        // tree as a pane with no spec. Save and restore both halves.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
+        let float_shown = self.float.as_ref().is_some_and(|f| f.shown);
         let id = self.spawn_child(adapter, cwd, owner);
+        if let Some(f) = &mut self.float {
+            f.shown = float_shown;
+        }
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
@@ -2261,7 +2489,18 @@ impl<B: PaneBackend> App<B> {
         // C21: closing the pane you're zoomed on ends the zoomed view —
         // there's nothing left to show full-screen. A control-plane close of
         // some *other* pane leaves an unrelated zoom alone.
-        if self.zoomed && id == self.focused {
+        //
+        // C22: the pane that is zoomed is not always the focused one. While
+        // the float is shown focus belongs to it — never to a tiled pane —
+        // so asking `id == self.focused` could not fire, and closing the
+        // pane actually being shown full-screen left `zoomed` set pointing
+        // at a pane that no longer exists. `display_rects` resolves the real
+        // target the same way; this must agree with it.
+        let zoom_target = match &self.float {
+            Some(f) if f.shown => f.prev_focus,
+            _ => self.focused,
+        };
+        if self.zoomed && id == zoom_target {
             self.exit_zoom();
         }
         let spec = self.ws.tabs[ti].panes.get(&id).cloned();
@@ -2290,6 +2529,17 @@ impl<B: PaneBackend> App<B> {
         // otherwise be inherited by an unrelated later pane that reuses
         // this id, silently switching it into raw mode.
         self.raw.remove(&id);
+        // Same reason again, for the three attention maps. These were pruned
+        // only by `diff_statuses` on the tick, under a comment asserting the
+        // opposite of the C23 note above — so for up to a `DETECT_INTERVAL`
+        // a pane taking this id inherited: F3's "you already looked at this"
+        // mark (silently absent from Alt+a though nobody ever saw it), a
+        // last status that makes its first observation read as a transition
+        // and prints a C20 feed line for a life it did not live, and the
+        // dead pane's pending question, attributed to it.
+        self.last_status.remove(&id);
+        self.needy_msgs.remove(&id);
+        self.visited_waiting.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         // U11: a closed pane is no longer anyone's focus memory — pane ids
@@ -2331,7 +2581,13 @@ impl<B: PaneBackend> App<B> {
         // routing keystrokes to a pane in a tab nobody's looking at. U11:
         // being moved onto a tab is a tab switch like any other, so honor
         // that tab's focus memory before falling back to its first pane.
-        if !self.ws.active_tab().panes.contains_key(&self.focused) {
+        // C22 rule 1 first: the float lives outside every tab's map by
+        // construction, so this test's answer for a focused float is always
+        // "not in this tab" — without the guard the fallback fired on every
+        // close while the float was up, pulling focus onto a tiled pane
+        // while the float stayed on screen, and the user's keystrokes went
+        // somewhere they could not see.
+        if !self.float_focused() && !self.ws.active_tab().panes.contains_key(&self.focused) {
             let active = self.ws.active_tab;
             let target = self
                 .tab_focus_target(active)
@@ -3637,7 +3893,14 @@ impl<B: PaneBackend> App<B> {
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
                 let first = self.pane_order().first().copied().unwrap_or(0);
                 self.set_focus(first);
-                self.restore_pane(spec);
+                if !self.restore_pane(spec.clone()) {
+                    // Refused for want of room. The close is NOT consumed:
+                    // put it back so the pane is still reopenable once the
+                    // user makes room, and say why nothing happened (C38).
+                    self.remember_closed(Closed::Pane { tab_index, spec });
+                    self.flash_no_room();
+                    return;
+                }
                 // U2: `restore_pane` allocated the pane's NEW id and left it
                 // focused — label with that id, not the closed one's.
                 let restored = self.focused;
@@ -3648,22 +3911,23 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// Insert `spec` as a new pane split off the focused pane, spawning it.
-    /// Shared by undo (reuses a saved spec, session and all).
-    fn restore_pane(&mut self, spec: PaneSpec) {
-        let id = self.alloc_pane_id();
+    /// Shared by undo (reuses a saved spec, session and all). Returns false
+    /// if the split was refused for want of room — nothing was mutated.
+    ///
+    /// C38: the fit test is `split_fit`, the same one `spawn_child` uses,
+    /// not a hand-rolled copy. This used to pick the axis from the rect's
+    /// aspect and then split unconditionally, so `Alt+u` would land a pane
+    /// in a slot `Alt+n` had just refused to open — under
+    /// `MIN_SPLIT_COLS`×`MIN_SPLIT_ROWS`, which is also the vt100 underflow
+    /// trigger, and it took the pane being split down there with it. Same
+    /// rect and the same keypress-level decision must give the same answer.
+    #[must_use]
+    fn restore_pane(&mut self, spec: PaneSpec) -> bool {
         let focused = self.focused;
-        let dir = self
-            .rects()
-            .iter()
-            .find(|pr| pr.id == focused)
-            .map(|pr| {
-                if pr.rect.width >= pr.rect.height * 3 {
-                    SplitDir::Vertical
-                } else {
-                    SplitDir::Horizontal
-                }
-            })
-            .unwrap_or(SplitDir::Vertical);
+        let target_rect =
+            self.rects().iter().find(|pr| pr.id == focused).map(|pr| pr.rect);
+        let Some(dir) = split_fit(target_rect) else { return false };
+        let id = self.alloc_pane_id();
         let tab = self.ws.active_tab_mut();
         tab.panes.insert(id, spec.clone());
         if !layout::split_pane(&mut tab.layout, focused, id, dir) {
@@ -3673,6 +3937,7 @@ impl<B: PaneBackend> App<B> {
         if let Some(pr) = self.rects().iter().find(|pr| pr.id == id).copied() {
             self.spawn_pane(id, &spec, pr.rect);
         }
+        true
     }
 
     /// P10: move roost's focus to `id`, telling the panes involved.
@@ -3699,6 +3964,20 @@ impl<B: PaneBackend> App<B> {
         // feature that moves focus.
         if old != id && self.pane_exists(old) {
             self.alternate = Some(old);
+        }
+        // C22 rule 1: a shown float IS the focused pane, so focus landing on
+        // anything else means the float is no longer up. Enforced here, in
+        // the single writer of `self.focused`, rather than at each door: the
+        // rule was previously re-applied per call site, and the ones that
+        // forgot (C35's Alt+`` `` "go back" among them) left the float drawn
+        // over the body with the user's keystrokes going to a tiled pane
+        // underneath it. `shown` is cleared directly rather than through
+        // `hide_float`, which would re-route focus the caller has already
+        // decided.
+        if old != id && self.float_focused() && !self.is_float(id) {
+            if let Some(f) = &mut self.float {
+                f.shown = false;
+            }
         }
         self.focused = id;
         // F3: landing focus on a pane that's currently in the ○ fallback
@@ -11117,6 +11396,1219 @@ mod tests {
         fn session_root(&self, cwd: &std::path::Path) -> Option<PathBuf> {
             Some(cwd.to_path_buf())
         }
+    }
+
+    /// A pane promoted to an agent must not claim a session from *before*
+    /// it was a shell.
+    ///
+    /// The reported workflow: open a shell pane, type `pi`. That is the
+    /// **promotion** path, and it seeds detection with `SystemTime::
+    /// UNIX_EPOCH` — no lower bound at all — so the scan takes the newest
+    /// unclaimed file in that cwd whenever it was written. Agent CLIs write
+    /// their session file *after* starting, so if the 2s tick lands in that
+    /// gap the newest unclaimed file is a **previous conversation**, and
+    /// `set_session` commits it and drops the pane from `pending_detect` —
+    /// permanently. The next quit/relaunch then resumes last week's
+    /// session, which is what "it loads the wrong session" looks like.
+    ///
+    /// The taken-set does not save this: `claimed_sessions` only knows ids
+    /// stored on live panes, so any conversation from a closed pane or an
+    /// earlier run is eligible.
+    #[test]
+    fn a_promoted_pane_never_claims_a_session_older_than_its_shell() {
+        let dir = std::env::temp_dir().join(format!("roost-promote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Last week's conversation in this project, sitting in the session
+        // root — unclaimed, because the pane that made it is long gone.
+        let old = dir.join("old.jsonl");
+        std::fs::write(&old, "").unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
+        std::fs::File::open(&old).unwrap().set_modified(long_ago).unwrap();
+
+        let mut panes = HashMap::new();
+        // Starts as a *shell* — the reported workflow is opening a pane and
+        // typing `pi` into it, which is what makes this the promotion path.
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Drive the **real** promotion path rather than hand-seeding the
+        // window: the first draft did the latter, and reverting the fix
+        // then left it green — it proved the scan honours a bound, not that
+        // promotion supplies one. Tick once seeing a plain shell (which
+        // records `last_shell_seen`), then again seeing the agent.
+        app.pending_detect.clear();
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
+        // `tick` self-throttles on `last_detect`, which `App::new` set to
+        // now — without this the call returns instantly and the assertion
+        // below passes having exercised nothing. (It did, on the first
+        // draft of this test.)
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        assert_eq!(
+            app.find_spec(1).unwrap().session,
+            None,
+            "claimed a conversation that predates the shell this pane was",
+        );
+
+        // ...and once the agent *does* write its file, the same pane picks
+        // it up. A bound that excluded everything would pass the assertion
+        // above while breaking detection outright.
+        let fresh = dir.join("fresh.jsonl");
+        std::fs::write(&fresh, "").unwrap();
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(1).unwrap().session.as_deref(),
+            Some("fresh"),
+            "the session this pane actually started must still be found",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C22: the float lives outside every tab's layout tree — including
+    /// when its id comes from the same pool a parked tab's panes do.
+    ///
+    /// `alloc_pane_id` guards the float and the undo stack separately; this
+    /// is the crossing case. Close a tab (parking its ids), open the float,
+    /// then reopen the tab: if the float took an id the tab is about to
+    /// bring back, `is_float` becomes true for a real tiled pane and both
+    /// share one entry in `runtimes`.
+    #[test]
+    fn the_float_never_takes_an_id_a_parked_tab_will_bring_back() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let parked: Vec<PaneId> =
+            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        for id in &parked {
+            app.close_pane_id(*id);
+        }
+        app.apply(Action::ToggleFloat);
+        let float_id = app.float.as_ref().expect("the float is up").id;
+        assert!(
+            !parked.contains(&float_id),
+            "the float took id {float_id}, which the parked tab still owns",
+        );
+
+        app.apply(Action::Undo);
+        let tree: Vec<PaneId> =
+            app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+        assert!(
+            !tree.contains(&float_id),
+            "C22: the float's id {float_id} is now a tiled pane too — tree {tree:?}",
+        );
+    }
+
+    /// F3/C20: a closed pane must not bequeath its attention state to
+    /// whatever pane next takes its id.
+    ///
+    /// `last_status`, `needy_msgs` and `visited_waiting` were pruned only on
+    /// the tick, under a comment claiming "ids are never reused" — which the
+    /// close path itself contradicts a thousand lines away, where `raw`,
+    /// `dead`, `tab_focus` and the token table are all pruned *at close*
+    /// precisely because ids ARE recycled (`alloc_pane_id` is a max+1, and a
+    /// closed pane's id is not parked). Close the highest-id pane and open
+    /// one inside the 2s `DETECT_INTERVAL` and the newborn inherits all
+    /// three: it is silently absent from Alt+a's fallback though nobody ever
+    /// looked at it, its first status observation reads as a *transition*
+    /// and prints a feed line for a life it did not live, and the dead
+    /// pane's question gets attributed to it.
+    #[test]
+    fn a_closed_panes_attention_state_does_not_outlive_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.set_focus(1);
+        app.apply(Action::JumpAttention); // visits pane 2 — marks it seen
+        app.needy_msgs.insert(2, "pick a database".into());
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick(); // `last_status[2]` = Waiting
+        assert!(app.visited_waiting.contains(&2), "setup: pane 2 was visited");
+        assert!(app.last_status.contains_key(&2), "setup: pane 2 has a status");
+
+        app.close_pane_id(2);
+
+        assert!(
+            !app.visited_waiting.contains(&2),
+            "F3: pane 2's `already looked at this` mark outlived the pane",
+        );
+        assert!(
+            !app.last_status.contains_key(&2),
+            "C20: pane 2's last status outlived the pane — the next pane to \
+             take id 2 would have its birth read as a transition",
+        );
+        assert!(
+            !app.needy_msgs.contains_key(&2),
+            "pane 2's question outlived the pane",
+        );
+    }
+
+    /// C38: Alt+u must respect the same floor Alt+n does.
+    ///
+    /// `restore_pane` hand-rolled the aspect test and never checked
+    /// `MIN_SPLIT_COLS`/`MIN_SPLIT_ROWS`, so undo would split a pane that
+    /// `spawn_child` had just refused to split — landing the reopened pane
+    /// in a slot too small to render in, and driving the *other* half under
+    /// the floor too. Same rect, same keypress-level decision, opposite
+    /// answer.
+    #[test]
+    fn undo_refuses_the_split_alt_n_just_refused() {
+        let (mut app, _) = mk_app(shell_ws());
+        // Something on the undo stack to reopen, taken while there is room.
+        app.apply(Action::NewPane);
+        let victim = app.focused;
+        app.close_pane_id(victim);
+
+        // Undo splits `pane_order().first()`, so shrink *that* pane until
+        // it is under the floor — Alt+n itself refuses on it here.
+        for _ in 0..12 {
+            let first = app.pane_order()[0];
+            app.set_focus(first);
+            if app.spawn_child("shell", None, None).is_none() {
+                break;
+            }
+        }
+        let first = app.pane_order()[0];
+        app.set_focus(first);
+        assert!(
+            app.spawn_child("shell", None, None).is_none(),
+            "setup: the first pane should be too small to split",
+        );
+        let before: Vec<PaneId> = app.pane_order();
+
+        app.apply(Action::Undo);
+
+        assert_eq!(
+            app.pane_order(),
+            before,
+            "Alt+u split a pane Alt+n had just refused to split",
+        );
+        assert!(
+            app.flash().is_some_and(|f| f.contains("no room")),
+            "the refusal is spoken, not silent: {:?}",
+            app.flash(),
+        );
+    }
+
+    /// C21/C22: closing the pane that is actually zoomed must end the zoom,
+    /// even when the float is covering it.
+    ///
+    /// `close_pane_id` asked `id == self.focused`, but while the float is
+    /// shown focus belongs to the float — never to a tiled pane — so the
+    /// test could not fire. `display_rects` already knows the real target is
+    /// `float.prev_focus`; the close path did not, so it left `zoomed` set
+    /// pointing at a pane that no longer exists, and the renderer was handed
+    /// a rect for it.
+    #[test]
+    fn closing_the_zoomed_pane_under_the_float_ends_the_zoom() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed(), "setup: pane 2 is zoomed");
+        let zoomed = app.focused;
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        app.close_pane_id(zoomed);
+
+        let live: Vec<PaneId> = app.ws.active_tab().panes.keys().copied().collect();
+        for pr in app.display_rects() {
+            assert!(
+                app.is_float(pr.id) || live.contains(&pr.id),
+                "the renderer was handed pane {} — gone from the tab {live:?}",
+                pr.id,
+            );
+        }
+    }
+
+    /// C22 rule 1: a shown float IS the focused pane. Closing some other
+    /// pane must not quietly take that away.
+    ///
+    /// The close path's "keep focus inside the tab on screen" fallback asked
+    /// whether `self.focused` is in the active tab's map. The float lives
+    /// outside every tab's map by construction, so while it was up the
+    /// answer was always no and the fallback fired on every close, yanking
+    /// focus off the float onto a tiled pane while the float stayed on
+    /// screen — keystrokes going to a pane the user cannot see.
+    #[test]
+    fn closing_a_pane_does_not_steal_focus_from_a_shown_float() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes
+        let victim = app.focused;
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        app.close_pane_id(victim);
+
+        if app.float.as_ref().is_some_and(|f| f.shown) {
+            assert!(
+                app.float_focused(),
+                "C22: the float is on screen but focus is on {}",
+                app.focused,
+            );
+        }
+    }
+
+    /// C22 rule 1, at the one chokepoint: every focus move off the float
+    /// takes the float down with it.
+    ///
+    /// The rule was enforced per call site, so each new focus path had to
+    /// remember it — and C35's "go back" did not. The float stayed drawn
+    /// over the body while keystrokes went to a tiled pane underneath.
+    #[test]
+    fn every_focus_move_off_the_float_hides_it() {
+        for (name, action) in [
+            ("FocusAlternate", Action::FocusAlternate),
+            ("Focus(Left)", Action::Focus(layout::Dir::Left)),
+            ("NextTab", Action::NextTab),
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::NewPane);
+            app.apply(Action::NewTab);
+            app.go_to_tab(0);
+            app.apply(Action::Focus(layout::Dir::Right));
+            app.apply(Action::Focus(layout::Dir::Left)); // give C35 an alternate
+            app.apply(Action::ToggleFloat);
+            assert!(app.float_focused(), "{name}: setup — the float has focus");
+
+            app.apply(action);
+
+            if !app.float_focused() {
+                assert!(
+                    !app.float.as_ref().is_some_and(|f| f.shown),
+                    "{name}: the float is still drawn but focus is on {}",
+                    app.focused,
+                );
+            }
+        }
+    }
+
+    /// A control spawn borrows focus and gives it back. It must give back
+    /// the float's visibility with it, or the pair ends up in a state the
+    /// model does not have: hidden and focused at the same time.
+    ///
+    /// From there `cycle_layout` — which arranges `pane_order()` around
+    /// whatever is focused — planted the float's id into the tab's layout
+    /// tree as a pane with no spec.
+    #[test]
+    fn a_control_spawn_gives_back_the_float_it_borrowed_focus_from() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        let ct = app.control_token().to_string();
+        app.handle_control(crate::core::control::Request {
+            token: ct,
+            method: crate::core::control::Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+            },
+        });
+
+        assert_eq!(app.focused, float_id, "focus was borrowed, not taken");
+        assert!(
+            app.float.as_ref().is_some_and(|f| f.shown),
+            "the float is focused but no longer drawn",
+        );
+
+        // The state that used to leak: a hidden-but-focused float becomes a
+        // ghost pane in the tree the moment anything arranges by focus.
+        app.apply(Action::CycleLayout { forward: true });
+        let tree: Vec<PaneId> = {
+            let mut v = Vec::new();
+            layout::pane_order(&app.ws.active_tab().layout, &mut v);
+            v
+        };
+        for id in &tree {
+            assert!(
+                app.ws.active_tab().panes.contains_key(id),
+                "pane {id} is in the tree with no spec — tree {tree:?}",
+            );
+        }
+    }
+
+    // -- the layout invariant fuzzer -----------------------------------------
+    //
+    // roost's structural state is three things that must agree: each tab's
+    // layout tree, its `panes` map, and the workspace-wide `runtimes` map —
+    // with the float sitting deliberately outside all three. Nearly every
+    // action moves at least two of them, and the crossings (zoom under a
+    // float, a control-plane close of a pane in another tab, undo after a
+    // tab was removed) are where they drift apart. Each such drift is
+    // invisible until it isn't: a pane in the tree with no spec, a runtime
+    // nothing can reach, a rect handed to the renderer for a pane that is
+    // gone.
+    //
+    // Hand-written tests cover the crossings someone thought of. This walks
+    // long random sequences and re-checks every invariant after every single
+    // operation, so the failure arrives with the exact trail that produced
+    // it. It has earned its runtime: the one-member stack, both float
+    // close-path crossings, C35's go-back, and the control-spawn float
+    // restore were all found here, none of them by reading the code.
+
+    fn inv_tree_ids(node: &LayoutNode) -> Vec<PaneId> {
+        let mut v = Vec::new();
+        layout::pane_order(node, &mut v);
+        v
+    }
+
+    fn inv_check_node(node: &LayoutNode, ctx: &str, tab: usize) {
+        match node {
+            LayoutNode::Pane(_) => {}
+            LayoutNode::Stack { children, expanded } => {
+                // >= 2, not merely non-empty (C6, clarified 2026-08-20): a
+                // stack of one is a pane, and `layout.rs` normalizes it into
+                // one wherever it can arise. The weaker assertion let the
+                // one-member stack that `toggle_stack` turns into a
+                // single-child `Split` walk right past this checker — the
+                // design audit had to find it by reading. Nothing guards a
+                // future construction path unless this does.
+                assert!(
+                    children.len() >= 2,
+                    "{ctx}: tab {tab} has a Stack with {} member(s) — a stack of one is a pane",
+                    children.len()
+                );
+                assert!(
+                    *expanded < children.len(),
+                    "{ctx}: tab {tab} stack expanded={expanded} out of range ({} members)",
+                    children.len()
+                );
+            }
+            LayoutNode::Split { children, ratios, .. } => {
+                assert!(
+                    children.len() >= 2,
+                    "{ctx}: tab {tab} has a Split with {} child(ren) — layout.rs says it never builds one",
+                    children.len()
+                );
+                assert_eq!(
+                    ratios.len(),
+                    children.len(),
+                    "{ctx}: tab {tab} split ratios {ratios:?} vs {} children",
+                    children.len()
+                );
+                for c in children {
+                    inv_check_node(c, ctx, tab);
+                }
+            }
+        }
+    }
+
+    /// THE invariant: per tab, the set of PaneIds in `layout` == the keys of
+    /// `panes`; ids are unique within a tab AND across tabs; the float is in
+    /// no tree.
+    fn inv_check(app: &App<FakePane>, ctx: &str) {
+        use std::collections::HashSet;
+        let mut global: HashMap<PaneId, usize> = HashMap::new();
+        for (i, tab) in app.ws.tabs.iter().enumerate() {
+            let ids = inv_tree_ids(&tab.layout);
+            let set: HashSet<PaneId> = ids.iter().copied().collect();
+            assert_eq!(set.len(), ids.len(), "{ctx}: tab {i} tree lists a pane twice: {ids:?}");
+            let keys: HashSet<PaneId> = tab.panes.keys().copied().collect();
+            assert_eq!(set, keys, "{ctx}: tab {i} tree ids {set:?} != panes map keys {keys:?}");
+            if let Some(f) = &app.float {
+                assert!(!set.contains(&f.id), "{ctx}: tab {i} tree contains the float's id {}", f.id);
+            }
+            for id in ids {
+                if let Some(prev) = global.insert(id, i) {
+                    panic!("{ctx}: pane {id} is in tab {prev} AND tab {i}");
+                }
+            }
+            inv_check_node(&tab.layout, ctx, i);
+        }
+        if app.float.as_ref().is_some_and(|f| !f.shown && f.id == app.focused) {
+            panic!("{ctx}: the float is HIDDEN but still focused");
+        }
+        // C22 rule 1: a shown float is the focused pane.
+        if app.float.as_ref().is_some_and(|f| f.shown) {
+            assert!(app.float_focused(), "{ctx}: the float is shown but focus is on {}", app.focused);
+        }
+        // Focus is always a real pane: the float, or a pane in the tab on screen.
+        assert!(
+            app.is_float(app.focused) || app.ws.active_tab().panes.contains_key(&app.focused),
+            "{ctx}: focused pane {} is in neither the active tab nor the float",
+            app.focused
+        );
+        // Nothing is drawn that does not exist.
+        let live: HashSet<PaneId> = app.ws.active_tab().panes.keys().copied().collect();
+        for pr in app.display_rects() {
+            assert!(
+                app.is_float(pr.id) || live.contains(&pr.id),
+                "{ctx}: display_rects hands the renderer pane {} — not in the active tab {live:?}",
+                pr.id
+            );
+        }
+        // (A pane that exists but is allocated no area is a real hazard,
+        // but at these densities — 20 panes in 58 rows — it is honest
+        // overcrowding rather than a bug. The one case that ISN'T is
+        // covered by `a_split_never_allocates_its_last_child_nothing`.)
+        // No runtime outlives its pane: `runtimes` is keyed by PaneId
+        // workspace-wide, and a leftover entry is a live child process
+        // nothing can reach.
+        let all_panes: HashSet<PaneId> =
+            app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+        let orphan_runtimes: Vec<PaneId> = app
+            .runtimes
+            .keys()
+            .copied()
+            .filter(|id| !all_panes.contains(id) && !app.is_float(*id))
+            .collect();
+        assert!(
+            orphan_runtimes.is_empty(),
+            "{ctx}: runtimes {orphan_runtimes:?} belong to no pane and no float"
+        );
+        // Split ratios describe a whole: they are renormalised on removal
+        // and traded on resize, so they always sum to 1.
+        fn inv_ratio_sums(node: &LayoutNode, ctx: &str) {
+            if let LayoutNode::Split { children, ratios, .. } = node {
+                let sum: f32 = ratios.iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 0.01,
+                    "{ctx}: split ratios {ratios:?} sum to {sum}, not 1"
+                );
+                for c in children {
+                    inv_ratio_sums(c, ctx);
+                }
+            }
+        }
+        for tab in &app.ws.tabs {
+            inv_ratio_sums(&tab.layout, ctx);
+        }
+    }
+
+    fn inv_app(cols: u16, rows: u16) -> App<FakePane> {
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(4096);
+        App::<FakePane>::new(
+            shell_ws(),
+            agents::registry(),
+            Box::new(store),
+            tx,
+            Size::new(cols, rows),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap()
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn inv_has_stack(node: &LayoutNode) -> bool {
+        match node {
+            LayoutNode::Pane(_) => false,
+            LayoutNode::Stack { .. } => true,
+            LayoutNode::Split { children, .. } => children.iter().any(inv_has_stack),
+        }
+    }
+
+    /// Long random operation sequences must never break the tree↔map
+    /// invariant.
+    #[test]
+    fn layout_tree_and_panes_map_never_diverge_under_random_operations() {
+        use crate::core::layout::Dir;
+        let dirs = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+        let mut coverage: HashMap<&'static str, usize> = HashMap::new();
+        let mut stacks_seen = 0usize;
+        let mut zoom_seen = 0usize;
+        let mut float_seen = 0usize;
+        let mut float_and_zoom = 0usize;
+        let mut multi_tab = 0usize;
+        let mut ops_total = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(12345));
+            let mut app = inv_app(200, 60);
+            let mut trail: Vec<String> = Vec::new();
+            'step: for step in 0..400 {
+                let would_quit = app.ws.tabs.len() == 1 && app.ws.active_tab().panes.len() == 1;
+                let (name, action) = loop {
+                    let pick = rng.below(40);
+                    let d = dirs[rng.below(4) as usize];
+                    let a = match pick {
+                        0..=3 => ("NewPane", Action::NewPane),
+                        4 | 5 => {
+                            if would_quit {
+                                continue;
+                            }
+                            ("ClosePane", Action::ClosePane)
+                        }
+                        6..=8 => ("Focus", Action::Focus(d)),
+                        9..=11 => ("MovePane", Action::MovePane(d)),
+                        12 => ("NewTab", Action::NewTab),
+                        13 => ("MovePaneToTab+", Action::MovePaneToTab { forward: true }),
+                        14 => ("MovePaneToTab-", Action::MovePaneToTab { forward: false }),
+                        15 => ("NextTab", Action::NextTab),
+                        16 => ("PrevTab", Action::PrevTab),
+                        17 | 18 => ("ToggleStack", Action::ToggleStack),
+                        19 => ("FlipSplit", Action::FlipSplit),
+                        20 => (
+                            "Resize",
+                            Action::Resize { horizontal: rng.below(2) == 0, grow: rng.below(2) == 0 },
+                        ),
+                        21 => ("Undo", Action::Undo),
+                        22 => ("ToggleZoom", Action::ToggleZoom),
+                        23 => ("CycleLayout+", Action::CycleLayout { forward: true }),
+                        24 => ("CycleLayout-", Action::CycleLayout { forward: false }),
+                        25 => ("ToggleFloat", Action::ToggleFloat),
+                        26 => ("GoToTab", Action::GoToTab(rng.below(4) as usize)),
+                        27 => {
+                            // Control-plane close of an arbitrary live pane
+                            // (the other close_pane_id caller). Refuses the
+                            // last pane itself, so nothing to guard here.
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let victim = all[rng.below(all.len() as u64) as usize];
+                            let ct = app.control_token().to_string();
+                            app.handle_control(crate::core::control::Request {
+                                token: ct,
+                                method: crate::core::control::Method::Close {
+                                    pane: victim,
+                                    force: true,
+                                },
+                            });
+                            *coverage.entry("CtlClose").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:CtlClose({victim})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        28 => {
+                            let (w, h) = match rng.below(4) {
+                                0 => (200u16, 60u16),
+                                1 => (120, 40),
+                                2 => (80, 24),
+                                _ => (60, 18),
+                            };
+                            app.on_resize(Size::new(w, h), (0, 0));
+                            *coverage.entry("Resize(term)").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:Term({w}x{h})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        29 => ("LastTab", Action::LastTab),
+                        30 => ("JumpAttention", Action::JumpAttention),
+                        31 => {
+                            // C27: jump to an arbitrary pane through the
+                            // roster's own path (tab switch + stack expand).
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let dest = all[rng.below(all.len() as u64) as usize];
+                            app.apply(Action::ToggleRoster);
+                            app.roster_jump(dest);
+                            *coverage.entry("RosterJump").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:RosterJump({dest})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        32 => {
+                            // Control-plane spawn: the other pane-creating
+                            // path, which allocates its own id.
+                            let ct = app.control_token().to_string();
+                            app.handle_control(crate::core::control::Request {
+                                token: ct,
+                                method: crate::core::control::Method::Spawn {
+                                    adapter: "shell".into(),
+                                    cwd: None,
+                                    initial_input: None,
+                                },
+                            });
+                            *coverage.entry("CtlSpawn").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:CtlSpawn"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        33 => {
+                            // U25: jump out of the activity feed (the third
+                            // `focus_attention_target` caller).
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let dest = all[rng.below(all.len() as u64) as usize];
+                            app.push_feed("fuzz".into(), false, Some(dest));
+                            app.apply(Action::ToggleFeed);
+                            app.handle_mode_key(crossterm::event::KeyEvent::from(
+                                crossterm::event::KeyCode::Enter,
+                            ));
+                            app.mode = Mode::Normal;
+                            *coverage.entry("FeedJump").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:FeedJump({dest})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        34 | 35 => ("ToggleFloat", Action::ToggleFloat),
+                        36 | 37 => ("ToggleZoom", Action::ToggleZoom),
+                        _ => ("FocusAlternate", Action::FocusAlternate),
+                    };
+                    break a;
+                };
+                trail.push(format!("{step}:{name}"));
+                *coverage.entry(name).or_default() += 1;
+                ops_total += 1;
+                app.apply(action);
+                if app.zoomed() {
+                    zoom_seen += 1;
+                }
+                if app.float.as_ref().is_some_and(|f| f.shown) {
+                    float_seen += 1;
+                    if app.zoomed() {
+                        float_and_zoom += 1;
+                    }
+                }
+                if app.ws.tabs.len() > 1 {
+                    multi_tab += 1;
+                }
+                if app.ws.tabs.iter().any(|t| inv_has_stack(&t.layout)) {
+                    stacks_seen += 1;
+                }
+                inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                assert!(!app.quit, "seed {seed}: quit unexpectedly at [{}]", trail.join(","));
+            }
+        }
+        let mut cov: Vec<_> = coverage.iter().collect();
+        cov.sort();
+        println!("ops={ops_total} coverage={cov:?}");
+        println!(
+            "states: stack-present={stacks_seen} zoomed={zoom_seen} float-shown={float_seen} float+zoom={float_and_zoom} multi-tab={multi_tab}"
+        );
+        assert!(stacks_seen > 1000, "generator never reached stacks");
+        assert!(zoom_seen > 1000, "generator never reached zoom");
+        assert!(float_seen > 1000, "generator never reached the float");
+        assert!(float_and_zoom > 100, "generator never crossed the float with zoom");
+        assert!(multi_tab > 1000, "generator never reached multiple tabs");
+    }
+
+
+    /// One principal must not be able to deny `wait` to the whole fleet.
+    ///
+    /// A parked waiter is freed only by firing or timing out — nothing
+    /// notices the client hung up — so 16 fire-and-forget waits held every
+    /// global slot for up to 24 hours while holding no connection and no
+    /// process. A pane can send them with its own `$ROOST_TOKEN`, which is
+    /// squarely outside its authority.
+    #[test]
+    fn one_principal_cannot_park_every_wait_slot() {
+        let (mut app, _) = mk_app(shell_ws());
+        let pane = app.focused;
+        let mut keep = Vec::new();
+
+        // One pane spams waits with its own token's authority.
+        let mut parked = 0;
+        for _ in 0..MAX_WAITS * 2 {
+            let (tx, rx) = mpsc::channel();
+            if app
+                .register_waiter(Actor::Pane(pane), vec![pane], "exited", Some(60_000), tx)
+                .is_ok_and(|why| why == "parked")
+            {
+                parked += 1;
+            }
+            keep.push(rx);
+        }
+        assert!(
+            parked <= MAX_WAITS_PER_ACTOR,
+            "one principal parked {parked} waits — it can hold every global slot",
+        );
+
+        // ...and the fleet can still use the verb.
+        let (tx, _rx) = mpsc::channel();
+        let got = app.register_waiter(
+            Actor::Fleet,
+            vec![pane],
+            "exited",
+            Some(60_000),
+            tx,
+        );
+        assert_eq!(got.as_deref(), Ok("parked"), "the verb is denied to everyone else");
+    }
+
+    /// A `wait` naming more panes than any fleet has is a load generator:
+    /// `poll_waiters` walks every id of every waiter on the **UI thread**,
+    /// every event-loop iteration, for the wait's whole timeout.
+    #[test]
+    fn a_wait_cannot_name_an_unbounded_pane_list() {
+        let (mut app, _) = mk_app(shell_ws());
+        let pane = app.focused;
+        let (tx, _rx) = mpsc::channel();
+        let huge: Vec<PaneId> = vec![pane; 20_000];
+        assert!(
+            app.register_waiter(Actor::Fleet, huge, "exited", Some(60_000), tx)
+                .is_err(),
+            "a 20,000-id wait was accepted; it is re-walked on the UI thread every frame",
+        );
+    }
+
+    /// Detection must give up eventually.
+    ///
+    /// `pending_detect` is only ever removed from on success
+    /// (`set_session`) or when the pane disappears. A pane whose agent
+    /// never writes a session file roost can attribute — it exited early,
+    /// it is an adapter with no session root reachable, or the scan keeps
+    /// declining as ambiguous — stays pending **forever**, and every 2s
+    /// tick runs `session_files_since` over the whole session root for it.
+    ///
+    /// No adapter overrides `detect_session`, so that is a full recursive
+    /// walk stat-ing every file under e.g. `~/.pi/agent/sessions` — every
+    /// project, all history — twice a minute, for the life of the process.
+    #[test]
+    fn detection_stops_retrying_a_pane_that_will_never_resolve() {
+        let dir = std::env::temp_dir().join(format!("roost-giveup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "detect".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Pending since well past any plausible agent startup, and the
+        // session root is empty, so no scan will ever succeed.
+        app.pending_detect.clear();
+        app.pending_detect.insert(1, SystemTime::now() - Duration::from_secs(3600));
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        assert!(
+            !app.pending_detect.contains_key(&1),
+            "still pending an hour on — roost will rescan the whole session root \
+             every 2 seconds for the rest of the process's life",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pane id parked on the undo stack must not be handed out again.
+    ///
+    /// `Workspace::next_pane_id` takes the max over **live tabs only**, and
+    /// `alloc_pane_id` additionally guards the float — but a tab sitting on
+    /// the undo stack still owns its pane ids, and nothing accounts for
+    /// them. Close a tab, open enough panes to reach its ids, then `Alt+u`:
+    /// the restored tab's panes collide with live ones.
+    ///
+    /// That is not cosmetic. `App::runtimes` is keyed by `PaneId` **across
+    /// all tabs**, as are `tokens`, `dead`, `pending_input` and `raw` — so
+    /// two panes sharing an id share one PTY, one auth token and one
+    /// status. Keystrokes meant for one reach the other.
+    #[test]
+    fn a_pane_id_parked_on_the_undo_stack_is_never_reused() {
+        let (mut app, _) = mk_app(shell_ws());
+        // A second tab, so closing it parks a whole Tab on the undo stack.
+        app.apply(Action::NewTab);
+        let parked: Vec<PaneId> =
+            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        assert!(!parked.is_empty(), "the new tab has a pane");
+
+        // Close it: its last pane going means the tab is parked whole.
+        for id in &parked {
+            app.close_pane_id(*id);
+        }
+        assert_eq!(app.ws.tabs.len(), 1, "the tab is gone");
+
+        // Now open panes until we would reach the parked ids.
+        for _ in 0..parked.len() + 2 {
+            app.apply(Action::NewPane);
+        }
+        let live: Vec<PaneId> = app
+            .ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.keys().copied())
+            .collect();
+        for id in &parked {
+            assert!(
+                !live.contains(id),
+                "pane id {id} is parked on the undo stack and was handed out again — \
+                 restoring that tab would put two panes on one runtime. live={live:?}",
+            );
+        }
+
+        // And the consequence, so the claim above is demonstrated rather
+        // than asserted: reopening puts the tab back with its original ids.
+        app.apply(Action::Undo);
+        let mut seen: HashMap<PaneId, usize> = HashMap::new();
+        for t in &app.ws.tabs {
+            for id in t.panes.keys() {
+                *seen.entry(*id).or_insert(0) += 1;
+            }
+        }
+        let dupes: Vec<PaneId> =
+            seen.iter().filter(|(_, n)| **n > 1).map(|(id, _)| *id).collect();
+        assert!(
+            dupes.is_empty(),
+            "after reopening, pane id(s) {dupes:?} exist in two tabs at once — \
+             `runtimes`, `tokens` and `dead` are all keyed by PaneId across tabs, \
+             so those panes share one PTY and one auth token",
+        );
+    }
+
+    /// The promotion floor must never be *loosened* by a later promotion.
+    ///
+    /// `pending_detect.entry(id).or_insert(floor)` keeps whatever bound is
+    /// already there. A pane that promotes, fails to find a file (so stays
+    /// pending), demotes when the agent exits, and promotes again hours
+    /// later would keep the **first** floor — by then old enough to reach
+    /// conversations from earlier in the session. The window must only ever
+    /// tighten.
+    #[test]
+    fn a_second_promotion_tightens_the_detection_floor_it_never_loosens() {
+        let dir = std::env::temp_dir().join(format!("roost-refloor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        let tick = |app: &mut App<FakePane>, agent: Option<&str>| {
+            app.runtimes.get_mut(&1).unwrap().observation = Some(crate::ports::Observation {
+                cwd: None,
+                agent: agent.map(String::from),
+            });
+            app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+            app.tick();
+        };
+
+        // Shell → agent: promoted, nothing on disk, so it stays pending.
+        tick(&mut app, None);
+        tick(&mut app, Some("detect"));
+        let first_floor = *app.pending_detect.get(&1).expect("pending after promotion");
+
+        // The agent exits (demote), the pane sits as a shell, then the user
+        // launches it again much later.
+        tick(&mut app, None);
+        app.last_shell_seen.insert(1, SystemTime::now() + Duration::from_secs(3600));
+        tick(&mut app, Some("detect"));
+
+        let second_floor = *app.pending_detect.get(&1).expect("pending after re-promotion");
+        assert!(
+            second_floor > first_floor,
+            "the second promotion kept the first floor ({first_floor:?}), so its window \
+             still reaches back to conversations from before the agent was relaunched",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same guarantee when the pane **changes directory first** — open
+    /// a pane, `cd` into a project, then launch the agent.
+    ///
+    /// This is the sharper version of the reported workflow: the directory
+    /// you move into is one you have worked in before, so its session root
+    /// is full of previous conversations. `observe_panes` follows the live
+    /// cwd, so the scan is correctly scoped to the *new* project — which is
+    /// exactly why an unbounded window would hand the pane that project's
+    /// most recent old conversation.
+    #[test]
+    fn a_pane_that_cds_before_launching_still_gets_its_own_session() {
+        let old_dir = std::env::temp_dir().join(format!("roost-cd-a-{}", std::process::id()));
+        let new_dir = std::env::temp_dir().join(format!("roost-cd-b-{}", std::process::id()));
+        for d in [&old_dir, &new_dir] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // A conversation from last week in the project we are about to
+        // `cd` into.
+        let stale = new_dir.join("lastweek.jsonl");
+        std::fs::write(&stale, "").unwrap();
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
+            .unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: old_dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Tick 1: still a shell, but now in the new directory.
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: Some(new_dir.clone()), agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.find_spec(1).unwrap().cwd, new_dir, "the pane followed the cd");
+
+        // Tick 2: the agent is up, its session file not yet written.
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: Some(new_dir.clone()), agent: Some("detect".into()) });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(1).unwrap().session,
+            None,
+            "claimed last week's conversation from the directory it cd'd into",
+        );
+
+        // Tick 3: the agent writes its file, and the pane claims that.
+        std::fs::write(new_dir.join("mine.jsonl"), "").unwrap();
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("mine"));
+
+        for d in [&old_dir, &new_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Adapter with a **global** session root that claims every file for
+    /// every cwd — codex's shape (`~/.codex/sessions`, bucketed by date,
+    /// `owns_session_file` true by design because the path carries no cwd
+    /// signal at all).
+    struct UnscopedAdapter(PathBuf);
+    impl crate::agents::AgentAdapter for UnscopedAdapter {
+        fn id(&self) -> &'static str {
+            "unscoped"
+        }
+        fn launch(&self, cwd: &std::path::Path) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd)
+        }
+        fn resume(&self, cwd: &std::path::Path, session: &str) -> crate::agents::CommandSpec {
+            crate::agents::CommandSpec::new("true", cwd).arg(session)
+        }
+        fn resume_flag(&self) -> &'static str {
+            "--resume"
+        }
+        fn session_root(&self, _cwd: &std::path::Path) -> Option<PathBuf> {
+            Some(self.0.clone()) // global: the same root for every project
+        }
+    }
+
+    /// Two panes in **different projects** must never be handed each
+    /// other's conversation.
+    ///
+    /// An adapter whose session root is global (codex) gives the scan no
+    /// cwd signal, so when two panes are mid-detection at once the only
+    /// thing separating them is arrival order — and a session file's mtime
+    /// says nothing about which project it belongs to. The taken-set stops
+    /// one id reaching two panes; it does nothing about the *wrong* id
+    /// reaching a pane.
+    ///
+    /// Guiding principle for this tool: **a wrong session is far worse than
+    /// no session.** Losing a resume pointer costs the user `--continue`;
+    /// attaching a pane to another project's conversation corrupts work.
+    #[test]
+    fn an_unscoped_adapter_never_hands_a_pane_another_projects_session() {
+        let root = std::env::temp_dir().join(format!("roost-unscoped-{}", std::process::id()));
+        let a_dir = root.join("proj-a");
+        let b_dir = root.join("proj-b");
+        let _ = std::fs::remove_dir_all(&root);
+        for d in [&root, &a_dir, &b_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Two sessions land in the one global root, moments apart. Nothing
+        // in either path says which project it came from.
+        let base = SystemTime::now();
+        for (name, offset) in [("first", 10u64), ("second", 20)] {
+            let f = root.join(format!("{name}.jsonl"));
+            std::fs::write(&f, "").unwrap();
+            std::fs::File::open(&f)
+                .unwrap()
+                .set_modified(base + Duration::from_millis(offset))
+                .unwrap();
+        }
+
+        let mut panes = HashMap::new();
+        for (id, dir) in [(1 as PaneId, &a_dir), (2 as PaneId, &b_dir)] {
+            panes.insert(
+                id,
+                PaneSpec {
+                    adapter: "unscoped".into(),
+                    cwd: dir.clone(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
+            );
+        }
+        let layout = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("unscoped", Box::new(UnscopedAdapter(root.clone())));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        app.pending_detect.clear();
+        app.pending_detect.insert(1, base);
+        app.pending_detect.insert(2, base);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let a = app.find_spec(1).unwrap().session.clone();
+        let b = app.find_spec(2).unwrap().session.clone();
+        assert!(
+            a.is_none() && b.is_none(),
+            "two panes in different projects were each handed a session from a \
+             global root that cannot say which project it belongs to: \
+             pane1(proj-a)={a:?} pane2(proj-b)={b:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
