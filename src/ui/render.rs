@@ -579,17 +579,29 @@ fn picker_cwd_label(path: &std::path::Path) -> String {
     }
 }
 
-/// C14 (U20): the picker dialog's width — the adapter column (a fixed
-/// width, as before the cwd column existed) plus the widest cwd label, plus
-/// the gap and the two border columns. `centered_near` still clamps it to
-/// the screen. Pure so the sizing and the drawing can't drift.
+/// C14 (U20): the picker's adapter column — the 3-char row prefix
+/// (`picker_row_body`'s `" {digit} "`) + the registry's longest id
+/// (`opencode`, 8) + the longest status suffix (`" not found"`, 10, see
+/// `picker_filtered`) + 2 columns of slack.
 ///
-/// `ADAPTER_COL` = 23: the 3-char row prefix (`picker_row_body`'s
-/// `" {digit} "`) + the registry's longest id (`opencode`, 8 chars) + the
-/// longest status suffix (`" not found"`, 10 chars, see `picker_filtered`) +
-/// 2 columns of slack.
+/// **One constant, because there were two.** `picker_dialog_width` sized
+/// the dialog for 23 while `draw_mode_overlay` padded its rows to 16 — same
+/// name, same intent, free to disagree, and they did. Any row wider than 16
+/// (`" 1 opencode not found"` is 21) got no padding at all, so its cwd
+/// label started six columns right of every other row's: a ragged column in
+/// exactly the case the dialog was sized to accommodate. Found by sweeping
+/// for the class of the C15 padding bug rather than its instance — a
+/// minimum-width pad standing in for a column is the same mistake twice.
+const ADAPTER_COL: u16 = 23;
+
+/// C14 (U20): the picker dialog's width — the adapter column plus the
+/// widest cwd label, plus the gap and the two border columns.
+/// `centered_near` still clamps it to the screen. Pure so the sizing and
+/// the drawing can't drift.
+///
+/// `ADAPTER_COL` is the shared constant below — the same number that pads
+/// each row, so the dialog is sized for exactly the column it draws.
 fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
-    const ADAPTER_COL: u16 = 23;
     let widest = cwds
         .iter()
         .map(|p| mouse::display_width(&picker_cwd_label(p)))
@@ -1360,7 +1372,7 @@ fn draw_mode_overlay<B: PaneBackend>(
             // its selection with `❯`; the other shows its selection in
             // `ink` without the marker, so what will actually be launched
             // is readable from either side.
-            const ADAPTER_COL: usize = 16;
+            let adapter_col = ADAPTER_COL as usize;
             let rows = items.len().max(cwds.len());
             let lines: Vec<Line> = (0..rows)
                 .map(|i| {
@@ -1368,12 +1380,12 @@ fn draw_mode_overlay<B: PaneBackend>(
                     match items.get(i) {
                         Some(item) => {
                             let text = picker_row_body(i, item);
-                            let pad = ADAPTER_COL.saturating_sub(mouse::display_width(&text) as usize + 1);
+                            let pad = adapter_col.saturating_sub(mouse::display_width(&text) as usize + 1);
                             let (marker, style) = row_marks(i == *selection, !*on_cwd);
                             spans.push(marker);
                             spans.push(Span::styled(format!("{text}{}", " ".repeat(pad)), style));
                         }
-                        None => spans.push(Span::raw(" ".repeat(ADAPTER_COL))),
+                        None => spans.push(Span::raw(" ".repeat(adapter_col))),
                     }
                     if let Some(path) = cwds.get(i) {
                         let (marker, style) = row_marks(i == *cwd, *on_cwd);
@@ -4208,6 +4220,29 @@ mod tests {
         let (marker, style) = super::row_marks(false, true);
         assert_eq!(marker.content.as_ref(), " ");
         assert_eq!(style, theme::quiet());
+    }
+
+    /// C14 (U20): every picker row's cwd column starts at the same place,
+    /// including the widest adapter row the dialog is sized for.
+    ///
+    /// The pad target and the width constant used to be two constants with
+    /// one name — 16 in the draw loop, 23 in the sizing — so a row wider
+    /// than 16 got no padding and shoved its cwd label right. This walks
+    /// the whole worst case rather than asserting the number: the longest
+    /// registry id with the longest status suffix, at the accelerator
+    /// prefix that makes it longest.
+    #[test]
+    fn the_adapter_column_is_wide_enough_for_the_row_it_pads() {
+        let widest = format!(" 1 {}", "opencode not found");
+        assert!(
+            super::mouse::display_width(&widest) + 1 <= super::ADAPTER_COL,
+            "the worst-case row ({} cols + marker) overflows the column it pads to ({}),              so its cwd label starts further right than every other row's",
+            super::mouse::display_width(&widest),
+            super::ADAPTER_COL,
+        );
+        // ...and `picker_row_body` really does produce it, so the string
+        // above cannot quietly stop being the worst case.
+        assert_eq!(super::picker_row_body(0, "opencode not found"), widest);
     }
 
     /// C14 (U20): the dialog grows to fit the widest cwd label, and stays

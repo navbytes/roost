@@ -4102,8 +4102,8 @@ not a benchmark suite.
 
 ---
 
-### Open: the picker's adapter column has two widths and neither widens
-**[Added 2026-08-20, floor-stress audit]**
+### ~~Open~~: the picker's adapter column has two widths and neither widens
+**[Added 2026-08-20, floor-stress audit · RESOLVED 2026-08-20]**
 
 `render.rs` defines `ADAPTER_COL` **twice, with different values**: 23 in
 `picker_dialog_width` (documented as 3-char row prefix + longest id + longest
@@ -4125,6 +4125,17 @@ audit only by proximity.
 Found by the design-supervisor sweep for the `{:<N}` minimum-width mistake
 that produced the C15 amendment above — the class, not the instance, which is
 what that sweep was for.
+
+**Resolved:** one module-scope `ADAPTER_COL = 23`, used by both the sizing
+and the draw loop, so the dialog is sized for exactly the column it draws.
+The reason for filing rather than fixing — that it belongs to C14's sizing
+contract rather than the help overlay's — turned out to be a reason to give
+it its own commit, not to leave it. `the_adapter_column_is_wide_enough_for_
+the_row_it_pads` walks the worst case (`picker_row_body(0, "opencode not
+found")`) instead of asserting the number, and re-checks that
+`picker_row_body` still produces it, so the worst case cannot quietly stop
+being the worst case. Reverting the constant to 16 reproduces the original
+misalignment by name.
 
 ### ~~Open~~: the composer's `Exited` filter tier can never match
 **[Added 2026-08-20, simulation pass · RESOLVED 2026-08-20]**
