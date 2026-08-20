@@ -12122,7 +12122,78 @@ mod tests {
                             inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
                             continue 'step;
                         }
-                        34 | 35 => ("ToggleFloat", Action::ToggleFloat),
+                        34 => {
+                            // The rest of the control plane, with arguments a
+                            // machine caller can really send: pane ids that
+                            // do not exist, an empty `text`, a `tail` past
+                            // any scrollback, a `wait` naming panes in bulk.
+                            // `CtlClose`/`CtlSpawn` above are the two verbs
+                            // that change structure; these are the ones that
+                            // read it, and they reach the same maps and the
+                            // same `find_spec`/`tab_of` lookups. A panic or a
+                            // drift here is a control call taking the fleet
+                            // down (`tests/panic_shutdown.rs`), which is why
+                            // they are walked and not merely unit-tested.
+                            use crate::core::control::{Method, ReadMode, Request};
+                            let all: Vec<PaneId> =
+                                app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+                            let any = |rng: &mut Lcg| -> PaneId {
+                                // Half real ids, half ids that name nothing.
+                                if all.is_empty() || rng.below(2) == 0 {
+                                    rng.below(64)
+                                } else {
+                                    all[rng.below(all.len() as u64) as usize]
+                                }
+                            };
+                            let method = match rng.below(7) {
+                                0 => Method::List,
+                                1 => Method::Status {
+                                    pane: (rng.below(2) == 0).then(|| any(&mut rng)),
+                                },
+                                2 => Method::Fork {
+                                    pane: (rng.below(2) == 0).then(|| any(&mut rng)),
+                                },
+                                3 => Method::Send {
+                                    pane: any(&mut rng),
+                                    text: ["", "hi", "\u{4e2d}\u{1f600}", "\x1b[2J"]
+                                        [rng.below(4) as usize]
+                                        .into(),
+                                    submit: rng.below(2) == 0,
+                                },
+                                4 => Method::Broadcast {
+                                    text: ["", "go"][rng.below(2) as usize].into(),
+                                    submit: rng.below(2) == 0,
+                                },
+                                5 => Method::Read {
+                                    pane: any(&mut rng),
+                                    mode: match rng.below(3) {
+                                        0 => ReadMode::Screen,
+                                        1 => ReadMode::Tail(rng.below(100_000) as usize),
+                                        _ => ReadMode::Full,
+                                    },
+                                },
+                                _ => Method::Wait {
+                                    panes: (0..rng.below(80)).map(|_| any(&mut rng)).collect(),
+                                    until: ["waiting", "idle", "nonsense", ""]
+                                        [rng.below(4) as usize]
+                                        .into(),
+                                    timeout_ms: match rng.below(3) {
+                                        0 => None,
+                                        1 => Some(0),
+                                        _ => Some(u64::MAX),
+                                    },
+                                },
+                            };
+                            let name = method_summary(&method);
+                            let ct = app.control_token().to_string();
+                            app.handle_control(Request { token: ct, method });
+                            *coverage.entry("CtlVerb").or_default() += 1;
+                            ops_total += 1;
+                            trail.push(format!("{step}:Ctl({name})"));
+                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            continue 'step;
+                        }
+                        35 => ("ToggleFloat", Action::ToggleFloat),
                         36 | 37 => ("ToggleZoom", Action::ToggleZoom),
                         _ => ("FocusAlternate", Action::FocusAlternate),
                     };
