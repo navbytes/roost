@@ -11282,6 +11282,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The same guarantee when the pane **changes directory first** — open
+    /// a pane, `cd` into a project, then launch the agent.
+    ///
+    /// This is the sharper version of the reported workflow: the directory
+    /// you move into is one you have worked in before, so its session root
+    /// is full of previous conversations. `observe_panes` follows the live
+    /// cwd, so the scan is correctly scoped to the *new* project — which is
+    /// exactly why an unbounded window would hand the pane that project's
+    /// most recent old conversation.
+    #[test]
+    fn a_pane_that_cds_before_launching_still_gets_its_own_session() {
+        let old_dir = std::env::temp_dir().join(format!("roost-cd-a-{}", std::process::id()));
+        let new_dir = std::env::temp_dir().join(format!("roost-cd-b-{}", std::process::id()));
+        for d in [&old_dir, &new_dir] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // A conversation from last week in the project we are about to
+        // `cd` into.
+        let stale = new_dir.join("lastweek.jsonl");
+        std::fs::write(&stale, "").unwrap();
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
+            .unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: old_dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Tick 1: still a shell, but now in the new directory.
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: Some(new_dir.clone()), agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.find_spec(1).unwrap().cwd, new_dir, "the pane followed the cd");
+
+        // Tick 2: the agent is up, its session file not yet written.
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: Some(new_dir.clone()), agent: Some("detect".into()) });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(1).unwrap().session,
+            None,
+            "claimed last week's conversation from the directory it cd'd into",
+        );
+
+        // Tick 3: the agent writes its file, and the pane claims that.
+        std::fs::write(new_dir.join("mine.jsonl"), "").unwrap();
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("mine"));
+
+        for d in [&old_dir, &new_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     #[test]
     fn tick_lets_each_concurrently_launched_pane_claim_its_own_session_file() {
         // Two panes launched into the same cwd around the same time share
