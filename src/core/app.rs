@@ -801,8 +801,38 @@ impl<B: PaneBackend> App<B> {
         self.keymap = keymap;
     }
 
+    /// Persist the workspace, and **say so out loud the moment it starts
+    /// failing**.
+    ///
+    /// The failure used to reach exactly one surface: the tab bar's
+    /// right-aligned `saved ✓` / `save failed ✗` indicator. C2's yield
+    /// ladder drops that area *whole* when the tabs need the room, so on an
+    /// ordinary 80-column terminal with five tabs roost could fail every
+    /// single write — read-only state dir, full disk, wrong ownership — and
+    /// show nothing at all, until the user relaunched into a fleet hours
+    /// stale. The error text was discarded by `.is_ok()` on the way, so
+    /// even the indicator could not say *why*.
+    ///
+    /// A C10 flash takes the whole hint bar and cannot be crowded out.
+    /// Raised on the **transition** into failure, not on every save: a
+    /// persistent failure fires on every action, and re-flashing each time
+    /// would bury whatever else the bar was saying and make roost unusable
+    /// exactly when the user needs to read it. The indicator remains the
+    /// standing signal; this is the one that cannot be missed.
     fn save(&mut self) {
-        self.last_save_ok = self.store.save(&self.ws).is_ok();
+        let result = self.store.save(&self.ws);
+        let ok = result.is_ok();
+        if self.last_save_ok && !ok {
+            // Innermost cause: the outer layers are `anyhow` context naming
+            // the path, which the flash has no room for and the user
+            // already knows. "Permission denied" is the actionable half.
+            let why = result
+                .err()
+                .map(|e| e.chain().last().map(|c| c.to_string()).unwrap_or_else(|| e.to_string()))
+                .unwrap_or_default();
+            self.set_flash(format!("workspace NOT saved — {why}"));
+        }
+        self.last_save_ok = ok;
     }
 
     /// The pane area: below the tab bar (row 0), above the hint bar (last

@@ -1028,6 +1028,39 @@ impl PaneBackend for PtyPane {
         // libc::kill on `self.pid.is_some()` (and run again unconditionally
         // on every runtime during App::shutdown), can't signal it.
         if let Ok(Some(_)) = self.child.try_wait() {
+            // Sweep the session **here**, before the pid is cleared.
+            //
+            // `kill()` gates both its group kill and its session sweep on
+            // `self.pid`, so once this line nulls it every cleanup path
+            // becomes a no-op — and a pane's shell exiting on its own is
+            // the *normal* way a pane dies. Anything the pane put in
+            // another process group (`sleep 600 &`, an agent's daemonized
+            // helper) then survived closing the pane, respawning it, and
+            // quitting roost entirely, with nothing left on screen to
+            // mention it.
+            //
+            // It has to happen at this instant rather than later. Keeping
+            // the sid around to sweep at close time would work, but the
+            // pid-reuse race the group kill already accepts is only
+            // tolerable because its window is microseconds — a sid held
+            // from a shell that exited at breakfast and swept when the pane
+            // is closed after lunch is a different proposition entirely,
+            // and could signal a wholly unrelated process. Sweeping now,
+            // one statement after the reap, keeps the window exactly where
+            // the existing code already accepts it.
+            //
+            // `!= pid` for the same reason the `kill()` sweep does it: the
+            // leader is already reaped, and re-signalling a dead pid is
+            // precisely the hazard being avoided.
+            if let Some(pid) = self.pid {
+                for member in session_members(pid) {
+                    if member != pid {
+                        unsafe {
+                            libc::kill(member as libc::pid_t, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
             self.pid = None;
         }
     }

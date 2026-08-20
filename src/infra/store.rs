@@ -88,9 +88,30 @@ impl StateStore for FsStore {
                 .mode(0o600)
                 .open(&tmp)?;
             f.write_all(&serde_json::to_vec_pretty(ws)?)?;
-            f.flush()?;
+            // **Not** `flush()`. `Write::flush` on a `std::fs::File` is a
+            // no-op — it reads like a durability barrier and is not one.
+            // Without a real fsync the rename below can reach the disk
+            // before the bytes do, so a power cut or kernel panic can leave
+            // `workspace.json` truncated or zero-length. `load()` treats an
+            // unparseable file as "no workspace", so that outcome costs the
+            // user their whole fleet: the durability gap and the
+            // discard-on-corrupt rule compound into real data loss.
+            //
+            // One fsync of a small file per save, and only the *data* — see
+            // the directory note below for why that half is best-effort.
+            f.sync_all()?;
         }
         fs::rename(&tmp, &self.path)?;
+        // The rename's own durability, best-effort and deliberately so:
+        // losing it means the *previous* save is what comes back, which is
+        // stale but intact. That is a different and far milder failure than
+        // the truncation the data fsync above prevents, and some
+        // filesystems refuse fsync on a directory handle outright.
+        if let Some(dir) = self.path.parent() {
+            if let Ok(d) = fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
         Ok(())
     }
 }
