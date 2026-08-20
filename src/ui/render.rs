@@ -4792,7 +4792,7 @@ mod tests {
         let suffix = crate::core::app::PICKER_MISSING_SUFFIX;
         let worst = super::picker_row_body(0, &format!("{longest} {suffix}"));
         assert!(
-            mouse::display_width(&worst) + 1 <= super::ADAPTER_COL,
+            mouse::display_width(&worst) < super::ADAPTER_COL,
             "the worst-case row {worst:?} ({} cols + 1 marker) overflows the column \
 it pads to ({}), so its cwd label would start further right than every other \
 row's — widen ADAPTER_COL",

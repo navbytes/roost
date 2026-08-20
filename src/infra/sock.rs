@@ -283,9 +283,9 @@ struct Msg {
 /// - `Some(Ok(_))` — parsed clean; dispatch as usual.
 fn parse_control(line: &str) -> Option<Result<Request, String>> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    if v.get("method").is_none() {
-        return None;
-    }
+    // A line with no `method` is not a control request at all (it is a
+    // status/session report); `?` here is the same early return.
+    v.get("method")?;
     let req: Request = match serde_json::from_value(v) {
         Ok(req) => req,
         Err(e) => return Some(Err(e.to_string())),

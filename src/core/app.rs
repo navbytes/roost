@@ -2203,7 +2203,7 @@ impl<B: PaneBackend> App<B> {
         cwd: Option<String>,
         initial_input: Option<String>,
     ) -> Reply {
-        if self.registry.get(adapter).is_none() {
+        if !self.registry.contains_key(adapter) {
             return Reply::err(format!("unknown adapter: {adapter}"));
         }
         // QA-2: an explicit --cwd is the one path a caller can name a
@@ -7073,8 +7073,8 @@ fn rotate_audit_log(path: &std::path::Path, max: u64) {
 /// `centered_near` clamps the ask to the body, so the floor can never
 /// overflow a body smaller than the frame it asks for.
 pub fn feed_overlay_size(body: Rect) -> (u16, u16) {
-    let w = body.width.saturating_sub(4).min(72).max(1);
-    let h = body.height.saturating_sub(4).min(16).max(1);
+    let w = body.width.saturating_sub(4).clamp(1, 72);
+    let h = body.height.saturating_sub(4).clamp(1, 16);
     (w, h)
 }
 
@@ -10141,6 +10141,9 @@ mod tests {
         assert!(consumed);
         let (name, lines, row, col) = edit_state(&app);
         assert_eq!((name.as_str(), row, col), ("ab", 1, 0), "descended into the note");
+        // The descend opens an empty note rather than carrying the name into
+        // it — the half this test used to bind and then shadow unread.
+        assert_eq!(lines, vec![String::new()], "the note starts empty");
         type_query(&mut app, "cd");
         let consumed =
             app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
@@ -10148,7 +10151,6 @@ mod tests {
         let (_, lines, row, col) = edit_state(&app);
         assert_eq!(lines, vec!["cd".to_string(), String::new()]);
         assert_eq!((row, col), (2, 0), "split the note line");
-        let _ = lines;
     }
 
     /// C32: the note stops growing at NOTE_MAX_LINES — the split is
