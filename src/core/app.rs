@@ -6499,7 +6499,9 @@ impl<B: PaneBackend> App<B> {
         for rt in self.runtimes.values_mut() {
             rt.hangup();
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Once, for the whole fleet — `hangup` marks each pane so `kill`
+        // does not spend it again per pane (`infra::pty::HANGUP_GRACE`).
+        std::thread::sleep(crate::infra::pty::HANGUP_GRACE);
         for rt in self.runtimes.values_mut() {
             rt.kill();
         }

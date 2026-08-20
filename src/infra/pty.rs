@@ -21,6 +21,33 @@ use crate::ports::{MouseProto, Observation, PaneBackend, PaneEffects};
 
 const SCROLLBACK_LINES: usize = 5000;
 
+/// How long a pane is given to act on SIGHUP before the guaranteed SIGKILL.
+///
+/// Long enough for an agent to flush its final turn to its session file —
+/// the whole reason `hangup` exists — and short enough that closing a pane
+/// still feels like a keystroke. Shared with `App::kill_fleet`, which spends
+/// it **once** for the whole fleet rather than once per pane.
+pub const HANGUP_GRACE: Duration = Duration::from_millis(200);
+
+/// How long `kill` will wait for a SIGKILLed child to become reapable before
+/// leaving the zombie for process exit to collect.
+///
+/// A wall-clock deadline, not a spin count: `sleep(1ms)` on macOS returns
+/// after 3–4 ms, so the previous `for _ in 0..100 { sleep(1ms) }` was a
+/// documented "~100 ms cap" that measured 380 ms — per pane, serially, on
+/// the event loop.
+///
+/// And short, because the long version bought nothing. A SIGKILLed child
+/// that is going to be reapable promptly is so within a step or two; one
+/// that is not — a pane blocked writing to a pty roost has stopped draining
+/// — was measured still unreapable after 380 ms, so waiting longer only
+/// makes quit slower without collecting anything. The zombie it leaves is
+/// harmless and goes when roost's own process does.
+const REAP_BUDGET: Duration = Duration::from_millis(20);
+
+/// Polling step for both waits above.
+const REAP_STEP: Duration = Duration::from_millis(2);
+
 /// How many bytes of input may be waiting for one pane's child before roost
 /// refuses more.
 ///
@@ -571,6 +598,12 @@ pub struct PtyPane {
     /// and be flipped straight back to "dead", or get old bytes rendered into
     /// the new pane.
     alive: Arc<AtomicBool>,
+    /// Has roost already sent this pane SIGHUP and waited for it? Set by
+    /// `hangup`, read by `kill` so the grace is spent exactly once: the
+    /// shutdown path hangs the whole fleet up and waits once
+    /// (`App::kill_fleet`), while the close/respawn path arrives at `kill`
+    /// cold and has to give the same chance itself.
+    hung_up: bool,
 }
 
 impl PtyPane {
@@ -859,6 +892,7 @@ impl PaneBackend for PtyPane {
             last_host_clipboard: None,
             cursor_shape: None,
             alive,
+            hung_up: false,
         })
     }
 
@@ -1018,6 +1052,7 @@ impl PaneBackend for PtyPane {
     }
 
     fn hangup(&mut self) {
+        self.hung_up = true;
         // SIGHUP the child so it exits the way a closed terminal would —
         // giving pi/claude a chance to flush their final turn to the session
         // file — before shutdown escalates to the guaranteed SIGKILL. Mark the
@@ -1036,7 +1071,50 @@ impl PaneBackend for PtyPane {
         // will see EOF the moment the child dies, doesn't emit a stale
         // Exit/Output for an id that may be reused or respawned.
         self.alive.store(false, Ordering::Relaxed);
-        let _ = self.child.kill();
+        // Give the child its chance to flush *only if nobody already has*.
+        // `App::kill_fleet` hangs the whole fleet up and waits `HANGUP_GRACE`
+        // once before it kills anything; the close/respawn path comes
+        // straight here instead, and an agent closed with Alt+w deserves the
+        // same window to write its final turn as one closed by quitting.
+        //
+        // Polled rather than slept flat, so the common case — a shell, which
+        // dies on the hangup at once — costs a step and not the budget.
+        if !self.hung_up {
+            self.hangup();
+            let deadline = Instant::now() + HANGUP_GRACE;
+            while Instant::now() < deadline {
+                if !matches!(self.child.try_wait(), Ok(None)) {
+                    break;
+                }
+                std::thread::sleep(REAP_STEP);
+            }
+        }
+        // SIGKILL the child directly rather than through `Child::kill`.
+        //
+        // portable-pty's `ChildKiller for std::process::Child` is not the
+        // syscall its name suggests: it sends **SIGHUP**, then sleeps in
+        // four 50 ms steps waiting for the process to take the hint, and
+        // only then escalates to SIGKILL. That is a perfectly reasonable
+        // default for a library — and it is the grace period roost has
+        // already given, once, in `App::kill_fleet` (`hangup()` on every
+        // pane, then one shared 200 ms wait). Paying it again, per pane and
+        // serially on the event loop, made quit grow linearly with the
+        // fleet: measured 1.3 s / 1.7 s / 2.5 s / 4.0 s for 1 / 2 / 4 / 8
+        // busy panes, against DESIGN-ui §6's 2 s budget, and it is what
+        // failed that gate on CI (run 32398616684, 2.66 s).
+        //
+        // This is also what this function's own doc has always claimed to
+        // be — "the guaranteed SIGKILL", the escalation after `hangup()`'s
+        // polite one. The hidden second grace was an accident of the
+        // library, not a decision roost made.
+        if let Some(pid) = self.pid {
+            if pid > 1 {
+                // Safety: kill(2) with a pid we own and a plain signal number.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
         // The child is a session/process-group leader (portable-pty setsid's
         // it), so also SIGKILL the whole group — otherwise pi/claude's own
         // subprocesses linger as orphans, and a child that's blocked waiting on
@@ -1085,9 +1163,10 @@ impl PaneBackend for PtyPane {
         // SIGKILL is normally reaped within a millisecond; poll `try_wait`
         // briefly (~100ms cap), then move on. A lingering zombie is harmless
         // (reaped when roost exits) and infinitely preferable to a frozen UI.
-        for _ in 0..100 {
+        let deadline = Instant::now() + REAP_BUDGET;
+        while Instant::now() < deadline {
             match self.child.try_wait() {
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Ok(None) => std::thread::sleep(REAP_STEP),
                 _ => break, // reaped, or errored (already gone)
             }
         }
@@ -1535,6 +1614,79 @@ mod tests {
         assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
         // The first notification of a pane's life is never rate-limited.
         assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+    }
+
+    /// The SIGHUP grace is spent exactly once per pane, whoever spends it.
+    ///
+    /// `App::kill_fleet` hangs the whole fleet up and waits `HANGUP_GRACE`
+    /// once, then kills every pane; `close_pane_id` comes straight to `kill`
+    /// with no hangup at all. Both must give the agent its window to flush a
+    /// final turn, and neither must pay for it twice — which is exactly what
+    /// used to happen, invisibly, because portable-pty's `Child::kill` is
+    /// not a `kill(2)`: it sends SIGHUP and sleeps in four 50 ms steps
+    /// before escalating. Quit therefore grew with the fleet — measured
+    /// 1.3 / 1.7 / 2.5 / 4.0 s for 1 / 2 / 4 / 8 busy panes against
+    /// DESIGN-ui §6's 2 s budget, and it is what failed that gate on CI.
+    ///
+    /// The child here ignores SIGHUP, so the grace is always spent in full
+    /// when it is spent at all — no timing luck in either direction.
+    #[test]
+    fn the_hangup_grace_is_given_once_and_only_by_whoever_owes_it() {
+        use super::HANGUP_GRACE;
+        use crate::agents::CommandSpec;
+        use crate::core::event::AppEvent;
+        use crate::ports::PaneBackend;
+
+        // The child has to have reached its `trap` before either half means
+        // anything — a pane still mid-exec ignores SIGHUP for the wrong
+        // reason.
+        fn settle(pt: &mut super::PtyPane) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                if matches!(pt.child.try_wait(), Ok(None)) && pt.pid.is_some() {
+                    // Running, with a pid to signal: far enough along.
+                    std::thread::sleep(Duration::from_millis(100));
+                    return;
+                }
+            }
+        }
+
+        let deaf = || {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(64);
+            std::thread::spawn(move || while rx.recv().is_ok() {});
+            let spec = CommandSpec::new("sh", &std::env::temp_dir())
+                .arg("-c")
+                .arg("trap '' HUP; sleep 30");
+            super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx).ok()
+        };
+
+        // The close path owes the grace and pays it.
+        let Some(mut cold) = deaf() else {
+            eprintln!("SKIP hangup-grace gate: no pty available");
+            return;
+        };
+        settle(&mut cold);
+        let t = Instant::now();
+        cold.kill();
+        let cold_cost = t.elapsed();
+        assert!(
+            cold_cost >= HANGUP_GRACE,
+            "closing a pane must still give it the hangup window: took {cold_cost:?}"
+        );
+
+        // The shutdown path has already paid it, and must not pay again.
+        let Some(mut warm) = deaf() else { return };
+        settle(&mut warm);
+        warm.hangup();
+        let t = Instant::now();
+        warm.kill();
+        let warm_cost = t.elapsed();
+        assert!(
+            warm_cost < HANGUP_GRACE / 2,
+            "a pane roost has already hung up must go straight to SIGKILL: took {warm_cost:?} \
+             (the grace is {HANGUP_GRACE:?}, and kill_fleet pays it once for the whole fleet)"
+        );
     }
 
     /// The EOF sweep must not depend on winning the reap race.
