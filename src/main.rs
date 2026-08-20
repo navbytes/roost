@@ -734,7 +734,7 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
             .map(|f| f.width)
             .unwrap_or(0);
             if let Some(i) =
-                mouse::tab_at_x(&names, bar_width, status_w, app.ws.active_tab, me.column)
+                mouse::tab_at_x(&names, bar_width, status_w, app.last_save_ok(), app.ws.active_tab, me.column)
             {
                 app.apply(input::Action::GoToTab(i));
             }

@@ -75,6 +75,16 @@ since it names no chord). `main.rs` also now requests a deliberate subset of
 crossterm's mouse-capture modes (C29's own bullet); that is a startup-cost
 change, not a chrome one, and touches no contract's rendered output.
 
+**Amendment 2026-08-20 (reliability audit):** **C2**'s yield ladder is
+amended so that `save failed ✕` outranks tab *names* — the failure was
+previously dropped whole by "tabs win", which on an ordinary terminal with a
+few tabs made a permanently-failing save permanently invisible. The strip
+scrolls under U7 instead, always keeping the active tab, and the indicator
+yields after all rather than empty the bar. No new glyph and no new colour:
+the indicator, its `accent()` styling and its columns are unchanged — only
+which of two existing things yields to the other. Details, including the
+floor case, live in C2's own dated amendment.
+
 ---
 
 ## 1. Design thesis
@@ -366,6 +376,25 @@ at `main.rs:306–309`; tests `mouse.rs:250–269`.
   *visible* tab is clickable. Clicks on the `…` cell or the status area must
   not switch tabs (clamp at the `main.rs:309` call site or inside `tab_at_x`).
   If tabs + status collide, the status area is dropped first (tabs win).
+  **[Amended 2026-08-20 — a failed save outranks tab names.]** "Tabs win" is
+  right for *context* — a cwd, a mode word, `saved ✓` — all of which you can
+  get another way. `save failed ✕` is not context: it is the only standing
+  sign that the workspace on disk is going stale, and this rule dropped it
+  *whole*, so on an ordinary 80-column terminal with five tabs roost could
+  fail every single write and show nothing at all. (The same audit gave
+  `App::save` a C10 flash on the ok→failed transition; that fires once, and a
+  standing signal that vanishes exactly when the terminal is busy is not a
+  standing signal.) On a failed save the ladder therefore inverts: the cwd
+  yields, then the mode word yields (the reverse of U15's usual order —
+  ZOOM/RAW/COPY can be rediscovered by pressing a key, "not reaching disk"
+  cannot), and finally the strip itself yields, scrolling under U7 with its
+  `…` markers rather than the indicator being dropped. The active tab is
+  always among the ones kept, so what is spent is other tabs' names,
+  temporarily and visibly. One floor: if even the active tab could not be
+  drawn beside the indicator, the indicator is dropped after all — a tab bar
+  with no tabs is not a trade worth making, and the flash has already fired.
+  `mouse::effective_status_width` takes `save_ok` and `active` for exactly
+  this; `status_fit` grows one failed-save-only rung.
 - Mouse unit tests (`mouse.rs:250–260`) are rewritten to the new offsets **in
   the same change** as the renderer (lockstep rule, §4).
 

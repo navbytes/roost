@@ -176,8 +176,39 @@ pub fn total_tabs_width(names: &[String]) -> u16 {
 /// status area goes first, freeing its width back to the tabs.
 /// `draw_tab_bar` and `tab_at_x` both derive their layout from this number
 /// so they can't disagree about whether the status area is on screen.
-pub fn effective_status_width(names: &[String], bar_width: u16, status_width: u16) -> u16 {
+///
+/// **[Amended 2026-08-20 — a failed save outranks tab names.]** "Tabs win"
+/// is right for context (a cwd, a mode word, `saved ✓`): those are things
+/// you can get another way. `save failed ✕` is not context, it is the only
+/// standing signal that the workspace on disk is going stale, and it was
+/// being dropped *whole* by this rule — on an ordinary 80-column terminal
+/// with five tabs, roost could fail every single write and show nothing at
+/// all. The C10 flash added alongside this fires once, on the transition;
+/// this is what stays on screen afterwards, and a signal that disappears
+/// exactly when the terminal is busy is not a signal.
+///
+/// So on a failed save the strip yields instead: U7 already scrolls it and
+/// marks each clipped end with `…`, and the *active* tab is always among the
+/// ones kept — so what is lost is other tabs' names, temporarily and
+/// visibly, not the tab you are on. The area is still dropped when even the
+/// active tab could not be drawn beside it: a tab bar with no tabs is not a
+/// trade worth making, and the flash already fired.
+pub fn effective_status_width(
+    names: &[String],
+    bar_width: u16,
+    status_width: u16,
+    save_ok: bool,
+    active: usize,
+) -> u16 {
     if total_tabs_width(names).saturating_add(status_width) <= bar_width {
+        return status_width;
+    }
+    if save_ok {
+        return 0;
+    }
+    // Plus one column for the left `…` the strip needs once it scrolls.
+    let active_w = names.get(active).map(|n| tab_width(active, n)).unwrap_or(0);
+    if bar_width.saturating_sub(status_width) >= active_w.saturating_add(1) {
         status_width
     } else {
         0
@@ -228,8 +259,15 @@ fn tab_scroll_start(names: &[String], budget: u16, active: usize) -> usize {
 /// C2: lay out the tab strip for this bar. `status_width` is the fitted
 /// width of the right status area (`status_fit`), which tabs win against
 /// exactly as before.
-pub fn tab_strip(names: &[String], bar_width: u16, status_width: u16, active: usize) -> TabStrip {
-    let budget = bar_width.saturating_sub(effective_status_width(names, bar_width, status_width));
+pub fn tab_strip(
+    names: &[String],
+    bar_width: u16,
+    status_width: u16,
+    save_ok: bool,
+    active: usize,
+) -> TabStrip {
+    let budget =
+        bar_width.saturating_sub(effective_status_width(names, bar_width, status_width, save_ok, active));
     let start = tab_scroll_start(names, budget, active);
     let x0 = u16::from(start > 0);
     let mut width = x0.min(budget);
@@ -263,10 +301,11 @@ pub fn tab_at_x(
     names: &[String],
     bar_width: u16,
     status_width: u16,
+    save_ok: bool,
     active: usize,
     x: u16,
 ) -> Option<usize> {
-    let strip = tab_strip(names, bar_width, status_width, active);
+    let strip = tab_strip(names, bar_width, status_width, save_ok, active);
     if x < strip.x0 || x >= strip.width {
         return None;
     }
@@ -354,6 +393,19 @@ pub fn status_fit<'a>(
         let width = status_width(m, c, save_ok);
         if tabs.saturating_add(width) <= bar_width {
             return Some(StatusFit { mode: m, cwd: c, width });
+        }
+    }
+    // [Amended 2026-08-20] One more rung, for a failed save only: the bare
+    // indicator, exempt from the fits-alongside-every-tab test above. The
+    // mode word yields to it here — the reverse of U15's usual order, and
+    // deliberately: ZOOM/RAW/COPY is an affordance you can also discover by
+    // pressing a key, while `save failed ✕` is the only standing word for
+    // "what you are doing is not reaching disk". `effective_status_width`
+    // still has the last word on whether there is room to draw it at all.
+    if !save_ok {
+        let width = status_width(None, None, false);
+        if width <= bar_width {
+            return Some(StatusFit { mode: None, cwd: None, width });
         }
     }
     None
@@ -712,12 +764,12 @@ mod tests {
         // Generous bar width, no status area, so this pins the base hit-math
         // with nothing else in play.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 0), Some(0)); // start of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(0)); // last col of tab 0 (its gutter)
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 14), Some(1)); // first col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 26), Some(1)); // last col of tab 1
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 27), None); // past the end
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 200), None);
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 0), Some(0)); // start of tab 0
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 13), Some(0)); // last col of tab 0 (its gutter)
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 14), Some(1)); // first col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 26), Some(1)); // last col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 27), None); // past the end
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 200), None);
     }
 
     /// C2's geometry rule: the count cell is **always** reserved, so a
@@ -745,8 +797,8 @@ mod tests {
         // misindex clicks past the glyph's real width.
         let names = vec!["日本".to_string()];
         assert_eq!(tab_width(0, "日本"), 14);
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(0)); // last col of the tab
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 14), None); // just past it
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 13), Some(0)); // last col of the tab
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 14), None); // just past it
     }
 
     #[test]
@@ -756,8 +808,8 @@ mod tests {
         // tab 1 must start at col 13, not the char-count answer of 12.
         let names = vec!["🦀x".to_string(), "b".to_string()];
         assert_eq!(tab_width(0, "🦀x"), 13);
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 12), Some(0)); // last col of tab 0
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(1)); // first col of tab 1
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 12), Some(0)); // last col of tab 0
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 13), Some(1)); // first col of tab 1
     }
 
     #[test]
@@ -765,9 +817,9 @@ mod tests {
         // +8 with the count cell (2026-07-28): two tabs are 27 cols
         // (14 + 13); a 10-col status area then occupies cols 27..37.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 37, 10, 0, 26), Some(1)); // last tab col
-        assert_eq!(tab_at_x(&names, 37, 10, 0, 27), None); // status area starts here
-        assert_eq!(tab_at_x(&names, 37, 10, 0, 36), None); // status area, last col
+        assert_eq!(tab_at_x(&names, 37, 10, true, 0, 26), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, 37, 10, true, 0, 27), None); // status area starts here
+        assert_eq!(tab_at_x(&names, 37, 10, true, 0, 36), None); // status area, last col
     }
 
     #[test]
@@ -776,8 +828,8 @@ mod tests {
         // status area (27+10=37 > 27) — C2 says the status area drops first,
         // so tab 1 (cols 14..27) stays fully clickable and nothing clips.
         let names = vec!["main".to_string(), "api".to_string()];
-        assert_eq!(tab_at_x(&names, 27, 10, 0, 26), Some(1));
-        assert_eq!(tab_at_x(&names, 27, 10, 0, 27), None); // past both tabs, no status shown
+        assert_eq!(tab_at_x(&names, 27, 10, true, 0, 26), Some(1));
+        assert_eq!(tab_at_x(&names, 27, 10, true, 0, 27), None); // past both tabs, no status shown
     }
 
     #[test]
@@ -787,9 +839,9 @@ mod tests {
         // area fits exactly four tabs (44 cols) before the fifth would
         // overflow, leaving one spare column for the `…` clip marker at 44.
         let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
-        assert_eq!(tab_strip(&names, 45, 0, 0).width, 44);
-        assert_eq!(tab_at_x(&names, 45, 0, 0, 43), Some(3)); // last col of tab 3 (0-based)
-        assert_eq!(tab_at_x(&names, 45, 0, 0, 44), None); // the `…` clip marker
+        assert_eq!(tab_strip(&names, 45, 0, true, 0).width, 44);
+        assert_eq!(tab_at_x(&names, 45, 0, true, 0, 43), Some(3)); // last col of tab 3 (0-based)
+        assert_eq!(tab_at_x(&names, 45, 0, true, 0, 44), None); // the `…` clip marker
     }
 
     #[test]
@@ -823,20 +875,20 @@ mod tests {
     fn the_strip_scrolls_the_least_it_can_to_keep_the_active_tab_visible() {
         let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
         // Tab 0 active: nothing scrolls, four tabs fit (44 of 45 cols).
-        let strip = tab_strip(&names, 45, 0, 0);
+        let strip = tab_strip(&names, 45, 0, true, 0);
         assert_eq!((strip.start, strip.end, strip.x0), (0, 4, 0));
         assert!(!strip.left_marker && strip.right_marker);
         // Tab 3 is the last that fits unscrolled — still no scroll.
-        assert_eq!(tab_strip(&names, 45, 0, 3).start, 0);
+        assert_eq!(tab_strip(&names, 45, 0, true, 3).start, 0);
         // Tab 4 forces it: start=1 (the left `…` costs a column, so tabs
         // 1..4 = 44 + 1 = 45 <= 45). The window now fills the bar exactly, so
         // the *trailing* marker yields — it is opportunistic by contract and
         // may never displace a tab (C2, U7 amendment).
-        let strip = tab_strip(&names, 45, 0, 4);
+        let strip = tab_strip(&names, 45, 0, true, 4);
         assert_eq!((strip.start, strip.end, strip.x0), (1, 5, 1));
         assert!(strip.left_marker && !strip.right_marker);
         // The last tab (index 9, a 12-col label) is reachable and drawn.
-        let strip = tab_strip(&names, 45, 0, 9);
+        let strip = tab_strip(&names, 45, 0, true, 9);
         assert!(strip.end == names.len(), "the active tab must be inside the window");
         assert!(strip.start > 0 && strip.left_marker);
         assert!(!strip.right_marker, "nothing is hidden past the last tab");
@@ -850,7 +902,7 @@ mod tests {
         let names: Vec<String> = (0..12).map(|i| format!("tab{i}")).collect();
         for active in 0..names.len() {
             for bar in 12..=140u16 {
-                let strip = tab_strip(&names, bar, 0, active);
+                let strip = tab_strip(&names, bar, 0, true, active);
                 let fits_one = tab_width(active, &names[active]) + strip.x0 <= bar;
                 if fits_one {
                     assert!(
@@ -871,18 +923,18 @@ mod tests {
     #[test]
     fn clicks_land_on_the_scrolled_strips_real_tab_indexes() {
         let names: Vec<String> = "abcdefghij".chars().map(|c| c.to_string()).collect();
-        let strip = tab_strip(&names, 45, 0, 4);
+        let strip = tab_strip(&names, 45, 0, true, 4);
         assert_eq!((strip.start, strip.x0), (1, 1));
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 0), None, "the left `…` is not a tab");
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 1), Some(1), "first drawn tab, at its real index");
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 11), Some(1), "...through its last column");
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 12), Some(2));
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 34), Some(4), "the active tab is clickable");
-        assert_eq!(tab_at_x(&names, 45, 0, 4, 44), Some(4), "...to its last column");
+        assert_eq!(tab_at_x(&names, 45, 0, true, 4, 0), None, "the left `…` is not a tab");
+        assert_eq!(tab_at_x(&names, 45, 0, true, 4, 1), Some(1), "first drawn tab, at its real index");
+        assert_eq!(tab_at_x(&names, 45, 0, true, 4, 11), Some(1), "...through its last column");
+        assert_eq!(tab_at_x(&names, 45, 0, true, 4, 12), Some(2));
+        assert_eq!(tab_at_x(&names, 45, 0, true, 4, 34), Some(4), "the active tab is clickable");
+        assert_eq!(tab_at_x(&names, 45, 0, true, 4, 44), Some(4), "...to its last column");
         // Exhaustive agreement with the drawn strip: every column either
         // maps to a tab inside the window, or to nothing.
         for x in 0..45u16 {
-            match tab_at_x(&names, 45, 0, 4, x) {
+            match tab_at_x(&names, 45, 0, true, 4, x) {
                 Some(i) => assert!((strip.start..strip.end).contains(&i), "x={x} hit tab {i}"),
                 None => assert!(x < strip.x0 || x >= strip.width, "x={x} should have hit a tab"),
             }
@@ -950,8 +1002,8 @@ mod tests {
         let names = vec!["main".to_string(), "api".to_string()]; // tabs: 0..27
         let bar = total_tabs_width(&names) + status_width(Some("ZOOM"), None, true);
         let fit = status_fit(Some("ZOOM"), None, true, &names, bar).unwrap();
-        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 26), Some(1)); // last tab col
-        assert_eq!(tab_at_x(&names, bar, fit.width, 0, 27), None); // status area
+        assert_eq!(tab_at_x(&names, bar, fit.width, true, 0, 26), Some(1)); // last tab col
+        assert_eq!(tab_at_x(&names, bar, fit.width, true, 0, 27), None); // status area
     }
 
     #[test]
@@ -960,10 +1012,10 @@ mod tests {
         // fixed cols = 14, occupying the whole visible width.
         let names = vec!["solo".to_string()];
         assert_eq!(tab_width(0, "solo"), 14);
-        assert_eq!(tab_strip(&names, 100, 0, 0).width, 14);
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 0), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 13), Some(0));
-        assert_eq!(tab_at_x(&names, 100, 0, 0, 14), None); // just past the only tab
+        assert_eq!(tab_strip(&names, 100, 0, true, 0).width, 14);
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 0), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 13), Some(0));
+        assert_eq!(tab_at_x(&names, 100, 0, true, 0, 14), None); // just past the only tab
     }
 
     #[test]
@@ -972,10 +1024,80 @@ mod tests {
         // math (which never divides) doesn't panic on the degenerate input.
         let none: Vec<String> = vec![];
         assert_eq!(total_tabs_width(&none), 0);
-        assert_eq!(tab_at_x(&none, 40, 0, 0, 0), None);
+        assert_eq!(tab_at_x(&none, 40, 0, true, 0, 0), None);
 
         let one = vec!["solo".to_string()];
-        assert_eq!(tab_strip(&one, 0, 0, 0).width, 0);
-        assert_eq!(tab_at_x(&one, 0, 0, 0, 0), None);
+        assert_eq!(tab_strip(&one, 0, 0, true, 0).width, 0);
+        assert_eq!(tab_at_x(&one, 0, 0, true, 0, 0), None);
     }
+
+    /// C2 amendment (2026-08-20): "tabs win" holds for context, not for a
+    /// failed save.
+    ///
+    /// The exact shape that made this a real loss: a bar too narrow for
+    /// tabs + status, so the old rule dropped the status area whole and the
+    /// only standing sign that writes were failing vanished — on an
+    /// ordinary terminal with a handful of tabs, permanently.
+    #[test]
+    fn a_failed_save_is_not_dropped_to_make_room_for_tab_names() {
+        let names: Vec<String> =
+            ["main", "api", "web", "jobs", "docs"].iter().map(|s| s.to_string()).collect();
+        // Narrow enough that everything cannot coexist...
+        let bar = total_tabs_width(&names) - 4;
+        let ok_w = status_width(None, Some("~/work"), true);
+        let fail_w = status_width(None, None, false);
+
+        assert_eq!(
+            effective_status_width(&names, bar, ok_w, true, 0),
+            0,
+            "a healthy status area still yields to the tabs",
+        );
+        assert_eq!(
+            effective_status_width(&names, bar, fail_w, false, 0),
+            fail_w,
+            "the failure indicator must survive the same squeeze",
+        );
+
+        // ...and what pays for it is other tabs' names, never the tab you
+        // are on: the strip scrolls (U7) and keeps the active tab drawn.
+        let active = 4;
+        let strip = tab_strip(&names, bar, fail_w, false, active);
+        assert!(
+            (strip.start..strip.end).contains(&active),
+            "the active tab was scrolled off to make room: {strip:?}",
+        );
+    }
+
+    /// The floor: a bar so narrow that keeping the indicator would leave no
+    /// tab drawn at all. A tab bar with no tabs is not a trade worth making
+    /// — and the C10 flash has already fired on the transition.
+    #[test]
+    fn the_failure_indicator_still_yields_rather_than_empty_the_bar() {
+        let names = vec!["main".to_string()];
+        let fail_w = status_width(None, None, false);
+        let bar = fail_w + 2; // nowhere near enough for "1 main" beside it
+        assert_eq!(effective_status_width(&names, bar, fail_w, false, 0), 0);
+    }
+
+    /// The status ladder's last rung, failed-save only: the mode word yields
+    /// to the indicator — the reverse of U15's usual order, because
+    /// ZOOM/RAW/COPY can be rediscovered by pressing a key and "not reaching
+    /// disk" cannot.
+    #[test]
+    fn a_failed_save_outranks_even_the_mode_word() {
+        let names: Vec<String> =
+            ["main", "api", "web", "jobs"].iter().map(|s| s.to_string()).collect();
+        let bar = total_tabs_width(&names) + status_width(None, None, false);
+
+        let fit = status_fit(Some("ZOOM"), Some("~/work"), false, &names, bar)
+            .expect("the indicator fits once everything else has yielded");
+        assert_eq!(fit.mode, None, "the mode word yielded");
+        assert_eq!(fit.cwd, None, "the cwd yielded first");
+        assert_eq!(fit.width, status_width(None, None, false));
+
+        // Same width, healthy save: the area is dropped whole instead —
+        // nothing here is worth taking a tab's columns for.
+        assert_eq!(status_fit(Some("ZOOM"), Some("~/work"), true, &names, bar - 4), None);
+    }
+
 }

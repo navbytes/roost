@@ -1859,10 +1859,10 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner
     let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
     let fit = mouse::status_fit(tab_status_word(app), cwd.as_deref(), saved, &names, area.width);
     let status_w = fit.map(|f| f.width).unwrap_or(0);
-    let show_status = mouse::effective_status_width(&names, area.width, status_w) > 0;
+    let show_status = mouse::effective_status_width(&names, area.width, status_w, saved, app.ws.active_tab) > 0;
     // U7: the drawn window — scrolled so the active tab is always visible.
     // `tab_at_x` reads the same layout, so hitboxes follow the scroll.
-    let strip = mouse::tab_strip(&names, area.width, status_w, app.ws.active_tab);
+    let strip = mouse::tab_strip(&names, area.width, status_w, saved, app.ws.active_tab);
 
     let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 4);
     let mut used = 0u16;
