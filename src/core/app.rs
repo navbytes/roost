@@ -968,11 +968,34 @@ impl<B: PaneBackend> App<B> {
     /// outside `ws.tabs` — `ws.next_pane_id()` alone would eventually let a
     /// split reuse its id. The one allocator every spawn path goes through.
     fn alloc_pane_id(&self) -> PaneId {
+        // `next_pane_id` scans **live tabs**. Two other places own ids that
+        // are not in a live tab, and both must be counted or the id gets
+        // handed out twice.
         let base = self.ws.next_pane_id();
-        match &self.float {
+        let base = match &self.float {
             Some(f) => base.max(f.id + 1),
             None => base,
-        }
+        };
+        // The undo stack. A parked `Closed::Tab` is re-inserted **verbatim,
+        // with its original pane ids** (`undo_close`), and `spawn_active_tab`
+        // then builds runtimes for them — so if one of those ids has since
+        // been reissued, reopening the tab silently clobbers the live pane's
+        // entry in `runtimes`, `tokens`, `dead`, `pending_input` and `raw`,
+        // all of which are keyed by `PaneId` across every tab. Two panes end
+        // up on one PTY and one auth token.
+        //
+        // `Closed::Pane` needs no such guard: it stores only a `PaneSpec`
+        // (which carries no id) and `restore_pane` allocates a fresh one.
+        let parked = self
+            .undo
+            .iter()
+            .filter_map(|c| match c {
+                Closed::Tab { tab, .. } => tab.panes.keys().max().map(|id| id + 1),
+                Closed::Pane { .. } => None,
+            })
+            .max()
+            .unwrap_or(0);
+        base.max(parked)
     }
 
     /// Is `id` the float's pane?
@@ -11323,6 +11346,70 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pane id parked on the undo stack must not be handed out again.
+    ///
+    /// `Workspace::next_pane_id` takes the max over **live tabs only**, and
+    /// `alloc_pane_id` additionally guards the float — but a tab sitting on
+    /// the undo stack still owns its pane ids, and nothing accounts for
+    /// them. Close a tab, open enough panes to reach its ids, then `Alt+u`:
+    /// the restored tab's panes collide with live ones.
+    ///
+    /// That is not cosmetic. `App::runtimes` is keyed by `PaneId` **across
+    /// all tabs**, as are `tokens`, `dead`, `pending_input` and `raw` — so
+    /// two panes sharing an id share one PTY, one auth token and one
+    /// status. Keystrokes meant for one reach the other.
+    #[test]
+    fn a_pane_id_parked_on_the_undo_stack_is_never_reused() {
+        let (mut app, _) = mk_app(shell_ws());
+        // A second tab, so closing it parks a whole Tab on the undo stack.
+        app.apply(Action::NewTab);
+        let parked: Vec<PaneId> =
+            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        assert!(!parked.is_empty(), "the new tab has a pane");
+
+        // Close it: its last pane going means the tab is parked whole.
+        for id in &parked {
+            app.close_pane_id(*id);
+        }
+        assert_eq!(app.ws.tabs.len(), 1, "the tab is gone");
+
+        // Now open panes until we would reach the parked ids.
+        for _ in 0..parked.len() + 2 {
+            app.apply(Action::NewPane);
+        }
+        let live: Vec<PaneId> = app
+            .ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.keys().copied())
+            .collect();
+        for id in &parked {
+            assert!(
+                !live.contains(id),
+                "pane id {id} is parked on the undo stack and was handed out again — \
+                 restoring that tab would put two panes on one runtime. live={live:?}",
+            );
+        }
+
+        // And the consequence, so the claim above is demonstrated rather
+        // than asserted: reopening puts the tab back with its original ids.
+        app.apply(Action::Undo);
+        let mut seen: HashMap<PaneId, usize> = HashMap::new();
+        for t in &app.ws.tabs {
+            for id in t.panes.keys() {
+                *seen.entry(*id).or_insert(0) += 1;
+            }
+        }
+        let dupes: Vec<PaneId> =
+            seen.iter().filter(|(_, n)| **n > 1).map(|(id, _)| *id).collect();
+        assert!(
+            dupes.is_empty(),
+            "after reopening, pane id(s) {dupes:?} exist in two tabs at once — \
+             `runtimes`, `tokens` and `dead` are all keyed by PaneId across tabs, \
+             so those panes share one PTY and one auth token",
+        );
     }
 
     /// The promotion floor must never be *loosened* by a later promotion.
