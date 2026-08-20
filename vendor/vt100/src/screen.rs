@@ -570,11 +570,24 @@ impl Screen {
             // don't even try to draw control characters
             return;
         }
-        let width = width
+        let width: u16 = width
             .unwrap_or(1)
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+        // roost hardening: a wide char needs a continuation cell to its
+        // right, and every invariant below (and `Cell::set`, which marks the
+        // cell wide from the char alone) assumes that cell exists. In a
+        // 1-column grid it does not: `col_wrap` cannot make room, so the
+        // draw ran off the end and `drawing_cell(pos).unwrap()` panicked —
+        // which unwinds out of the event loop past `App::shutdown`, killing
+        // roost and leaving every agent running. A pane one column wide is
+        // reachable by dragging a terminal narrow, and any emoji or CJK
+        // glyph in it was enough. Real terminals cannot show the glyph
+        // either; dropping it is the honest degradation.
+        if width > size.cols {
+            return;
+        }
 
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
