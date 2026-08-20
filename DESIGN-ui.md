@@ -5088,17 +5088,42 @@ lockstep, applied to a modal's own heading.
   variant without weakening `every_mode()`'s duplicate check, which is what
   makes its exhaustive `match` mean anything.
 
-**Not in scope.** The report's other half — ordering the groups by context,
-so a dead-focused pane's overlay leads with the dead-pane verbs — is
-deliberately not built here. Its headline case ("copy mode leads with
-READING") is **unreachable**: C24b's escape hatch sets `mode = Normal`
-before `Action::Help` runs, so `Mode::Help` never learns what it was
-entered from, and `selection` is cleared on the way too (verified, not
-reasoned). Making it reachable means threading a predecessor mode through
-the escape hatch contracted the same day. The *workspace*-state half (a dead
-focused pane) needs none of that and stays available; it is simply a much
-smaller win than filtering, and worth its own decision rather than a
-tail-end of this one.
+**[Amended 2026-08-20] The dead-pane keys join the table.** `↵` relaunch,
+`f` fresh and `y` copy-resume are **bare keys, not Alt chords** —
+`main.rs` claims them out of `InputResult::Forward` while the focused pane
+is dead — so §8 has no row for them and C34's chord sweep cannot reach
+them. The C9 bar advertised them and nothing else did: P21's case verbatim
+("a search nothing advertises is a search nobody finds"), on the one
+surface whose job is to prevent it. They now ride one row in `PANES`, next
+to the other recovery verb, which is how C15 has always absorbed a
+mode-local non-Alt key.
+
+`y` is listed unconditionally although the bar shows it only when there is
+a session to resume. The overlay is the whole keymap, not the keymap for
+this instant, and every other row here documents a key whose effect depends
+on context.
+
+`the_overlay_teaches_every_key_the_dead_pane_bar_advertises` is keyed off
+the **bar**, not a written list, because the bar is where a new dead-pane
+key would appear first. It fails both ways: dropping the overlay row, and
+adding a bar key with no row.
+
+**Not in scope.** The report's other half — ordering the groups by context
+— is deliberately not built. Two separate reasons, and both are worth
+recording because the report proposed it as the cheap alternative:
+
+- Its headline case ("copy mode leads with READING") is **unreachable**.
+  C24b's escape hatch sets `mode = Normal` before `Action::Help` runs, so
+  `Mode::Help` never learns what it was entered from, and `selection` is
+  cleared on the way too (verified against the running code, not reasoned).
+  Making it reachable means threading a predecessor mode through the escape
+  hatch contracted the same day.
+- Its *reachable* case — a dead focused pane — turns out to be a **no-op**.
+  `PANES` already leads `HELP_GROUPS`, and it already holds every overlay
+  row a dead pane cares about. Reordering would change nothing on screen.
+  What was actually missing there was not an order but a *row*, which is
+  the amendment above. Found by checking whether the reordering would do
+  anything before building it.
 
 ### On gates that pass by construction
 **[Added 2026-08-20, after the sixth instance]**

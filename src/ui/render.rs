@@ -1154,6 +1154,24 @@ const HELP_GROUPS: &[HelpGroup] = &[
             chords(&[Action::EditPane], "name + parking note (first line shows on the badge)"),
             chords(&[Action::ClosePane], "close pane (confirm if busy)"),
             chords(&[Action::Undo], "reopen the last pane or tab you closed"),
+            // [F9] The dead-pane keys, which the overlay did not teach at
+            // all. They are bare keys rather than Alt chords — `main.rs`
+            // claims them from `InputResult::Forward` while the focused
+            // pane is dead — so §8 has no row for them and the C34 sweep
+            // does not cover them; the C9 bar advertised them and nothing
+            // else did. That is P21's case verbatim ("a search nothing
+            // advertises is a search nobody finds"), and C15 answered it
+            // the same way: fold the mode-local keys into the group that
+            // owns them, next to the other recovery verb.
+            //
+            // `y` is listed unconditionally though the bar shows it only
+            // when there is a session to resume: the overlay is the whole
+            // keymap, not the keymap for this instant, and every other row
+            // here documents a key whose effect depends on context.
+            HelpRow {
+                key: HelpKey::Text("↵ / f / y"),
+                desc: "dead pane: relaunch · fresh (drops resume) · copy resume",
+            },
             chords(&[Action::ToggleRaw], "raw pass-through for this pane (same chord exits)"),
         ],
     },
@@ -4444,6 +4462,46 @@ mod tests {
         assert_eq!(marker.content.as_ref(), " ");
         assert_eq!(style, theme::quiet());
     }
+    /// [F9] Every key the dead-pane hint bar advertises is taught by the
+    /// overlay too.
+    ///
+    /// The dead-pane keys (`↵` relaunch, `f` fresh, `y` copy resume) are
+    /// bare keys, not Alt chords — `main.rs` claims them out of
+    /// `InputResult::Forward` while the focused pane is dead — so §8 has no
+    /// row for them and C34's chord sweep does not reach them. They were
+    /// advertised on the C9 bar and documented nowhere else: P21's case
+    /// verbatim, and the one C15 exists to prevent.
+    ///
+    /// This is the gate that would have caught it, and it is deliberately
+    /// keyed off the **bar** rather than a written list — the bar is where
+    /// a new dead-pane key would appear first.
+    #[test]
+    fn the_overlay_teaches_every_key_the_dead_pane_bar_advertises() {
+        let bar = hint_pairs(&Mode::Normal, true, false, true, false);
+        let keys: Vec<String> = bar
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| !k.starts_with("Alt+")) // Alt chords are C34's sweep
+            .collect();
+        assert!(!keys.is_empty(), "the dead-pane bar must actually be the dead-pane bar");
+
+        let overlay: String = help_lines(&Keymap::default(), "")
+            .iter()
+            .map(|l| match l {
+                HelpLine::Row(k, d) => format!("{k} {d}"),
+                HelpLine::Head(h) => h.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for k in keys {
+            assert!(
+                overlay.contains(&k),
+                "the dead-pane bar offers {k:?} and the overlay never mentions it — \
+                 a key nothing but the bar advertises is a key nobody finds (P21)",
+            );
+        }
+    }
+
     /// [F9] The query actually narrows the table, matching on **both**
     /// columns, and an empty query changes nothing at all.
     #[test]
