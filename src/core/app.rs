@@ -11442,6 +11442,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// C22: the float lives outside every tab's layout tree — including
+    /// when its id comes from the same pool a parked tab's panes do.
+    ///
+    /// `alloc_pane_id` guards the float and the undo stack separately; this
+    /// is the crossing case. Close a tab (parking its ids), open the float,
+    /// then reopen the tab: if the float took an id the tab is about to
+    /// bring back, `is_float` becomes true for a real tiled pane and both
+    /// share one entry in `runtimes`.
+    #[test]
+    fn the_float_never_takes_an_id_a_parked_tab_will_bring_back() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let parked: Vec<PaneId> =
+            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        for id in &parked {
+            app.close_pane_id(*id);
+        }
+        app.apply(Action::ToggleFloat);
+        let float_id = app.float.as_ref().expect("the float is up").id;
+        assert!(
+            !parked.contains(&float_id),
+            "the float took id {float_id}, which the parked tab still owns",
+        );
+
+        app.apply(Action::Undo);
+        let tree: Vec<PaneId> =
+            app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+        assert!(
+            !tree.contains(&float_id),
+            "C22: the float's id {float_id} is now a tiled pane too — tree {tree:?}",
+        );
+    }
+
     /// One principal must not be able to deny `wait` to the whole fleet.
     ///
     /// A parked waiter is freed only by firing or timing out — nothing
