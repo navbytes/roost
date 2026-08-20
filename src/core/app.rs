@@ -2241,8 +2241,19 @@ impl<B: PaneBackend> App<B> {
             Actor::Fleet | Actor::Local => None,
             Actor::Pane(a) => Some(a),
         };
+        // A control spawn must leave the human's view exactly as it found
+        // it — including the float. `spawn_child` focuses the pane it
+        // creates, and C22 rule 1 (enforced in `set_focus`) takes the float
+        // down when focus leaves it, so restoring `focused` alone put focus
+        // back on a float that was now hidden: a state the model does not
+        // have, and one `cycle_layout` then planted into the tab's layout
+        // tree as a pane with no spec. Save and restore both halves.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
+        let float_shown = self.float.as_ref().is_some_and(|f| f.shown);
         let id = self.spawn_child(adapter, cwd, owner);
+        if let Some(f) = &mut self.float {
+            f.shown = float_shown;
+        }
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
@@ -11710,6 +11721,53 @@ mod tests {
                     app.focused,
                 );
             }
+        }
+    }
+
+    /// A control spawn borrows focus and gives it back. It must give back
+    /// the float's visibility with it, or the pair ends up in a state the
+    /// model does not have: hidden and focused at the same time.
+    ///
+    /// From there `cycle_layout` — which arranges `pane_order()` around
+    /// whatever is focused — planted the float's id into the tab's layout
+    /// tree as a pane with no spec.
+    #[test]
+    fn a_control_spawn_gives_back_the_float_it_borrowed_focus_from() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        let ct = app.control_token().to_string();
+        app.handle_control(crate::core::control::Request {
+            token: ct,
+            method: crate::core::control::Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+            },
+        });
+
+        assert_eq!(app.focused, float_id, "focus was borrowed, not taken");
+        assert!(
+            app.float.as_ref().is_some_and(|f| f.shown),
+            "the float is focused but no longer drawn",
+        );
+
+        // The state that used to leak: a hidden-but-focused float becomes a
+        // ghost pane in the tree the moment anything arranges by focus.
+        app.apply(Action::CycleLayout { forward: true });
+        let tree: Vec<PaneId> = {
+            let mut v = Vec::new();
+            layout::pane_order(&app.ws.active_tab().layout, &mut v);
+            v
+        };
+        for id in &tree {
+            assert!(
+                app.ws.active_tab().panes.contains_key(id),
+                "pane {id} is in the tree with no spec — tree {tree:?}",
+            );
         }
     }
 
