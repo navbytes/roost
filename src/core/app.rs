@@ -11257,7 +11257,7 @@ mod tests {
         // ShellAdapter resolves an absolute $SHELL (or /bin/bash fallback)
         // path directly, not via a $PATH scan — real, unmodified, and
         // guaranteed to exist on any machine this suite already assumes one
-        // on (session_members's pgrep, every shell-spawning test, ...).
+        // on (the harness's `pgrep -P`, every shell-spawning test, ...).
         let shell_at = crate::agents::picker_ids().iter().position(|&id| id == "shell").unwrap();
         assert_eq!(rows[shell_at], "shell", "resolved via an absolute path, not $PATH");
         assert_eq!(spawned, Some("pi".to_string()), "launch used the raw id, not the annotated text");

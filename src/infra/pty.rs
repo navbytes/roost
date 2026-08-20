@@ -371,12 +371,30 @@ fn scrub_control_env(cmd: &mut CommandBuilder) {
 /// session" the one net wide enough to catch a backgrounded job, which is in
 /// neither the pane's process group nor the terminal's foreground group.
 ///
-/// Linux reads `/proc` directly: no subprocess in a teardown path, and no
-/// dependency on a `pgrep` binary being installed. Elsewhere (macOS has no
-/// `/proc`) it shells out to `pgrep -s`, which BSD and Linux both support.
-/// Either way a failure yields an empty list — the group kill above still
-/// happened, and a sweep that cannot enumerate must not block the quit.
+/// Linux reads `/proc` directly and macOS asks the kernel
+/// (`proc_listpids` + `getsid`): no subprocess in a teardown path, and no
+/// dependency on an external binary. Only a third platform still shells out
+/// to `pgrep -s`. Either way a failure yields an empty list — the group kill
+/// above still happened, and a sweep that cannot enumerate must not block
+/// the quit.
+///
+/// **macOS used to shell out here too, and it never once worked**: BSD
+/// `pgrep` has a `-s`, but Apple's does not (`pgrep: illegal option -- s`,
+/// exit 2, nothing on stdout), so the sweep silently enumerated nothing on
+/// the one platform roost is developed on. Every backgrounded job outlived
+/// its pane — closing it, respawning over it, and quitting roost entirely —
+/// which is what `tests/orphan_after_exit.rs` was failing on.
 fn session_members(sid: u32) -> Vec<u32> {
+    // A sid of 0 or 1 is not a pane's session and never can be: `setsid`
+    // makes the pane's own child the leader, so the sid is its pid. Were one
+    // to arrive anyway (a `process_id()` that answered 1, a future caller
+    // passing a default), the scans below would happily return *init's whole
+    // session* — i.e. the machine — and every caller here follows this list
+    // straight into `SIGKILL`. Refuse at the one place they all route
+    // through rather than at each of them.
+    if sid <= 1 {
+        return Vec::new();
+    }
     #[cfg(target_os = "linux")]
     {
         let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
@@ -401,7 +419,21 @@ fn session_members(sid: u32) -> Vec<u32> {
         }
         out
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // `getsid(2)` answers the session question for any pid we can see,
+        // dead leader or not — so the net is: every live pid, keep the ones
+        // whose session is ours. ~1900 pids on a busy Mac, one cheap syscall
+        // each, and only on a pane teardown.
+        all_pids()
+            .into_iter()
+            .filter(|p| *p != sid)
+            // SAFETY: getsid(2) with a plain pid; -1 on a pid that vanished
+            // between the listing and here, which simply doesn't match.
+            .filter(|p| unsafe { libc::getsid(*p as libc::pid_t) } == sid as libc::pid_t)
+            .collect()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let Ok(out) = std::process::Command::new("pgrep").arg("-s").arg(sid.to_string()).output()
         else {
@@ -413,6 +445,40 @@ fn session_members(sid: u32) -> Vec<u32> {
             .filter(|p| *p != sid)
             .collect()
     }
+}
+
+/// Every pid on the machine, via libproc. Empty on any failure — a sweep
+/// that cannot enumerate must not block the quit.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<u32> {
+    /// `PROC_ALL_PIDS` from `<libproc.h>`; the libc crate binds the function
+    /// but not this selector.
+    const PROC_ALL_PIDS: u32 = 1;
+    // A NULL buffer asks for the size, in bytes, the kernel would fill.
+    // SAFETY: the documented sizing call.
+    let want = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if want <= 0 {
+        return Vec::new();
+    }
+    // Slack for processes that start between the sizing call and the fill.
+    let mut buf = vec![0i32; want as usize / std::mem::size_of::<i32>() + 64];
+    // SAFETY: out-buffer of exactly the byte length we declare.
+    let got = unsafe {
+        libc::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            std::mem::size_of_val(buf.as_slice()) as libc::c_int,
+        )
+    };
+    if got <= 0 {
+        return Vec::new();
+    }
+    // This call reports *bytes* written (unlike `proc_listchildpids`, which
+    // reports a count) — but the `> 0` filter makes either reading safe,
+    // since an over-read only ever reaches the zeroed tail.
+    let n = (got as usize / std::mem::size_of::<i32>()).min(buf.len());
+    buf[..n].iter().filter(|p| **p > 0).map(|p| *p as u32).collect()
 }
 
 pub struct PtyPane {
@@ -1762,5 +1828,16 @@ mod tests {
         );
 
         pt.kill();
+    }
+
+    /// Every caller of `session_members` walks its result straight into
+    /// `SIGKILL`, so a sid that names init's session — the one every daemon
+    /// on the machine belongs to — must come back empty rather than come
+    /// back enormous. (Without the guard this returns hundreds of pids on
+    /// both supported platforms.)
+    #[test]
+    fn the_session_sweep_refuses_to_enumerate_inits_session() {
+        assert!(super::session_members(1).is_empty(), "sid 1 is init's session");
+        assert!(super::session_members(0).is_empty(), "sid 0 is not a session at all");
     }
 }
