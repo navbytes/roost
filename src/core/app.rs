@@ -6415,9 +6415,21 @@ fn rotate_audit_log(path: &std::path::Path, max: u64) {
 /// (C27), deliberately the same function so toggling between the two never
 /// resizes the frame. Pure so the 72×16 formula is unit-tested without a
 /// `Frame`.
+///
+/// **Floored at one cell in each axis.** The `saturating_sub(4)` reached 0
+/// on a body four rows tall — a terminal six rows tall, since the tab bar
+/// and hint bar take two — and a zero-height dialog draws *nothing*: no
+/// border, no title, no rows. The chord still flipped the mode word to
+/// `FEED`/`ROSTER` and the hint bar still offered `↑↓ select`, so pressing
+/// Alt+e or Alt+Shift+a at a small terminal changed one word on screen and
+/// left everything else alone — indistinguishable from a binding that does
+/// not work. The picker already had the answer, in `dialog_rect`: "an empty
+/// result still needs a frame to say so". These two never adopted it.
+/// `centered_near` clamps the ask to the body, so the floor can never
+/// overflow a body smaller than the frame it asks for.
 pub fn feed_overlay_size(body: Rect) -> (u16, u16) {
-    let w = body.width.saturating_sub(4).min(72);
-    let h = body.height.saturating_sub(4).min(16);
+    let w = body.width.saturating_sub(4).min(72).max(1);
+    let h = body.height.saturating_sub(4).min(16).max(1);
     (w, h)
 }
 
@@ -14008,6 +14020,36 @@ mod tests {
     #[test]
     fn feed_overlay_size_clamps_on_a_tiny_body() {
         assert_eq!(feed_overlay_size(Rect::new(0, 1, 20, 6)), (16, 2));
+    }
+
+    /// C12/C27: the feed and roster never resolve to a **zero-sized** rect.
+    /// `saturating_sub(4)` reached 0 at a body four rows tall — a terminal
+    /// six rows tall, since the tab bar and hint bar take two — and a
+    /// zero-height dialog draws nothing at all. The chord still flipped the
+    /// mode word to `FEED`/`ROSTER` and the hint bar still offered
+    /// `↑↓ select`, so pressing Alt+e or Alt+Shift+a at a small terminal
+    /// changed one word on screen and nothing else: indistinguishable from
+    /// a broken binding. The picker had the answer already ("an empty
+    /// result still needs a frame to say so", `dialog_rect`); these two
+    /// were the surfaces that never adopted it. Found by a simulation agent
+    /// sweeping terminal sizes, which pinned the cutoff at height 6.
+    #[test]
+    fn the_fleet_overlays_always_have_a_frame_to_say_so_with() {
+        // A body with no cells is C30's territory (`draw_too_small`
+        // pre-empts the whole chrome below two rows), and nothing can be
+        // drawn there by anyone — so the invariant starts at one cell.
+        for h in 1..12u16 {
+            for w in 1..12u16 {
+                let (ow, oh) = feed_overlay_size(Rect::new(0, 0, w, h));
+                assert!(
+                    ow >= 1 && oh >= 1,
+                    "a {w}x{h} body gives a {ow}x{oh} overlay — it would draw nothing",
+                );
+                // And it never asks for more than the body can hold, which
+                // is what kept `centered_near`'s clamp arithmetic safe.
+                assert!(ow <= w && oh <= h, "{w}x{h} → {ow}x{oh} overflows the body");
+            }
+        }
     }
 
     // -- C22 floating scratch pane --------------------------------------------

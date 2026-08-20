@@ -1780,6 +1780,33 @@ chrome.
   A 0-height area test is implicitly covered by the `if area.height == 0`
   guard at `:92`.
 
+**[Amended 2026-08-20, floor stress — the key column must end in a space]**
+`draw_help_columns` draws a row as **two adjacent spans**, the key prefix
+and the description, with nothing between them: all the separation there is
+comes from the prefix's own padding. That padding was `format!(" {key:<18}")`
+— a *minimum* width, not a column. A key 18 cells or wider gets padded by
+nothing, and the description fuses straight onto it.
+
+It was already visible on the **default keymap**, in the group this
+contract's own PR #42 amendment added: `roost send <id> "text"` is 22 cells,
+and the row rendered `roost send <id> "text"type into that pane`. C34 then
+made the key column keymap-derived, so an enumerated family reaches 24 and
+`Alt+← / Alt+↓ / Alt+j …move focus (…)` joined it. Neither is a clipping
+failure — the 80-column floor holds in both cases — which is why the floor
+tests never saw it: the row *fits*, it just isn't readable.
+
+**Rule:** a key column always ends in at least one space. Pad to the
+18-column grid when the key fits it, otherwise exactly one space. Rows under
+18 render byte-identically to before; only the ones that were unreadable
+move. `elide_key` and `help_content_width` both measure through
+`help_key_prefix`, so the extra column is inside the floor rather than
+smuggled past it. Pinned by `a_key_column_never_fuses_to_its_description`,
+which sweeps the same remaps the C34 audit measured — and asserts the
+*separator*, not the width, because width was never the thing that broke.
+
+Found by a simulation agent stressing the design floor, which is where the
+fusion is ugliest but not where it lives: it happens at every terminal size.
+
 ### C16 — Dead-pane overlay
 
 **Current:** `render.rs:387–403` — error line Red fg; action bar Black on Red.
@@ -2100,6 +2127,30 @@ frame `accent()` border with an `ink()` title over a `DIM` backdrop;
 timestamps and ordinary text `quiet()`; a NeedsInput line's text `ink()` with
 an `accent()` `◆ ` prefix; the U25 selection marker `❯` `accent()`; the empty
 state `quiet()`. No fills anywhere in it.
+
+
+**[Amended 2026-08-20, floor stress — the overlay always has a frame]**
+`feed_overlay_size` subtracts four from the body in each axis, and nothing
+floored the result: a body four rows tall gave a **zero-height dialog**,
+which draws nothing — no border, no title, no rows. The body is two rows
+short of the terminal (tab bar and hint bar), so any terminal six rows or
+shorter was affected. `Alt+e` and C27's `Alt+Shift+a` still flipped the mode
+word and still offered `↑↓ select` in the hint bar, so the whole visible
+effect of the chord was one word changing: indistinguishable from a binding
+that does not work, at exactly the sizes where a user is least sure what
+they are looking at.
+
+C14's picker had answered this already — "an empty result still needs a
+frame to say so" — and these two never adopted it. Both axes are now floored
+at one cell. `centered_near` clamps the ask to the body, so the floor can
+never overflow a body smaller than the frame it asks for; a one-row dialog
+is its top border and title, which is enough to say *something opened*.
+Pinned by `the_fleet_overlays_always_have_a_frame_to_say_so_with` (geometry,
+every body size from 1×1 to 11×11) and `tests/small_terminal_overlays.rs` (a
+real roost at 40×8, 40×6, 40×5 and 40×4, looking for the overlay's title
+rather than a border glyph — the panes draw borders too, and a first draft
+that counted corners passed with the bug present because the *panes'*
+corners arrived between its two samples).
 
 ### C21 — Pane zoom (Alt+z) — [Added 2026-07-22, fleet features]
 

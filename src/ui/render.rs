@@ -607,8 +607,27 @@ fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
 /// The help overlay's key-column prefix: the key label left-padded to a
 /// fixed column so every description lines up underneath it. Shared by the
 /// width computation and the row-rendering loop below so they can't drift.
+///
+/// **The trailing space is load-bearing, and `{key:<18}` did not guarantee
+/// one.** `draw_help_columns` draws this prefix and the description as two
+/// adjacent spans with nothing between them, so all the separation there is
+/// comes from this padding — and `{:<18}` is a *minimum* width, not a
+/// column: a key 18 or more wide gets padded by nothing and the description
+/// fuses straight onto it. On the default keymap the control-CLI row
+/// `roost send <id> "text"` (22) rendered as `…"text"type into that pane`;
+/// after C34 made the key column keymap-derived, an enumerated family
+/// reaches 24 and did the same to `move focus`. Found by a simulation agent
+/// stressing the 80-column floor, which is where it is ugliest, but it was
+/// never width-dependent — the fusion happens at any terminal size.
+///
+/// So: pad to the 18-column grid when the key fits it, and otherwise fall
+/// back to exactly one space. Rows under 18 render byte-identically to
+/// before; only the ones that were broken move. `elide_key` and
+/// `help_content_width` both measure through here, so the extra column is
+/// accounted for in the floor rather than smuggled past it.
 fn help_key_prefix(key: &str) -> String {
-    format!(" {key:<18}")
+    let pad = (18usize).saturating_sub(mouse::display_width(key) as usize).max(1);
+    format!(" {key}{}", " ".repeat(pad))
 }
 
 /// F1: the chord table with no config.json applied — what `HelpKey::Family`
@@ -3811,6 +3830,39 @@ mod tests {
             assert!(diagnostics.is_empty(), "{cfg}: {diagnostics:?}");
             let w = help_content_width(&help_lines(&keymap));
             assert!(w <= 80, "{cfg} makes a column {w} wide; the 80-col floor would clip it");
+        }
+    }
+
+    /// A key column always ends in a space, so the description can never
+    /// fuse to it.
+    ///
+    /// `draw_help_columns` draws the prefix and the description as two
+    /// adjacent spans with nothing between them — the separation is
+    /// entirely the prefix's padding. `{key:<18}` supplies it only while
+    /// the key is *under* 18 wide, because that is a minimum width, not a
+    /// column: at 18 or more it pads by nothing and the two spans abut.
+    /// Before C34 no key reached 18, so the distinction never came up; an
+    /// enumerated family reaches 24 easily, and at exactly 80×24 the focus
+    /// row rendered `Alt+← / Alt+↓ / Alt+j …move focus (…)`. Found by a
+    /// simulation agent stressing the design floor.
+    #[test]
+    fn a_key_column_never_fuses_to_its_description() {
+        for cfg in [
+            r#"{}"#,
+            r#"{"keys": {"alt+h": "disable"}}"#,
+            r#"{"keys": {"alt+left": "disable"}}"#,
+            r#"{"keys": {"alt+1": "disable"}}"#,
+            r#"{"keys": {"alt+b": "focus_left"}}"#,
+        ] {
+            let (keymap, _) = Keymap::parse(cfg, "config.json");
+            for line in help_lines(&keymap) {
+                let HelpLine::Row(k, d) = line else { continue };
+                let rendered = format!("{}{d}", super::help_key_prefix(&k));
+                assert!(
+                    super::help_key_prefix(&k).ends_with(' '),
+                    "{cfg}: no separator between key and description — {rendered:?}",
+                );
+            }
         }
     }
 
