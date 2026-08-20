@@ -507,6 +507,92 @@ cannot un-pad them.
 
 ---
 
+## Simulation pass — 2026-08-20
+
+Four agents drove the real binary in real PTYs against the shipped
+contracts: every chord in the table, the CLI and `config.json` surface, the
+new fleet features, and small terminals under resize.
+
+**One report came back as a critical bug and was wrong.** The claim: `Alt+q`
+does not quit while any modal is open — "100% reproducible across all three
+modal types", the process hanging until force-killed. It reproduces on
+nothing. The harness pressed the modal-opening chord **100 ms after spawn**,
+before roost had drawn a first frame, so no modal was ever open; its own
+screenshots would have shown `NORMAL`. Then it gave the quit a **1 s**
+deadline, while `quit_and_wait` re-presses at 700 ms to answer U1's
+busy-fleet confirm and a real quit here takes 0.9–1.9 s. Two independent
+timing mistakes, compounding into a confident false positive.
+
+Three things follow, and only one of them is about the report.
+
+1. **Verify before acting.** The claim contradicted a contract on its face —
+   C15 says *any* key dismisses the help overlay — which was the tell. A
+   ten-minute reproduction in the main tree settled it. An agent's
+   confidence ("VERY HIGH") is not evidence, and a failing test is evidence
+   only about the test until you have read it.
+2. **The rule it accused was genuinely untested.** "An Alt chord always
+   leaves the mode" was enforced by one `if` in `handle_mode_key`, asserted
+   nowhere, and already carved out once (C36's `Alt+Enter`). A false report
+   found a real gap, which is worth more than the report costing nothing.
+   Now contracted as an amendment to **C24b** — which turned out to own the
+   rule already, in one under-specified bullet; the design audit caught the
+   amendment landing in C12 and duplicating it — and pinned three ways: a
+   1,111-probe sweep of every chord against every mode, an exhaustive
+   `match` that breaks the build when a mode is added, and
+   `tests/modal_quit.rs` driving five modals in a real PTY. The same audit
+   found the amendment's own summary sentence false (`Alt+Enter` is
+   consumed but does **not** leave the mode — it is a line break) and
+   surfaced an open behaviour question underneath it: an Alt chord discards
+   an editor's unsaved buffer, which U8 forbids the mouse from doing.
+   Recorded in DESIGN-ui.md §7, not guessed at.
+3. **A modal test must prove the modal opened.** `tests/modal_quit.rs`
+   asserts its marker is *absent* before the chord and present after —
+   so a test that reaches no overlay fails loudly instead of quietly
+   reporting on Normal mode. The mode word (`HELP`, `ROSTER`, `BROADCAST`)
+   is the marker precisely because overlay body text like "keys" or "shell"
+   also sits in the always-visible hint bar.
+
+**Three real bugs came back from the other agents, all of the same shape:
+roost working correctly and looking broken.** None crashes, none clips, and
+every existing test passed over all three — which is the pattern worth
+naming. Width tests measure width; geometry tests measure geometry; nothing
+was measuring *legibility*.
+
+1. **The help overlay's key column fused to its description**, on the
+   **default** keymap: `roost send <id> "text"type into that pane`.
+   `format!(" {key:<18}")` is a minimum width, not a column, so a key 18
+   cells or wider gets no padding at all — and `draw_help_columns` puts
+   nothing between the two spans. C34 then made the key column
+   keymap-derived, so an enumerated family reached 24 and did the same to
+   `move focus`. The 80-column floor holds in both cases, which is exactly
+   why the floor tests never saw it: the row *fits*, it just cannot be read.
+2. **The roster and activity feed drew nothing at six rows or fewer.**
+   `feed_overlay_size` subtracts four per axis with no floor, so a four-row
+   body gave a zero-height dialog. The chord still flipped the mode word and
+   the hint bar still offered `↑↓ select` — the entire visible effect of
+   `Alt+Shift+a` was one word changing. C14's picker had answered this
+   already ("an empty result still needs a frame to say so"); these two
+   never adopted it.
+3. **Three gestures refused correctly and wordlessly**, and roost's own
+   contracts disagreed about whether that was acceptable: C35 states the
+   rule ("a navigation key that silently does nothing reads as broken") and
+   C33, shipped the same week, has a silent edge no-op. Now **C38**: a
+   refusal says why, and where another chord would do the job it names that
+   chord — `Alt+Shift+h` at a tab edge points at `Alt+Shift+m`, resolved
+   from the live keymap. C33's defence of the no-op turns out to be a
+   defence of *not moving the pane*, never of the silence.
+
+The comparison is what found (3): each contract reads fine alone. That is an
+argument for reviewing features in cohorts rather than one PR at a time.
+
+Everything else the pass touched — 35 chords, rapid-fire sequences, orphan
+cleanup, 50+ CLI and config cases, every modal at five terminal sizes, resize
+below the floor and back, and an adversarial attempt to make C36's target
+count disagree with its delivery (including a real cross-process status race
+against an open composer) — came back clean.
+
+---
+
 ## What roost already does better — worth not regressing
 
 Recorded so a future pass doesn't "improve" these toward the comparison tools:

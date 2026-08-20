@@ -607,8 +607,32 @@ fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
 /// The help overlay's key-column prefix: the key label left-padded to a
 /// fixed column so every description lines up underneath it. Shared by the
 /// width computation and the row-rendering loop below so they can't drift.
+///
+/// **The trailing space is load-bearing, and `{key:<18}` did not guarantee
+/// one.** `draw_help_columns` draws this prefix and the description as two
+/// adjacent spans with nothing between them, so all the separation there is
+/// comes from this padding — and `{:<18}` is a *minimum* width, not a
+/// column: a key 18 or more wide gets padded by nothing and the description
+/// fuses straight onto it. On the default keymap **two** control-CLI rows
+/// did this: `roost send <id> "text"` (22) rendered `…"text"type into that
+/// pane`, and `roost spawn ADAPTER` (19) rendered `…ADAPTERlaunch a new
+/// pane`. After C34 made the key column keymap-derived, an enumerated
+/// family reaches 23 and did the same to `move focus`. Found by a
+/// simulation agent stressing the 80-column floor, which is where it is
+/// ugliest, but it was never width-dependent — the fusion happens at any
+/// terminal size.
+///
+/// So: pad to the 18-column grid when the key fits it, and otherwise fall
+/// back to exactly one space. Rows under 18 render byte-identically to
+/// before; only the ones that were broken move. `elide_key` and
+/// `help_content_width` both measure through here, so the extra column is
+/// accounted for in the floor rather than smuggled past it — see
+/// `HELP_COL_FLOOR`, which had to be corrected in the same pass: it read 80
+/// where the dialog can only draw 77, and this extra column was what finally
+/// made three columns of slop matter.
 fn help_key_prefix(key: &str) -> String {
-    format!(" {key:<18}")
+    let pad = (18usize).saturating_sub(mouse::display_width(key) as usize).max(1);
+    format!(" {key}{}", " ".repeat(pad))
 }
 
 /// F1: the chord table with no config.json applied — what `HelpKey::Family`
@@ -636,9 +660,32 @@ fn join_chords(actions: &[Action], bindings: &[(String, Action)]) -> Option<Stri
     (!labels.is_empty()).then(|| labels.join(" / "))
 }
 
-/// C15's 80-column floor: the width one *column* of the overlay may not
-/// exceed, or `centered_near` clamps and a description clips mid-word.
-const HELP_COL_FLOOR: u16 = 80;
+/// C15's 80-column floor, expressed as what one *column of content* may
+/// measure — which is **not 80**. `help_layout` asks for `content + 3` (two
+/// borders plus the column of air before the right one), so a column of 78
+/// is a dialog of 81, `centered_near` clamps it to the terminal, and the air
+/// goes first: a row that spends the full width ends flush against the
+/// border. 80 − 2 borders − 1 air = 77.
+///
+/// It read `80` from the start, three columns too loose, and never bit
+/// because the widest content the table could produce was exactly 77 — the
+/// ceiling this constant should have named. Then C38's sibling fix (a key
+/// column always ends in a space) added one column to the over-wide rows and
+/// the slack was gone: at 80×24 with `alt+h` disabled, `…j … move focus (…at
+/// an edge)` sat against the border. Found by the design audit of that fix,
+/// measured rather than reasoned.
+///
+/// So it is derived here rather than restated, because the derivation is the
+/// part that was wrong.
+const HELP_COL_FLOOR: u16 = HELP_FLOOR_COLS - HELP_DIALOG_CHROME;
+
+/// The terminal width C15's floor is written against.
+const HELP_FLOOR_COLS: u16 = 80;
+
+/// What `help_layout` adds to a column of content: a border each side, and
+/// one column of air before the right one so a full-width row can breathe.
+/// The key column already opens with a space, which is the left-hand air.
+const HELP_DIALOG_CHROME: u16 = 3;
 
 /// C34/C15: keep a resolved key column inside the floor by eliding **the
 /// key**, never the description.
@@ -797,7 +844,9 @@ fn help_layout(body: Rect, keymap: &Keymap) -> HelpLayout {
     let height = tallest.min(avail_h);
     // +1 so a row that spends the full content width still has a column of
     // air before the right border (the key column already opens with one).
-    let w = content * columns.len() as u16 + HELP_GUTTER * (columns.len() as u16 - 1) + 3;
+    let w = content * columns.len() as u16
+        + HELP_GUTTER * (columns.len() as u16 - 1)
+        + HELP_DIALOG_CHROME;
     HelpLayout { columns, height, size: (w.min(body.width), height + 2), content }
 }
 
@@ -3809,8 +3858,53 @@ mod tests {
         ] {
             let (keymap, diagnostics) = Keymap::parse(cfg, "config.json");
             assert!(diagnostics.is_empty(), "{cfg}: {diagnostics:?}");
+            // Measure the *content*, and against the ceiling the dialog can
+            // actually draw — not `layout.size.0`, which is
+            // `.min(body.width)` and therefore says "≤ 80" whether the
+            // layout fit or was clamped down to it. That tautology is why
+            // the sibling floor test could not see the audit's finding.
             let w = help_content_width(&help_lines(&keymap));
-            assert!(w <= 80, "{cfg} makes a column {w} wide; the 80-col floor would clip it");
+            let floor = super::HELP_FLOOR_COLS;
+            assert!(
+                w + super::HELP_DIALOG_CHROME <= floor,
+                "{cfg} makes a column {w} wide, so the dialog asks for {} at an \
+                 {floor}-column terminal and is clamped — the column of air before the \
+                 right border goes first",
+                w + super::HELP_DIALOG_CHROME,
+            );
+        }
+    }
+
+    /// A key column always ends in a space, so the description can never
+    /// fuse to it.
+    ///
+    /// `draw_help_columns` draws the prefix and the description as two
+    /// adjacent spans with nothing between them — the separation is
+    /// entirely the prefix's padding. `{key:<18}` supplies it only while
+    /// the key is *under* 18 wide, because that is a minimum width, not a
+    /// column: at 18 or more it pads by nothing and the two spans abut.
+    /// Before C34 no key reached 18, so the distinction never came up; an
+    /// enumerated family reaches 24 easily, and at exactly 80×24 the focus
+    /// row rendered `Alt+← / Alt+↓ / Alt+j …move focus (…)`. Found by a
+    /// simulation agent stressing the design floor.
+    #[test]
+    fn a_key_column_never_fuses_to_its_description() {
+        for cfg in [
+            r#"{}"#,
+            r#"{"keys": {"alt+h": "disable"}}"#,
+            r#"{"keys": {"alt+left": "disable"}}"#,
+            r#"{"keys": {"alt+1": "disable"}}"#,
+            r#"{"keys": {"alt+b": "focus_left"}}"#,
+        ] {
+            let (keymap, _) = Keymap::parse(cfg, "config.json");
+            for line in help_lines(&keymap) {
+                let HelpLine::Row(k, d) = line else { continue };
+                let rendered = format!("{}{d}", super::help_key_prefix(&k));
+                assert!(
+                    super::help_key_prefix(&k).ends_with(' '),
+                    "{cfg}: no separator between key and description — {rendered:?}",
+                );
+            }
         }
     }
 
@@ -4043,7 +4137,10 @@ mod tests {
     fn help_fits_the_eighty_column_floor_and_reaches_every_row() {
         let body = Rect::new(0, 1, 80, 22); // 80×24 minus the two bars
         let layout = help_layout(body, &Keymap::default());
-        assert!(layout.size.0 <= 80, "the keymap is {} cols wide", layout.size.0);
+        // `size.0` is already `.min(body.width)` here, so it can only ever
+        // report 80 — assert on the ask instead.
+        let asked = layout.content + super::HELP_DIALOG_CHROME;
+        assert!(asked <= body.width, "the keymap asks for {asked} cols at the floor");
         assert!(layout.size.1 <= body.height);
         let (visible, total) = super::help_scroll_extent(body, &Keymap::default());
         assert_eq!(total, help_lines(&Keymap::default()).len(), "one column at the floor holds the whole table");
@@ -4188,8 +4285,11 @@ mod tests {
         // The default-keymap case. Remapped keymaps — where the width is no
         // longer constant — are swept by
         // `one_help_column_fits_the_floor_under_a_remap_too`.
+        // Laid out in unbounded space, so `size.0` is the width the dialog
+        // *asked* for rather than what a clamp allowed it — the distinction
+        // the remap sweep above spells out.
         let w = help_layout(Rect::new(0, 1, 200, 200), &Keymap::default()).size.0;
-        assert!(w <= 80, "the keymap is {w} cols wide; the 80-col floor would clip it");
+        assert!(w <= super::HELP_FLOOR_COLS, "the keymap is {w} cols wide; the floor would clip it");
     }
 
     /// ux P2-15: the overlay used to teach every chord and never mention
