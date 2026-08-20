@@ -23,6 +23,16 @@ use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Slack subtracted from a promoted pane's "last seen as a shell" bound.
+///
+/// `observe_panes` reads the process tree on a `DETECT_INTERVAL` tick, so
+/// its view can lag the truth by up to one tick: an agent that started at T
+/// may still be observed as a shell a moment later, and its session file —
+/// written at T — would then fall just outside a strict bound and never be
+/// found. A few seconds of slack absorbs that while still excluding
+/// everything a previous run left behind, which is the whole point.
+const PROMOTION_GRACE: Duration = Duration::from_secs(10);
+
 /// F1: how long the "Alt keys aren't reaching roost" hint stays up after its
 /// most recent evidence (`App::alt_swallow_at`) — not since launch.
 /// `is_alt_swallow_char`'s evidence is real but not unambiguous (every
@@ -432,6 +442,16 @@ pub struct App<B: PaneBackend> {
     host_pixels: (u16, u16),
     /// Freshly launched agent panes we still owe a session id.
     pending_detect: HashMap<PaneId, SystemTime>,
+    /// When each pane was last observed running **no** agent — a plain
+    /// shell. The lower bound for a *promoted* pane's session detection.
+    ///
+    /// A pane promoted by the user typing `pi` at a shell prompt cannot own
+    /// a session file older than the last moment it was still a shell, so
+    /// this is the honest window. It used to be `SystemTime::UNIX_EPOCH` —
+    /// no bound at all — which let the scan claim the newest *unclaimed*
+    /// file in the project whenever it was written, i.e. a conversation
+    /// from days ago. See `PROMOTION_GRACE`.
+    last_shell_seen: HashMap<PaneId, SystemTime>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
     /// `$HOME`, resolved once at startup — `focused_cwd()`'s `~`-abbreviation
@@ -672,6 +692,7 @@ impl<B: PaneBackend> App<B> {
             term_size,
             host_pixels,
             pending_detect: HashMap::new(),
+            last_shell_seen: HashMap::new(),
             last_detect: Instant::now(),
             sock_path,
             home: dirs::home_dir(),
@@ -1337,6 +1358,10 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
+        // Panes observed running no agent this tick — `last_shell_seen`
+        // (collected here and written after the loop, since `find_spec_mut`
+        // holds `self`).
+        let mut still_shell: Vec<PaneId> = Vec::new();
         // D5: adapter flips collected here and pushed into the runtimes'
         // title-signal gate after the loop (`find_spec_mut` holds `self`).
         let mut retitle: Vec<(PaneId, bool)> = Vec::new();
@@ -1358,6 +1383,13 @@ impl<B: PaneBackend> App<B> {
             // Reflect the running agent: promote a shell that's now running pi
             // to the pi adapter; demote back to shell when the agent exits.
             let want = o.agent.unwrap_or_else(|| "shell".to_string());
+            // Not gated on a *transition*: a pane sitting at a shell prompt
+            // for an hour must keep moving this bound forward, or the
+            // window it eventually gets on promotion would reach back to
+            // whenever it last changed state.
+            if want == "shell" {
+                still_shell.push(id);
+            }
             if spec.adapter != want {
                 let demoting = want == "shell";
                 spec.adapter = want;
@@ -1383,11 +1415,35 @@ impl<B: PaneBackend> App<B> {
                 rt.set_title_signal(enabled);
             }
         }
+        let now = SystemTime::now();
+        for id in still_shell {
+            self.last_shell_seen.insert(id, now);
+        }
         // A newly-recognized agent needs its already-created session file
-        // located; a wide window (epoch) plus the taken-set finds it without
-        // cross-wiring against other panes.
+        // located — it was written moments before roost noticed, so `now()`
+        // would miss it. The bound is **the last tick this pane was still a
+        // shell**, minus `PROMOTION_GRACE` for observation lag.
+        //
+        // This used to be `SystemTime::UNIX_EPOCH`, on the reasoning that a
+        // wide window "plus the taken-set finds it without cross-wiring".
+        // The taken-set does not carry that weight: `claimed_sessions` only
+        // knows ids stored on *live* panes, so a conversation from a closed
+        // pane or an earlier run is unclaimed and therefore eligible. With
+        // no lower bound the scan took the newest such file whenever it was
+        // written, `set_session` committed it, and the pane was dropped from
+        // `pending_detect` — so the mistake was permanent, and the next
+        // relaunch resumed a conversation from days ago. Reported as "it
+        // loads the wrong session"; pinned by
+        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`.
         for id in promoted {
-            self.pending_detect.entry(id).or_insert(SystemTime::UNIX_EPOCH);
+            let floor = self
+                .last_shell_seen
+                .get(&id)
+                .copied()
+                .unwrap_or(now)
+                .checked_sub(PROMOTION_GRACE)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            self.pending_detect.entry(id).or_insert(floor);
         }
         for cwd in visited {
             self.note_cwd(cwd);
@@ -11117,6 +11173,113 @@ mod tests {
         fn session_root(&self, cwd: &std::path::Path) -> Option<PathBuf> {
             Some(cwd.to_path_buf())
         }
+    }
+
+    /// A pane promoted to an agent must not claim a session from *before*
+    /// it was a shell.
+    ///
+    /// The reported workflow: open a shell pane, type `pi`. That is the
+    /// **promotion** path, and it seeds detection with `SystemTime::
+    /// UNIX_EPOCH` — no lower bound at all — so the scan takes the newest
+    /// unclaimed file in that cwd whenever it was written. Agent CLIs write
+    /// their session file *after* starting, so if the 2s tick lands in that
+    /// gap the newest unclaimed file is a **previous conversation**, and
+    /// `set_session` commits it and drops the pane from `pending_detect` —
+    /// permanently. The next quit/relaunch then resumes last week's
+    /// session, which is what "it loads the wrong session" looks like.
+    ///
+    /// The taken-set does not save this: `claimed_sessions` only knows ids
+    /// stored on live panes, so any conversation from a closed pane or an
+    /// earlier run is eligible.
+    #[test]
+    fn a_promoted_pane_never_claims_a_session_older_than_its_shell() {
+        let dir = std::env::temp_dir().join(format!("roost-promote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Last week's conversation in this project, sitting in the session
+        // root — unclaimed, because the pane that made it is long gone.
+        let old = dir.join("old.jsonl");
+        std::fs::write(&old, "").unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
+        std::fs::File::open(&old).unwrap().set_modified(long_ago).unwrap();
+
+        let mut panes = HashMap::new();
+        // Starts as a *shell* — the reported workflow is opening a pane and
+        // typing `pi` into it, which is what makes this the promotion path.
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let store = MemStore::default();
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(store),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // Drive the **real** promotion path rather than hand-seeding the
+        // window: the first draft did the latter, and reverting the fix
+        // then left it green — it proved the scan honours a bound, not that
+        // promotion supplies one. Tick once seeing a plain shell (which
+        // records `last_shell_seen`), then again seeing the agent.
+        app.pending_detect.clear();
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
+        // `tick` self-throttles on `last_detect`, which `App::new` set to
+        // now — without this the call returns instantly and the assertion
+        // below passes having exercised nothing. (It did, on the first
+        // draft of this test.)
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        assert_eq!(
+            app.find_spec(1).unwrap().session,
+            None,
+            "claimed a conversation that predates the shell this pane was",
+        );
+
+        // ...and once the agent *does* write its file, the same pane picks
+        // it up. A bound that excluded everything would pass the assertion
+        // above while breaking detection outright.
+        let fresh = dir.join("fresh.jsonl");
+        std::fs::write(&fresh, "").unwrap();
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(1).unwrap().session.as_deref(),
+            Some("fresh"),
+            "the session this pane actually started must still be found",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -175,6 +175,22 @@ This is the "hybrid" model made concrete: where we control an extension API, sta
 - Sessions: `~/.claude/projects/<encoded-cwd>/*.jsonl`; resume with `claude --resume <session-id>` (or `claude --continue` for most recent in cwd).
 - Clean signals: Claude Code **hooks** (`Notification`, `Stop`, `PreToolUse`) can run a shell command — point them at the same unix socket. Same design as the pi extension, different plug. The `Notification` hook's own stdin JSON carries the human-readable reason ("Claude needs your permission to use Bash"); roost's hook shim forwards it as the status line's `message`, so the ◆ says why.
 - Session detection fallback: diff the project's session dir before/after spawn; newest new `.jsonl` is ours.
+  - **Every scan needs a lower time bound, and "before spawn" is only half
+    the cases.** A pane launched as an agent gets `now()` — tight and
+    obviously right. A pane *promoted* (you opened a shell and typed `pi`)
+    has no spawn moment to anchor on, because the agent started between two
+    observation ticks. That window was `UNIX_EPOCH` — no bound — on the
+    reasoning that the claimed-id set would prevent cross-wiring. It does
+    not: `claimed_sessions` only knows ids stored on **live** panes, so a
+    conversation from a closed pane or an earlier run is unclaimed and
+    therefore eligible. The scan took the newest such file whenever it was
+    written, committed it, and dropped the pane from `pending_detect` — so
+    the mistake was permanent and the next relaunch resumed a conversation
+    from days ago.
+  - The bound is **the last tick the pane was observed running no agent**
+    (`last_shell_seen`), minus a few seconds for observation lag: a promoted
+    pane cannot own a session file older than the moment it was still a
+    shell. Reported from real use as "it loads the wrong session".
 - Title channel (D5): Claude Code also publishes its state in the terminal title — a braille spinner frame (`⠧ …`) while a turn runs, `✳ …` at rest. Roost parses title changes into a screen-derived Working/Waiting signal that ranks between hook reports and byte heuristics: never consulted while a status-socket link is live, ranked below the bell (a blocked agent's one remaining "needs you" signal must win), never able to touch NeedsInput/Exited, and a Working title decays like a report once stale *and* silent — an *animating* spinner refreshes the clock every frame, so only a frozen (hung) spinner ever decays, and conversely a live spinner sustains a quiet hook-reported Working past its usual decay (a long silent tool call between one-shot hooks). The whole channel sits behind an app-pushed gate — enabled only while an agent actually runs in the pane (spawn adapter + `observe_panes` promote/demote, which also clears the stored signal on demote): a vt100 title outlives the process that set it, so without the gate an exited agent's leftover `✳` would veto Working for every later shell command in that pane. The gate is what makes the channel safe; the ranking is what keeps claude panes honest **between** their one-shot hook connections — a keystroke echo on a resting pane no longer paints a phantom ●, and a lost `Stop` hook settles the moment the title flips to rest.
 
 ### 6.3 Heuristic fallback (any adapter, incl. plain `shell`)
