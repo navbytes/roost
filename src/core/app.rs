@@ -1457,10 +1457,11 @@ impl<B: PaneBackend> App<B> {
                 }
             }
         }
-        // Drop entries for panes that no longer have a runtime (closed) —
-        // ids are never reused, so without this the map would grow by one
-        // stale entry per pane ever spawned over a long session. F3's
-        // visited-set is pruned on the same cadence, same reason.
+        // Backstop for panes that lost their runtime without going through
+        // `close_pane_id` (a tab removed with its panes, a workspace
+        // reload). The close path prunes all three itself — it has to, since
+        // ids ARE recycled (C23) and this pass only runs every
+        // `DETECT_INTERVAL`.
         self.last_status.retain(|id, _| self.runtimes.contains_key(id));
         self.needy_msgs.retain(|id, _| self.runtimes.contains_key(id));
         self.visited_waiting.retain(|id| self.runtimes.contains_key(id));
@@ -2506,6 +2507,17 @@ impl<B: PaneBackend> App<B> {
         // otherwise be inherited by an unrelated later pane that reuses
         // this id, silently switching it into raw mode.
         self.raw.remove(&id);
+        // Same reason again, for the three attention maps. These were pruned
+        // only by `diff_statuses` on the tick, under a comment asserting the
+        // opposite of the C23 note above — so for up to a `DETECT_INTERVAL`
+        // a pane taking this id inherited: F3's "you already looked at this"
+        // mark (silently absent from Alt+a though nobody ever saw it), a
+        // last status that makes its first observation read as a transition
+        // and prints a C20 feed line for a life it did not live, and the
+        // dead pane's pending question, attributed to it.
+        self.last_status.remove(&id);
+        self.needy_msgs.remove(&id);
+        self.visited_waiting.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         // U11: a closed pane is no longer anyone's focus memory — pane ids
@@ -11481,6 +11493,51 @@ mod tests {
         assert!(
             !tree.contains(&float_id),
             "C22: the float's id {float_id} is now a tiled pane too — tree {tree:?}",
+        );
+    }
+
+    /// F3/C20: a closed pane must not bequeath its attention state to
+    /// whatever pane next takes its id.
+    ///
+    /// `last_status`, `needy_msgs` and `visited_waiting` were pruned only on
+    /// the tick, under a comment claiming "ids are never reused" — which the
+    /// close path itself contradicts a thousand lines away, where `raw`,
+    /// `dead`, `tab_focus` and the token table are all pruned *at close*
+    /// precisely because ids ARE recycled (`alloc_pane_id` is a max+1, and a
+    /// closed pane's id is not parked). Close the highest-id pane and open
+    /// one inside the 2s `DETECT_INTERVAL` and the newborn inherits all
+    /// three: it is silently absent from Alt+a's fallback though nobody ever
+    /// looked at it, its first status observation reads as a *transition*
+    /// and prints a feed line for a life it did not live, and the dead
+    /// pane's question gets attributed to it.
+    #[test]
+    fn a_closed_panes_attention_state_does_not_outlive_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.find_spec_mut(2).unwrap().adapter = "pi".into();
+        app.runtimes.get_mut(&2).unwrap().set_extension_status(AgentStatus::Waiting);
+        app.set_focus(1);
+        app.apply(Action::JumpAttention); // visits pane 2 — marks it seen
+        app.needy_msgs.insert(2, "pick a database".into());
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick(); // `last_status[2]` = Waiting
+        assert!(app.visited_waiting.contains(&2), "setup: pane 2 was visited");
+        assert!(app.last_status.contains_key(&2), "setup: pane 2 has a status");
+
+        app.close_pane_id(2);
+
+        assert!(
+            !app.visited_waiting.contains(&2),
+            "F3: pane 2's `already looked at this` mark outlived the pane",
+        );
+        assert!(
+            !app.last_status.contains_key(&2),
+            "C20: pane 2's last status outlived the pane — the next pane to \
+             take id 2 would have its birth read as a transition",
+        );
+        assert!(
+            !app.needy_msgs.contains_key(&2),
+            "pane 2's question outlived the pane",
         );
     }
 
