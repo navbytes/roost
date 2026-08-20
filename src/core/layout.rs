@@ -122,6 +122,19 @@ pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
             *node = child;
         }
     }
+    // A stack of one is a pane. Splits have always collapsed at one child;
+    // stacks did not, and the leftover `Stack { children: [x] }` was not just
+    // cosmetic chrome ("STACK · 1 PANES", a header row stolen from the only
+    // member). `toggle_stack` explodes a stack into an even split of its
+    // members, so Alt+s on a stack of one built a `Split` with a single
+    // child — a shape the rest of this module states it never constructs and
+    // does not handle. Close panes out of a stack until one is left, press
+    // Alt+s, and the tree is illegal. Collapse here, where stacks shrink.
+    if let LayoutNode::Stack { children, .. } = node {
+        if children.len() == 1 {
+            *node = LayoutNode::Pane(children[0]);
+        }
+    }
     empty
 }
 
@@ -975,6 +988,28 @@ mod tests {
         assert_eq!(expanded.rect.height, 17); // 20 − 1 header − 2 collapsed
         let total: u16 = out.iter().map(|p| p.rect.height).sum::<u16>() + headers[0].rect.height;
         assert_eq!(total, 20);
+    }
+
+    /// A stack of one is a pane, and must become one — a `Split` never
+    /// carries a single child, and `toggle_stack` on a one-member stack
+    /// would build exactly that.
+    #[test]
+    fn a_stack_shrunk_to_one_member_stops_being_a_stack() {
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        remove_pane(&mut node, 3);
+        remove_pane(&mut node, 2);
+        assert!(
+            matches!(node, LayoutNode::Pane(1)),
+            "a stack of one is a pane, not {node:?}",
+        );
+
+        // ...and the illegal shape it used to make: Alt+s on that stack.
+        let mut stack = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        remove_pane(&mut stack, 2);
+        toggle_stack(&mut stack, 1);
+        if let LayoutNode::Split { children, .. } = &stack {
+            panic!("Alt+s built a Split with {} child(ren): {stack:?}", children.len());
+        }
     }
 
     #[test]

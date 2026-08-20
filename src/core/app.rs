@@ -2478,7 +2478,18 @@ impl<B: PaneBackend> App<B> {
         // C21: closing the pane you're zoomed on ends the zoomed view —
         // there's nothing left to show full-screen. A control-plane close of
         // some *other* pane leaves an unrelated zoom alone.
-        if self.zoomed && id == self.focused {
+        //
+        // C22: the pane that is zoomed is not always the focused one. While
+        // the float is shown focus belongs to it — never to a tiled pane —
+        // so asking `id == self.focused` could not fire, and closing the
+        // pane actually being shown full-screen left `zoomed` set pointing
+        // at a pane that no longer exists. `display_rects` resolves the real
+        // target the same way; this must agree with it.
+        let zoom_target = match &self.float {
+            Some(f) if f.shown => f.prev_focus,
+            _ => self.focused,
+        };
+        if self.zoomed && id == zoom_target {
             self.exit_zoom();
         }
         let spec = self.ws.tabs[ti].panes.get(&id).cloned();
@@ -2559,7 +2570,13 @@ impl<B: PaneBackend> App<B> {
         // routing keystrokes to a pane in a tab nobody's looking at. U11:
         // being moved onto a tab is a tab switch like any other, so honor
         // that tab's focus memory before falling back to its first pane.
-        if !self.ws.active_tab().panes.contains_key(&self.focused) {
+        // C22 rule 1 first: the float lives outside every tab's map by
+        // construction, so this test's answer for a focused float is always
+        // "not in this tab" — without the guard the fallback fired on every
+        // close while the float was up, pulling focus onto a tiled pane
+        // while the float stayed on screen, and the user's keystrokes went
+        // somewhere they could not see.
+        if !self.float_focused() && !self.ws.active_tab().panes.contains_key(&self.focused) {
             let active = self.ws.active_tab;
             let target = self
                 .tab_focus_target(active)
@@ -3936,6 +3953,20 @@ impl<B: PaneBackend> App<B> {
         // feature that moves focus.
         if old != id && self.pane_exists(old) {
             self.alternate = Some(old);
+        }
+        // C22 rule 1: a shown float IS the focused pane, so focus landing on
+        // anything else means the float is no longer up. Enforced here, in
+        // the single writer of `self.focused`, rather than at each door: the
+        // rule was previously re-applied per call site, and the ones that
+        // forgot (C35's Alt+`` `` "go back" among them) left the float drawn
+        // over the body with the user's keystrokes going to a tiled pane
+        // underneath it. `shown` is cleared directly rather than through
+        // `hide_float`, which would re-route focus the caller has already
+        // decided.
+        if old != id && self.float_focused() && !self.is_float(id) {
+            if let Some(f) = &mut self.float {
+                f.shown = false;
+            }
         }
         self.focused = id;
         // F3: landing focus on a pane that's currently in the ○ fallback
@@ -11586,6 +11617,100 @@ mod tests {
             "the refusal is spoken, not silent: {:?}",
             app.flash(),
         );
+    }
+
+    /// C21/C22: closing the pane that is actually zoomed must end the zoom,
+    /// even when the float is covering it.
+    ///
+    /// `close_pane_id` asked `id == self.focused`, but while the float is
+    /// shown focus belongs to the float — never to a tiled pane — so the
+    /// test could not fire. `display_rects` already knows the real target is
+    /// `float.prev_focus`; the close path did not, so it left `zoomed` set
+    /// pointing at a pane that no longer exists, and the renderer was handed
+    /// a rect for it.
+    #[test]
+    fn closing_the_zoomed_pane_under_the_float_ends_the_zoom() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2, focus=2
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed(), "setup: pane 2 is zoomed");
+        let zoomed = app.focused;
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        app.close_pane_id(zoomed);
+
+        let live: Vec<PaneId> = app.ws.active_tab().panes.keys().copied().collect();
+        for pr in app.display_rects() {
+            assert!(
+                app.is_float(pr.id) || live.contains(&pr.id),
+                "the renderer was handed pane {} — gone from the tab {live:?}",
+                pr.id,
+            );
+        }
+    }
+
+    /// C22 rule 1: a shown float IS the focused pane. Closing some other
+    /// pane must not quietly take that away.
+    ///
+    /// The close path's "keep focus inside the tab on screen" fallback asked
+    /// whether `self.focused` is in the active tab's map. The float lives
+    /// outside every tab's map by construction, so while it was up the
+    /// answer was always no and the fallback fired on every close, yanking
+    /// focus off the float onto a tiled pane while the float stayed on
+    /// screen — keystrokes going to a pane the user cannot see.
+    #[test]
+    fn closing_a_pane_does_not_steal_focus_from_a_shown_float() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes
+        let victim = app.focused;
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "setup: the float has focus");
+
+        app.close_pane_id(victim);
+
+        if app.float.as_ref().is_some_and(|f| f.shown) {
+            assert!(
+                app.float_focused(),
+                "C22: the float is on screen but focus is on {}",
+                app.focused,
+            );
+        }
+    }
+
+    /// C22 rule 1, at the one chokepoint: every focus move off the float
+    /// takes the float down with it.
+    ///
+    /// The rule was enforced per call site, so each new focus path had to
+    /// remember it — and C35's "go back" did not. The float stayed drawn
+    /// over the body while keystrokes went to a tiled pane underneath.
+    #[test]
+    fn every_focus_move_off_the_float_hides_it() {
+        for (name, action) in [
+            ("FocusAlternate", Action::FocusAlternate),
+            ("Focus(Left)", Action::Focus(layout::Dir::Left)),
+            ("NextTab", Action::NextTab),
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::NewPane);
+            app.apply(Action::NewTab);
+            app.go_to_tab(0);
+            app.apply(Action::Focus(layout::Dir::Right));
+            app.apply(Action::Focus(layout::Dir::Left)); // give C35 an alternate
+            app.apply(Action::ToggleFloat);
+            assert!(app.float_focused(), "{name}: setup — the float has focus");
+
+            app.apply(action);
+
+            if !app.float_focused() {
+                assert!(
+                    !app.float.as_ref().is_some_and(|f| f.shown),
+                    "{name}: the float is still drawn but focus is on {}",
+                    app.focused,
+                );
+            }
+        }
     }
 
     /// One principal must not be able to deny `wait` to the whole fleet.
