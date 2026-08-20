@@ -39,6 +39,21 @@ pub(crate) fn test_panic_after() -> Option<std::time::Duration> {
     raw.parse().ok().map(std::time::Duration::from_millis)
 }
 
+/// The sibling hatch for the *other* half of the panic contract: panic on a
+/// background thread this many milliseconds in.
+///
+/// roost runs real work off the event loop — a reader and a writer thread
+/// per pane, the socket's accept loop and a thread per connection (which
+/// parse untrusted input from panes), the notification reapers — and a panic
+/// on any of those does not end the process. The panic hook must therefore
+/// leave the terminal alone there, which is only observable from outside,
+/// in the spawned binary, by watching whether it emits the leave-alternate-
+/// screen sequence. Same family, same cost when unset as the one above.
+pub(crate) fn test_panic_thread_after() -> Option<std::time::Duration> {
+    let raw = std::env::var("ROOST_TEST_PANIC_THREAD_AFTER_MS").ok()?;
+    raw.parse().ok().map(std::time::Duration::from_millis)
+}
+
 pub mod clipboard;
 pub mod config;
 pub mod extension;
