@@ -214,8 +214,28 @@ protect.
      is still set — it's what makes that loop tick on a genuinely silent
      connection rather than block forever inside one `read()` — but it no
      longer has to *be* the deadline. A pile of squatters, silent or
-     dripping, now recycles within the 2s deadline of connecting either way;
-     nobody else is ever blocked from getting in.
+     dripping, now recycles within the 2s deadline of connecting either way.
+   - **What that bound does and does not buy, measured.** The sentence that
+     stood here — "nobody else is ever blocked from getting in" — was false,
+     and measurably so. Recycling within 2s is not the same as never
+     blocking: while 64 squatters hold the pool every other client is shed,
+     so a legitimate `roost list` waits out the deadline. Measured against a
+     real instance: 64 silent connections cost a legitimate client **2.07s
+     and 21 refused attempts**; a squatter that simply retakes each slot as
+     it recycles stretched that to **12.1s and 118 refused attempts**, and
+     got in at all only because the probe's retake loop was not tight. The
+     deadline bounds how long any *one* squatter is subsidised; it does not
+     bound the denial, because reconnecting is free. Sustained, this is a
+     control-plane denial of service available to any local process that can
+     reach the socket — including a hostile process inside a pane, which is
+     precisely the principal the per-pane tokens exist to contain. The
+     tokens still hold (nothing can be *driven* without one); what is
+     deniable is access itself. A pre-auth pool sized separately from
+     `MAX_CONN` would bound the blast radius to unauthenticated callers and
+     leave promoted connections (including parked `wait`s) untouched — but
+     no scheme distinguishes a squatter from a first-time legitimate client
+     before either has authenticated, so this is mitigable, not closable.
+     **Open — not yet fixed.**
    - **Per-principal pool, 20**, alongside the unchanged global 64 — a
      connection is promoted here, and onto the generous `READ_TIMEOUT` (30s),
      the instant it sends its first well-formed request. Must be at least
