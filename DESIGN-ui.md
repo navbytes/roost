@@ -4737,7 +4737,7 @@ its name and now means the forward direction explicitly.
 
 ### C38 — A refusal says so — [Added 2026-08-20, simulation pass]
 
-**The gap.** Three gestures refuse correctly and wordlessly. Pressing them
+**The gap.** Eight gestures refuse correctly and wordlessly. Pressing them
 changes nothing on screen, so "bound, but nothing to do here" is
 indistinguishable from "not bound at all" — and roost's own contracts
 already disagreed about whether that is acceptable. C35, shipped the same
@@ -4747,6 +4747,14 @@ where it lands."* C33's edge no-op is the same gesture family and says
 nothing. Found by a simulation agent comparing the two — the comparison is
 what makes the inconsistency visible, since each contract reads fine alone.
 
+**C33's silence was the outlier, not a decision**, and the tree already said
+so: `move_pane_to_tab` flashes its own refusals with the reason written into
+the code — *"a no-op you can see beats one you can't"* — and `focus_dir`
+flashes at its cross-tab boundary. C38 is less a new rule than the rule the
+rest of roost was already following, applied to the sites that missed it.
+(That evidence came from this contract's design audit, which went looking
+for whether the reading of C33 was fair. It is.)
+
 C33's defence of the no-op is **not** a defence of the silence. It argues
 that a swap must not cross tabs ("moving a pane out of its tab is a
 structural edit rather than a look, so the recoverable failure is doing
@@ -4755,46 +4763,90 @@ nothing.
 
 **The rule.** When a gesture declines to act, it says why in a C10 flash —
 and where another chord *would* do what the user is reaching for, it names
-that chord. A dead end that teaches the way out is worth more than one that
-merely reports itself.
+that chord, **but only when that chord would work**. A dead end that teaches
+the way out is worth more than one that merely reports itself; a dead end
+that hands you a second dead end is worth less than silence.
 
 | site | flash |
 |---|---|
-| `Alt+Shift+h/l` at a tab edge | `at the tab's edge — {chord} moves it to the {next\|previous} tab` |
+| `Alt+Shift+h/l` at a tab edge, with another tab | `at the tab's edge — {chord} moves it to the {next\|previous} tab` |
+| `Alt+Shift+h/l` at a tab edge, single tab | `at the tab's edge` |
 | `Alt+Shift+j/k` at a layout edge | `nothing {above\|below} to swap with` |
 | `Alt+Shift+hjkl` on the float | `the scratch pane sits outside the layout` |
-| `Alt+n` / picker launch, split refused | `no room to split — a pane needs 36×10` |
+| `Alt+s` / `Alt+o` / `Alt+Shift+arrow`, tab has one pane | `nothing to {stack\|flip\|resize}: this tab has one pane — {chord} splits it` |
+| `Alt+s` / `Alt+o` / `Alt+Shift+arrow`, shape has no such move | `nothing to {stack\|flip\|resize} here` |
+| `Alt+1..9` past the last tab | `no tab {n}: this workspace has {n} {tab\|tabs}` |
+| `Alt+n` / picker launch, split refused | `no room to split — {side by side needs 36 columns, has 30 \| stacked needs 10 rows, has 7}` |
 
-Four decisions inside that table, each load-bearing:
+Decisions inside that table, each load-bearing:
 
 - **The horizontal edge names `Alt+Shift+i`/`Alt+Shift+m`, resolved from the
-  live keymap.** C33 declined the cross-tab handoff *because* those chords
-  "already do exactly that job and name it" — and the moment the user needs
-  to know that is the moment they press the wrong one. Through
-  `chord_clause`, never a literal: the C34 gate bans spelling a chord in
-  `src/`, and a flash teaching a remapped-away key is the drift C34 exists
-  to end. With the chord unbound the clause collapses and the flash still
-  says `at the tab's edge` — no dead key, no dangling em-dash.
+  live keymap, and only with somewhere to carry the pane to.** C33 declined
+  the cross-tab handoff *because* those chords "already do exactly that job
+  and name it" — and the moment the user needs to know that is the moment
+  they press the wrong one. Through `chord_clause`, never a literal: the C34
+  gate bans spelling one in `src/`, and a flash teaching a remapped-away
+  chord would be the exact drift C34 exists to prevent. Guarded on
+  `tabs.len() > 1` as well as on bound, because on the default single-tab
+  workspace the named chord immediately refuses with "only one tab".
 - **The vertical edge names nothing**, because there is nothing to name:
   C31 makes tabs roost's horizontal axis, so `j`/`k` have no cross-tab
   counterpart. Inventing one for symmetry would teach a chord that does not
   exist.
-- **The refused split names the threshold**, not the advice. "Widen the
-  terminal" is a suggestion; `36×10` is the number that makes the next
-  attempt work, and it comes from `MIN_SPLIT_COLS`/`MIN_SPLIT_ROWS` rather
-  than being restated.
+- **The three structural chords detect their no-op by comparing the tree,
+  not by the mutator's `bool`.** `layout::resize_pane` returns `true` at the
+  0.1/0.9 ratio clamp — "handled, no change" — so the bool does not mean
+  "changed", and trusting it would drop exactly the case a user leans on the
+  key for. One mechanism, no per-site special cases, and it cannot drift as
+  those mutators grow.
+- **A one-pane tab and an inapplicable shape get different sentences**,
+  because they need different things: the first needs a split (`Alt+n`,
+  named), the second needs a different key.
+- **The refused split names the axis that actually failed, and the number it
+  missed by.** `split_fit` picks the axis from the rect's aspect and tests
+  *that axis only*, so an earlier draft's "a pane needs 36×10" asserted a
+  rule the guard does not have — a 30×30 pane splits happily into two
+  30-wide halves. A helpful message that is false is the worst kind.
 - **A refusal flashes at the keypress, not inside `spawn_child`.** The
-  control CLI reaches the same refusal and reports it in its own reply;
+  control CLI reaches the same refusal and reports it in its own `Reply`;
   raising a TUI flash from an API call would put a message on screen that
-  nobody at the keyboard caused.
+  nobody at the keyboard caused. The two surfaces **word it differently on
+  purpose** — an API client cannot widen a terminal, so its advice is "stack
+  a pane with `Alt+s` first" rather than the pane's shortfall. What they
+  share is that the refusal is *said*.
 
 **A success stays quiet.** Only the refusal speaks — the new pane, or the
 pane arriving in its new slot, is its own feedback, and a flash on every
 `Alt+n` would be noise that trains the eye to skip the bar. Pinned by
-`a_split_that_succeeds_stays_quiet`.
+`a_split_that_succeeds_stays_quiet` and
+`the_structural_chords_stay_quiet_when_they_do_something`.
+
+**`MovePane` left `apply`'s structural guard to make this work.** The guard
+hid the float before `move_pane_dir` ran, so `float_focused()` was always
+false there and this contract's float row was **dead code** — and what
+happened instead was worse than the silence C38 set out to fix: the float
+vanished and the swap landed on whichever pane it had been covering, moving
+a pane the user was not looking at. `MovePane` now joins `Alt+z` in refusing
+the float itself, by the same mechanism and for the same reason; C21's
+zoom exit moved into `move_pane_dir`, where it must run before `rects()`
+(under zoom `rects()` yields only the zoomed pane, so `neighbor` would find
+nothing). Found by this contract's own design audit, which probed the row
+rather than reading it.
+
+**Deliberately still silent.** `layout::swap_panes` returning `false` is
+unreachable — both ids came from `neighbor` — so it is a defensive branch,
+not a refusal a user can reach; giving it a voice would put an impossible
+sentence in the vocabulary. `go_to_tab`'s *same-tab* return is U11's
+deliberate no-op, not a refusal: `Alt+1` on tab 1 has done exactly what it
+says. The picker's Enter over an empty filtered list is left for now — the
+empty frame is already partial feedback, and the right answer is probably a
+line inside the dialog rather than a flash behind it.
 
 **Chrome.** Nothing new: C10's flash, C9's hint bar, no glyph, no colour.
-This contract adds a sentence, not a surface.
+The longest flash measures 62 columns, inside both the 80-column floor and
+C9's 100-column budget; a flash takes the whole bar and returns, so C9's
+right-segment arithmetic is untouched. This contract adds sentences, not a
+surface.
 
 **Not in scope.** The `Exited` tier of the composer's `Tab` filter (C36) is
 structurally always empty — `broadcast_targets` excludes exited panes

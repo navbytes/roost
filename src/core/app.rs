@@ -2013,6 +2013,11 @@ impl<B: PaneBackend> App<B> {
         self.set_focus(focused);
         self.ws.active_tab = active_tab;
         let Some(id) = id else {
+            // C38: the same refusal the TUI flashes, phrased for a caller
+            // rather than a reader — an API client cannot widen a terminal,
+            // so the actionable advice here is to stack rather than the
+            // pane's shortfall. The divergence is deliberate and contracted;
+            // what both surfaces must share is that the refusal is *said*.
             let hint = self.chord_clause(Action::ToggleStack, |c| {
                 format!("; stack a pane with {c} first")
             });
@@ -3433,6 +3438,18 @@ impl<B: PaneBackend> App<B> {
         // deliberately excluded from the float rule — it gets its own
         // "can't zoom the float" no-op below instead of retargeting to
         // `prev_focus`.
+        //
+        // **[C38] `MovePane` left this list**, joining Alt+z for the same
+        // reason and by the same mechanism: it now refuses the float itself
+        // (`move_pane_dir`) rather than being retargeted onto `prev_focus`.
+        // While it was here the C38 float row could never fire — `hide_float`
+        // ran first, so `float_focused()` was always false by the time the
+        // check saw it — and worse, the behaviour it was written to replace
+        // was not silence but a *surprise*: the float vanished and the swap
+        // landed on whichever pane it had been covering. Found by the C38
+        // design audit, which probed the row instead of reading it. Zoom is
+        // still left, from inside `move_pane_dir` — under zoom `rects()`
+        // yields only the zoomed pane, so `neighbor` must run after.
         if matches!(
             action,
             Action::NewPane
@@ -3440,7 +3457,6 @@ impl<B: PaneBackend> App<B> {
                 | Action::FlipSplit
                 | Action::Resize { .. }
                 | Action::CycleLayout { .. }
-                | Action::MovePane(_)
         ) {
             self.exit_zoom();
             self.hide_float();
@@ -3465,19 +3481,34 @@ impl<B: PaneBackend> App<B> {
             Action::MovePaneToTab { forward } => {
                 self.move_pane_to_tab(if forward { 1 } else { -1 })
             }
+            // C38: each of these three declines silently on a tab the shape
+            // cannot apply to — overwhelmingly "this tab has one pane", and
+            // `Alt+s` is one of C9's advertised seven, so its silence is the
+            // most visible of the three. The refusal is detected by
+            // comparing the tree rather than by the mutator's `bool`,
+            // because the bool does not mean "changed": `resize_pane`
+            // returns `true` at the 0.1/0.9 clamp ("handled, no change"),
+            // which is a no-op the user has every reason to hear about.
+            // One rule, one mechanism, no per-site special cases.
             Action::ToggleStack => {
                 let focused = self.focused;
+                let before = self.ws.active_tab().layout.clone();
                 layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
+                self.flash_if_layout_unchanged(&before, "stack");
             }
             Action::FlipSplit => {
                 let focused = self.focused;
+                let before = self.ws.active_tab().layout.clone();
                 layout::flip_split(&mut self.ws.active_tab_mut().layout, focused);
+                self.flash_if_layout_unchanged(&before, "flip");
             }
             Action::Resize { horizontal, grow } => {
                 let delta = if grow { 0.04 } else { -0.04 };
                 let axis = if horizontal { SplitDir::Vertical } else { SplitDir::Horizontal };
                 let focused = self.focused;
+                let before = self.ws.active_tab().layout.clone();
                 layout::resize_pane(&mut self.ws.active_tab_mut().layout, focused, axis, delta);
+                self.flash_if_layout_unchanged(&before, "resize");
             }
             Action::EditPane => {
                 // C32 (combined): opens prefilled — the editor IS the
@@ -3756,6 +3787,10 @@ impl<B: PaneBackend> App<B> {
             self.set_flash("the scratch pane sits outside the layout");
             return;
         }
+        // C21, from here rather than `apply`'s structural guard: the float
+        // check above has to see a float that is still shown, and `rects()`
+        // below has to see the whole tab rather than just the zoomed pane.
+        self.exit_zoom();
         let rects = self.rects();
         let Some(target) = layout::neighbor(&rects, self.focused, dir) else {
             self.flash_move_edge(dir);
@@ -3778,6 +3813,32 @@ impl<B: PaneBackend> App<B> {
         // by hand either).
     }
 
+    /// C38: the shared no-op detector for the three structural chords that
+    /// reshape a tab (`Alt+s`, `Alt+o`, `Alt+Shift+arrows`).
+    ///
+    /// Compares the tree, not the mutator's return value. `resize_pane`
+    /// returns `true` at the 0.1/0.9 ratio clamp — "handled, no change" —
+    /// so trusting the bool would keep exactly the case a user is most
+    /// likely to lean on the key for. Comparing what actually happened is
+    /// also the rule that cannot drift as those mutators grow.
+    ///
+    /// The message distinguishes the two reasons, because they need
+    /// different things from the user: a single-pane tab needs a split
+    /// (`Alt+n`), while a shape that simply cannot take this verb — a
+    /// resize across an axis with no split on it, `Alt+o` on an unsplit
+    /// tab — needs a different key.
+    fn flash_if_layout_unchanged(&mut self, before: &LayoutNode, verb: &str) {
+        if format!("{before:?}") != format!("{:?}", self.ws.active_tab().layout) {
+            return;
+        }
+        if self.ws.active_tab().panes.len() < 2 {
+            let split = self.chord_clause(Action::NewPane, |c| format!(" — {c} splits it"));
+            self.set_flash(format!("nothing to {verb}: this tab has one pane{split}"));
+        } else {
+            self.set_flash(format!("nothing to {verb} here"));
+        }
+    }
+
     /// C38: what a refused split says. `split_fit` returns `None` when the
     /// pane being split is under `MIN_SPLIT_COLS`×`MIN_SPLIT_ROWS`, which
     /// is also the trigger for the vt100 underflow crash — so the refusal
@@ -3791,11 +3852,26 @@ impl<B: PaneBackend> App<B> {
     /// TUI flash from an API call would put a message on screen that no one
     /// at the keyboard caused.
     fn flash_no_room(&mut self) {
-        self.set_flash(format!(
-            "no room to split — a pane needs {}×{}",
-            layout::MIN_SPLIT_COLS,
-            layout::MIN_SPLIT_ROWS,
-        ));
+        // `split_fit` picks the axis from the rect's aspect and then tests
+        // **that axis only**, so "a pane needs 36×10" was not the guard's
+        // condition — a 30×30 pane splits happily into two 30-wide halves.
+        // Naming the axis that actually failed, with the number it missed
+        // by, is both true and the more useful sentence. Found by the C38
+        // design audit; the first draft asserted a rule the code does not
+        // have, which is the worst kind of helpful message.
+        let rect = self.split_target().and_then(|id| {
+            self.rects().iter().find(|pr| pr.id == id).map(|pr| pr.rect)
+        });
+        let detail = match rect {
+            Some(r) if r.width >= r.height * 3 => {
+                format!("{} needs {} columns, has {}", "side by side", layout::MIN_SPLIT_COLS, r.width)
+            }
+            Some(r) => {
+                format!("stacked needs {} rows, has {}", layout::MIN_SPLIT_ROWS, r.height)
+            }
+            None => "the pane is too small".to_string(),
+        };
+        self.set_flash(format!("no room to split — {detail}"));
     }
 
     /// C38: what `Alt+Shift+hjkl` says when there is nothing that way.
@@ -3821,9 +3897,17 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
         };
-        let carry = self.chord_clause(Action::MovePaneToTab { forward }, |c| {
-            format!(" — {c} moves it to the {whither} tab")
-        });
+        // Named only when it would actually work. The clause was guarded on
+        // *bound*, which on the default single-tab workspace pointed at a
+        // chord that immediately refuses with "only one tab" — a dead end
+        // that hands you a second dead end. Found by the C38 design audit.
+        let carry = if self.ws.tabs.len() > 1 {
+            self.chord_clause(Action::MovePaneToTab { forward }, |c| {
+                format!(" — {c} moves it to the {whither} tab")
+            })
+        } else {
+            String::new()
+        };
         self.set_flash(format!("at the tab's edge{carry}"));
     }
 
@@ -3905,6 +3989,22 @@ impl<B: PaneBackend> App<B> {
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
     }
 
+    /// C22: the pane a split would actually be taken off — the focused one
+    /// when it is in the active tab's tree, else that tab's first pane.
+    ///
+    /// `self.focused` can be the float, which lives outside the tree, and
+    /// splitting "off" an id the tree does not contain is what trips
+    /// `split_pane`'s empty-tab fallback and wipes the whole tab's layout.
+    /// Shared by `spawn_child` and C38's refusal flash so the message can
+    /// never describe a different pane than the one that was refused.
+    fn split_target(&self) -> Option<PaneId> {
+        if self.ws.active_tab().panes.contains_key(&self.focused) {
+            Some(self.focused)
+        } else {
+            self.pane_order().first().copied()
+        }
+    }
+
     /// Split the focused pane and spawn a new one running `adapter`. `cwd`
     /// overrides the inherited working directory; `spawned_by` records the
     /// owner for the control-interface capability model. Returns the new pane
@@ -3926,11 +4026,7 @@ impl<B: PaneBackend> App<B> {
         // tree doesn't contain is exactly what trips `split_pane`'s
         // empty-tab fallback below and wipes the whole tab's layout — this
         // fallback closes that hole for every caller at once.
-        let split_target = if self.ws.active_tab().panes.contains_key(&self.focused) {
-            self.focused
-        } else {
-            self.pane_order().first().copied()?
-        };
+        let split_target = self.split_target()?;
         let cwd = cwd.unwrap_or_else(|| {
             self.ws
                 .active_tab()
@@ -3943,8 +4039,12 @@ impl<B: PaneBackend> App<B> {
 
         // Split in the widest direction of the split target's rect. Refuses
         // (returns None) a split that would produce unusably tiny panes
-        // (also the trigger for the vt100 underflow crash) — silent no-op,
-        // the layout is left untouched.
+        // (also the trigger for the vt100 underflow crash), leaving the
+        // layout untouched. **Not silent any more** (C38): the refusal is
+        // reported by whoever asked — `flash_no_room` at the two keypress
+        // sites, `ctl_spawn_child`'s own `Reply` for the control plane —
+        // and deliberately not from here, so an API call cannot put a
+        // message on a screen nobody was typing at.
         let target_rect = self.rects().iter().find(|pr| pr.id == split_target).map(|pr| pr.rect);
         let dir = split_fit(target_rect)?;
 
@@ -4129,6 +4229,14 @@ impl<B: PaneBackend> App<B> {
 
     fn go_to_tab(&mut self, i: usize) {
         if i >= self.ws.tabs.len() {
+            // C38: `Alt+5` on a two-tab workspace is literally C35's case —
+            // "a navigation key that silently does nothing reads as broken"
+            // — and the digit keys are the most guessed-at chords roost
+            // has. The count is the useful half: it says both that the key
+            // works and what the legal range is.
+            let n = self.ws.tabs.len();
+            let plural = if n == 1 { "tab" } else { "tabs" };
+            self.set_flash(format!("no tab {}: this workspace has {n} {plural}", i + 1));
             return;
         }
         // U11: the digit for the tab you're already on is a no-op. It used
@@ -12574,6 +12682,40 @@ mod tests {
         assert_eq!(app.focused, 3);
     }
 
+    /// C38: `Alt+Shift+hjkl` on the float refuses and says why — and it can
+    /// actually reach that refusal.
+    ///
+    /// It could not when C38 shipped: `apply`'s structural guard hid the
+    /// float for `MovePane` *before* `move_pane_dir` ran, so
+    /// `float_focused()` was always false and the contract's third row was
+    /// dead code. What happened instead was worse than the silence C38 set
+    /// out to fix — the float vanished and the swap landed on whichever
+    /// pane it had been covering, so the gesture moved a pane the user was
+    /// not looking at. Found by the C38 design audit, which probed the row
+    /// rather than reading it.
+    #[test]
+    fn moving_the_float_refuses_instead_of_hiding_it_and_moving_something_else() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1|2 in the tab
+        let before = format!("{:?}", app.ws.active_tab().layout);
+        app.apply(Action::ToggleFloat);
+        assert!(app.float_focused(), "the float is up and focused");
+
+        app.apply(Action::MovePane(Dir::Left));
+
+        assert!(app.float_focused(), "the float is still up — the chord refused it");
+        assert_eq!(
+            format!("{:?}", app.ws.active_tab().layout),
+            before,
+            "and nothing behind it moved",
+        );
+        assert_eq!(
+            app.flash(),
+            Some("the scratch pane sits outside the layout"),
+        );
+    }
+
     /// C38: the edge no-op **says so**, and horizontally it names the chord
     /// that does cross tabs — the dead end teaches the way out.
     ///
@@ -12588,7 +12730,8 @@ mod tests {
     fn moving_a_pane_off_the_edge_names_the_chord_that_would_work() {
         use crate::core::layout::Dir;
         let (mut app, _) = mk_app(shell_ws());
-        app.apply(Action::NewPane); // panes 1|2, focus 2 (right)
+        app.apply(Action::NewTab); // a second tab, so the carry chord is usable
+        app.apply(Action::NewPane); // panes 2|3 here, focus 3 (right)
 
         app.apply(Action::MovePane(Dir::Right)); // at the right edge
         let right = app.flash().expect("the edge speaks").to_string();
@@ -12604,6 +12747,84 @@ mod tests {
         app.apply(Action::MovePane(Dir::Up));
         let up = app.flash().expect("the edge speaks").to_string();
         assert_eq!(up, "nothing above to swap with");
+    }
+
+    /// C38: with nowhere to carry the pane *to*, the flash offers nothing.
+    ///
+    /// The clause was guarded on whether the chord was **bound**, not on
+    /// whether it would work — so on the default single-tab workspace the
+    /// edge flash named `Alt+Shift+i`, which then refuses with "only one
+    /// tab": a dead end handing you a second dead end. Found by the C38
+    /// design audit.
+    #[test]
+    fn the_edge_flash_offers_nothing_when_there_is_no_other_tab() {
+        use crate::core::layout::Dir;
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // one tab, panes 1|2, focus 2
+
+        app.apply(Action::MovePane(Dir::Right));
+        assert_eq!(app.flash(), Some("at the tab's edge"));
+    }
+
+    /// C38: `Alt+5` on a two-tab workspace says so, and says what the range
+    /// is. The digit keys are the most guessed-at chords roost has, and
+    /// this is C35's own case verbatim.
+    #[test]
+    fn a_tab_digit_past_the_end_says_how_many_tabs_there_are() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // two tabs now
+
+        app.apply(Action::GoToTab(4)); // "Alt+5"
+        assert_eq!(app.flash(), Some("no tab 5: this workspace has 2 tabs"));
+        assert_eq!(app.ws.active_tab, 1, "and it did not move");
+
+        // Singular reads correctly too — the common case is one tab.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::GoToTab(2));
+        assert_eq!(app.flash(), Some("no tab 3: this workspace has 1 tab"));
+    }
+
+    /// C38: the three structural chords say so when the tab's shape has
+    /// nothing for them, rather than looking unbound. Detected by comparing
+    /// the tree — `resize_pane` returns `true` at the ratio clamp ("handled,
+    /// no change"), so the mutator's bool is not the question.
+    #[test]
+    fn the_structural_chords_say_when_a_tab_has_nothing_for_them() {
+        let (mut app, _) = mk_app(shell_ws()); // one pane
+
+        for (action, verb) in [
+            (Action::ToggleStack, "stack"),
+            (Action::FlipSplit, "flip"),
+            (Action::Resize { horizontal: true, grow: true }, "resize"),
+        ] {
+            app.set_flash("stale");
+            app.apply(action);
+            let flash = app.flash().expect("{verb} speaks").to_string();
+            assert!(flash.starts_with(&format!("nothing to {verb}")), "{flash}");
+            assert!(flash.contains("one pane"), "it says why: {flash}");
+            let split = app.chord_label(Action::NewPane).expect("Alt+n is bound");
+            assert!(flash.contains(&split), "and what to press: {flash}");
+        }
+    }
+
+    /// ...and once the tab has a shape they apply to, they stay quiet.
+    #[test]
+    fn the_structural_chords_stay_quiet_when_they_do_something() {
+        // A fresh tab per verb: run in sequence they interfere honestly —
+        // `Alt+s` turns the split into a stack, and `Alt+o` then has
+        // nothing to flip and correctly says so. That is the code being
+        // right, so each verb gets the shape it applies to.
+        for action in [
+            Action::ToggleStack,
+            Action::FlipSplit,
+            Action::Resize { horizontal: true, grow: true },
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(Action::NewPane); // a real split to work on
+            app.flash = None;
+            app.apply(action);
+            assert!(app.flash().is_none(), "{:?}: {:?}", action, app.flash());
+        }
     }
 
     /// The flash resolves its chord through the live keymap. A literal
@@ -12644,10 +12865,15 @@ mod tests {
         app.apply(Action::NewPane);
         let flash = app.flash().expect("the refusal speaks").to_string();
         assert!(flash.contains("no room"), "{flash}");
+        // The axis `split_fit` actually tested, with the number it missed by
+        // — not both dimensions, which is a rule the guard does not have (a
+        // 30×30 pane splits fine into two 30-wide halves).
+        let vertical = flash.contains("columns");
+        let want = if vertical { layout::MIN_SPLIT_COLS } else { layout::MIN_SPLIT_ROWS };
+        assert!(flash.contains(&want.to_string()), "the threshold is actionable: {flash}");
         assert!(
-            flash.contains(&layout::MIN_SPLIT_COLS.to_string())
-                && flash.contains(&layout::MIN_SPLIT_ROWS.to_string()),
-            "the threshold is the actionable part: {flash}",
+            flash.contains("columns") != flash.contains("rows"),
+            "exactly one axis is named — the one that failed: {flash}",
         );
     }
 
