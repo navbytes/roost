@@ -12385,7 +12385,14 @@ mod tests {
                 .position(|r| matches!(r, RosterRow::Pane { id } if *id == roster_cursor(app)))
                 .expect("the cursor is on a row");
             assert!(at >= top && at < top + height, "the cursor is inside the window");
-            assert!(top + height <= rows.len(), "and the window never runs past the end");
+            // "the window never runs past the end" used to be asserted
+            // here as `top + height <= rows.len()` — which is
+            // `roster_top_clamped`'s own postcondition (`top.min(len -
+            // height)`), applied unconditionally by `roster_view` on the
+            // line above. It could not fail. The property is real, so it
+            // moved to `roster_top_clamped`'s own test, where the clamp is
+            // the thing under test rather than the thing supplying the
+            // answer. Sixth instance of the shape; see DESIGN-ui.md §7.
             top
         };
         let (rows, _) = app.roster_view();
@@ -13242,6 +13249,34 @@ mod tests {
         open_help(&mut app);
         help_type(&mut app, "/jk");
         assert_eq!(app.help_filter(), Some("jk"));
+    }
+
+    /// C27: the roster's scroll clamp, tested directly rather than through
+    /// a caller that applies it and then asserts its postcondition.
+    ///
+    /// `roster_window_follows_the_cursor_and_clamps` used to carry
+    /// `top + height <= rows.len()` after calling `roster_view`, which
+    /// clamps — so the assertion restated the clamp it had just run. That
+    /// left the clamp itself, including its `saturating_sub` edge, with no
+    /// test at all: the tautology had been standing in for one.
+    #[test]
+    fn the_roster_scroll_clamp_keeps_the_window_inside_the_list() {
+        // The ordinary case: a window smaller than the list.
+        assert_eq!(roster_top_clamped(0, 20, 5), 0, "the top of a long list stays put");
+        assert_eq!(roster_top_clamped(15, 20, 5), 15, "the last legal top is reachable");
+        assert_eq!(roster_top_clamped(99, 20, 5), 15, "past the end clamps to it");
+        for top in 0..30 {
+            let t = roster_top_clamped(top, 20, 5);
+            assert!(t + 5 <= 20, "top {top} clamped to {t}, which runs past the end");
+        }
+
+        // The edge the `saturating_sub` exists for: a window taller than
+        // the list. There is nothing to scroll, so the only legal top is 0
+        // — an underflow here would wrap to usize::MAX and scroll a short
+        // roster off its own bottom.
+        assert_eq!(roster_top_clamped(0, 3, 10), 0);
+        assert_eq!(roster_top_clamped(7, 3, 10), 0, "a taller window pins the top at 0");
+        assert_eq!(roster_top_clamped(1, 0, 10), 0, "and an empty list has nowhere to go");
     }
 
     /// The flash resolves its chord through the live keymap. A literal

@@ -5101,9 +5101,9 @@ smaller win than filtering, and worth its own decision rather than a
 tail-end of this one.
 
 ### On gates that pass by construction
-**[Added 2026-08-20, after the fifth instance]**
+**[Added 2026-08-20, after the sixth instance]**
 
-Five assertions on this branch turned out to prove nothing, all the same
+Six assertions on this branch turned out to prove nothing, all the same
 shape: **a test asserting a bound on a value that was already clamped to
 that bound.** Recorded here because the count is the argument — each one was
 found by a design audit or a deliberate sweep, never by CI, and each made a
@@ -5124,6 +5124,14 @@ The instances, so the shape is recognisable:
    vacuous, and the test's own comment stated the clamps before asserting
    them. Two clamps covered for each other, so deleting either left it
    green.
+6. `roster_window_follows_the_cursor_and_clamps` — `top + height <=
+   rows.len()` asserted after `roster_view`, which had just applied
+   `roster_top_clamped` (`top.min(len - height)`). The assertion restated
+   the clamp that produced the answer. This one is the clearest case of the
+   real cost: **`roster_top_clamped` had no test at all**, its
+   `saturating_sub` edge included, because the tautology had been standing
+   in for one. Breaking the clamp fails the direct test now and left the
+   caller's test green.
 
 Three rules follow, and they are cheap:
 
@@ -5139,6 +5147,10 @@ Three rules follow, and they are cheap:
   rewrite of (5) asserted placement and *still* passed with the clamp
   deleted, because a dialog centred on the whole body is inside it either
   way. Only the mutation showed that; the assertion looked meaningful.
+- **Test a clamp where it lives, not through a caller that applies it.**
+  (6)'s property was real; asserting it downstream of the clamp made it
+  unfalsifiable *and* hid that the clamp had no test. A pure helper with an
+  edge case (`saturating_sub`, `rem_euclid`, `.max(1)`) deserves its own.
 
 A test that cannot fail is worse than a missing one: the missing test is
 visible in coverage, and this one reads as a guarantee.
