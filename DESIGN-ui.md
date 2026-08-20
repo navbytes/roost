@@ -1702,6 +1702,16 @@ So the cap goes, and with it the merges:
   It is the check that actually matters, and it only became available by
   removing the constraint that made it unsatisfiable.
 
+**[Amended 2026-08-20, F9 — the keymap filters]** `/` opens a type-ahead
+filter over the table, and while a query is open "any key closes it" no
+longer holds: printables type. That is a **larger** carve-out than the
+scroll amendment above, which is conditional and hands its keys back the
+moment they have nothing to do — the rules, the reason C27's roster rather
+than C15's own scrolling licenses it, and the four title/hint-bar wordings
+that announce it are contracted in **C39**. Everything on this page holds
+unchanged while the filter is closed, which is the default and, for a reader
+who never presses `/`, the only state.
+
 **[Amended 2026-08-06, PR #46 design audit (D2) — the mouse row grows]**
 C29's three new gestures had no discoverability surface at all:
 `every_bound_chord_is_documented_in_the_keymap` only ever walks Alt chords,
@@ -4925,6 +4935,226 @@ the cycle rather than a silent refusal, so not C38's kind of problem. It was
 C36/C27's question and got C36/C27's answer: the composer now skips the
 tier, the roster keeps it, and §7 records why the two are not in tension.
 
+### C39 — The keymap filters (`/`) — [Added 2026-08-20, comparative UX review F9]
+
+**The gap.** The overlay is roost's longest list and its only unfilterable
+one. `Alt+?` draws thirty-odd rows in eight groups; finding "the one that
+moves a pane between tabs" means reading. Meanwhile roost already has
+type-ahead in C14's picker and C27's roster, and `/` search inside scroll
+mode (P21) — three surfaces where narrowing a list is a reflex, and the one
+surface whose entire job is *explaining roost* is the one that cannot.
+
+**The rule.** `/` opens a type-ahead filter. Typing narrows the table;
+`Backspace` widens it; `Esc` clears a query and then, pressed on an empty
+one, closes. The scroll keys keep working throughout. Matching is
+case-insensitive over **both** columns — key and description — because a
+reader is as likely to remember "the one with `g` in it" as "the layout
+one".
+
+**`Option<String>`, not `String`.** `None` is the un-filtered overlay and
+`Some("")` is a live but empty query (`/` then `Backspace`). They behave
+differently and must: under `None` every key still closes, `q` included;
+under `Some` every printable types. An empty string standing in for "not
+filtering" would make `/`-then-`Backspace` close the overlay on the next
+letter. Pinned by `the_help_overlay_is_unchanged_until_slash_opens_the_filter`.
+
+#### On the size of this carve-out — stated, not smuggled
+
+C15's scroll amendment earned its carve-out by being **conditional**:
+`help_scroll` reports whether it moved, a key that moved nothing falls
+through and dismisses, so on a terminal showing the whole table the
+amendment is invisible. It is tempting to present this one as the same
+shape. **It is not, and the difference should be read plainly:**
+
+- The scroll carve-out claims eight keys (`↑ ↓ j k PgUp PgDn Home End`),
+  conditionally, and hands them back the moment they have nothing to do.
+- This one claims **every printable key, unconditionally**, for as long as
+  the query is open. There is no "did nothing, fall through" available:
+  `Backspace` has to work when the query matches nothing, or a typo becomes
+  a trap.
+
+What licenses it is not the scroll precedent but **C27's roster**, which
+made exactly this trade first and wrote the reason into its hint bar: *"`q`
+is deliberately absent (the roster filters as you type, so a letter is
+filter text, U20's rule) — `Esc` is the way out."* C14's picker is the same
+rule again. So this is roost's own established idiom applied to the surface
+that lacked it — not a new liberty, and not an extension of a smaller one.
+
+Two things keep it honest:
+
+- **`/` is the only unconditional new key**, and only from the un-filtered
+  state. Everything else lives inside a state the user opened deliberately.
+- **A second `/` is text, not a second open.** A key meaning "open" in one
+  state and "type" in another is the ambiguity U20 already resolved for the
+  picker; a query can contain a slash.
+
+#### Where it announces itself
+
+Both C15 surfaces, because while a query is open "any key closes it" is
+false and a reader who cannot see why is stuck — on the one modal you open
+*because* you are lost.
+
+| state | title | hint bar |
+|---|---|---|
+| plain | `keys — / filters · any key closes` | `Alt+? all keys` · `/ filter` · `any key close` |
+| scrolled | `keys — 26/36 · ↑↓ more · / filters · any key closes` | `↑↓ PgUp/Dn read on` · `/ filter` · `any other key close` |
+| filtering | `keys — /mov · 4 shown · Esc clears` | `type filter` · `↑↓ PgUp/Dn read on` · `Esc clear · close` |
+| filtering, scrolled | `keys — /a · 26/31 · ↑↓ more · Esc clears` | as above |
+
+The filtered hint row is C27's roster pairs, for C27's reason. The
+unfiltered rows gain only `/ filter` — the affordance has to be visible or
+the feature does not exist, which is precisely the state P21 catalogued for
+scroll-mode search. All four rows stay inside C9's 100-column budget, and
+`the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls` measures
+every one of them rather than the two it used to.
+
+**All four wordings come from one function** (`help_title`), because the
+dialog's **width is floored by the title's** — see below — and a second
+spelling would let the floor guard a string the frame does not draw. §4/§5
+lockstep, applied to a modal's own heading.
+
+#### Consequences the first draft had to be told about
+
+- **The dialog is sized for the filtered table**, C14's picker rule applied
+  to the surface that borrowed its type-ahead: a query cutting 36 rows to 3
+  must not leave a 36-row frame around them.
+- **Editing the query resets `top` to 0.** A filtered list is a *new* list
+  and an old `top` can point past its end. C14 and C27 both put the cursor
+  at the start for the same reason.
+- **A dead-end scroll key must not close while filtering.** Un-filtered it
+  does — C15's conditional rule, untouched — but losing a live query to an
+  over-pressed `↓` is exactly the "the modal you open when you are lost is
+  the one with a surprising way out" failure that made U23 reject scrolling
+  in the first place.
+- **`/` is taught in the overlay's own `Alt+?` row** (`this keymap — /
+  filters it`), not only in §8 and the live title. C15's P21 precedent:
+  `/ search, n/N` rides the `Alt+c` row rather than taking one of its own,
+  because a key the overlay does not print is a key the overlay does not
+  teach. The C39 audit found `/` documented everywhere except the surface
+  whose job is documenting.
+- **Enter and Tab close a live query; Delete does not.** Delete is an
+  *edit* key and a reader reaching for it is erasing a typo — losing the
+  overlay would be the sharpest possible answer. It has nothing to delete
+  (the caret is always at the end of an append-only query), so it does
+  nothing, which is what Delete does at the end of any text field. Enter
+  and Tab have no meaning on a list with no cursor, so they read as "done"
+  — contracted deliberately rather than left as a fall-through.
+- **A group whose every row is filtered away contributes no heading**, the
+  rule `config.json`'s `disable` already put there. A heading that matched
+  while its rows did not would title an empty block.
+- **The 80-column floor holds under every query**, not just the empty one.
+  Filtering only removes rows, so the widest survivor is never wider than
+  the widest row overall — but that is an argument, and two prior audits
+  found this floor sitting at exactly its limit with zero slack, so
+  `the_help_dialog_fits_the_floor_under_every_query` checks instead.
+- **The dialog is never narrower than its own title**, which the filter is
+  what made possible. Before it, the table always contained its widest row,
+  so the frame was always wider than any heading. A query isolating one
+  *short* row breaks that: `/this keymap` left a 33-column dialog under a
+  44-column title, and `modal_frame` clipped it — hiding the one sentence
+  telling a filtering reader how to get out, on the surface they opened
+  because they were lost. `help_layout` floors its width on
+  `help_title`'s.
+
+  **Found by driving the overlay in a PTY, not by any unit test**, and the
+  reason is worth keeping: every test here looked at the frame *or* the
+  title, never at the two together. The same shape as the C15 padding bug —
+  each half correct, the pair wrong — and the second time on this branch
+  that the check which caught it was "render it and look".
+
+  **That floor is only half the answer, and the audit had to say so.** It
+  fixes *content narrower than the title*; a **body** narrower than the
+  title is the other half, and `.min(body.width)` re-admitted it — at the
+  80-column floor a 46-character query clamped and the frame truncated the
+  tail, losing `Esc clears` all over again. Widening cannot help when the
+  title already exceeds the terminal, so **the query elides** (`…`) and
+  everything after it survives: the count, and the way out. The query is
+  the right thing to cut because it is the one part the user can already
+  see themselves typing.
+- **The floor test asserts on the un-clamped `asked`, never on `size.0`.**
+  `size.0` is `.min(body.width)`, so at an 80-column body it reports 80
+  whether the dialog fitted or was cut down to it. C39's first floor gate
+  read `size.0` and therefore passed by construction — the third tautology
+  on this branch, written 160 lines below a corrected test in the same file
+  carrying the comment "assert on the ask instead", and five days after
+  C15's own amendment named the shape. `HelpLayout::asked` exists so the
+  honest assertion is the easy one.
+- **The filtering state has its own chrome fixture and its own C24b
+  probe.** `chrome_buffers` rendered only the un-filtered overlay, so §2's
+  gates never saw the filtering title or hint row; and `every_mode()` lists
+  one state per variant, so the sweeps never probed the one surface that
+  holds every printable key — precisely where C24b's rule is under real
+  pressure. A second list (`extra_mode_states`) covers surfaces-within-a-
+  variant without weakening `every_mode()`'s duplicate check, which is what
+  makes its exhaustive `match` mean anything.
+
+**Not in scope.** The report's other half — ordering the groups by context,
+so a dead-focused pane's overlay leads with the dead-pane verbs — is
+deliberately not built here. Its headline case ("copy mode leads with
+READING") is **unreachable**: C24b's escape hatch sets `mode = Normal`
+before `Action::Help` runs, so `Mode::Help` never learns what it was
+entered from, and `selection` is cleared on the way too (verified, not
+reasoned). Making it reachable means threading a predecessor mode through
+the escape hatch contracted the same day. The *workspace*-state half (a dead
+focused pane) needs none of that and stays available; it is simply a much
+smaller win than filtering, and worth its own decision rather than a
+tail-end of this one.
+
+### On gates that pass by construction
+**[Added 2026-08-20, after the sixth instance]**
+
+Six assertions on this branch turned out to prove nothing, all the same
+shape: **a test asserting a bound on a value that was already clamped to
+that bound.** Recorded here because the count is the argument — each one was
+found by a design audit or a deliberate sweep, never by CI, and each made a
+check look done when it was not.
+
+The instances, so the shape is recognisable:
+
+1. `help_dialog_fits_the_eighty_column_floor` — `size.0 <= 80` at an
+   80-column body, where `size.0` ends in `.min(body.width)`.
+2. `one_help_column_fits_the_eighty_column_floor` — the same, one test over.
+3. C39's `the_help_dialog_fits_the_floor_under_every_query` — the same
+   again, written *160 lines below* the corrected version of (1), which
+   carries the comment "assert on the ask instead".
+4. `help_fits_the_eighty_column_floor_and_reaches_every_row` — the width
+   half had been fixed; the **height** half (`size.1 <= body.height`, where
+   `size.1` is `min(tallest, body.height - 2) + 2`) was still vacuous.
+5. `help_dialog_clamps_to_the_screen_via_centered_near` — every assertion
+   vacuous, and the test's own comment stated the clamps before asserting
+   them. Two clamps covered for each other, so deleting either left it
+   green.
+6. `roster_window_follows_the_cursor_and_clamps` — `top + height <=
+   rows.len()` asserted after `roster_view`, which had just applied
+   `roster_top_clamped` (`top.min(len - height)`). The assertion restated
+   the clamp that produced the answer. This one is the clearest case of the
+   real cost: **`roster_top_clamped` had no test at all**, its
+   `saturating_sub` edge included, because the tautology had been standing
+   in for one. Breaking the clamp fails the direct test now and left the
+   caller's test green.
+
+Three rules follow, and they are cheap:
+
+- **Never assert on a value the production code clamped.** Assert on the
+  *ask* — the pre-clamp want. `HelpLayout::asked` exists for exactly this,
+  and a computed quantity that gets clamped on the way out should carry its
+  unclamped form when a test needs to bound it.
+- **When two mechanisms both enforce a property, a test of the property
+  tests neither.** (5) survived deleting `centered_near`'s clamp because
+  `help_layout` clamped too. Pick the input that makes exactly one of them
+  responsible — in that case, an anchor hugging an edge.
+- **Mutation-check the replacement, not just the original.** The first
+  rewrite of (5) asserted placement and *still* passed with the clamp
+  deleted, because a dialog centred on the whole body is inside it either
+  way. Only the mutation showed that; the assertion looked meaningful.
+- **Test a clamp where it lives, not through a caller that applies it.**
+  (6)'s property was real; asserting it downstream of the clamp made it
+  unfalsifiable *and* hid that the clamp had no test. A pure helper with an
+  edge case (`saturating_sub`, `rem_euclid`, `.max(1)`) deserves its own.
+
+A test that cannot fail is worse than a missing one: the missing test is
+visible in coverage, and this one reads as a guarantee.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -4958,7 +5188,7 @@ shows only the C9-curated subsets.
 | 17 | `Alt+PgUp` | scroll mode | — |
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
-| 20 | `Alt+?` | full keymap overlay (this table) | C15 |
+| 20 | `Alt+?` | full keymap overlay (this table); `/` filters it | C15, C39 |
 
 *Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
 terminals disagree about which half of that they report: some deliver
