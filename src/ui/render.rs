@@ -96,8 +96,19 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
         // from the pane beneath the moment the flash expires. Nothing new is
         // drawn — same text, same `attention()` styling, same single row as
         // the hint-bar path, because it is literally the same function.
+        //
+        // **[C11, same amendment]** and the Alt-trap warning with it, in the
+        // same precedence the hint bar uses (flash first). It is the worse
+        // half of the two: if Alt really is being swallowed, `Alt+/` cannot
+        // bring the hint bar back, so the one sentence explaining why no
+        // chord works was unreachable by the only key that would reveal it.
+        // Unlike the flash this bar is persistent, so it does cost a row of
+        // pane content for as long as it holds — but `show_alt_hint` is
+        // evidence-gated (U4/F1: the signature of a swallowed Option chord,
+        // not merely an absence of Alt), and a user in that state needs the
+        // sentence more than the row.
         let last = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-        draw_flash(f, app, last);
+        let _ = draw_flash(f, app, last) || draw_alt_warning(f, app, last);
     }
 
     // Anchor floating dialogs near the focused pane rather than dead-center
@@ -468,22 +479,29 @@ fn draw_flash<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
     true
 }
 
+/// C11/U4: paint the Alt-trap warning into `area`, or report that there is
+/// nothing to warn about. Same shape and same reasons as `draw_flash` — one
+/// function for both the hint bar and the body's last row, and the `Clear`
+/// so the cells past the message do not keep their border glyphs under the
+/// reversal (`attention_problem()` names its own fg, so unlike the flash the
+/// *text* could not inherit, but the ragged band could).
+fn draw_alt_warning<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
+    if !app.show_alt_hint() {
+        return false;
+    }
+    // Same bar, per-terminal wording — the app knows the host's TERM_PROGRAM
+    // and picks the real menu path where there is one. A problem bar, so the
+    // red-tinted reversal, not the neutral one.
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()), area);
+    true
+}
+
 fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // Flash wins the bar over the alt-warning: a transient action result
     // (e.g. "copied") takes over the bar briefly rather than being swallowed
     // by a persistent problem bar for its entire window.
-    if draw_flash(f, app, area) {
-        return;
-    }
-
-    if app.show_alt_hint() {
-        // C11/U4: same bar, per-terminal wording — the app knows the host's
-        // TERM_PROGRAM and picks the real menu path where there is one. A
-        // problem bar, so the red-tinted reversal, not the neutral one.
-        f.render_widget(
-            Paragraph::new(app.alt_hint_line()).style(theme::attention_problem()),
-            area,
-        );
+    if draw_flash(f, app, area) || draw_alt_warning(f, app, area) {
         return;
     }
 
@@ -5025,6 +5043,13 @@ row's — widen ADAPTER_COL",
         app.set_flash("copied 12 chars");
         out.push(("flash, hint bar hidden", snap(&mut app)));
 
+        // ...and the C11 bar on that same surface, for the same reason.
+        let mut app = three_panes();
+        app.apply(Action::ToggleHints);
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
+        assert!(app.show_alt_hint());
+        out.push(("alt-trap warning bar, hint bar hidden", snap(&mut app)));
+
         let mut app = three_panes();
         // F1's evidence: a swallowed Option chord (Option+n -> '˜' with no
         // Alt modifier), not just any key.
@@ -5510,6 +5535,66 @@ row's — widen ADAPTER_COL",
             (0..100).filter_map(|x| term.backend().buffer().cell((x, 0)).map(|c| c.symbol().to_string())).collect();
         assert!(row.contains("ZOOM · "), "tab bar row was: {row:?}");
         assert!(row.trim_end().ends_with(theme::SAVED), "the save word still trails: {row:?}");
+    }
+
+    /// C10/C11 (2026-08-20): neither message may be hostage to whether the
+    /// hint bar is drawn. Both used to reach the screen only through
+    /// `draw_hint_bar`, so `Alt+/` silenced every refusal, every copy
+    /// result, every confirm-arm prompt, and the one sentence explaining a
+    /// terminal that swallows Alt — which `Alt+/` itself cannot then undo.
+    #[test]
+    fn a_hidden_hint_bar_does_not_silence_the_flash_or_the_alt_trap_warning() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        fn last_row(app: &mut App<crate::ports::fakes::FakePane>) -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            (0..100)
+                .filter_map(|x| term.backend().buffer().cell((x, 29)).map(|c| c.symbol().to_string()))
+                .collect()
+        }
+
+        // A flash, with the bar hidden.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        assert!(!app.hints_shown(), "setup: the hint bar is not drawn");
+        app.set_flash("no room to split — stacked needs 10 rows, has 4");
+        assert!(
+            last_row(&mut app).contains("no room to split"),
+            "the refusal never reached the screen: {:?}",
+            last_row(&mut app),
+        );
+
+        // U22's confirm-arm prompt is a flash too — the case where silence
+        // costs the user a pane rather than a message.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        app.apply(Action::ClosePane); // arms, and flashes "… again to …"
+        let row = last_row(&mut app);
+        assert!(row.contains("again"), "the confirm prompt never reached the screen: {row:?}");
+
+        // The C11 bar, with the bar hidden — the one Alt+/ cannot restore.
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::ToggleHints);
+        app.note_key_seen(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('˜')));
+        assert!(app.show_alt_hint(), "setup: the alt trap is detected");
+        let row = last_row(&mut app);
+        assert!(!row.trim().is_empty(), "the alt-trap warning never reached the screen");
+        assert_eq!(
+            row.trim(),
+            app.alt_hint_line().trim(),
+            "the same sentence the hint bar would have carried",
+        );
+
+        // Flash still wins over the warning, exactly as on the hint bar.
+        app.set_flash("copied 12 chars");
+        assert!(
+            last_row(&mut app).contains("copied 12 chars"),
+            "flash must outrank the persistent warning here too",
+        );
     }
 
     /// Asserts `text` sits flush against the pane's top-right border

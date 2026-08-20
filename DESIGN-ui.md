@@ -1328,6 +1328,23 @@ unchanged; what fires the bar, and what it says, are now contracted:
   Settings > Profiles > Keys, Left Option = `Esc+`. Anything else gets a
   terminal-agnostic line — never a menu path that terminal doesn't have.
 
+**[Amended 2026-08-20 — the bar is no longer hint-bar-only]** Styling,
+trigger and wording are untouched; where it may be *drawn* is not. The bar
+reached the screen only through `draw_hint_bar`, so `hints_shown()` gated it
+— false both under `Alt+/` and under 3 rows of terminal. The failure mode is
+circular and was the reason to fix this ahead of the rest of C11: if Alt
+really is being swallowed, `Alt+/` cannot bring the hint bar back, so the one
+sentence that explains why no chord works is unreachable by the only key that
+would reveal it. It now falls back to the body's last row on exactly the
+terms C10's flash does (same amendment, same `Clear`, same shared function
+per path, flash still winning over it), with one difference worth stating
+because it is a real cost rather than an oversight: this bar is
+**persistent**, so it holds that row for as long as the trap is detected
+rather than for two seconds. That is accepted because the trigger is already
+evidence-gated (U4/F1 above — the signature of a swallowed Option chord, not
+a mere absence of Alt), a user in that state has no working chords at all,
+and one Alt key ever — or the 8 s window closing — ends it.
+
 **[Amended 2026-07-27, theme inheritance; revised same day after the design
 supervisor's SG-1]** The bar is `attention_problem()`
 (`REVERSED`), not `FG` on an `ACCENT_DIM` fill. The "roost-level problem bars
