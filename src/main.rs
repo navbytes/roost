@@ -1557,12 +1557,12 @@ mod tests {
         // C15 (amended): the wheel reads on when the keymap is taller than
         // the overlay — it must not be mistaken for a dismissal, or the one
         // gesture for "show me more" would throw the list away.
-        let (visible, total) = ui::render::help_scroll_extent(app.body_area(), app.keymap());
+        let (visible, total) = ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert!(visible < total, "this fixture's keymap is scrolled");
         handle_mouse(&mut app, wheel_down(rect.x + 1, rect.y + 1));
-        assert!(matches!(app.mode, Mode::Help { top } if top > 0), "the wheel scrolls the keymap");
+        assert!(matches!(app.mode, Mode::Help { top, .. } if top > 0), "the wheel scrolls the keymap");
         handle_mouse(&mut app, wheel_up(rect.x + 1, rect.y + 1));
-        assert!(matches!(app.mode, Mode::Help { top: 0 }), "…and back up");
+        assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "…and back up");
         handle_mouse(&mut app, click(rect.x + 1, rect.y + 1));
         assert!(matches!(app.mode, Mode::Normal), "any click dismisses help");
 

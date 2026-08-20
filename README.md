@@ -159,7 +159,7 @@ you're in.
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
 | `Alt+Shift+p` | raw pass-through for the focused pane — same chord exits it |
 | `Alt+/` | toggle the shortcut hint bar |
-| `Alt+?` | show the full keymap (any key closes it) |
+| `Alt+?` | show the full keymap (`/` filters it, any key closes it) |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 
 A shortcut hint bar runs along the bottom by default (zellij-style), showing

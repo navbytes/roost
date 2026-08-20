@@ -423,7 +423,7 @@ continue-into-the-next-tab rule.
 
 ---
 
-## F9 · Low · `Alt+?` neither filters nor knows where you are
+## F9 · Low · **PARTLY RESOLVED 2026-08-20 (C39)** · `Alt+?` neither filters nor knows where you are
 
 **What.** The overlay is one global scrolling table. roost already has
 type-ahead filtering in two other dialogs (C14's picker per U20, C27's roster)
@@ -443,6 +443,21 @@ way C14's does, `Esc` clears then closes, and every other key still dismisses.
 **Cheaper alternative that keeps the contract untouched:** order the groups by
 context. A dead-focused pane's overlay leads with the dead-pane verbs; copy
 mode leads with READING. No new keys, no carve-out.
+
+**Resolved (the filter half) as C39.** The tension resolved as sketched, but
+*not* by the precedent named above. C15's scroll carve-out is conditional —
+a key that scrolled nothing falls through and dismisses — and a filter's
+cannot be, because `Backspace` has to work when the query matches nothing.
+What licenses it is **C27's roster**, which made exactly this trade first and
+wrote the reason into its hint bar ("a letter is filter text, U20's rule").
+C39 says that plainly rather than borrowing the smaller precedent.
+
+**The cheap alternative was half wrong, and the wrong half was the headline.**
+"Copy mode leads with READING" is unreachable: C24b's escape hatch sets
+`mode = Normal` before `Action::Help` runs, so `Mode::Help` never learns
+where it came from — verified against the running code, not reasoned. The
+*workspace*-state half (a dead focused pane) needs no such state and remains
+available; it is left as its own decision, being a much smaller win.
 
 ---
 

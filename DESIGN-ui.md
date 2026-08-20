@@ -1702,6 +1702,16 @@ So the cap goes, and with it the merges:
   It is the check that actually matters, and it only became available by
   removing the constraint that made it unsatisfiable.
 
+**[Amended 2026-08-20, F9 — the keymap filters]** `/` opens a type-ahead
+filter over the table, and while a query is open "any key closes it" no
+longer holds: printables type. That is a **larger** carve-out than the
+scroll amendment above, which is conditional and hands its keys back the
+moment they have nothing to do — the rules, the reason C27's roster rather
+than C15's own scrolling licenses it, and the four title/hint-bar wordings
+that announce it are contracted in **C39**. Everything on this page holds
+unchanged while the filter is closed, which is the default and, for a reader
+who never presses `/`, the only state.
+
 **[Amended 2026-08-06, PR #46 design audit (D2) — the mouse row grows]**
 C29's three new gestures had no discoverability surface at all:
 `every_bound_chord_is_documented_in_the_keymap` only ever walks Alt chords,
@@ -4925,6 +4935,132 @@ the cycle rather than a silent refusal, so not C38's kind of problem. It was
 C36/C27's question and got C36/C27's answer: the composer now skips the
 tier, the roster keeps it, and §7 records why the two are not in tension.
 
+### C39 — The keymap filters (`/`) — [Added 2026-08-20, comparative UX review F9]
+
+**The gap.** The overlay is roost's longest list and its only unfilterable
+one. `Alt+?` draws thirty-odd rows in seven groups; finding "the one that
+moves a pane between tabs" means reading. Meanwhile roost already has
+type-ahead in C14's picker and C27's roster, and `/` search inside scroll
+mode (P21) — three surfaces where narrowing a list is a reflex, and the one
+surface whose entire job is *explaining roost* is the one that cannot.
+
+**The rule.** `/` opens a type-ahead filter. Typing narrows the table;
+`Backspace` widens it; `Esc` clears a query and then, pressed on an empty
+one, closes. The scroll keys keep working throughout. Matching is
+case-insensitive over **both** columns — key and description — because a
+reader is as likely to remember "the one with `g` in it" as "the layout
+one".
+
+**`Option<String>`, not `String`.** `None` is the un-filtered overlay and
+`Some("")` is a live but empty query (`/` then `Backspace`). They behave
+differently and must: under `None` every key still closes, `q` included;
+under `Some` every printable types. An empty string standing in for "not
+filtering" would make `/`-then-`Backspace` close the overlay on the next
+letter. Pinned by `the_help_overlay_is_unchanged_until_slash_opens_the_filter`.
+
+#### On the size of this carve-out — stated, not smuggled
+
+C15's scroll amendment earned its carve-out by being **conditional**:
+`help_scroll` reports whether it moved, a key that moved nothing falls
+through and dismisses, so on a terminal showing the whole table the
+amendment is invisible. It is tempting to present this one as the same
+shape. **It is not, and the difference should be read plainly:**
+
+- The scroll carve-out claims six keys, conditionally, and hands them back
+  the moment they have nothing to do.
+- This one claims **every printable key, unconditionally**, for as long as
+  the query is open. There is no "did nothing, fall through" available:
+  `Backspace` has to work when the query matches nothing, or a typo becomes
+  a trap.
+
+What licenses it is not the scroll precedent but **C27's roster**, which
+made exactly this trade first and wrote the reason into its hint bar: *"`q`
+is deliberately absent (the roster filters as you type, so a letter is
+filter text, U20's rule) — `Esc` is the way out."* C14's picker is the same
+rule again. So this is roost's own established idiom applied to the surface
+that lacked it — not a new liberty, and not an extension of a smaller one.
+
+Two things keep it honest:
+
+- **`/` is the only unconditional new key**, and only from the un-filtered
+  state. Everything else lives inside a state the user opened deliberately.
+- **A second `/` is text, not a second open.** A key meaning "open" in one
+  state and "type" in another is the ambiguity U20 already resolved for the
+  picker; a query can contain a slash.
+
+#### Where it announces itself
+
+Both C15 surfaces, because while a query is open "any key closes it" is
+false and a reader who cannot see why is stuck — on the one modal you open
+*because* you are lost.
+
+| state | title | hint bar |
+|---|---|---|
+| plain | `keys — / filters · any key closes` | `Alt+? all keys` · `/ filter` · `any key close` |
+| scrolled | `keys — 26/36 · ↑↓ more · / filters · any key closes` | `↑↓ PgUp/Dn read on` · `/ filter` · `any other key close` |
+| filtering | `keys — /mov · 4 shown · Esc clears` | `type filter` · `↑↓ PgUp/Dn read on` · `Esc clear · close` |
+| filtering, scrolled | `keys — /a · 26/31 · ↑↓ more · Esc clears` | as above |
+
+The filtered hint row is C27's roster pairs, for C27's reason. The
+unfiltered rows gain only `/ filter` — the affordance has to be visible or
+the feature does not exist, which is precisely the state P21 catalogued for
+scroll-mode search. All four rows stay inside C9's 100-column budget, and
+`the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls` measures
+every one of them rather than the two it used to.
+
+**All four wordings come from one function** (`help_title`), because the
+dialog's **width is floored by the title's** — see below — and a second
+spelling would let the floor guard a string the frame does not draw. §4/§5
+lockstep, applied to a modal's own heading.
+
+#### Consequences the first draft had to be told about
+
+- **The dialog is sized for the filtered table**, C14's picker rule applied
+  to the surface that borrowed its type-ahead: a query cutting 36 rows to 3
+  must not leave a 36-row frame around them.
+- **Editing the query resets `top` to 0.** A filtered list is a *new* list
+  and an old `top` can point past its end. C14 and C27 both put the cursor
+  at the start for the same reason.
+- **A dead-end scroll key must not close while filtering.** Un-filtered it
+  does — C15's conditional rule, untouched — but losing a live query to an
+  over-pressed `↓` is exactly the "the modal you open when you are lost is
+  the one with a surprising way out" failure that made U23 reject scrolling
+  in the first place.
+- **A group whose every row is filtered away contributes no heading**, the
+  rule `config.json`'s `disable` already put there. A heading that matched
+  while its rows did not would title an empty block.
+- **The 80-column floor holds under every query**, not just the empty one.
+  Filtering only removes rows, so the widest survivor is never wider than
+  the widest row overall — but that is an argument, and two prior audits
+  found this floor sitting at exactly its limit with zero slack, so
+  `the_help_dialog_fits_the_floor_under_every_query` checks instead.
+- **The dialog is never narrower than its own title**, which the filter is
+  what made possible. Before it, the table always contained its widest row,
+  so the frame was always wider than any heading. A query isolating one
+  *short* row breaks that: `/this keymap` left a 33-column dialog under a
+  44-column title, and `modal_frame` clipped it — hiding the one sentence
+  telling a filtering reader how to get out, on the surface they opened
+  because they were lost. `help_layout` floors its width on
+  `help_title`'s.
+
+  **Found by driving the overlay in a PTY, not by any unit test**, and the
+  reason is worth keeping: every test here looked at the frame *or* the
+  title, never at the two together. The same shape as the C15 padding bug —
+  each half correct, the pair wrong — and the second time on this branch
+  that the check which caught it was "render it and look".
+
+**Not in scope.** The report's other half — ordering the groups by context,
+so a dead-focused pane's overlay leads with the dead-pane verbs — is
+deliberately not built here. Its headline case ("copy mode leads with
+READING") is **unreachable**: C24b's escape hatch sets `mode = Normal`
+before `Action::Help` runs, so `Mode::Help` never learns what it was
+entered from, and `selection` is cleared on the way too (verified, not
+reasoned). Making it reachable means threading a predecessor mode through
+the escape hatch contracted the same day. The *workspace*-state half (a dead
+focused pane) needs none of that and stays available; it is simply a much
+smaller win than filtering, and worth its own decision rather than a
+tail-end of this one.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -4958,7 +5094,7 @@ shows only the C9-curated subsets.
 | 17 | `Alt+PgUp` | scroll mode | — |
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
-| 20 | `Alt+?` | full keymap overlay (this table) | C15 |
+| 20 | `Alt+?` | full keymap overlay (this table); `/` filters it | C15, C39 |
 
 *Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
 terminals disagree about which half of that they report: some deliver
