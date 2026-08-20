@@ -507,6 +507,56 @@ cannot un-pad them.
 
 ---
 
+## Simulation pass — 2026-08-20
+
+Four agents drove the real binary in real PTYs against the shipped
+contracts: every chord in the table, the CLI and `config.json` surface, the
+new fleet features, and small terminals under resize.
+
+**One report came back as a critical bug and was wrong.** The claim: `Alt+q`
+does not quit while any modal is open — "100% reproducible across all three
+modal types", the process hanging until force-killed. It reproduces on
+nothing. The harness pressed the modal-opening chord **100 ms after spawn**,
+before roost had drawn a first frame, so no modal was ever open; its own
+screenshots would have shown `NORMAL`. Then it gave the quit a **1 s**
+deadline, while `quit_and_wait` re-presses at 700 ms to answer U1's
+busy-fleet confirm and a real quit here takes 0.9–1.9 s. Two independent
+timing mistakes, compounding into a confident false positive.
+
+Three things follow, and only one of them is about the report.
+
+1. **Verify before acting.** The claim contradicted a contract on its face —
+   C15 says *any* key dismisses the help overlay — which was the tell. A
+   ten-minute reproduction in the main tree settled it. An agent's
+   confidence ("VERY HIGH") is not evidence, and a failing test is evidence
+   only about the test until you have read it.
+2. **The rule it accused was genuinely untested.** "An Alt chord always
+   leaves the mode" was enforced by one `if` in `handle_mode_key`, asserted
+   nowhere, and already carved out once (C36's `Alt+Enter`). A false report
+   found a real gap, which is worth more than the report costing nothing.
+   Now contracted as an amendment to **C24b** — which turned out to own the
+   rule already, in one under-specified bullet; the design audit caught the
+   amendment landing in C12 and duplicating it — and pinned three ways: a
+   1,111-probe sweep of every chord against every mode, an exhaustive
+   `match` that breaks the build when a mode is added, and
+   `tests/modal_quit.rs` driving five modals in a real PTY. The same audit
+   found the amendment's own summary sentence false (`Alt+Enter` is
+   consumed but does **not** leave the mode — it is a line break) and
+   surfaced an open behaviour question underneath it: an Alt chord discards
+   an editor's unsaved buffer, which U8 forbids the mouse from doing.
+   Recorded in DESIGN-ui.md §7, not guessed at.
+3. **A modal test must prove the modal opened.** `tests/modal_quit.rs`
+   asserts its marker is *absent* before the chord and present after —
+   so a test that reaches no overlay fails loudly instead of quietly
+   reporting on Normal mode. The mode word (`HELP`, `ROSTER`, `BROADCAST`)
+   is the marker precisely because overlay body text like "keys" or "shell"
+   also sits in the always-visible hint bar.
+
+Everything else the pass touched — 35 chords, rapid-fire sequences, orphan
+cleanup, 50+ CLI and config cases — came back clean.
+
+---
+
 ## What roost already does better — worth not regressing
 
 Recorded so a future pass doesn't "improve" these toward the comparison tools:

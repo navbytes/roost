@@ -14772,4 +14772,227 @@ mod tests {
         assert_eq!(sel.cursor, (5, 6));
         assert_eq!(copy_cursor(&app), (5, 6));
     }
+
+    // -- U1/C12: the mode escape hatch --------------------------------------
+
+    /// Every `Mode` this test must cover, one of each variant.
+    ///
+    /// The `match` below is the point, and its limit is worth stating
+    /// exactly: it is exhaustive over `Mode`, so adding a variant fails to
+    /// compile *here* — which lands the author in this function, holding
+    /// the list they need to extend. It cannot force them to extend it.
+    /// That is still the strongest guarantee available (Rust exposes no
+    /// variant count to assert against), and it matters more than usual
+    /// because the rule this feeds is a **negative** one — "no mode may
+    /// swallow an Alt chord" — so a mode that skipped the list would break
+    /// it in silence, the shape the C36 audit already caught once with
+    /// `Alt+Enter`. The duplicate check below is the other half: a list
+    /// that gained an entry by copy-paste covers one fewer variant than
+    /// its length suggests.
+    fn every_mode() -> Vec<(&'static str, Mode)> {
+        let modes = vec![
+            ("Normal", Mode::Normal),
+            ("Rename", Mode::Rename { buffer: "x".into(), cursor: 1, target: RenameTarget::Tab }),
+            (
+                "PaneEdit",
+                Mode::PaneEdit {
+                    name: "x".into(),
+                    lines: vec![String::new()],
+                    row: 0,
+                    col: 0,
+                    pane: 1,
+                },
+            ),
+            (
+                "Broadcast",
+                Mode::Broadcast {
+                    lines: vec![String::new()],
+                    row: 0,
+                    col: 0,
+                    status_filter: None,
+                },
+            ),
+            (
+                "Picker",
+                Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
+            ),
+            ("Scroll", Mode::Scroll),
+            ("Copy", Mode::Copy { cursor: (0, 0) }),
+            ("Help", Mode::Help { top: 0 }),
+            ("Feed", Mode::Feed { offset: 0 }),
+            (
+                "Roster",
+                Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None },
+            ),
+            ("Search", Mode::Search { copy_cursor: None }),
+        ];
+        for (_, m) in &modes {
+            // Exhaustiveness guard — add the new variant to the list above.
+            match m {
+                Mode::Normal
+                | Mode::Rename { .. }
+                | Mode::PaneEdit { .. }
+                | Mode::Broadcast { .. }
+                | Mode::Picker { .. }
+                | Mode::Scroll
+                | Mode::Copy { .. }
+                | Mode::Help { .. }
+                | Mode::Feed { .. }
+                | Mode::Roster { .. }
+                | Mode::Search { .. } => {}
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (label, m) in &modes {
+            assert!(
+                seen.insert(std::mem::discriminant(m)),
+                "{label}: listed twice — the list covers fewer variants than it looks",
+            );
+        }
+        modes
+    }
+
+    /// `handle_mode_key`'s central promise: an Alt chord is never consumed
+    /// by a mode, it drops the mode and yields to the global bindings —
+    /// "Alt+q must quit from anywhere". Enforced by a single `if` at the
+    /// top of that function, and until now asserted nowhere.
+    ///
+    /// C24b's "nothing else changes" bullet, at the one instance that
+    /// matters most. Written after a simulation agent reported Alt+q
+    /// hanging inside every modal. It does not — its harness pressed the
+    /// chord 100 ms after spawn, before roost had drawn anything, so no
+    /// modal was ever open, and the 1 s deadline was under the real quit
+    /// time. The report was wrong; that the rule had no test was not.
+    #[test]
+    fn no_mode_swallows_an_alt_chord() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (label, m) in every_mode() {
+            let (mut app, _) = mk_app(shell_ws());
+            app.mode = m;
+            let consumed =
+                app.handle_mode_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
+            assert!(
+                !consumed,
+                "{label}: swallowed Alt+q instead of yielding to the global bindings",
+            );
+            assert!(
+                matches!(app.mode, Mode::Normal),
+                "{label}: yielded the chord but stayed in the mode",
+            );
+        }
+    }
+
+    /// The contract in full, not just its most important instance: **every**
+    /// Alt chord leaves every mode. C24b names the complete list of chords
+    /// a mode may consume, and it is two — the mode's own entry chord
+    /// (which also *exits*) and `Alt+Enter` in the two multi-line editors
+    /// (which does **not**: it breaks a line and the dialog stays open, the
+    /// tree's one retained Alt chord, because Terminal.app spells
+    /// Shift+Enter that way). Anything else a mode holds on to fails here.
+    ///
+    /// Sweeping the whole chord space rather than listing chords is what
+    /// makes this a gate: a mode that claims some future `Alt+x` is caught
+    /// without anyone remembering to test `Alt+x`.
+    #[test]
+    fn the_only_alt_chords_a_mode_keeps_are_the_two_c24b_names() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut codes: Vec<KeyCode> =
+            (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
+        codes.extend([
+            KeyCode::Enter,
+            KeyCode::PageUp,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+        ]);
+        let mut swept = 0;
+        // `Mode` is deliberately not `Clone` (a mode owns buffers), so each
+        // probe rebuilds the list and takes its own copy of the variant.
+        for i in 0..every_mode().len() {
+            let (label, m) = every_mode().swap_remove(i);
+            let entry = mode_entry_action(&m);
+            let editor = matches!(m, Mode::PaneEdit { .. } | Mode::Broadcast { .. });
+            for &code in &codes {
+                for shift in [false, true] {
+                    let mut mods = KeyModifiers::ALT;
+                    if shift {
+                        mods |= KeyModifiers::SHIFT;
+                    }
+                    let key = KeyEvent::new(code, mods);
+                    let (mut app, _) = mk_app(shell_ws());
+                    let Some(action) = bound_action(key, &app) else { continue };
+                    swept += 1;
+                    app.mode = every_mode().swap_remove(i).1;
+                    if !app.handle_mode_key(key) {
+                        assert!(
+                            matches!(app.mode, Mode::Normal),
+                            "{label}: yielded {action:?} but stayed in the mode",
+                        );
+                        continue;
+                    }
+                    // Consumed. Only C12's two are allowed to.
+                    let is_entry = Some(&action) == entry.as_ref();
+                    let is_editor_newline = editor && code == KeyCode::Enter;
+                    assert!(
+                        is_entry || is_editor_newline,
+                        "{label}: consumed the Alt chord for {action:?} — C24b lets a \
+                         mode keep only its own entry chord and, in the two multi-line \
+                         editors, Alt+Enter",
+                    );
+                    // The two consumptions differ, and C24b turns on the
+                    // difference: an entry chord is a *way out*, so it must
+                    // leave the mode; a retained chord is *content*, so it
+                    // must not. Asserting only the first would let the
+                    // editors' Alt+Enter start closing the dialog it exists
+                    // to type into, with nothing to say so.
+                    if is_entry {
+                        assert!(
+                            matches!(app.mode, Mode::Normal),
+                            "{label}: its entry chord must toggle the mode off (U18)",
+                        );
+                    } else {
+                        assert!(
+                            !matches!(app.mode, Mode::Normal),
+                            "{label}: Alt+Enter is a line break, not a way out — the \
+                             editor must still be open",
+                        );
+                    }
+                }
+            }
+        }
+        // The sweep is worthless if `bound_action` stopped resolving
+        // anything — it would pass by testing nothing at all.
+        assert!(swept > 200, "the chord sweep found almost nothing ({swept}) — check it");
+    }
+
+    /// What `translate` makes of `key` against the default keymap, or None
+    /// if nothing is bound to it.
+    fn bound_action(key: crossterm::event::KeyEvent, app: &App<FakePane>) -> Option<Action> {
+        match crate::ui::input::translate_with(key, app.keymap()) {
+            crate::ui::input::InputResult::Action(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// And the end of that path: the yielded chord really does quit. A
+    /// quiet fleet quits on the first press (U1), so one `apply` is the
+    /// whole story — the busy-fleet confirm has its own tests.
+    #[test]
+    fn alt_q_quits_from_every_mode() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (label, m) in every_mode() {
+            let (mut app, _) = mk_app(shell_ws());
+            app.mode = m;
+            let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
+            if !app.handle_mode_key(key) {
+                if let crate::ui::input::InputResult::Action(a) =
+                    crate::ui::input::translate_with(key, app.keymap())
+                {
+                    app.apply(a);
+                }
+            }
+            assert!(app.quit, "{label}: Alt+q did not quit");
+        }
+    }
 }

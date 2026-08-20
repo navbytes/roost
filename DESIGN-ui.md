@@ -1402,6 +1402,12 @@ filter difference contracted in C32: newlines survive as line breaks
 field a pasted newline is content, not a commit. Wheel swallowed, like
 every non-feed/roster modal.
 
+**[Amended 2026-08-20]** U8 above contracts what a modal owns of the
+**mouse**. The keys are not C12's to answer: an Alt chord leaves every mode,
+modal or not, and that rule is **C24b**'s — amended the same day with the
+two chords a mode may keep and the gates that pin them. C12 adds nothing to
+it; a modal is a mode, and holds keys exactly as weakly as one.
+
 ### C13 — Rename dialog
 
 **Current:** `render.rs:153–168` — 44×3, Double/Cyan, plain input text.
@@ -2458,6 +2464,49 @@ calls that scroll mode, Alt+? in Help closes and reopens the overlay.
 - Rename's toggle cancels (Esc semantics), discarding the buffer: an
   explicit second Alt+r is a deliberate act, unlike U8's stray click, which
   still may not throw unsaved text away.
+
+**[Amended 2026-08-20, the escape hatch is now a gate]** "Nothing else
+changes" above is the load-bearing half of this contract, and until now the
+only half with no test: it was one `if` at the top of `handle_mode_key` and
+an assertion nowhere. State it as the invariant it is — **an Alt chord
+always leaves the mode** — and name the complete list of chords a mode may
+keep, which is two:
+
+1. Its own **entry chord**, the bullets above. Consumed, and *exits*.
+2. **`Alt+Enter`** in the two multi-line editors — the note editor (C32) and
+   the composer (C36). Consumed, and **does not exit**: it breaks a line and
+   the dialog stays open. This is the tree's only *retained* Alt chord, and
+   the only admissible kind. Terminal.app spells Shift+Enter as exactly
+   those bytes (README's CSI-u collapse), so there it is the only spelling
+   of "break a line" the dialog can receive — the chord is the mode's **own
+   text**. That is the whole test a carve-out must pass; it is never a
+   shortcut for "this mode wants that key". Note the asymmetry with (1),
+   which is the point: an entry chord is a *way out*, a retained chord is
+   *content*.
+
+Everything else drops to `Mode::Normal` and dispatches globally, so `Alt+q`
+quits, `Alt+n` opens a pane and `Alt+1` switches tabs from inside any dialog
+— **out of any mode**, which is narrower than "from anywhere" and
+deliberately so: C23's raw pass-through (a raw pane in Normal mode) claims
+every Alt chord but its own toggle, and a C11 terminal that never sends ALT
+at all has no chord to route.
+
+Pinned three ways, all added 2026-08-20:
+- `the_only_alt_chords_a_mode_keeps_are_the_two_c24b_names` sweeps every
+  bound chord against every mode — 1,111 probes — and fails on any third
+  consumption. Sweeping the space rather than listing chords is what makes
+  it a gate: a mode that claims some future `Alt+x` is caught without anyone
+  remembering to test `Alt+x`.
+- `every_mode()` carries an exhaustive `match` over `Mode`, so a variant
+  cannot be added without that `match` failing to compile — which lands the
+  author in the one function that has to know about it.
+- `tests/modal_quit.rs` drives five real modals in a real PTY, asserting
+  each is on screen **before** pressing anything at it. That assertion is
+  the one worth keeping: a simulation agent reported `Alt+q` hanging in
+  every modal, and its harness had pressed the opening chord 100 ms after
+  spawn, before roost drew a frame. The modal never opened, so what it timed
+  was Normal mode against a deadline shorter than a real quit. A modal test
+  that never opened a modal reports on a screen it never reached.
 
 ### C25 — Canned layout cycle (Alt+g / Alt+Shift+g) — [Added 2026-07-22, fleet features]
 
@@ -3978,6 +4027,36 @@ not a benchmark suite.
   configurable keys for any of the above (zero-config stands).
 
 ---
+
+### Open: an Alt chord discards an editor's unsaved buffer
+**[Added 2026-08-20, C24b amendment audit]**
+
+Found while contracting C24b's escape hatch, and deliberately **not** fixed
+there — the amendment documented and gated existing behaviour; this is a
+behaviour question that deserves its own answer.
+
+C24b's Rename bullet permits discarding an unsaved buffer on the entry
+chord, and justifies it narrowly: "an explicit second `Alt+r` is a
+deliberate act, unlike U8's stray click, which still may not throw unsaved
+text away." But the escape hatch discards on **every** Alt chord, not just
+the entry one. `Alt+n` while composing a broadcast (C36), or `Alt+1` in the
+note editor (C32), drops the text with no prompt and no undo — the same harm
+U8 named, arriving through the keyboard instead of the mouse, and without
+the deliberateness the Rename bullet leans on.
+
+The tension is real but the fix is not obvious, which is why it is recorded
+rather than guessed at. Three shapes, none free:
+- **Confirm on a dirty buffer.** Honest, but puts a dialog in front of
+  `Alt+q`, which U1 already guards — two confirms deep to quit is worse.
+- **Keep the buffer and restore it on re-entry.** No interruption, but adds
+  state that must be invalidated (which pane? which tab? how stale?), and a
+  composer that silently remembers last week's half-message is its own bug.
+- **Leave it.** Defensible for `Alt+q` (you asked to quit) and much less so
+  for `Alt+1`.
+
+Blocked on nothing but a decision. Whichever way it goes, C24b's amendment
+and its gates stand — they pin *which* chords a mode keeps, not what a mode
+throws away on the way out.
 
 ### C33 — Move a pane within its tab (`Alt+Shift+hjkl`) — [Added 2026-08-19, comparative UX review]
 
