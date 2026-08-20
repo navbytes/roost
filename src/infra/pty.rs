@@ -552,6 +552,11 @@ pub struct PtyPane {
     /// P2: when this pane last re-emitted an OSC 9 to the host, for
     /// `HOST_NOTIFY_INTERVAL`. `None` until the first one.
     last_host_notify: Option<Instant>,
+    /// P2: when this pane's OSC 9 last reached the **desktop** channel —
+    /// `PaneEffects::notifications`, which the composition root turns into a
+    /// host bell plus an `osascript`. Same `HOST_NOTIFY_INTERVAL`, its own
+    /// clock; see `route_effect` for why it is not `last_host_notify`.
+    last_desktop_notify: Option<Instant>,
     /// P2/P3: when this pane last relayed an OSC 52 clipboard write to the
     /// host, for `OSC52_INTERVAL`. `None` until the first one.
     last_host_clipboard: Option<Instant>,
@@ -611,11 +616,37 @@ impl PtyPane {
             // as a bell, so nothing else could ever notice.
             vt100::Effect::Notify { title, body } => {
                 self.status.on_bell();
-                let text = match &title {
-                    Some(t) if !t.is_empty() => format!("{t}: {body}"),
-                    _ => body.clone(),
-                };
-                self.effects.notifications.push(text);
+                // P2: at most one *desktop* notification per pane per
+                // `HOST_NOTIFY_INTERVAL` — the identical limit
+                // `queue_host_notify` right below already applies to the
+                // host relay, on the identical reasoning, for the identical
+                // event. It was missing here, and this channel is the
+                // expensive one: every notification that reaches the
+                // composition root rings the host bell and (on macOS) forks
+                // an `osascript`. Measured before this gate: 500 OSC 9
+                // sequences in a second produced 500 desktop notifications
+                // while the relay beside it produced one — i.e. a `for i in
+                // $(seq 1 10000); do printf '\e]9;hi\a'; done` in any pane
+                // forked ten thousand processes.
+                //
+                // Its own clock rather than `last_host_notify`: that one is
+                // shared with the audible-bell relay, so borrowing it would
+                // let a bell silence a genuine notification (and a
+                // notification whose body sanitizes away would leave the
+                // clock unstamped, which is exactly the input an abuser
+                // picks). Same interval, independently enforced.
+                let now = Instant::now();
+                let quiet = self
+                    .last_desktop_notify
+                    .is_none_or(|t| now.duration_since(t) >= HOST_NOTIFY_INTERVAL);
+                if quiet {
+                    self.last_desktop_notify = Some(now);
+                    let text = match &title {
+                        Some(t) if !t.is_empty() => format!("{t}: {body}"),
+                        _ => body.clone(),
+                    };
+                    self.effects.notifications.push(text);
+                }
                 self.queue_host_notify(&body);
             }
             // P3: an app inside the pane set the clipboard. roost's own copy
@@ -824,6 +855,7 @@ impl PaneBackend for PtyPane {
             gesture_freeze: None,
             effects: PaneEffects::default(),
             last_host_notify: None,
+            last_desktop_notify: None,
             last_host_clipboard: None,
             cursor_shape: None,
             alive,
@@ -1496,6 +1528,42 @@ mod tests {
         assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
         // The first notification of a pane's life is never rate-limited.
         assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
+    }
+
+    /// P2: and the **desktop** channel is gated too, on the same interval.
+    ///
+    /// The relay above (`host_notify_bytes`) was rate-limited from the
+    /// start; `PaneEffects::notifications` — which the composition root
+    /// turns into a host bell plus an `osascript` fork — was not. Measured
+    /// before the gate: this exact loop produced 500 notifications while
+    /// the relay beside it produced one, so `for i in $(seq 1 10000); do
+    /// printf '\e]9;hi\a'; done` in any pane forked ten thousand processes.
+    ///
+    /// Driven through a real `PtyPane` rather than a helper, because the
+    /// gate has to hold for the path the event loop actually takes.
+    #[test]
+    fn the_desktop_notification_channel_is_rate_limited_per_pane_too() {
+        use crate::agents::CommandSpec;
+        use crate::core::event::AppEvent;
+        use crate::ports::PaneBackend;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(8);
+        std::thread::spawn(move || while rx.recv().is_ok() {});
+        let spec = CommandSpec::new("sleep", &std::env::temp_dir()).arg("30");
+        let Ok(mut pt) = super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx) else {
+            eprintln!("SKIP desktop-notification gate: no pty available");
+            return;
+        };
+        let mut fired = 0usize;
+        for i in 0..500 {
+            pt.process_output(format!("\x1b]9;ping {i}\x07").as_bytes());
+            fired += pt.take_effects().notifications.len();
+        }
+        pt.kill();
+        assert_eq!(
+            fired, 1,
+            "500 OSC 9 sequences inside one interval must yield one desktop notification"
+        );
     }
 
     /// ux P1-6: the fallback bell relay is a single raw BEL, gated by the
