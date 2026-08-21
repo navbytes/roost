@@ -8,8 +8,16 @@
 //! `waiting`, and no `ESC ]9;` ever reached the host stream.
 //!
 //! Both halves are gated here: the pane must end up `needs_input` in the
-//! control plane's own words, and roost must re-emit an OSC 9 to its host
+//! control plane's own words, and roost must put an OSC 9 on its host
 //! terminal so the native desktop notification actually fires.
+//!
+//! **Amended 2026-08-21** with P2's own amendment. There used to be two
+//! emitters — `PtyPane`'s verbatim relay and `App`'s `display_name`-prefixed
+//! nudge — which were different surfaces (the terminal, and a forked
+//! `osascript`) until the fork was deleted, at which point they were two
+//! banners for one event. The named one won, so this now drives an
+//! **unfocused** pane: the surviving emitter deliberately says nothing about
+//! the pane you are already looking at.
 
 // The shared harness is compiled per test binary; helpers other tenants use
 // are dead code from this binary's view — not real rot.
@@ -35,6 +43,32 @@ fn cli_status(state_dir: &std::path::Path) -> String {
     format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
+/// Run `roost <args>` against the harness instance (ROOST_STATE routes it to
+/// the instance's socket + fleet control token).
+fn cli(state_dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_roost"))
+        .args(args)
+        .env("ROOST_STATE", state_dir)
+        .env_remove("ROOST_SOCK")
+        .env_remove("ROOST_TOKEN")
+        .env_remove("ROOST_CONTROL_TOKEN")
+        .output()
+        .expect("run roost");
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+/// Poll `pred` until it holds or `timeout` passes.
+fn poll(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if pred() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 #[test]
 fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     let cwd = std::env::temp_dir();
@@ -44,26 +78,52 @@ fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
-    // The pane notifies exactly the way an agent CLI does. The body is
-    // spelled split (`NEEDS''-YOU`) so the shell's echo of the command line
-    // can't satisfy the host-stream assertion — only roost's own
-    // re-emission can.
-    h.write_bytes(b"printf '\\033]9;NEEDS''-YOU\\007'\r");
+    // Wait for the control plane, not just for a frame: `settle` proves
+    // roost *drew*, and roost draws before its socket is up. A keystroke
+    // sent into that window can still be swallowed by the startup keyboard
+    // probe (`main.rs`'s `KBD_PROBE_BUDGET`), which is exactly what made
+    // this test's `Alt+n` a no-op until it waited for this instead.
+    let up = poll(Duration::from_secs(10), || cli(h.state_dir(), &["list"]).contains("\"pane\""));
+    assert!(up, "roost's control socket never came up");
 
-    // Half one: roost forwards the notification to its host terminal, so the
-    // desktop notification the app asked for actually happens. `ESC ]9;`
-    // never appeared anywhere in the captured stream before this landed.
+    // Alt+n: a second pane, which takes focus — so pane 1, the one about to
+    // notify, is the pane the user is *not* looking at. That is the case the
+    // surviving emitter serves; a focused pane's notification is deliberately
+    // silent now (you are already there).
+    h.write_bytes(b"\x1bn");
+    let split = poll(Duration::from_secs(10), || {
+        let list = cli(h.state_dir(), &["list"]);
+        list.matches("\"pane\"").count() == 2 && list.contains("\"pane\": 2")
+    });
+    assert!(split, "Alt+n never split the pane:\n{}", cli(h.state_dir(), &["list"]));
+
+    // The notification is driven through the control plane rather than the
+    // keyboard, because the keyboard now goes to pane 2. The pane notifies
+    // exactly the way an agent CLI does; the body is spelled split
+    // (`NEEDS''-YOU`) so the shell's echo of the command line can't satisfy
+    // the assertions below — only roost's own emission can.
+    let sent =
+        cli(h.state_dir(), &["send", "1", "--enter", "--", "printf '\\033]9;NEEDS''-YOU\\007'"]);
+    assert!(sent.contains("sent"), "control send to pane 1 failed: {sent}");
+
+    // Half one: roost puts an OSC 9 on its host terminal, so the desktop
+    // notification the app asked for actually happens. `ESC ]9;` never
+    // appeared anywhere in the captured stream before this landed.
     let saw_osc9 =
-        h.wait_for_host_bytes(Duration::from_secs(5), |b| b.windows(4).any(|w| w == b"\x1b]9;"));
+        h.wait_for_host_bytes(Duration::from_secs(8), |b| b.windows(4).any(|w| w == b"\x1b]9;"));
     assert!(
         saw_osc9,
-        "roost never re-emitted an OSC 9 to the host; captured tail:\n{}",
+        "roost never emitted an OSC 9 to the host; captured tail:\n{}",
         String::from_utf8_lossy(&tail(&h.host_bytes(), 400))
     );
-    // ...carrying the pane's actual body, not an empty or truncated husk.
+    // ...carrying the pane's actual body, and **named**: with a fleet open,
+    // a banner that cannot say which pane wants you is the exact pain this
+    // exists to solve. The prefix's own spelling is U2/C4's contract and is
+    // pinned there, so this asserts the shape, not the text.
     let host = h.host_bytes();
-    let osc9 = find_osc9(&host).expect("the re-emitted OSC 9 is well formed");
-    assert_eq!(osc9, "NEEDS-YOU", "the pane's body must ride along verbatim");
+    let osc9 = find_osc9(&host).expect("the emitted OSC 9 is well formed");
+    assert!(osc9.ends_with("NEEDS-YOU"), "the pane's body must ride along: {osc9:?}");
+    assert_ne!(osc9, "NEEDS-YOU", "and must be prefixed with the pane's display name");
 
     // Half two: the pane counts as needing the user. The heuristic waits for
     // the pane to go quiet (output within ~2 s still reads as Working), so
@@ -113,8 +173,8 @@ fn a_pane_bare_bell_relays_to_the_host_and_is_rate_limited() {
     let after_first = bell_count(&mut h);
 
     // A burst right behind it must not machine-gun the operator's terminal —
-    // the same per-pane interval `queue_host_notify` already gates OSC 9
-    // with (P2's `HOST_NOTIFY_INTERVAL`).
+    // P2's `HOST_NOTIFY_INTERVAL`, this relay's own per-pane gate since the
+    // OSC 9 relay it used to share with was retired.
     h.write_bytes(b"for i in 1 2 3 4 5; do printf '\\007'; done\r");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(bell_count(&mut h), after_first, "a bell burst must relay at most once per window");

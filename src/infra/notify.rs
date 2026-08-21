@@ -90,14 +90,21 @@ fn allowed() -> bool {
     take(&mut guard, Instant::now(), NOTIFY_BURST, NOTIFY_PER_SEC)
 }
 
-pub fn notify(msg: &str) {
+/// The bytes for one roost notification, or `None` when the shared budget
+/// says no (or there is nothing left after sanitizing).
+///
+/// Bytes rather than a write: these go on the host terminal's stream, and
+/// W3's rule is that such bytes are *queued* by the core (`App::notify_host`)
+/// and placed between frames by the composition root, never written from
+/// wherever the event happened to be noticed.
+pub fn host_bytes(msg: &str) -> Option<Vec<u8>> {
     if !allowed() {
-        return;
+        return None;
     }
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(&host_notify(msg));
-    let _ = out.flush();
+    let bytes = host_notify(msg);
+    // A body that sanitizes away leaves only the bell, which is still worth
+    // sending — the attention signal is the point.
+    Some(bytes)
 }
 
 /// The bytes `notify` puts on the host terminal: a bell, then an `OSC 9`
