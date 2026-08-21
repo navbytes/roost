@@ -511,10 +511,18 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     // and "◆ N needs you" the fleet's primary signal — trailing pairs drop
     // whole until the segment fits.
     let focused_raw = app.is_raw(app.focused);
-    let (help_visible, help_total) =
-        help_scroll_extent(app.body_area(), app.keymap(), app.help_filter());
     let resumable = app.focused_dead() && app.resume_command_line(app.focused).is_some();
-    let scrolled = help_visible < help_total;
+    // Only the C15 overlay's own hint row asks whether the help table
+    // scrolls, and answering means laying the whole keymap out —
+    // `effective_bindings` (a clone of the default table, a redundant-
+    // spelling pass, a sort) plus a formatted label per row, thrown away.
+    // Unguarded, that ran on every frame in every mode: the hint bar
+    // repaints 30 times a second whether or not the overlay is up.
+    let scrolled = matches!(app.mode, Mode::Help { .. }) && {
+        let (visible, total) =
+            help_scroll_extent(app.body_area(), app.keymap(), app.help_filter());
+        visible < total
+    };
     let hints =
         hint_pairs(&app.mode, app.focused_dead(), resumable, focused_raw, scrolled, app.keymap());
     // U3: Scroll mode's right segment shows where in history the view sits
@@ -1427,7 +1435,26 @@ pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
         .find(|pr| pr.id == app.focused)
         .map(|pr| pr.rect)
         .unwrap_or(body);
-    dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds(), app.keymap())
+    dialog_rect(&app.mode, body, anchor, picker_rows(app), app.picker_cwds(), app.keymap())
+}
+
+/// How many rows `dialog_rect` should size the picker's adapter column to —
+/// **zero unless the picker is actually up**, which every other mode's
+/// branch ignores anyway.
+///
+/// The guard is not tidiness. `picker_filtered` annotates each adapter with
+/// whether its launch program is on `$PATH`, which is a `stat` per `$PATH`
+/// entry per adapter — around fifty syscalls a call on an ordinary machine.
+/// Both callers passed it eagerly, so the two hottest paths in the chrome
+/// paid for it in every mode: `draw_mode_overlay` runs on every frame, i.e.
+/// ~1,500 `stat` calls a second at the 33ms loop with no dialog on screen at
+/// all, and `modal_rect` runs on every mouse event. Measured at 23% of
+/// roost's whole idle CPU.
+fn picker_rows<B: PaneBackend>(app: &App<B>) -> usize {
+    match app.mode {
+        Mode::Picker { .. } => app.picker_filtered().len(),
+        _ => 0,
+    }
 }
 
 /// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
@@ -1505,7 +1532,7 @@ fn draw_mode_overlay<B: PaneBackend>(
     spinner: char,
 ) {
     let Some(rect) =
-        dialog_rect(&app.mode, body, anchor, app.picker_filtered().len(), app.picker_cwds(), app.keymap())
+        dialog_rect(&app.mode, body, anchor, picker_rows(app), app.picker_cwds(), app.keymap())
     else {
         return;
     };
@@ -4881,6 +4908,27 @@ row's — widen ADAPTER_COL",
         assert_eq!(super::picker_dialog_width(&cwds), 23 + 2 + 9 + 2);
         let long = vec![PathBuf::from("/home/me/a-rather-long/checkout-name")];
         assert_eq!(super::picker_dialog_width(&long), 23 + 2 + 27 + 2, "label = a-rather-long/checkout-name");
+    }
+
+    /// The picker's row count is `$PATH` probing — `picker_filtered`
+    /// annotates each adapter with whether its launch program resolves, so
+    /// one call is roughly a `stat` per adapter per `$PATH` entry — and
+    /// `dialog_rect` reads it in exactly one of its eight branches. Both
+    /// callers used to hand it over eagerly, so `draw_mode_overlay` paid for
+    /// it on every frame in every mode (~1,500 `stat` calls a second at the
+    /// 33ms loop, with no dialog on screen) and `modal_rect` on every mouse
+    /// event. Nothing about the drawn dialog changes; this is the guard.
+    #[test]
+    fn the_picker_row_count_is_only_computed_while_the_picker_is_up() {
+        use crate::ui::input::Action;
+        use ratatui::layout::Size;
+        let mut app = mk_app(Size::new(100, 30));
+        assert_eq!(super::picker_rows(&app), 0, "Normal mode must not probe $PATH");
+        app.apply(Action::QuickLaunch);
+        assert!(matches!(app.mode, Mode::Picker { .. }), "Alt+p opens the picker");
+        let rows = super::picker_rows(&app);
+        assert_eq!(rows, app.picker_filtered().len(), "the picker sizes to its own rows");
+        assert!(rows > 0, "the registry has adapters to size against");
     }
 
     /// U20: the accelerator is on the hint bar too — a key you can only
