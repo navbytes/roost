@@ -4465,15 +4465,37 @@ impl<B: PaneBackend> App<B> {
         self.confirm_close = None;
         self.clear_confirm_flash(); // the arm was consumed; its prompt dies with it (U22)
 
-        // The actual removal (kill the runtime, capture undo, fix up
-        // tab/focus bookkeeping) is close_pane_id's job — shared with the
-        // control interface. This wrapper only adds the confirm guard above
-        // and the quit flag below: closing the very last pane exits roost
-        // outright, so (unlike every other close) there's nothing to reopen.
-        self.close_pane_id(id);
+        // Closing the very last pane is a **quit**, not a close — its own
+        // confirm says so ("last pane — {again} to quit roost"), and the
+        // control plane refuses the identical call outright rather than
+        // quitting for a caller (`ctl_close`). So leave the pane exactly
+        // where it is and take Alt+q's door: `shutdown` saves the workspace,
+        // `kill_fleet` takes the processes.
+        //
+        // Removing it first was silent data loss on the one file the whole
+        // tool is. `close_pane_id` drops the spec; `layout::remove_pane`
+        // cannot drop a bare `Pane` root; and with one tab left there is no
+        // tab to drop either — so `shutdown`'s save wrote a tab whose layout
+        // still names a pane its `panes` map no longer has. On the next
+        // launch `validate_and_repair` mints that id a **fresh** spec:
+        // adapter `shell`, `cwd` wherever roost happened to be launched
+        // from, and no session, title or note. Quitting through this door
+        // therefore threw away the last pane's resumable conversation, its
+        // directory and its name; quitting with Alt+q kept all of them. Two
+        // doors to "quit roost", one of them losing the thing roost exists
+        // to preserve — and losing it quietly, since the repair is silent
+        // and the file it repairs looks intact.
+        //
+        // (`kill_fleet` still kills the pane's process on the way out. What
+        // survives is what always survives a quit: the spec.)
         if would_quit {
             self.quit = true;
+            return;
         }
+        // The actual removal (kill the runtime, capture undo, fix up
+        // tab/focus bookkeeping) is close_pane_id's job — shared with the
+        // control interface. This wrapper only adds the confirm guard above.
+        self.close_pane_id(id);
     }
 
     /// Alt+q. U1: quitting kills every pane's process at once, so it gets
@@ -7387,8 +7409,11 @@ fn adapter_installed(id: &str, registry: &Registry) -> bool {
 // Unit tests — the whole app core runs against fakes, no PTYs involved.
 // ---------------------------------------------------------------------------
 
+// `pub(crate)` for `inv_check` alone: `main.rs`'s mouse fuzzer checks the
+// same structural invariants after every gesture, and a second copy of them
+// over there would drift from this one the first time either is amended.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     /// Security M2: the audit log is byte-bounded and rotates keeping one
     /// generation, and audit lines interpolate caller-controlled strings.
@@ -11980,7 +12005,7 @@ mod tests {
     /// THE invariant: per tab, the set of PaneIds in `layout` == the keys of
     /// `panes`; ids are unique within a tab AND across tabs; the float is in
     /// no tree.
-    fn inv_check(app: &App<FakePane>, ctx: &str) {
+    pub(crate) fn inv_check(app: &App<FakePane>, ctx: &str) {
         use std::collections::HashSet;
         let mut global: HashMap<PaneId, usize> = HashMap::new();
         for (i, tab) in app.ws.tabs.iter().enumerate() {
@@ -14136,6 +14161,76 @@ mod tests {
         app.apply(Action::ToggleZoom);
         assert!(!app.zoomed());
         assert_eq!(app.display_rects().len(), app.rects().len());
+    }
+
+    /// Quitting by closing the last pane must keep the pane it quits on.
+    ///
+    /// `Alt+w` on the last pane is a quit — its own confirm says "last pane
+    /// — Alt+w again to quit roost", and the control plane refuses the same
+    /// call rather than quitting for a caller. It used to remove the pane
+    /// first anyway, and that removal reached disk: `layout::remove_pane`
+    /// cannot drop a bare `Pane` root and one tab cannot be dropped either,
+    /// so `shutdown`'s save wrote a tab whose layout named a pane its
+    /// `panes` map no longer had. `validate_and_repair` then minted that id
+    /// a fresh `shell` spec in roost's launch directory on the next start —
+    /// so the session id, cwd, title and note of the pane you quit on were
+    /// gone, silently, while `Alt+q` on the same pane kept every one of
+    /// them. Found by the mouse fuzzer, which — unlike the layout fuzzer —
+    /// does not skip `ClosePane` on the last pane.
+    #[test]
+    fn quitting_by_closing_the_last_pane_keeps_the_pane_it_quits_on() {
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "claude".into(),
+                cwd: PathBuf::from("/repos/important"),
+                session: Some("11111111-2222-3333-4444-555555555555".into()),
+                title: Some("the pane you quit on".into()),
+                spawned_by: None,
+                note: Some("what's next".into()),
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let (mut app, store) = mk_app(ws);
+
+        app.apply(Action::ClosePane); // arms the confirm
+        assert!(!app.quit, "the first press only arms");
+        app.apply(Action::ClosePane); // confirms
+        assert!(app.quit, "the second press quits");
+
+        let spec = app
+            .ws
+            .tabs[0]
+            .panes
+            .get(&1)
+            .expect("the pane roost quit on is still in the workspace");
+        assert_eq!(spec.adapter, "claude");
+        assert_eq!(spec.cwd, PathBuf::from("/repos/important"));
+        assert_eq!(spec.session.as_deref(), Some("11111111-2222-3333-4444-555555555555"));
+        assert_eq!(spec.title.as_deref(), Some("the pane you quit on"));
+        assert_eq!(spec.note.as_deref(), Some("what's next"));
+
+        // ...and that is what reaches disk, satisfying the tree-vs-map
+        // invariant *before* `validate_and_repair` has to rescue it — the
+        // repair mints a blank spec, so a file that needs rescuing here has
+        // already lost everything asserted above.
+        app.save();
+        let saved = store.0.lock().unwrap().clone().expect("shutdown saves");
+        assert_eq!(saved.tabs[0].panes.len(), 1, "saved workspace still holds the pane");
+        let mut ids = Vec::new();
+        layout::pane_order(&saved.tabs[0].layout, &mut ids);
+        assert_eq!(ids, vec![1], "the layout names exactly the pane the map holds");
+        assert_eq!(
+            saved.tabs[0].panes[&1].session.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "the resumable conversation survived the quit",
+        );
     }
 
     /// C34: the confirm flashes name the chord you are being told to press

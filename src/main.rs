@@ -2207,6 +2207,136 @@ mod tests {
         assert_eq!(app.flash(), Some("copied 12 chars"));
     }
 
+    // ---- the mouse fuzzer -----------------------------------------------
+    //
+    // `core::app`'s layout fuzzer walks the action space and checks state;
+    // `ui::render`'s walks the same space and draws a frame after every
+    // step. Neither sends a single mouse event — every mouse path in this
+    // file (the tab-strip hit-test, U21's seam drag, P20's gesture latch,
+    // C29's native selection, U8's modal capture, the wheel's four
+    // destinations) is covered only by hand-written tests, over the
+    // geometries somebody thought of.
+    //
+    // This is the missing third walk: random gestures at random
+    // coordinates — over the tab bar, the hint bar, borders, seams, inside
+    // and outside panes — against a layout being reshaped underneath them,
+    // in every mode, with a real `draw()` after each so a bad rect fails
+    // here rather than on a user's screen. `infra::open::open_url` and
+    // `infra::clipboard::copy` are `#[cfg(test)]` no-ops, so an Alt+click
+    // on a URL and a drag-release that yanks cost the host nothing.
+
+    struct MouseLcg(u64);
+    impl MouseLcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// Random mouse input must never panic, and must never leave focus on a
+    /// pane that isn't there.
+    #[test]
+    fn mouse_never_panics_at_any_coordinate_in_any_mode() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Deliberately small and odd: the interesting coordinates are the
+        // ones on a border, on a seam, on the tab bar and one past the last
+        // row, and a cramped screen puts far more of them within reach of a
+        // uniform draw.
+        const GEOM: [(u16, u16); 4] = [(100, 30), (60, 18), (40, 12), (24, 8)];
+        let buttons = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+        let mut events = 0u64;
+        for seed in 0..40u64 {
+            let mut rng = MouseLcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(31));
+            let mut app = mk_app();
+            let (mut w, mut h) = GEOM[0];
+            let mut trail: Vec<String> = Vec::new();
+            for _ in 0..150 {
+                // Reshape underneath the pointer every few events, so a
+                // gesture's latch and the tree it points into disagree as
+                // often as they can.
+                let __pick = rng.below(16);
+                trail.push(format!("A{__pick}"));
+                match __pick {
+                    0 | 1 => app.apply(Action::NewPane),
+                    2 => app.apply(Action::ClosePane),
+                    3 => app.apply(Action::NewTab),
+                    4 => app.apply(Action::ToggleStack),
+                    5 => app.apply(Action::ToggleZoom),
+                    6 => app.apply(Action::ToggleFloat),
+                    7 => app.apply(Action::NextTab),
+                    8 => app.apply(Action::CopyMode),
+                    9 => app.apply(Action::QuickLaunch),
+                    10 => app.apply(Action::Help),
+                    11 => app.apply(Action::ToggleFeed),
+                    12 => app.apply(Action::ToggleRoster),
+                    13 => app.apply(Action::ScrollMode),
+                    14 => {
+                        let (nw, nh) = GEOM[rng.below(GEOM.len() as u64) as usize];
+                        w = nw;
+                        h = nh;
+                        app.on_resize(Size::new(w, h), (0, 0));
+                    }
+                    _ => app.apply(Action::EditPane),
+                }
+                app.quit = false; // a random Quit must not end the walk
+
+                // One to four mouse events, so presses, drags and releases
+                // interleave into real (and deliberately malformed —
+                // orphan drags, releases with no press) gestures.
+                for _ in 0..=rng.below(4) {
+                    let b = buttons[rng.below(3) as usize];
+                    let kind = match rng.below(7) {
+                        0 => MouseEventKind::Down(b),
+                        1 => MouseEventKind::Up(b),
+                        2 => MouseEventKind::Drag(b),
+                        3 => MouseEventKind::Moved,
+                        4 => MouseEventKind::ScrollUp,
+                        5 => MouseEventKind::ScrollDown,
+                        _ => MouseEventKind::Down(b),
+                    };
+                    // Past the edges too: a terminal can report a coordinate
+                    // outside the grid, and every hit-test has to say "no"
+                    // rather than index with it.
+                    let column = rng.below(u64::from(w) + 3) as u16;
+                    let row = rng.below(u64::from(h) + 3) as u16;
+                    let modifiers = match rng.below(4) {
+                        0 => KeyModifiers::ALT,
+                        1 => KeyModifiers::SHIFT,
+                        _ => KeyModifiers::NONE,
+                    };
+                    trail.push(format!("M{:?}@{column},{row},{modifiers:?}", kind));
+                    handle_mouse(&mut app, MouseEvent { kind, column, row, modifiers });
+                    events += 1;
+                }
+
+                // Every frame the fuzzer produced, actually drawn — the
+                // same standing check `ui::render`'s own walk applies, over
+                // states only the mouse can reach (a half-finished seam
+                // drag, a selection anchored in a pane that just closed).
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| ui::render::draw(f, &mut app)).unwrap();
+
+                // THE structural invariant, borrowed whole from the layout
+                // fuzzer rather than restated here: tree ids == `panes`
+                // keys per tab, ids unique across tabs, the float in no
+                // tree, focus on a pane that exists, nothing drawn that
+                // does not, split ratios summing to one. A seam drag is
+                // the mouse's own way into that last one, and nothing else
+                // checks it after a gesture.
+                core::app::tests::inv_check(
+                    &app,
+                    &format!("seed {seed} after [{}]", trail.join(" ")),
+                );
+            }
+        }
+        eprintln!("mouse sweep: {events} events");
+    }
+
     /// S3 (PR #46 code review): an Alt+click that opens a URL is a complete
     /// gesture on its own pane and must not leave a *different* pane's
     /// lingering native selection around for a later, unrelated
