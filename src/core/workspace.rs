@@ -154,11 +154,18 @@ impl Workspace {
             }
         }
         // A tab whose layout holds no panes at all draws as a blank body with
-        // no key that makes a pane — and roost saves exactly that: closing the
-        // last pane quits, but the removal still runs, and with one tab left
-        // there is no tab to drop, so an emptied `Stack` root reaches disk (a
-        // bare `Pane` root gets refilled by the loop above; a `Stack` has no
-        // leaf left to refill). Drop such tabs, and start over if none survive.
+        // no key that makes a pane. Drop such tabs, and start over if none
+        // survive.
+        //
+        // roost no longer *writes* one: closing the last pane used to remove
+        // it and then quit, and with one tab left there was no tab to drop
+        // either, so the emptied tab reached disk — where the refill loop
+        // above minted the id a blank `shell` spec and the pane's session,
+        // cwd, title and note were gone (see `App::close_pane`, which now
+        // quits without removing, exactly as `Alt+q` does). What is left
+        // here is the boundary this function exists to be: `workspace.json`
+        // is hand-editable, and a file written by an older roost, an editor,
+        // or a bad merge still has to become something roost can run.
         self.tabs.retain(|t| !t.panes.is_empty());
         if self.tabs.is_empty() {
             *self = Workspace::default_in(std::env::current_dir().unwrap_or_else(|_| "/".into()));

@@ -51,6 +51,11 @@ pub fn src_files() -> Vec<(std::path::PathBuf, String)> {
 /// - **any test-gated cfg, not the bare literal.** `infra/qos.rs` gates its
 ///   module on `all(test, target_os = "macos")`, so matching `#[cfg(test)]`
 ///   exactly let a whole test module through into the production half.
+/// - **a module at any visibility** (`starts_a_module`). The literal
+///   `"mod " || "pub mod "` pair missed `core::app`'s `pub(crate) mod
+///   tests`, and the miss surfaced as C34's chord gate failing on
+///   *assertions* — a gate reading test code as shipped code, which is the
+///   first bullet's failure by another route.
 pub fn production(text: &str) -> &str {
     let mut from = 0;
     while let Some(rel) = text[from..].find("#[cfg(") {
@@ -68,11 +73,36 @@ pub fn production(text: &str) -> &str {
             continue;
         }
         let rest = text[at + end + ")]".len()..].trim_start();
-        if rest.starts_with("mod ") || rest.starts_with("pub mod ") {
+        if starts_a_module(rest) {
             return &text[..at];
         }
     }
     text
+}
+
+/// Does `rest` begin a `mod` item, at any visibility?
+///
+/// Split out and made exhaustive because the cut silently *not* firing is
+/// this module's worst failure — the gates then read a whole test module as
+/// shipped code, which is how `no_surface_spells_a_chord_it_did_not_resolve`
+/// starts failing on assertions rather than on anything roost prints. The
+/// literal `"mod " || "pub mod "` pair missed `pub(crate) mod tests`, added
+/// so `main.rs`'s mouse fuzzer could reuse `core::app`'s invariant checker
+/// instead of keeping a second copy of it.
+fn starts_a_module(rest: &str) -> bool {
+    let rest = match rest.strip_prefix("pub") {
+        None => rest,
+        Some(after) => {
+            let after = after.trim_start();
+            // `pub(crate)`, `pub(super)`, `pub(in path)` — skip the whole
+            // restriction; a bare `pub` leaves `after` starting at `mod`.
+            match after.strip_prefix('(') {
+                None => after,
+                Some(inner) => inner.split_once(')').map_or(inner, |(_, tail)| tail.trim_start()),
+            }
+        }
+    };
+    rest.starts_with("mod ")
 }
 
 /// The contents of every double-quoted string literal on `line`, for a gate
@@ -106,8 +136,11 @@ mod tests {
     fn the_production_cut_leaves_no_test_module_behind() {
         for (path, text) in src_files() {
             let prod = production(&text);
+            // Any visibility, not just the bare one: `pub(crate) mod tests`
+            // is what slipped through the first version of this assertion
+            // *and* of the cut it guards, in the same commit.
             assert!(
-                !prod.contains("\nmod tests {"),
+                !prod.contains("mod tests {"),
                 "{}: a test module survived the production cut",
                 path.display(),
             );
@@ -133,6 +166,24 @@ mod tests {
                 path.display(),
             );
         }
+    }
+
+    /// The cut fires on a test module at *any* visibility. `pub(crate) mod
+    /// tests` is not hypothetical — `core::app`'s module is spelled that way
+    /// so the mouse fuzzer can reuse its invariant checker, and it walked
+    /// straight past the original `"mod " || "pub mod "` pair.
+    #[test]
+    fn the_cut_recognizes_a_module_at_any_visibility() {
+        for vis in ["", "pub ", "pub(crate) ", "pub(super) ", "pub(in crate::ui) "] {
+            let text = format!("fn shipped() {{}}\n#[cfg(test)]\n{vis}mod tests {{ }}\n");
+            assert!(
+                !production(&text).contains("mod tests"),
+                "the cut missed `{vis}mod tests`",
+            );
+        }
+        // ...and it still fires only on a module, not on a test-gated item.
+        let item = "fn shipped() {}\n#[cfg(test)]\nfn helper() {}\nfn also_shipped() {}\n";
+        assert!(production(item).contains("also_shipped"), "a cfg(test) *item* is not the cut");
     }
 
     #[test]
