@@ -2236,6 +2236,125 @@ mod tests {
         }
     }
 
+    /// The keyboard's own walk, through the same two routers `run` uses.
+    ///
+    /// The mouse fuzzer below covers one half of `main.rs`'s input surface;
+    /// this is the other. `ui::render`'s fuzzer drives `App::handle_mode_key`
+    /// directly with thirteen unmodified key codes — so nothing exercises
+    /// `handle_key` itself: C23's raw pass-through (`encode_raw`, and the
+    /// one chord that must still escape it), the kitty and DECCKM byte
+    /// upgrades, and the dead-pane interceptions (`Enter` relaunch, `f`
+    /// fresh, `y` copy-the-resume-line), each of which reads a *modifier*
+    /// combination the render sweep never sends.
+    ///
+    /// Same order as the event loop: `note_key_seen`, the Alt note, the
+    /// mode's first refusal, then the router — and the two deferred effects
+    /// a keypress can stage (`take_pending_yank`, `take_pending_open`),
+    /// which are `#[cfg(test)]` no-ops in `infra` and so cost the host
+    /// nothing.
+    #[test]
+    fn keys_never_panic_through_the_real_router() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let codes = [
+            KeyCode::Char('a'), KeyCode::Char('Z'), KeyCode::Char('1'), KeyCode::Char('/'),
+            KeyCode::Char('?'), KeyCode::Char('\''), KeyCode::Char(' '), KeyCode::Char('y'),
+            KeyCode::Char('f'), KeyCode::Char('\u{4e2d}'), KeyCode::Char('\u{1f600}'),
+            KeyCode::Char('\u{0301}'), KeyCode::Enter, KeyCode::Esc, KeyCode::Backspace,
+            KeyCode::Tab, KeyCode::BackTab, KeyCode::Delete, KeyCode::Insert, KeyCode::Home,
+            KeyCode::End, KeyCode::PageUp, KeyCode::PageDown, KeyCode::Up, KeyCode::Down,
+            KeyCode::Left, KeyCode::Right, KeyCode::F(1), KeyCode::F(12), KeyCode::Null,
+        ];
+        let mods = [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ];
+        let mut sent = 0u64;
+        for seed in 0..40u64 {
+            let mut rng = MouseLcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(97));
+            let mut app = mk_app();
+            let (mut w, mut h) = (100u16, 30u16);
+            let mut trail: Vec<String> = Vec::new();
+            for _ in 0..150 {
+                match rng.below(15) {
+                    0 | 1 => app.apply(Action::NewPane),
+                    2 => app.apply(Action::NewTab),
+                    3 => app.apply(Action::ToggleRaw), // C23 pass-through on/off
+                    4 => app.apply(Action::ToggleStack),
+                    5 => app.apply(Action::ToggleFloat),
+                    6 => app.apply(Action::CopyMode),
+                    7 => app.apply(Action::ScrollMode),
+                    8 => app.apply(Action::EditPane),
+                    9 => app.apply(Action::ToggleBroadcast),
+                    10 => app.apply(Action::QuickLaunch),
+                    11 => {
+                        // A dead pane intercepts Enter/f/y before the
+                        // forward path — reachable no other way from here.
+                        let id = app.focused;
+                        let _ = app.on_pty_exit(id);
+                    }
+                    13 => {
+                        // DECCKM: the focused pane asks for SS3 cursor keys,
+                        // so `app_cursor_upgrade` rewrites the bytes the
+                        // forward path just built.
+                        let id = app.focused;
+                        if let Some(rt) = app.runtimes.get_mut(&id) {
+                            rt.app_cursor = !rt.app_cursor;
+                            rt.bracketed = !rt.bracketed;
+                        }
+                    }
+                    12 => {
+                        let (nw, nh) = [(100u16, 30u16), (60, 18), (36, 10)]
+                            [rng.below(3) as usize];
+                        w = nw;
+                        h = nh;
+                        app.on_resize(Size::new(w, h), (0, 0));
+                    }
+                    _ => app.apply(Action::Help),
+                }
+                app.quit = false;
+
+                for _ in 0..=rng.below(4) {
+                    let key = KeyEvent::new(
+                        codes[rng.below(codes.len() as u64) as usize],
+                        mods[rng.below(mods.len() as u64) as usize],
+                    );
+                    trail.push(format!("{:?}+{:?}", key.modifiers, key.code));
+                    // Verbatim from `run`'s drain loop.
+                    app.note_key_seen(key);
+                    if key.modifiers.contains(KeyModifiers::ALT) {
+                        app.note_alt_seen();
+                    }
+                    if !app.handle_mode_key(key) {
+                        handle_key(&mut app, key);
+                    }
+                    if let Some(text) = app.take_pending_yank() {
+                        let outcome = infra::clipboard::copy(&text);
+                        app.flash_copy(text.chars().count(), outcome);
+                    }
+                    if let Some(url) = app.take_pending_open() {
+                        infra::open::open_url(&url);
+                    }
+                    app.quit = false;
+                    sent += 1;
+                }
+
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| ui::render::draw(f, &mut app)).unwrap();
+                core::app::tests::inv_check(
+                    &app,
+                    &format!("seed {seed} after [{}]", trail.join(" ")),
+                );
+            }
+        }
+        eprintln!("key sweep: {sent} keys");
+    }
+
     /// Random mouse input must never panic, and must never leave focus on a
     /// pane that isn't there.
     #[test]
