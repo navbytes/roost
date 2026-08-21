@@ -211,46 +211,60 @@ fn borders_are_structure_and_the_badge_is_quiet_ink() {
     assert_eq!(attrs(screen, 1, corners[0]).0, RED, "the focused pane's border");
     assert_eq!(attrs(screen, 1, corners[1]).0, STRUCTURE, "the unfocused pane's border");
 
-    // C4's corner badge rides the focused pane's first inner row, hard right
-    // against its inner edge. It is **two-tone**: the text is the quiet rung
-    // — readable as a watermark in any theme, because it is the user's own
-    // ink dimmed — and the status glyph rightmost of it carries its own C5
+    // C4 (amended 2026-08-21): identity rides the **top border**, hard left
+    // against the corner — it used to be a badge painted over the pane's own
+    // first content row. It is **two-tone**: the text is the quiet rung —
+    // readable as a watermark in any theme, because it is the user's own ink
+    // dimmed — and the status glyph rightmost of it carries its own C5
     // style, which is only sometimes dim (`·` idle, `✕` exited; `○` waiting
     // is full-strength `ink()` per §2, and the Working spinner/`◆` are the
     // accent). So the scan has to step over the glyph by *position* before it
     // starts reading weight, or a waiting pane breaks the walk on its own
-    // badge.
-    let badge_row = 2;
-    let inner_right = corners[1] - 2; // last inner column of the focused pane
-    let cell = |c: u16| screen.cell(badge_row, c).expect("cell inside the grid").contents();
+    // title.
+    let cell = |c: u16| screen.cell(1, c).expect("cell inside the grid").contents();
 
-    // Rightmost non-blank cell on the row: the breathing-room column comes
-    // after the glyph, so this is the glyph itself.
-    let glyph_col = (0..=inner_right)
+    // The title runs from just past the corner to wherever the border's own
+    // rule resumes.
+    let start = corners[0] + 1;
+    let title_end = (start..corners[1])
+        .find(|c| cell(*c) == "─")
+        .expect("the border's rule resumes after the title");
+    let glyph_col = (start..title_end)
         .rev()
         .find(|c| !cell(*c).trim().is_empty())
-        .expect("the badge's status glyph");
+        .expect("the identity title's status glyph");
     let glyph = cell(glyph_col);
     assert!(
         "◆○·✕".contains(&glyph) || SPINNER_FRAMES.contains(&glyph),
-        "badge col {glyph_col} should be a C5 status glyph, found {glyph:?}",
+        "title col {glyph_col} should be a C5 status glyph, found {glyph:?}",
     );
 
-    // Everything left of the glyph is the quiet run, up to the point the walk
-    // leaves the badge and lands in the pane's own content.
+    // Everything left of the glyph, back to the leading breathing-room
+    // column, is the quiet run.
     let mut quiet_cells = 0;
-    for c in (0..glyph_col).rev() {
-        let (fg, dim, ..) = attrs(screen, badge_row, c);
+    for c in (start..glyph_col).rev() {
         if cell(c).trim().is_empty() && quiet_cells == 0 {
             continue; // the space separating the glyph from the text
         }
+        let (fg, dim, ..) = attrs(screen, 1, c);
         if !dim {
-            break; // ran off the front of the badge into pane content
+            break; // ran off the front of the title onto the border's own rule
         }
-        assert_eq!(fg, vt100::Color::Default, "badge col {c} is not the user's ink");
+        assert_eq!(fg, vt100::Color::Default, "title col {c} is not the user's ink");
         quiet_cells += 1;
     }
-    assert!(quiet_cells >= 3, "the corner badge should be a run of quiet ink, found {quiet_cells}");
+    assert!(quiet_cells >= 3, "the identity title should be a run of quiet ink, found {quiet_cells}");
+
+    // ...and the row it used to occupy belongs to the pane again. The
+    // fixture's panes are shells at a prompt, so their first inner row is
+    // either their own output or blank — never roost's chrome.
+    let first_inner: String = (corners[0] + 1..corners[1] - 1)
+        .filter_map(|c| screen.cell(2, c).map(|x| x.contents()))
+        .collect();
+    assert!(
+        !first_inner.contains('·') && !first_inner.chars().any(|g| SPINNER_FRAMES.contains(g)),
+        "no chrome left on the pane's first content row: {first_inner:?}"
+    );
 
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
 }
