@@ -299,7 +299,8 @@ fn install_panic_hook() {
 /// block.
 const EVENT_CHANNEL_BOUND: usize = 1024;
 
-/// How long the loop may go without repainting when nothing has happened.
+/// How long the loop may go without repainting **while something is
+/// animating**.
 ///
 /// Every iteration used to repaint unconditionally, so at the 33ms poll
 /// roost built a full frame 30 times a second forever — and a profile of the
@@ -312,6 +313,19 @@ const EVENT_CHANNEL_BOUND: usize = 1024;
 /// event behind it, so this is the coarsest budget that still animates it.
 const IDLE_REPAINT: Duration = Duration::from_millis(ui::theme::SPINNER_FRAME_MS as u64);
 
+/// The outer budget, spent when nothing is animating at all.
+///
+/// A fleet at rest — every pane idle or waiting, nobody at the keyboard — is
+/// what roost spends most of its life being, and there is nothing on that
+/// screen that moves. The only things left with a deadline of their own are
+/// coarse (a flash expiring, F1's hint window closing, a badge age ticking
+/// over a minute), so half a second late is not a difference anyone can
+/// see — and paying a frame every 80ms to be early costs six times the CPU
+/// for it.
+///
+/// Deliberately still a *ceiling*, not a condition: see `should_repaint`.
+const CALM_REPAINT: Duration = Duration::from_millis(500);
+
 /// Must the loop paint this iteration?
 ///
 /// `dirty` is "something the loop learned about since the last paint" — a
@@ -319,14 +333,22 @@ const IDLE_REPAINT: Duration = Duration::from_millis(ui::theme::SPINNER_FRAME_MS
 /// deferred copy firing. Those paint on the spot, so interactive latency is
 /// exactly what it was.
 ///
-/// `since >= IDLE_REPAINT` is the safety net rather than the optimization,
-/// and it is the half that makes this change safe to make at all: it fires
-/// unconditionally, so anything that moves with no event behind it — the
-/// spinner, a flash expiring, an age word ticking over, and any future
-/// source nobody thought to mark dirty — is at worst one frame late. There
-/// is no state in which the screen stops updating.
-fn should_repaint(dirty: bool, since: Duration) -> bool {
-    dirty || since >= IDLE_REPAINT
+/// The budgets are the safety net rather than the optimization, and they are
+/// the half that makes this safe to do at all. `CALM_REPAINT` fires
+/// **unconditionally** — it does not consult `animating`, so anything that
+/// moves with no event behind it, including a future source nobody thought
+/// to mark dirty or to teach `App::animating` about, is at worst half a
+/// second late. There is no state in which the screen stops updating.
+/// `animating` only buys the finer budget on top of that, so being wrong
+/// about it costs a spinner that steps twice a second — a stutter, never a
+/// freeze.
+///
+/// It is a closure because `App::animating` walks the fleet's statuses and
+/// the answer is only ever needed between the two budgets: `||` short-
+/// circuits, so it is asked at most once per `IDLE_REPAINT` and never on an
+/// iteration that was going to paint anyway.
+fn should_repaint(dirty: bool, since: Duration, animating: impl FnOnce() -> bool) -> bool {
+    dirty || since >= CALM_REPAINT || (since >= IDLE_REPAINT && animating())
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
@@ -478,7 +500,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         });
     }
     // Far enough in the past that the first iteration always paints.
-    let mut last_draw = Instant::now() - IDLE_REPAINT;
+    let mut last_draw = Instant::now() - CALM_REPAINT;
     let mut dirty = true;
     let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
     loop {
@@ -487,7 +509,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if panic_at.is_some_and(|deadline| Instant::now() >= deadline) {
             panic!("ROOST_TEST_PANIC_AFTER_MS: deliberate panic, gating fleet teardown");
         }
-        if should_repaint(dirty, last_draw.elapsed()) {
+        if should_repaint(dirty, last_draw.elapsed(), || app.animating()) {
             terminal.draw(|f| ui::render::draw(f, &mut app))?;
             last_draw = Instant::now();
             dirty = false;
@@ -1173,11 +1195,37 @@ mod tests {
     /// of invisible — there is no input for which the screen stops updating.
     #[test]
     fn the_repaint_budget_always_fires_and_never_outruns_the_spinner() {
-        assert!(should_repaint(true, Duration::ZERO), "an event paints immediately");
-        assert!(!should_repaint(false, Duration::ZERO), "a quiet iteration skips");
-        assert!(!should_repaint(false, IDLE_REPAINT - Duration::from_millis(1)));
-        assert!(should_repaint(false, IDLE_REPAINT), "the backstop fires on its own");
-        assert!(should_repaint(false, Duration::from_secs(3600)), "and keeps firing");
+        let still = || false;
+        let moving = || true;
+        assert!(should_repaint(true, Duration::ZERO, still), "an event paints immediately");
+        assert!(!should_repaint(false, Duration::ZERO, moving), "a quiet iteration skips");
+        assert!(!should_repaint(false, IDLE_REPAINT - Duration::from_millis(1), moving));
+        assert!(should_repaint(false, IDLE_REPAINT, moving), "an animation gets the fine budget");
+        assert!(
+            !should_repaint(false, IDLE_REPAINT, still),
+            "and a still screen does not — that is the whole saving",
+        );
+        // The outer budget is a ceiling, not a condition: it fires whatever
+        // `animating` says, so a screen can never stop updating.
+        assert!(should_repaint(false, CALM_REPAINT, still), "the ceiling fires on its own");
+        assert!(should_repaint(false, Duration::from_secs(3600), still), "and keeps firing");
+        assert!(IDLE_REPAINT < CALM_REPAINT, "the fine budget must be the finer one");
+
+        // And the fleet walk is only paid for where its answer matters.
+        let mut asked = 0;
+        let _ = should_repaint(true, Duration::from_secs(1), || {
+            asked += 1;
+            false
+        });
+        let _ = should_repaint(false, Duration::ZERO, || {
+            asked += 1;
+            false
+        });
+        let _ = should_repaint(false, CALM_REPAINT, || {
+            asked += 1;
+            false
+        });
+        assert_eq!(asked, 0, "`animating` is asked only between the two budgets");
         // The bound is the spinner's own frame: the finest thing on screen
         // that moves with no event behind it must not be quantized coarser
         // than the animation it has to carry.
