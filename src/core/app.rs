@@ -12819,7 +12819,8 @@ pub(crate) mod tests {
         }
 
         let mut panes = HashMap::new();
-        for (id, dir) in [(1 as PaneId, &a_dir), (2 as PaneId, &b_dir)] {
+        let seeds: [(PaneId, &PathBuf); 2] = [(1, &a_dir), (2, &b_dir)];
+        for (id, dir) in seeds {
             panes.insert(
                 id,
                 PaneSpec {

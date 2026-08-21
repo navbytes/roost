@@ -47,6 +47,8 @@ fn fleet_dies_on(sig: libc::c_int, what: &str) {
     let fleet = harness::descendant_pids(roost);
     assert!(!fleet.is_empty(), "{what}: no pane processes to orphan");
 
+    // SAFETY: `kill(2)` on a pid the harness owns, with a signal number
+    // from this test's own table. No pointers involved.
     unsafe { libc::kill(roost as libc::pid_t, sig) };
 
     assert!(

@@ -20,6 +20,35 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # Formatting and lints are properties of the source, not of the platform,
+  # so they run once here rather than twice inside the OS matrix below. Cheap
+  # and first: a run that is going to fail `cargo fmt --check` should say so
+  # in twenty seconds, not after two full test matrices.
+  #
+  # Note for whoever administers branch protection: this job is *not* one of
+  # the required checks on `main` (those are the two matrix jobs). Add it to
+  # the required set to make it binding — until then it reports, loudly, but
+  # does not block.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustfmt and clippy ship in the default rustup profile the runners
+      # already have, so there is nothing to install — same reasoning as the
+      # no-toolchain-action note below.
+      #
+      # `--check` rather than a formatting commit: CI reports, it does not
+      # rewrite. The house style lives in `rustfmt.toml`, which documents why
+      # its two settings are what they are.
+      - run: cargo fmt --check
+      # `-D warnings` is what makes `Cargo.toml`'s `[lints]` tables binding.
+      # `--all-targets` so tests and integration tests are linted too — the
+      # PTY harness under `tests/` is real code that drives the real binary,
+      # and it has caught real bugs. `vendor/vt100` is a path dependency
+      # rather than a workspace member, so clippy never reaches it, which is
+      # deliberate: it is third-party code carrying roost patches.
+      - run: cargo clippy --all-targets -- -D warnings
+
   test:
     # Both, deliberately: the PTY integration tests under tests/ drive the real
     # binary through a real pty, and several have only ever been run on one

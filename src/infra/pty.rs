@@ -1128,6 +1128,9 @@ impl PaneBackend for PtyPane {
             // Neither is "the pane's own process tree," so guard rather than
             // assume.
             if pid > 1 {
+                // SAFETY: `kill(2)` with a plain signal number and a target
+                // the `pid > 1` guard above has already established is a
+                // real process group of ours and not 0/-1. No pointers.
                 unsafe {
                     libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                 }
@@ -1151,6 +1154,10 @@ impl PaneBackend for PtyPane {
             // possible; the window is microseconds and the group kill carries
             // the identical hazard, so it is accepted rather than papered over.
             for member in session_members(pid) {
+                // SAFETY: as above — `kill(2)` on a plain pid, taken from
+                // `session_members`, which never returns 0, 1 or the
+                // leader. Worst case the pid is already gone and this is
+                // ESRCH, which is why the return value is not checked.
                 unsafe {
                     libc::kill(member as libc::pid_t, libc::SIGKILL);
                 }

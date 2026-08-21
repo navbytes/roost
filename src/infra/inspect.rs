@@ -134,6 +134,10 @@ mod platform {
 
     /// The process's current working directory, straight from the kernel.
     fn cwd_of(pid: u32) -> Option<PathBuf> {
+        // SAFETY: `proc_vnodepathinfo` is a plain C struct of integers and
+        // fixed-size char arrays — no references, no `NonNull`, no enums —
+        // so all-zeroes is a valid value for it, and `proc_pidinfo` below
+        // overwrites the part it fills.
         let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
         let want = std::mem::size_of::<libc::proc_vnodepathinfo>() as c_int;
         // SAFETY: out-pointer to a local of exactly the size we declare, and

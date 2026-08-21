@@ -13,6 +13,18 @@ each adapter's own session ids.
   CI: `.github/workflows/ci.yml`.
 - Conventions: single writer per file-set; effort scales to task weight;
   durable lessons/decisions get promoted to nt, not left in engagement docs.
+- **Formatting and lints are enforced** (2026-08-21, reversing the old "roost
+  is not rustfmt-formatted, never run `cargo fmt` here" rule — that is no
+  longer true and following it now fails CI). Run `cargo fmt` and
+  `cargo clippy --all-targets -- -D warnings` before pushing; CI's `lint` job
+  runs both. `rustfmt.toml` is tuned to the style the tree already had
+  (`max_width = 100`, `use_small_heuristics = "Max"` — measured as 3x less
+  churn than the default heuristics), and the lint set lives in `Cargo.toml`'s
+  `[lints]` tables so it applies to every local `cargo check`, not only to CI.
+  The one-time reformat is listed in `.git-blame-ignore-revs`; run
+  `git config blame.ignoreRevsFile .git-blame-ignore-revs` once so blame skips
+  it. `vendor/vt100` is a path dependency, not a workspace member, so neither
+  tool reaches it — deliberate, it is third-party code carrying roost patches.
 - Records of past multi-agent engagements live in `docs/engagements/`
   (plans, worker scopes, handoffs, reports — historical, not specs).
 - **Releasing is PR-mergeable end to end** — bump the version everywhere

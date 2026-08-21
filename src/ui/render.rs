@@ -21,7 +21,7 @@ use crate::ui::input::{self, Action, Keymap};
 use crate::ui::mouse;
 use crate::ui::theme;
 
-pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
+pub fn draw<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>) {
     let area = f.area();
     if area.height < 2 {
         // ux P3-16: below the tab-bar-plus-one-body-row floor there is no
@@ -126,7 +126,7 @@ pub fn draw<B: PaneBackend>(f: &mut Frame, app: &mut App<B>) {
 /// wrapping — the same idiom `draw_hint_bar` leans on — so the message
 /// degrades character by character as the terminal narrows, down to 1×1,
 /// with no manual width arithmetic of its own to get wrong.
-fn draw_too_small(f: &mut Frame, area: Rect) {
+fn draw_too_small(f: &mut Frame<'_>, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -472,7 +472,7 @@ fn fit_hint_pairs<K: AsRef<str>>(hints: &[(K, &'static str)], right_w: u16, widt
 /// the message kept their border glyphs, reversed, leaving a ragged band.
 /// Found by the design-supervisor pass on this very change; the fixture that
 /// would have caught it mechanically is added alongside.
-fn draw_flash<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
+fn draw_flash<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) -> bool {
     let Some(msg) = app.flash() else { return false };
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(format!(" {msg} ")).style(theme::attention()), area);
@@ -485,7 +485,7 @@ fn draw_flash<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
 /// so the cells past the message do not keep their border glyphs under the
 /// reversal (`attention_problem()` names its own fg, so unlike the flash the
 /// *text* could not inherit, but the ragged band could).
-fn draw_alt_warning<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> bool {
+fn draw_alt_warning<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) -> bool {
     if !app.show_alt_hint() {
         return false;
     }
@@ -497,7 +497,7 @@ fn draw_alt_warning<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) -> 
     true
 }
 
-fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
+fn draw_hint_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) {
     // Flash wins the bar over the alt-warning: a transient action result
     // (e.g. "copied") takes over the bar briefly rather than being swallowed
     // by a persistent problem bar for its entire window.
@@ -549,7 +549,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect) {
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
 
     let shown = fit_hint_pairs(&hints, right_w, area.width);
-    let mut spans: Vec<Span> = Vec::with_capacity(shown * 2 + 4);
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(shown * 2 + 4);
     let mut used = 0u16;
     for (key, label) in &hints[..shown] {
         used += hint_pair_cols(key, label); // same source as fit_hint_pairs
@@ -588,7 +588,7 @@ fn centered_near(anchor: Rect, bounds: Rect, width: u16, height: u16) -> Rect {
 /// whole body, then `Clear` the dialog's own rect right after (`modal_frame`)
 /// — that reset already undoes the dim there, so this doesn't need to know
 /// the dialog's rect at all.
-fn dim_backdrop(f: &mut Frame, body: Rect) {
+fn dim_backdrop(f: &mut Frame<'_>, body: Rect) {
     f.buffer_mut().set_style(body, Style::new().add_modifier(Modifier::DIM));
 }
 
@@ -597,7 +597,7 @@ fn dim_backdrop(f: &mut Frame, body: Rect) {
 /// hand back the inner area for the mode-specific content. Border color is
 /// `theme::accent()`, the one look all dialogs share (a modal is the focused
 /// interaction surface); no BOLD (§2 bold policy).
-fn modal_frame(f: &mut Frame, body: Rect, rect: Rect, title: Line<'static>) -> Rect {
+fn modal_frame(f: &mut Frame<'_>, body: Rect, rect: Rect, title: Line<'static>) -> Rect {
     dim_backdrop(f, body);
     f.render_widget(Clear, rect);
     let block = Block::bordered()
@@ -1083,7 +1083,7 @@ const HELP_GUTTER: u16 = 2;
 /// A heading borrows C6's idiom, the same one the roster's group rows use:
 /// uppercase, `quiet()`, underlined across its own column so it reads as a
 /// rule rather than as another chord.
-fn draw_help_columns(f: &mut Frame, layout: &HelpLayout, top: usize, inner: Rect) {
+fn draw_help_columns(f: &mut Frame<'_>, layout: &HelpLayout, top: usize, inner: Rect) {
     let content = layout.content;
     for (i, column) in layout.columns.iter().enumerate() {
         let x = inner.x + i as u16 * (content + HELP_GUTTER);
@@ -1091,7 +1091,7 @@ fn draw_help_columns(f: &mut Frame, layout: &HelpLayout, top: usize, inner: Rect
             break;
         }
         let width = content.min(inner.x + inner.width - x);
-        let lines: Vec<Line> = column
+        let lines: Vec<Line<'_>> = column
             .iter()
             .skip(top)
             .take(layout.height as usize)
@@ -1525,7 +1525,7 @@ fn dialog_rect(
 /// roster draws status glyphs, and a second `app.elapsed()` sample here could
 /// split a frame across two different spinner glyphs.
 fn draw_mode_overlay<B: PaneBackend>(
-    f: &mut Frame,
+    f: &mut Frame<'_>,
     app: &App<B>,
     body: Rect,
     anchor: Rect,
@@ -1563,7 +1563,7 @@ fn draw_mode_overlay<B: PaneBackend>(
                 if *row == 0 { rename_field(name, *col) } else { name.clone() };
             let pad =
                 (inner.width as usize).saturating_sub(mouse::display_width(&name_text) as usize);
-            let mut rendered: Vec<Line> = vec![Line::from(Span::styled(
+            let mut rendered: Vec<Line<'_>> = vec![Line::from(Span::styled(
                 format!("{name_text}{}", " ".repeat(pad)),
                 theme::ink().add_modifier(Modifier::UNDERLINED),
             ))];
@@ -1605,7 +1605,7 @@ fn draw_mode_overlay<B: PaneBackend>(
                 title.push(Span::styled(format!("{glyph} "), style));
             }
             let inner = modal_frame(f, body, rect, Line::from(title));
-            let rendered: Vec<Line> = lines
+            let rendered: Vec<Line<'_>> = lines
                 .iter()
                 .enumerate()
                 .map(|(i, l)| {
@@ -1638,9 +1638,9 @@ fn draw_mode_overlay<B: PaneBackend>(
             // is readable from either side.
             let adapter_col = ADAPTER_COL as usize;
             let rows = items.len().max(cwds.len());
-            let lines: Vec<Line> = (0..rows)
+            let lines: Vec<Line<'_>> = (0..rows)
                 .map(|i| {
-                    let mut spans: Vec<Span> = Vec::with_capacity(3);
+                    let mut spans: Vec<Span<'_>> = Vec::with_capacity(3);
                     match items.get(i) {
                         Some(item) => {
                             let text = picker_row_body(i, item);
@@ -1731,7 +1731,7 @@ fn draw_mode_overlay<B: PaneBackend>(
 /// Shared shape for a modal's "nothing here yet" line: one row, vertically
 /// centered in `inner`, horizontally centered by `Paragraph::centered()` —
 /// the roster's "no pane matches" and the feed's "no activity yet".
-fn draw_empty_state(f: &mut Frame, inner: Rect, text: &str) {
+fn draw_empty_state(f: &mut Frame<'_>, inner: Rect, text: &str) {
     if inner.height == 0 {
         return;
     }
@@ -1747,7 +1747,7 @@ fn draw_empty_state(f: &mut Frame, inner: Rect, text: &str) {
 /// format verbatim (through the very same `collapsed_row_spans`), each behind
 /// the one leading column that carries the cursor marker.
 fn draw_roster_rows<B: PaneBackend>(
-    f: &mut Frame,
+    f: &mut Frame<'_>,
     app: &App<B>,
     cursor: layout::PaneId,
     inner: Rect,
@@ -1763,7 +1763,7 @@ fn draw_roster_rows<B: PaneBackend>(
         draw_empty_state(f, inner, "no pane matches");
         return;
     }
-    let lines: Vec<Line> = rows
+    let lines: Vec<Line<'_>> = rows
         .iter()
         .skip(top)
         .take(inner.height as usize)
@@ -1837,7 +1837,7 @@ fn roster_row_spans<B: PaneBackend>(
 /// C20: the feed's visible entry rows inside the modal's inner area — newest
 /// at the bottom, scrolled back by `offset` entries from the tail; a single
 /// centered line when the ring is empty.
-fn draw_feed_entries(f: &mut Frame, feed: &VecDeque<FeedEntry>, offset: usize, inner: Rect) {
+fn draw_feed_entries(f: &mut Frame<'_>, feed: &VecDeque<FeedEntry>, offset: usize, inner: Rect) {
     if inner.height == 0 {
         return;
     }
@@ -1850,7 +1850,7 @@ fn draw_feed_entries(f: &mut Frame, feed: &VecDeque<FeedEntry>, offset: usize, i
     // at `len - 1 - offset`), so the marker can't drift from what Enter acts
     // on — both read the same number.
     let selected = range.end.saturating_sub(1);
-    let lines: Vec<Line> = feed
+    let lines: Vec<Line<'_>> = feed
         .iter()
         .enumerate()
         .skip(range.start)
@@ -1917,7 +1917,13 @@ fn local_hh_mm_ss(t: std::time::SystemTime) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as libc::time_t)
         .unwrap_or(0);
+    // SAFETY: `tm` is a plain C struct of `c_int`s (plus, on this
+    // platform, a `*const c_char` zone name that all-zeroes reads as null),
+    // so zeroing is a valid initial value; `localtime_r` then writes it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: the reentrant form — an in-pointer to a local `time_t` and an
+    // out-pointer to the local above, both live for the whole call, and no
+    // shared static like `localtime` would use.
     unsafe { libc::localtime_r(&secs, &mut tm) };
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
@@ -1943,7 +1949,7 @@ pub fn tab_status_word<B: PaneBackend>(app: &App<B>) -> Option<&'static str> {
     (word != "NORMAL").then_some(word)
 }
 
-fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner: char) {
+fn draw_tab_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect, spinner: char) {
     let cwd = app.focused_cwd();
     let saved = app.last_save_ok();
     let names: Vec<String> = app.ws.tabs.iter().map(|t| t.name.clone()).collect();
@@ -1954,7 +1960,7 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame, app: &App<B>, area: Rect, spinner
     // `tab_at_x` reads the same layout, so hitboxes follow the scroll.
     let strip = mouse::tab_strip(&names, area.width, status_w, saved, app.ws.active_tab);
 
-    let mut spans: Vec<Span> = Vec::with_capacity(names.len() * 7 + 4);
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(names.len() * 7 + 4);
     let mut used = 0u16;
     // A leading `…` when the strip has scrolled past earlier tabs (C2's
     // marker, now at whichever end is hiding tabs). It occupies column 0,
@@ -2224,7 +2230,7 @@ fn zoom_title_text(n: usize, width: u16) -> Option<String> {
 }
 
 fn draw_pane<B: PaneBackend>(
-    f: &mut Frame,
+    f: &mut Frame<'_>,
     app: &mut App<B>,
     pr: PaneRect,
     stack_expanded: bool,
@@ -2397,7 +2403,7 @@ fn draw_pane<B: PaneBackend>(
     // C16: dead pane — overlay the relaunch hint (and spawn error, if any)
     // on the bottom rows. The last screen contents stay visible above.
     if status == AgentStatus::Exited && inner.height > 0 {
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
         if let Some(err) = app.dead.get(&pr.id) {
             lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
         }
@@ -2439,7 +2445,7 @@ fn dead_bar_text(resumable: bool, close_chord: Option<&str>) -> String {
 /// C7: overpaint an expanded stack member's left border column with the
 /// accent-dim half-block edge — the cell translation of the mockup's 2px
 /// `--tui-red-dim` left edge (a half-block reads "thicker than a 1px line").
-fn paint_stack_edge(f: &mut Frame, rect: Rect) {
+fn paint_stack_edge(f: &mut Frame<'_>, rect: Rect) {
     let buf = f.buffer_mut();
     for y in rect.y..rect.y + rect.height {
         if let Some(cell) = buf.cell_mut((rect.x, y)) {
@@ -2516,7 +2522,7 @@ fn collapsed_row_spans(
 
     if width >= left_w + right_w {
         let pad = width - left_w - right_w;
-        let mut spans: Vec<Span> = left.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
+        let mut spans: Vec<Span<'_>> = left.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
         spans.push(Span::raw(" ".repeat(pad as usize)));
         if noted {
             spans.push(Span::styled("¶ ", theme::ink()));
@@ -2544,7 +2550,7 @@ fn stack_header_text(width: u16, n: usize) -> String {
 /// `Modifier::UNDERLINED` — the cell translation of the mockup's 1px bottom
 /// rule — via the paragraph-level style, the same edge-to-edge-fill trick
 /// `draw_tab_bar` uses. No bg (background policy, §2).
-fn draw_stack_header(f: &mut Frame, header: layout::StackHeader) {
+fn draw_stack_header(f: &mut Frame<'_>, header: layout::StackHeader) {
     f.render_widget(
         Paragraph::new(stack_header_text(header.rect.width, header.n))
             .style(theme::quiet().add_modifier(Modifier::UNDERLINED)),
@@ -2695,7 +2701,7 @@ fn badge_glyph(spins: bool, scrolled: usize, spinner: char, base: char) -> char 
 
 /// Reverse-video the cells between `a` and `b` (inclusive, pane-inner coords)
 /// to show a copy-mode selection. Reading-order/linewise, clipped to `inner`.
-fn highlight_selection(f: &mut Frame, inner: Rect, a: (u16, u16), b: (u16, u16)) {
+fn highlight_selection(f: &mut Frame<'_>, inner: Rect, a: (u16, u16), b: (u16, u16)) {
     let (start, end) = if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) };
     let (w, h) = (inner.width, inner.height);
     let buf = f.buffer_mut();
@@ -2718,7 +2724,7 @@ fn highlight_selection(f: &mut Frame, inner: Rect, a: (u16, u16), b: (u16, u16))
 /// `UNDERLINED`, so "which of these am I parked on" is answerable at a
 /// glance. Modifier-only by C17: hits land on arbitrary program colors, and
 /// a palette token here would be a DEVIATED.
-fn highlight_matches(f: &mut Frame, inner: Rect, search: &Search, first_line: usize) {
+fn highlight_matches(f: &mut Frame<'_>, inner: Rect, search: &Search, first_line: usize) {
     let width = search.width();
     if width == 0 {
         return;
@@ -2763,7 +2769,7 @@ fn cell_in_selection(pos: (u16, u16), a: (u16, u16), b: (u16, u16)) -> bool {
 /// stays distinguishable within the reversed region. Painted after the
 /// selection pass (C17). Modifier-only, no color tokens — any styling here
 /// beyond modifiers is a DEVIATED (C24).
-fn paint_copy_cursor(f: &mut Frame, inner: Rect, cursor: (u16, u16), selection: Option<Selection>) {
+fn paint_copy_cursor(f: &mut Frame<'_>, inner: Rect, cursor: (u16, u16), selection: Option<Selection>) {
     let (row, col) = cursor;
     if row >= inner.height || col >= inner.width {
         return;
@@ -2812,7 +2818,7 @@ fn should_place_cursor(
 /// widths with the same unicode-width the terminal backend uses, so a cell
 /// marked wide here is a cell ratatui's diff will skip when flushing — the two
 /// halves can no longer disagree about which columns the glyph owns.
-fn blit_screen(f: &mut Frame, screen: &vt100::Screen, inner: Rect) {
+fn blit_screen(f: &mut Frame<'_>, screen: &vt100::Screen, inner: Rect) {
     let (rows, cols) = screen.size();
     let visible_cols = inner.width.min(cols);
     let buf = f.buffer_mut();
@@ -4135,7 +4141,7 @@ mod tests {
     fn feed_entry_spans_mark_the_selected_row_without_shifting_a_column() {
         let plain = feed_entry_spans("12:34:56", "spawned shell", false, false);
         let picked = feed_entry_spans("12:34:56", "spawned shell", false, true);
-        let text = |v: &[super::Span]| -> String { v.iter().map(|s| s.content.as_ref()).collect() };
+        let text = |v: &[super::Span<'_>]| -> String { v.iter().map(|s| s.content.as_ref()).collect() };
         assert_eq!(text(&picked), format!("{}12:34:56  spawned shell", theme::PICKER_SELECTED));
         assert_eq!(text(&plain).chars().count(), text(&picked).chars().count());
         assert_eq!(picked[0].style, theme::accent());
