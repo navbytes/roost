@@ -240,7 +240,7 @@ exactly this section's fallback again.
 enum AgentStatus { Working, NeedsInput, Waiting, Idle, Exited(ExitKind) }
 ```
 
-Surfaced in three places: pane border color, stack title-bar badge (`● working  ◆ needs you  ○ idle`), and tab title aggregation (a tab shows ◆ if *any* pane inside needs input). `NeedsInput` panes also get a terminal bell / macOS notification (config-gated) — the "not knowing who needs me" pain, solved.
+Surfaced in three places: pane border color, stack title-bar badge (`● working  ◆ needs you  ○ idle`), and tab title aggregation (a tab shows ◆ if *any* pane inside needs input). `NeedsInput` panes also get a terminal bell and an `OSC 9` their host terminal raises as a real desktop notification — the "not knowing who needs me" pain, solved. (Through the terminal, not through `osascript`: a CLI cannot post a macOS notification under its own name, so that route always said "Script Editor". SPEC-parity P2 carries the reasoning.)
 
 A reported `Working` that goes silent past a generous timeout (45s) decays
 rather than sticking forever — but not always to the same place. With the

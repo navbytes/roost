@@ -86,7 +86,7 @@ const HOST_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
 /// P2: how much of a notification body is re-emitted to the host. Long
 /// enough for a real "needs your approval to run X" line, short enough that
 /// a pane can't push a megabyte through roost's own stdout.
-const HOST_NOTIFY_CAP: usize = 200;
+pub(crate) const HOST_NOTIFY_CAP: usize = 200;
 
 /// P3: largest OSC 52 payload roost relays to the host, in base64
 /// characters (~75 KB of decoded text). Generous for any real "copy this
@@ -117,7 +117,7 @@ const OSC52_SELECTIONS: &str = "cpqs01234567";
 /// host commands (a pane repainting the user's real terminal). C0 controls
 /// are dropped outright and the result truncated to `cap` characters —
 /// truncation is on char boundaries, so a multi-byte glyph is never split.
-fn sanitize_for_host(text: &str, cap: usize) -> String {
+pub(crate) fn sanitize_for_host(text: &str, cap: usize) -> String {
     text.chars().filter(|c| !c.is_control()).take(cap).collect()
 }
 
