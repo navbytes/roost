@@ -5212,6 +5212,31 @@ row's — widen ADAPTER_COL",
                     let k = KeyEvent::from(keys[rng.below(keys.len() as u64) as usize]);
                     app.handle_mode_key(k);
                 }
+                // U8(b): and the *other* way text enters those fields.
+                // `handle_paste` is the one editing path that moves the
+                // point by a whole string rather than a character, and it
+                // does it with `byte_at`/`truncate`/`insert_str` — byte
+                // offsets into text the fuzzer above has already filled
+                // with combining marks and wide glyphs, at a cursor the
+                // keys above have already walked somewhere arbitrary. A
+                // paste that lands off a char boundary panics the event
+                // loop, which is a fleet incident (`tests/panic_shutdown`).
+                if rng.below(4) == 0 {
+                    const PASTES: &[&str] = &[
+                        "",
+                        "plain",
+                        "one\ntwo\nthree",
+                        "crlf\r\nand\rcr",
+                        "\u{4e2d}\u{6587}\u{4e2d}\u{6587}",
+                        "e\u{0301}\u{0301}\u{0301}",
+                        "\u{1f600}\u{200d}\u{1f9b0}",
+                        "a\u{fe0f}b",
+                        "\u{7}\u{1b}[31m\u{0}control",
+                        // Past NOTE_MAX_LINES, so the overflow fold runs.
+                        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12",
+                    ];
+                    app.handle_paste(PASTES[rng.below(PASTES.len() as u64) as usize]);
+                }
                 let (w, h) = GEOM[rng.below(GEOM.len() as u64) as usize];
                 app.on_resize(Size::new(w, h), (0, 0));
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
