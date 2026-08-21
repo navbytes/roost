@@ -192,7 +192,7 @@ pub fn session_files_since(root: &Path, since: SystemTime) -> Vec<PathBuf> {
             }
         }
     }
-    found.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    found.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first
     found.into_iter().map(|(_, p)| p).collect()
 }
 

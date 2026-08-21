@@ -25,6 +25,12 @@ each adapter's own session ids.
   `git config blame.ignoreRevsFile .git-blame-ignore-revs` once so blame skips
   it. `vendor/vt100` is a path dependency, not a workspace member, so neither
   tool reaches it — deliberate, it is third-party code carrying roost patches.
+  **The lint job pins its toolchain** (`LINT_TOOLCHAIN` in ci.yml): `-D
+  warnings` against a moving `stable` breaks green branches on a clippy
+  release, and a drifted local toolchain then cannot reproduce it. Lint
+  locally with the same one — `cargo +$LINT_TOOLCHAIN clippy --all-targets --
+  -D warnings` — or you will find out on CI. Only the lint job is pinned;
+  build, test and release deliberately still float on the runner's stable.
 - Records of past multi-agent engagements live in `docs/engagements/`
   (plans, worker scopes, handoffs, reports — historical, not specs).
 - **Releasing is PR-mergeable end to end** — bump the version everywhere

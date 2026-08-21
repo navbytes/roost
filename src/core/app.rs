@@ -1368,7 +1368,7 @@ impl<B: PaneBackend> App<B> {
         // starving that pane of a session id forever (HashMap iteration order
         // made this non-deterministic). Claiming newest-spawned-first mirrors
         // file-creation order, so each pane gets its own file.
-        pending.sort_by(|a, b| b.1.cmp(&a.1));
+        pending.sort_by_key(|(_, since)| std::cmp::Reverse(*since));
         // Drop anything past the give-up horizon before scanning for it.
         // Checked against the pane's own `since` rather than a separate
         // clock so the window means the same thing here as it does in the
