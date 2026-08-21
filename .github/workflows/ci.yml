@@ -1,25 +1,15 @@
 name: CI
 
+# No paths-ignore. It used to skip the two-OS matrix on docs-only changes,
+# which was free until this workflow became a *required* status check on
+# main: a run that never triggers reports nothing, and a required check with
+# nothing to report sits "Expected — waiting for status" forever. A docs-only
+# PR was therefore unmergeable. Two runner-minutes on a public repo is the
+# cheaper side of that trade, so every push and PR builds.
 on:
-  # Docs-only changes can't affect the binary or the tests — no .md is
-  # compiled in (only extensions/roost.ts is), so they skip the two-OS matrix
-  # entirely. This list stays restricted to paths that provably can't change
-  # build or test behaviour: markdown, the docs/ site, LICENSE, and the
-  # Homebrew packaging template. A PR that touches code *and* docs still runs,
-  # because paths-ignore only skips when *every* changed path matches.
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - 'packaging/**'
   pull_request:
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - 'packaging/**'
 
 # Supersede a still-running check when a newer commit lands on the same PR
 # branch — a force-push during iteration is the common case, and the older
