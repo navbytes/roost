@@ -1590,6 +1590,35 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// Is anything on screen moving with no event behind it?
+    ///
+    /// The event loop repaints on demand and, failing that, on a budget
+    /// (`main.rs`'s `should_repaint`). This picks which budget: the C5
+    /// spinner is the only thing roost draws that moves faster than half a
+    /// second unprompted, and it moves for exactly one reason — a pane whose
+    /// **displayed** status is Working. Everything else time-driven changes
+    /// at a boundary a few hundred milliseconds either side of which nobody
+    /// can tell: a flash expiring, the F1 hint window closing, a badge's age
+    /// tag ticking over a minute.
+    ///
+    /// `display_status`, not the raw runtime status, for the same reason
+    /// `diff_statuses` reads it: the chrome that draws the spinner reads it
+    /// too, so this cannot say "still" about a frame that is about to move.
+    ///
+    /// Workspace-wide (`runtimes`), not the active tab: the tab strip's
+    /// per-tab summary and C27's roster both draw spinners for panes that
+    /// are not on screen.
+    ///
+    /// Being wrong here is deliberately cheap. `should_repaint`'s outer
+    /// budget fires whatever this answers, so a missed animation is a
+    /// spinner that steps twice a second for as long as the miss lasts —
+    /// never a screen that stops updating.
+    pub fn animating(&self) -> bool {
+        self.runtimes
+            .keys()
+            .any(|id| self.display_status(*id) == Some(AgentStatus::Working))
+    }
+
     /// U2 (amended, P6): the one display name for pane `id`, used by every
     /// fleet surface (corner badge, collapsed rows, feed lines,
     /// notifications, flashes, and the host terminal's own title).
@@ -14231,6 +14260,39 @@ pub(crate) mod tests {
             Some("11111111-2222-3333-4444-555555555555"),
             "the resumable conversation survived the quit",
         );
+    }
+
+    /// `animating` must answer for the whole fleet, not the active tab, and
+    /// must agree with the surfaces that actually draw a spinner — a pane
+    /// working quietly in another tab still spins in the tab strip's
+    /// summary and in C27's roster.
+    ///
+    /// It picks the event loop's repaint budget (`main.rs`'s
+    /// `should_repaint`): a `false` here that should have been `true` is a
+    /// spinner stepping at the outer ceiling instead of at its own frame
+    /// rate. Cheap, but only because that ceiling exists.
+    #[test]
+    fn animating_is_true_exactly_while_the_fleet_has_a_spinner_on_screen() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert!(!app.animating(), "a quiet fleet draws no spinner");
+
+        app.apply(Action::NewTab); // pane 1 in tab 0, a fresh pane in tab 1
+        let elsewhere = app.ws.tabs[0].panes.keys().copied().next().expect("tab 0 has a pane");
+        assert_ne!(app.ws.active_tab, 0, "the new tab is the one on screen");
+
+        app.runtimes.get_mut(&elsewhere).unwrap().set_extension_status(AgentStatus::Working);
+        assert_eq!(app.display_status(elsewhere), Some(AgentStatus::Working));
+        assert!(
+            app.animating(),
+            "a pane working in another tab still spins in the tab strip and the roster",
+        );
+
+        app.runtimes.get_mut(&elsewhere).unwrap().set_extension_status(AgentStatus::Waiting);
+        assert!(!app.animating(), "and stops when it does");
+
+        // Exited is not animation either — a dead pane's glyph is static.
+        let _ = app.on_pty_exit(elsewhere);
+        assert!(!app.animating());
     }
 
     /// C34: the confirm flashes name the chord you are being told to press
