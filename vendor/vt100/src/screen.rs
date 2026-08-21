@@ -2264,6 +2264,35 @@ mod roost_tests {
         assert_eq!(s.contents().lines().next().unwrap(), "\u{2764}\u{fe0f}X");
     }
 
+    /// roost: the blit's allocation-free `push_contents` must produce byte
+    /// for byte what `contents` does, for every cell shape the grid can
+    /// hold — empty, ascii, a combining sequence, a wide glyph and its
+    /// continuation.
+    #[test]
+    fn push_contents_matches_contents_for_every_cell_shape() {
+        let mut p = parser();
+        p.process("a\u{2764}\u{fe0f}e\u{301}\u{4e16}".as_bytes());
+        let s = p.screen();
+        let (rows, cols) = s.size();
+        let mut seen_multi = false;
+        let mut buf = String::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                let cell = s.cell(row, col).unwrap();
+                buf.clear();
+                cell.push_contents(&mut buf);
+                assert_eq!(buf, cell.contents(), "cell ({row}, {col})");
+                seen_multi |= cell.contents().chars().count() > 1;
+            }
+        }
+        assert!(seen_multi, "the fixture must exercise a multi-codepoint cell");
+        // and the buffer is genuinely reusable: no residue between cells
+        let mut buf = String::from("stale");
+        buf.clear();
+        s.cell(0, 0).unwrap().push_contents(&mut buf);
+        assert_eq!(buf, "a");
+    }
+
     #[test]
     fn widening_a_vs16_sequence_repairs_the_wide_char_it_displaces() {
         // The cell claimed as the continuation may already hold a wide char
