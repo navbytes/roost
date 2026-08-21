@@ -4,12 +4,23 @@
 #
 #     git config blame.ignoreRevsFile .git-blame-ignore-revs
 #
-# (GitHub honours this file automatically.) Add a commit here only when it
-# is *purely* mechanical — `cargo fmt` and nothing else — so that ignoring
-# it can never hide a real change.
+# (GitHub honours this file automatically.) List a commit here only when it
+# is overwhelmingly mechanical, and say plainly what else is in it — the
+# whole value of this file is that a reader can trust an ignored commit not
+# to be hiding anything they wanted to see.
 
-# The SHA below is added *after* the reformat lands on `main`, not before:
-# this repository squash-merges, so the commit hash on the PR branch is not
-# the hash that ends up in history.
+# chore: rustfmt + clippy, enforced in CI (#150)
 #
-# chore: apply rustfmt (adopting rustfmt.toml) — SHA added on merge
+# 52 files, ~3,300 lines, of which all but ~43 are `cargo fmt` and nothing
+# else. This repository squash-merges, so the reformat could not land as its
+# own commit however it was authored: the PR's second commit
+# (`chore: apply rustfmt`, pure) was collapsed together with its first
+# (`rustfmt.toml`, the `[lints]` tables, the CI job, and the lint fixes those
+# rules turned up — ten missing `SAFETY:` comments, 32 elided lifetimes, two
+# reverse sorts, two dead `return`s).
+#
+# So ignoring it does hide those ~43 lines, and that is the honest trade:
+# blame on 3,300 reformatted lines pointing at their real authors is worth
+# blame on 43 lines pointing one commit early. Look at #150 directly for
+# those; everything in it is described in the PR body.
+7744cf48b7eef3ecae5a9471560a89936ba91071
