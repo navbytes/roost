@@ -21,11 +21,24 @@ each adapter's own session ids.
   dispatches Release, which builds four targets, **creates the `v*` tag
   itself** from Cargo.toml's version, publishes with SHA256SUMS.txt, and
   syncs the Homebrew tap — but the tap sync needs the `HOMEBREW_TAP_TOKEN`
-  secret, which is **not configured** as of 2026-08-15 (the step skips
-  with a warning; v0.1.6 and v0.1.7 were both synced by hand — render
-  with `RENDER_ONLY=1 RELEASE_TAG=vX.Y.Z scripts/update-homebrew-formula.sh`
-  and PR the result to navbytes/homebrew-tap). Built this way (v0.1.7,
+  secret, which is **still not configured** as of 2026-08-21 (the step skips
+  with a warning). **Every release since v0.1.5 has needed a hand-sync, and
+  v0.1.8 and v0.1.9 did not get one** — the tap sat on 0.1.8 for two
+  releases while `brew install roost` quietly served it. So the sync is not
+  optional cleanup: render with
+  `RENDER_ONLY=1 RELEASE_TAG=vX.Y.Z scripts/update-homebrew-formula.sh`
+  and PR the result to navbytes/homebrew-tap as part of the release, or set
+  the secret and stop paying this every time. Built this way (v0.1.7,
   2026-08-15) because
   agent-session credentials can merge PRs but get 403 on both
   `refs/tags/*` pushes and the workflow-dispatch API — don't re-derive
   that. Human tag pushes and the Actions "Run workflow" button still work.
+- **`main` is protected** (2026-08-21): PRs required, both CI matrix jobs
+  must be green, no force-push, no branch deletion, zero required
+  approvals so a solo maintainer can self-merge. Admins are exempt, and
+  agent sessions run as the repo admin — so the gate is a guardrail, not a
+  wall, and a direct push to `main` will still land. `v*` tags are
+  immutable (a ruleset blocks delete and force-update; creation stays open
+  so release.yml can make its own tag). ci.yml has no `paths-ignore`: a
+  required check that never triggers never reports, and a docs-only PR
+  would wait for a status forever.
