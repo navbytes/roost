@@ -49,10 +49,7 @@ fn pastes_are_guarded_only_for_panes_in_bracketed_paste_mode() {
     h.write_bytes(b"\x1b[200~bye now\x1b[201~");
     h.wait_for(Duration::from_secs(5), |s| s.contents().contains("bye now"))
         .expect("plain pane never received the pasted text");
-    assert!(
-        !h.screen().contents().contains("200~bye"),
-        "plain pane wrongly received paste guards"
-    );
+    assert!(!h.screen().contents().contains("200~bye"), "plain pane wrongly received paste guards");
 
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }

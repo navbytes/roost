@@ -106,11 +106,7 @@ fn col_of(cols: &[String], needle: &str) -> Option<u16> {
 
 /// Every column holding `glyph` on a `row_cols` row.
 fn cols_of(cols: &[String], glyph: char) -> Vec<u16> {
-    cols.iter()
-        .enumerate()
-        .filter(|(_, s)| s.starts_with(glyph))
-        .map(|(i, _)| i as u16)
-        .collect()
+    cols.iter().enumerate().filter(|(_, s)| s.starts_with(glyph)).map(|(i, _)| i as u16).collect()
 }
 
 /// The row rendered as text, for failure messages only.
@@ -253,7 +249,10 @@ fn borders_are_structure_and_the_badge_is_quiet_ink() {
         assert_eq!(fg, vt100::Color::Default, "title col {c} is not the user's ink");
         quiet_cells += 1;
     }
-    assert!(quiet_cells >= 3, "the identity title should be a run of quiet ink, found {quiet_cells}");
+    assert!(
+        quiet_cells >= 3,
+        "the identity title should be a run of quiet ink, found {quiet_cells}"
+    );
 
     // ...and the row it used to occupy belongs to the pane again. The
     // fixture's panes are shells at a prompt, so their first inner row is
@@ -278,7 +277,9 @@ fn the_flash_reverses_the_terminals_own_pair_instead_of_filling() {
     // surface that outranks a flash on this row.
     h.write_bytes(b"\x1bu");
     let found = h.wait_for(Duration::from_secs(5), |s| {
-        (0..COLS).map(|c| s.cell(ROWS - 1, c).map(|x| x.contents()).unwrap_or_default()).collect::<String>()
+        (0..COLS)
+            .map(|c| s.cell(ROWS - 1, c).map(|x| x.contents()).unwrap_or_default())
+            .collect::<String>()
             .contains("nothing to reopen")
     });
     assert!(found.is_some(), "the flash never reached the bar");
@@ -355,7 +356,10 @@ fn the_working_spinner_is_the_one_red_braille_set_and_animates_while_the_pane_is
         let screen = h.screen();
         let (r, c, glyph) = find_spinner_cell(screen).expect("the spinner is still on screen");
         let (fg, dim, ..) = attrs(screen, r, c);
-        assert_eq!(fg, RED, "spinner glyph at ({r},{c}) is {fg:?} — must be the one red, not a second hue");
+        assert_eq!(
+            fg, RED,
+            "spinner glyph at ({r},{c}) is {fg:?} — must be the one red, not a second hue"
+        );
         assert!(!dim, "the spinner must never lean on DIM ({r},{c})");
         seen.insert(glyph);
         std::thread::sleep(Duration::from_millis(90));
@@ -413,7 +417,10 @@ fn the_dead_pane_bar_is_the_one_red_reversed_across_its_whole_row() {
     for c in first..=last {
         let (fg, _, inverse, _) = attrs(screen, row, c);
         assert!(inverse, "col {c} of the dead-pane bar should be reversed");
-        assert_eq!(fg, RED, "col {c}: the problem bar is the one red, reversed (attention_problem)");
+        assert_eq!(
+            fg, RED,
+            "col {c}: the problem bar is the one red, reversed (attention_problem)"
+        );
     }
     // Same §2 background policy as every other attention surface: the
     // reversal is a modifier, not a fill.
@@ -444,9 +451,8 @@ fn a_lit_selection_reverses_without_forcing_any_colour() {
     let screen = h.screen();
     // Find the selected row: the one with a long contiguous reversed run
     // (the whole pane's inner width) rather than assuming exact geometry.
-    let selected_row = (1..ROWS - 1).find(|&r| {
-        (0..COLS).filter(|&c| attrs(screen, r, c).2).count() >= 10
-    });
+    let selected_row =
+        (1..ROWS - 1).find(|&r| (0..COLS).filter(|&c| attrs(screen, r, c).2).count() >= 10);
     let Some(selected_row) = selected_row else {
         panic!("no fully-reversed selection row found:\n{}", screen.contents());
     };
@@ -457,7 +463,11 @@ fn a_lit_selection_reverses_without_forcing_any_colour() {
             continue;
         }
         assert_eq!(bg, vt100::Color::Default, "col {c}: selection may not paint a fill (C17)");
-        assert_eq!(fg, vt100::Color::Default, "col {c}: selection may not force a palette colour (C17)");
+        assert_eq!(
+            fg,
+            vt100::Color::Default,
+            "col {c}: selection may not force a palette colour (C17)"
+        );
         checked += 1;
     }
     assert!(checked >= 10, "expected a wide reversed run, only checked {checked} cells");
@@ -591,8 +601,7 @@ fn below_the_two_row_floor_the_notice_is_plain_ink_with_no_fill() {
     let mut found_text = false;
     for c in 0..80u16 {
         let cell = screen.cell(0, c).expect("cell inside the 80x1 grid");
-        let (fg, dim, inverse, bg) =
-            (cell.fgcolor(), cell.dim(), cell.inverse(), cell.bgcolor());
+        let (fg, dim, inverse, bg) = (cell.fgcolor(), cell.dim(), cell.inverse(), cell.bgcolor());
         assert_eq!(bg, vt100::Color::Default, "col {c}: the notice paints no fill");
         if !cell.contents().trim().is_empty() {
             found_text = true;

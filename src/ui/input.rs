@@ -41,12 +41,17 @@ pub enum Action {
     /// C28: carry the focused pane to the previous / next tab, wrapping —
     /// `Alt+Shift+i` / `Alt+Shift+m`, the shifted siblings of the two chords
     /// that move *you* between tabs. Focus follows the pane.
-    MovePaneToTab { forward: bool },
+    MovePaneToTab {
+        forward: bool,
+    },
     ToggleStack,
     /// Flip the focused pane's split between vertical and horizontal.
     FlipSplit,
     /// Grow (+) or shrink (−) the focused pane along an axis.
-    Resize { horizontal: bool, grow: bool },
+    Resize {
+        horizontal: bool,
+        grow: bool,
+    },
     /// Open the combined pane editor, Alt+r (C32) — name row + parking
     /// note lines in one dialog; the note's first line is the headline
     /// the C4 badge shows. Absorbed v0.1.7's separate Alt+Shift+n note
@@ -73,7 +78,9 @@ pub enum Action {
     ToggleZoom,
     /// Snap the active tab to the next canned arrangement that fits (C25);
     /// `forward: false` walks the same cycle backwards (C37, `Alt+Shift+g`).
-    CycleLayout { forward: bool },
+    CycleLayout {
+        forward: bool,
+    },
     /// Toggle the C20 activity-feed overlay (status/spawn/close/exit/control
     /// events), Alt+e.
     ToggleFeed,
@@ -276,9 +283,7 @@ fn unbound_alt(key: KeyEvent) -> InputResult {
 /// focused pane's state is known (same pattern as `kitty_upgrade`).
 pub fn app_cursor_upgrade(key: KeyEvent, bytes: Vec<u8>, app_cursor: bool) -> Vec<u8> {
     if !app_cursor
-        || key
-            .modifiers
-            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+        || key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return bytes;
     }
@@ -351,7 +356,9 @@ pub fn kitty_upgrade(key: KeyEvent, bytes: Vec<u8>, kitty: bool) -> Vec<u8> {
     let ctrl_or_alt = m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     match key.code {
         KeyCode::Esc => csi_u(27, m),
-        KeyCode::Enter if m.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+        KeyCode::Enter
+            if m.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             csi_u(13, m)
         }
         // The unshifted codepoint: crossterm hands us the *shifted* char for
@@ -540,10 +547,7 @@ impl Chord {
             Some(k) => (true, k),
             None => (false, rest),
         };
-        Some(Chord {
-            code: named_key(key)?,
-            shift,
-        })
+        Some(Chord { code: named_key(key)?, shift })
     }
 }
 
@@ -611,9 +615,8 @@ impl Keymap {
             Some(serde_json::Value::Object(keys)) => {
                 for (chord_str, action_val) in keys {
                     let Some(chord) = Chord::parse(chord_str) else {
-                        diagnostics.push(format!(
-                            "{source}: unrecognized chord {chord_str:?} — skipped"
-                        ));
+                        diagnostics
+                            .push(format!("{source}: unrecognized chord {chord_str:?} — skipped"));
                         continue;
                     };
                     let Some(action_str) = action_val.as_str() else {
@@ -654,10 +657,7 @@ pub fn translate_with(key: KeyEvent, keymap: &Keymap) -> InputResult {
         && key.modifiers.contains(KeyModifiers::ALT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
     {
-        let chord = Chord {
-            code: key.code,
-            shift: key.modifiers.contains(KeyModifiers::SHIFT),
-        };
+        let chord = Chord { code: key.code, shift: key.modifiers.contains(KeyModifiers::SHIFT) };
         match keymap.overrides.get(&chord) {
             Some(Override::Disabled) => return unbound_alt(key),
             Some(Override::Bound(action)) => return InputResult::Action(*action),
@@ -857,10 +857,27 @@ fn shifted_char(c: char) -> Option<char> {
         return Some(c.to_ascii_uppercase());
     }
     Some(match c {
-        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%', '6' => '^',
-        '7' => '&', '8' => '*', '9' => '(', '0' => ')', '-' => '_', '=' => '+',
-        '[' => '{', ']' => '}', '\\' => '|', ';' => ':', '\'' => '"',
-        ',' => '<', '.' => '>', '/' => '?', '`' => '~',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
         _ => return None,
     })
 }
@@ -889,11 +906,7 @@ fn shifted_char(c: char) -> Option<char> {
 /// Every rule fires only when both spellings carry the **same action**: when
 /// they differ, both are real and distinct (`Alt+←` focuses, `Alt+Shift+←`
 /// resizes; `Alt+h` focuses, `Alt+Shift+h` moves the pane).
-fn is_redundant_spelling(
-    chord: &Chord,
-    action: &Action,
-    table: &HashMap<Chord, Action>,
-) -> bool {
+fn is_redundant_spelling(chord: &Chord, action: &Action, table: &HashMap<Chord, Action>) -> bool {
     let same = |code: KeyCode, shift: bool| table.get(&Chord { code, shift }) == Some(action);
     // 3: the arm ignored shift.
     if chord.shift && same(chord.code, false) {
@@ -996,10 +1009,7 @@ fn twins(code: KeyCode, shift: bool) -> Vec<Chord> {
     let mut found = Vec::new();
     for cased in [c.to_ascii_lowercase(), c.to_ascii_uppercase()] {
         for s in [false, true] {
-            let candidate = Chord {
-                code: KeyCode::Char(cased),
-                shift: s,
-            };
+            let candidate = Chord { code: KeyCode::Char(cased), shift: s };
             if !found.contains(&candidate)
                 && default_chord_action(candidate.code, s) == Some(action)
             {
@@ -1029,7 +1039,10 @@ mod tests {
     fn alt_chords_map_to_actions() {
         assert!(matches!(translate(alt(KeyCode::Char('q'))), InputResult::Action(Action::Quit)));
         assert!(matches!(translate(alt(KeyCode::Char('n'))), InputResult::Action(Action::NewPane)));
-        assert!(matches!(translate(alt(KeyCode::Char('s'))), InputResult::Action(Action::ToggleStack)));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('s'))),
+            InputResult::Action(Action::ToggleStack)
+        ));
         assert!(matches!(translate(alt(KeyCode::Enter)), InputResult::Action(Action::QuickLaunch)));
         assert!(matches!(
             translate(alt(KeyCode::Char('3'))),
@@ -1135,14 +1148,8 @@ mod tests {
                 "Alt+{upper} (uppercase delivery)",
             );
         }
-        assert!(matches!(
-            translate(alt(KeyCode::Char('i'))),
-            InputResult::Action(Action::PrevTab)
-        ));
-        assert!(matches!(
-            translate(alt(KeyCode::Char('m'))),
-            InputResult::Action(Action::NextTab)
-        ));
+        assert!(matches!(translate(alt(KeyCode::Char('i'))), InputResult::Action(Action::PrevTab)));
+        assert!(matches!(translate(alt(KeyCode::Char('m'))), InputResult::Action(Action::NextTab)));
     }
 
     #[test]
@@ -1177,11 +1184,11 @@ mod tests {
             InputResult::Action(Action::NewPane)
         ));
         assert!(matches!(translate(alt(KeyCode::Char('N'))), InputResult::Forward(_)));
+        assert!(matches!(translate(alt(KeyCode::Char('n'))), InputResult::Action(Action::NewPane)));
         assert!(matches!(
-            translate(alt(KeyCode::Char('n'))),
-            InputResult::Action(Action::NewPane)
+            translate(alt(KeyCode::Char('r'))),
+            InputResult::Action(Action::EditPane)
         ));
-        assert!(matches!(translate(alt(KeyCode::Char('r'))), InputResult::Action(Action::EditPane)));
     }
 
     #[test]
@@ -1275,7 +1282,10 @@ mod tests {
         let shift_up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
         assert_eq!(app_cursor_upgrade(shift_up, b"\x1b[A".to_vec(), true), b"\x1b[A");
         assert_eq!(app_cursor_upgrade(plain(KeyCode::Char('a')), b"a".to_vec(), true), b"a");
-        assert_eq!(app_cursor_upgrade(plain(KeyCode::PageUp), b"\x1b[5~".to_vec(), true), b"\x1b[5~");
+        assert_eq!(
+            app_cursor_upgrade(plain(KeyCode::PageUp), b"\x1b[5~".to_vec(), true),
+            b"\x1b[5~"
+        );
     }
 
     #[test]
@@ -1428,7 +1438,10 @@ mod tests {
         assert_eq!(encode_raw(plain(KeyCode::Char('a'))), b"a");
         assert_eq!(encode_raw(plain(KeyCode::Enter)), b"\r");
         assert_eq!(encode_raw(plain(KeyCode::Up)), b"\x1b[A");
-        assert_eq!(encode_raw(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), vec![0x03]);
+        assert_eq!(
+            encode_raw(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![0x03]
+        );
     }
 
     #[test]
@@ -1522,7 +1535,8 @@ mod tests {
         let cmd_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
         assert!(matches!(translate(cmd_c), InputResult::Ignore));
         // Composed with Ctrl too: must not fall into the C0 ctrl-byte path.
-        let ctrl_cmd_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER | KeyModifiers::CONTROL);
+        let ctrl_cmd_c =
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER | KeyModifiers::CONTROL);
         assert!(matches!(translate(ctrl_cmd_c), InputResult::Ignore));
         // The C23 raw-mode path shares the guard (it delegates to the same
         // `encode_key`), so a raw-focused pane is equally protected.
@@ -1671,20 +1685,13 @@ mod tests {
                 mods |= KeyModifiers::SHIFT;
             }
             let key = KeyEvent::new(chord.code, mods);
-            assert_eq!(
-                translate_with(key, &empty),
-                translate(key),
-                "chord {chord:?}"
-            );
+            assert_eq!(translate_with(key, &empty), translate(key), "chord {chord:?}");
         }
         let extra = [
             alt(KeyCode::Char('b')),   // unbound Alt printable (readline M-b)
             alt(KeyCode::Char('d')),   // unbound Alt printable (readline M-d)
             plain(KeyCode::Char('a')), // no Alt at all
-            KeyEvent::new(
-                KeyCode::Char('w'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            ), // P13
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL | KeyModifiers::ALT), // P13
         ];
         for key in extra {
             assert_eq!(translate_with(key, &empty), translate(key), "{key:?}");
@@ -1780,10 +1787,7 @@ mod tests {
         let json = r#"{"keys": {"alt+z": "not_a_real_action"}}"#;
         let (keymap, diagnostics) = Keymap::parse(json, "config.json");
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(
-            diagnostics[0].contains("not_a_real_action"),
-            "{diagnostics:?}"
-        );
+        assert!(diagnostics[0].contains("not_a_real_action"), "{diagnostics:?}");
         assert!(diagnostics[0].contains("alt+z"), "{diagnostics:?}");
         assert!(matches!(
             translate_with(alt(KeyCode::Char('z')), &keymap),
@@ -1874,10 +1878,7 @@ mod tests {
     #[test]
     fn the_unshifted_vim_letters_still_move_focus() {
         for (c, dir) in [('h', Dir::Left), ('j', Dir::Down), ('k', Dir::Up), ('l', Dir::Right)] {
-            assert_eq!(
-                translate(alt(KeyCode::Char(c))),
-                InputResult::Action(Action::Focus(dir)),
-            );
+            assert_eq!(translate(alt(KeyCode::Char(c))), InputResult::Action(Action::Focus(dir)),);
         }
     }
 
@@ -2193,5 +2194,3 @@ mod tests {
         }
     }
 }
-
-

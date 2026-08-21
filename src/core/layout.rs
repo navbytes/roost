@@ -26,7 +26,10 @@ pub enum LayoutNode {
         children: Vec<LayoutNode>,
     },
     /// Zellij-style stack: collapsed panes are 1-row title bars, one pane expanded.
-    Stack { children: Vec<PaneId>, expanded: usize },
+    Stack {
+        children: Vec<PaneId>,
+        expanded: usize,
+    },
     Pane(PaneId),
 }
 
@@ -229,9 +232,8 @@ pub fn toggle_stack(node: &mut LayoutNode, target: PaneId) -> bool {
                     return true;
                 }
             }
-            let direct = children
-                .iter()
-                .any(|c| matches!(c, LayoutNode::Pane(id) if *id == target));
+            let direct =
+                children.iter().any(|c| matches!(c, LayoutNode::Pane(id) if *id == target));
             if !direct {
                 return false;
             }
@@ -527,11 +529,8 @@ pub fn compute_rects_and_headers(
             }
             let avail = area.height.saturating_sub(if show_header { 1 } else { 0 });
             for (i, id) in children.iter().enumerate() {
-                let h = if i == *expanded {
-                    avail.saturating_sub(n16.saturating_sub(1))
-                } else {
-                    1
-                };
+                let h =
+                    if i == *expanded { avail.saturating_sub(n16.saturating_sub(1)) } else { 1 };
                 let h = h.min((area.y + area.height).saturating_sub(y));
                 out.push(PaneRect {
                     id: *id,
@@ -721,15 +720,14 @@ pub const MIN_SPLIT_ROWS: u16 = 10;
 pub fn arrangement_fits(node: &LayoutNode, area: Rect) -> bool {
     let mut rects = Vec::new();
     compute_rects(node, area, &mut rects);
-    rects
-        .iter()
-        .all(|pr| pr.collapsed || (pr.rect.width >= MIN_SPLIT_COLS && pr.rect.height >= MIN_SPLIT_ROWS))
+    rects.iter().all(|pr| {
+        pr.collapsed || (pr.rect.width >= MIN_SPLIT_COLS && pr.rect.height >= MIN_SPLIT_ROWS)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     /// Every pane in a split gets a rect. None may be rounded out of
     /// existence.
@@ -935,8 +933,11 @@ mod tests {
         match &root {
             LayoutNode::Split { dir, children, .. } => {
                 assert_eq!(*dir, SplitDir::Horizontal); // outer flipped
-                // inner untouched
-                assert!(matches!(&children[1], LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+                                                        // inner untouched
+                assert!(matches!(
+                    &children[1],
+                    LayoutNode::Split { dir: SplitDir::Horizontal, .. }
+                ));
             }
             _ => panic!(),
         }
@@ -1012,10 +1013,7 @@ mod tests {
         let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
         remove_pane(&mut node, 3);
         remove_pane(&mut node, 2);
-        assert!(
-            matches!(node, LayoutNode::Pane(1)),
-            "a stack of one is a pane, not {node:?}",
-        );
+        assert!(matches!(node, LayoutNode::Pane(1)), "a stack of one is a pane, not {node:?}",);
 
         // ...and the illegal shape it used to make: Alt+s on that stack.
         let mut stack = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
@@ -1068,7 +1066,8 @@ mod tests {
         compute_rects_and_headers(&node, area, &mut out, &mut headers);
         let header_row = headers[0].rect.y;
         for pr in &out {
-            let covers_header_row = pr.rect.y <= header_row && header_row < pr.rect.y + pr.rect.height;
+            let covers_header_row =
+                pr.rect.y <= header_row && header_row < pr.rect.y + pr.rect.height;
             assert!(!covers_header_row, "pane {} covers the header row", pr.id);
         }
     }
@@ -1302,7 +1301,10 @@ mod tests {
             LayoutNode::Split { dir: SplitDir::Vertical, ratios, children } => {
                 assert_eq!(ratios, vec![0.6, 0.4]);
                 assert!(matches!(&children[0], LayoutNode::Pane(1)));
-                assert!(matches!(&children[1], LayoutNode::Pane(2)), "must not be a one-member stack");
+                assert!(
+                    matches!(&children[1], LayoutNode::Pane(2)),
+                    "must not be a one-member stack"
+                );
             }
             other => panic!("expected a plain 0.6/0.4 split, got {other:?}"),
         }

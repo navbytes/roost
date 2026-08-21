@@ -135,8 +135,8 @@ fn main() -> Result<()> {
     // paint immediately without enhancement.
     let (kbd_tx, kbd_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = kbd_tx
-            .send(matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)));
+        let _ =
+            kbd_tx.send(matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)));
     });
     if matches!(kbd_rx.recv_timeout(KBD_PROBE_BUDGET), Ok(true)) {
         push_kbd_enhancement();
@@ -435,10 +435,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         let msg = if keymap_diagnostics.len() == 1 {
             first.clone()
         } else {
-            format!(
-                "{first} (+{} more — see the activity feed)",
-                keymap_diagnostics.len() - 1
-            )
+            format!("{first} (+{} more — see the activity feed)", keymap_diagnostics.len() - 1)
         };
         app.set_flash(msg);
     }
@@ -503,211 +500,209 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut last_draw = Instant::now() - CALM_REPAINT;
     let mut dirty = true;
     let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-    loop {
-        // Test hatch only (`infra::test_panic_after`): `panic_at` is `None`
-        // on every real run, so this is one `Option` compare per frame.
-        if panic_at.is_some_and(|deadline| Instant::now() >= deadline) {
-            panic!("ROOST_TEST_PANIC_AFTER_MS: deliberate panic, gating fleet teardown");
-        }
-        if should_repaint(dirty, last_draw.elapsed(), || app.animating()) {
-            terminal.draw(|f| ui::render::draw(f, &mut app))?;
-            last_draw = Instant::now();
-            dirty = false;
-        }
-
-        // Drain ALL pending terminal events this tick, not just one. During a
-        // resize storm (dragging the window edge) several events queue up
-        // faster than a one-event-per-iteration loop can consume; processing
-        // one at a time leaves roost's geometry lagging the true terminal size
-        // and stale intermediate frames on screen. We coalesce resizes to a
-        // single post-drain reconciliation.
-        let mut resized = false;
-        // Perf telemetry (infra::perf): how much later than the 33ms budget
-        // the poll actually returned is this thread's scheduling stall —
-        // the isolated measurement behind the QoS keep-or-delete decision.
-        // An event arriving early returns sooner than the budget; the
-        // saturating_sub reads that as zero stall, which it is.
-        let poll_started = Instant::now();
-        let had_event = crossterm::event::poll(Duration::from_millis(33))?;
-        perf.record_iteration(
-            poll_started.elapsed().saturating_sub(Duration::from_millis(33)),
-        );
-        if had_event {
-            let mut keys_drained: u64 = 0;
-            loop {
-                match crossterm::event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        keys_drained += 1;
-                        // F1 (exit UX audit 2026-08-07): note_key_seen looks
-                        // at the key itself now — evidence is a specific
-                        // swallowed-Alt character, not "a key arrived".
-                        app.note_key_seen(key);
-                        if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
-                            app.note_alt_seen();
-                        }
-                        if !app.handle_mode_key(key) {
-                            handle_key(&mut app, key);
-                        }
-                        // C24: a keyboard-copy `y`/Enter stashes its yanked
-                        // text on the app (core has no clipboard I/O of its
-                        // own); hand it to the OS clipboard here, same as
-                        // the mouse path does inline in `handle_copy_mouse`.
-                        // U14: flash what the clipboard actually did, once
-                        // it has answered — never an optimistic "copied".
-                        if let Some(text) = app.take_pending_yank() {
-                            let outcome = infra::clipboard::copy(&text);
-                            app.flash_copy(text.chars().count(), outcome);
-                        }
-                        // U19: and copy mode's `o` stashes a URL the same
-                        // way — the browser is I/O, so it happens out here.
-                        if let Some(url) = app.take_pending_open() {
-                            infra::open::open_url(&url);
-                        }
-                    }
-                    Event::Mouse(me) => handle_mouse(&mut app, me),
-                    // P10: roost's window changed focus — the focused pane
-                    // owns that event (inside roost, exactly one pane has
-                    // focus), and only if it subscribed.
-                    Event::FocusGained => app.on_host_focus(true),
-                    Event::FocusLost => app.on_host_focus(false),
-                    // Coalesce: act on the true size once, after draining.
-                    Event::Resize(..) => resized = true,
-                    // U8(b): a modal owns the paste — into the rename buffer,
-                    // or swallowed — else it forwards to the focused pane.
-                    Event::Paste(s) => app.handle_paste(&s),
-                    _ => {}
-                }
-                if !crossterm::event::poll(Duration::ZERO)? {
-                    break;
-                }
+        loop {
+            // Test hatch only (`infra::test_panic_after`): `panic_at` is `None`
+            // on every real run, so this is one `Option` compare per frame.
+            if panic_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                panic!("ROOST_TEST_PANIC_AFTER_MS: deliberate panic, gating fleet teardown");
             }
-            perf.record_keys(keys_drained);
-        }
-        // Everything below this point either changed app state or did not
-        // happen; either way the next iteration decides whether to paint.
-        dirty |= had_event;
-        if resized {
-            // Trust the terminal's current size, not a possibly-stale value
-            // carried on an intermediate coalesced event, then hard-clear so
-            // no leftover cells from an in-between frame survive. Pixel
-            // geometry travels with it (P4) — same ioctl, re-read together.
-            let sz = terminal.size()?;
-            app.on_resize(sz, host_pixels());
-            // Deliberately NOT `?`. ratatui-core 0.1.2 made `clear()` snapshot
-            // the cursor first, which writes `ESC[6n` and blocks up to 2 s
-            // waiting for the terminal to answer — and this arrived under the
-            // `ratatui = "0.30"` pin via a patch bump, with no roost change.
-            // A host that never answers DSR (a nested multiplexer that
-            // swallows it, some CI and serial terminals, an ssh hop dropped
-            // mid-resize) therefore turned a *cosmetic* clear into `run()`
-            // returning Err, which sends `shutdown()` through every pane with
-            // SIGHUP then SIGKILL. Resizing a window must never be able to
-            // destroy the fleet: a failed clear costs one stale frame.
-            let _ = terminal.clear();
-        }
+            if should_repaint(dirty, last_draw.elapsed(), || app.animating()) {
+                terminal.draw(|f| ui::render::draw(f, &mut app))?;
+                last_draw = Instant::now();
+                dirty = false;
+            }
 
-        // ...then drain PTY output and socket events — but cap how many per
-        // tick. A firehose pane (an agent dumping megabytes) could otherwise
-        // keep this loop busy indefinitely and starve draw / input / the
-        // wait-registry poll below. The channel is bounded, so events past the
-        // cap simply wait for the next tick: no loss, bounded latency.
-        // ponytail: fixed cap; make it adaptive only if a real workload starves.
-        const MAX_EVENTS_PER_TICK: usize = 512;
-        for _ in 0..MAX_EVENTS_PER_TICK {
-            let Ok(ev) = rx.try_recv() else { break };
-            dirty = true;
-            match ev {
-                AppEvent::Command(req, reply) => {
-                    app.handle_control_msg(req, reply);
-                }
-                // P2: a pane's OSC 9/777 notification pulls attention the
-                // same way a bell or an extension "needs you" does.
-                AppEvent::Output(id, bytes) => {
-                    if let Some(msg) = app.on_pty_output(id, &bytes) {
-                        notify(&msg);
+            // Drain ALL pending terminal events this tick, not just one. During a
+            // resize storm (dragging the window edge) several events queue up
+            // faster than a one-event-per-iteration loop can consume; processing
+            // one at a time leaves roost's geometry lagging the true terminal size
+            // and stale intermediate frames on screen. We coalesce resizes to a
+            // single post-drain reconciliation.
+            let mut resized = false;
+            // Perf telemetry (infra::perf): how much later than the 33ms budget
+            // the poll actually returned is this thread's scheduling stall —
+            // the isolated measurement behind the QoS keep-or-delete decision.
+            // An event arriving early returns sooner than the budget; the
+            // saturating_sub reads that as zero stall, which it is.
+            let poll_started = Instant::now();
+            let had_event = crossterm::event::poll(Duration::from_millis(33))?;
+            perf.record_iteration(poll_started.elapsed().saturating_sub(Duration::from_millis(33)));
+            if had_event {
+                let mut keys_drained: u64 = 0;
+                loop {
+                    match crossterm::event::read()? {
+                        Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            keys_drained += 1;
+                            // F1 (exit UX audit 2026-08-07): note_key_seen looks
+                            // at the key itself now — evidence is a specific
+                            // swallowed-Alt character, not "a key arrived".
+                            app.note_key_seen(key);
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+                                app.note_alt_seen();
+                            }
+                            if !app.handle_mode_key(key) {
+                                handle_key(&mut app, key);
+                            }
+                            // C24: a keyboard-copy `y`/Enter stashes its yanked
+                            // text on the app (core has no clipboard I/O of its
+                            // own); hand it to the OS clipboard here, same as
+                            // the mouse path does inline in `handle_copy_mouse`.
+                            // U14: flash what the clipboard actually did, once
+                            // it has answered — never an optimistic "copied".
+                            if let Some(text) = app.take_pending_yank() {
+                                let outcome = infra::clipboard::copy(&text);
+                                app.flash_copy(text.chars().count(), outcome);
+                            }
+                            // U19: and copy mode's `o` stashes a URL the same
+                            // way — the browser is I/O, so it happens out here.
+                            if let Some(url) = app.take_pending_open() {
+                                infra::open::open_url(&url);
+                            }
+                        }
+                        Event::Mouse(me) => handle_mouse(&mut app, me),
+                        // P10: roost's window changed focus — the focused pane
+                        // owns that event (inside roost, exactly one pane has
+                        // focus), and only if it subscribed.
+                        Event::FocusGained => app.on_host_focus(true),
+                        Event::FocusLost => app.on_host_focus(false),
+                        // Coalesce: act on the true size once, after draining.
+                        Event::Resize(..) => resized = true,
+                        // U8(b): a modal owns the paste — into the rename buffer,
+                        // or swallowed — else it forwards to the focused pane.
+                        Event::Paste(s) => app.handle_paste(&s),
+                        _ => {}
+                    }
+                    if !crossterm::event::poll(Duration::ZERO)? {
+                        break;
                     }
                 }
-                AppEvent::Exit(id) => {
-                    if let Some(msg) = app.on_pty_exit(id) {
-                        notify(&msg);
+                perf.record_keys(keys_drained);
+            }
+            // Everything below this point either changed app state or did not
+            // happen; either way the next iteration decides whether to paint.
+            dirty |= had_event;
+            if resized {
+                // Trust the terminal's current size, not a possibly-stale value
+                // carried on an intermediate coalesced event, then hard-clear so
+                // no leftover cells from an in-between frame survive. Pixel
+                // geometry travels with it (P4) — same ioctl, re-read together.
+                let sz = terminal.size()?;
+                app.on_resize(sz, host_pixels());
+                // Deliberately NOT `?`. ratatui-core 0.1.2 made `clear()` snapshot
+                // the cursor first, which writes `ESC[6n` and blocks up to 2 s
+                // waiting for the terminal to answer — and this arrived under the
+                // `ratatui = "0.30"` pin via a patch bump, with no roost change.
+                // A host that never answers DSR (a nested multiplexer that
+                // swallows it, some CI and serial terminals, an ssh hop dropped
+                // mid-resize) therefore turned a *cosmetic* clear into `run()`
+                // returning Err, which sends `shutdown()` through every pane with
+                // SIGHUP then SIGKILL. Resizing a window must never be able to
+                // destroy the fleet: a failed clear costs one stale frame.
+                let _ = terminal.clear();
+            }
+
+            // ...then drain PTY output and socket events — but cap how many per
+            // tick. A firehose pane (an agent dumping megabytes) could otherwise
+            // keep this loop busy indefinitely and starve draw / input / the
+            // wait-registry poll below. The channel is bounded, so events past the
+            // cap simply wait for the next tick: no loss, bounded latency.
+            // ponytail: fixed cap; make it adaptive only if a real workload starves.
+            const MAX_EVENTS_PER_TICK: usize = 512;
+            for _ in 0..MAX_EVENTS_PER_TICK {
+                let Ok(ev) = rx.try_recv() else { break };
+                dirty = true;
+                match ev {
+                    AppEvent::Command(req, reply) => {
+                        app.handle_control_msg(req, reply);
                     }
-                }
-                // Socket-sourced events must present the pane's token; a
-                // mismatch means another pane (or process) is trying to spoof
-                // this one — drop it silently.
-                AppEvent::Session(id, token, s) => {
-                    if app.socket_authorized(id, &token) {
-                        app.on_session(id, s);
-                    }
-                }
-                AppEvent::Status(id, token, s, detail) => {
-                    if app.socket_authorized(id, &token) {
-                        if let Some(msg) = app.on_status(id, s, detail) {
+                    // P2: a pane's OSC 9/777 notification pulls attention the
+                    // same way a bell or an extension "needs you" does.
+                    AppEvent::Output(id, bytes) => {
+                        if let Some(msg) = app.on_pty_output(id, &bytes) {
                             notify(&msg);
                         }
                     }
-                }
-                // D2: same auth gate as Status/Session above — a link-down
-                // must only be honored for the pane its connection actually
-                // authenticated for, never let an unrelated connection's
-                // close clear another pane's link.
-                AppEvent::ExtLink(id, token, up) => {
-                    if app.socket_authorized(id, &token) {
-                        app.on_status_link(id, up);
+                    AppEvent::Exit(id) => {
+                        if let Some(msg) = app.on_pty_exit(id) {
+                            notify(&msg);
+                        }
+                    }
+                    // Socket-sourced events must present the pane's token; a
+                    // mismatch means another pane (or process) is trying to spoof
+                    // this one — drop it silently.
+                    AppEvent::Session(id, token, s) => {
+                        if app.socket_authorized(id, &token) {
+                            app.on_session(id, s);
+                        }
+                    }
+                    AppEvent::Status(id, token, s, detail) => {
+                        if app.socket_authorized(id, &token) {
+                            if let Some(msg) = app.on_status(id, s, detail) {
+                                notify(&msg);
+                            }
+                        }
+                    }
+                    // D2: same auth gate as Status/Session above — a link-down
+                    // must only be honored for the pane its connection actually
+                    // authenticated for, never let an unrelated connection's
+                    // close clear another pane's link.
+                    AppEvent::ExtLink(id, token, up) => {
+                        if app.socket_authorized(id, &token) {
+                            app.on_status_link(id, up);
+                        }
                     }
                 }
             }
-        }
 
-        // W3: hand the host terminal what the panes asked roost to forward
-        // on their behalf — P2's re-emitted OSC 9 notifications, P3's OSC 52
-        // clipboard writes. Deliberately here, between draws: a write landing
-        // mid-frame would interleave with ratatui's own output and could be
-        // parsed as part of a cell run. The core has already rate-limited,
-        // capped and sanitized every byte.
-        let host_bytes = app.take_host_output();
-        if !host_bytes.is_empty() {
-            use std::io::Write;
-            let mut out = std::io::stdout();
-            let _ = out.write_all(&host_bytes);
-            let _ = out.flush();
-        }
+            // W3: hand the host terminal what the panes asked roost to forward
+            // on their behalf — P2's re-emitted OSC 9 notifications, P3's OSC 52
+            // clipboard writes. Deliberately here, between draws: a write landing
+            // mid-frame would interleave with ratatui's own output and could be
+            // parsed as part of a cell run. The core has already rate-limited,
+            // capped and sanitized every byte.
+            let host_bytes = app.take_host_output();
+            if !host_bytes.is_empty() {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = out.write_all(&host_bytes);
+                let _ = out.flush();
+            }
 
-        // P7: mirror the FOCUSED pane's DECSCUSR shape onto the host's one
-        // real cursor — an editor's insert bar should look like a bar. Only
-        // on change, so this costs nothing per frame; moving focus to a pane
-        // that asked for no shape restores roost's default with no special
-        // case, because that pane simply reports `None`.
-        let want_shape = app.focused_cursor_shape();
-        if want_shape != host_cursor_shape {
-            host_cursor_shape = want_shape;
-            let _ = execute!(std::io::stdout(), cursor_style(want_shape));
-        }
+            // P7: mirror the FOCUSED pane's DECSCUSR shape onto the host's one
+            // real cursor — an editor's insert bar should look like a bar. Only
+            // on change, so this costs nothing per frame; moving focus to a pane
+            // that asked for no shape restores roost's default with no special
+            // case, because that pane simply reports `None`.
+            let want_shape = app.focused_cursor_shape();
+            if want_shape != host_cursor_shape {
+                host_cursor_shape = want_shape;
+                let _ = execute!(std::io::stdout(), cursor_style(want_shape));
+            }
 
-        // S4 (PR #46 code review): fire a double-click's deferred copy once
-        // its window has passed with nothing superseding it — checked every
-        // iteration (not just after an event) since it fires on a deadline,
-        // not a keypress. See `App::due_copy`.
-        if let Some(text) = app.due_copy() {
-            let outcome = infra::clipboard::copy(&text); // U14
-            app.flash_copy(text.chars().count(), outcome);
-            dirty = true; // U14's flash has no event behind it
-        }
-        // Periodic housekeeping (filesystem session detection).
-        app.tick();
-        perf.maybe_flush();
-        // Fire any parked `wait` control requests whose panes hit their target
-        // status (or timed out) this iteration.
-        app.poll_waiters();
+            // S4 (PR #46 code review): fire a double-click's deferred copy once
+            // its window has passed with nothing superseding it — checked every
+            // iteration (not just after an event) since it fires on a deadline,
+            // not a keypress. See `App::due_copy`.
+            if let Some(text) = app.due_copy() {
+                let outcome = infra::clipboard::copy(&text); // U14
+                app.flash_copy(text.chars().count(), outcome);
+                dirty = true; // U14's flash has no event behind it
+            }
+            // Periodic housekeeping (filesystem session detection).
+            app.tick();
+            perf.maybe_flush();
+            // Fire any parked `wait` control requests whose panes hit their target
+            // status (or timed out) this iteration.
+            app.poll_waiters();
 
-        // Alt+q, or the host telling roost to go away (window closed, ssh
-        // dropped, `kill`). Both leave by the same door: `shutdown()` below
-        // saves the workspace and hangs up every pane.
-        if app.quit || infra::signals::terminating() {
-            break;
+            // Alt+q, or the host telling roost to go away (window closed, ssh
+            // dropped, `kill`). Both leave by the same door: `shutdown()` below
+            // saves the workspace and hangs up every pane.
+            if app.quit || infra::signals::terminating() {
+                break;
+            }
         }
-    }
-    Ok(())
+        Ok(())
     }));
 
     // Always tear the fleet down — whether the loop returned, bailed with an
@@ -742,12 +737,8 @@ fn host_pixels() -> (u16, u16) {
 fn write_control_token(path: &std::path::Path, token: &str) {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)
     {
         let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
         let _ = f.write_all(token.as_bytes());
@@ -863,9 +854,14 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
             )
             .map(|f| f.width)
             .unwrap_or(0);
-            if let Some(i) =
-                mouse::tab_at_x(&names, bar_width, status_w, app.last_save_ok(), app.ws.active_tab, me.column)
-            {
+            if let Some(i) = mouse::tab_at_x(
+                &names,
+                bar_width,
+                status_w,
+                app.last_save_ok(),
+                app.ws.active_tab,
+                me.column,
+            ) {
                 app.apply(input::Action::GoToTab(i));
             }
         }
@@ -1249,7 +1245,8 @@ mod tests {
     #[test]
     fn only_an_unsafe_socket_dir_is_a_fatal_listener_failure() {
         use crate::infra::sock::UNSAFE_SOCKET_DIR_MSG;
-        let unsafe_dir = anyhow::anyhow!("roost: socket directory /tmp/x has {UNSAFE_SOCKET_DIR_MSG}");
+        let unsafe_dir =
+            anyhow::anyhow!("roost: socket directory /tmp/x has {UNSAFE_SOCKET_DIR_MSG}");
         assert!(super::is_unsafe_socket_dir(&unsafe_dir));
 
         for benign in [
@@ -1275,7 +1272,9 @@ mod tests {
     use crate::core::workspace::Workspace;
     use crate::ports::fakes::{FakePane, MemStore};
     use crate::ui::input::Action;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::layout::Size;
     use std::path::PathBuf;
 
@@ -1380,7 +1379,10 @@ mod tests {
 
         handle_key(&mut app, alt_shift(KeyCode::Char('p')));
         assert!(!app.raw_routing_active(), "Alt+Shift+p must exit raw");
-        assert!(app.runtimes.get(&focused).unwrap().input.is_empty(), "the toggle chord itself must not forward");
+        assert!(
+            app.runtimes.get(&focused).unwrap().input.is_empty(),
+            "the toggle chord itself must not forward"
+        );
 
         // Re-enter, then confirm the uppercase-delivery tolerance also exits.
         app.apply(Action::ToggleRaw);
@@ -1398,7 +1400,10 @@ mod tests {
         assert!(!app.raw_routing_active(), "a dead pane must not intercept via raw routing");
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(!app.focused_dead(), "Enter must relaunch the dead raw pane, not forward \\r to it");
+        assert!(
+            !app.focused_dead(),
+            "Enter must relaunch the dead raw pane, not forward \\r to it"
+        );
     }
 
     /// `y` on a dead pane copies the pasteable resume command — and must
@@ -1518,7 +1523,11 @@ mod tests {
 
         app.handle_mode_key(key(KeyCode::Enter));
         assert_eq!(app.find_spec(target).and_then(|s| s.title.clone()), Some("ZZZ".into()));
-        assert_eq!(app.find_spec(1).and_then(|s| s.title.clone()), None, "pane 1 must be untouched");
+        assert_eq!(
+            app.find_spec(1).and_then(|s| s.title.clone()),
+            None,
+            "pane 1 must be untouched"
+        );
     }
 
     /// A modal click never reaches the tab bar either (row 0).
@@ -1638,7 +1647,10 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal), "launching leaves the modal");
         assert_eq!(app.rects().len(), 2, "the clicked row spawned a pane");
         let spawned = app.focused;
-        assert_eq!(app.find_spec(spawned).map(|s| s.adapter.clone()), Some(items[items.len() - 1].into()));
+        assert_eq!(
+            app.find_spec(spawned).map(|s| s.adapter.clone()),
+            Some(items[items.len() - 1].into())
+        );
     }
 
     // ---- U21: drag a shared border to resize -----------------------------
@@ -1760,7 +1772,10 @@ mod tests {
         let (visible, total) = ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert!(visible < total, "this fixture's keymap is scrolled");
         handle_mouse(&mut app, wheel_down(rect.x + 1, rect.y + 1));
-        assert!(matches!(app.mode, Mode::Help { top, .. } if top > 0), "the wheel scrolls the keymap");
+        assert!(
+            matches!(app.mode, Mode::Help { top, .. } if top > 0),
+            "the wheel scrolls the keymap"
+        );
         handle_mouse(&mut app, wheel_up(rect.x + 1, rect.y + 1));
         assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "…and back up");
         handle_mouse(&mut app, click(rect.x + 1, rect.y + 1));
@@ -2037,12 +2052,7 @@ mod tests {
         app.apply(Action::ToggleStack); // stacks them: focused (2) expands, 1 collapses
         let id = app.focused;
         app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
-        let r = app
-            .display_rects()
-            .iter()
-            .find(|p| p.id == id)
-            .unwrap()
-            .rect;
+        let r = app.display_rects().iter().find(|p| p.id == id).unwrap().rect;
 
         handle_mouse(&mut app, click(r.x + 2, r.y + 1));
         handle_mouse(&mut app, drag(r.x + 6, r.y + 1));
@@ -2050,11 +2060,7 @@ mod tests {
         let other = app.pane_order().into_iter().find(|&p| p != id).unwrap();
         app.on_click(other); // expands `other`, collapsing `id` mid-drag
         assert!(
-            app.display_rects()
-                .iter()
-                .find(|p| p.id == id)
-                .unwrap()
-                .collapsed,
+            app.display_rects().iter().find(|p| p.id == id).unwrap().collapsed,
             "setup: id must now be the collapsed member"
         );
 
@@ -2109,10 +2115,7 @@ mod tests {
         let token = app.control_token();
         let reply = app.handle_control(Request {
             token,
-            method: Method::Read {
-                pane: id,
-                mode: ReadMode::Screen,
-            },
+            method: Method::Read { pane: id, mode: ReadMode::Screen },
         });
         let text = match reply {
             Reply::Ok { ok } => ok["text"].as_str().unwrap().to_string(),
@@ -2306,13 +2309,36 @@ mod tests {
         use ratatui::Terminal;
 
         let codes = [
-            KeyCode::Char('a'), KeyCode::Char('Z'), KeyCode::Char('1'), KeyCode::Char('/'),
-            KeyCode::Char('?'), KeyCode::Char('\''), KeyCode::Char(' '), KeyCode::Char('y'),
-            KeyCode::Char('f'), KeyCode::Char('\u{4e2d}'), KeyCode::Char('\u{1f600}'),
-            KeyCode::Char('\u{0301}'), KeyCode::Enter, KeyCode::Esc, KeyCode::Backspace,
-            KeyCode::Tab, KeyCode::BackTab, KeyCode::Delete, KeyCode::Insert, KeyCode::Home,
-            KeyCode::End, KeyCode::PageUp, KeyCode::PageDown, KeyCode::Up, KeyCode::Down,
-            KeyCode::Left, KeyCode::Right, KeyCode::F(1), KeyCode::F(12), KeyCode::Null,
+            KeyCode::Char('a'),
+            KeyCode::Char('Z'),
+            KeyCode::Char('1'),
+            KeyCode::Char('/'),
+            KeyCode::Char('?'),
+            KeyCode::Char('\''),
+            KeyCode::Char(' '),
+            KeyCode::Char('y'),
+            KeyCode::Char('f'),
+            KeyCode::Char('\u{4e2d}'),
+            KeyCode::Char('\u{1f600}'),
+            KeyCode::Char('\u{0301}'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::F(1),
+            KeyCode::F(12),
+            KeyCode::Null,
         ];
         let mods = [
             KeyModifiers::NONE,
@@ -2357,8 +2383,7 @@ mod tests {
                         }
                     }
                     12 => {
-                        let (nw, nh) = [(100u16, 30u16), (60, 18), (36, 10)]
-                            [rng.below(3) as usize];
+                        let (nw, nh) = [(100u16, 30u16), (60, 18), (36, 10)][rng.below(3) as usize];
                         w = nw;
                         h = nh;
                         app.on_resize(Size::new(w, h), (0, 0));
@@ -2604,7 +2629,11 @@ mod tests {
         // float): hides the float, focuses what it actually hit.
         handle_mouse(&mut app, click(0, 1));
         assert_eq!(app.focused, 1);
-        assert_eq!(app.display_rects().len(), app.rects().len(), "float no longer in the display list");
+        assert_eq!(
+            app.display_rects().len(),
+            app.rects().len(),
+            "float no longer in the display list"
+        );
     }
 
     /// L2: `.mode(0o600)` on `OpenOptions` only applies when `open()`

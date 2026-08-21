@@ -34,10 +34,7 @@ fn focused_pane(state_dir: &std::path::Path) -> u64 {
     serde_json::from_slice::<serde_json::Value>(&out.stdout)
         .ok()
         .and_then(|v| {
-            v.as_array()?
-                .iter()
-                .find(|p| p["focused"] == true)
-                .and_then(|p| p["pane"].as_u64())
+            v.as_array()?.iter().find(|p| p["focused"] == true).and_then(|p| p["pane"].as_u64())
         })
         .unwrap_or(0)
 }

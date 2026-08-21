@@ -25,8 +25,7 @@ const ALT_PGUP: &[u8] = b"\x1b[5;3~";
 fn slash_finds_a_line_that_has_scrolled_off_and_jumps_the_view_to_it() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let Some(mut h) =
-        harness::spawn_or_skip("scrollback-search gate", &harness::one_pane(cwd))
+    let Some(mut h) = harness::spawn_or_skip("scrollback-search gate", &harness::one_pane(cwd))
     else {
         return;
     };
@@ -61,10 +60,7 @@ fn slash_finds_a_line_that_has_scrolled_off_and_jumps_the_view_to_it() {
     // don't exist below 300 anyway) nor the query echoed on the hint bar
     // (that reads `/mark-42`).
     if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("mark-42 ")).is_none() {
-        panic!(
-            "the search never jumped the view to its hit:\n{}",
-            h.screen().contents()
-        );
+        panic!("the search never jumped the view to its hit:\n{}", h.screen().contents());
     }
     // The prompt reports where it is in the hit list, so an empty result
     // can't masquerade as a jump.

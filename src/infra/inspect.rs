@@ -25,10 +25,7 @@ fn match_agent(cmdline_args: impl Iterator<Item = String>, known: &[String]) -> 
         if arg.is_empty() {
             continue;
         }
-        let base = std::path::Path::new(&arg)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&arg);
+        let base = std::path::Path::new(&arg).file_name().and_then(|s| s.to_str()).unwrap_or(&arg);
         if let Some(a) = known.iter().find(|a| a.as_str() == base) {
             return Some(a.clone());
         }
@@ -335,10 +332,8 @@ mod platform {
         /// argv basename — the `node .../pi` case, one level down.
         #[test]
         fn finds_a_known_agent_in_a_child_process() {
-            let mut child = std::process::Command::new("/bin/sleep")
-                .arg("30")
-                .spawn()
-                .expect("spawn sleep");
+            let mut child =
+                std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
             let kid = child.id();
             // The kernel lists it immediately; no settling needed.
             assert!(child_pids(std::process::id()).contains(&kid), "child not listed");

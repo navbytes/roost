@@ -58,7 +58,15 @@ impl Workspace {
         let mut panes = HashMap::new();
         panes.insert(
             1,
-            PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None, note: None, noted_at: None },
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd,
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
         );
         Workspace {
             version: 1,
@@ -68,13 +76,7 @@ impl Workspace {
     }
 
     pub fn next_pane_id(&self) -> PaneId {
-        self.tabs
-            .iter()
-            .flat_map(|t| t.panes.keys())
-            .copied()
-            .max()
-            .unwrap_or(0)
-            + 1
+        self.tabs.iter().flat_map(|t| t.panes.keys()).copied().max().unwrap_or(0) + 1
     }
 
     /// `tabs` is never actually empty (`validate_and_repair` guarantees it on
@@ -96,9 +98,7 @@ impl Workspace {
         // need two live mutable borrows of `self.tabs` at once, so clamp the
         // index first (no subtraction) and take a single `get_mut`.
         let i = if self.active_tab < self.tabs.len() { self.active_tab } else { 0 };
-        self.tabs
-            .get_mut(i)
-            .expect("a workspace always has at least one tab (validate_and_repair)")
+        self.tabs.get_mut(i).expect("a workspace always has at least one tab (validate_and_repair)")
     }
 
     /// Repair layout ↔ panes inconsistencies after loading a (possibly
@@ -261,10 +261,8 @@ mod repair_fuzz {
                 .map(|_| {
                     let mut panes = serde_json::Map::new();
                     for _ in 0..r.n(5) {
-                        panes.insert(
-                            r.n(4).to_string(),
-                            json!({"adapter": "shell", "cwd": "/tmp"}),
-                        );
+                        panes
+                            .insert(r.n(4).to_string(), json!({"adapter": "shell", "cwd": "/tmp"}));
                     }
                     json!({"name": "t", "layout": node(&mut r, 3), "panes": panes})
                 })
@@ -411,7 +409,15 @@ mod tests {
         // Orphan spec: a pane id with no place in the layout tree.
         ws.tabs[0].panes.insert(
             5,
-            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: "/tmp".into(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
         );
         // Orphan layout leaf: the layout references pane 1, but drop its spec.
         ws.tabs[0].panes.remove(&1);

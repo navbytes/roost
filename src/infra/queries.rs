@@ -235,9 +235,7 @@ impl QueryResponder {
                 b"5" => out.extend_from_slice(b"\x1b[0n"), // "operating OK"
                 b"6" => {
                     let (row, col) = screen.cursor_position();
-                    out.extend_from_slice(
-                        format!("\x1b[{};{}R", row + 1, col + 1).as_bytes(),
-                    );
+                    out.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
                 }
                 _ => {}
             },
@@ -272,9 +270,7 @@ impl QueryResponder {
                 }
                 // Text area size in pixels: only when real geometry exists.
                 b"14" if pixels.0 > 0 && pixels.1 > 0 => {
-                    out.extend_from_slice(
-                        format!("\x1b[4;{};{}t", pixels.1, pixels.0).as_bytes(),
-                    );
+                    out.extend_from_slice(format!("\x1b[4;{};{}t", pixels.1, pixels.0).as_bytes());
                 }
                 // Cell size in pixels, derived from the text-area geometry.
                 b"16" if pixels.0 > 0 && pixels.1 > 0 => {
@@ -466,14 +462,14 @@ mod tests {
         let ver = env!("CARGO_PKG_VERSION");
         let xtversion = format!("\x1bP>|roost {ver}\x1b\\");
         let cases: &[(&[u8], &[u8])] = &[
-            (b"\x1b[c", DA1_REPLY),                      // DA1
-            (b"\x1b[0c", DA1_REPLY),                     // DA1, explicit 0
-            (b"\x1b[>c", DA2_REPLY),                     // DA2
-            (b"\x1b[>0c", DA2_REPLY),                    // DA2, explicit 0
-            (b"\x1b[5n", b"\x1b[0n"),                    // DSR 5: operating OK
-            (b"\x1b[>q", xtversion.as_bytes()),          // XTVERSION
-            (b"\x1b[>0q", xtversion.as_bytes()),         // XTVERSION, explicit 0
-            (b"\x1b[18t", b"\x1b[8;24;80t"),             // text area in cells
+            (b"\x1b[c", DA1_REPLY),              // DA1
+            (b"\x1b[0c", DA1_REPLY),             // DA1, explicit 0
+            (b"\x1b[>c", DA2_REPLY),             // DA2
+            (b"\x1b[>0c", DA2_REPLY),            // DA2, explicit 0
+            (b"\x1b[5n", b"\x1b[0n"),            // DSR 5: operating OK
+            (b"\x1b[>q", xtversion.as_bytes()),  // XTVERSION
+            (b"\x1b[>0q", xtversion.as_bytes()), // XTVERSION, explicit 0
+            (b"\x1b[18t", b"\x1b[8;24;80t"),     // text area in cells
         ];
         for (query, reply) in cases {
             let mut r = QueryResponder::new();
@@ -541,7 +537,7 @@ mod tests {
     #[test]
     fn pixel_reports_answer_only_with_known_geometry() {
         let p = blank(); // 24 rows x 80 cols
-        // Unknown pixels: 14t and 16t stay silent; 18t still answers.
+                         // Unknown pixels: 14t and 16t stay silent; 18t still answers.
         let mut r = QueryResponder::new();
         assert!(r.feed(b"\x1b[14t\x1b[16t", p.screen(), (0, 0)).is_empty());
         assert_eq!(r.feed(b"\x1b[18t", p.screen(), (0, 0)), b"\x1b[8;24;80t");
@@ -578,13 +574,13 @@ mod tests {
         let mut r = QueryResponder::new();
         feed(&mut r, b"\x1b[>1u"); // give the kitty report a nonzero flag
         let echoes: &[&[u8]] = &[
-            b"\x1b[?1;2c",   // DA1 response
-            b"\x1b[>84;0;0c", // DA2 response
-            b"\x1b[0n",      // DSR 5 response
-            b"\x1b[3;1R",    // DSR 6 response (CPR)
-            b"\x1b[?1u",     // kitty flag report
+            b"\x1b[?1;2c",     // DA1 response
+            b"\x1b[>84;0;0c",  // DA2 response
+            b"\x1b[0n",        // DSR 5 response
+            b"\x1b[3;1R",      // DSR 6 response (CPR)
+            b"\x1b[?1u",       // kitty flag report
             b"\x1b[?2004;1$y", // DECRQM response
-            b"\x1b[8;24;80t", // XTWINOPS 18t response
+            b"\x1b[8;24;80t",  // XTWINOPS 18t response
             b"\x1b[4;480;800t",
             b"\x1b[6;20;10t",
         ];

@@ -92,7 +92,7 @@ fn banked_history_keeps_its_ink_and_sheds_its_padding() {
     {
         let mut p = vt100::Parser::new(4, 40, 100);
         p.process(b"\x1b[41mhi\x1b[K\r\n"); // red background, erase to EOL
-        // Bank it: print past the bottom of a 4-row grid.
+                                            // Bank it: print past the bottom of a 4-row grid.
         for _ in 0..10 {
             p.process(b"x\r\n");
         }

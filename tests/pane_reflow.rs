@@ -84,10 +84,7 @@ fn a_zoom_round_trip_keeps_every_column_of_a_line_printed_while_zoomed() {
     assert!(h.settle(Duration::from_secs(5)), "the unzoomed frame never settled");
 
     let tiled = cli_read_tail(h.state_dir());
-    assert!(
-        tiled.contains("Q7HEAD"),
-        "the head of the marker line vanished on unzoom:\n{tiled}"
-    );
+    assert!(tiled.contains("Q7HEAD"), "the head of the marker line vanished on unzoom:\n{tiled}");
     assert!(
         tiled.contains("Q7TAIL"),
         "P5: unzooming truncated the pane's grid — the marker's tail (printed \

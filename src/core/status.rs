@@ -160,8 +160,7 @@ impl StatusTracker {
         self.title_enabled
             && !self.ext_link
             && self.title_status == Some(AgentStatus::Working)
-            && (self.recent_output()
-                || self.title_at.is_some_and(|t| t.elapsed() <= STUCK_WORKING))
+            && (self.recent_output() || self.title_at.is_some_and(|t| t.elapsed() <= STUCK_WORKING))
     }
 
     /// D5: the title says the agent is at rest (`✳`). No time decay — it
@@ -494,11 +493,7 @@ mod tests {
         live.ext_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
         assert_eq!(live.current(), AgentStatus::Idle);
         live.on_output();
-        assert_eq!(
-            live.current(),
-            AgentStatus::Working,
-            "output resuming returns it to Working"
-        );
+        assert_eq!(live.current(), AgentStatus::Working, "output resuming returns it to Working");
 
         // Down link: no live evidence the hook is still around at all —
         // today's behavior, self-heal to Waiting.
@@ -507,11 +502,7 @@ mod tests {
         down.ext_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
         assert_eq!(down.current(), AgentStatus::Waiting);
         down.on_output();
-        assert_eq!(
-            down.current(),
-            AgentStatus::Working,
-            "output resuming returns it to Working"
-        );
+        assert_eq!(down.current(), AgentStatus::Working, "output resuming returns it to Working");
     }
 
     /// NeedsInput's decay stays time-based no matter what the link is doing
@@ -696,11 +687,7 @@ mod tests {
         t.set_ext_link(true);
         t.set_extension_status(AgentStatus::Working);
         t.ext_at = Some(Instant::now() - STUCK_WORKING - Duration::from_secs(1));
-        assert_eq!(
-            t.current(),
-            AgentStatus::Idle,
-            "setup: this is D2's live-link Working decay"
-        );
+        assert_eq!(t.current(), AgentStatus::Idle, "setup: this is D2's live-link Working decay");
 
         assert!(
             t.vouched_live(),

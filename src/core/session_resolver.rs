@@ -104,7 +104,8 @@ mod tests {
     /// sight. Also doubles as the `Exists` branch (resume, unchanged).
     #[test]
     fn resolver_is_constructible_and_testable_without_an_app() {
-        let adapter = FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Exists };
+        let adapter =
+            FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Exists };
         let out = resolve(&adapter, Path::new("/proj"), Some("real-id"));
         assert_eq!(
             out,
@@ -124,9 +125,13 @@ mod tests {
         // Can't tell (no root, or an unreadable one) must never be treated
         // as Gone — that would discard a possibly-still-valid resume
         // pointer over a transient read error.
-        let adapter = FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Unknown };
+        let adapter =
+            FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Unknown };
         let out = resolve(&adapter, Path::new("/proj"), Some("kept"));
-        assert_eq!(out, SpawnResolution { session: Some("kept".into()), stale: false, wants_detect: false });
+        assert_eq!(
+            out,
+            SpawnResolution { session: Some("kept".into()), stale: false, wants_detect: false }
+        );
     }
 
     #[test]
@@ -160,7 +165,8 @@ mod tests {
 
     #[test]
     fn a_session_root_with_nothing_stored_arms_detection() {
-        let adapter = FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Unknown };
+        let adapter =
+            FixedAdapter { root: Some(PathBuf::from("/tmp")), state: SessionState::Unknown };
         let out = resolve(&adapter, Path::new("/proj"), None);
         assert_eq!(out, SpawnResolution { session: None, stale: false, wants_detect: true });
     }

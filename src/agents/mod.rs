@@ -68,9 +68,13 @@ impl CommandSpec {
 /// pasteable line stays readable; anything else is single-quoted with
 /// embedded `'` escaped as `'\''`.
 fn shell_word(s: &str) -> String {
-    let safe = !s.is_empty()
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
-    if safe { s.to_string() } else { format!("'{}'", s.replace('\'', r"'\''")) }
+    let safe =
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 pub trait AgentAdapter: Send + Sync {
@@ -165,9 +169,7 @@ pub fn valid_session_id(id: &str) -> bool {
         && id.len() <= 256
         && !id.starts_with('-')
         && !id.contains("..")
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Files under `root` (recursive) modified after `since`, newest first.
@@ -229,7 +231,12 @@ pub fn newest_unclaimed_session<A: AgentAdapter + ?Sized>(
 /// directory (permission hiccup, or — for a narrowed root passed in by an
 /// override — simply a cwd whose subdirectory doesn't exist yet). Only an id
 /// absent from a root that's actually present and readable is Gone.
-pub fn session_file_state<A: AgentAdapter + ?Sized>(adapter: &A, root: &Path, cwd: &Path, id: &str) -> SessionState {
+pub fn session_file_state<A: AgentAdapter + ?Sized>(
+    adapter: &A,
+    root: &Path,
+    cwd: &Path,
+    id: &str,
+) -> SessionState {
     if std::fs::read_dir(root).is_err() {
         return SessionState::Unknown;
     }
@@ -333,7 +340,8 @@ mod tests {
         std::fs::write(d.join("the-id.jsonl"), "").unwrap();
         // default session_id_from_path = file stem = "the-id"
         assert_eq!(
-            test_support::RootAdapter::new(Some(d.clone())).session_state(Path::new("/x"), "the-id"),
+            test_support::RootAdapter::new(Some(d.clone()))
+                .session_state(Path::new("/x"), "the-id"),
             SessionState::Exists
         );
         assert_eq!(

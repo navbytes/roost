@@ -25,8 +25,7 @@ const ALT_LEFT: &[u8] = b"\x1b[1;3D";
 fn a_subscribed_pane_is_told_when_it_loses_and_regains_roost_focus() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let Some(mut h) =
-        harness::spawn_or_skip("focus-reporting gate", &harness::two_panes(cwd))
+    let Some(mut h) = harness::spawn_or_skip("focus-reporting gate", &harness::two_panes(cwd))
     else {
         return;
     };
@@ -72,8 +71,7 @@ fn a_subscribed_pane_is_told_when_it_loses_and_regains_roost_focus() {
 fn a_pane_that_never_asked_receives_no_focus_bytes() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let Some(mut h) =
-        harness::spawn_or_skip("focus-reporting gate", &harness::two_panes(cwd))
+    let Some(mut h) = harness::spawn_or_skip("focus-reporting gate", &harness::two_panes(cwd))
     else {
         return;
     };

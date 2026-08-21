@@ -58,18 +58,12 @@ fn pane_da1_and_cursor_position_queries_are_answered() {
     // roost's replies land on the pane's stdin; the parked cat's tty echoes
     // them as visible `^[` text. DA1 must be the VT100+AVO identity...
     if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[[?1;2c")).is_none() {
-        panic!(
-            "pane never received the DA1 reply (CSI ?1;2c):\n{}",
-            h.screen().contents()
-        );
+        panic!("pane never received the DA1 reply (CSI ?1;2c):\n{}", h.screen().contents());
     }
     // ...and a well-formed CPR must arrive (typically `^[[2;5R` — the row
     // after the command echo, the column right after the QRY1 marker).
     if h.wait_for(Duration::from_secs(5), |s| has_cpr(&s.contents())).is_none() {
-        panic!(
-            "pane never received the DSR 6 cursor-position report:\n{}",
-            h.screen().contents()
-        );
+        panic!("pane never received the DSR 6 cursor-position report:\n{}", h.screen().contents());
     }
 
     h.write_bytes(b"\x03"); // Ctrl+C ends cat

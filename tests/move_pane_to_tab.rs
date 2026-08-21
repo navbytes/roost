@@ -69,7 +69,7 @@ fn alt_shift_m_moves_the_focused_pane_into_the_next_tab_without_restarting_it() 
     assert!(
         h.wait_for(Duration::from_secs(5), |s| pane_tab(&sd, 1).is_some_and(|(t, _)| t == 0)
             && s.contents().contains("1 api"))
-        .is_some(),
+            .is_some(),
         "the tab bar never showed the move:\n{}",
         h.screen().contents(),
     );

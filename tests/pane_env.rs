@@ -71,8 +71,7 @@ fn pane_children_see_roost_identity_not_the_hosts() {
     let env_path = h.state_dir().join("pane.env");
     let done_path = h.state_dir().join("pane.env.done");
     h.write_bytes(
-        format!("env > {} && printf ok > {}\r", env_path.display(), done_path.display())
-            .as_bytes(),
+        format!("env > {} && printf ok > {}\r", env_path.display(), done_path.display()).as_bytes(),
     );
     wait_for_file(&done_path, Duration::from_secs(5)).expect("pane shell never dumped its env");
     let dump = std::fs::read_to_string(&env_path).expect("read pane env dump");
@@ -117,8 +116,7 @@ fn a_pane_shell_runs_its_login_profile() {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let home =
-        std::env::temp_dir().join(format!("roost-p18-home-{}-{stamp}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("roost-p18-home-{}-{stamp}", std::process::id()));
     std::fs::create_dir_all(&home).expect("create fixture HOME");
     std::fs::write(
         home.join(".profile"),
@@ -140,14 +138,11 @@ fn a_pane_shell_runs_its_login_profile() {
     let env_path = h.state_dir().join("login.env");
     let done_path = h.state_dir().join("login.env.done");
     h.write_bytes(
-        format!("env > {} && printf ok > {}\r", env_path.display(), done_path.display())
-            .as_bytes(),
+        format!("env > {} && printf ok > {}\r", env_path.display(), done_path.display()).as_bytes(),
     );
     let dumped = wait_for_file(&done_path, Duration::from_secs(5)).is_some();
-    let dump = dumped
-        .then(|| std::fs::read_to_string(&env_path).ok())
-        .flatten()
-        .unwrap_or_default();
+    let dump =
+        dumped.then(|| std::fs::read_to_string(&env_path).ok()).flatten().unwrap_or_default();
     let _ = std::fs::remove_dir_all(&home);
     assert!(dumped, "pane shell never dumped its env");
 

@@ -84,12 +84,8 @@ pub fn notify(msg: &str) {
         // `Command` execs `osascript` directly — so this isn't shell
         // quoting, just `osascript` reusing `-e` for both roles.
         let script = "on run {b}\n  display notification b with title \"roost\"\nend run";
-        if let Ok(child) = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .arg("--")
-            .arg(msg)
-            .spawn()
+        if let Ok(child) =
+            std::process::Command::new("osascript").arg("-e").arg(script).arg("--").arg(msg).spawn()
         {
             // Reap it so rapid notifications don't accumulate zombies.
             std::thread::spawn(move || {
@@ -114,18 +110,21 @@ mod budget_tests {
         let t0 = Instant::now();
         let mut state = None;
         // Same instant throughout: no refill, so only the burst gets through.
-        let burst = (0..1000).filter(|_| take(&mut state, t0, NOTIFY_BURST, NOTIFY_PER_SEC)).count();
+        let burst =
+            (0..1000).filter(|_| take(&mut state, t0, NOTIFY_BURST, NOTIFY_PER_SEC)).count();
         assert_eq!(burst, NOTIFY_BURST as usize, "the burst is exactly the capacity");
 
         // One second later the bucket has refilled by the sustained rate,
         // and not by more.
         let t1 = t0 + Duration::from_secs(1);
-        let after = (0..1000).filter(|_| take(&mut state, t1, NOTIFY_BURST, NOTIFY_PER_SEC)).count();
+        let after =
+            (0..1000).filter(|_| take(&mut state, t1, NOTIFY_BURST, NOTIFY_PER_SEC)).count();
         assert_eq!(after, NOTIFY_PER_SEC as usize, "a second buys exactly the sustained rate");
 
         // A long quiet period refills to the cap, never past it.
         let t2 = t1 + Duration::from_secs(3600);
-        let later = (0..1000).filter(|_| take(&mut state, t2, NOTIFY_BURST, NOTIFY_PER_SEC)).count();
+        let later =
+            (0..1000).filter(|_| take(&mut state, t2, NOTIFY_BURST, NOTIFY_PER_SEC)).count();
         assert_eq!(later, NOTIFY_BURST as usize, "the bucket never exceeds its capacity");
     }
 

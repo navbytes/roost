@@ -72,17 +72,15 @@ fn a_hidden_pane_cursor_is_not_placed_and_decscusr_is_mirrored() {
     h.write_bytes(b"\x03"); // end the sleep
     let restore_from = h.host_bytes().len();
     h.write_bytes(b"printf '\\033[?25h'\r");
-    let restored = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
-        placed_cursor(&b[restore_from..])
-    });
+    let restored =
+        h.wait_for_host_bytes(Duration::from_secs(5), |b| placed_cursor(&b[restore_from..]));
     assert!(restored, "roost never resumed placing the cursor after `?25h`");
 
     // -- (b) DECSCUSR is mirrored to the host ------------------------------
     let before = h.host_bytes().len();
     h.write_bytes(b"printf '\\033[5 q'\r"); // blinking bar, an editor's insert cursor
-    let mirrored = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
-        contains(&b[before..], b"\x1b[5 q")
-    });
+    let mirrored =
+        h.wait_for_host_bytes(Duration::from_secs(5), |b| contains(&b[before..], b"\x1b[5 q"));
     assert!(
         mirrored,
         "roost never mirrored the focused pane's DECSCUSR shape; tail:\n{}",
@@ -92,9 +90,8 @@ fn a_hidden_pane_cursor_is_not_placed_and_decscusr_is_mirrored() {
     // Moving focus to a pane that asked for no shape restores the default.
     let before = h.host_bytes().len();
     h.write_bytes(b"\x1b[1;3C"); // Alt+Right: focus the neighbouring pane
-    let reset = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
-        contains(&b[before..], b"\x1b[0 q")
-    });
+    let reset =
+        h.wait_for_host_bytes(Duration::from_secs(5), |b| contains(&b[before..], b"\x1b[0 q"));
     assert!(
         reset,
         "focusing a shape-less pane must restore the host cursor default; \

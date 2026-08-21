@@ -35,9 +35,8 @@ fn a_pane_clipboard_write_reaches_the_host_and_a_read_never_does() {
     // the host-stream assertion — only roost's own relay can.
     h.write_bytes(b"printf '\\033]52;c;cm9v''c3Q=\\007'\r");
 
-    let relayed = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
-        contains(b, b"\x1b]52;c;cm9vc3Q=\x07")
-    });
+    let relayed =
+        h.wait_for_host_bytes(Duration::from_secs(5), |b| contains(b, b"\x1b]52;c;cm9vc3Q=\x07"));
     assert!(
         relayed,
         "roost never relayed the pane's OSC 52 write to the host; tail:\n{}",
