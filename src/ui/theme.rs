@@ -166,11 +166,15 @@ pub fn tab_summary_style(summary: TabSummary) -> (char, Style) {
 }
 
 /// One spinner frame's on-screen time (C5). pi's own loader runs this
-/// nominal (80ms/frame, 800ms full rotation); roost's render loop redraws
-/// roughly every 33ms even with nothing to read (`main.rs`'s crossterm poll
-/// timeout is the effective tick), which is finer than 80ms, so the frame
-/// length is used as-is rather than quantized up to match a coarser tick.
-const SPINNER_FRAME_MS: u128 = 80;
+/// nominal (80ms/frame, 800ms full rotation), and roost uses the number
+/// as-is rather than quantizing it to a coarser tick.
+///
+/// It is also the loop's **idle repaint budget** (`main.rs`'s
+/// `IDLE_REPAINT`): the spinner is the finest thing on screen that moves
+/// with no event behind it, so a repaint at this cadence is what keeps it
+/// smooth, and nothing else time-driven can be staler than one frame of it.
+/// Shared rather than restated so the two cannot drift apart.
+pub const SPINNER_FRAME_MS: u128 = 80;
 
 /// `elapsed` (the shared clock — `App::elapsed`, time since app start) → the
 /// `SPINNER_FRAMES` index on screen right now, wrapping every 800ms (10

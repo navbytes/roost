@@ -299,6 +299,36 @@ fn install_panic_hook() {
 /// block.
 const EVENT_CHANNEL_BOUND: usize = 1024;
 
+/// How long the loop may go without repainting when nothing has happened.
+///
+/// Every iteration used to repaint unconditionally, so at the 33ms poll
+/// roost built a full frame 30 times a second forever — and a profile of the
+/// idle binary is almost entirely that frame: the pane blit, ratatui's buffer
+/// diff, and the `/dev/tty` `open`+ioctl `Terminal::draw` does to autoresize.
+/// None of it changed a cell.
+///
+/// One spinner frame (`theme::SPINNER_FRAME_MS`, shared so the two cannot
+/// drift): the C5 spinner is the finest thing on screen that moves with no
+/// event behind it, so this is the coarsest budget that still animates it.
+const IDLE_REPAINT: Duration = Duration::from_millis(ui::theme::SPINNER_FRAME_MS as u64);
+
+/// Must the loop paint this iteration?
+///
+/// `dirty` is "something the loop learned about since the last paint" — a
+/// key, a mouse event, a resize, a pane's output, a control request, a
+/// deferred copy firing. Those paint on the spot, so interactive latency is
+/// exactly what it was.
+///
+/// `since >= IDLE_REPAINT` is the safety net rather than the optimization,
+/// and it is the half that makes this change safe to make at all: it fires
+/// unconditionally, so anything that moves with no event behind it — the
+/// spinner, a flash expiring, an age word ticking over, and any future
+/// source nobody thought to mark dirty — is at worst one frame late. There
+/// is no state in which the screen stops updating.
+fn should_repaint(dirty: bool, since: Duration) -> bool {
+    dirty || since >= IDLE_REPAINT
+}
+
 fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // This thread is the whole visible product — keyboard poll, pane
     // parsing, drawing — so it gets macOS's user-interactive QoS: when the
@@ -447,6 +477,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             panic!("ROOST_TEST_PANIC_THREAD_AFTER_MS: deliberate background-thread panic");
         });
     }
+    // Far enough in the past that the first iteration always paints.
+    let mut last_draw = Instant::now() - IDLE_REPAINT;
+    let mut dirty = true;
     let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
     loop {
         // Test hatch only (`infra::test_panic_after`): `panic_at` is `None`
@@ -454,7 +487,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if panic_at.is_some_and(|deadline| Instant::now() >= deadline) {
             panic!("ROOST_TEST_PANIC_AFTER_MS: deliberate panic, gating fleet teardown");
         }
-        terminal.draw(|f| ui::render::draw(f, &mut app))?;
+        if should_repaint(dirty, last_draw.elapsed()) {
+            terminal.draw(|f| ui::render::draw(f, &mut app))?;
+            last_draw = Instant::now();
+            dirty = false;
+        }
 
         // Drain ALL pending terminal events this tick, not just one. During a
         // resize storm (dragging the window edge) several events queue up
@@ -524,6 +561,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             }
             perf.record_keys(keys_drained);
         }
+        // Everything below this point either changed app state or did not
+        // happen; either way the next iteration decides whether to paint.
+        dirty |= had_event;
         if resized {
             // Trust the terminal's current size, not a possibly-stale value
             // carried on an intermediate coalesced event, then hard-clear so
@@ -553,6 +593,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         const MAX_EVENTS_PER_TICK: usize = 512;
         for _ in 0..MAX_EVENTS_PER_TICK {
             let Ok(ev) = rx.try_recv() else { break };
+            dirty = true;
             match ev {
                 AppEvent::Command(req, reply) => {
                     app.handle_control_msg(req, reply);
@@ -628,6 +669,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if let Some(text) = app.due_copy() {
             let outcome = infra::clipboard::copy(&text); // U14
             app.flash_copy(text.chars().count(), outcome);
+            dirty = true; // U14's flash has no event behind it
         }
         // Periodic housekeeping (filesystem session detection).
         app.tick();
@@ -1121,6 +1163,29 @@ fn inner_cell(rect: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
 
 #[cfg(test)]
 mod tests {
+    use super::{should_repaint, IDLE_REPAINT};
+    use std::time::Duration;
+
+    /// The idle repaint budget is an optimization with a safety net, and
+    /// this pins the net: an event always paints now, a quiet iteration
+    /// inside the budget skips, and the budget itself always fires. The last
+    /// one is what keeps a change nobody marked `dirty` a frame late instead
+    /// of invisible — there is no input for which the screen stops updating.
+    #[test]
+    fn the_repaint_budget_always_fires_and_never_outruns_the_spinner() {
+        assert!(should_repaint(true, Duration::ZERO), "an event paints immediately");
+        assert!(!should_repaint(false, Duration::ZERO), "a quiet iteration skips");
+        assert!(!should_repaint(false, IDLE_REPAINT - Duration::from_millis(1)));
+        assert!(should_repaint(false, IDLE_REPAINT), "the backstop fires on its own");
+        assert!(should_repaint(false, Duration::from_secs(3600)), "and keeps firing");
+        // The bound is the spinner's own frame: the finest thing on screen
+        // that moves with no event behind it must not be quantized coarser
+        // than the animation it has to carry.
+        assert!(
+            IDLE_REPAINT.as_millis() <= crate::ui::theme::SPINNER_FRAME_MS,
+            "the repaint budget must not be coarser than one spinner frame",
+        );
+    }
 
     /// rev P1-2: only the security refusal may be fatal. Every other
     /// listener failure has to degrade to "no control plane, and roost says
