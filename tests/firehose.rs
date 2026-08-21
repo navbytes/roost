@@ -58,15 +58,18 @@ fn half(screen: &vt100::Screen, right_side: bool) -> String {
 
 #[test]
 fn firehose_latency_starvation_and_clean_exit() {
-    // Short basename deliberately: C4's corner badge ("{adapter} · {cwd
-    // basename}") is right-aligned on the pane's own first content row and
-    // occludes it by design (DESIGN-ui.md C4) — a long cwd (e.g. this repo's
-    // worktree dirname) pushes the badge left far enough to clobber the
-    // typed echo we're asserting on a ~58-column-wide half-pane. The system
-    // temp dir's basename ("T" on macOS) keeps the badge short and out of
-    // the way; it isn't what's under test here.
-    let cwd = std::env::temp_dir();
-    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    // This repo's own directory — a deliberately *long* cwd.
+    //
+    // It used to have to be a short one. C4's corner badge ("{adapter} · {cwd
+    // basename}") was right-aligned on the pane's own first content row, so a
+    // long cwd pushed it left far enough to clobber the typed echo this gate
+    // asserts on a ~58-column half-pane, and the fixture used the system temp
+    // dir ("T" on macOS) to keep it out of the way. Since C4's 2026-08-21
+    // amendment identity rides the top border instead, and the first content
+    // row is the pane's again — so the fixture no longer has to dodge roost's
+    // own chrome, and picking the awkward cwd on purpose keeps it that way.
+    let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cwd = cwd.to_str().expect("manifest dir is valid utf8");
     // Two side-by-side shell panes (DESIGN-ui.md §6 scenario, `harness::
     // two_panes`). Pane 1 (left) is focused by default (`App::new` focuses
     // the first pane in DFS order) and becomes the firehose; pane 2 (right)
@@ -88,24 +91,18 @@ fn firehose_latency_starvation_and_clean_exit() {
     // (`src/ui/input.rs`: Alt+l / Alt+Right both map to Focus(Dir::Right)).
     h.write_bytes(b"\x1bl");
 
-    // Give pane B a two-column prompt before measuring anything typed into
-    // it. This is not cosmetic: the echo assertion below accumulates 20
-    // characters on the pane's **first content row**, and C4's corner badge
-    // (`2 shell · T ○`, ~16 columns) is right-aligned on that very row and
-    // overwrites what runs under it — the fixture comment above already
-    // guards the badge's *width*, but not the prompt's. A login shell on
-    // macOS starts with `\h:\W \u\$ `, 30 columns of hostname and username,
-    // which leaves 12 before the collision and fails this test at keystroke
-    // ~12 on every Mac while passing on Linux's two-column `$ `. Setting it
-    // in-band is the only way: shell panes are login shells (P18) and
-    // macOS's /etc/bashrc assigns PS1 after any inherited value.
-    h.write_bytes(b"PS1='$ '\r");
-    // The new prompt is a row that *starts* with `$` — matching bare `$ `
-    // would also match the echo of the command that set it.
-    h.wait_for(Duration::from_secs(3), |s| {
-        half(s, true).lines().any(|l| l.trim_start_matches('│').starts_with('$'))
-    })
-    .expect("pane B never took the short prompt");
+    // No PS1 wrangling either, for the same reason. The echo assertion below
+    // accumulates 20 characters on the pane's **first content row**, and this
+    // gate used to have to set a two-column prompt in-band because macOS's
+    // login shell starts with `\h:\W \u\$ ` — 30 columns of hostname and
+    // username — which left 12 before the badge overwrote the echo, failing
+    // at keystroke ~12 on every Mac while passing on Linux's `$ `. With the
+    // badge off that row, the default prompt and twenty characters fit side
+    // by side and the shell can be whatever the host makes it.
+    //
+    // Verified as the reason rather than assumed: with the pre-amendment
+    // renderer and these two workarounds removed, this gate fails at
+    // keystroke 6.
 
     // --- Assertion 2 (checked first so its ~3.5s duration overlaps the
     // sustained-spew window assertion 1 also needs, keeping total wall time

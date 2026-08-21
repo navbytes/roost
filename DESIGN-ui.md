@@ -603,6 +603,32 @@ sanctioned home of the theme-variant slot: a theme that renders ANSI 8 faint
 costs a hairline here and nothing else. Everything else in this contract —
 `BorderType::Plain`, no BOLD, no border title — is unchanged.
 
+**[Amended 2026-08-21 — the border carries the pane's label again.]** This
+contract's target line "the border-embedded title line is **removed** … pane
+identity moves entirely to the corner badge (C4)" is reversed for identity
+and extended for the note. A pane's top border carries its **identity
+title** (C4) left-aligned; its bottom border carries its **note title**
+(C32) left-aligned. `ZOOM · {n} hidden` keeps the top-right (C21), and is
+served first — identity yields the columns zoom takes plus one, so the two
+never touch.
+
+The 2026-07-27 reading was that a border is structure and text on it is
+noise. Measured against real frames, the alternative was worse: the badge
+was painted over the pane's own **first content row**, which is its most
+valuable one — a prompt, the first line of a diff, the answer just asked
+for. It took 29–55 columns of a 58-column pane, and the *entire* row of a
+28-column one, on all four panes of a four-way split, while the border
+above sat empty. `tests/firehose.rs` had carried a workaround for this since
+it was written (a deliberately short cwd and an in-band `PS1`, both to keep
+the badge from clobbering the echo it measures); both are deleted by this
+amendment, and with the pre-amendment renderer they are demonstrably load-
+bearing — that gate fails at keystroke 6 without them.
+
+Nothing else in C3 changes: `BorderType::Plain`, no BOLD, `accent()` focused
+and `rule()` unfocused, and U21's two-cell drag handle all stand. A title
+occupies cells that were already border and already drag; the content cells
+it vacates go back to plain click-to-focus, so no click behaviour changes.
+
 **[Amended 2026-07-28, SPEC-ux U21 — a shared border is a handle.]** The
 border between two panes can be dragged to move that split. Nothing about
 how a border is *drawn* changes; this contracts what it *is*.
@@ -706,6 +732,9 @@ folded into the text. No bg — the badge is a watermark over the pane's own
 last output, and `quiet()` is exactly the right shape for that: the user's
 ink, one rung back.
 
+**[Superseded 2026-08-21 — the note segment moved to its own border; see
+C32's amendment of that date. The composition and styling below still
+describe what is drawn, just on the bottom edge rather than in this badge.]**
 **[Amended 2026-08-15, C32 — the note segment.]** A pane carrying a parking
 note (C32) grows a note segment between the identity text and the
 `raw`/`↑N`/glyph tail; identity keeps leading, so U2's id-first rule holds
@@ -729,6 +758,31 @@ untouched and a narrow pane clips the note before the join key:
   absent, never as fresh.
 - Width behavior unchanged: same parts pipeline (`clip_spans`), tail
   trimmed first; no bg, no new colour, no BOLD.
+
+**[Amended 2026-08-21 — the badge becomes the identity title.]** The corner
+badge moves off the pane's first content row and onto its **top border**,
+left-aligned, one column of breathing room after the corner. See C3's
+amendment of the same date for why. Everything C4 contracts about *what* it
+says is unchanged and pinned as an equality in
+`identity_title_is_two_toned_and_reads_exactly_as_the_badge_did`: the same
+`"{id} {name} · {adapter}"` composition, the same U2 id-first rule, the same
+P6 naming chain, the same `raw`/`↑N` tokens in the same order, the same
+two-tone styling (`quiet()` text, C5 glyph, `accent_quiet()` tokens). Only
+the placement moved, and with it:
+
+- **Geometry.** Left-aligned on the top border, budget `width − 2` (the
+  border's title area, corners excluded — the same span `inner.width`
+  measures), less whatever C21's zoom title has taken.
+- **The glyph is never shed.** The badge clipped its own tail, so a long
+  name deleted the status glyph — the one element reporting whether the
+  agent is alive. The tail is now fixed and the *name* absorbs the
+  shortfall, down to nothing; a title that cannot fit even ` {glyph} `
+  disappears whole rather than clipping the glyph in half.
+- **Styling does *not* follow C21's "match the border you sit on".** That
+  rule is right for `ZOOM · {n} hidden`, which is one undifferentiated
+  statement about the pane. This title has structure C5 requires be
+  coloured: the glyph carries status and `raw`/`↑N` carry view state, and
+  flattening them to the border colour would delete the signal.
 
 ### C5 — Status glyph system + spinner
 
@@ -3864,6 +3918,29 @@ forgotten each pane's *intent* — the transcript survives in the agent's own
 session, but "waiting on CI", "this approach is a dead end", "next: rebase
 then merge" do not. A name (`Alt+r`) says what a pane *is*; a note says
 where it *stands*.
+
+**[Amended 2026-08-21 — the note gets an edge of its own.]** The note segment
+leaves the corner badge (which itself became C4's identity title on the top
+border, same date) and becomes the **note title** on the pane's **bottom
+border**, left-aligned. Reveal-on-visit is untouched and is the whole reason
+the two forms still exist: `" ¶ {headline} ({age}) "` on the focused pane,
+a bare `" ¶ "` (or `" ¶⋮ "`) everywhere else — presence everywhere, content
+only where you are looking. Text, styling (`ink()` headline, `quiet()` age),
+the `¶⋮` body marker, and the missing-timestamp rule all stand.
+
+Its own edge rather than a segment of the identity title, for two reasons.
+It is the widest thing roost draws about a pane, so sharing the top border
+would make it the first casualty of a narrow one — which is exactly what it
+was as the badge's tail, clipped before it could be read. And it answers a
+different question from a name: *what did I park here*, not *what is this*.
+On its own edge a 28-column pane shows `└ ¶ waiting on schema review ┘`
+whole, which no width of pane ever did before. The marker is fixed and the
+headline absorbs a narrow border, so a note never becomes invisible — it
+degrades to a `¶`.
+
+Collapsed stack rows (C8) and the roster (C27) are unchanged: they are their
+own single-row chrome with no border to hang a title on, and they keep the
+`¶` presence marker exactly where it was.
 
 **Data:** `PaneSpec.note: Option<String>` + `PaneSpec.noted_at: Option<u64>`
 (unix seconds), both `#[serde(default)]` — a pre-C32 `workspace.json` loads

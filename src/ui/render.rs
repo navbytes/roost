@@ -2272,6 +2272,10 @@ fn draw_pane<B: PaneBackend>(
     // corner badge, C4). No BOLD.
     let border_style = if focused { theme::accent() } else { theme::rule() };
     let mut block = Block::bordered().border_style(border_style);
+    // The border's title area, corner to corner. Shared budget: C21's zoom
+    // title takes what it needs from the right, C4's identity title gets
+    // what is left on the left.
+    let mut top_budget = pr.rect.width.saturating_sub(2);
     // C21 (amended 2026-08-11, zoom indicator): the zoomed pane alone (never
     // the float, which can render alongside it, C22) gets a right-aligned
     // border title naming how many real-tree panes zoom is hiding. `n`
@@ -2282,9 +2286,36 @@ fn draw_pane<B: PaneBackend>(
     // under a focused float) — never its own fixed color.
     if app.zoomed() && !app.is_float(pr.id) {
         let n = app.rects().len().saturating_sub(1);
-        if let Some(title) = zoom_title_text(n, pr.rect.width.saturating_sub(2)) {
+        if let Some(title) = zoom_title_text(n, top_budget) {
+            // [Amended 2026-08-21] Zoom is served first and identity yields
+            // the columns it takes, plus one so the two never touch: zoom is
+            // a transient announcement about what you *cannot* see, and a
+            // zoomed tab is one pane with the whole body's width to spend.
+            top_budget = top_budget.saturating_sub(mouse::display_width(&title) + 1);
             block = block.title_top(Line::from(title).right_aligned().style(border_style));
         }
+    }
+    // C3/C4 (amended 2026-08-21): identity on the top border, left-aligned —
+    // a label for the box, on the box. It used to be a corner badge painted
+    // over the pane's own first content row; see `identity_title`.
+    let (base_glyph, glyph_style, spins) = theme::status_style(status);
+    let glyph = badge_glyph(spins, app.scroll_offset(pr.id), spinner, base_glyph);
+    if let Some(spans) = identity_title(
+        top_budget,
+        &badge_text(pr.id, &name, &adapter, has_title),
+        raw,
+        app.scroll_offset(pr.id),
+        glyph,
+        glyph_style,
+    ) {
+        block = block.title_top(Line::from(spans).left_aligned());
+    }
+    // C32 (amended 2026-08-21): the note gets the bottom border to itself.
+    if let Some(spans) = note
+        .as_ref()
+        .and_then(|n| note_title(pr.rect.width.saturating_sub(2), n))
+    {
+        block = block.title_bottom(Line::from(spans).left_aligned());
     }
     let inner = block.inner(pr.rect);
     f.render_widget(block, pr.rect);
@@ -2334,22 +2365,6 @@ fn draw_pane<B: PaneBackend>(
         if let Mode::Copy { cursor } = app.mode {
             paint_copy_cursor(f, inner, cursor, app.selection);
         }
-    }
-
-    // C4: corner badge — the pane label, top-right. Drawn after the content
-    // so it stays visible (a cell TUI can't do true translucency; quiet text
-    // reads as a watermark rather than content). Drawn on every pane,
-    // focused included: occlusion of the inner app's own top-right cells is
-    // accepted by design now that identity lives here, not a border title.
-    // U3: a scrolled pane's badge gains the dim ↑N token; N1: its Working
-    // glyph stops animating while the view is frozen (badge_glyph).
-    let (base_glyph, glyph_style, spins) = theme::status_style(status);
-    let glyph = badge_glyph(spins, scrolled, spinner, base_glyph);
-    let text = badge_text(pr.id, &name, &adapter, has_title);
-    if let Some((rect, spans)) =
-        corner_badge(inner, &text, note.as_ref(), raw, scrolled, glyph, glyph_style)
-    {
-        f.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
 
     // C16: dead pane — overlay the relaunch hint (and spawn error, if any)
@@ -2538,71 +2553,102 @@ fn age_word(noted_at: u64, now: u64) -> String {
     }
 }
 
-/// Top-right corner badge (C4): pane name (+ adapter, when titled) and the
-/// status glyph, right-aligned with one column of breathing room. Two-tone:
-/// the text is `quiet`, the glyph carries its own C5 status style. A raw
-/// pane's badge gains a `raw` token between the text and the glyph, in its
-/// own `accent_quiet` span. A scrolled pane's badge carries a quiet `↑N`
-/// token — its grid-clamped view offset, 0 = live tail = no token —
-/// glyph-adjacent (after `raw`), same `accent_quiet` family. Returns the
-/// 1-row rect and the clipped spans — or `None` if the pane is too small to
-/// be worth badging. Pure so it can be unit-tested.
+/// C3/C4 (amended 2026-08-21): the pane's **identity title** — the left half
+/// of the top border, `" {id} {name} · {adapter} [raw] [↑N] {glyph} "`.
 ///
-/// C32: a pane with a parking note grows a note segment after the identity
-/// text — on the focused pane `¶ {headline} ({age})`, headline in `ink()`
-/// (the badge's one full-strength element: reveal-on-visit is the note's
-/// whole display story, and quiet input you're hunting for is input you
-/// cannot find), age in `quiet`; on an unfocused pane just the `¶` marker
-/// in `ink()` — presence, not content. `¶⋮` when a body sits under the
-/// headline. Identity leads and the note trails it, so C4's id-first rule
-/// holds untouched and a narrow pane clips the note before the join key.
-fn corner_badge(
-    inner: Rect,
+/// Formerly the corner badge, drawn over the pane's own first content row.
+/// That row is the pane's most valuable one — a prompt, the first line of a
+/// diff, the answer you just asked for — and the badge took as much of it as
+/// it needed: measured, 29–55 columns of a 58-column pane, and the *whole*
+/// row of a 28-column one, on all four panes of a four-way split, while the
+/// border above it sat empty. Identity is a label for the box, so it goes on
+/// the box.
+///
+/// **The glyph is never shed.** It is C5's status signal, and a long name
+/// used to clip it away — the badge trimmed its tail, so the first thing
+/// lost was the one element reporting whether the agent is alive. Here the
+/// tail is fixed and the *name* absorbs the shortfall, down to nothing; only
+/// when even ` {glyph} ` will not fit does the title disappear.
+///
+/// Styling stays C4's, deliberately **not** C21's "match the border you sit
+/// on": `ZOOM · {n} hidden` is one undifferentiated statement about the
+/// pane, while this title has structure C5 requires be coloured — the glyph
+/// carries status, `raw`/`↑N` carry view state. Matching the border is right
+/// for the former and would delete the signal in the latter.
+fn identity_title(
+    budget: u16,
     text: &str,
-    note: Option<&BadgeNote>,
     raw: bool,
     scrolled: usize,
     glyph: char,
     glyph_style: Style,
-) -> Option<(Rect, Vec<Span<'static>>)> {
-    if text.trim().is_empty() || inner.width < 3 || inner.height == 0 {
-        return None;
-    }
-    let max = inner.width.saturating_sub(1);
-    // One space of breathing room on the right edge (the trailing space in
-    // the glyph part).
-    let mut parts: Vec<(String, Style)> = Vec::with_capacity(6);
-    let noted_focused = note.is_some_and(|n| n.focused);
-    if raw || scrolled > 0 || noted_focused {
-        parts.push((format!(" {text} · "), theme::quiet()));
-    } else {
-        parts.push((format!(" {text} "), theme::quiet()));
-    }
-    if let Some(n) = note {
-        let marker = if n.more { "¶⋮" } else { "¶" };
-        if n.focused {
-            parts.push((format!("{marker} {}", n.headline), theme::ink()));
-            match &n.age {
-                Some(age) => parts.push((format!(" ({age}) "), theme::quiet())),
-                None => parts.push((" ".into(), theme::quiet())),
-            }
-        } else {
-            parts.push((format!("{marker} "), theme::ink()));
-        }
-    }
+) -> Option<Vec<Span<'static>>> {
+    // The fixed tail: everything the name may not push off the border.
+    // Composition and separators are C4's, unchanged — only the placement
+    // moved, so the rendered text is byte-identical to the badge's.
+    let mut tail: Vec<(String, Style)> = Vec::with_capacity(3);
     if raw {
         let token = if scrolled > 0 { "raw · " } else { "raw " };
-        parts.push((token.to_string(), theme::accent_quiet()));
+        tail.push((token.to_string(), theme::accent_quiet()));
     }
     if scrolled > 0 {
-        parts.push((format!("{}{scrolled} ", theme::SCROLLED), theme::accent_quiet()));
+        tail.push((format!("{}{scrolled} ", theme::SCROLLED), theme::accent_quiet()));
     }
-    parts.push((format!("{glyph} "), glyph_style));
-    let total: u16 = parts.iter().map(|(t, _)| mouse::display_width(t)).sum();
-    let w = total.min(max);
-    let spans = clip_spans(&parts, w);
-    let x = inner.x + inner.width - w;
-    Some((Rect::new(x, inner.y, w, 1), spans))
+    tail.push((format!("{glyph} "), glyph_style));
+    let tail_w: u16 = tail.iter().map(|(t, _)| mouse::display_width(t)).sum();
+    // A leading column of breathing room so the title never butts against
+    // the corner glyph, and C4's separator before the token run.
+    let sep = if raw || scrolled > 0 { " · " } else { " " };
+    let fixed = 1 + mouse::display_width(sep) + tail_w;
+    if fixed > budget || text.trim().is_empty() {
+        return None;
+    }
+    // Whatever the tail leaves is the name's. `take_width` keeps the clip
+    // off a wide glyph's second half (D1).
+    let name = take_width(text, budget - fixed);
+    let mut parts: Vec<(String, Style)> = Vec::with_capacity(tail.len() + 1);
+    if name.is_empty() {
+        // Clipped to nothing: the glyph still reports, and a stray separator
+        // dangling off an absent name would read as a missing word.
+        parts.push((" ".to_string(), theme::quiet()));
+    } else {
+        parts.push((format!(" {name}{sep}"), theme::quiet()));
+    }
+    parts.extend(tail);
+    Some(clip_spans(&parts, budget))
+}
+
+/// C32 (amended 2026-08-21): the pane's **note title** — the left half of
+/// the bottom border, `" ¶ {headline} ({age}) "` on the focused pane and a
+/// bare `" ¶ "` everywhere else. `¶⋮` when a body sits under the headline.
+///
+/// Its own edge rather than a segment of the identity title, for two
+/// reasons. It is the widest thing roost draws about a pane, so sharing the
+/// top border would make it the first casualty of a narrow one — which is
+/// exactly what it was as the badge's tail, clipped before it could be read.
+/// And it answers a different question from a name: *what did I park here*,
+/// not *what is this*. On its own edge a 28-column pane still shows
+/// `└ ¶ waiting on schema review ┘` whole.
+///
+/// C32's reveal-on-visit contract is unchanged, and is the whole reason the
+/// two forms exist: presence everywhere, content only where you are looking.
+/// The marker is fixed and the headline absorbs a narrow border, so a note
+/// never becomes invisible — it becomes a `¶`.
+fn note_title(budget: u16, note: &BadgeNote) -> Option<Vec<Span<'static>>> {
+    let marker = if note.more { "¶⋮" } else { "¶" };
+    let head = format!(" {marker} ");
+    if mouse::display_width(&head) > budget {
+        return None;
+    }
+    let mut parts: Vec<(String, Style)> = vec![(head, theme::ink())];
+    if note.focused {
+        parts.push((note.headline.clone(), theme::ink()));
+        match &note.age {
+            Some(age) => parts.push((format!(" ({age}) "), theme::quiet())),
+            None => parts.push((" ".into(), theme::quiet())),
+        }
+    }
+    Some(clip_spans(&parts, budget))
 }
 
 /// N1: the badge glyph shown — the C5 spinner only while the pane's view is
@@ -2831,7 +2877,8 @@ mod tests {
     use crate::App;
     use super::{
         age_word, badge_text, blit_screen, cell_in_selection, centered_near,
-        collapsed_name_style, collapsed_row_spans, corner_badge, dialog_rect, feed_entry_spans,
+        collapsed_name_style, collapsed_row_spans, dialog_rect, feed_entry_spans, identity_title,
+        note_title,
         feed_window, help_content_width, help_layout, help_lines, hint_bar_right_spans,
         mode_word, push_tab_spans, should_place_cursor, stack_header_text,
         state_word, BadgeNote, HelpKey, HelpLine, HELP_GROUPS,
@@ -2902,16 +2949,19 @@ mod tests {
         assert_eq!(badge_text(7, "worker1", "claude", true), "7 worker1 · claude");
     }
 
+    fn ident(budget: u16, text: &str) -> String {
+        identity_title(budget, text, false, 0, theme::GLYPH_WORKING, theme::accent())
+            .map(|s| s.iter().map(|s| s.content.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// C3/C4 (amended 2026-08-21): the identity title's *text* is the corner
+    /// badge's, unchanged — only where it is drawn moved. Pinned as an equality
+    /// so the move cannot quietly become a redesign.
     #[test]
-    fn badge_is_two_toned_and_right_aligned_on_top_row() {
-        // inner content area at (1,1) sized 40x20 (borders excluded)
-        let inner = Rect::new(1, 1, 40, 20);
-        let (rect, spans) = corner_badge(inner, "claude", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
-        assert_eq!(rect.y, inner.y); // top row of the content
-        assert_eq!(rect.height, 1);
-        // right edge: badge ends one col shy of the inner right edge is fine;
-        // here it butts to the edge because the text fits.
-        assert_eq!(rect.x + rect.width, inner.x + inner.width);
+    fn identity_title_is_two_toned_and_reads_exactly_as_the_badge_did() {
+        let spans =
+            identity_title(40, "claude", false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content.as_ref(), " claude ");
         assert_eq!(spans[0].style, theme::quiet());
@@ -2919,29 +2969,43 @@ mod tests {
         assert_eq!(spans[1].style, theme::accent());
     }
 
+    /// The glyph is the one element that must survive a narrow pane: it is
+    /// C5's status signal, and the badge used to shed it first because it
+    /// clipped its own tail. Here the *name* absorbs the shortfall.
     #[test]
-    fn badge_clips_and_drops_the_glyph_first_when_pane_too_small() {
-        let inner = Rect::new(0, 0, 6, 5);
-        let (rect, spans) =
-            corner_badge(inner, "a-very-long-name", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
-        let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        assert!(total <= 5); // width-1 breathing room
-        assert!(rect.x >= inner.x && rect.x + rect.width <= inner.x + inner.width);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains(theme::GLYPH_WORKING)); // too narrow even for the text alone
+    fn identity_title_clips_the_name_and_never_the_status_glyph() {
+        let text = ident(9, "a-very-long-name");
+        assert!(
+            text.contains(theme::GLYPH_WORKING),
+            "the glyph outranks the name at every width that fits it: {text:?}"
+        );
+        assert!(mouse::display_width(&text) <= 9, "{text:?}");
+        assert!(text.starts_with(" a-"), "and what is left of the name still leads: {text:?}");
+
+        // Down to nothing: the glyph alone still reports, with no dangling
+        // separator where a name used to be.
+        assert_eq!(ident(4, "a-very-long-name"), format!(" {} ", theme::GLYPH_WORKING));
+        // Below even that, the title sheds whole rather than clipping the
+        // glyph in half.
+        assert_eq!(identity_title(2, "x", false, 0, theme::GLYPH_WORKING, theme::accent()), None);
+        assert_eq!(identity_title(40, "   ", false, 0, theme::GLYPH_WORKING, theme::accent()), None);
     }
 
+    /// D1: "日本語" is 3 chars but 6 display columns — a `.chars().count()`
+    /// measure would call a 4-column budget a fit and overflow the border.
+    /// The clip lands on a column boundary and never splits a glyph.
     #[test]
-    fn badge_clips_wide_glyphs_without_overflowing_the_display_width_budget() {
-        // "日本語" is 3 chars but 6 display columns — the old .chars().count()
-        // measure would treat a 4-column budget as fitting all 3 chars and
-        // overflow the pane by several columns (D1). The fix must stop
-        // clipping on a display-width boundary and never split a glyph.
-        let inner = Rect::new(0, 0, 5, 5); // budget = inner.width - 1 = 4
-        let (rect, spans) = corner_badge(inner, "日本語", None, false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
-        let rendered_width: u16 = spans.iter().map(|s| mouse::display_width(&s.content)).sum();
-        assert!(rendered_width <= 4, "clipped badge must fit its column budget, got {rendered_width}");
-        assert!(rect.width <= 4);
+    fn identity_title_clips_wide_glyphs_on_a_column_boundary() {
+        for budget in 4..12u16 {
+            let text = ident(budget, "日本語");
+            let w = mouse::display_width(&text);
+            assert!(w <= budget, "budget {budget} overflowed by {text:?} ({w} cols)");
+            // Never half a glyph.
+            for ch in text.chars() {
+                assert!(ch != '\u{fffd}', "{text:?}");
+            }
+        }
+        assert_eq!(ident(8, "日本語"), format!(" 日本 {} ", theme::GLYPH_WORKING));
     }
 
     /// P7: every way the pane can be "not showing a cursor" suppresses
@@ -2968,20 +3032,13 @@ mod tests {
         assert!(!should_place_cursor(false, Exited, true, 3));
     }
 
-    #[test]
-    fn no_badge_for_tiny_or_empty() {
-        assert!(corner_badge(Rect::new(0, 0, 2, 5), "x", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 0), "x", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
-        assert!(corner_badge(Rect::new(0, 0, 40, 5), "   ", None, false, 0, theme::GLYPH_WORKING, theme::accent()).is_none());
-    }
-
     // -- C23 raw indication ---------------------------------------------------
 
     #[test]
-    fn badge_gains_a_raw_token_in_its_own_quiet_red() {
-        let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) =
-            corner_badge(inner, "scratch · shell", None, true, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+    fn identity_title_gains_a_raw_token_in_its_own_quiet_red() {
+        let spans =
+            identity_title(40, "scratch · shell", true, 0, theme::GLYPH_IDLE, theme::quiet())
+                .unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" scratch · shell · raw {} ", theme::GLYPH_IDLE));
         let raw_span = spans.iter().find(|s| s.content.as_ref() == "raw ").expect("raw token span");
@@ -2991,22 +3048,18 @@ mod tests {
     }
 
     #[test]
-    fn badge_without_raw_has_no_raw_token() {
-        let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) = corner_badge(inner, "pi", None, false, 0, theme::GLYPH_IDLE, theme::quiet()).unwrap();
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains("raw"));
+    fn identity_title_without_raw_has_no_raw_token() {
+        assert!(!ident(40, "pi").contains("raw"));
     }
 
     // -- U3 scrollback indication ---------------------------------------------
 
     #[test]
-    fn badge_gains_a_scrolled_token_in_quiet_red() {
+    fn identity_title_gains_a_scrolled_token_in_quiet_red() {
         // U3: a frozen view must say so — `↑N` (grid-clamped offset), same
         // quiet-red family as the raw token, glyph-adjacent.
-        let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) =
-            corner_badge(inner, "3 pi", None, false, 42, theme::GLYPH_WORKING, theme::accent()).unwrap();
+        let spans =
+            identity_title(40, "3 pi", false, 42, theme::GLYPH_WORKING, theme::accent()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · ↑42 {} ", theme::GLYPH_WORKING));
         let token = spans.iter().find(|s| s.content.as_ref() == "↑42 ").expect("↑N token span");
@@ -3014,94 +3067,103 @@ mod tests {
     }
 
     #[test]
-    fn badge_scrolled_and_raw_tokens_compose_in_order() {
+    fn identity_title_scrolled_and_raw_tokens_compose_in_order() {
         // raw · ↑N — input state first, then view state, then the glyph.
-        let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) =
-            corner_badge(inner, "3 pi", None, true, 7, theme::GLYPH_IDLE, theme::quiet()).unwrap();
+        let spans =
+            identity_title(40, "3 pi", true, 7, theme::GLYPH_IDLE, theme::quiet()).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, format!(" 3 pi · raw · ↑7 {} ", theme::GLYPH_IDLE));
     }
 
     #[test]
-    fn badge_at_live_tail_has_no_scrolled_token() {
-        let inner = Rect::new(0, 0, 40, 20);
-        let (_, spans) =
-            corner_badge(inner, "3 pi", None, false, 0, theme::GLYPH_WORKING, theme::accent()).unwrap();
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains('↑'), "{text}");
+    fn identity_title_at_live_tail_has_no_scrolled_token() {
+        assert!(!ident(40, "3 pi").contains('↑'));
     }
 
-    // -- C32: the badge's note segment ------------------------------------
+    // -- C32: the note title on the bottom border -------------------------
 
-    /// C32: the focused pane's badge reads its note out — headline in
-    /// `ink()` (the badge's one full-strength element), age tag `quiet` —
-    /// after the identity text, so C4's id-first rule holds and a narrow
-    /// pane clips the note before the join key.
+    /// C32 (amended 2026-08-21): the focused pane reads its note out —
+    /// headline in `ink()` (the note's one full-strength element), age tag
+    /// `quiet` — on the bottom border, which it has to itself. Text
+    /// unchanged from the badge's note segment; only the edge moved.
     #[test]
-    fn focused_badge_reads_the_headline_in_ink_with_a_quiet_age() {
-        let inner = Rect::new(0, 0, 60, 20);
+    fn focused_note_title_reads_the_headline_in_ink_with_a_quiet_age() {
         let note = BadgeNote {
             headline: "tests green, PR up".into(),
             more: false,
             age: Some("14h".into()),
             focused: true,
         };
-        let (_, spans) =
-            corner_badge(inner, "3 api", Some(&note), false, 0, theme::GLYPH_WAITING, theme::ink())
-                .unwrap();
+        let spans = note_title(60, &note).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, format!(" 3 api · ¶ tests green, PR up (14h) {} ", theme::GLYPH_WAITING));
-        let headline =
-            spans.iter().find(|s| s.content.as_ref().contains("tests green")).unwrap();
-        assert_eq!(headline.style, theme::ink(), "the headline is the badge's loud element");
+        assert_eq!(text, " ¶ tests green, PR up (14h) ");
+        let headline = spans.iter().find(|s| s.content.as_ref().contains("tests green")).unwrap();
+        assert_eq!(headline.style, theme::ink(), "the headline is the note's loud element");
         let age = spans.iter().find(|s| s.content.as_ref().contains("(14h)")).unwrap();
         assert_eq!(age.style, theme::quiet(), "the age tag stays quiet");
 
         // A note missing its timestamp (hand-edited state) shows NO age tag
         // — an absent fact renders as absent, never as a fabricated "now".
         let unstamped = BadgeNote { age: None, ..note };
-        let (_, spans) = corner_badge(
-            inner,
-            "3 api",
-            Some(&unstamped),
-            false,
-            0,
-            theme::GLYPH_WAITING,
-            theme::ink(),
-        )
-        .unwrap();
+        let spans = note_title(60, &unstamped).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, format!(" 3 api · ¶ tests green, PR up {} ", theme::GLYPH_WAITING));
+        assert_eq!(text, " ¶ tests green, PR up ");
     }
 
-    /// C32: an unfocused pane's badge marks presence, never content — a
-    /// bare `¶` in `ink()` (`¶⋮` when a body exists), no headline, no age.
-    /// Reveal-on-visit is the display contract.
+    /// C32: an unfocused pane marks presence, never content — a bare `¶` in
+    /// `ink()` (`¶⋮` when a body exists), no headline, no age.
+    /// Reveal-on-visit is the display contract, and moving edges did not
+    /// move it.
     #[test]
-    fn unfocused_badge_shows_only_the_note_marker() {
-        let inner = Rect::new(0, 0, 60, 20);
+    fn unfocused_note_title_shows_only_the_marker() {
         let note = BadgeNote {
             headline: "tests green, PR up".into(),
             more: false,
             age: Some("14h".into()),
             focused: false,
         };
-        let (_, spans) =
-            corner_badge(inner, "3 api", Some(&note), false, 0, theme::GLYPH_IDLE, theme::quiet())
-                .unwrap();
+        let spans = note_title(60, &note).unwrap();
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, format!(" 3 api ¶ {} ", theme::GLYPH_IDLE));
-        let marker = spans.iter().find(|s| s.content.as_ref() == "¶ ").unwrap();
-        assert_eq!(marker.style, theme::ink(), "the marker is findable, not dim");
+        assert_eq!(text, " ¶ ");
+        assert_eq!(spans[0].style, theme::ink(), "the marker is findable, not dim");
 
         // A body under the headline shows as ¶⋮ — "there's more here".
         let deeper = BadgeNote { more: true, ..note };
-        let (_, spans) =
-            corner_badge(inner, "3 api", Some(&deeper), false, 0, theme::GLYPH_IDLE, theme::quiet())
-                .unwrap();
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("¶⋮"), "{text}");
+        let text: String = note_title(60, &deeper)
+            .unwrap()
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(text, " ¶⋮ ");
+    }
+
+    /// The note owns a whole edge, so a headline the badge would have
+    /// clipped away survives a narrow pane — the reason it moved. The marker
+    /// is fixed, so a note never vanishes: it degrades to `¶`.
+    #[test]
+    fn note_title_clips_the_headline_and_never_the_marker() {
+        let note = BadgeNote {
+            headline: "waiting on the schema review".into(),
+            more: false,
+            age: Some("2h".into()),
+            focused: true,
+        };
+        // A 28-column pane's bottom border shows the headline whole — the
+        // badge, sharing the top row with identity, never could.
+        let text: String = note_title(26, &note)
+            .unwrap()
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.starts_with(" ¶ waiting on the schema"), "{text:?}");
+
+        for budget in 3..30u16 {
+            let spans = note_title(budget, &note).expect("a marker always fits from 3 columns");
+            let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+            assert!(mouse::display_width(&text) <= budget, "budget {budget}: {text:?}");
+            assert!(text.contains('¶'), "budget {budget} lost the marker: {text:?}");
+        }
+        assert_eq!(note_title(2, &note), None, "below the marker itself, nothing");
     }
 
     /// C32: the age tag's units — floored, coarsest-sensible, "now" under
@@ -5847,12 +5909,19 @@ row's — widen ADAPTER_COL",
             (0..14).filter_map(|x| buf.cell((x, 1)).map(|c| c.symbol().to_string())).collect();
         assert_title_right_aligned(&border, 14, "ZOOM");
         assert!(!border.contains("hidden"), "the count yields first: {border:?}");
-        // The badge (top-right corner of the inner content, row 2) is
-        // untouched by the title's narrow-width shedding — it still draws
-        // its own token rather than going blank.
-        let badge_row: String =
+        // [Amended 2026-08-21] Identity shares this border now (C3/C4), and
+        // yields to zoom rather than the other way round — but only the
+        // columns zoom actually took. At 14 the two still coexist, so the
+        // join key survives on the left while `ZOOM` holds the right.
+        assert!(border.contains('3'), "identity keeps its end of the border: {border:?}");
+        // ...and the pane's own first content row, which the badge used to
+        // occupy, is the pane's again.
+        let content_row: String =
             (0..14).filter_map(|x| buf.cell((x, 2)).map(|c| c.symbol().to_string())).collect();
-        assert!(badge_row.contains('3'), "the badge still shows the pane id: {badge_row:?}");
+        assert!(
+            !content_row.contains('3'),
+            "no chrome left on the content row: {content_row:?}"
+        );
     }
 
     /// C21/C22 (amended 2026-08-11): "keeps zoom" + the float draws above
