@@ -61,18 +61,22 @@ pub fn enabled() -> bool {
 /// (unsupported class, sandbox) changes nothing about correctness, so the
 /// return code is deliberately ignored beyond debug builds.
 pub fn promote_input_loop_thread() {
-    if !enabled() {
-        return;
-    }
+    // The whole body is macOS-only, so it is gated as a whole rather than
+    // guarded by an early `return` the other platforms compile down to a
+    // bare `return;` — which is both dead and, from clippy 1.96, a
+    // `needless_return` error on Linux CI. `enabled()` is `cfg!(macos) &&
+    // ...`, so this is the same condition, spelled where it can be read.
     #[cfg(target_os = "macos")]
-    // SAFETY: plain FFI with no pointers; affects only the calling thread's
-    // scheduler class.
-    unsafe {
-        let rc = libc::pthread_set_qos_class_self_np(
-            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
-            0,
-        );
-        debug_assert_eq!(rc, 0, "QOS_CLASS_USER_INTERACTIVE refused for the event loop");
+    if enabled() {
+        // SAFETY: plain FFI with no pointers; affects only the calling
+        // thread's scheduler class.
+        unsafe {
+            let rc = libc::pthread_set_qos_class_self_np(
+                libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                0,
+            );
+            debug_assert_eq!(rc, 0, "QOS_CLASS_USER_INTERACTIVE refused for the event loop");
+        }
     }
 }
 
@@ -80,17 +84,15 @@ pub fn promote_input_loop_thread() {
 /// of each pane's PTY writer thread — the thread that delivers keystrokes
 /// to the child. Same best-effort contract as `promote_input_loop_thread`.
 pub fn promote_input_delivery_thread() {
-    if !enabled() {
-        return;
-    }
+    // Gated as a whole, same reasoning as `promote_input_loop_thread`.
     #[cfg(target_os = "macos")]
-    // SAFETY: as above — no pointers, calling thread only.
-    unsafe {
-        let rc = libc::pthread_set_qos_class_self_np(
-            libc::qos_class_t::QOS_CLASS_USER_INITIATED,
-            0,
-        );
-        debug_assert_eq!(rc, 0, "QOS_CLASS_USER_INITIATED refused for a writer thread");
+    if enabled() {
+        // SAFETY: as above — no pointers, calling thread only.
+        unsafe {
+            let rc =
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+            debug_assert_eq!(rc, 0, "QOS_CLASS_USER_INITIATED refused for a writer thread");
+        }
     }
 }
 
@@ -104,9 +106,8 @@ mod tests {
         let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
         let mut prio = 0i32;
         // SAFETY: out-pointers to locals; pthread_self is the calling thread.
-        let rc = unsafe {
-            libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut prio)
-        };
+        let rc =
+            unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut prio) };
         assert_eq!(rc, 0);
         class as u32
     }

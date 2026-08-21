@@ -220,6 +220,8 @@ pub const UNSAFE_SOCKET_DIR_MSG: &str = "unsafe ownership/permissions";
 /// (tmux does the same for its socket dir).
 fn dir_is_private_and_ours(dir: &Path) -> bool {
     match fs::metadata(dir) {
+        // SAFETY: `geteuid(2)` takes no arguments, touches no memory and
+        // cannot fail — the one libc call with nothing to get wrong.
         Ok(m) => m.uid() == unsafe { libc::geteuid() } && (m.mode() & 0o077) == 0,
         Err(_) => false,
     }
@@ -871,7 +873,10 @@ fn read_line_deadlined(
                 // reported immediately, exactly as `read_until` always did.
                 Err(e)
                     if pre_auth_start.is_some()
-                        && matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
                 {
                     continue;
                 }
@@ -979,7 +984,11 @@ pub fn spawn_listener(tx: SyncSender<AppEvent>, tokens: TokenReader) -> Result<P
 /// `XDG_RUNTIME_DIR` env vars — racy to poke from tests that run in parallel
 /// in the same process). Returns the shared `Limits` so tests can also
 /// inspect accounting state directly instead of only through the wire.
-fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: TokenReader) -> Arc<Limits> {
+fn spawn_accept_loop(
+    listener: UnixListener,
+    tx: SyncSender<AppEvent>,
+    tokens: TokenReader,
+) -> Arc<Limits> {
     let limits = Arc::new(Limits::new());
     let accept_limits = limits.clone();
     std::thread::spawn(move || {
@@ -1133,7 +1142,8 @@ fn spawn_accept_loop(listener: UnixListener, tx: SyncSender<AppEvent>, tokens: T
                                     && guard.principal.is_none()
                                     && matches!(
                                         e.kind(),
-                                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
                                     ) =>
                             {
                                 continue;
@@ -1451,7 +1461,9 @@ mod tests {
     #[test]
     fn parses_string_and_numeric_pane_ids() {
         let ev = parse_line(r#"{"pane":"7","event":"status","token":"tok","status":"working"}"#);
-        assert!(matches!(ev, Some(AppEvent::Status(7, ref t, AgentStatus::Working, _)) if t == "tok"));
+        assert!(
+            matches!(ev, Some(AppEvent::Status(7, ref t, AgentStatus::Working, _)) if t == "tok")
+        );
         let ev = parse_line(r#"{"pane":7,"event":"session","token":"tok","session":"abc-123"}"#);
         match ev {
             Some(AppEvent::Session(7, t, s)) => {
@@ -1535,7 +1547,10 @@ mod tests {
         let err = parse_control(r#"{"token":"t","method":"send","pane":"three","text":"hi"}"#)
             .expect("has a `method` key")
             .expect_err("pane must be numeric");
-        assert!(err.contains("pane") || err.to_lowercase().contains("u64"), "error should name the offending field/type: {err}");
+        assert!(
+            err.contains("pane") || err.to_lowercase().contains("u64"),
+            "error should name the offending field/type: {err}"
+        );
     }
 
     /// The tri-state split itself: well-formed still dispatches, and a line
@@ -1562,7 +1577,10 @@ mod tests {
         // Right at the boundary is still fine.
         let ok_token = "a".repeat(MAX_TOKEN_LEN);
         let line = format!(r#"{{"token":"{ok_token}","method":"list"}}"#);
-        assert!(parse_control(&line).unwrap().is_ok(), "exactly MAX_TOKEN_LEN must still be accepted");
+        assert!(
+            parse_control(&line).unwrap().is_ok(),
+            "exactly MAX_TOKEN_LEN must still be accepted"
+        );
     }
 
     #[test]
@@ -1581,8 +1599,15 @@ mod tests {
             })
             .collect();
         let successes = handles.into_iter().map(|h| h.join().unwrap()).filter(|&ok| ok).count();
-        assert_eq!(successes, MAX_CONN, "exactly MAX_CONN reservations should win under contention");
-        assert_eq!(limits.global.load(Ordering::Relaxed), MAX_CONN, "counter must not exceed MAX_CONN");
+        assert_eq!(
+            successes, MAX_CONN,
+            "exactly MAX_CONN reservations should win under contention"
+        );
+        assert_eq!(
+            limits.global.load(Ordering::Relaxed),
+            MAX_CONN,
+            "counter must not exceed MAX_CONN"
+        );
     }
 
     /// Audit finding L1: a panic between reserving and releasing (e.g. a
@@ -1609,7 +1634,11 @@ mod tests {
         .join();
 
         assert!(result.is_err(), "setup bug: the thread should have panicked");
-        assert_eq!(limits.global.load(Ordering::Relaxed), 0, "a panic must not leak the global slot");
+        assert_eq!(
+            limits.global.load(Ordering::Relaxed),
+            0,
+            "a panic must not leak the global slot"
+        );
     }
 
     /// Audit finding L1: `lock()` must recover a poisoned mutex rather than
@@ -1668,8 +1697,12 @@ mod tests {
         // post-promotion READ_TIMEOUT.
         c.get_ref().set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3))).unwrap();
         let mut discard = String::new();
-        let n = c.read_line(&mut discard).expect("must be closed at the pre-auth deadline, not hang");
-        assert_eq!(n, 0, "an unauthenticated control connection must die at the 2s deadline: {discard:?}");
+        let n =
+            c.read_line(&mut discard).expect("must be closed at the pre-auth deadline, not hang");
+        assert_eq!(
+            n, 0,
+            "an unauthenticated control connection must die at the 2s deadline: {discard:?}"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -1700,7 +1733,8 @@ mod tests {
         // Never promoted: dies at the pre-auth wall clock.
         c.get_ref().set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3))).unwrap();
         let mut discard = String::new();
-        let n = c.read_line(&mut discard).expect("must be closed at the pre-auth deadline, not hang");
+        let n =
+            c.read_line(&mut discard).expect("must be closed at the pre-auth deadline, not hang");
         assert_eq!(n, 0, "an unauthenticated-but-parseable status connection must die at the 2s deadline: {discard:?}");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -1740,7 +1774,9 @@ mod tests {
         // promptly — the door's cap-full/close path, well before
         // `READ_TIMEOUT` (this is its FIRST line, so it was never promoted).
         let mut over = connect(&path);
-        over.get_ref().set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3))).unwrap();
+        over.get_ref()
+            .set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3)))
+            .unwrap();
         over.get_mut().write_all(line).unwrap();
         over.get_mut().write_all(b"\n").unwrap();
         assert!(
@@ -1753,14 +1789,21 @@ mod tests {
 
         // Closing one of the eight frees a slot for a fresh reporter.
         conns.pop();
-        let down = rx.recv_timeout(Duration::from_secs(5)).expect("link-down for the closed reporter never arrived");
+        let down = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("link-down for the closed reporter never arrived");
         assert!(matches!(down, AppEvent::ExtLink(1, ref t, false) if t == "t"));
 
         let mut fresh = connect(&path);
         fresh.get_mut().write_all(line).unwrap();
         fresh.get_mut().write_all(b"\n").unwrap();
-        let up = rx.recv_timeout(Duration::from_secs(2)).expect("a fresh reporter after a close must be admitted");
-        assert!(matches!(up, AppEvent::ExtLink(1, ref t, true) if t == "t"), "the freed slot must be usable");
+        let up = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a fresh reporter after a close must be admitted");
+        assert!(
+            matches!(up, AppEvent::ExtLink(1, ref t, true) if t == "t"),
+            "the freed slot must be usable"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -1789,7 +1832,10 @@ mod tests {
         let mut c = connect(&path);
         for pane in 1..=MAX_LINK_PANES_PER_CONN as u64 {
             c.get_mut()
-                .write_all(format!(r#"{{"pane":{pane},"token":"t","event":"status","status":"working"}}"#).as_bytes())
+                .write_all(
+                    format!(r#"{{"pane":{pane},"token":"t","event":"status","status":"working"}}"#)
+                        .as_bytes(),
+                )
                 .unwrap();
             c.get_mut().write_all(b"\n").unwrap();
         }
@@ -1803,10 +1849,17 @@ mod tests {
         // already have exhausted (and kept exhausting) pane P's real cap.
         for _ in 0..(REPORTER_MAX_CONN_PER_PANE * 2) {
             c.get_mut()
-                .write_all(format!(r#"{{"pane":{extra_pane},"token":"t","event":"status","status":"working"}}"#).as_bytes())
+                .write_all(
+                    format!(
+                        r#"{{"pane":{extra_pane},"token":"t","event":"status","status":"working"}}"#
+                    )
+                    .as_bytes(),
+                )
                 .unwrap();
             c.get_mut().write_all(b"\n").unwrap();
-            let ev = rx.recv_timeout(Duration::from_secs(2)).expect("the overflow pane's report must still forward");
+            let ev = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the overflow pane's report must still forward");
             assert!(matches!(ev, AppEvent::Status(p, ..) if p == extra_pane));
         }
         assert!(
@@ -1826,10 +1879,17 @@ mod tests {
         let mut fresh = connect(&path);
         fresh
             .get_mut()
-            .write_all(format!(r#"{{"pane":{extra_pane},"token":"t","event":"status","status":"working"}}"#).as_bytes())
+            .write_all(
+                format!(
+                    r#"{{"pane":{extra_pane},"token":"t","event":"status","status":"working"}}"#
+                )
+                .as_bytes(),
+            )
             .unwrap();
         fresh.get_mut().write_all(b"\n").unwrap();
-        let up = rx.recv_timeout(Duration::from_secs(2)).expect("a fresh connection for the overflow pane must still be admitted");
+        let up = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a fresh connection for the overflow pane must still be admitted");
         assert!(matches!(up, AppEvent::ExtLink(p, ref t, true) if p == extra_pane && t == "t"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -1877,7 +1937,8 @@ mod tests {
             "the nested one-shot must ALSO be admitted — 2 reporters is well under the cap of 8"
         );
         rx.recv_timeout(Duration::from_secs(2)).expect("claude's status report never arrived");
-        let down1 = rx.recv_timeout(Duration::from_secs(2)).expect("claude's own link-down never arrived");
+        let down1 =
+            rx.recv_timeout(Duration::from_secs(2)).expect("claude's own link-down never arrived");
         assert!(matches!(down1, AppEvent::ExtLink(1, ref t, false) if t == "t"));
 
         // The live pi connection is completely unaffected by the nested
@@ -1887,7 +1948,9 @@ mod tests {
             "the live pi connection's link must not be touched by the nested one-shot closing"
         );
         drop(pi);
-        let down2 = rx.recv_timeout(Duration::from_secs(2)).expect("pi's own eventual close must still emit its link-down");
+        let down2 = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pi's own eventual close must still emit its link-down");
         assert!(matches!(down2, AppEvent::ExtLink(1, ref t, false) if t == "t"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -2002,7 +2065,10 @@ mod tests {
     fn poll_until_admitted(limits: &Limits, want: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while limits.global.load(Ordering::Relaxed) < want {
-            assert!(Instant::now() < deadline, "accept loop never reached {want} admitted connections");
+            assert!(
+                Instant::now() < deadline,
+                "accept loop never reached {want} admitted connections"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -2024,8 +2090,10 @@ mod tests {
             if let Ok(stream) = UnixStream::connect(path) {
                 if stream.set_read_timeout(Some(Duration::from_secs(1))).is_ok() {
                     let mut r = BufReader::new(stream);
-                    let sent =
-                        r.get_mut().write_all(line.as_bytes()).and_then(|_| r.get_mut().write_all(b"\n"));
+                    let sent = r
+                        .get_mut()
+                        .write_all(line.as_bytes())
+                        .and_then(|_| r.get_mut().write_all(b"\n"));
                     if sent.is_ok() {
                         let mut resp = String::new();
                         if r.read_line(&mut resp).is_ok() && !resp.is_empty() {
@@ -2036,7 +2104,10 @@ mod tests {
                     }
                 }
             }
-            assert!(Instant::now() < deadline, "fresh caller never got a reply before the deadline — locked out");
+            assert!(
+                Instant::now() < deadline,
+                "fresh caller never got a reply before the deadline — locked out"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -2126,8 +2197,10 @@ mod tests {
         // connection instead of joining it. The other 48 slots stay
         // available to connections that identify themselves.
         poll_until(
-            || limits.pending_len() <= MAX_PENDING_CONN
-                && limits.global.load(Ordering::Relaxed) <= MAX_PENDING_CONN,
+            || {
+                limits.pending_len() <= MAX_PENDING_CONN
+                    && limits.global.load(Ordering::Relaxed) <= MAX_PENDING_CONN
+            },
             "squatters were allowed past the pre-auth share",
         );
 
@@ -2169,7 +2242,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let reply = try_request(&path, r#"{"token":"newcomer","method":"list"}"#, deadline);
-        assert!(reply.get("ok").is_some(), "a drip flood must never lock out a fresh caller: {reply}");
+        assert!(
+            reply.get("ok").is_some(),
+            "a drip flood must never lock out a fresh caller: {reply}"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -2296,9 +2372,14 @@ mod tests {
         let mut squatter = connect(&path);
         // Override the shared helper's 2s client timeout — it must not race
         // the server's own (also 2s) PRE_AUTH_READ_TIMEOUT.
-        squatter.get_ref().set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3))).unwrap();
+        squatter
+            .get_ref()
+            .set_read_timeout(Some(PRE_AUTH_READ_TIMEOUT + Duration::from_secs(3)))
+            .unwrap();
         let mut discard = String::new();
-        let n = squatter.read_line(&mut discard).expect("must recycle, not hang for the full READ_TIMEOUT");
+        let n = squatter
+            .read_line(&mut discard)
+            .expect("must recycle, not hang for the full READ_TIMEOUT");
         assert_eq!(n, 0, "an idle pre-auth connection must eventually be closed: {discard:?}");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -2359,7 +2440,9 @@ mod tests {
         // One status line — exactly what the extension sends. No `method`
         // key, so `parse_control` returns `None` and this never touches
         // `guard.principal`.
-        c.get_mut().write_all(br#"{"pane":"1","token":"t","event":"status","status":"working"}"#).unwrap();
+        c.get_mut()
+            .write_all(br#"{"pane":"1","token":"t","event":"status","status":"working"}"#)
+            .unwrap();
         c.get_mut().write_all(b"\n").unwrap();
 
         // Idle well past the pre-auth deadline, sending nothing — the real
@@ -2371,7 +2454,10 @@ mod tests {
         // connection (the bug: the server would already have closed its end
         // by now, so this would come back as EOF, and `roundtrip` panics).
         let reply = roundtrip(&mut c, r#"{"token":"t","method":"list"}"#);
-        assert!(reply.get("ok").is_some(), "a status-only connection must survive past the pre-auth deadline: {reply}");
+        assert!(
+            reply.get("ok").is_some(),
+            "a status-only connection must survive past the pre-auth deadline: {reply}"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -2427,10 +2513,7 @@ mod tests {
                 _ => panic!("unexpected setup event (wanted exactly one link-up and one status)"),
             }
         }
-        assert!(
-            got_link_up,
-            "setup: the status line must have earned a link-up"
-        );
+        assert!(got_link_up, "setup: the status line must have earned a link-up");
 
         // The gap size the P1 finding is actually about — past READ_TIMEOUT
         // itself, not just the pre-auth deadline. The retry clause that
@@ -2476,16 +2559,13 @@ mod tests {
             .unwrap();
         c.get_mut().write_all(b"\n").unwrap();
 
-        let first = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("no event within the deadline");
+        let first = rx.recv_timeout(Duration::from_secs(2)).expect("no event within the deadline");
         assert!(
             matches!(first, AppEvent::ExtLink(1, ref t, true) if t == "tok"),
             "expected link-up first"
         );
-        let second = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("no second event within the deadline");
+        let second =
+            rx.recv_timeout(Duration::from_secs(2)).expect("no second event within the deadline");
         assert!(
             matches!(second, AppEvent::Status(1, ref t, AgentStatus::Working, _) if t == "tok"),
             "expected the status report itself second"
@@ -2519,15 +2599,13 @@ mod tests {
         // count is deterministic here, so wait for exactly that many before
         // touching either connection further.
         for _ in 0..4 {
-            rx.recv_timeout(Duration::from_secs(2))
-                .expect("setup: link-up/status never arrived");
+            rx.recv_timeout(Duration::from_secs(2)).expect("setup: link-up/status never arrived");
         }
 
         drop(a); // pane 1's connection closes; pane 2's (`b`) stays open
 
-        let ev = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("link-down for pane 1 never arrived");
+        let ev =
+            rx.recv_timeout(Duration::from_secs(5)).expect("link-down for pane 1 never arrived");
         assert!(
             matches!(ev, AppEvent::ExtLink(1, ref t, false) if t == "tok-a"),
             "expected link-down for pane 1"
@@ -2611,23 +2689,18 @@ mod tests {
             // instant the write is queued, no reply ever read.
             drop(c);
 
-            let up = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("link-up never arrived");
+            let up = rx.recv_timeout(Duration::from_secs(2)).expect("link-up never arrived");
             assert!(
                 matches!(up, AppEvent::ExtLink(1, ref t, true) if t == "t"),
                 "round {round}: expected link-up"
             );
-            let status = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("status report never arrived");
+            let status =
+                rx.recv_timeout(Duration::from_secs(2)).expect("status report never arrived");
             assert!(
                 matches!(status, AppEvent::Status(1, ref t, AgentStatus::Working, _) if t == "t"),
                 "round {round}: expected the status report"
             );
-            let down = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("link-down never arrived");
+            let down = rx.recv_timeout(Duration::from_secs(2)).expect("link-down never arrived");
             assert!(
                 matches!(down, AppEvent::ExtLink(1, ref t, false) if t == "t"),
                 "round {round}: expected link-down right after the connection closed"
@@ -2670,8 +2743,7 @@ mod tests {
             c.get_mut().write_all(b"\n").unwrap();
         }
         for _ in 0..(MAX_LINK_PANES_PER_CONN * 2) {
-            rx.recv_timeout(Duration::from_secs(2))
-                .expect("setup: link-up/status never arrived");
+            rx.recv_timeout(Duration::from_secs(2)).expect("setup: link-up/status never arrived");
         }
 
         // One more pane, past the cap: the underlying report still forwards...
@@ -2707,10 +2779,7 @@ mod tests {
             }
         }
         downs.sort();
-        assert_eq!(
-            downs,
-            (1..=MAX_LINK_PANES_PER_CONN as u64).collect::<Vec<_>>()
-        );
+        assert_eq!(downs, (1..=MAX_LINK_PANES_PER_CONN as u64).collect::<Vec<_>>());
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
             "no link-down for the pane past the cap — it was never tracked"
@@ -2797,11 +2866,17 @@ mod tests {
 
         for i in 0..20 {
             let reply = roundtrip(&mut c, r#"{"token":"orch","method":"spawn","adapter":"shell"}"#);
-            assert!(reply.get("ok").is_some(), "spawn #{i} of the 20-pane burst was throttled: {reply}");
+            assert!(
+                reply.get("ok").is_some(),
+                "spawn #{i} of the 20-pane burst was throttled: {reply}"
+            );
         }
         for i in 0..20 {
             let reply = roundtrip(&mut c, r#"{"token":"orch","method":"list"}"#);
-            assert!(reply.get("ok").is_some(), "op #{i} of the 20-pane burst was throttled: {reply}");
+            assert!(
+                reply.get("ok").is_some(),
+                "op #{i} of the 20-pane burst was throttled: {reply}"
+            );
         }
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -2844,7 +2919,10 @@ mod tests {
         // identity — "rotated" is a genuinely valid principal (it passes
         // the door on its own) and still never mints its own bucket.
         let map = limits.buckets.lock().unwrap();
-        assert!(map.contains_key("admitted"), "the connection's admitted identity should have a bucket");
+        assert!(
+            map.contains_key("admitted"),
+            "the connection's admitted identity should have a bucket"
+        );
         assert_eq!(
             map.len(),
             1,
@@ -2878,7 +2956,10 @@ mod tests {
         // depends on.
         let mut other = connect(&path);
         let reply = roundtrip(&mut other, r#"{"token":"other","method":"list"}"#);
-        assert!(reply.get("ok").is_some(), "a line flood on one connection must not throttle a different one: {reply}");
+        assert!(
+            reply.get("ok").is_some(),
+            "a line flood on one connection must not throttle a different one: {reply}"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -2906,7 +2987,10 @@ mod tests {
                 rate_limited += 1;
             }
         }
-        assert!(rate_limited > 0, "a sustained flood must still throttle its own connection's line bucket eventually");
+        assert!(
+            rate_limited > 0,
+            "a sustained flood must still throttle its own connection's line bucket eventually"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -2938,7 +3022,11 @@ mod tests {
         let map = limits.buckets.lock().unwrap();
         assert!(map.len() <= MAX_TRACKED_TOKENS, "bucket map grew past its bound: {}", map.len());
         let active = map.get("active").expect("an actively-throttled principal was evicted");
-        assert!(active.tokens < 1.0, "active's drained state was reset by eviction: {} tokens", active.tokens);
+        assert!(
+            active.tokens < 1.0,
+            "active's drained state was reset by eviction: {} tokens",
+            active.tokens
+        );
     }
 
     #[test]
@@ -2959,7 +3047,8 @@ mod tests {
         // Malformed: no token to even evaluate.
         let mut m = connect(&path);
         let reply = roundtrip(&mut m, r#"{"method":"list"}"#);
-        let malformed = reply.get("err").and_then(|v| v.as_str()).expect("malformed must error").to_string();
+        let malformed =
+            reply.get("err").and_then(|v| v.as_str()).expect("malformed must error").to_string();
 
         // Connection limit: fill one principal's cap, then go one over.
         let mut _held = Vec::new();
@@ -2970,7 +3059,8 @@ mod tests {
         }
         let mut over = connect(&path);
         let reply = roundtrip(&mut over, r#"{"token":"cap-x","method":"list"}"#);
-        let cap_err = reply.get("err").and_then(|v| v.as_str()).expect("over cap must error").to_string();
+        let cap_err =
+            reply.get("err").and_then(|v| v.as_str()).expect("over cap must error").to_string();
 
         // Rate limit: exhaust a fresh principal's bucket.
         let mut r = connect(&path);
@@ -2984,9 +3074,15 @@ mod tests {
         }
         let throttled = throttled.expect("flood must throttle within the loop above");
 
-        for (name, s) in [("malformed", &malformed), ("connection-limit", &cap_err), ("rate-limit", &throttled)] {
+        for (name, s) in
+            [("malformed", &malformed), ("connection-limit", &cap_err), ("rate-limit", &throttled)]
+        {
             assert!(!s.contains("unauthorized"), "{name} reply reads as unauthorized: {s}");
-            assert_ne!(s.as_str(), UNAUTHORIZED_MSG, "{name} reply must not equal the shared unauthorized text");
+            assert_ne!(
+                s.as_str(),
+                UNAUTHORIZED_MSG,
+                "{name} reply must not equal the shared unauthorized text"
+            );
         }
         assert_ne!(malformed, cap_err, "malformed and connection-limit must read differently");
         assert_ne!(malformed, throttled, "malformed and rate-limit must read differently");
@@ -3044,7 +3140,10 @@ mod tests {
 
         let payload = "A".repeat(OVERSIZED_PAYLOAD);
         let reply = roundtrip(&mut c, &payload);
-        let err = reply.get("err").and_then(|v| v.as_str()).expect("oversized line must error, not hang or drop silently");
+        let err = reply
+            .get("err")
+            .and_then(|v| v.as_str())
+            .expect("oversized line must error, not hang or drop silently");
         assert_eq!(err, OVERSIZE_LINE_MSG, "must be the exact shared message cli.rs matches on");
 
         // Still closes afterward: no newline left in this connection to
@@ -3082,7 +3181,10 @@ mod tests {
 
         let mut fresh = connect(&path);
         let reply = roundtrip(&mut fresh, r#"{"token":"newcomer","method":"list"}"#);
-        assert!(reply.get("ok").is_some(), "a fresh connection after an oversized one must still be served: {reply}");
+        assert!(
+            reply.get("ok").is_some(),
+            "a fresh connection after an oversized one must still be served: {reply}"
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

@@ -64,10 +64,7 @@ impl Harness {
     /// Like `try_spawn`, but with extra env vars set on the roost process
     /// itself — for scenarios asserting what a pane child does (or doesn't)
     /// inherit from its host, e.g. the SPEC-parity P11 identity scrub.
-    pub fn try_spawn_with_env(
-        workspace_json: &str,
-        envs: &[(&str, &str)],
-    ) -> Result<Self, String> {
+    pub fn try_spawn_with_env(workspace_json: &str, envs: &[(&str, &str)]) -> Result<Self, String> {
         Self::try_spawn_sized(workspace_json, envs, ROWS, COLS)
     }
 
@@ -157,12 +154,9 @@ impl Harness {
             .map_err(|e| format!("spawning CARGO_BIN_EXE_roost: {e}"))?;
         drop(pair.slave);
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("clone pty reader: {e}"))?;
-        let writer =
-            pair.master.take_writer().map_err(|e| format!("take pty writer: {e}"))?;
+        let mut reader =
+            pair.master.try_clone_reader().map_err(|e| format!("clone pty reader: {e}"))?;
+        let writer = pair.master.take_writer().map_err(|e| format!("take pty writer: {e}"))?;
 
         let (tx, rx) = mpsc::channel();
         let raw = Arc::new(Mutex::new(Vec::new()));
@@ -187,14 +181,7 @@ impl Harness {
             }
         });
 
-        Ok(Self {
-            child,
-            writer,
-            rx,
-            parser: vt100::Parser::new(rows, cols, 0),
-            state_dir,
-            raw,
-        })
+        Ok(Self { child, writer, rx, parser: vt100::Parser::new(rows, cols, 0), state_dir, raw })
     }
 
     /// Everything roost has written to its host terminal so far, unparsed.

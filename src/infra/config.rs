@@ -26,10 +26,7 @@ fn load_keymap_from(path: &Path) -> (Keymap, Vec<String>) {
     match std::fs::read_to_string(path) {
         Ok(raw) => Keymap::parse(&raw, &source),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Keymap::default(), Vec::new()),
-        Err(e) => (
-            Keymap::default(),
-            vec![format!("{source}: {e} — using defaults")],
-        ),
+        Err(e) => (Keymap::default(), vec![format!("{source}: {e} — using defaults")]),
     }
 }
 
@@ -69,11 +66,7 @@ mod tests {
         std::fs::write(&path, r#"{"keys": {"alt+f": "disable"}}"#).unwrap();
         let (keymap, diagnostics) = load_keymap_from(&path);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_ne!(
-            keymap,
-            Keymap::default(),
-            "the disable entry must have been applied"
-        );
+        assert_ne!(keymap, Keymap::default(), "the disable entry must have been applied");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

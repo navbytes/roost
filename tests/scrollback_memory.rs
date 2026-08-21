@@ -23,6 +23,8 @@ struct Counting;
 // bookkeeping; the pointers, layouts and null-handling are all System's.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        // SAFETY: `l` is forwarded untouched to the system allocator, which
+        // is the one that gets to have requirements about it.
         let p = unsafe { System.alloc(l) };
         if !p.is_null() {
             LIVE.fetch_add(l.size(), Ordering::Relaxed);
@@ -31,9 +33,12 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         LIVE.fetch_sub(l.size(), Ordering::Relaxed);
+        // SAFETY: `p`/`l` are forwarded untouched — this allocator only ever
+        // hands back what `System` gave it, so the pairing is System's own.
         unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        // SAFETY: same forwarding as `alloc`/`dealloc` above.
         let q = unsafe { System.realloc(p, l, new) };
         if !q.is_null() {
             LIVE.fetch_add(new, Ordering::Relaxed);
@@ -87,7 +92,7 @@ fn banked_history_keeps_its_ink_and_sheds_its_padding() {
     {
         let mut p = vt100::Parser::new(4, 40, 100);
         p.process(b"\x1b[41mhi\x1b[K\r\n"); // red background, erase to EOL
-        // Bank it: print past the bottom of a 4-row grid.
+                                            // Bank it: print past the bottom of a 4-row grid.
         for _ in 0..10 {
             p.process(b"x\r\n");
         }

@@ -103,7 +103,11 @@ pub enum Mode {
     /// `buffer.chars().count()` = at the end) — chars, not bytes, because
     /// every motion, edit and the `▏` caret's position are all counted in
     /// what the user sees, and a byte index would split a multi-byte name.
-    Rename { buffer: String, cursor: usize, target: RenameTarget },
+    Rename {
+        buffer: String,
+        cursor: usize,
+        target: RenameTarget,
+    },
     /// C32 (amended): the combined pane editor (Alt+r) — the pane's whole
     /// text surface in one dialog. `name` is the single-line title field;
     /// `lines` is the parking note split on newlines, never empty (an
@@ -114,7 +118,13 @@ pub enum Mode {
     /// at the boundary are walls, so the two fields can't merge by typo.
     /// `pane` pins the editor's owner at open time, so the commit can
     /// never land on a different pane than the dialog opened on.
-    PaneEdit { name: String, lines: Vec<String>, row: usize, col: usize, pane: PaneId },
+    PaneEdit {
+        name: String,
+        lines: Vec<String>,
+        row: usize,
+        col: usize,
+        pane: PaneId,
+    },
     /// C36: the broadcast composer (`Alt+'`). `lines` is the message being
     /// written, split on newlines and never empty; `row` indexes it and
     /// `col` is a **char** index into that row, for the same reason
@@ -127,12 +137,22 @@ pub enum Mode {
     /// shape U1 exists to prevent: you would have to notice a mode
     /// indicator to avoid typing into a fleet. One composed message, one
     /// deliberate send.
-    Broadcast { lines: Vec<String>, row: usize, col: usize, status_filter: Option<AgentStatus> },
+    Broadcast {
+        lines: Vec<String>,
+        row: usize,
+        col: usize,
+        status_filter: Option<AgentStatus>,
+    },
     /// U20: the quick-launch picker. `selection` indexes the **filtered**
     /// adapter list (`filter` is the type-ahead query, empty = everything);
     /// `cwd` indexes the recent-directory column; `on_cwd` says which of the
     /// two columns `↑`/`↓` are steering.
-    Picker { selection: usize, filter: String, cwd: usize, on_cwd: bool },
+    Picker {
+        selection: usize,
+        filter: String,
+        cwd: usize,
+        on_cwd: bool,
+    },
     /// [P14] Scroll mode carries **no offset of its own** — a cached mirror
     /// of the view's position would be a second answer to a question with
     /// exactly one, since the vt100 grid auto-advances its offset as new
@@ -142,7 +162,9 @@ pub enum Mode {
     /// Text selection — mouse drag, or the C24 keyboard cursor. `cursor` is
     /// (row, col) in the focused pane's inner cell space; both input
     /// methods write the same `App::selection`.
-    Copy { cursor: (u16, u16) },
+    Copy {
+        cursor: (u16, u16),
+    },
     /// C15: the full-keymap overlay (Alt+?). `top` is the first visible
     /// content row — 0 whenever the keymap fits, which is the common case;
     /// the scroll keys only do anything on a terminal too short to show the
@@ -156,10 +178,15 @@ pub enum Mode {
     /// than an empty string standing in for "not filtering". An empty
     /// `Some` is a real state: `/` then Backspace, still filtering, showing
     /// everything.
-    Help { top: usize, filter: Option<String> },
+    Help {
+        top: usize,
+        filter: Option<String>,
+    },
     /// C20 activity-feed overlay; `offset` counts entries back from the
     /// newest (0 = live tail).
-    Feed { offset: usize },
+    Feed {
+        offset: usize,
+    },
     /// C27: the fleet roster — every pane in the workspace, grouped by tab.
     ///
     /// The cursor is a **`PaneId`, not a row index**: the roster is a live
@@ -173,13 +200,20 @@ pub enum Mode {
     /// tier), cycled with `Tab`/`Shift+Tab` — the two non-`Char` keys the
     /// type-ahead (every printable, C27's own rule) cannot claim. Composes
     /// with `filter` by AND: a row must satisfy both.
-    Roster { cursor: PaneId, filter: String, top: usize, status_filter: Option<AgentStatus> },
+    Roster {
+        cursor: PaneId,
+        filter: String,
+        top: usize,
+        status_filter: Option<AgentStatus>,
+    },
     /// P21: the incremental scrollback-search prompt, opened with `/` from
     /// Scroll or Copy mode. The search itself lives on `App::search` (it
     /// outlives the prompt — `n`/`N` keep working after Enter); this only
     /// carries what Enter and Esc need to hand the mode back: the copy
     /// cursor to restore, or `None` for "came from Scroll mode".
-    Search { copy_cursor: Option<(u16, u16)> },
+    Search {
+        copy_cursor: Option<(u16, u16)>,
+    },
 }
 
 /// P21: one incremental search over a pane's scrollback + screen.
@@ -240,15 +274,7 @@ impl Search {
     #[cfg(test)]
     pub fn over(lines: Vec<String>, query: &str, current: usize) -> Self {
         let matches = find_matches(&lines, query);
-        Self {
-            pane: 1,
-            query: query.to_string(),
-            lines,
-            total: 0,
-            matches,
-            current,
-            origin: 0,
-        }
+        Self { pane: 1, query: query.to_string(), lines, total: 0, matches, current, origin: 0 }
     }
 }
 
@@ -770,12 +796,8 @@ impl<B: PaneBackend> App<B> {
         // was just loaded — the directories this fleet already lives in.
         // Reverse order so the *first* pane's cwd ends up most-recent,
         // matching where focus just landed.
-        let seed: Vec<PathBuf> = app
-            .ws
-            .tabs
-            .iter()
-            .flat_map(|t| t.panes.values().map(|s| s.cwd.clone()))
-            .collect();
+        let seed: Vec<PathBuf> =
+            app.ws.tabs.iter().flat_map(|t| t.panes.values().map(|s| s.cwd.clone())).collect();
         for cwd in seed.into_iter().rev() {
             app.note_cwd(cwd);
         }
@@ -1099,7 +1121,9 @@ impl<B: PaneBackend> App<B> {
     /// alive. Checked by `main.rs`'s key path before it ever calls
     /// `translate()`.
     pub fn raw_routing_active(&self) -> bool {
-        matches!(self.mode, Mode::Normal) && self.raw.contains(&self.focused) && !self.focused_dead()
+        matches!(self.mode, Mode::Normal)
+            && self.raw.contains(&self.focused)
+            && !self.focused_dead()
     }
 
     /// C24: take (clearing) the pending keyboard-copy yank, if any — see
@@ -1241,7 +1265,8 @@ impl<B: PaneBackend> App<B> {
         // §6.1): only launch fresh + clear it when the session is
         // *definitively* gone. All adapter queries happen here, before we
         // borrow self mut.
-        let resolution = session_resolver::resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref());
+        let resolution =
+            session_resolver::resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref());
         let mut cmd = match &resolution.session {
             Some(s) => adapter.resume(&spec.cwd, s),
             None => adapter.launch(&spec.cwd),
@@ -1343,7 +1368,7 @@ impl<B: PaneBackend> App<B> {
         // starving that pane of a session id forever (HashMap iteration order
         // made this non-deterministic). Claiming newest-spawned-first mirrors
         // file-creation order, so each pane gets its own file.
-        pending.sort_by(|a, b| b.1.cmp(&a.1));
+        pending.sort_by_key(|(_, since)| std::cmp::Reverse(*since));
         // Drop anything past the give-up horizon before scanning for it.
         // Checked against the pane's own `since` rather than a separate
         // clock so the window means the same thing here as it does in the
@@ -1354,9 +1379,10 @@ impl<B: PaneBackend> App<B> {
         });
         pending.retain(|(id, _)| self.pending_detect.contains_key(id));
         for (id, since) in pending.clone() {
-            let Some((spec, adapter)) = self.find_spec(id).and_then(|s| {
-                self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a))
-            }) else {
+            let Some((spec, adapter)) = self
+                .find_spec(id)
+                .and_then(|s| self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a)))
+            else {
                 self.pending_detect.remove(&id);
                 continue;
             };
@@ -1577,10 +1603,7 @@ impl<B: PaneBackend> App<B> {
             // demotes when the agent exits, then promotes again hours later
             // would otherwise keep its first floor — by then old enough to
             // reach conversations from earlier in the same session.
-            self.pending_detect
-                .entry(id)
-                .and_modify(|f| *f = (*f).max(floor))
-                .or_insert(floor);
+            self.pending_detect.entry(id).and_modify(|f| *f = (*f).max(floor)).or_insert(floor);
         }
         for cwd in visited {
             self.note_cwd(cwd);
@@ -1614,9 +1637,7 @@ impl<B: PaneBackend> App<B> {
     /// spinner that steps twice a second for as long as the miss lasts —
     /// never a screen that stops updating.
     pub fn animating(&self) -> bool {
-        self.runtimes
-            .keys()
-            .any(|id| self.display_status(*id) == Some(AgentStatus::Working))
+        self.runtimes.keys().any(|id| self.display_status(*id) == Some(AgentStatus::Working))
     }
 
     /// U2 (amended, P6): the one display name for pane `id`, used by every
@@ -2151,7 +2172,8 @@ impl<B: PaneBackend> App<B> {
             if let Some(id) = hit {
                 let status = self.status_str(id);
                 let w = self.waiters.remove(i);
-                let _ = w.reply.send(Reply::ok(serde_json::json!({ "pane": id, "status": status })));
+                let _ =
+                    w.reply.send(Reply::ok(serde_json::json!({ "pane": id, "status": status })));
             } else if timed_out {
                 let w = self.waiters.remove(i);
                 let _ = w.reply.send(Reply::ok(serde_json::json!({ "timed_out": true })));
@@ -2295,9 +2317,8 @@ impl<B: PaneBackend> App<B> {
             // so the actionable advice here is to stack rather than the
             // pane's shortfall. The divergence is deliberate and contracted;
             // what both surfaces must share is that the refusal is *said*.
-            let hint = self.chord_clause(Action::ToggleStack, |c| {
-                format!("; stack a pane with {c} first")
-            });
+            let hint = self
+                .chord_clause(Action::ToggleStack, |c| format!("; stack a pane with {c} first"));
             return Reply::err(format!("{verb} refused: not enough room to split{hint}"));
         };
         if let Some(text) = initial_input {
@@ -2630,7 +2651,11 @@ impl<B: PaneBackend> App<B> {
                 // U2: the spec is already out of the tree, so the label is
                 // built from the captured spec (same `{id} {name}` shape as
                 // `feed_label`).
-                self.push_feed(format!("closed {id} {}", display_name_live(&spec, None)), false, None);
+                self.push_feed(
+                    format!("closed {id} {}", display_name_live(&spec, None)),
+                    false,
+                    None,
+                );
                 self.remember_closed(Closed::Pane { tab_index: ti, spec });
             }
         }
@@ -2854,9 +2879,7 @@ impl<B: PaneBackend> App<B> {
         // ended) — only notify when it follows active work, so a resume
         // that lands straight on Waiting doesn't nag.
         let became_needy = match status {
-            AgentStatus::NeedsInput => {
-                prev != Some(AgentStatus::NeedsInput) || detail != prev_msg
-            }
+            AgentStatus::NeedsInput => prev != Some(AgentStatus::NeedsInput) || detail != prev_msg,
             AgentStatus::Waiting => prev == Some(AgentStatus::Working),
             _ => false,
         };
@@ -2918,8 +2941,7 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
             let clean = text.replace("\r\n", "\n").replace('\r', "\n");
-            let clean: String =
-                clean.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            let clean: String = clean.chars().filter(|c| !c.is_control() || *c == '\n').collect();
             let mut nrow = (*row - 1).min(lines.len().saturating_sub(1));
             let at = byte_at(&lines[nrow], (*col).min(lines[nrow].chars().count()));
             let tail = lines[nrow][at..].to_string();
@@ -3022,8 +3044,8 @@ impl<B: PaneBackend> App<B> {
             return (0, 0);
         }
         let scale = |px: u16, cells: u16, host_cells: u16| -> u16 {
-            (u32::from(px) * u32::from(cells) / u32::from(host_cells))
-                .min(u32::from(u16::MAX)) as u16
+            (u32::from(px) * u32::from(cells) / u32::from(host_cells)).min(u32::from(u16::MAX))
+                as u16
         };
         (scale(host_w, cols, host_cols), scale(host_h, rows, host_rows))
     }
@@ -3058,7 +3080,8 @@ impl<B: PaneBackend> App<B> {
     /// moves the keyboard cursor there, so a fresh mouse drag and the
     /// keyboard cursor never disagree about where the selection is.
     pub fn begin_selection(&mut self, id: PaneId, row: u16, col: u16) {
-        self.selection = Some(Selection { pane: id, anchor: (row, col), cursor: (row, col), dragging: true });
+        self.selection =
+            Some(Selection { pane: id, anchor: (row, col), cursor: (row, col), dragging: true });
         if let Mode::Copy { cursor } = &mut self.mode {
             *cursor = (row, col);
         }
@@ -3125,7 +3148,8 @@ impl<B: PaneBackend> App<B> {
                 // selection, not just its first column.
                 let end_w = line.chars().nth(end).and_then(|c| c.width()).unwrap_or(1).max(1);
                 let c1 = (char_to_cell(&line, end) + end_w - 1) as u16;
-                self.selection = Some(Selection { pane, anchor: (row, c0), cursor: (row, c1), dragging: false });
+                self.selection =
+                    Some(Selection { pane, anchor: (row, c0), cursor: (row, c1), dragging: false });
             }
             None => self.selection = None,
         }
@@ -3136,7 +3160,8 @@ impl<B: PaneBackend> App<B> {
     /// not silently widen it word-by-word — out of scope here, see C29).
     pub fn select_line_at(&mut self, pane: PaneId, row: u16) {
         let last = self.pane_inner_dims(pane).1.saturating_sub(1);
-        self.selection = Some(Selection { pane, anchor: (row, 0), cursor: (row, last), dragging: false });
+        self.selection =
+            Some(Selection { pane, anchor: (row, 0), cursor: (row, last), dragging: false });
     }
 
     /// C29: shift-click — extend the live selection to the pointer, keeping
@@ -3194,8 +3219,13 @@ impl<B: PaneBackend> App<B> {
         let sel = self.selection.as_mut()?;
         sel.dragging = false;
         let (pane, anchor, cursor) = (sel.pane, sel.anchor, sel.cursor);
-        let text = self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
-        if text.is_empty() { None } else { Some(text) }
+        let text =
+            self.runtimes.get(&pane).map(|rt| rt.grab_text(anchor, cursor)).unwrap_or_default();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Finish the drag: extract the selected text and leave copy mode.
@@ -3505,7 +3535,8 @@ impl<B: PaneBackend> App<B> {
         if matches!(self.mode, Mode::Roster { .. }) {
             let (rows, top) = self.roster_view();
             let visible = rows.len().saturating_sub(top).min(self.roster_view_rows());
-            match dialog.and_then(|r| crate::ui::mouse::picker_row_at(r, visible, me.column, me.row))
+            match dialog
+                .and_then(|r| crate::ui::mouse::picker_row_at(r, visible, me.column, me.row))
             {
                 Some(i) => {
                     if let Some(RosterRow::Pane { id }) = rows.get(top + i) {
@@ -3963,7 +3994,11 @@ impl<B: PaneBackend> App<B> {
                 // U2: `restore_pane` allocated the pane's NEW id and left it
                 // focused — label with that id, not the closed one's.
                 let restored = self.focused;
-                self.push_feed(format!("reopened {}", self.feed_label(restored)), false, Some(restored));
+                self.push_feed(
+                    format!("reopened {}", self.feed_label(restored)),
+                    false,
+                    Some(restored),
+                );
                 self.set_flash(format!("reopened {}", self.display_name(restored)));
             }
         }
@@ -3983,8 +4018,7 @@ impl<B: PaneBackend> App<B> {
     #[must_use]
     fn restore_pane(&mut self, spec: PaneSpec) -> bool {
         let focused = self.focused;
-        let target_rect =
-            self.rects().iter().find(|pr| pr.id == focused).map(|pr| pr.rect);
+        let target_rect = self.rects().iter().find(|pr| pr.id == focused).map(|pr| pr.rect);
         let Some(dir) = split_fit(target_rect) else { return false };
         let id = self.alloc_pane_id();
         let tab = self.ws.active_tab_mut();
@@ -4213,12 +4247,17 @@ impl<B: PaneBackend> App<B> {
         // by, is both true and the more useful sentence. Found by the C38
         // design audit; the first draft asserted a rule the code does not
         // have, which is the worst kind of helpful message.
-        let rect = self.split_target().and_then(|id| {
-            self.rects().iter().find(|pr| pr.id == id).map(|pr| pr.rect)
-        });
+        let rect = self
+            .split_target()
+            .and_then(|id| self.rects().iter().find(|pr| pr.id == id).map(|pr| pr.rect));
         let detail = match rect {
             Some(r) if r.width >= r.height * 3 => {
-                format!("{} needs {} columns, has {}", "side by side", layout::MIN_SPLIT_COLS, r.width)
+                format!(
+                    "{} needs {} columns, has {}",
+                    "side by side",
+                    layout::MIN_SPLIT_COLS,
+                    r.width
+                )
             }
             Some(r) => {
                 format!("stacked needs {} rows, has {}", layout::MIN_SPLIT_ROWS, r.height)
@@ -4389,7 +4428,15 @@ impl<B: PaneBackend> App<B> {
                 .map(|s| s.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         });
-        let spec = PaneSpec { adapter: adapter.into(), cwd, session: None, title: None, spawned_by, note: None, noted_at: None };
+        let spec = PaneSpec {
+            adapter: adapter.into(),
+            cwd,
+            session: None,
+            title: None,
+            spawned_by,
+            note: None,
+            noted_at: None,
+        };
 
         // Split in the widest direction of the split target's rect. Refuses
         // (returns None) a split that would produce unusably tiny panes
@@ -4567,7 +4614,18 @@ impl<B: PaneBackend> App<B> {
         let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut panes = HashMap::new();
-        panes.insert(id, PaneSpec { adapter: "shell".into(), cwd, session: None, title: None, spawned_by: None, note: None, noted_at: None });
+        panes.insert(
+            id,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd,
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
         self.ws.tabs.push(Tab {
             name: format!("tab{}", self.ws.tabs.len() + 1),
             layout: LayoutNode::Pane(id),
@@ -4889,12 +4947,9 @@ impl<B: PaneBackend> App<B> {
     fn toggle_broadcast(&mut self) {
         self.mode = match self.mode {
             Mode::Broadcast { .. } => Mode::Normal,
-            _ => Mode::Broadcast {
-                lines: vec![String::new()],
-                row: 0,
-                col: 0,
-                status_filter: None,
-            },
+            _ => {
+                Mode::Broadcast { lines: vec![String::new()], row: 0, col: 0, status_filter: None }
+            }
         };
     }
 
@@ -4923,10 +4978,7 @@ impl<B: PaneBackend> App<B> {
         bytes.push(b'\r');
         let sent = self.deliver_broadcast(&targets, &bytes);
         let count = sent.len();
-        let summary = method_summary(&Method::Broadcast {
-            text: text.to_string(),
-            submit: true,
-        });
+        let summary = method_summary(&Method::Broadcast { text: text.to_string(), submit: true });
         self.audit(Some(Actor::Local), &summary, true, &format!("count={count}"));
         let noun = if count == 1 { "pane" } else { "panes" };
         self.set_flash(format!("broadcast to {count} {noun}"));
@@ -5096,7 +5148,9 @@ impl<B: PaneBackend> App<B> {
     /// nothing).
     pub fn roster_rows(&self) -> Vec<RosterRow> {
         let (filter, status_filter) = match &self.mode {
-            Mode::Roster { filter, status_filter, .. } => (filter.to_ascii_lowercase(), *status_filter),
+            Mode::Roster { filter, status_filter, .. } => {
+                (filter.to_ascii_lowercase(), *status_filter)
+            }
             _ => (String::new(), None),
         };
         // [design-supervisor D2] Compared by `roster_rank`, not equality: a
@@ -5107,9 +5161,8 @@ impl<B: PaneBackend> App<B> {
         // a restored workspace hits on its very first roster open.
         let shows = |id: PaneId| {
             self.roster_matches(id, &filter)
-                && status_filter.is_none_or(|s| {
-                    roster_rank(self.display_status(id)) == roster_rank(Some(s))
-                })
+                && status_filter
+                    .is_none_or(|s| roster_rank(self.display_status(id)) == roster_rank(Some(s)))
         };
 
         let mut groups: Vec<(u8, usize, Vec<PaneId>)> = Vec::new();
@@ -5632,8 +5685,7 @@ impl<B: PaneBackend> App<B> {
             // Alt+c handoff keeps it — a search *is* how you find the text
             // you are about to select, so throwing the hits away at the
             // handoff would break the flow the search exists to serve.
-            let looking_back =
-                matches!(self.mode, Mode::Scroll | Mode::Search { .. });
+            let looking_back = matches!(self.mode, Mode::Scroll | Mode::Search { .. });
             let scroll_to_copy = looking_back && key.code == KeyCode::Char('c');
             if looking_back && !scroll_to_copy {
                 let focused = self.focused;
@@ -5906,11 +5958,8 @@ impl<B: PaneBackend> App<B> {
                 // Same stale-point hygiene as Rename: clamp, never slice
                 // bad. Unified rows: 0 = name, 1..=lines.len() = note.
                 *row = (*row).min(lines.len());
-                let len = if *row == 0 {
-                    name.chars().count()
-                } else {
-                    lines[*row - 1].chars().count()
-                };
+                let len =
+                    if *row == 0 { name.chars().count() } else { lines[*row - 1].chars().count() };
                 *col = (*col).min(len);
                 match key.code {
                     KeyCode::Enter if shift || ctrl => {
@@ -5923,8 +5972,7 @@ impl<B: PaneBackend> App<B> {
                         // of "" would make the badge segment a lie),
                         // interior blanks are the author's call.
                         let new_title = name.trim().to_string();
-                        let new_title =
-                            if new_title.is_empty() { None } else { Some(new_title) };
+                        let new_title = if new_title.is_empty() { None } else { Some(new_title) };
                         let text = lines.join("\n").trim().to_string();
                         let new_note = if text.is_empty() { None } else { Some(text) };
                         if let Some(spec) = self.find_spec_mut(pane) {
@@ -5970,8 +6018,7 @@ impl<B: PaneBackend> App<B> {
                     KeyCode::Backspace => {
                         if *col > 0 {
                             *col -= 1;
-                            let cur =
-                                if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
+                            let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
                             let at = byte_at(cur, *col);
                             cur.remove(at);
                         } else if *row > 1 {
@@ -5985,8 +6032,7 @@ impl<B: PaneBackend> App<B> {
                     }
                     KeyCode::Delete => {
                         if *col < len {
-                            let cur =
-                                if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
+                            let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
                             let at = byte_at(cur, *col);
                             cur.remove(at);
                         } else if *row >= 1 && *row < lines.len() {
@@ -6201,8 +6247,12 @@ impl<B: PaneBackend> App<B> {
                         if self.selection.is_some() {
                             self.selection = None; // toggle off: clear the anchor
                         } else {
-                            self.selection =
-                                Some(Selection { pane: focused, anchor, cursor: anchor, dragging: false });
+                            self.selection = Some(Selection {
+                                pane: focused,
+                                anchor,
+                                cursor: anchor,
+                                dragging: false,
+                            });
                         }
                     }
                     // U17: `V` selects the cursor's whole row — the "grab
@@ -6346,8 +6396,7 @@ impl<B: PaneBackend> App<B> {
                     // costs one key, not the whole overlay and the place
                     // you had scrolled to.
                     if key.code == KeyCode::Esc {
-                        let empty =
-                            matches!(&self.mode, Mode::Help { filter: Some(q), .. } if q.is_empty());
+                        let empty = matches!(&self.mode, Mode::Help { filter: Some(q), .. } if q.is_empty());
                         if empty {
                             self.mode = Mode::Normal;
                         } else if let Mode::Help { filter, top } = &mut self.mode {
@@ -7030,7 +7079,11 @@ fn split_fit(rect: Option<Rect>) -> Option<SplitDir> {
         SplitDir::Vertical => r.width < layout::MIN_SPLIT_COLS,
         SplitDir::Horizontal => r.height < layout::MIN_SPLIT_ROWS,
     };
-    if too_small { None } else { Some(dir) }
+    if too_small {
+        None
+    } else {
+        Some(dir)
+    }
 }
 
 /// U2 + P6: the full naming chain as a pure function — explicit Alt+r title,
@@ -7313,8 +7366,31 @@ fn wants_alt_hint(alt_seen: bool, since_evidence: Option<Duration>) -> bool {
 fn is_alt_swallow_char(c: char) -> bool {
     matches!(
         c,
-        'å' | '∫' | 'ç' | '∂' | '´' | 'ƒ' | '©' | '˙' | 'ˆ' | '∆' | '˚' | '¬' | 'µ' | '˜' | 'ø'
-            | 'π' | 'œ' | '®' | 'ß' | '†' | '¨' | '√' | '∑' | '≈' | '¥' | 'Ω'
+        'å' | '∫'
+            | 'ç'
+            | '∂'
+            | '´'
+            | 'ƒ'
+            | '©'
+            | '˙'
+            | 'ˆ'
+            | '∆'
+            | '˚'
+            | '¬'
+            | 'µ'
+            | '˜'
+            | 'ø'
+            | 'π'
+            | 'œ'
+            | '®'
+            | 'ß'
+            | '†'
+            | '¨'
+            | '√'
+            | '∑'
+            | '≈'
+            | '¥'
+            | 'Ω'
     )
 }
 
@@ -7684,10 +7760,10 @@ pub(crate) mod tests {
     fn tab_summary_reports_exited_and_ranks_it_between_waiting_and_quiet() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1 | 2 in one tab
-        // Pane 2 is a real agent, not the default shell: this test is U13's
-        // "a live agent outranks a corpse" ranking, and U13 is silent on
-        // shells — a shell's Waiting would read Idle (P2-10) and never
-        // exercise the Waiting rung this test means to pin.
+                                    // Pane 2 is a real agent, not the default shell: this test is U13's
+                                    // "a live agent outranks a corpse" ranking, and U13 is silent on
+                                    // shells — a shell's Waiting would read Idle (P2-10) and never
+                                    // exercise the Waiting rung this test means to pin.
         app.find_spec_mut(2).unwrap().adapter = "pi".into();
         assert_eq!(app.tab_summary(0).0, TabSummary::Quiet);
 
@@ -7730,8 +7806,16 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         let id = app.pane_order()[0];
         app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
-        assert_eq!(app.tab_summary(0).0, TabSummary::Quiet, "a shell's Waiting is not tab-bar news");
-        assert_eq!(app.display_status(id), Some(AgentStatus::Idle), "same answer the badge/roster read");
+        assert_eq!(
+            app.tab_summary(0).0,
+            TabSummary::Quiet,
+            "a shell's Waiting is not tab-bar news"
+        );
+        assert_eq!(
+            app.display_status(id),
+            Some(AgentStatus::Idle),
+            "same answer the badge/roster read"
+        );
     }
 
     /// [ux P2-10] A quiet shell's heuristic `Waiting` reads `Idle` through
@@ -7745,7 +7829,11 @@ pub(crate) mod tests {
         let id = app.pane_order()[0];
         app.runtimes.get_mut(&id).unwrap().set_extension_status(AgentStatus::Waiting);
         assert_eq!(app.row_status(id), Some(AgentStatus::Waiting), "raw ground truth is unchanged");
-        assert_eq!(app.display_status(id), Some(AgentStatus::Idle), "a shell has no turn to hand back");
+        assert_eq!(
+            app.display_status(id),
+            Some(AgentStatus::Idle),
+            "a shell has no turn to hand back"
+        );
 
         // A real agent pane's Waiting is untouched — it really might be
         // "your turn".
@@ -7768,13 +7856,19 @@ pub(crate) mod tests {
     /// that can silently do nothing); neither is an honest failure.
     #[test]
     fn copy_flash_text_names_the_channel_that_took_it() {
-        assert_eq!(App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Native), "copied 13 chars");
+        assert_eq!(
+            App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Native),
+            "copied 13 chars"
+        );
         assert_eq!(
             App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Osc52),
             "copied 13 chars (OSC 52)"
         );
         let failed = App::<FakePane>::copy_flash_text(13, ClipboardOutcome::Failed);
-        assert_eq!(failed, "copy failed: no clipboard channel worked; check your terminal's clipboard support");
+        assert_eq!(
+            failed,
+            "copy failed: no clipboard channel worked; check your terminal's clipboard support"
+        );
         // A failure never quotes a count — there is no N to have copied.
         assert!(!App::<FakePane>::copy_flash_text(0, ClipboardOutcome::Failed).contains('0'));
     }
@@ -7789,7 +7883,9 @@ pub(crate) mod tests {
         app.flash_copy(4, ClipboardOutcome::Failed);
         assert_eq!(
             app.flash(),
-            Some("copy failed: no clipboard channel worked; check your terminal's clipboard support")
+            Some(
+                "copy failed: no clipboard channel worked; check your terminal's clipboard support"
+            )
         );
     }
 
@@ -7920,7 +8016,7 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         let id = app.focused;
         app.on_pty_output(id, b"x"); // heuristic Working on a shell
-        // …which `Alt+w` would now close on the first press:
+                                     // …which `Alt+w` would now close on the first press:
         assert!(!app.mid_turn(id));
         // …but `Alt+q` still arms, because it takes the fleet with it.
         app.apply(Action::Quit);
@@ -8145,9 +8241,9 @@ pub(crate) mod tests {
         let id = app.focused;
         app.apply(Action::ScrollMode);
         app.handle_mode_key(key('/')); // captures a 300-row haystack
-        // Between the capture and the jump the pane floods and the ring
-        // evicts almost all of that history — the documented drift case.
-        // The arithmetic still asks for a row that is no longer banked.
+                                       // Between the capture and the jump the pane floods and the ring
+                                       // evicts almost all of that history — the documented drift case.
+                                       // The arithmetic still asks for a row that is no longer banked.
         app.runtimes.get_mut(&id).unwrap().scroll_total = 10;
         type_query(&mut app, "line 42"); // wants offset 300 - 41 = 259
         assert_eq!(app.scroll_offset(id), 10, "the grid's clamp wins over the arithmetic");
@@ -8247,10 +8343,8 @@ pub(crate) mod tests {
         // The "reflow": the same content now occupies different rows.
         let rt = app.runtimes.get_mut(&id).unwrap();
         let rewrapped: Vec<String> = (1..=300).map(|i| format!("... line {i}")).collect();
-        rt.all_text = std::iter::once("banner".to_string())
-            .chain(rewrapped)
-            .collect::<Vec<_>>()
-            .join("\n");
+        rt.all_text =
+            std::iter::once("banner".to_string()).chain(rewrapped).collect::<Vec<_>>().join("\n");
         rt.scroll_total = 301;
         app.on_resize(Size::new(80, 24), (0, 0));
 
@@ -8490,10 +8584,7 @@ pub(crate) mod tests {
         const ALT: KeyModifiers = KeyModifiers::ALT;
         let cases: [(Action, KeyEvent); 7] = [
             (Action::EditPane, KeyEvent::new(KeyCode::Char('r'), ALT)),
-            (
-                Action::RenameTab,
-                KeyEvent::new(KeyCode::Char('r'), ALT.union(KeyModifiers::SHIFT)),
-            ),
+            (Action::RenameTab, KeyEvent::new(KeyCode::Char('r'), ALT.union(KeyModifiers::SHIFT))),
             (Action::QuickLaunch, KeyEvent::new(KeyCode::Enter, ALT)),
             (Action::ScrollMode, KeyEvent::new(KeyCode::PageUp, ALT)),
             (Action::CopyMode, KeyEvent::new(KeyCode::Char('c'), ALT)),
@@ -8570,7 +8661,8 @@ pub(crate) mod tests {
     fn the_keymap_scrolls_on_a_short_terminal_and_still_closes_on_any_other_key() {
         use crossterm::event::{KeyCode, KeyEvent};
         let (mut app, _) = mk_app(shell_ws());
-        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
+        let (visible, total) =
+            crate::ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert!(visible < total, "this fixture's body is too short for the whole keymap");
 
         app.apply(Action::Help);
@@ -8606,7 +8698,8 @@ pub(crate) mod tests {
         ws.tabs[0].name = "main".into();
         let (mut app, _) = mk_app(ws);
         app.on_resize(Size::new(120, 60), (0, 0));
-        let (visible, total) = crate::ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
+        let (visible, total) =
+            crate::ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert_eq!(visible, total, "a tall body shows the whole keymap at once");
         for key in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Char('j')] {
             app.apply(Action::Help);
@@ -8734,7 +8827,11 @@ pub(crate) mod tests {
         // inside spawn_child, before this reply was ever built.
         let spawned = ok(app.handle_control(Request {
             token: ct.clone(),
-            method: Method::Spawn { adapter: "always-fails".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "always-fails".into(),
+                cwd: None,
+                initial_input: None,
+            },
         }));
         let id = spawned["pane"].as_u64().unwrap();
         // FakePane::spawn's hook is a bare `anyhow::bail!` — no chain to
@@ -8779,8 +8876,10 @@ pub(crate) mod tests {
             Reply::Err { err } => panic!("expected ok, got err: {err}"),
         };
         let id = app.focused;
-        let status =
-            ok(app.handle_control(Request { token: ct.clone(), method: Method::Status { pane: Some(id) } }));
+        let status = ok(app.handle_control(Request {
+            token: ct.clone(),
+            method: Method::Status { pane: Some(id) },
+        }));
         assert!(status["error"].is_null());
         let list = ok(app.handle_control(Request { token: ct, method: Method::List }));
         assert!(list.as_array().unwrap()[0]["error"].is_null());
@@ -9060,7 +9159,10 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         let ct = app.control_token().to_string();
         assert!(matches!(
-            app.handle_control(Request { token: ct, method: Method::Close { pane: 1, force: true } }),
+            app.handle_control(Request {
+                token: ct,
+                method: Method::Close { pane: 1, force: true }
+            }),
             crate::core::control::Reply::Err { .. }
         ));
     }
@@ -9087,7 +9189,9 @@ pub(crate) mod tests {
         assert_eq!(app.focused, focused, "spawn must not move the human's focus");
         assert_eq!(app.ws.active_tab, active_tab, "spawn must not switch the human's tab");
 
-        match app.handle_control(Request { token: ct, method: Method::Fork { pane: Some(spawned) } }) {
+        match app
+            .handle_control(Request { token: ct, method: Method::Fork { pane: Some(spawned) } })
+        {
             Reply::Ok { .. } => {}
             Reply::Err { err } => panic!("{err}"),
         }
@@ -9203,7 +9307,8 @@ pub(crate) mod tests {
     #[test]
     fn broadcast_audit_line_has_the_contracted_shape_and_omits_the_text() {
         use crate::core::control::{Method, Reply, Request};
-        let dir = std::env::temp_dir().join(format!("roost-broadcast-audit-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("roost-broadcast-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = MemStore::default();
@@ -9241,7 +9346,11 @@ pub(crate) mod tests {
         // identical feed row too).
         assert_eq!(lines.len(), 1, "exactly one ctl line per broadcast: {log:?}");
         // len=14 is "secret payload".len(); count=1 is the lone auto-spawned pane.
-        assert!(lines[0].contains("fleet broadcast len=14 submit=true -> ok count=1"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("fleet broadcast len=14 submit=true -> ok count=1"),
+            "{}",
+            lines[0]
+        );
         assert!(!log.contains("secret payload"), "broadcast text must never be logged: {log:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -9261,9 +9370,14 @@ pub(crate) mod tests {
             rtx,
         );
         assert!(matches!(rrx.recv().unwrap(), Reply::Ok { .. }));
-        let ctl_lines: Vec<&FeedEntry> = app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        let ctl_lines: Vec<&FeedEntry> =
+            app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
         assert_eq!(ctl_lines.len(), 1, "exactly one ctl feed line per broadcast: {:?}", app.feed());
-        assert!(ctl_lines[0].text.contains("fleet: broadcast len=2 submit=false → ok"), "{}", ctl_lines[0].text);
+        assert!(
+            ctl_lines[0].text.contains("fleet: broadcast len=2 submit=false → ok"),
+            "{}",
+            ctl_lines[0].text
+        );
     }
 
     #[test]
@@ -9311,14 +9425,18 @@ pub(crate) mod tests {
         let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
         assert_eq!(transitions.len(), 2, "{:?}", app.feed());
         // U2: transition lines lead with the pane id, then the display name.
-        let alpha = transitions.iter().find(|e| e.text.contains("alpha:")).expect("alpha's own line");
+        let alpha =
+            transitions.iter().find(|e| e.text.contains("alpha:")).expect("alpha's own line");
         assert_eq!(alpha.text, format!("{a} alpha: idle → working"));
         assert!(!alpha.needs_input);
         let charlie =
             transitions.iter().find(|e| e.text.contains("charlie:")).expect("charlie's own line");
         assert_eq!(charlie.text, format!("{c} charlie: idle → needs you"));
         assert!(charlie.needs_input);
-        assert!(!transitions.iter().any(|e| e.text.contains("bravo:")), "unchanged pane must stay silent");
+        assert!(
+            !transitions.iter().any(|e| e.text.contains("bravo:")),
+            "unchanged pane must stay silent"
+        );
 
         // The broadcast's one ctl line must still be exactly one — untouched by the tick.
         assert_eq!(app.feed().iter().filter(|e| e.text.starts_with("ctl ")).count(), 1);
@@ -9350,7 +9468,11 @@ pub(crate) mod tests {
 
         let transitions: Vec<&FeedEntry> = app.feed().iter().filter(is_transition).collect();
         let last = transitions.last().expect("a transition line");
-        assert_eq!(last.text, format!("{}: working → idle", app.feed_label(id)), "not \"your turn\"");
+        assert_eq!(
+            last.text,
+            format!("{}: working → idle", app.feed_label(id)),
+            "not \"your turn\""
+        );
     }
 
     #[test]
@@ -9669,10 +9791,7 @@ pub(crate) mod tests {
             "the pane's link must stay live while the other connection is still open"
         );
         app.on_status_link(id, false); // the long-lived connection finally closes too
-        assert!(
-            !app.runtimes.get(&id).unwrap().ext_link,
-            "down once every connection has closed"
-        );
+        assert!(!app.runtimes.get(&id).unwrap().ext_link, "down once every connection has closed");
     }
 
     /// [F1] The reviewer's probe, pinned permanently: a one-shot connection's
@@ -9718,10 +9837,10 @@ pub(crate) mod tests {
         assert!(app.runtimes.get(&id).unwrap().ext_link);
 
         app.respawn_focused(false); // kills the old process, mints a new token
-        // TokenTable exposes no by-id getter (sock.rs's door only ever needs
-        // "does this token authorize this pane", never "what is pane N's
-        // token") — read the freshly minted one the same way a real child
-        // process would receive it: off the spawned command's own env.
+                                    // TokenTable exposes no by-id getter (sock.rs's door only ever needs
+                                    // "does this token authorize this pane", never "what is pane N's
+                                    // token") — read the freshly minted one the same way a real child
+                                    // process would receive it: off the spawned command's own env.
         let new_token = app
             .runtimes
             .get(&id)
@@ -9738,10 +9857,7 @@ pub(crate) mod tests {
         // The old connection's Drop link-down finally arrives, carrying the
         // token it was actually admitted under — rejected exactly like
         // main.rs's real gate would reject it.
-        assert!(
-            !app.socket_authorized(id, &old_token),
-            "the old token must not survive a respawn"
-        );
+        assert!(!app.socket_authorized(id, &old_token), "the old token must not survive a respawn");
 
         assert!(
             !app.ext_link_counts.contains_key(&id),
@@ -9788,7 +9904,8 @@ pub(crate) mod tests {
         let (app, store) = mk_app(ws);
         let program = app.runtimes.get(&1).unwrap().cmd.program.clone();
         let args = app.runtimes.get(&1).unwrap().cmd.args.clone();
-        let saved_session = store.0.lock().unwrap().clone().unwrap().tabs[0].panes[&1].session.clone();
+        let saved_session =
+            store.0.lock().unwrap().clone().unwrap().tabs[0].panes[&1].session.clone();
 
         // Restore before asserting, so a failure here can't leave $HOME
         // redirected for the rest of the test binary.
@@ -9964,7 +10081,10 @@ pub(crate) mod tests {
         assert!(app.runtimes.get(&1).unwrap().cmd.args.is_empty(), "expected a fresh launch");
         assert!(app.find_spec(1).unwrap().session.is_none());
         let saved = store.0.lock().unwrap().clone().unwrap();
-        assert!(saved.tabs[0].panes[&1].session.is_none(), "the dead id must be persisted as cleared");
+        assert!(
+            saved.tabs[0].panes[&1].session.is_none(),
+            "the dead id must be persisted as cleared"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10199,8 +10319,7 @@ pub(crate) mod tests {
         assert_eq!(spec.note.as_deref(), Some("keep me"));
         app.apply(Action::EditPane);
         type_query(&mut app, " junk");
-        let consumed = app
-            .handle_mode_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
         assert!(consumed, "the toggle-off is handled, not forwarded");
         assert!(matches!(app.mode, Mode::Normal));
         let spec = app.find_spec(id).unwrap();
@@ -10218,8 +10337,7 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::EditPane);
         type_query(&mut app, "ab");
-        let consumed =
-            app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         assert!(consumed);
         let (name, lines, row, col) = edit_state(&app);
         assert_eq!((name.as_str(), row, col), ("ab", 1, 0), "descended into the note");
@@ -10227,8 +10345,7 @@ pub(crate) mod tests {
         // it — the half this test used to bind and then shadow unread.
         assert_eq!(lines, vec![String::new()], "the note starts empty");
         type_query(&mut app, "cd");
-        let consumed =
-            app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        let consumed = app.handle_mode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         assert!(consumed);
         let (_, lines, row, col) = edit_state(&app);
         assert_eq!(lines, vec!["cd".to_string(), String::new()]);
@@ -10749,7 +10866,10 @@ pub(crate) mod tests {
         assert!(!sel.dragging);
 
         app.select_word_at(id, 0, 8); // inside "world"
-        assert_eq!((app.selection.unwrap().anchor, app.selection.unwrap().cursor), ((0, 6), (0, 10)));
+        assert_eq!(
+            (app.selection.unwrap().anchor, app.selection.unwrap().cursor),
+            ((0, 6), (0, 10))
+        );
 
         // D3: the gap between the words has nothing to grab, and must clear
         // `self.selection` outright rather than degrade to a same-point
@@ -10889,7 +11009,11 @@ pub(crate) mod tests {
         app.click_count(id, 0, 8);
         assert_eq!(app.click_count(id, 0, 8), 2);
         app.select_word_at(id, 0, 8);
-        assert_eq!(app.release_native_selection(), None, "the word's release stages, doesn't commit");
+        assert_eq!(
+            app.release_native_selection(),
+            None,
+            "the word's release stages, doesn't commit"
+        );
         assert!(app.pending_copy.is_some());
 
         assert_eq!(app.click_count(id, 0, 8), 3, "the 3rd click");
@@ -10899,7 +11023,10 @@ pub(crate) mod tests {
             Some("hello world"),
             "the 3rd click's own release commits the line immediately"
         );
-        assert!(app.pending_copy.is_none(), "the word's stage was cancelled outright, not just outrun");
+        assert!(
+            app.pending_copy.is_none(),
+            "the word's stage was cancelled outright, not just outrun"
+        );
         assert_eq!(app.due_copy(), None, "nothing left to fire, staged or otherwise");
     }
 
@@ -10950,7 +11077,11 @@ pub(crate) mod tests {
 
         app.pending_copy =
             app.pending_copy.map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
-        assert_eq!(app.due_copy().as_deref(), Some("world"), "must copy what was actually double-clicked");
+        assert_eq!(
+            app.due_copy().as_deref(),
+            Some("world"),
+            "must copy what was actually double-clicked"
+        );
     }
 
     /// `on_click` drops a lingering native selection when the click lands on
@@ -11025,7 +11156,7 @@ pub(crate) mod tests {
         // click on surrounding words → nothing
         assert_eq!(find_url_at(line, 0), None); // "see"
         assert_eq!(find_url_at(line, 30), None); // "for"
-        // trailing punctuation and wrapping parens are stripped
+                                                 // trailing punctuation and wrapping parens are stripped
         assert_eq!(find_url_at("(https://a.co).", 3).as_deref(), Some("https://a.co"));
         assert_eq!(find_url_at("go to https://a.co!", 10).as_deref(), Some("https://a.co"));
         // non-http tokens ignored
@@ -11093,9 +11224,9 @@ pub(crate) mod tests {
         // join — still inside the link, and past it lands on "tail".
         assert_eq!(url_in_wrapped_rows(&run, 17, 1, 4).as_deref(), Some(joined));
         assert_eq!(url_in_wrapped_rows(&run, 17, 1, 10), None); // "tail"
-        // A row whose tail really was blank keeps the tokens apart: the
-        // padding restores exactly what `grab_text` trimmed, so the two
-        // rows never fuse into one nonsense word.
+                                                                // A row whose tail really was blank keeps the tokens apart: the
+                                                                // padding restores exactly what `grab_text` trimmed, so the two
+                                                                // rows never fuse into one nonsense word.
         let run = vec!["https://a.co".to_string(), "notpartofit".to_string()];
         assert_eq!(url_in_wrapped_rows(&run, 40, 0, 0).as_deref(), Some("https://a.co"));
         assert_eq!(url_in_wrapped_rows(&run, 40, 1, 0), None);
@@ -11199,7 +11330,11 @@ pub(crate) mod tests {
     fn picker_type_ahead_filters_the_adapter_list_and_backspace_widens_it() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::QuickLaunch);
-        assert_eq!(app.picker_filtered_ids().len(), crate::agents::picker_ids().len(), "no filter shows all");
+        assert_eq!(
+            app.picker_filtered_ids().len(),
+            crate::agents::picker_ids().len(),
+            "no filter shows all"
+        );
         app.handle_mode_key(key('l'));
         // Substring, not prefix: `l` finds both `claude` and `shell`.
         assert_eq!(app.picker_filtered_ids(), vec!["claude", "shell"]);
@@ -11363,7 +11498,11 @@ pub(crate) mod tests {
         // on (the harness's `pgrep -P`, every shell-spawning test, ...).
         let shell_at = crate::agents::picker_ids().iter().position(|&id| id == "shell").unwrap();
         assert_eq!(rows[shell_at], "shell", "resolved via an absolute path, not $PATH");
-        assert_eq!(spawned, Some("pi".to_string()), "launch used the raw id, not the annotated text");
+        assert_eq!(
+            spawned,
+            Some("pi".to_string()),
+            "launch used the raw id, not the annotated text"
+        );
     }
 
     /// U20: `↑`/`↓` steer whichever column has the keyboard, and `←`/`→`
@@ -11403,10 +11542,7 @@ pub(crate) mod tests {
         use crate::core::layout::SplitDir;
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // vertical split (side by side)
-        assert!(matches!(
-            app.ws.tabs[0].layout,
-            LayoutNode::Split { dir: SplitDir::Vertical, .. }
-        ));
+        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Vertical, .. }));
         app.apply(Action::FlipSplit);
         assert!(matches!(
             app.ws.tabs[0].layout,
@@ -11711,8 +11847,7 @@ pub(crate) mod tests {
     fn the_float_never_takes_an_id_a_parked_tab_will_bring_back() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewTab);
-        let parked: Vec<PaneId> =
-            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        let parked: Vec<PaneId> = app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
         for id in &parked {
             app.close_pane_id(*id);
         }
@@ -11724,8 +11859,7 @@ pub(crate) mod tests {
         );
 
         app.apply(Action::Undo);
-        let tree: Vec<PaneId> =
-            app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+        let tree: Vec<PaneId> = app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
         assert!(
             !tree.contains(&float_id),
             "C22: the float's id {float_id} is now a tiled pane too — tree {tree:?}",
@@ -11771,10 +11905,7 @@ pub(crate) mod tests {
             "C20: pane 2's last status outlived the pane — the next pane to \
              take id 2 would have its birth read as a transition",
         );
-        assert!(
-            !app.needy_msgs.contains_key(&2),
-            "pane 2's question outlived the pane",
-        );
+        assert!(!app.needy_msgs.contains_key(&2), "pane 2's question outlived the pane",);
     }
 
     /// C38: Alt+u must respect the same floor Alt+n does.
@@ -11812,11 +11943,7 @@ pub(crate) mod tests {
 
         app.apply(Action::Undo);
 
-        assert_eq!(
-            app.pane_order(),
-            before,
-            "Alt+u split a pane Alt+n had just refused to split",
-        );
+        assert_eq!(app.pane_order(), before, "Alt+u split a pane Alt+n had just refused to split",);
         assert!(
             app.flash().is_some_and(|f| f.contains("no room")),
             "the refusal is spoken, not silent: {:?}",
@@ -12044,7 +12171,11 @@ pub(crate) mod tests {
             let keys: HashSet<PaneId> = tab.panes.keys().copied().collect();
             assert_eq!(set, keys, "{ctx}: tab {i} tree ids {set:?} != panes map keys {keys:?}");
             if let Some(f) = &app.float {
-                assert!(!set.contains(&f.id), "{ctx}: tab {i} tree contains the float's id {}", f.id);
+                assert!(
+                    !set.contains(&f.id),
+                    "{ctx}: tab {i} tree contains the float's id {}",
+                    f.id
+                );
             }
             for id in ids {
                 if let Some(prev) = global.insert(id, i) {
@@ -12058,7 +12189,11 @@ pub(crate) mod tests {
         }
         // C22 rule 1: a shown float is the focused pane.
         if app.float.as_ref().is_some_and(|f| f.shown) {
-            assert!(app.float_focused(), "{ctx}: the float is shown but focus is on {}", app.focused);
+            assert!(
+                app.float_focused(),
+                "{ctx}: the float is shown but focus is on {}",
+                app.focused
+            );
         }
         // Focus is always a real pane: the float, or a pane in the tab on screen.
         assert!(
@@ -12189,7 +12324,10 @@ pub(crate) mod tests {
                         19 => ("FlipSplit", Action::FlipSplit),
                         20 => (
                             "Resize",
-                            Action::Resize { horizontal: rng.below(2) == 0, grow: rng.below(2) == 0 },
+                            Action::Resize {
+                                horizontal: rng.below(2) == 0,
+                                grow: rng.below(2) == 0,
+                            },
                         ),
                         21 => ("Undo", Action::Undo),
                         22 => ("ToggleZoom", Action::ToggleZoom),
@@ -12406,7 +12544,6 @@ pub(crate) mod tests {
         assert!(multi_tab > 1000, "generator never reached multiple tabs");
     }
 
-
     /// One principal must not be able to deny `wait` to the whole fleet.
     ///
     /// A parked waiter is freed only by firing or timing out — nothing
@@ -12439,13 +12576,7 @@ pub(crate) mod tests {
 
         // ...and the fleet can still use the verb.
         let (tx, _rx) = mpsc::channel();
-        let got = app.register_waiter(
-            Actor::Fleet,
-            vec![pane],
-            "exited",
-            Some(60_000),
-            tx,
-        );
+        let got = app.register_waiter(Actor::Fleet, vec![pane], "exited", Some(60_000), tx);
         assert_eq!(got.as_deref(), Ok("parked"), "the verb is denied to everyone else");
     }
 
@@ -12459,8 +12590,7 @@ pub(crate) mod tests {
         let (tx, _rx) = mpsc::channel();
         let huge: Vec<PaneId> = vec![pane; 20_000];
         assert!(
-            app.register_waiter(Actor::Fleet, huge, "exited", Some(60_000), tx)
-                .is_err(),
+            app.register_waiter(Actor::Fleet, huge, "exited", Some(60_000), tx).is_err(),
             "a 20,000-id wait was accepted; it is re-walked on the UI thread every frame",
         );
     }
@@ -12549,8 +12679,7 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         // A second tab, so closing it parks a whole Tab on the undo stack.
         app.apply(Action::NewTab);
-        let parked: Vec<PaneId> =
-            app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
+        let parked: Vec<PaneId> = app.ws.tabs[app.ws.active_tab].panes.keys().copied().collect();
         assert!(!parked.is_empty(), "the new tab has a pane");
 
         // Close it: its last pane going means the tab is parked whole.
@@ -12563,12 +12692,7 @@ pub(crate) mod tests {
         for _ in 0..parked.len() + 2 {
             app.apply(Action::NewPane);
         }
-        let live: Vec<PaneId> = app
-            .ws
-            .tabs
-            .iter()
-            .flat_map(|t| t.panes.keys().copied())
-            .collect();
+        let live: Vec<PaneId> = app.ws.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
         for id in &parked {
             assert!(
                 !live.contains(id),
@@ -12586,8 +12710,7 @@ pub(crate) mod tests {
                 *seen.entry(*id).or_insert(0) += 1;
             }
         }
-        let dupes: Vec<PaneId> =
-            seen.iter().filter(|(_, n)| **n > 1).map(|(id, _)| *id).collect();
+        let dupes: Vec<PaneId> = seen.iter().filter(|(_, n)| **n > 1).map(|(id, _)| *id).collect();
         assert!(
             dupes.is_empty(),
             "after reopening, pane id(s) {dupes:?} exist in two tabs at once — \
@@ -12644,10 +12767,8 @@ pub(crate) mod tests {
         .unwrap();
 
         let tick = |app: &mut App<FakePane>, agent: Option<&str>| {
-            app.runtimes.get_mut(&1).unwrap().observation = Some(crate::ports::Observation {
-                cwd: None,
-                agent: agent.map(String::from),
-            });
+            app.runtimes.get_mut(&1).unwrap().observation =
+                Some(crate::ports::Observation { cwd: None, agent: agent.map(String::from) });
             app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
             app.tick();
         };
@@ -12740,8 +12861,10 @@ pub(crate) mod tests {
         assert_eq!(app.find_spec(1).unwrap().cwd, new_dir, "the pane followed the cd");
 
         // Tick 2: the agent is up, its session file not yet written.
-        app.runtimes.get_mut(&1).unwrap().observation =
-            Some(crate::ports::Observation { cwd: Some(new_dir.clone()), agent: Some("detect".into()) });
+        app.runtimes.get_mut(&1).unwrap().observation = Some(crate::ports::Observation {
+            cwd: Some(new_dir.clone()),
+            agent: Some("detect".into()),
+        });
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
         app.tick();
         assert_eq!(
@@ -12819,7 +12942,8 @@ pub(crate) mod tests {
         }
 
         let mut panes = HashMap::new();
-        for (id, dir) in [(1 as PaneId, &a_dir), (2 as PaneId, &b_dir)] {
+        let seeds: [(PaneId, &PathBuf); 2] = [(1, &a_dir), (2, &b_dir)];
+        for (id, dir) in seeds {
             panes.insert(
                 id,
                 PaneSpec {
@@ -12893,18 +13017,50 @@ pub(crate) mod tests {
         let file_b = dir.join("b.jsonl");
         std::fs::write(&file_a, "").unwrap();
         std::fs::write(&file_b, "").unwrap();
-        std::fs::File::open(&file_a).unwrap().set_modified(base + Duration::from_millis(10)).unwrap();
-        std::fs::File::open(&file_b).unwrap().set_modified(base + Duration::from_millis(20)).unwrap();
+        std::fs::File::open(&file_a)
+            .unwrap()
+            .set_modified(base + Duration::from_millis(10))
+            .unwrap();
+        std::fs::File::open(&file_b)
+            .unwrap()
+            .set_modified(base + Duration::from_millis(20))
+            .unwrap();
 
         let mut panes = HashMap::new();
-        panes.insert(1, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
-        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "detect".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        panes.insert(
+            2,
+            PaneSpec {
+                adapter: "detect".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
         let layout = LayoutNode::Split {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],
             children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
         };
-        let ws = Workspace { version: 1, active_tab: 0, tabs: vec![Tab { name: "main".into(), layout, panes }] };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
 
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
@@ -12954,8 +13110,14 @@ pub(crate) mod tests {
         let file_b = dir.join("b.jsonl");
         std::fs::write(&file_a, "").unwrap();
         std::fs::write(&file_b, "").unwrap();
-        std::fs::File::open(&file_a).unwrap().set_modified(base + Duration::from_millis(10)).unwrap();
-        std::fs::File::open(&file_b).unwrap().set_modified(base + Duration::from_millis(20)).unwrap();
+        std::fs::File::open(&file_a)
+            .unwrap()
+            .set_modified(base + Duration::from_millis(10))
+            .unwrap();
+        std::fs::File::open(&file_b)
+            .unwrap()
+            .set_modified(base + Duration::from_millis(20))
+            .unwrap();
 
         let mut panes = HashMap::new();
         panes.insert(
@@ -12970,13 +13132,28 @@ pub(crate) mod tests {
                 noted_at: None,
             },
         );
-        panes.insert(2, PaneSpec { adapter: "detect".into(), cwd: dir.clone(), session: None, title: None, spawned_by: None, note: None, noted_at: None });
+        panes.insert(
+            2,
+            PaneSpec {
+                adapter: "detect".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
         let layout = LayoutNode::Split {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],
             children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
         };
-        let ws = Workspace { version: 1, active_tab: 0, tabs: vec![Tab { name: "main".into(), layout, panes }] };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
 
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
@@ -13022,10 +13199,8 @@ pub(crate) mod tests {
         // D5: a plain shell pane spawns with the title channel disarmed.
         assert_eq!(app.runtimes[&1].title_signal, Some(false));
         // pane 1: user cd'd to /work/proj and typed `pi`
-        app.runtimes.get_mut(&1).unwrap().observation = Some(Observation {
-            cwd: Some(PathBuf::from("/work/proj")),
-            agent: Some("pi".into()),
-        });
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(Observation { cwd: Some(PathBuf::from("/work/proj")), agent: Some("pi".into()) });
         app.observe_panes();
         let spec = app.find_spec(1).unwrap();
         assert_eq!(spec.adapter, "pi");
@@ -13153,7 +13328,10 @@ pub(crate) mod tests {
         assert!(wants_alt_hint(false, Some(Duration::from_secs(1))));
         assert!(wants_alt_hint(false, Some(ALT_HINT_WINDOW - Duration::from_millis(1))));
         assert!(!wants_alt_hint(false, Some(ALT_HINT_WINDOW)), "at the boundary, already expired");
-        assert!(!wants_alt_hint(false, Some(ALT_HINT_WINDOW + Duration::from_secs(60))), "long expired");
+        assert!(
+            !wants_alt_hint(false, Some(ALT_HINT_WINDOW + Duration::from_secs(60))),
+            "long expired"
+        );
         // One Alt key ever ends it, and it never fires with no evidence at
         // all: an untouched roost — or one that's only seen ordinary keys —
         // has nothing to warn about.
@@ -13165,9 +13343,9 @@ pub(crate) mod tests {
     fn is_alt_swallow_char_matches_the_examples_the_audit_named() {
         assert!(is_alt_swallow_char('˜')); // Option+n with Option-as-Meta off
         assert!(is_alt_swallow_char('∑')); // Option+w
-        // Plain letters — what a healthy terminal sends when Alt DOES get
-        // through (roost sees the ALT modifier bit instead) and what an
-        // unrelated keystroke looks like either way — are not evidence.
+                                           // Plain letters — what a healthy terminal sends when Alt DOES get
+                                           // through (roost sees the ALT modifier bit instead) and what an
+                                           // unrelated keystroke looks like either way — are not evidence.
         for c in 'a'..='z' {
             assert!(!is_alt_swallow_char(c), "{c:?} is not swallowed-Alt evidence");
         }
@@ -13251,7 +13429,10 @@ pub(crate) mod tests {
         app.note_key_seen(key('ç')); // e.g. Portuguese "ação", typed directly, no Alt involved
         assert!(app.show_alt_hint(), "the char alone still reads as evidence — the known tradeoff");
         app.alt_swallow_at = app.alt_swallow_at.map(|t| t - ALT_HINT_WINDOW);
-        assert!(!app.show_alt_hint(), "must self-clear, not own the row for the rest of the session");
+        assert!(
+            !app.show_alt_hint(),
+            "must self-clear, not own the row for the rest of the session"
+        );
     }
 
     /// The other half of SG1's fix: a still-broken Alt layer must keep being
@@ -13298,7 +13479,10 @@ pub(crate) mod tests {
         // "/home/nav" even though the *string* "/home/nav" is a byte-prefix
         // of it — guards against a naive str::starts_with reimplementation.
         let home = PathBuf::from("/home/nav");
-        assert_eq!(abbreviate_home(&PathBuf::from("/home/navvy/work"), Some(&home)), "/home/navvy/work");
+        assert_eq!(
+            abbreviate_home(&PathBuf::from("/home/navvy/work"), Some(&home)),
+            "/home/navvy/work"
+        );
     }
 
     /// P0-3: the exact bug — a chained error's default `Display` drops
@@ -13322,7 +13506,8 @@ pub(crate) mod tests {
     /// is never split.
     #[test]
     fn dead_reason_caps_a_long_chain_on_a_char_boundary() {
-        let err = anyhow::anyhow!("{}", "x".repeat(DEAD_REASON_CAP * 2)).context("spawning wide 日");
+        let err =
+            anyhow::anyhow!("{}", "x".repeat(DEAD_REASON_CAP * 2)).context("spawning wide 日");
         let reason = dead_reason(&err);
         assert_eq!(reason.chars().count(), DEAD_REASON_CAP);
         assert!(reason.ends_with('…'));
@@ -13766,9 +13951,9 @@ pub(crate) mod tests {
     #[test]
     fn roster_rows_sort_worst_first_reorders_both_panes_and_groups() {
         let (mut app, tab0, tab1) = roster_fixture(); // tab0=[a,b], tab1=[c,d]
-        // tab0 (earlier in tab order) is entirely quiet; tab1's *second*
-        // pane is the fleet's one ◆. Worst-first must promote tab1 to the
-        // first group, and that pane to the first row inside it.
+                                                      // tab0 (earlier in tab order) is entirely quiet; tab1's *second*
+                                                      // pane is the fleet's one ◆. Worst-first must promote tab1 to the
+                                                      // first group, and that pane to the first row inside it.
         app.find_spec_mut(tab1[1]).unwrap().adapter = "pi".into();
         app.runtimes.get_mut(&tab1[1]).unwrap().set_extension_status(AgentStatus::NeedsInput);
         app.apply(Action::ToggleRoster);
@@ -13825,7 +14010,9 @@ pub(crate) mod tests {
         app.apply(Action::ToggleRoster);
         let rows = app.roster_rows();
         assert_eq!(rows.last(), Some(&RosterRow::Pane { id: float_id }));
-        assert!(matches!(&rows[rows.len() - 2], RosterRow::Group { label } if label.contains("FLOAT")));
+        assert!(
+            matches!(&rows[rows.len() - 2], RosterRow::Group { label } if label.contains("FLOAT"))
+        );
     }
 
     /// C27: a *hidden* float is still fleet, so it is still a row. C19's
@@ -14041,7 +14228,11 @@ pub(crate) mod tests {
             app.handle_mode_key(KeyEvent::from(KeyCode::Char(c)));
         }
         assert_eq!(roster_panes(&app), vec![tab1[0]], "must satisfy both filters");
-        assert_eq!(app.roster_rows().len(), 2, "tab0's group — its ◆ fails the text filter — drops whole");
+        assert_eq!(
+            app.roster_rows().len(),
+            2,
+            "tab0's group — its ◆ fails the text filter — drops whole"
+        );
 
         // Widen the text filter back: the status filter alone still narrows.
         for _ in 0..7 {
@@ -14076,8 +14267,7 @@ pub(crate) mod tests {
     #[test]
     fn roster_entry_chord_and_esc_both_close_it() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let chord =
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let chord = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::SHIFT);
 
         let (mut app, ..) = roster_fixture();
         app.apply(Action::ToggleRoster);
@@ -14233,12 +14423,8 @@ pub(crate) mod tests {
         app.apply(Action::ClosePane); // confirms
         assert!(app.quit, "the second press quits");
 
-        let spec = app
-            .ws
-            .tabs[0]
-            .panes
-            .get(&1)
-            .expect("the pane roost quit on is still in the workspace");
+        let spec =
+            app.ws.tabs[0].panes.get(&1).expect("the pane roost quit on is still in the workspace");
         assert_eq!(spec.adapter, "claude");
         assert_eq!(spec.cwd, PathBuf::from("/repos/important"));
         assert_eq!(spec.session.as_deref(), Some("11111111-2222-3333-4444-555555555555"));
@@ -14452,7 +14638,11 @@ pub(crate) mod tests {
                 "pane {id} got the message, submitted",
             );
         }
-        assert!(app.flash().unwrap_or_default().contains("broadcast to 3 panes"), "{:?}", app.flash());
+        assert!(
+            app.flash().unwrap_or_default().contains("broadcast to 3 panes"),
+            "{:?}",
+            app.flash()
+        );
     }
 
     /// C36's safety affordance is the *visible target count*, so the count
@@ -14482,7 +14672,11 @@ pub(crate) mod tests {
         }
         press(&mut app, crossterm::event::KeyCode::Enter);
 
-        assert!(app.flash().unwrap_or_default().contains("broadcast to 1 pane"), "{:?}", app.flash());
+        assert!(
+            app.flash().unwrap_or_default().contains("broadcast to 1 pane"),
+            "{:?}",
+            app.flash()
+        );
         for id in order {
             let got = app.runtimes.get(&id).unwrap().input.ends_with(b"only you\r");
             assert_eq!(got, id == marked, "pane {id} received iff it was targeted");
@@ -14542,7 +14736,11 @@ pub(crate) mod tests {
         let ctl: Vec<&FeedEntry> =
             app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
         assert_eq!(ctl.len(), 1, "exactly one ctl line, as the control path also guarantees");
-        assert!(ctl[0].text.contains("local"), "attributed to the human, not the fleet: {:?}", ctl[0].text);
+        assert!(
+            ctl[0].text.contains("local"),
+            "attributed to the human, not the fleet: {:?}",
+            ctl[0].text
+        );
     }
 
     /// C12/U8, and the highest-severity thing the C36 audit found: the
@@ -14562,7 +14760,10 @@ pub(crate) mod tests {
         app.handle_paste("pasted");
         for id in app.pane_order() {
             let got = String::from_utf8_lossy(&app.runtimes.get(&id).unwrap().input).into_owned();
-            assert!(!got.contains("pasted"), "pane {id} must not receive a paste meant for the dialog");
+            assert!(
+                !got.contains("pasted"),
+                "pane {id} must not receive a paste meant for the dialog"
+            );
         }
         assert_eq!(app.focused, focused, "and focus did not move beneath it");
     }
@@ -14673,11 +14874,7 @@ pub(crate) mod tests {
 
         app.apply(Action::FocusAlternate);
         assert_eq!(app.focused, 1, "focus did not move to the closed pane");
-        assert!(
-            app.flash().unwrap_or_default().contains("has closed"),
-            "{:?}",
-            app.flash()
-        );
+        assert!(app.flash().unwrap_or_default().contains("has closed"), "{:?}", app.flash());
     }
 
     // ---- C33: move a pane within its tab (Alt+Shift+hjkl) ---------------
@@ -14754,10 +14951,7 @@ pub(crate) mod tests {
             before,
             "and nothing behind it moved",
         );
-        assert_eq!(
-            app.flash(),
-            Some("the scratch pane sits outside the layout"),
-        );
+        assert_eq!(app.flash(), Some("the scratch pane sits outside the layout"),);
     }
 
     /// C38: the edge no-op **says so**, and horizontally it names the chord
@@ -14887,12 +15081,8 @@ pub(crate) mod tests {
         // A full lap of Tab, from every starting point.
         let mut seen = Vec::new();
         for _ in 0..ROSTER_STATUS_CYCLE.len() + 2 {
-            app.handle_mode_key(crossterm::event::KeyEvent::from(
-                crossterm::event::KeyCode::Tab,
-            ));
-            let Mode::Broadcast { status_filter, .. } = app.mode else {
-                panic!("still composing")
-            };
+            app.handle_mode_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab));
+            let Mode::Broadcast { status_filter, .. } = app.mode else { panic!("still composing") };
             seen.push(status_filter);
         }
         assert!(
@@ -14942,9 +15132,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleRoster);
         let mut seen = Vec::new();
         for _ in 0..ROSTER_STATUS_CYCLE.len() {
-            app.handle_mode_key(crossterm::event::KeyEvent::from(
-                crossterm::event::KeyCode::Tab,
-            ));
+            app.handle_mode_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab));
             let Mode::Roster { status_filter, .. } = app.mode else { panic!("still rostering") };
             seen.push(status_filter);
         }
@@ -15269,11 +15457,23 @@ pub(crate) mod tests {
         for id in [1u64, 2, 3] {
             panes.insert(
                 id,
-                PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
+                PaneSpec {
+                    adapter: "shell".into(),
+                    cwd: "/tmp".into(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
             );
         }
         let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
-        let ws = Workspace { version: 1, active_tab: 0, tabs: vec![Tab { name: "main".into(), layout, panes }] };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
         let (mut app, _) = mk_app(ws);
         app.focused = 3; // a collapsed member — expanded is currently 0 (pane 1)
 
@@ -15351,12 +15551,24 @@ pub(crate) mod tests {
             for &id in ids {
                 panes.insert(
                     id,
-                    PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None },
+                    PaneSpec {
+                        adapter: "shell".into(),
+                        cwd: "/tmp".into(),
+                        session: None,
+                        title: None,
+                        spawned_by: None,
+                        note: None,
+                        noted_at: None,
+                    },
                 );
             }
             let children = ids.iter().map(|&id| LayoutNode::Pane(id)).collect::<Vec<_>>();
             let n = children.len() as f32;
-            let layout = LayoutNode::Split { dir: SplitDir::Vertical, ratios: vec![1.0 / n; children.len()], children };
+            let layout = LayoutNode::Split {
+                dir: SplitDir::Vertical,
+                ratios: vec![1.0 / n; children.len()],
+                children,
+            };
             (layout, panes)
         }
         let (layout0, panes0) = row(&[1, 2]);
@@ -15414,7 +15626,10 @@ pub(crate) mod tests {
 
         app.apply(Action::Focus(layout::Dir::Left)); // off the left edge of the first tab
         assert_eq!(app.ws.active_tab, 2, "wraps backward past the first tab");
-        assert_eq!(app.focused, last_tabs_pane, "back on the tab it started from, and its only pane");
+        assert_eq!(
+            app.focused, last_tabs_pane,
+            "back on the tab it started from, and its only pane"
+        );
     }
 
     /// Below two tabs this is exactly the pre-existing dead end: `neighbor`
@@ -15479,7 +15694,10 @@ pub(crate) mod tests {
 
         app.set_focus(1); // the full-width top pane: touches both x edges, but shares the tab
         app.apply(Action::Focus(layout::Dir::Right));
-        assert_eq!(app.ws.active_tab, tab_before, "full width but not the tab's only pane — not an edge");
+        assert_eq!(
+            app.ws.active_tab, tab_before,
+            "full width but not the tab's only pane — not an edge"
+        );
         assert_eq!(app.focused, 1);
         assert_eq!(app.flash(), Some("full-width pane — nothing to cross into"));
         app.apply(Action::Focus(layout::Dir::Left));
@@ -15503,7 +15721,15 @@ pub(crate) mod tests {
     #[test]
     fn cross_tab_focus_lands_on_the_already_expanded_stack_member_at_the_destination() {
         fn spec() -> PaneSpec {
-            PaneSpec { adapter: "shell".into(), cwd: "/tmp".into(), session: None, title: None, spawned_by: None, note: None, noted_at: None }
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: "/tmp".into(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            }
         }
         let mut panes0 = HashMap::new();
         panes0.insert(1, spec());
@@ -15542,7 +15768,10 @@ pub(crate) mod tests {
         match &app.ws.tabs[1].layout {
             LayoutNode::Split { children, .. } => match &children[1] {
                 LayoutNode::Stack { expanded, children } => {
-                    assert_eq!(children[*expanded], 22, "the stack's shape is untouched — still 22 expanded")
+                    assert_eq!(
+                        children[*expanded], 22,
+                        "the stack's shape is untouched — still 22 expanded"
+                    )
                 }
                 other => panic!("expected the stack, got {other:?}"),
             },
@@ -15654,10 +15883,7 @@ pub(crate) mod tests {
         assert_eq!(app.focused, moved);
         // No undo record: the pane is alive over here, and resurrecting the
         // tab around it would duplicate it.
-        assert!(
-            !app.undo.iter().any(|c| matches!(c, Closed::Tab { .. })),
-            "a move is not a close",
-        );
+        assert!(!app.undo.iter().any(|c| matches!(c, Closed::Tab { .. })), "a move is not a close",);
     }
 
     /// Both refusals are flashed, not silent, and neither disturbs anything:
@@ -15675,11 +15901,7 @@ pub(crate) mod tests {
         app.apply(Action::MovePaneToTab { forward: true });
         assert_eq!(app.focused, float_id, "the float is still where it was");
         assert!(app.is_float(float_id));
-        assert!(
-            app.flash.as_ref().is_some_and(|(m, ..)| m.contains("scratch")),
-            "{:?}",
-            app.flash
-        );
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("scratch")), "{:?}", app.flash);
     }
 
     /// C21: a move is a tab change, so it exits zoom — the invariant that
@@ -15905,10 +16127,8 @@ pub(crate) mod tests {
         app.apply(Action::NewPane); // panes 1|2, focus=2
         app.apply(Action::ToggleZoom); // zoom on pane 2
         let ct = app.control_token().to_string();
-        let reply = app.handle_control(Request {
-            token: ct,
-            method: Method::Close { pane: 1, force: false },
-        });
+        let reply = app
+            .handle_control(Request { token: ct, method: Method::Close { pane: 1, force: false } });
         assert!(matches!(reply, Reply::Ok { .. }));
         assert!(app.zoomed(), "closing an unrelated pane must not touch an unrelated zoom");
     }
@@ -15947,7 +16167,10 @@ pub(crate) mod tests {
         app.apply(Action::NewPane); // 3 panes total
 
         app.apply(Action::CycleLayout { forward: true });
-        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+        assert!(matches!(
+            app.ws.tabs[0].layout,
+            LayoutNode::Split { dir: SplitDir::Horizontal, .. }
+        ));
 
         app.apply(Action::CycleLayout { forward: true });
         match &app.ws.tabs[0].layout {
@@ -15959,7 +16182,10 @@ pub(crate) mod tests {
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
 
         app.apply(Action::CycleLayout { forward: true }); // wraps back to grid
-        assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+        assert!(matches!(
+            app.ws.tabs[0].layout,
+            LayoutNode::Split { dir: SplitDir::Horizontal, .. }
+        ));
     }
 
     #[test]
@@ -16054,7 +16280,8 @@ pub(crate) mod tests {
         app.apply(Action::Undo);
 
         assert_eq!(app.ws.tabs.len(), 2);
-        let restored = app.ws.tabs.iter().find(|t| t.name == "fleet").expect("tab reopened by name");
+        let restored =
+            app.ws.tabs.iter().find(|t| t.name == "fleet").expect("tab reopened by name");
         assert_eq!(restored.panes.len(), 3);
         let sessions: std::collections::HashSet<Option<String>> =
             restored.panes.values().map(|s| s.session.clone()).collect();
@@ -16391,7 +16618,7 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         let id = app.pane_order()[0];
         app.apply(Action::NewPane); // focus moves off pane `id`
-        // Seed the diff baseline so the ◆ below logs as a transition.
+                                    // Seed the diff baseline so the ◆ below logs as a transition.
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
         app.tick();
 
@@ -16538,8 +16765,14 @@ pub(crate) mod tests {
             tx,
         );
         let _ = rx.recv().unwrap();
-        let ctl_lines: Vec<&FeedEntry> = app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
-        assert_eq!(ctl_lines.len(), 1, "exactly one ctl feed line per audited call: {:?}", app.feed());
+        let ctl_lines: Vec<&FeedEntry> =
+            app.feed().iter().filter(|e| e.text.starts_with("ctl ")).collect();
+        assert_eq!(
+            ctl_lines.len(),
+            1,
+            "exactly one ctl feed line per audited call: {:?}",
+            app.feed()
+        );
         assert!(
             ctl_lines[0].text.contains("fleet: spawn adapter=shell → ok"),
             "{}",
@@ -16852,7 +17085,10 @@ pub(crate) mod tests {
         app.runtimes.get_mut(&1).unwrap().set_extension_status(AgentStatus::NeedsInput);
         app.apply(Action::ToggleFloat); // float focused, prev_focus = 2
         app.apply(Action::JumpAttention);
-        assert_eq!(app.focused, real_pane, "Alt+a from the float returns to prev_focus, not a ring jump");
+        assert_eq!(
+            app.focused, real_pane,
+            "Alt+a from the float returns to prev_focus, not a ring jump"
+        );
         assert!(!app.float.as_ref().unwrap().shown);
     }
 
@@ -16906,7 +17142,10 @@ pub(crate) mod tests {
 
         assert_eq!(app.ws.tabs[0].panes.len(), real_panes_before + 1);
         let order = app.pane_order();
-        assert!(order.contains(&1) && order.contains(&2), "original panes must stay reachable: {order:?}");
+        assert!(
+            order.contains(&1) && order.contains(&2),
+            "original panes must stay reachable: {order:?}"
+        );
         assert!(!app.float.as_ref().unwrap().shown);
     }
 
@@ -16929,7 +17168,10 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         assert!(app.float.as_ref().unwrap().shown);
         app.apply(Action::QuickLaunch);
-        assert!(app.float.as_ref().unwrap().shown, "opening the picker alone must not hide the float");
+        assert!(
+            app.float.as_ref().unwrap().shown,
+            "opening the picker alone must not hide the float"
+        );
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter)); // launches the first item
         assert!(!app.float.as_ref().unwrap().shown, "picker launch (C22 rule 3) hides it");
         let order = app.pane_order();
@@ -16950,8 +17192,14 @@ pub(crate) mod tests {
         });
         assert!(matches!(reply, Reply::Ok { .. }));
         let order = app.pane_order();
-        assert!(order.contains(&1) && order.contains(&2), "control spawn must not wipe the tab layout: {order:?}");
-        assert_eq!(app.focused, float_id, "the human's focus/float must be undisturbed by a control spawn");
+        assert!(
+            order.contains(&1) && order.contains(&2),
+            "control spawn must not wipe the tab layout: {order:?}"
+        );
+        assert_eq!(
+            app.focused, float_id,
+            "the human's focus/float must be undisturbed by a control spawn"
+        );
     }
 
     #[test]
@@ -17083,8 +17331,10 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
         let ct = app.control_token().to_string();
-        let reply =
-            app.handle_control(Request { token: ct, method: Method::Close { pane: float_id, force: true } });
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Close { pane: float_id, force: true },
+        });
         match reply {
             Reply::Err { err } => assert_eq!(err, "cannot close the scratch pane"),
             other => panic!("expected refusal, got {other:?}"),
@@ -17113,9 +17363,14 @@ pub(crate) mod tests {
             Reply::Err { err } => assert_eq!(err, "cannot send to the scratch pane"),
             other => panic!("expected refusal, got {other:?}"),
         }
-        assert!(app.runtimes.get(&float_id).unwrap().input.is_empty(), "nothing must reach the float");
-        let reply =
-            app.handle_control(Request { token: ct, method: Method::Read { pane: float_id, mode: ReadMode::Screen } });
+        assert!(
+            app.runtimes.get(&float_id).unwrap().input.is_empty(),
+            "nothing must reach the float"
+        );
+        let reply = app.handle_control(Request {
+            token: ct,
+            method: Method::Read { pane: float_id, mode: ReadMode::Screen },
+        });
         match reply {
             Reply::Err { err } => assert_eq!(err, "cannot read the scratch pane"),
             other => panic!("expected refusal, got {other:?}"),
@@ -17132,8 +17387,8 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
         let ct = app.control_token().to_string();
-        let reply =
-            app.handle_control(Request { token: ct, method: Method::Status { pane: Some(float_id) } });
+        let reply = app
+            .handle_control(Request { token: ct, method: Method::Status { pane: Some(float_id) } });
         match reply {
             Reply::Err { err } => assert_eq!(err, "cannot get the status of the scratch pane"),
             other => panic!("expected refusal, got {other:?}"),
@@ -17151,8 +17406,8 @@ pub(crate) mod tests {
         let float_id = app.focused;
         let panes_before = app.runtimes.len();
         let ct = app.control_token().to_string();
-        let reply =
-            app.handle_control(Request { token: ct, method: Method::Fork { pane: Some(float_id) } });
+        let reply = app
+            .handle_control(Request { token: ct, method: Method::Fork { pane: Some(float_id) } });
         match reply {
             Reply::Err { err } => assert_eq!(err, "cannot fork the scratch pane"),
             other => panic!("expected refusal, got {other:?}"),
@@ -17174,7 +17429,11 @@ pub(crate) mod tests {
         app.handle_control_msg(
             Request {
                 token: ct,
-                method: Method::Wait { panes: vec![float_id], until: "idle".into(), timeout_ms: None },
+                method: Method::Wait {
+                    panes: vec![float_id],
+                    until: "idle".into(),
+                    timeout_ms: None,
+                },
             },
             tx,
         );
@@ -17207,7 +17466,11 @@ pub(crate) mod tests {
         app.handle_control_msg(
             Request {
                 token: ct.clone(),
-                method: Method::Wait { panes: vec![2], until: "idle".into(), timeout_ms: Some(60_000) },
+                method: Method::Wait {
+                    panes: vec![2],
+                    until: "idle".into(),
+                    timeout_ms: Some(60_000),
+                },
             },
             tx,
         );
@@ -17217,7 +17480,8 @@ pub(crate) mod tests {
         // Pane 2 (highest id) closes, freeing its id, and the float —
         // spawned fresh, so it starts idle same as any shell pane —
         // recycles it.
-        let close = app.handle_control(Request { token: ct, method: Method::Close { pane: 2, force: true } });
+        let close = app
+            .handle_control(Request { token: ct, method: Method::Close { pane: 2, force: true } });
         assert!(matches!(close, Reply::Ok { .. }), "{close:?}");
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
@@ -17237,7 +17501,8 @@ pub(crate) mod tests {
         let ct = app.control_token().to_string();
         let reply = app.handle_control(Request { token: ct, method: Method::List });
         let Reply::Ok { ok } = reply else { panic!("expected ok") };
-        let ids: Vec<u64> = ok.as_array().unwrap().iter().map(|v| v["pane"].as_u64().unwrap()).collect();
+        let ids: Vec<u64> =
+            ok.as_array().unwrap().iter().map(|v| v["pane"].as_u64().unwrap()).collect();
         assert!(!ids.contains(&float_id));
     }
 
@@ -17533,17 +17798,9 @@ pub(crate) mod tests {
             ),
             (
                 "Broadcast",
-                Mode::Broadcast {
-                    lines: vec![String::new()],
-                    row: 0,
-                    col: 0,
-                    status_filter: None,
-                },
+                Mode::Broadcast { lines: vec![String::new()], row: 0, col: 0, status_filter: None },
             ),
-            (
-                "Picker",
-                Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
-            ),
+            ("Picker", Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false }),
             ("Scroll", Mode::Scroll),
             ("Copy", Mode::Copy { cursor: (0, 0) }),
             ("Help", Mode::Help { top: 0, filter: None }),
@@ -17651,8 +17908,7 @@ pub(crate) mod tests {
     #[test]
     fn the_only_alt_chords_a_mode_keeps_are_the_two_c24b_names() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut codes: Vec<KeyCode> =
-            (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
+        let mut codes: Vec<KeyCode> = (0x20u8..=0x7e).map(|b| KeyCode::Char(b as char)).collect();
         codes.extend([
             KeyCode::Enter,
             KeyCode::PageUp,

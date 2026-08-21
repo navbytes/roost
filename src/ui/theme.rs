@@ -308,7 +308,8 @@ mod tests {
         assert_eq!(spinner_frame(Duration::from_millis(79)), SPINNER_FRAMES[0]);
         assert_eq!(spinner_frame(Duration::from_millis(80)), SPINNER_FRAMES[1]);
         assert_eq!(spinner_frame(Duration::from_millis(795)), SPINNER_FRAMES[9]);
-        assert_eq!(spinner_frame(Duration::from_millis(800)), SPINNER_FRAMES[0]); // wraps
+        assert_eq!(spinner_frame(Duration::from_millis(800)), SPINNER_FRAMES[0]);
+        // wraps
     }
 
     #[test]
@@ -322,7 +323,9 @@ mod tests {
 
     #[test]
     fn only_working_spins() {
-        for s in [AgentStatus::NeedsInput, AgentStatus::Waiting, AgentStatus::Idle, AgentStatus::Exited] {
+        for s in
+            [AgentStatus::NeedsInput, AgentStatus::Waiting, AgentStatus::Idle, AgentStatus::Exited]
+        {
             assert!(!status_style(s).2, "{s:?} must not animate");
         }
     }

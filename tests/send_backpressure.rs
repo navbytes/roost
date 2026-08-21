@@ -59,8 +59,7 @@ fn roost_cli(state_dir: &std::path::Path, args: &[&str], timeout: Duration) -> O
 fn a_send_to_a_pane_that_never_reads_leaves_roost_fully_alive() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let Some(mut h) =
-        harness::spawn_or_skip("send-backpressure gate", &harness::one_pane(cwd))
+    let Some(mut h) = harness::spawn_or_skip("send-backpressure gate", &harness::one_pane(cwd))
     else {
         return;
     };

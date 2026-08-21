@@ -1,0 +1,15 @@
+# Revisions that changed formatting only, and should not show up in blame.
+#
+# Use them:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# (GitHub honours this file automatically.) Add a commit here only when it
+# is *purely* mechanical — `cargo fmt` and nothing else — so that ignoring
+# it can never hide a real change.
+
+# The SHA below is added *after* the reformat lands on `main`, not before:
+# this repository squash-merges, so the commit hash on the PR branch is not
+# the hash that ends up in history.
+#
+# chore: apply rustfmt (adopting rustfmt.toml) — SHA added on merge

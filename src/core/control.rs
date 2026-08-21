@@ -394,8 +394,7 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"token":"t","method":"list"}"#).unwrap().method,
             Method::List
         ));
-        let r: Request =
-            serde_json::from_str(r#"{"token":"t","method":"read","pane":1}"#).unwrap();
+        let r: Request = serde_json::from_str(r#"{"token":"t","method":"read","pane":1}"#).unwrap();
         assert!(matches!(r.method, Method::Read { mode: ReadMode::Screen, .. }));
     }
 

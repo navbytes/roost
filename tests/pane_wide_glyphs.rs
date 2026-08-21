@@ -77,9 +77,7 @@ fn wide_glyphs_reach_the_host_intact_and_own_two_columns_each() {
     let mut checked = 0;
     for col in 0..cols {
         let Some(cell) = screen.cell(row, col) else { continue };
-        if ![CJK[..3].to_string(), VS16.to_string(), EMOJI.to_string()]
-            .contains(&cell.contents())
-        {
+        if ![CJK[..3].to_string(), VS16.to_string(), EMOJI.to_string()].contains(&cell.contents()) {
             continue;
         }
         assert!(

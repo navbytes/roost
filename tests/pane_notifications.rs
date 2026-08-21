@@ -32,11 +32,7 @@ fn cli_status(state_dir: &std::path::Path) -> String {
         .env_remove("ROOST_CONTROL_TOKEN")
         .output()
         .expect("run roost status");
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
 #[test]
@@ -57,9 +53,8 @@ fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     // Half one: roost forwards the notification to its host terminal, so the
     // desktop notification the app asked for actually happens. `ESC ]9;`
     // never appeared anywhere in the captured stream before this landed.
-    let saw_osc9 = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
-        b.windows(4).any(|w| w == b"\x1b]9;")
-    });
+    let saw_osc9 =
+        h.wait_for_host_bytes(Duration::from_secs(5), |b| b.windows(4).any(|w| w == b"\x1b]9;"));
     assert!(
         saw_osc9,
         "roost never re-emitted an OSC 9 to the host; captured tail:\n{}",

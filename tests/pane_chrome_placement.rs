@@ -21,9 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// whole first row. Two carry parking notes; one is titled and one is not,
 /// so both C4 name forms are on screen at once.
 fn four_panes(cwd: &str, now: u64) -> String {
-    let plain = |title: &str| {
-        serde_json::json!({"adapter": "shell", "cwd": cwd, "title": title})
-    };
+    let plain = |title: &str| serde_json::json!({"adapter": "shell", "cwd": cwd, "title": title});
     let noted = |title: &str, note: &str| {
         serde_json::json!({"adapter": "shell", "cwd": cwd, "title": title,
                            "note": note, "noted_at": now - 7200})
@@ -50,8 +48,7 @@ fn roost_draws_no_chrome_on_a_panes_first_content_row() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let Some(mut h) = harness::spawn_or_skip("pane chrome placement", &four_panes(cwd, now))
-    else {
+    let Some(mut h) = harness::spawn_or_skip("pane chrome placement", &four_panes(cwd, now)) else {
         return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
@@ -88,9 +85,7 @@ fn roost_draws_no_chrome_on_a_panes_first_content_row() {
     let screen = h.screen();
     let (rows, cols) = screen.size();
     let row_text = |r: u16| -> String {
-        (0..cols)
-            .filter_map(|c| screen.cell(r, c).map(|x| x.contents()))
-            .collect()
+        (0..cols).filter_map(|c| screen.cell(r, c).map(|x| x.contents())).collect()
     };
 
     // Find the frame rather than assume it: the panes' top border is the row

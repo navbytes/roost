@@ -25,10 +25,7 @@ fn match_agent(cmdline_args: impl Iterator<Item = String>, known: &[String]) -> 
         if arg.is_empty() {
             continue;
         }
-        let base = std::path::Path::new(&arg)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&arg);
+        let base = std::path::Path::new(&arg).file_name().and_then(|s| s.to_str()).unwrap_or(&arg);
         if let Some(a) = known.iter().find(|a| a.as_str() == base) {
             return Some(a.clone());
         }
@@ -134,6 +131,10 @@ mod platform {
 
     /// The process's current working directory, straight from the kernel.
     fn cwd_of(pid: u32) -> Option<PathBuf> {
+        // SAFETY: `proc_vnodepathinfo` is a plain C struct of integers and
+        // fixed-size char arrays — no references, no `NonNull`, no enums —
+        // so all-zeroes is a valid value for it, and `proc_pidinfo` below
+        // overwrites the part it fills.
         let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
         let want = std::mem::size_of::<libc::proc_vnodepathinfo>() as c_int;
         // SAFETY: out-pointer to a local of exactly the size we declare, and
@@ -331,10 +332,8 @@ mod platform {
         /// argv basename — the `node .../pi` case, one level down.
         #[test]
         fn finds_a_known_agent_in_a_child_process() {
-            let mut child = std::process::Command::new("/bin/sleep")
-                .arg("30")
-                .spawn()
-                .expect("spawn sleep");
+            let mut child =
+                std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
             let kid = child.id();
             // The kernel lists it immediately; no settling needed.
             assert!(child_pids(std::process::id()).contains(&kid), "child not listed");

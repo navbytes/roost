@@ -65,8 +65,5 @@ fn a_backgrounded_job_in_a_pane_does_not_survive_quit() {
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
 
     let left = survivors(&before, Duration::from_millis(1500));
-    assert!(
-        left.is_empty(),
-        "these survived the quit: {left:?} (the backgrounded job was {bg})",
-    );
+    assert!(left.is_empty(), "these survived the quit: {left:?} (the backgrounded job was {bg})",);
 }

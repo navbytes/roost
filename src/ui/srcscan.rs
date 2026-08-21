@@ -176,10 +176,7 @@ mod tests {
     fn the_cut_recognizes_a_module_at_any_visibility() {
         for vis in ["", "pub ", "pub(crate) ", "pub(super) ", "pub(in crate::ui) "] {
             let text = format!("fn shipped() {{}}\n#[cfg(test)]\n{vis}mod tests {{ }}\n");
-            assert!(
-                !production(&text).contains("mod tests"),
-                "the cut missed `{vis}mod tests`",
-            );
+            assert!(!production(&text).contains("mod tests"), "the cut missed `{vis}mod tests`",);
         }
         // ...and it still fires only on a module, not on a test-gated item.
         let item = "fn shipped() {}\n#[cfg(test)]\nfn helper() {}\nfn also_shipped() {}\n";

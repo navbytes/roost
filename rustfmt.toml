@@ -1,0 +1,35 @@
+# The house style, written down rather than imposed.
+#
+# roost was hand-formatted for its whole life, and this file is the closest
+# rustfmt configuration to what is already in the tree — chosen by measuring,
+# not by taste. Over `src/` and `tests/`:
+#
+#     max_width = 100                             1,632 hunks
+#     max_width = 100 + use_small_heuristics=Max     556 hunks
+#     max_width = 110 + use_small_heuristics=Max     773 hunks
+#
+# So the tree was written to ~100 columns with everything that fits on one
+# line kept on one line, and `Max` is what tells rustfmt that. Adopting it
+# cost one mechanical reformat (see `.git-blame-ignore-revs`) instead of the
+# three times larger one the default heuristics would have.
+max_width = 100
+
+# Keep an expression on one line whenever it fits inside `max_width`, rather
+# than at rustfmt's much narrower per-construct defaults (a struct literal at
+# 18 columns, a function call at 60). This single setting is what makes the
+# formatter agree with the dense, one-idea-per-line style the codebase
+# already uses — and, on the evidence above, it is the style the codebase
+# already had.
+use_small_heuristics = "Max"
+
+# Deliberately stable options only. This crate pins `rust-version = "1.89"`
+# and CI runs stable rustfmt, where a nightly-only key (`wrap_comments`,
+# `imports_granularity`, `group_imports`, `format_code_in_doc_comments`) is
+# *silently ignored* — a formatting rule nobody enforces is worse than no
+# rule, because it reads like one.
+#
+# `vendor/vt100` is untouched by all of this: it is a path dependency rather
+# than a workspace member, so `cargo fmt` and `cargo clippy` never reach it.
+# That is the intent — it is third-party code carrying roost patches, and
+# reformatting it would bury those patches in noise the next time it is
+# diffed against upstream.

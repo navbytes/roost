@@ -109,9 +109,9 @@ impl AgentAdapter for GeminiAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::{scratch_dir, RootAdapter};
     use super::super::SessionState;
+    use super::*;
     use std::collections::HashSet;
     use std::time::{Duration, SystemTime};
 
@@ -179,7 +179,8 @@ mod tests {
         assert_eq!(GeminiAdapter.session_id_from_path(&subagent), None);
         // Legacy `.json` (not `.jsonl`) — intentionally unhandled.
         let legacy = d.join("session-2026-08-06T10-30-a1b2c3d4.json");
-        std::fs::write(&legacy, "{\"sessionId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\"}").unwrap();
+        std::fs::write(&legacy, "{\"sessionId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\"}")
+            .unwrap();
         assert_eq!(GeminiAdapter.session_id_from_path(&legacy), None);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -228,8 +229,12 @@ mod tests {
         let d = scratch_dir("gemini-detect");
         let since = SystemTime::now();
         let file = d.join("session-2026-08-06T10-30-a1b2c3d4.jsonl");
-        std::fs::write(&file, "{\"sessionId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\"}\n").unwrap();
-        std::fs::File::open(&file).unwrap().set_modified(since + Duration::from_millis(10)).unwrap();
+        std::fs::write(&file, "{\"sessionId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\"}\n")
+            .unwrap();
+        std::fs::File::open(&file)
+            .unwrap()
+            .set_modified(since + Duration::from_millis(10))
+            .unwrap();
 
         let a = fixture(d.clone());
         assert_eq!(

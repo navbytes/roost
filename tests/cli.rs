@@ -252,8 +252,7 @@ fn wait_timeout_exits_nonzero_and_distinct_from_runtime_and_usage_errors() {
 fn oversized_request_gets_a_true_diagnosis_and_leaves_the_instance_alive() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let Some(mut h) =
-        harness::spawn_or_skip("oversized-request gate", &harness::one_pane(cwd))
+    let Some(mut h) = harness::spawn_or_skip("oversized-request gate", &harness::one_pane(cwd))
     else {
         return;
     };
@@ -274,7 +273,10 @@ fn oversized_request_gets_a_true_diagnosis_and_leaves_the_instance_alive() {
     // The actual regression risk: the instance must still be fully alive —
     // a subsequent `list`, on a brand new connection, must still succeed.
     let after = cli_in(h.state_dir(), &["list"]);
-    assert!(after.status.success(), "control plane stopped answering after the oversized request: {after:?}");
+    assert!(
+        after.status.success(),
+        "control plane stopped answering after the oversized request: {after:?}"
+    );
 
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }

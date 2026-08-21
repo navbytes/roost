@@ -20,6 +20,47 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # Formatting and lints are properties of the source, not of the platform,
+  # so they run once here rather than twice inside the OS matrix below. Cheap
+  # and first: a run that is going to fail `cargo fmt --check` should say so
+  # in twenty seconds, not after two full test matrices.
+  #
+  # Note for whoever administers branch protection: this job is *not* one of
+  # the required checks on `main` (those are the two matrix jobs). Add it to
+  # the required set to make it binding — until then it reports, loudly, but
+  # does not block.
+  lint:
+    runs-on: ubuntu-latest
+    # Pinned, and pinned *here only*. `-D warnings` against a moving `stable`
+    # means a clippy release can turn a green branch red with no code change,
+    # and — the way this was actually found — a developer whose local
+    # toolchain has drifted cannot reproduce the failure at all. Two lints
+    # this repo now passes (`sort_by_key`, `needless_return` on the Linux-only
+    # half of `infra::qos`) simply do not exist in clippy 0.1.89.
+    #
+    # Deliberately not a repo-wide `rust-toolchain.toml`: that would also pin
+    # what `cargo build`, the test matrix and — worst — `release.yml`'s
+    # four-target build compile with, and the release path is the one thing
+    # here that cannot be rehearsed. Lint determinism is worth a pin; build
+    # determinism is not worth that risk. Bump this when a new stable lands
+    # and its findings have been dealt with; nothing else moves with it.
+    env:
+      LINT_TOOLCHAIN: "1.96.1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$LINT_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+      # `--check` rather than a formatting commit: CI reports, it does not
+      # rewrite. The house style lives in `rustfmt.toml`, which documents why
+      # its two settings are what they are.
+      - run: cargo "+$LINT_TOOLCHAIN" fmt --check
+      # `-D warnings` is what makes `Cargo.toml`'s `[lints]` tables binding.
+      # `--all-targets` so tests and integration tests are linted too — the
+      # PTY harness under `tests/` is real code that drives the real binary,
+      # and it has caught real bugs. `vendor/vt100` is a path dependency
+      # rather than a workspace member, so clippy never reaches it, which is
+      # deliberate: it is third-party code carrying roost patches.
+      - run: cargo "+$LINT_TOOLCHAIN" clippy --all-targets -- -D warnings
+
   test:
     # Both, deliberately: the PTY integration tests under tests/ drive the real
     # binary through a real pty, and several have only ever been run on one

@@ -90,8 +90,13 @@ mod tests {
     fn two_projects_differing_only_in_punctuation_must_not_share_sessions() {
         let a = PiAdapter;
         // pi's own directory encoding for /home/me/my-project.
-        let f = Path::new("/h/.pi/agent/sessions/-home-me-my-project/2026-01-01T00-00-00-000Z_aaaa.jsonl");
-        assert!(a.owns_session_file(f, Path::new("/home/me/my-project")), "its own project matches");
+        let f = Path::new(
+            "/h/.pi/agent/sessions/-home-me-my-project/2026-01-01T00-00-00-000Z_aaaa.jsonl",
+        );
+        assert!(
+            a.owns_session_file(f, Path::new("/home/me/my-project")),
+            "its own project matches"
+        );
         assert!(
             !a.owns_session_file(f, Path::new("/home/me/myproject")),
             "a different project whose path differs only by a dash must NOT match",

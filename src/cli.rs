@@ -245,7 +245,11 @@ fn run(args: &[String]) -> i32 {
                 // resolved normally.
                 let timed_out =
                     verb == "wait" && ok.get("timed_out") == Some(&serde_json::Value::Bool(true));
-                if timed_out { EXIT_WAIT_TIMEOUT } else { 0 }
+                if timed_out {
+                    EXIT_WAIT_TIMEOUT
+                } else {
+                    0
+                }
             } else {
                 let err = reply.get("err").and_then(|e| e.as_str()).unwrap_or("unknown error");
                 eprintln!("roost: {err}");
@@ -253,7 +257,11 @@ fn run(args: &[String]) -> i32 {
                 // the usage-error family (2, see USAGE), not a runtime
                 // failure of the instance (1) every other `err` reply here
                 // gets.
-                if err == OVERSIZE_LINE_MSG { 2 } else { 1 }
+                if err == OVERSIZE_LINE_MSG {
+                    2
+                } else {
+                    1
+                }
             }
         }
         // A timeout is not "cannot reach": the connection was made and the
@@ -382,7 +390,10 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             let panes: Result<Vec<serde_json::Value>, String> =
                 pos.iter().map(|p| parse_pane(p).map(Into::into)).collect();
             m.insert("panes".into(), serde_json::Value::Array(panes?));
-            m.insert("until".into(), flag_value(rest, "--until")?.unwrap_or_else(|| "waiting".into()).into());
+            m.insert(
+                "until".into(),
+                flag_value(rest, "--until")?.unwrap_or_else(|| "waiting".into()).into(),
+            );
             if let Some(secs) = flag_value(rest, "--timeout")? {
                 let secs: u64 = secs.parse().map_err(|_| "--timeout needs a number (seconds)")?;
                 // Code review (exit UX audit 2026-08-07): `secs * 1000`
@@ -697,7 +708,8 @@ mod tests {
         // --all replaces the PANE positional; a leading token that still
         // parses as a pane id looks like `send PANE TEXT` with --all left
         // in by mistake — usage error, not a guess.
-        let owned: Vec<String> = ["send", "--all", "3", "x"].iter().map(|s| s.to_string()).collect();
+        let owned: Vec<String> =
+            ["send", "--all", "3", "x"].iter().map(|s| s.to_string()).collect();
         assert!(build_request(&owned, "T".into()).is_err());
     }
 
@@ -820,10 +832,7 @@ mod reply_timeout_tests {
 
         // An explicit one is honoured...
         let long = serde_json::json!({"method": "wait", "timeout_ms": 900_000});
-        assert_eq!(
-            reply_timeout("wait", &long),
-            Duration::from_millis(900_000) + WAIT_REPLY_SLACK
-        );
+        assert_eq!(reply_timeout("wait", &long), Duration::from_millis(900_000) + WAIT_REPLY_SLACK);
 
         // ...and clamped exactly where the server clamps it, so `--timeout`
         // of u64::MAX (which `cli_wait_timeout_saturates_instead_of_
@@ -864,10 +873,7 @@ mod reply_timeout_tests {
         let took = started.elapsed();
 
         assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ),
+            matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
             "the failure must read as a timeout, not something else: {err:?} ({:?})",
             err.kind()
         );
@@ -886,7 +892,8 @@ mod status_hook_tests {
     use std::path::PathBuf;
 
     fn scratch_sock(name: &str) -> (PathBuf, UnixListener) {
-        let dir = std::env::temp_dir().join(format!("roost-status-hook-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("roost-status-hook-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.sock");
@@ -904,7 +911,13 @@ mod status_hook_tests {
 
         assert_eq!(status_hook(None, String::new(), Some(sock.clone()), Some("working"), None), 0);
         assert_eq!(
-            status_hook(Some(String::new()), String::new(), Some(sock.clone()), Some("working"), None),
+            status_hook(
+                Some(String::new()),
+                String::new(),
+                Some(sock.clone()),
+                Some("working"),
+                None
+            ),
             0
         );
         assert_eq!(status_hook(Some("3".into()), "t".into(), Some(sock.clone()), None, None), 0);
@@ -948,7 +961,10 @@ mod status_hook_tests {
     #[test]
     fn no_message_means_no_message_key_on_the_wire() {
         let (sock, listener) = scratch_sock("bare");
-        assert_eq!(status_hook(Some("7".into()), "tok".into(), Some(sock.clone()), Some("working"), None), 0);
+        assert_eq!(
+            status_hook(Some("7".into()), "tok".into(), Some(sock.clone()), Some("working"), None),
+            0
+        );
         let (stream, _) = listener.accept().expect("status_hook never connected");
         let mut reader = BufReader::new(stream);
         let mut line = String::new();

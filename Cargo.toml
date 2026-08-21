@@ -38,6 +38,51 @@ libc = "0.2"
 portable-pty = "0.9"
 vt100 = { path = "vendor/vt100" }
 
+# Lints live with the crate, not only in CI: `[lints]` applies to every
+# `cargo check`, `cargo build` and `cargo clippy` anyone runs, so a rule is
+# visible in the editor the moment it is broken rather than twenty minutes
+# later on a runner. CI's `-D warnings` (`.github/workflows/ci.yml`) is what
+# makes them binding; this is what makes them *present*.
+#
+# Every lint below was verified to already hold across `src/` and `tests/`
+# before being switched on — this table pins the discipline the codebase
+# already has, and does not schedule a cleanup. `vendor/vt100` is a path
+# dependency rather than a workspace member, so none of it reaches there.
+[lints.rust]
+# `priority = -1` because this is a *group*: without it, an individual lint
+# below could not override a member of it, and cargo rejects the ambiguity.
+rust_2018_idioms = { level = "warn", priority = -1 }
+# roost's `unsafe` is all FFI (libc, proc_listpids, getsid). An `unsafe fn`
+# whose body may use unsafe implicitly hides which operation is the
+# dangerous one; this forces the block, which forces the SAFETY comment
+# below to sit next to what it is vouching for.
+unsafe_op_in_unsafe_fn = "warn"
+# NOT `unreachable_pub`: roost is a binary crate, so *every* `pub` is
+# unreachable by that lint's definition and it fired 582 times — almost all
+# in `tests/harness/mod.rs`, where `pub` is how a shared test module offers
+# anything at all. A lint that is right 0% of the time trains people to
+# ignore the ones that are right.
+# NOT `trivial_casts`: on this tree it only ever fires on the FFI
+# reference-to-pointer casts (`&mut info as *mut _ as *mut c_void`, a fn
+# item to a fn pointer for `libc::signal`) that make the call sites read
+# like the C prototypes they are calling. Its numeric sibling has no such
+# false-positive class — a `u64 as u64` is always noise — so that half
+# stays.
+trivial_numeric_casts = "warn"
+
+[lints.clippy]
+# The one that matters most here: every `unsafe` block in this tree already
+# carries a `// SAFETY:` comment explaining the invariant it relies on. That
+# was a convention; this makes it a rule.
+undocumented_unsafe_blocks = "warn"
+# Leftovers from a debugging session must not reach a release.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# NOT `str_to_string`: it fires 184 times for `"x".to_string()`, asking for
+# `.to_owned()` instead. Both are one allocation and one meaning; the rule
+# would buy a 184-line diff and nothing else.
+
 [profile.release]
 lto = true
 strip = true

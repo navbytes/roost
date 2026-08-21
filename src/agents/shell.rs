@@ -16,9 +16,8 @@ fn user_shell() -> String {
 /// the flag would die at birth, and every shell pane failing to start is a far
 /// worse outcome than the missing profile this item fixes. The list covers
 /// every shell `$SHELL` realistically names on a developer machine.
-const LOGIN_FLAG_SHELLS: &[&str] = &[
-    "ash", "bash", "csh", "dash", "fish", "ksh", "ksh93", "mksh", "pdksh", "sh", "tcsh", "zsh",
-];
+const LOGIN_FLAG_SHELLS: &[&str] =
+    &["ash", "bash", "csh", "dash", "fish", "ksh", "ksh93", "mksh", "pdksh", "sh", "tcsh", "zsh"];
 
 /// P18: shell panes are login shells, the way tmux and every terminal
 /// emulator spawn theirs. Without it `~/.zprofile` never runs, so on macOS the

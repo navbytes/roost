@@ -96,9 +96,7 @@ impl PerfLog {
         }
         let line = self.format_line();
         rotate_log(&self.path, PERF_LOG_MAX);
-        if let Ok(mut f) =
-            std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
-        {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
             let _ = f.write_all(line.as_bytes());
         }
         self.window_start = Instant::now();

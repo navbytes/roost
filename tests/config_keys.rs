@@ -27,10 +27,7 @@ fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
     else {
         return;
     };
-    assert!(
-        h.settle(Duration::from_secs(5)),
-        "initial frame never settled"
-    );
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
     // Same ECHOCTL trick tests/cursor_mode.rs uses: park a dumb `cat` sink
     // so the bytes roost forwards echo back onto the screen verbatim,
@@ -46,9 +43,7 @@ fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
     // would never reach the pane at all, so this can only pass if
     // config.json was actually read from the harness's own ROOST_STATE dir
     // (which starts empty but for what the harness itself wrote into it).
-    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[f"))
-        .is_none()
-    {
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[f")).is_none() {
         panic!(
             "alt+f was not forwarded to the pane — config.json's disable entry \
              was not picked up from ROOST_STATE:\n{}",

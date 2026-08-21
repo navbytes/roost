@@ -279,8 +279,7 @@ fn upsert_hook(
             continue;
         };
         for entry in entries.iter_mut() {
-            let is_ours =
-                entry.get("command").and_then(|c| c.as_str()).is_some_and(is_roost_hook);
+            let is_ours = entry.get("command").and_then(|c| c.as_str()).is_some_and(is_roost_hook);
             if !is_ours {
                 continue;
             }
@@ -383,7 +382,8 @@ mod tests {
     use super::*;
 
     fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("roost-claude-hooks-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("roost-claude-hooks-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -418,7 +418,8 @@ mod tests {
         let path = dir.join("settings.json");
         let msg = merge_claude_hooks(&path, "/opt/roost/roost").expect("should install");
         assert!(msg.contains("installed"), "{msg}");
-        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         for (event, status) in HOOK_EVENTS {
             let cmds = hook_commands(&root, event);
             assert_eq!(cmds, vec![command_for("/opt/roost/roost", status)], "{event}");
@@ -434,7 +435,8 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         let msg = merge_claude_hooks(&path, "/opt/roost/roost").expect("should install");
         assert!(msg.contains("installed"), "{msg}");
-        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(hook_commands(&root, "Stop").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -473,7 +475,8 @@ mod tests {
         )
         .unwrap();
         merge_claude_hooks(&path, "/opt/roost/roost").expect("should install");
-        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let groups = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(groups.len(), 2, "user's group must survive alongside roost's own: {groups:?}");
         assert_eq!(groups[0]["hooks"][0]["command"], "echo mine");
@@ -489,7 +492,8 @@ mod tests {
         merge_claude_hooks(&path, "/opt/roost/roost").expect("first run installs");
         let second = merge_claude_hooks(&path, "/opt/roost/roost");
         assert!(second.is_none(), "unchanged second run must be silent: {second:?}");
-        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         for (event, _) in HOOK_EVENTS {
             assert_eq!(hook_commands(&root, event).len(), 1, "{event} duplicated");
         }
@@ -503,7 +507,8 @@ mod tests {
         merge_claude_hooks(&path, "/old/path/roost").expect("first run installs");
         let msg = merge_claude_hooks(&path, "/new/path/roost").expect("moved binary must update");
         assert!(msg.contains("updated"), "{msg}");
-        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         for (event, status) in HOOK_EVENTS {
             let cmds = hook_commands(&root, event);
             assert_eq!(cmds, vec![command_for("/new/path/roost", status)], "{event}");
@@ -533,9 +538,11 @@ mod tests {
         }});
         std::fs::write(&path, seed.to_string()).unwrap();
 
-        let msg = merge_claude_hooks(&path, "/opt/roost/roost").expect("legacy hooks must be updated");
+        let msg =
+            merge_claude_hooks(&path, "/opt/roost/roost").expect("legacy hooks must be updated");
         assert!(msg.contains("updated"), "{msg}");
-        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         for (event, status) in HOOK_EVENTS {
             let cmds = hook_commands(&root, event);
             assert_eq!(cmds, vec![command_for("/opt/roost/roost", status)], "{event}: {cmds:?}");
@@ -551,7 +558,11 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let msg = merge_claude_hooks(&path, "/opt/roost/roost").expect("must explain the refusal");
         assert!(msg.contains("valid JSON"), "{msg}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "malformed file must be left untouched");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "malformed file must be left untouched"
+        );
         assert!(!path.with_extension("json.bak").exists());
         assert!(no_tmp_litter(&dir));
         let _ = std::fs::remove_dir_all(&dir);
@@ -565,7 +576,10 @@ mod tests {
         let path = dir.join("settings.json");
         std::fs::create_dir_all(&path).unwrap();
         let msg = merge_claude_hooks(&path, "/opt/roost/roost").expect("must explain the refusal");
-        assert!(!msg.contains("valid JSON"), "a read error must not claim to be a parse error: {msg}");
+        assert!(
+            !msg.contains("valid JSON"),
+            "a read error must not claim to be a parse error: {msg}"
+        );
         assert!(msg.contains("couldn't read"), "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -272,8 +272,13 @@ pub fn tab_strip(
     save_ok: bool,
     active: usize,
 ) -> TabStrip {
-    let budget =
-        bar_width.saturating_sub(effective_status_width(names, bar_width, status_width, save_ok, active));
+    let budget = bar_width.saturating_sub(effective_status_width(
+        names,
+        bar_width,
+        status_width,
+        save_ok,
+        active,
+    ));
     let start = tab_scroll_start(names, budget, active);
     let x0 = u16::from(start > 0);
     let mut width = x0.min(budget);
@@ -351,7 +356,11 @@ pub fn picker_row_at(rect: Rect, items: usize, col: u16, row: u16) -> Option<usi
 /// indicator, split into `(mode, cwd, save_word)` so the renderer can color
 /// them independently. `mode`/`cwd` are `"{x} · "`, or empty when there's
 /// nothing to show (that part is omitted, not blanked).
-pub fn status_parts(mode: Option<&str>, cwd: Option<&str>, save_ok: bool) -> (String, String, String) {
+pub fn status_parts(
+    mode: Option<&str>,
+    cwd: Option<&str>,
+    save_ok: bool,
+) -> (String, String, String) {
     let save_word = if save_ok {
         format!("saved {}", theme::SAVED)
     } else {
@@ -546,7 +555,14 @@ fn encode_sgr(rect: Rect, me: &MouseEvent) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn pr(id: crate::core::layout::PaneId, x: u16, y: u16, w: u16, h: u16, collapsed: bool) -> PaneRect {
+    fn pr(
+        id: crate::core::layout::PaneId,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        collapsed: bool,
+    ) -> PaneRect {
         PaneRect { id, rect: Rect::new(x, y, w, h), collapsed }
     }
 
@@ -581,7 +597,10 @@ mod tests {
         assert_eq!(MOUSE_CAPTURE_ENABLE, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
         assert_eq!(MOUSE_CAPTURE_DISABLE, "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
         fn modes(s: &str, suffix: char) -> Vec<&str> {
-            s.split("\x1b[?").filter(|p| !p.is_empty()).map(|p| p.trim_end_matches(suffix)).collect()
+            s.split("\x1b[?")
+                .filter(|p| !p.is_empty())
+                .map(|p| p.trim_end_matches(suffix))
+                .collect()
         }
         let enabled = modes(MOUSE_CAPTURE_ENABLE, 'h');
         let mut disabled = modes(MOUSE_CAPTURE_DISABLE, 'l');
@@ -633,8 +652,7 @@ mod tests {
     fn click_and_drag_forward_to_mouse_aware_app() {
         let pane = pr(1, 10, 5, 40, 20, false);
         // left press at inner (2,2)
-        match route_mouse(sgr(), &pane, &ev(MouseEventKind::Down(MouseButton::Left), 12, 7))
-        {
+        match route_mouse(sgr(), &pane, &ev(MouseEventKind::Down(MouseButton::Left), 12, 7)) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<0;2;2M"),
             other => panic!("{other:?}"),
         }
@@ -644,8 +662,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // left drag → button + motion flag (0 + 32)
-        match route_mouse(sgr(), &pane, &ev(MouseEventKind::Drag(MouseButton::Left), 13, 8))
-        {
+        match route_mouse(sgr(), &pane, &ev(MouseEventKind::Drag(MouseButton::Left), 13, 8)) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<32;3;3M"),
             other => panic!("{other:?}"),
         }
@@ -656,7 +673,7 @@ mod tests {
         let pane = pr(1, 0, 0, 40, 20, false);
         let mut e = ev(MouseEventKind::Down(MouseButton::Right), 5, 5);
         e.modifiers = KeyModifiers::CONTROL; // +16, right button = 2 → 18
-        // pane at (0,0): inner origin (1,1), so screen (5,5) → inner cell (5,5)
+                                             // pane at (0,0): inner origin (1,1), so screen (5,5) → inner cell (5,5)
         match route_mouse(sgr(), &pane, &e) {
             MouseAction::Forward(b) => assert_eq!(b, b"\x1b[<18;5;5M"),
             other => panic!("{other:?}"),
@@ -786,9 +803,9 @@ mod tests {
     fn tab_width_is_a_function_of_the_label_alone_so_a_count_cannot_move_it() {
         assert_eq!(tab_width(0, "main"), 14); // 6-col label + 8 fixed
         assert_eq!(tab_width(1, "api"), 13); // 5-col label + 8 fixed
-        // The renderer's own cell is one column for every count it can show,
-        // which is what makes the line above independent of status (the
-        // boundaries themselves are pinned in `render`).
+                                             // The renderer's own cell is one column for every count it can show,
+                                             // which is what makes the line above independent of status (the
+                                             // boundaries themselves are pinned in `render`).
         for n in [0usize, 1, 2, 9, 10, 99] {
             assert_eq!(crate::ui::render::tab_count_cell_cols(n), 1, "count {n}");
         }
@@ -932,7 +949,11 @@ mod tests {
         let strip = tab_strip(&names, 45, 0, true, 4);
         assert_eq!((strip.start, strip.x0), (1, 1));
         assert_eq!(tab_at_x(&names, 45, 0, true, 4, 0), None, "the left `…` is not a tab");
-        assert_eq!(tab_at_x(&names, 45, 0, true, 4, 1), Some(1), "first drawn tab, at its real index");
+        assert_eq!(
+            tab_at_x(&names, 45, 0, true, 4, 1),
+            Some(1),
+            "first drawn tab, at its real index"
+        );
         assert_eq!(tab_at_x(&names, 45, 0, true, 4, 11), Some(1), "...through its last column");
         assert_eq!(tab_at_x(&names, 45, 0, true, 4, 12), Some(2));
         assert_eq!(tab_at_x(&names, 45, 0, true, 4, 34), Some(4), "the active tab is clickable");
@@ -1136,5 +1157,4 @@ mod tests {
         // nothing here is worth taking a tab's columns for.
         assert_eq!(status_fit(Some("ZOOM"), Some("~/work"), true, &names, bar - 4), None);
     }
-
 }

@@ -49,19 +49,14 @@ fn cli_status(state_dir: &std::path::Path) -> String {
         .env_remove("ROOST_CONTROL_TOKEN")
         .output()
         .expect("run roost status");
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
 #[test]
 fn socket_exited_on_a_live_pane_is_advisory_not_death() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let Some(mut h) = harness::spawn_or_skip("socket status gate", &harness::one_pane(cwd))
-    else {
+    let Some(mut h) = harness::spawn_or_skip("socket status gate", &harness::one_pane(cwd)) else {
         return;
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
@@ -127,14 +122,10 @@ fn socket_exited_on_a_live_pane_is_advisory_not_death() {
 fn output_does_not_promote_a_resting_report_while_the_link_is_live_but_does_once_it_drops() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let Some(mut h) = harness::spawn_or_skip("socket status gate", &harness::one_pane(cwd))
-    else {
+    let Some(mut h) = harness::spawn_or_skip("socket status gate", &harness::one_pane(cwd)) else {
         return;
     };
-    assert!(
-        h.settle(Duration::from_secs(5)),
-        "initial frame never settled"
-    );
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
     let tok_path = h.state_dir().join("tok");
     h.write_bytes(format!("printf '%s' \"$ROOST_TOKEN\" > {}\r", tok_path.display()).as_bytes());
@@ -146,11 +137,8 @@ fn output_does_not_promote_a_resting_report_while_the_link_is_live_but_does_once
     let sock_path = h.state_dir().join("roost.sock");
     let mut sock = UnixStream::connect(&sock_path).expect("connect to roost.sock");
     sock.write_all(
-        format!(
-            r#"{{"pane":"1","token":"{token}","event":"status","status":"waiting"}}{}"#,
-            '\n'
-        )
-        .as_bytes(),
+        format!(r#"{{"pane":"1","token":"{token}","event":"status","status":"waiting"}}{}"#, '\n')
+            .as_bytes(),
     )
     .expect("send waiting status");
     sock.flush().expect("flush");
@@ -165,10 +153,7 @@ fn output_does_not_promote_a_resting_report_while_the_link_is_live_but_does_once
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(
-        status.contains("\"waiting\""),
-        "setup: extension report never took: {status}"
-    );
+    assert!(status.contains("\"waiting\""), "setup: extension report never took: {status}");
 
     // Byte noise while the link is live: composer echo from typing. Must
     // stay "waiting" throughout — never a phantom "working".

@@ -61,8 +61,8 @@ impl AgentAdapter for OpencodeAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::SessionState;
+    use super::*;
     use std::collections::HashSet;
     use std::path::Path;
     use std::time::SystemTime;

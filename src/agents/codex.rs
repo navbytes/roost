@@ -73,9 +73,9 @@ impl AgentAdapter for CodexAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::{scratch_dir, RootAdapter};
     use super::super::SessionState;
+    use super::*;
     use std::collections::HashSet;
     use std::time::{Duration, SystemTime};
 
@@ -173,7 +173,10 @@ mod tests {
         let file =
             day.join("rollout-2026-08-06T10-30-00-3f9a1c2e-7b4d-4a11-9c2e-0f1a2b3c4d5e.jsonl");
         std::fs::write(&file, "").unwrap();
-        std::fs::File::open(&file).unwrap().set_modified(since + Duration::from_millis(10)).unwrap();
+        std::fs::File::open(&file)
+            .unwrap()
+            .set_modified(since + Duration::from_millis(10))
+            .unwrap();
 
         let a = fixture(d.clone());
         assert_eq!(

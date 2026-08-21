@@ -515,10 +515,8 @@ pub mod fakes {
         /// has one staged, exactly like the real backend's `presented()`
         /// preferring `gesture_freeze` over the live grid.
         fn grab_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
-            let (grab, rows) = self
-                .frozen
-                .as_ref()
-                .map_or((&self.grab, &self.rows), |(g, r)| (g, r));
+            let (grab, rows) =
+                self.frozen.as_ref().map_or((&self.grab, &self.rows), |(g, r)| (g, r));
             if !rows.is_empty() && start.0 == end.0 {
                 let row = rows.get(start.0 as usize).cloned().unwrap_or_default();
                 return slice_cells(&row, start.1 as usize, end.1 as usize);

@@ -708,9 +708,13 @@ impl PtyPane {
     /// own terminal.
     fn queue_host_notify(&mut self, body: &str) {
         let now = Instant::now();
-        let Some(bytes) =
-            host_notify_bytes(body, self.last_host_notify, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP)
-        else {
+        let Some(bytes) = host_notify_bytes(
+            body,
+            self.last_host_notify,
+            now,
+            HOST_NOTIFY_INTERVAL,
+            HOST_NOTIFY_CAP,
+        ) else {
             return;
         };
         self.last_host_notify = Some(now);
@@ -798,10 +802,8 @@ impl PaneBackend for PtyPane {
             cmd.env(k, v);
         }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .with_context(|| format!("spawning {}", spec.program))?;
+        let child =
+            pair.slave.spawn_command(cmd).with_context(|| format!("spawning {}", spec.program))?;
         let pid = child.process_id();
         drop(pair.slave);
 
@@ -1128,6 +1130,9 @@ impl PaneBackend for PtyPane {
             // Neither is "the pane's own process tree," so guard rather than
             // assume.
             if pid > 1 {
+                // SAFETY: `kill(2)` with a plain signal number and a target
+                // the `pid > 1` guard above has already established is a
+                // real process group of ours and not 0/-1. No pointers.
                 unsafe {
                     libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                 }
@@ -1151,6 +1156,10 @@ impl PaneBackend for PtyPane {
             // possible; the window is microseconds and the group kill carries
             // the identical hazard, so it is accepted rather than papered over.
             for member in session_members(pid) {
+                // SAFETY: as above — `kill(2)` on a plain pid, taken from
+                // `session_members`, which never returns 0, 1 or the
+                // leader. Worst case the pid is already gone and this is
+                // ESRCH, which is why the return value is not checked.
                 unsafe {
                     libc::kill(member as libc::pid_t, libc::SIGKILL);
                 }
@@ -1385,11 +1394,7 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
         // P15 boundary: a selection that begins on a wide glyph's right half
         // snaps back to its left half, so the glyph the user pointed at is
         // yanked whole instead of vanishing with the skipped continuation.
-        if first > 0
-            && screen
-                .cell(row, first)
-                .is_some_and(|c| c.is_wide_continuation())
-        {
+        if first > 0 && screen.cell(row, first).is_some_and(|c| c.is_wide_continuation()) {
             first -= 1;
         }
         let last = if row == end.0 { end.1 } else { cols - 1 };
@@ -1463,14 +1468,18 @@ mod tests {
         let snap = p.take_sync_snapshot().expect("bracket open captures");
 
         // One tick shy of the cap: still the captured frame.
-        let fresh = Some((snap.clone(), Instant::now() - SYNC_STALE_CAP_DEFAULT + Duration::from_millis(1)));
+        let fresh = Some((
+            snap.clone(),
+            Instant::now() - SYNC_STALE_CAP_DEFAULT + Duration::from_millis(1),
+        ));
         assert!(sync_presented(p.screen(), fresh.as_ref(), SYNC_STALE_CAP_DEFAULT)
             .contents()
             .contains("complete"));
 
         // Past it: the live grid, however torn — the pane keeps moving even
         // though the app never sent `?2026l`.
-        let stale = Some((snap, Instant::now() - SYNC_STALE_CAP_DEFAULT - Duration::from_millis(1)));
+        let stale =
+            Some((snap, Instant::now() - SYNC_STALE_CAP_DEFAULT - Duration::from_millis(1)));
         let presented = sync_presented(p.screen(), stale.as_ref(), SYNC_STALE_CAP_DEFAULT);
         assert!(presented.contents().contains("half-drawn"));
         assert!(!presented.contents().contains("complete"));
@@ -1536,10 +1545,8 @@ mod tests {
         );
 
         // Past it: no gesture is this long-lived for real — live wins.
-        let stale = Some((
-            frozen,
-            Instant::now() - GESTURE_FREEZE_STALE_CAP - Duration::from_millis(1),
-        ));
+        let stale =
+            Some((frozen, Instant::now() - GESTURE_FREEZE_STALE_CAP - Duration::from_millis(1)));
         assert!(
             gesture_presented(live.screen(), stale.as_ref(), GESTURE_FREEZE_STALE_CAP).is_none(),
             "a stale freeze must not keep winning — a lost Up cannot freeze the pane forever"
@@ -1578,7 +1585,8 @@ mod tests {
     #[test]
     fn host_notify_is_bounded_and_cannot_break_out_of_its_sequence() {
         let now = Instant::now();
-        let emit = |body: &str| host_notify_bytes(body, None, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP);
+        let emit =
+            |body: &str| host_notify_bytes(body, None, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP);
 
         assert_eq!(emit("NEEDS-YOU").unwrap(), b"\x1b]9;NEEDS-YOU\x07".to_vec());
 
@@ -2107,10 +2115,8 @@ mod tests {
         use crate::ports::PaneBackend;
 
         let (tx, _rx) = std::sync::mpsc::sync_channel::<AppEvent>(8);
-        let spec = CommandSpec::new(
-            "roost-test-definitely-does-not-exist-9f3c",
-            &std::env::temp_dir(),
-        );
+        let spec =
+            CommandSpec::new("roost-test-definitely-does-not-exist-9f3c", &std::env::temp_dir());
         // `PtyPane` has no `Debug` impl (it holds trait objects), so
         // `expect_err` can't be used here — match instead.
         let err = match super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx) {
@@ -2143,16 +2149,10 @@ mod tests {
         let mut pt = super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx).expect("sh must spawn");
 
         pt.freeze_view();
-        assert!(
-            pt.gesture_freeze.is_some(),
-            "setup: the freeze must be armed"
-        );
+        assert!(pt.gesture_freeze.is_some(), "setup: the freeze must be armed");
 
         pt.resize(30, 100, (0, 0));
-        assert!(
-            pt.gesture_freeze.is_none(),
-            "a resize mid-gesture must drop the freeze"
-        );
+        assert!(pt.gesture_freeze.is_none(), "a resize mid-gesture must drop the freeze");
 
         pt.kill();
     }
@@ -2179,19 +2179,111 @@ mod tests {
         use crate::core::event::AppEvent;
         use crate::ports::PaneBackend;
         let vocab: &[&[u8]] = &[
-            b"\x1b[", b"\x1b]", b"\x1b", b"\x07", b"\x9b", b"\x1bP", b"\x1b_", b"\x1b^", b"\x1bX",
-            b";", b"?", b":", b"0", b"1", b"9", b"999999999", b"-1", b"2147483648",
-            b"H", b"J", b"K", b"m", b"r", b"h", b"l", b"n", b"t", b"S", b"T", b"L", b"M", b"@",
-            b"P", b"X", b"d", b"G", b"A", b"B", b"C", b"D", b"E", b"F", b"g", b"c", b"q", b"p",
-            b"$", b"\"", b"b", b"Z", b"I", b"`", b"a", b"e", b"f", b"s", b"u", b"W", b"|", b"'",
-            b"\x1b[c", b"\x1b[>c", b"\x1b[5n", b"\x1b[6n", b"\x1b[?6n", b"\x1b[?1$p", b"\x1b[?2026$p",
-            b"\x1b[14t", b"\x1b[16t", b"\x1b[18t", b"\x1b[>0q", b"\x1bP+q544e\x1b\\",
-            b"\x1b[?u", b"\x1b[=1;1u", b"\x1b[>1u", b"\x1b[<u", b"\x1b[?1049h", b"\x1b[?2026h",
-            b"\x1b]0;t\x07", b"\x1b]2;\xe4\xb8\xad\x07", b"\x1b]52;c;aGk=\x07", b"\x1b]9;hi\x07",
-            b"\x1b]777;notify;a;b\x07", b"\x1b]52;c;", b"\x1b]11;?\x07", b"\x1b]10;?\x1b\\",
-            b"\r", b"\n", b"\t", b"\x08", b"\x0b", b"\x0c", b"\x0e", b"\x0f", b"\x00",
-            "\u{1f600}".as_bytes(), "\u{4e2d}".as_bytes(), "\u{0301}".as_bytes(), "\u{fe0f}".as_bytes(),
-            "\u{200d}".as_bytes(), b"\xff\xfe", b"\xc3", b"\xed\xa0\x80", b"abc", b"     ",
+            b"\x1b[",
+            b"\x1b]",
+            b"\x1b",
+            b"\x07",
+            b"\x9b",
+            b"\x1bP",
+            b"\x1b_",
+            b"\x1b^",
+            b"\x1bX",
+            b";",
+            b"?",
+            b":",
+            b"0",
+            b"1",
+            b"9",
+            b"999999999",
+            b"-1",
+            b"2147483648",
+            b"H",
+            b"J",
+            b"K",
+            b"m",
+            b"r",
+            b"h",
+            b"l",
+            b"n",
+            b"t",
+            b"S",
+            b"T",
+            b"L",
+            b"M",
+            b"@",
+            b"P",
+            b"X",
+            b"d",
+            b"G",
+            b"A",
+            b"B",
+            b"C",
+            b"D",
+            b"E",
+            b"F",
+            b"g",
+            b"c",
+            b"q",
+            b"p",
+            b"$",
+            b"\"",
+            b"b",
+            b"Z",
+            b"I",
+            b"`",
+            b"a",
+            b"e",
+            b"f",
+            b"s",
+            b"u",
+            b"W",
+            b"|",
+            b"'",
+            b"\x1b[c",
+            b"\x1b[>c",
+            b"\x1b[5n",
+            b"\x1b[6n",
+            b"\x1b[?6n",
+            b"\x1b[?1$p",
+            b"\x1b[?2026$p",
+            b"\x1b[14t",
+            b"\x1b[16t",
+            b"\x1b[18t",
+            b"\x1b[>0q",
+            b"\x1bP+q544e\x1b\\",
+            b"\x1b[?u",
+            b"\x1b[=1;1u",
+            b"\x1b[>1u",
+            b"\x1b[<u",
+            b"\x1b[?1049h",
+            b"\x1b[?2026h",
+            b"\x1b]0;t\x07",
+            b"\x1b]2;\xe4\xb8\xad\x07",
+            b"\x1b]52;c;aGk=\x07",
+            b"\x1b]9;hi\x07",
+            b"\x1b]777;notify;a;b\x07",
+            b"\x1b]52;c;",
+            b"\x1b]11;?\x07",
+            b"\x1b]10;?\x1b\\",
+            b"\r",
+            b"\n",
+            b"\t",
+            b"\x08",
+            b"\x0b",
+            b"\x0c",
+            b"\x0e",
+            b"\x0f",
+            b"\x00",
+            "\u{1f600}".as_bytes(),
+            "\u{4e2d}".as_bytes(),
+            "\u{0301}".as_bytes(),
+            "\u{fe0f}".as_bytes(),
+            "\u{200d}".as_bytes(),
+            b"\xff\xfe",
+            b"\xc3",
+            b"\xed\xa0\x80",
+            b"abc",
+            b"     ",
         ];
         let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(65536);
         std::thread::spawn(move || while rx.recv().is_ok() {});
@@ -2204,15 +2296,34 @@ mod tests {
             }
         };
         let mut st: u64 = 0x243F6A8885A308D3;
-        let mut next = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
         for _ in 0..120_000u64 {
             match next() % 400 {
-                0 => { let r = 1 + (next() % 60) as u16; let c = 1 + (next() % 200) as u16; pt.resize(r, c, ((next()%2000) as u16, (next()%2000) as u16)); }
-                1 => { let _ = pt.screen().map(|s| s.contents()); }
-                2 => { let _ = pt.take_effects(); }
-                3 => { pt.set_scrollback((next() % 300) as usize); }
+                0 => {
+                    let r = 1 + (next() % 60) as u16;
+                    let c = 1 + (next() % 200) as u16;
+                    pt.resize(r, c, ((next() % 2000) as u16, (next() % 2000) as u16));
+                }
+                1 => {
+                    let _ = pt.screen().map(|s| s.contents());
+                }
+                2 => {
+                    let _ = pt.take_effects();
+                }
+                3 => {
+                    pt.set_scrollback((next() % 300) as usize);
+                }
                 4 => pt.scroll_by(((next() % 40) as i32) - 20),
-                5 => { let _ = pt.status(); let _ = pt.cursor_shape(); let _ = pt.alternate_screen(); }
+                5 => {
+                    let _ = pt.status();
+                    let _ = pt.cursor_shape();
+                    let _ = pt.alternate_screen();
+                }
                 _ => pt.process_output(vocab[(next() as usize) % vocab.len()]),
             }
         }
