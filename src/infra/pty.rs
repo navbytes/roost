@@ -2048,6 +2048,17 @@ mod tests {
         };
         let outer = format!("{err}");
         let full = format!("{err:#}");
+        // A machine out of ptys fails *earlier* than the spawn this gate is
+        // about — at `openpty`, before the program name is ever reached — so
+        // the assertions below would compare "openpty" against the program
+        // and report an environment limit as a product defect. Measured: a
+        // concurrent soak holding ~500 panes turns this into
+        // `left: "openpty", right: "spawning roost-test-…"`, which says
+        // nothing true about roost.
+        if full.contains("openpty") {
+            eprintln!("SKIP spawn-failure gate: no pty available ({full})");
+            return;
+        }
         assert_eq!(outer, format!("spawning {}", spec.program), "the context this file adds");
         assert!(
             full.len() > outer.len() && full.starts_with(&outer),
@@ -2069,7 +2080,15 @@ mod tests {
 
         let (tx, _rx) = std::sync::mpsc::sync_channel::<AppEvent>(8);
         let spec = CommandSpec::new("sh", &std::env::temp_dir());
-        let mut pt = super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx).expect("sh must spawn");
+        // Skip rather than fail on a machine with no pty left — the same
+        // stance every other pty-driving test in this module already takes.
+        // A loaded box (or a soak holding a few hundred panes) makes
+        // `openpty` return ENXIO, and a gate about *gesture state* reporting
+        // that as a failure is a false alarm nobody can act on.
+        let Ok(mut pt) = super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx) else {
+            eprintln!("SKIP resize-mid-gesture gate: no pty available");
+            return;
+        };
 
         pt.freeze_view();
         assert!(pt.gesture_freeze.is_some(), "setup: the freeze must be armed");

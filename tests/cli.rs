@@ -55,6 +55,20 @@ fn cli_in(state_dir: &std::path::Path, args: &[&str]) -> Output {
 /// satisfies that just as well as a real one, so a single `roost list`
 /// right after `settle` can race the socket's bind (same reasoning as
 /// `socket_status.rs`/`status_hook.rs`'s own retry-loop `cli_status`).
+/// Is the fixture's pane actually running a shell?
+///
+/// A machine with no pty left spawns roost fine — `spawn_or_skip` only needs
+/// one for roost itself — and then every *pane* fails to open one and is
+/// born `exited`. Tests that assume a live pane then fail in ways that say
+/// nothing true about roost: measured, a concurrent soak holding ~500 panes
+/// turned the `wait`-timeout gate below into `left: Some(0), right: Some(3)`,
+/// because `wait --until needs_input` on a dead pane resolves at once
+/// (correctly — a dead pane will never reach it) instead of timing out.
+fn pane_is_live(state_dir: &std::path::Path, pane: &str) -> bool {
+    let o = cli_in(state_dir, &["status", pane]);
+    o.status.success() && !out(&o).contains("\"exited\"")
+}
+
 fn wait_until_reachable(state_dir: &std::path::Path, timeout: Duration) {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -217,6 +231,11 @@ fn wait_timeout_exits_nonzero_and_distinct_from_runtime_and_usage_errors() {
     };
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
     wait_until_reachable(h.state_dir(), Duration::from_secs(5));
+    if !pane_is_live(h.state_dir(), "1") {
+        eprintln!("SKIP wait-timeout gate: the fixture pane never got a pty");
+        let _ = h.quit_and_wait(Duration::from_secs(5));
+        return;
+    }
 
     let o = cli_in(h.state_dir(), &["wait", "1", "--until", "needs_input", "--timeout", "1"]);
 
