@@ -2544,6 +2544,32 @@ impl<B: PaneBackend> App<B> {
         self.last_status.remove(&id);
         self.needy_msgs.remove(&id);
         self.visited_waiting.remove(&id);
+        // And once more, for the two session-detection maps — the last
+        // `PaneId`-keyed state in `App` that close was not pruning, and the
+        // one where inheriting a dead pane's entry is not cosmetic.
+        //
+        // `last_shell_seen` is the floor `observe_panes` gives a promoted
+        // pane's session scan ("the last tick this pane was still a
+        // shell"). A pane that sat at a prompt for two hours leaves a
+        // two-hour-old stamp behind; a later pane taking that id and
+        // promoting before its own first shell observation — which is the
+        // normal case for a pane spawned with initial input, since it is
+        // running the agent within milliseconds — inherits it and scans two
+        // hours back. That is exactly the window
+        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`
+        // exists to close, reopened through the recycled id: the scan takes
+        // the newest unclaimed file in that window, `set_session` commits
+        // it permanently, and the next relaunch resumes a stranger's
+        // conversation.
+        //
+        // `pending_detect` is the same hazard one step later: a pane closed
+        // mid-detection leaves its window keyed on the id, and `tick` only
+        // discards it if the id resolves to no spec at all — so an id
+        // recycled within the tick keeps hunting on the dead pane's clock,
+        // and can overwrite a session the new pane was resuming with an
+        // unrelated one.
+        self.last_shell_seen.remove(&id);
+        self.pending_detect.remove(&id);
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         // U11: a closed pane is no longer anyone's focus memory — pane ids
@@ -11521,6 +11547,97 @@ mod tests {
         app.tick();
         assert_eq!(
             app.find_spec(1).unwrap().session.as_deref(),
+            Some("fresh"),
+            "the session this pane actually started must still be found",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and the same must hold for a pane that *inherits* an id, which is
+    /// how the bound above was reopened.
+    ///
+    /// Pane ids are recycled (`alloc_pane_id` is max-live+1, C23), and
+    /// `last_shell_seen` — the map that supplies the promotion floor — was
+    /// the one `PaneId`-keyed map `close_pane_id` did not prune. So a pane
+    /// that sat at a shell prompt for hours left its stamp behind, and the
+    /// next pane to take that id promoted against *that* clock instead of
+    /// its own birth. Promoting before ever being seen as a shell is not
+    /// exotic: a pane spawned with initial input (the control plane's
+    /// `spawn --input`, the quick-launch path) is running its agent within
+    /// milliseconds, so the first `observe_panes` tick that sees it already
+    /// sees the agent.
+    ///
+    /// The consequence is identical to the original defect — the scan takes
+    /// the newest unclaimed file in the window, `set_session` commits it and
+    /// drops the pane from `pending_detect`, so the next relaunch resumes an
+    /// unrelated conversation, permanently.
+    #[test]
+    fn a_recycled_pane_id_does_not_inherit_the_dead_panes_promotion_floor() {
+        let dir = std::env::temp_dir().join(format!("roost-recycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An unrelated conversation from an hour ago, unclaimed because the
+        // pane that made it is long closed.
+        let old = dir.join("old.jsonl");
+        std::fs::write(&old, "").unwrap();
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            Workspace::default_in(dir.clone()),
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+        )
+        .unwrap();
+
+        // A shell pane that has been sitting at its prompt for hours.
+        // `observe_panes` stamps `SystemTime::now()`, so the passage of time
+        // is seeded rather than waited for; what is under test is what
+        // `close_pane_id` does with the stamp, not how it got there.
+        let dead = app.spawn_child("shell", Some(dir.clone()), None).expect("room to split");
+        app.last_shell_seen.insert(dead, SystemTime::now() - Duration::from_secs(2 * 3600));
+        app.close_pane_id(dead);
+        assert!(
+            !app.last_shell_seen.contains_key(&dead),
+            "a closed pane's shell stamp outlived it",
+        );
+
+        // A new pane takes the freed id and is running its agent by the
+        // first tick — never observed as a shell, so its floor can only come
+        // from whatever `last_shell_seen` still holds for this id.
+        let id = app.spawn_child("shell", Some(dir.clone()), None).expect("room to split");
+        assert_eq!(id, dead, "the id must actually be recycled for this to test anything");
+        app.pending_detect.clear();
+        app.runtimes.get_mut(&id).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        assert_eq!(
+            app.find_spec(id).unwrap().session,
+            None,
+            "the recycled id claimed a conversation from before it existed",
+        );
+
+        // ...and the floor is still a floor, not a wall: a file this pane
+        // could plausibly have written is picked up on the next tick.
+        std::fs::write(dir.join("fresh.jsonl"), "").unwrap();
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(id).unwrap().session.as_deref(),
             Some("fresh"),
             "the session this pane actually started must still be found",
         );
