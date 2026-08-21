@@ -31,7 +31,6 @@ use crate::core::control::TokenTable;
 use crate::core::event::AppEvent;
 use crate::core::layout::PaneRect;
 use crate::core::workspace::PaneId;
-use crate::infra::notify::notify;
 use crate::infra::pty::PtyPane;
 use crate::infra::store::FsStore;
 use crate::ports::{MouseProto, PaneBackend, StateStore};
@@ -619,12 +618,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                     // same way a bell or an extension "needs you" does.
                     AppEvent::Output(id, bytes) => {
                         if let Some(msg) = app.on_pty_output(id, &bytes) {
-                            notify(&msg);
+                            app.notify_host(&msg);
                         }
                     }
                     AppEvent::Exit(id) => {
                         if let Some(msg) = app.on_pty_exit(id) {
-                            notify(&msg);
+                            app.notify_host(&msg);
                         }
                     }
                     // Socket-sourced events must present the pane's token; a
@@ -638,7 +637,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                     AppEvent::Status(id, token, s, detail) => {
                         if app.socket_authorized(id, &token) {
                             if let Some(msg) = app.on_status(id, s, detail) {
-                                notify(&msg);
+                                app.notify_host(&msg);
                             }
                         }
                     }

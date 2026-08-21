@@ -142,12 +142,24 @@ already had; it gains correct attribution, one banner instead of two on
 everything else, and notifications that survive ssh, which `osascript`
 never did.
 
-**Still open, deliberately:** for a pane's *own* OSC 9, (a) and (b) now put
-two OSC 9s on the same stream — (b)'s verbatim body, and (a)'s
-`display_name`-prefixed one, which (a) alone skips for the focused pane. The
-two used to be different surfaces, so the overlap was invisible. Collapsing
-them is a contract change (which body rides, and whether the focused pane is
-exempt) and is not made here.
+**And (b) is now (a).** With both emitting `OSC 9` on the same stream, a
+pane's notification produced two banners — (b)'s verbatim body and (a)'s
+`display_name`-prefixed one — an overlap that was invisible only while (a)
+was an `osascript` fork. (a) wins and (b) is retired
+(`PtyPane::queue_host_notify` and `host_notify_bytes` deleted): with eight
+panes open, a banner reading "Claude needs your permission to use Bash" that
+cannot say *which* pane is the exact pain DESIGN.md's "not knowing who needs
+me" exists to solve, and (a) alone skips the pane you are already looking at.
+
+So the contract's (b) is now delivered *by* (a): one `OSC 9` per
+notification, body `{display_name}: {body}`, suppressed for the focused
+pane, bounded and C0-stripped by the same `sanitize_for_host` +
+`HOST_NOTIFY_CAP`, rate-limited per pane by `PtyPane`'s `last_desktop_notify`
+and process-wide by `infra::notify`'s budget. e2e
+`tests/pane_notifications.rs` drives an **unfocused** pane and asserts the
+body ends with the pane's own text and is *not* equal to it. The bare-bell
+relay (ux P1-6 below) is untouched and is now the sole tenant of
+`HOST_NOTIFY_INTERVAL`.
 
 **Extended 2026-08-07 (ux P1-6):** (b) held only for OSC 9/777 — a pane's
 *own* bell (the heuristic ◆ path this same item put on "the same attention

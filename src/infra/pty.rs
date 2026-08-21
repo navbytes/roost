@@ -144,38 +144,13 @@ fn agent_title_status(title: &str) -> Option<AgentStatus> {
     }
 }
 
-/// P2: the OSC 9 roost re-emits to its own terminal for a pane
-/// notification, or `None` when this one must be dropped — too soon after
-/// the last (`interval`), or nothing left after sanitizing. Pure (clock and
-/// limits are parameters) so the rate limit is proven without sleeping.
-fn host_notify_bytes(
-    body: &str,
-    last: Option<Instant>,
-    now: Instant,
-    interval: Duration,
-    cap: usize,
-) -> Option<Vec<u8>> {
-    if last.is_some_and(|t| now.duration_since(t) < interval) {
-        return None;
-    }
-    let body = sanitize_for_host(body, cap);
-    if body.is_empty() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(body.len() + 5);
-    out.extend_from_slice(b"\x1b]9;");
-    out.extend_from_slice(body.as_bytes());
-    out.push(0x07);
-    Some(out)
-}
-
 /// ux P1-6: the raw BEL roost relays to its own terminal for the bell
 /// *heuristic* — the fallback attention path that has no OSC 9 text to
 /// relay, only the pane's own bell (already consumed by the vt100 parser,
-/// see `process_output`) to echo. `None` when the last relay was too
-/// recent (`interval`) — shares `queue_host_notify`'s own gate, so a pane
-/// alternating BEL and OSC 9 in a loop still gets one relay per window, not
-/// two independent budgets to burn through.
+/// see `process_output`) to echo. `None` when the last relay was too recent
+/// (`interval`). The gate was shared with an OSC 9 relay so a pane
+/// alternating the two could not burn two budgets; P2's 2026-08-21
+/// amendment retired that relay, and this is now its sole tenant.
 fn host_bell_bytes(last: Option<Instant>, now: Instant, interval: Duration) -> Option<Vec<u8>> {
     if last.is_some_and(|t| now.duration_since(t) < interval) {
         return None;
@@ -680,7 +655,17 @@ impl PtyPane {
                     };
                     self.effects.notifications.push(text);
                 }
-                self.queue_host_notify(&body);
+                // P2 (amended 2026-08-21): the relay used to fire here too,
+                // so a pane's OSC 9 put *two* sequences on the host stream —
+                // this verbatim one, and `App::on_pty_output`'s
+                // `display_name`-prefixed one. They were different surfaces
+                // once (this reached the terminal, that forked `osascript`),
+                // which is the only reason the overlap went unnoticed. The
+                // named one wins: with eight panes open, "Claude needs your
+                // permission to use Bash" that cannot say *which* pane is
+                // the exact pain DESIGN.md §"not knowing who needs me"
+                // exists to solve. It also skips the focused pane, which
+                // this could not.
             }
             // P3: an app inside the pane set the clipboard. roost's own copy
             // mode already proves the host OSC 52 path works; forward the
@@ -701,33 +686,13 @@ impl PtyPane {
         }
     }
 
-    /// P2: re-emit the notification to the HOST terminal as an OSC 9, so the
-    /// native desktop notification the app asked for actually fires. Rate-
-    /// limited per pane and length-capped; the body is sanitized because it
-    /// is untrusted text about to ride inside a sequence roost writes to its
-    /// own terminal.
-    fn queue_host_notify(&mut self, body: &str) {
-        let now = Instant::now();
-        let Some(bytes) = host_notify_bytes(
-            body,
-            self.last_host_notify,
-            now,
-            HOST_NOTIFY_INTERVAL,
-            HOST_NOTIFY_CAP,
-        ) else {
-            return;
-        };
-        self.last_host_notify = Some(now);
-        self.effects.host_writes.extend_from_slice(&bytes);
-    }
-
     /// ux P1-6: ring the HOST terminal's own bell for the fallback attention
-    /// path — see `host_bell_bytes`. Shares `last_host_notify`/
-    /// `HOST_NOTIFY_INTERVAL` with `queue_host_notify` rather than a gate of
-    /// its own: both exist to stop a pane from machine-gunning the
-    /// operator's real terminal, so one per-pane "how often may this pane
-    /// ping the host" budget for the two of them is the simpler rule, not a
-    /// weaker one.
+    /// path — see `host_bell_bytes`. `last_host_notify`/
+    /// `HOST_NOTIFY_INTERVAL` is now this path's own per-pane budget: it was
+    /// shared with the OSC 9 relay so a pane alternating BEL and OSC 9 could
+    /// not burn two, and P2's 2026-08-21 amendment retired that relay (the
+    /// named notification `App` raises replaces it). The gate stays — it is
+    /// what stops a pane machine-gunning the operator's real terminal.
     fn queue_host_bell(&mut self) {
         let now = Instant::now();
         let Some(bytes) = host_bell_bytes(self.last_host_notify, now, HOST_NOTIFY_INTERVAL) else {
@@ -738,7 +703,7 @@ impl PtyPane {
     }
 
     /// P2/P3: relay a pane's clipboard write to the host, rate-gated the
-    /// same shape as `queue_host_notify` — the timestamp only advances on an
+    /// same shape as `queue_host_bell` — the timestamp only advances on an
     /// actual emission, so a tight loop still gets one relay per interval
     /// instead of resetting its own clock and being starved indefinitely.
     fn queue_host_clipboard(&mut self, selection: &str, payload_base64: &str) {
@@ -1418,10 +1383,10 @@ pub fn extract_selection(screen: &vt100::Screen, a: (u16, u16), b: (u16, u16)) -
 mod tests {
     use super::{
         agent_title_status, extract_selection, gesture_presented, host_bell_bytes,
-        host_clipboard_bytes, host_notify_bytes, sanitize_for_host, scrub_control_env,
-        scrub_host_identity, sync_presented, AgentStatus, CONTROL_ENV_VARS,
-        GESTURE_FREEZE_STALE_CAP, HOST_IDENTITY_VARS, HOST_NOTIFY_CAP, HOST_NOTIFY_INTERVAL,
-        OSC52_INTERVAL, OSC52_PAYLOAD_CAP, SYNC_STALE_CAP_DEFAULT,
+        host_clipboard_bytes, sanitize_for_host, scrub_control_env, scrub_host_identity,
+        sync_presented, AgentStatus, CONTROL_ENV_VARS, GESTURE_FREEZE_STALE_CAP,
+        HOST_IDENTITY_VARS, HOST_NOTIFY_INTERVAL, OSC52_INTERVAL, OSC52_PAYLOAD_CAP,
+        SYNC_STALE_CAP_DEFAULT,
     };
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -1577,51 +1542,6 @@ mod tests {
             gesture_presented(live.screen(), freeze.as_ref(), GESTURE_FREEZE_STALE_CAP).is_none(),
             "scrolled into history, the gesture freeze must not override the live scrolled view"
         );
-    }
-
-    /// P2: the shape roost re-emits, and the two things that must never
-    /// reach the host — a body that could break out of roost's own sequence,
-    /// and an unbounded one.
-    #[test]
-    fn host_notify_is_bounded_and_cannot_break_out_of_its_sequence() {
-        let now = Instant::now();
-        let emit =
-            |body: &str| host_notify_bytes(body, None, now, HOST_NOTIFY_INTERVAL, HOST_NOTIFY_CAP);
-
-        assert_eq!(emit("NEEDS-YOU").unwrap(), b"\x1b]9;NEEDS-YOU\x07".to_vec());
-
-        // A pane's payload is untrusted: an embedded BEL/ESC would close
-        // roost's own OSC early and let the rest be read as host commands.
-        let hostile = emit("safe\x07\x1b]0;PWNED\x07\x1b[2Jtail").unwrap();
-        assert_eq!(hostile, b"\x1b]9;safe]0;PWNED[2Jtail\x07".to_vec());
-        assert_eq!(hostile.iter().filter(|&&b| b == 0x07).count(), 1, "one terminator");
-        assert_eq!(hostile.iter().filter(|&&b| b == 0x1b).count(), 1, "one introducer");
-
-        // Length is capped in characters, on char boundaries.
-        let long = emit(&"x".repeat(HOST_NOTIFY_CAP * 3)).unwrap();
-        assert_eq!(long.len(), HOST_NOTIFY_CAP + 5);
-        let wide = emit(&"日".repeat(HOST_NOTIFY_CAP * 2)).unwrap();
-        assert!(std::str::from_utf8(&wide[4..wide.len() - 1]).is_ok(), "never split a glyph");
-
-        // Nothing printable left ⇒ nothing emitted (no empty OSC 9).
-        assert!(emit("\x07\x1b\x00").is_none());
-        assert!(emit("").is_none());
-    }
-
-    /// P2: at most one host notification per pane per interval — an agent
-    /// that notifies in a loop must not become a notification firehose.
-    #[test]
-    fn host_notify_is_rate_limited_per_pane() {
-        let now = Instant::now();
-        let cap = HOST_NOTIFY_CAP;
-        // Just inside the window: dropped.
-        let recent = Some(now - HOST_NOTIFY_INTERVAL + Duration::from_millis(1));
-        assert!(host_notify_bytes("again", recent, now, HOST_NOTIFY_INTERVAL, cap).is_none());
-        // Past it: emitted again.
-        let old = Some(now - HOST_NOTIFY_INTERVAL - Duration::from_millis(1));
-        assert!(host_notify_bytes("again", old, now, HOST_NOTIFY_INTERVAL, cap).is_some());
-        // The first notification of a pane's life is never rate-limited.
-        assert!(host_notify_bytes("first", None, now, HOST_NOTIFY_INTERVAL, cap).is_some());
     }
 
     /// The SIGHUP grace is spent exactly once per pane, whoever spends it.
@@ -1799,12 +1719,15 @@ mod tests {
 
     /// P2: and the **desktop** channel is gated too, on the same interval.
     ///
-    /// The relay above (`host_notify_bytes`) was rate-limited from the
+    /// The OSC 9 relay that used to sit beside it was rate-limited from the
     /// start; `PaneEffects::notifications` — which the composition root
-    /// turns into a host bell plus an `osascript` fork — was not. Measured
-    /// before the gate: this exact loop produced 500 notifications while
-    /// the relay beside it produced one, so `for i in $(seq 1 10000); do
-    /// printf '\e]9;hi\a'; done` in any pane forked ten thousand processes.
+    /// turns into a host bell plus an `OSC 9` (and, before 2026-08-21, an
+    /// `osascript` fork) — was not. Measured before the gate: this exact
+    /// loop produced 500 notifications while the relay beside it produced
+    /// one, so `for i in $(seq 1 10000); do printf '\e]9;hi\a'; done` in any
+    /// pane forked ten thousand processes. Now that this channel is the only
+    /// one, the gate is what stands between that loop and the operator's
+    /// notification centre.
     ///
     /// Driven through a real `PtyPane` rather than a helper, because the
     /// gate has to hold for the path the event loop actually takes.
@@ -1833,9 +1756,9 @@ mod tests {
         );
     }
 
-    /// ux P1-6: the fallback bell relay is a single raw BEL, gated by the
-    /// exact same rate window as `host_notify_bytes` — pinned separately so
-    /// a future change to one gate can't silently desync the other.
+    /// ux P1-6: the fallback bell relay is a single raw BEL, gated by
+    /// `HOST_NOTIFY_INTERVAL` — pinned separately from the desktop channel's
+    /// own gate so a future change to one can't silently desync the other.
     #[test]
     fn host_bell_is_a_single_bel_and_rate_limited_per_pane() {
         let now = Instant::now();

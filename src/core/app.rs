@@ -2729,6 +2729,20 @@ impl<B: PaneBackend> App<B> {
         Some(format!("{}: {}", self.display_name(id), body))
     }
 
+    /// Queue one of **roost's own** notifications for the host terminal.
+    ///
+    /// The single door for every desktop notification roost raises — a pane
+    /// needing input, a status transition, a pane exiting. `infra::notify`
+    /// builds the bytes (a bell plus a bounded, sanitized `OSC 9`) and owns
+    /// the process-wide budget; this puts them on the same `host_out` queue
+    /// as P2's relays and P6's title, so they land between frames like
+    /// everything else roost writes to the host (W3).
+    pub fn notify_host(&mut self, text: &str) {
+        if let Some(bytes) = crate::infra::notify::host_bytes(text) {
+            self.host_out.extend_from_slice(&bytes);
+        }
+    }
+
     /// W3: drain the bytes roost owes the HOST terminal — pane OSC 9
     /// notifications (P2), OSC 52 clipboard writes (P3) and the window title
     /// (P6), already rate-limited/capped/sanitized. The composition root
@@ -7591,7 +7605,7 @@ pub(crate) mod tests {
     /// focused pane is deliberately not announced (you're looking at it),
     /// matching `on_status`/`on_pty_exit`.
     #[test]
-    fn a_pane_notification_names_the_pane_and_queues_the_host_re_emission() {
+    fn a_pane_notification_names_the_pane_and_queues_one_host_emission() {
         let (mut app, _s) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1 | 2, focus 2
         assert_eq!(app.focused, 2);
@@ -7599,24 +7613,38 @@ pub(crate) mod tests {
         let name = app.display_name(1);
         app.runtimes.get_mut(&1).unwrap().effects = crate::ports::PaneEffects {
             notifications: vec!["NEEDS-YOU".to_string()],
-            host_writes: b"\x1b]9;NEEDS-YOU\x07".to_vec(),
+            ..Default::default()
         };
         let msg = app.on_pty_output(1, b"whatever").expect("unfocused pane notifies");
         assert_eq!(msg, format!("{name}: NEEDS-YOU"));
-        // `contains`, not equality: the same queue also carries P6's host
-        // title, whose own gate is `host_title_follows_focus_and_live_title`.
-        assert!(host_contains(&mut app, b"\x1b]9;NEEDS-YOU\x07"));
+        app.notify_host(&msg);
+        // One emission, carrying the name — P2's 2026-08-21 amendment. The
+        // verbatim relay that used to ride alongside it is gone; two banners
+        // for one event was only invisible while one of them was an
+        // `osascript` fork. `contains`, not equality, because the same queue
+        // also carries P6's host title.
+        let out = app.take_host_output();
+        assert_eq!(count(&out, b"\x1b]9;"), 1, "exactly one OSC 9 per notification");
+        assert!(window_contains(&out, format!("\x1b]9;{name}: NEEDS-YOU\x07").as_bytes()));
 
-        // The focused pane's notification still forwards to the host (the
-        // app asked its terminal for it) but raises no roost-side nudge.
+        // The focused pane's notification raises nothing at all: you are
+        // already looking at it, and there is no second emitter left to
+        // announce it behind your back.
         app.runtimes.get_mut(&2).unwrap().effects = crate::ports::PaneEffects {
             notifications: vec!["also me".to_string()],
-            host_writes: b"\x1b]9;also me\x07".to_vec(),
+            ..Default::default()
         };
         assert!(app.on_pty_output(2, b"x").is_none());
-        assert!(host_contains(&mut app, b"\x1b]9;also me\x07"));
-        // Draining takes it: nothing is re-emitted on the next pass.
         assert!(!host_contains(&mut app, b"\x1b]9;"));
+    }
+
+    /// How many times `needle` occurs in `hay`.
+    fn count(hay: &[u8], needle: &[u8]) -> usize {
+        hay.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    fn window_contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
     }
 
     /// Drain the host queue once and report whether it carried `needle`.
