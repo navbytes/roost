@@ -122,6 +122,33 @@ attention path as a bell (badge ◆ + notifier), and (b) is optionally
 re-emitted to the host terminal so native desktop notifications fire.
 OSC 9;4 progress may be surfaced later (badge percentage) — out of scope here.
 
+**Amended 2026-08-21 (the notifier is the host terminal):** the "notifier"
+in (a) was a forked `osascript` on macOS, and it was wrong twice.
+`display notification` posts under the bundle running the script, which for
+`/usr/bin/osascript` is **Script Editor** — so every roost notification
+arrived from an app the user never opened, and `with title "roost"` cannot
+change that (it sets the notification's title line, not its attribution).
+Short of shipping roost as an `.app`, a CLI cannot post under its own name.
+And on any host that honours OSC 9 — Ghostty, iTerm2, WezTerm, kitty — a
+pane's notification already produced **two** banners: (b)'s relay, correctly
+attributed, plus the Script Editor one.
+
+`infra::notify` now writes the same thing (b) does: a bell, then a bounded,
+C0-stripped `OSC 9`, on roost's own stdout. Same mechanism, same sanitizer
+(`pty::sanitize_for_host` + `HOST_NOTIFY_CAP`), same contract sentence — the
+emitter simply stopped being a subprocess. It costs a host that ignores
+OSC 9 (Apple Terminal, Alacritty) its desktop banner, leaving the bell it
+already had; it gains correct attribution, one banner instead of two on
+everything else, and notifications that survive ssh, which `osascript`
+never did.
+
+**Still open, deliberately:** for a pane's *own* OSC 9, (a) and (b) now put
+two OSC 9s on the same stream — (b)'s verbatim body, and (a)'s
+`display_name`-prefixed one, which (a) alone skips for the focused pane. The
+two used to be different surfaces, so the overlap was invisible. Collapsing
+them is a contract change (which body rides, and whether the focused pane is
+exempt) and is not made here.
+
 **Extended 2026-08-07 (ux P1-6):** (b) held only for OSC 9/777 — a pane's
 *own* bell (the heuristic ◆ path this same item put on "the same attention
 path as a bell") was consumed by the vt100 parser and never re-emitted, so
