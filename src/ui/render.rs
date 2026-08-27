@@ -413,9 +413,13 @@ fn hint_bar_right_spans(
 }
 
 /// P21: the search prompt and hit counter for C9's right segment — `/query`
-/// (with the `▏` insertion caret the rename dialog already uses, so a typed
-/// prompt looks like a text field everywhere in roost) and `i/n`, or `0/0`
-/// when nothing matches. `None` for both outside a search. Pure.
+/// (with the `▏` glyph trailing it, so a typed prompt looks like a text
+/// field) and `i/n`, or `0/0` when nothing matches. `None` for both outside
+/// a search. Pure.
+///
+/// The `▏` stays a *glyph* here, unlike `rename_field`'s reversed cell: this
+/// prompt and the picker/roster type-aheads are append-only — there is no
+/// point to move, so nothing can be displaced by a caret that takes a cell.
 fn search_segment(search: Option<&Search>) -> (Option<String>, Option<String>) {
     let Some(s) = search else { return (None, None) };
     let counter = if s.matches.is_empty() {
@@ -628,16 +632,42 @@ fn picker_row_body(i: usize, item: &str) -> String {
     }
 }
 
-/// C13 (U16): the rename field's rendered text — the buffer with the `▏`
-/// caret sitting *at* the insertion point rather than always at the end.
+/// C13 (U16, amended 2026-08-27): the rename field's rendered spans — the
+/// caret **on** the character at the insertion point (`theme::attention()`,
+/// the reversal every terminal's own block cursor is), not a glyph inserted
+/// before it.
+///
+/// It was an inserted `▏` until a live report: moving the point left pushed
+/// every character after it one column right, so editing the middle of a
+/// name visibly shoved the tail around — the field's own text moving under
+/// a key that was supposed to move only the cursor. An inserted caret costs
+/// a real cell; a reversed one costs none, which is exactly why terminals
+/// draw cursors that way. At the end of the buffer there is no character to
+/// reverse, so the caret is a reversed space — appended, displacing nothing.
+///
 /// `cursor` is a char index and is clamped, so a stale value (a resize
 /// between keystrokes, a paste that shortened the buffer) renders the caret
 /// at the end instead of panicking on a bad slice. Pure so the caret's
 /// placement has a unit-test seam.
-fn rename_field(buffer: &str, cursor: usize) -> String {
+fn rename_field(buffer: &str, cursor: usize) -> Vec<Span<'static>> {
     let at = cursor.min(buffer.chars().count());
     let byte = buffer.char_indices().nth(at).map_or(buffer.len(), |(b, _)| b);
-    format!("{}{}{}", &buffer[..byte], theme::RENAME_CURSOR, &buffer[byte..])
+    let mut spans = vec![Span::raw(buffer[..byte].to_string())];
+    let mut tail = buffer[byte..].chars();
+    match tail.next() {
+        Some(c) => {
+            spans.push(Span::styled(c.to_string(), theme::attention()));
+            spans.push(Span::raw(tail.as_str().to_string()));
+        }
+        None => spans.push(Span::styled(" ", theme::attention())),
+    }
+    spans
+}
+
+/// The rendered width of a span run, in display columns (D1) — what a
+/// caller has to pad against once a field is spans rather than one string.
+fn spans_width(spans: &[Span<'_>]) -> u16 {
+    spans.iter().map(|s| mouse::display_width(&s.content)).sum()
 }
 
 /// C14 (U20): one picker row's leading marker and text style, given whether
@@ -1551,7 +1581,7 @@ fn draw_mode_overlay<B: PaneBackend>(
             let RenameTarget::Tab = target;
             let inner = modal_frame(f, body, rect, Line::from(" rename tab ").style(theme::ink()));
             f.render_widget(
-                Paragraph::new(rename_field(buffer, *cursor)).style(theme::ink()),
+                Paragraph::new(Line::from(rename_field(buffer, *cursor))).style(theme::ink()),
                 inner,
             );
         }
@@ -1565,13 +1595,15 @@ fn draw_mode_overlay<B: PaneBackend>(
         // quiet input can't be proofread (C13's own rule).
         Mode::PaneEdit { name, lines, row, col, .. } => {
             let inner = modal_frame(f, body, rect, Line::from(" edit pane ").style(theme::ink()));
-            let name_text = if *row == 0 { rename_field(name, *col) } else { name.clone() };
-            let pad =
-                (inner.width as usize).saturating_sub(mouse::display_width(&name_text) as usize);
-            let mut rendered: Vec<Line<'_>> = vec![Line::from(Span::styled(
-                format!("{name_text}{}", " ".repeat(pad)),
-                theme::ink().add_modifier(Modifier::UNDERLINED),
-            ))];
+            let mut name_spans =
+                if *row == 0 { rename_field(name, *col) } else { vec![Span::raw(name.clone())] };
+            let pad = inner.width.saturating_sub(spans_width(&name_spans));
+            // The fill keeps the underline running edge to edge (C6's
+            // header idiom); the row's style carries it, so the caret's
+            // reversal patches on top of it rather than replacing it.
+            name_spans.push(Span::raw(" ".repeat(pad as usize)));
+            let mut rendered: Vec<Line<'_>> =
+                vec![Line::from(name_spans).style(theme::ink().add_modifier(Modifier::UNDERLINED))];
             rendered.extend(lines.iter().enumerate().map(|(i, l)| {
                 if i + 1 == *row {
                     Line::from(rename_field(l, *col))
@@ -4761,21 +4793,47 @@ mod tests {
         );
     }
 
-    /// U16: the `▏` caret sits AT the insertion point, not always at the
-    /// end — the visible half of the cursor motion. Out-of-range values
-    /// clamp to the end rather than panicking on a bad slice, and the field
-    /// slices on char boundaries so a multi-byte name survives.
+    /// U16: the caret sits AT the insertion point, not always at the end —
+    /// the visible half of the cursor motion. Out-of-range values clamp to
+    /// the end rather than panicking on a bad slice, and the field slices on
+    /// char boundaries so a multi-byte name survives.
     #[test]
     fn rename_field_puts_the_caret_at_the_insertion_point() {
-        let caret = theme::RENAME_CURSOR;
-        assert_eq!(super::rename_field("abcd", 4), format!("abcd{caret}"));
-        assert_eq!(super::rename_field("abcd", 2), format!("ab{caret}cd"));
-        assert_eq!(super::rename_field("abcd", 0), format!("{caret}abcd"));
-        assert_eq!(super::rename_field("", 0), caret.to_string());
+        // (text before the caret, the character under it, text after it).
+        let parts = |b: &str, c: usize| {
+            let spans = super::rename_field(b, c);
+            let at = spans.iter().position(|s| s.style == theme::attention()).expect("a caret");
+            assert_eq!(at, 1, "the caret always follows exactly one head span");
+            let text = |s: Option<&ratatui::text::Span<'_>>| {
+                s.map(|s| s.content.to_string()).unwrap_or_default()
+            };
+            (text(spans.first()), text(spans.get(at)), text(spans.get(at + 1)))
+        };
+        assert_eq!(parts("abcd", 2), ("ab".into(), "c".into(), "d".into()));
+        assert_eq!(parts("abcd", 0), (String::new(), "a".into(), "bcd".into()));
+        // Past the last character there is nothing to reverse, so the caret
+        // is a reversed space — appended, displacing nothing.
+        assert_eq!(parts("abcd", 4), ("abcd".into(), " ".into(), String::new()));
+        assert_eq!(parts("", 0), (String::new(), " ".into(), String::new()));
         // Clamped, not panicking.
-        assert_eq!(super::rename_field("abcd", 99), format!("abcd{caret}"));
-        // Multi-byte: the caret lands between chars, never inside one.
-        assert_eq!(super::rename_field("héllo", 2), format!("hé{caret}llo"));
+        assert_eq!(parts("abcd", 99), ("abcd".into(), " ".into(), String::new()));
+        // Multi-byte: the caret takes a whole char, never half of one.
+        assert_eq!(parts("héllo", 1), ("h".into(), "é".into(), "llo".into()));
+    }
+
+    /// The bug the reversal fixed: an inserted caret cost a real cell, so
+    /// moving the point left shoved every character after it one column
+    /// right. The field's width must not depend on where the point is.
+    #[test]
+    fn moving_the_caret_never_moves_the_text_around_it() {
+        let widths: Vec<u16> =
+            (0..=4).map(|c| super::spans_width(&super::rename_field("abcd", c))).collect();
+        assert_eq!(widths, vec![4, 4, 4, 4, 5], "only the end-of-buffer caret adds a column");
+        for cursor in 0..=4 {
+            let spans = super::rename_field("abcd", cursor);
+            let flat: String = spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(flat.trim_end(), "abcd", "cursor {cursor} rewrote the text");
+        }
     }
 
     /// C14 (U20): the cwd column shows the last two path components, so a
