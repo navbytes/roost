@@ -5345,6 +5345,46 @@ recording because the report proposed it as the cheap alternative:
   the amendment above. Found by checking whether the reordering would do
   anything before building it.
 
+### C40 — Mark and pull (`Alt+Shift+x` / `Alt+Shift+v`) — [Added 2026-08-27]
+
+C28 moves the focused pane one tab at a time. That is the whole feature on a
+three-tab workspace and a walk on a ten-tab one, and the walk is not free:
+every step re-parents the pane into a tab it is not staying in, splitting and
+re-splitting layouts on the way past. C40 is the same verb with an arbitrary
+destination — **mark here, pull there.**
+
+- `Alt+Shift+x` marks the focused pane. Marking the marked pane unmarks it.
+- `Alt+Shift+v` pulls the marked pane into the tab that is active *then*,
+  landing it exactly as C28 lands one: same host (the tab's focus target),
+  same widest-way split, same refusal below C25's floor, focus following the
+  pane, and the source tab removed if the pane was its last.
+
+**Nothing moves on the mark, and that is not a compromise.** A pane is a live
+process; it cannot sit in a clipboard between two tabs. This is tmux's
+`select-pane -m`, not a cut — the mark is a *name* roost is holding, and the
+pull is the whole move, atomic, with C28's refusals intact.
+
+**The mark is visible or it does not exist.** The marked pane is usually in
+another tab by the time it matters, so a mark with no chrome would be a mode
+the user cannot see. While one is pending, C9's hint bar leads with
+`Alt+Shift+v pull marked pane` — a *leading* pair, because pairs drop whole
+from the right and this is the one that must survive a narrow terminal. The
+flash on the mark names the pull chord (resolved, C34), and the feed records
+the arrival as an ordinary move.
+
+**The mark is cleared by every outcome that resolves it** — the pull,
+"already in this tab", a marked pane that has since closed — and *kept* when
+the destination refuses for want of room, which is the one refusal the user
+can fix and retry. It is also cleared when the marked pane closes: pane ids
+are recycled (`next_pane_id` is max+1), so a stale mark would eventually name
+a stranger rather than merely nothing.
+
+**Only the shifted forms are taken.** Bare `Alt+x` and `Alt+v` stay unbound,
+so emacs' `M-x` and `M-v` keep reaching the pane through U5 — the same reason
+`b`/`d` were struck out of §8's free pool. And the shifted forms are where
+this verb belongs anyway: C28 and C33's rule is that a shifted chord carries
+the *pane* where its unshifted sibling carries *you*.
+
 ### On gates that pass by construction
 **[Added 2026-08-20, after the eighth instance]**
 
@@ -5456,6 +5496,7 @@ shows only the C9-curated subsets.
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
 | 13b | `Alt+i / Alt+m` | **previous / next tab (wraps)** | C2 |
 | 13c | `Alt+Shift+i / Alt+Shift+m` | **move this pane to the previous / next tab (wraps)** | C28 |
+| 13d | `Alt+Shift+x / Alt+Shift+v` | **mark this pane / pull the marked pane into this tab** | C40 |
 | 14 | `Alt+w` | close pane (confirm if busy / last) | — |
 | 15 | `Alt+u` | undo — reopen last closed pane/tab | C26 |
 | 16 | `Alt+c` | copy mode (hjkl+v+y, or drag) | C17/C24 |
@@ -5518,6 +5559,14 @@ assigned alphabetically — i before m, previous before next.
 The overlay (C15) absorbs both rows within its ≤20 cap by merging
 `Alt+c`/`Alt+PgUp` (the two look-back modes) and `Alt+/`/`Alt+?` (the two
 help toggles) into one row each.]
+
+[Amended 2026-08-27, C40 — the `v`/`x` reservation, spent.] `Alt+Shift+x`
+and `Alt+Shift+v` are mark-pane and pull-pane (row 13d). That *is* the
+clipboard vocabulary the note above reserved them for, one level up: on
+panes rather than on text. Only the **shifted** forms are taken — bare
+`Alt+x`/`Alt+v` stay unbound, so emacs' `M-x` and `M-v` keep reaching the
+pane through U5, the same live-regression argument that struck `b`/`d` out.
+`y` is untouched and remains C24's yank key inside copy mode.]
 
 [Amended 2026-07-27, SPEC-ux U23 — this table is no longer the *whole* help
 overlay. The chord rows below are still rendered verbatim and in order, but

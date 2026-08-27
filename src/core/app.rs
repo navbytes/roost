@@ -462,6 +462,16 @@ pub struct App<B: PaneBackend> {
     /// (`set_focus` only records a real transition), so a toggle always
     /// ping-pongs: A→B leaves A, going back to A leaves B.
     alternate: Option<PaneId>,
+    /// C40: the pane `Alt+Shift+x` marked, waiting for `Alt+Shift+v` to
+    /// pull it into whichever tab is active by then. `None` almost always —
+    /// a mark is a gesture in progress, not a state a workspace lives in,
+    /// so it is session-only and never persisted.
+    ///
+    /// Cleared when the marked pane closes: pane ids are recycled
+    /// (`next_pane_id` is max+1), so a stale mark would not merely be dead —
+    /// it would eventually name a stranger. Same hygiene as `raw` /
+    /// `tab_focus`, and for the same reason.
+    marked: Option<PaneId>,
     /// P10: does roost's own window hold the host terminal's focus? Starts
     /// **true** — a host that never reports focus (no mode 1004 support, a
     /// bare PTY, another multiplexer) must not leave every pane believing it
@@ -733,6 +743,7 @@ impl<B: PaneBackend> App<B> {
         let mut app = Self {
             focused: 0,
             alternate: None,
+            marked: None,
             host_focused: true,
             ws,
             runtimes: HashMap::new(),
@@ -888,6 +899,13 @@ impl<B: PaneBackend> App<B> {
     /// the hint bar's `ZOOM` pseudo-state word (amended C9).
     pub fn zoomed(&self) -> bool {
         self.zoomed
+    }
+
+    /// C40: the pane waiting to be pulled, if any — the C9 hint bar's
+    /// standing "pull marked pane here" pair is the only thing that makes a
+    /// mark visible from the tab you marked it *from*.
+    pub fn marked(&self) -> Option<PaneId> {
+        self.marked
     }
 
     /// C20: the activity-feed ring, oldest first — read by the renderer
@@ -2620,6 +2638,12 @@ impl<B: PaneBackend> App<B> {
         // unrelated one.
         self.last_shell_seen.remove(&id);
         self.pending_detect.remove(&id);
+        // C40: and the pull mark, for the same recycled-id reason — a mark
+        // left pointing at a closed pane would be pulled by whichever pane
+        // inherited the number next.
+        if self.marked == Some(id) {
+            self.marked = None;
+        }
         let tab = &mut self.ws.tabs[ti];
         tab.panes.remove(&id);
         // U11: a closed pane is no longer anyone's focus memory — pane ids
@@ -3857,6 +3881,8 @@ impl<B: PaneBackend> App<B> {
             Action::MovePaneToTab { forward } => {
                 self.move_pane_to_tab(if forward { 1 } else { -1 })
             }
+            Action::MarkPane => self.mark_pane(),
+            Action::PullPane => self.pull_pane(),
             // C38: each of these three declines silently on a tab the shape
             // cannot apply to — overwhelmingly "this tab has one pane", and
             // `Alt+s` is one of C9's advertised seven, so its silence is the
@@ -4748,8 +4774,21 @@ impl<B: PaneBackend> App<B> {
         if !self.ws.tabs[si].panes.contains_key(&id) {
             return; // focus is somewhere this action has no business moving
         }
-        let mut di = (si as isize + delta).rem_euclid(n as isize) as usize;
+        let di = (si as isize + delta).rem_euclid(n as isize) as usize;
+        self.carry_pane_to_tab(id, si, di);
+    }
 
+    /// The carry itself, shared by C28's `Alt+Shift+i`/`Alt+Shift+m` and
+    /// C40's pull: take `id` out of tab `si` and land it in tab `di`, with
+    /// focus. Split out rather than duplicated because the interesting half
+    /// is the *refusal* — the fit check, the emptied-source rule and the
+    /// index fixup below are the contract, and a second copy of them would
+    /// be a second set of edge cases to keep in step.
+    ///
+    /// Caller's job: `si` really holds `id`, and `si != di`. Answers
+    /// whether the pane actually moved — the destination can refuse for
+    /// want of room, and C40's mark stands when it does.
+    fn carry_pane_to_tab(&mut self, id: PaneId, si: usize, mut di: usize) -> bool {
         // Where the pane lands, and whether it fits — decided *before*
         // anything is removed, so a refusal leaves the workspace untouched
         // rather than stranding the pane between two tabs. The destination
@@ -4763,13 +4802,13 @@ impl<B: PaneBackend> App<B> {
             .tab_focus_target(di)
             .filter(|h| drects.iter().any(|pr| pr.id == *h))
             .or_else(|| drects.first().map(|pr| pr.id));
-        let Some(host) = host else { return };
+        let Some(host) = host else { return false };
         // Same split rule as `spawn_child`: cut the widest way, and refuse
         // below the C25 floor rather than make a pane nothing can render in.
         let host_rect = drects.iter().find(|pr| pr.id == host).map(|pr| pr.rect);
         let Some(dir) = split_fit(host_rect) else {
             self.set_flash(format!("{} has no room", self.ws.tabs[di].name));
-            return;
+            return false;
         };
 
         // C21/C22: this is a tab change, so it exits zoom and hides the
@@ -4780,7 +4819,7 @@ impl<B: PaneBackend> App<B> {
         self.hide_float();
 
         let label = self.feed_label(id);
-        let Some(spec) = self.ws.tabs[si].panes.remove(&id) else { return };
+        let Some(spec) = self.ws.tabs[si].panes.remove(&id) else { return false };
         // U11: the pane that is leaving cannot also be what this tab
         // remembers — coming back falls through to the tab's first pane.
         // (`remember_tab_focus` is deliberately *not* called for the source:
@@ -4816,6 +4855,70 @@ impl<B: PaneBackend> App<B> {
         self.push_feed(format!("moved {label} to {dest_name}"), false, None);
         self.relayout();
         self.save();
+        true
+    }
+
+    /// C40: mark the focused pane for a later pull, or unmark it if it is
+    /// already the marked one — one chord both ways, like every other
+    /// toggle roost binds.
+    ///
+    /// Nothing moves here, and the flash says so by naming the chord that
+    /// finishes the gesture (resolved, never spelled — C34). The float
+    /// refuses on C28's exact wording: it belongs to no tab, so there is no
+    /// tab to pull it out of.
+    fn mark_pane(&mut self) {
+        if self.float_focused() {
+            self.set_flash("the scratch pane belongs to no tab");
+            return;
+        }
+        let id = self.focused;
+        if self.marked == Some(id) {
+            self.marked = None;
+            self.set_flash(format!("unmarked {}", self.feed_label(id)));
+            return;
+        }
+        self.marked = Some(id);
+        let clause = self.chord_clause(Action::PullPane, |c| format!(" — {c} pulls it here"));
+        self.set_flash(format!("marked {}{clause}", self.feed_label(id)));
+    }
+
+    /// C40: bring the marked pane into the active tab.
+    ///
+    /// The mark is cleared on every outcome that resolves it — the pull,
+    /// "already here", and a pane that has since gone — so the hint bar's
+    /// standing "pull marked pane" pair never outlives the gesture. It is
+    /// *kept* when the destination refuses for want of room, which is the
+    /// one outcome the user can fix and retry.
+    fn pull_pane(&mut self) {
+        let Some(id) = self.marked else {
+            let clause = self.chord_clause(Action::MarkPane, |c| format!(" — {c} marks one"));
+            self.set_flash(format!("nothing marked{clause}"));
+            return;
+        };
+        // Gone, or moved into the float — either way there is nothing in a
+        // tab to carry, and the mark has outlived its pane.
+        let Some(si) = self.tab_of(id) else {
+            self.marked = None;
+            self.set_flash("the marked pane is gone");
+            return;
+        };
+        let di = self.ws.active_tab;
+        if si == di {
+            self.marked = None;
+            self.set_flash(format!("{} is already in this tab", self.feed_label(id)));
+            return;
+        }
+        // The destination is the tab we are *standing on*, and
+        // `carry_pane_to_tab` picks its host through `tab_focus_target` —
+        // the remembered set, which `remember_tab_focus` only stamps on the
+        // way *out* of a tab. Stale here, so the pull would split whatever
+        // pane the tree happens to list first instead of the one the user
+        // is looking at. Stamp it first: the pane you are on is where a
+        // pull lands, exactly like `Alt+n`.
+        self.remember_tab_focus();
+        if self.carry_pane_to_tab(id, si, di) {
+            self.marked = None;
+        }
     }
 
     /// C21: leave zoom (a pure view flag). Called by every documented exit
@@ -12331,7 +12434,7 @@ pub(crate) mod tests {
             'step: for step in 0..400 {
                 let would_quit = app.ws.tabs.len() == 1 && app.ws.active_tab().panes.len() == 1;
                 let (name, action) = loop {
-                    let pick = rng.below(40);
+                    let pick = rng.below(42);
                     let d = dirs[rng.below(4) as usize];
                     let a = match pick {
                         0..=3 => ("NewPane", Action::NewPane),
@@ -12532,6 +12635,12 @@ pub(crate) mod tests {
                         }
                         35 => ("ToggleFloat", Action::ToggleFloat),
                         36 | 37 => ("ToggleZoom", Action::ToggleZoom),
+                        // C40: the mark is the one pane-carrying verb whose
+                        // source tab is arbitrary rather than the active
+                        // one, so it reaches tree/map states the walk-based
+                        // move cannot — worth the two picks.
+                        38 => ("MarkPane", Action::MarkPane),
+                        39 => ("PullPane", Action::PullPane),
                         _ => ("FocusAlternate", Action::FocusAlternate),
                     };
                     break a;
@@ -15968,6 +16077,131 @@ pub(crate) mod tests {
         assert_eq!(app.pane_order(), vec![moved]);
         assert_eq!(app.ws.tabs[1].panes.len(), packed.len(), "the destination is unchanged");
         assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("no room")), "{:?}", app.flash);
+    }
+
+    // ---- C40: mark and pull ---------------------------------------------
+
+    /// The whole point of C40 over C28: the destination is arbitrary, so a
+    /// pane four tabs away arrives in one gesture rather than four presses
+    /// — and it arrives *alive*, same as a move (same runtime, no respawn).
+    #[test]
+    fn a_marked_pane_is_pulled_into_whatever_tab_is_active_however_far_away() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 1: panes 1|2
+        for _ in 0..4 {
+            app.apply(Action::NewTab); // tabs 2..5, one pane each
+        }
+        app.apply(Action::GoToTab(0));
+        app.set_focus(2);
+        app.runtimes.get_mut(&2).expect("pane 2 is running").write_input(b"mid-turn");
+
+        app.apply(Action::MarkPane);
+        app.apply(Action::GoToTab(4)); // four tabs away, no walking
+        app.apply(Action::PullPane);
+
+        assert_eq!(app.ws.active_tab, 4, "the pull never leaves the tab you are on");
+        assert_eq!(app.focused, 2, "focus follows the pane, exactly like a move");
+        assert!(app.ws.tabs[4].panes.contains_key(&2), "it arrived");
+        assert!(app.pane_order().contains(&2), "…in the layout tree, not just the map");
+        assert!(!app.ws.tabs[0].panes.contains_key(&2), "and left the tab it was marked in");
+        assert_eq!(
+            app.runtimes.get(&2).map(|rt| rt.input.clone()),
+            Some(b"mid-turn".to_vec()),
+            "the same runtime object — a pull must never respawn the agent",
+        );
+        assert_eq!(app.marked(), None, "the gesture is over, so the mark is too");
+    }
+
+    /// One chord both ways, like every other toggle roost binds — and the
+    /// unmark really disarms the pull rather than just clearing a label.
+    #[test]
+    fn marking_the_marked_pane_unmarks_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewTab);
+        app.apply(Action::GoToTab(0));
+        let id = app.focused;
+
+        app.apply(Action::MarkPane);
+        assert_eq!(app.marked(), Some(id));
+        app.apply(Action::MarkPane);
+        assert_eq!(app.marked(), None);
+
+        app.apply(Action::GoToTab(1));
+        app.apply(Action::PullPane);
+        assert!(!app.pane_order().contains(&id), "an unmarked pane stays put");
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("nothing marked")));
+    }
+
+    /// Every outcome that resolves the gesture says so out loud (C10: a
+    /// no-op you can see beats one you can't) and clears the mark, so the
+    /// hint bar's standing pair never outlives it.
+    #[test]
+    fn pull_flashes_and_clears_when_the_mark_cannot_be_honoured() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let id = app.focused;
+
+        // Marked, then pulled into the tab it already lives in.
+        app.apply(Action::MarkPane);
+        app.apply(Action::PullPane);
+        assert_eq!(app.ws.tabs.len(), 1, "nothing moved");
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("already in this tab")));
+        assert_eq!(app.marked(), None);
+
+        // The C22 float belongs to no tab, so there is no tab to pull it
+        // out of — C28's refusal, verbatim.
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::MarkPane);
+        assert_eq!(app.marked(), None, "the float is never marked");
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("scratch")));
+        app.apply(Action::ToggleFloat);
+        assert_eq!(app.focused, id);
+    }
+
+    /// A destination with no room refuses the pull the way it refuses a
+    /// move — and the mark **stands**, because that is the one refusal the
+    /// user can fix (close something) and retry.
+    #[test]
+    fn a_refused_pull_keeps_the_mark() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        app.apply(Action::GoToTab(0));
+        let marked = app.focused;
+        app.apply(Action::MarkPane);
+
+        app.apply(Action::GoToTab(1));
+        while app.spawn_child("shell", None, None).is_some() {} // fill it
+        let packed = app.pane_order().len();
+        app.apply(Action::PullPane);
+
+        assert_eq!(app.pane_order().len(), packed, "the destination is unchanged");
+        assert!(app.ws.tabs[0].panes.contains_key(&marked), "…and so is the source");
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("no room")), "{:?}", app.flash);
+        assert_eq!(app.marked(), Some(marked), "still armed for a retry");
+    }
+
+    /// Pane ids are recycled (`next_pane_id` is max+1), so a mark left
+    /// pointing at a closed pane would not merely be dead — the next pane
+    /// to take that number would be pulled in its place.
+    #[test]
+    fn closing_the_marked_pane_clears_the_mark() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab); // tab 2, pane 2 — the tab survives the close
+        app.apply(Action::NewPane); // pane 3, the highest id: closing it is
+        let marked = app.focused; // what actually frees the number for reuse
+        app.apply(Action::MarkPane);
+        assert_eq!(app.marked(), Some(marked));
+
+        app.apply(Action::ClosePane);
+
+        assert_eq!(app.marked(), None);
+        let recycled = app.spawn_child("shell", None, None).expect("room for one more");
+        assert_eq!(recycled, marked, "the id really was recycled — this is the hazard");
+        app.apply(Action::GoToTab(0));
+        app.apply(Action::PullPane);
+        assert!(!app.pane_order().contains(&recycled), "the stranger was not pulled");
+        assert!(app.flash.as_ref().is_some_and(|(m, ..)| m.contains("nothing marked")));
     }
 
     /// `Alt+0` is the digit row's "and the rest" slot: the last tab,
