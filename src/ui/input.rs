@@ -44,6 +44,18 @@ pub enum Action {
     MovePaneToTab {
         forward: bool,
     },
+    /// C40: mark the focused pane (`Alt+Shift+x`) so `PullPane` can carry
+    /// it to an arbitrary tab later — C28's move without the walk, for the
+    /// workspace where the destination is six tabs away rather than next
+    /// door. Nothing moves on the mark: a pane's process cannot sit in
+    /// limbo, so this is tmux's `select-pane -m`, not a clipboard cut.
+    /// Marking the already-marked pane unmarks it.
+    MarkPane,
+    /// C40: pull the marked pane into the active tab (`Alt+Shift+v`),
+    /// landing it exactly the way `MovePaneToTab` lands one — same host,
+    /// same split rule, same refusal when the tab has no room. Focus
+    /// follows the pane.
+    PullPane,
     ToggleStack,
     /// Flip the focused pane's split between vertical and horizontal.
     FlipSplit,
@@ -218,6 +230,19 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
             Some(if shift { Action::MovePaneToTab { forward: true } } else { Action::NextTab })
         }
         KeyCode::Char('M') => Some(Action::MovePaneToTab { forward: true }),
+        // C40: the same "shifted carries the pane" rule one step further —
+        // mark here, pull there, for a destination too far to walk with
+        // `Alt+Shift+m`. `x`/`v` come from §8's free pool, where they were
+        // reserved for clipboard vocabulary; this is that vocabulary, on
+        // panes rather than on text. Only the *shifted* forms are taken:
+        // bare `Alt+x`/`Alt+v` stay unbound so emacs' `M-x` and `M-v` keep
+        // reaching the pane through U5, which is why `b`/`d` were struck
+        // out of the pool in the first place. Both delivery spellings,
+        // same reason as every shifted letter above.
+        KeyCode::Char('x') if shift => Some(Action::MarkPane),
+        KeyCode::Char('X') => Some(Action::MarkPane),
+        KeyCode::Char('v') if shift => Some(Action::PullPane),
+        KeyCode::Char('V') => Some(Action::PullPane),
         // C33: the shifted vim letters move the *pane*. These four arms
         // must sit above the focus arms below, which match `Char('l')` &c
         // with **no shift guard** — before C33 a shifted lowercase delivery
@@ -702,6 +727,8 @@ const NAMES: &[(&str, Action)] = &[
     ("last_tab", Action::LastTab),
     ("move_pane_to_tab_next", Action::MovePaneToTab { forward: true }),
     ("move_pane_to_tab_prev", Action::MovePaneToTab { forward: false }),
+    ("mark_pane", Action::MarkPane),
+    ("pull_pane", Action::PullPane),
     ("toggle_stack", Action::ToggleStack),
     ("flip_split", Action::FlipSplit),
     ("resize_horizontal_grow", Action::Resize { horizontal: true, grow: true }),
@@ -1935,6 +1962,8 @@ mod tests {
         "Alt+r",
         "Alt+q",
         "Alt+Shift+p",
+        // C40's standing pull pair, same shape as the seven above.
+        "Alt+Shift+v",
         // C15 `HelpKey::Family` shorthands, which give way to enumeration
         // the moment any member moves.
         "Alt+←↓↑→ / hjkl",

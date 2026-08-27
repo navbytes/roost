@@ -165,6 +165,7 @@ fn hint_pairs(
     resumable: bool,
     focused_raw: bool,
     help_scrolled: bool,
+    marked: bool,
     keymap: &Keymap,
 ) -> Vec<(String, &'static str)> {
     let b = input::effective_bindings(keymap);
@@ -310,7 +311,18 @@ fn hint_pairs(
                 Action::Focus(Dir::Up),
                 Action::Focus(Dir::Right),
             ];
+            // C40: a mark is a gesture the user is halfway through, and
+            // the pane it names is usually in another tab — invisible.
+            // This pair is what makes it visible, so it leads (pairs drop
+            // whole from the right) and it is here only while there is
+            // something to pull.
+            let pull = if marked {
+                alt(&[Action::PullPane], "Alt+Shift+v", "pull marked pane")
+            } else {
+                None
+            };
             [
+                pull,
                 alt(&[Action::Help], "Alt+?", "keys"),
                 alt(&[Action::NewPane], "Alt+n", "new"),
                 alt(&[Action::QuickLaunch], "Alt+↵", "launch"),
@@ -513,8 +525,15 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) {
         let (visible, total) = help_scroll_extent(app.body_area(), app.keymap(), app.help_filter());
         visible < total
     };
-    let hints =
-        hint_pairs(&app.mode, app.focused_dead(), resumable, focused_raw, scrolled, app.keymap());
+    let hints = hint_pairs(
+        &app.mode,
+        app.focused_dead(),
+        resumable,
+        focused_raw,
+        scrolled,
+        app.marked().is_some(),
+        app.keymap(),
+    );
     // U3: Scroll mode's right segment shows where in history the view sits
     // — `↑N/M` from the backend's grid-clamped (offset, banked) pair, so it
     // can never report a phantom row the grid refused (U9's overshoot).
@@ -1320,6 +1339,13 @@ const HELP_GROUPS: &[HelpGroup] = &[
                     Action::MovePaneToTab { forward: true },
                 ],
                 "move this pane to the previous / next tab",
+            ),
+            // C40 sits under C28 for the same reason C28 sits under the
+            // chords it shifts: it is the same verb, for a destination too
+            // far to walk to.
+            chords(
+                &[Action::MarkPane, Action::PullPane],
+                "mark this pane / pull the marked one into this tab",
             ),
             chords(&[Action::RenameTab], "rename this tab"),
         ],
@@ -2929,6 +2955,7 @@ mod tests {
             resumable,
             focused_raw,
             help_scrolled,
+            false,
             &Keymap::default(),
         )
     }
@@ -3653,6 +3680,26 @@ mod tests {
             cols + right_w <= 100,
             "copy hints are {cols} cols + {right_w} of segment; the 100-col floor clips them"
         );
+    }
+
+    /// C40: a mark names a pane that is usually in another tab, i.e.
+    /// invisible — this pair is the only thing that says the gesture is
+    /// still open, so it leads (pairs drop whole from the right) and it is
+    /// there only while there is something to pull.
+    #[test]
+    fn the_pull_pair_leads_the_bar_only_while_a_pane_is_marked() {
+        let unmarked = hint_pairs(&Mode::Normal, false, false, false, false);
+        assert!(!unmarked.iter().any(|(k, _)| k.contains("Shift+v")), "{unmarked:?}");
+
+        let marked =
+            super::hint_pairs(&Mode::Normal, false, false, false, false, true, &Keymap::default());
+        assert_eq!(marked[0], one("Alt+Shift+v", "pull marked pane"));
+        assert_eq!(&marked[1..], &unmarked[..], "and nothing else on the bar moved");
+        // It must survive the squeeze that drops everything else, or the
+        // one pair the user needs is the first one gone.
+        let right_w = " NORMAL ".chars().count() as u16;
+        let width = right_w + super::hint_pair_cols(&marked[0].0, marked[0].1);
+        assert_eq!(super::fit_hint_pairs(&marked, right_w, width), 1);
     }
 
     #[test]

@@ -153,6 +153,7 @@ you're in.
 | `Alt+t`, `Alt+1..9`, `Alt+0` | new tab / go to tab / go to the last tab |
 | `Alt+i` / `Alt+m` | previous / next tab (wraps — the route to tabs past the ninth) |
 | `Alt+Shift+i` / `Alt+Shift+m` | carry the focused pane to the previous / next tab |
+| `Alt+Shift+x` / `Alt+Shift+v` | mark a pane / pull the marked pane into the tab you're on — a move whose destination is any tab, not the next one |
 | `Alt+w` | close pane (press twice to confirm when the agent is busy or it's the last pane) |
 | `Alt+u` | undo — reopen the last closed pane or tab, sessions resumed (exact scope below) |
 | `Alt+c` | copy mode — `hjkl`/arrows + `v` mark + `y`/`Enter` yank, or drag with the mouse (`Esc`/`q` exits) |
