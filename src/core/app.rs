@@ -3528,14 +3528,29 @@ impl<B: PaneBackend> App<B> {
         // means "show me more" would fall through to the dismissal. Over a
         // keymap that fits entirely on screen the wheel is simply inert,
         // exactly as the arrow keys are.
+        // [C41] While filtering, the wheel moves the CURSOR, not the view —
+        // same reason the roster's does, one rung higher: `↵` acts on the
+        // cursor, so a wheel that scrolled the list out from under it would
+        // leave the overlay one keypress from running a row nobody can see.
+        // One row per notch, the arrow keys' own step. Un-filtered it is
+        // still C15's poster and the wheel reads it on by the page.
         if matches!(self.mode, Mode::Help { .. }) {
+            let filtering = self.help_filter().is_some();
             let page = self.help_page();
             match me.kind {
                 MouseEventKind::ScrollUp => {
-                    self.help_scroll(-page);
+                    if filtering {
+                        self.help_cursor_move(-1);
+                    } else {
+                        self.help_scroll(-page);
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    self.help_scroll(page);
+                    if filtering {
+                        self.help_cursor_move(1);
+                    } else {
+                        self.help_scroll(page);
+                    }
                 }
                 MouseEventKind::Down(MouseButton::Left) => self.mode = Mode::Normal,
                 _ => {}
@@ -15668,6 +15683,61 @@ pub(crate) mod tests {
         help_key(&mut app, KeyCode::Home);
         let Mode::Help { top, cursor, .. } = app.mode else { panic!("still open") };
         assert_eq!((top, cursor), (0, 0), "Home brings both back to the start");
+    }
+
+    /// [C41] The wheel is a motion key too. While filtering it moves the
+    /// **cursor**, so the row `↵` runs stays the row on screen — a wheel
+    /// that scrolled the view out from under the cursor would leave the
+    /// overlay one keypress from firing something nobody can see. The
+    /// keyboard path already branched on `filtering`; the wheel did not,
+    /// which is what this asserts.
+    ///
+    /// Asserting the fixpoint rather than `top`: the point is not that the
+    /// view stopped moving, it is that the cursor is still visible.
+    #[test]
+    fn the_wheel_moves_the_palette_cursor_rather_than_scrolling_past_it() {
+        use crossterm::event::{KeyCode, MouseEvent, MouseEventKind};
+        fn wheel<B: PaneBackend>(app: &mut App<B>, kind: MouseEventKind) {
+            app.handle_modal_mouse(
+                MouseEvent {
+                    kind,
+                    column: 0,
+                    row: 0,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                None,
+            );
+        }
+
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_key(&mut app, KeyCode::Char('/'));
+        for _ in 0..3 {
+            wheel(&mut app, MouseEventKind::ScrollDown);
+        }
+        let Mode::Help { top, cursor, .. } = app.mode else { panic!("still open") };
+        assert_eq!(cursor, 3, "one command per notch, the arrow keys' own step");
+        assert_eq!(
+            crate::ui::render::help_follow_top(
+                app.body_area(),
+                app.keymap(),
+                Some(""),
+                cursor,
+                top
+            ),
+            top,
+            "and the row the wheel landed on is on screen",
+        );
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert!(matches!(app.mode, Mode::Help { cursor: 2, .. }), "and back up a command");
+
+        // Un-filtered it is still C15's poster: the wheel reads it on by the
+        // page, and no cursor is involved.
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        let Mode::Help { top, filter, .. } = &app.mode else { panic!("still open") };
+        assert!(filter.is_none() && *top > 0, "the un-filtered wheel still scrolls the view");
     }
 
     /// A scroll key that hits the end must **not** close while filtering.
