@@ -5317,10 +5317,23 @@ mod tests {
             draw(1).iter().position(|r| r.contains(&marker)),
             "and ↓ moved it to a different row",
         );
+        // The width claim has to be read off the DRAWN row, not off
+        // `help_layout` — that takes no cursor, so comparing two of its
+        // calls compares a function to itself and passes by construction.
+        // The real property: the marked row, with the marker put back to the
+        // space it spent, is byte-identical to the same row drawn unmarked.
+        // Nothing shifted, so nothing widened.
+        let (rows0, rows1) = (draw(0), draw(1));
+        let idx = rows0.iter().position(|r| r.contains(&marker)).expect("cursor 0 marks a row");
+        assert_eq!(
+            rows0[idx].replacen(&marker, " ", 1),
+            rows1[idx],
+            "the marker rides in the key column's own leading space, so nothing shifted",
+        );
         assert_eq!(
             help_layout(body, &km, Some(q)).content,
             unmarked,
-            "the marker rides in the key column's own leading space, so nothing widened",
+            "and the laid-out table is the same table either way",
         );
     }
 

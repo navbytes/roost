@@ -5204,8 +5204,17 @@ false and a reader who cannot see why is stuck — on the one modal you open
 |---|---|---|
 | plain | `keys — / filters · any key closes` | `Alt+? all keys` · `/ filter` · `any key close` |
 | scrolled | `keys — 26/36 · ↑↓ more · / filters · any key closes` | `↑↓ PgUp/Dn read on` · `/ filter` · `any other key close` |
-| filtering | `keys — /mov · 4 shown · Esc clears` | `type filter` · `↑↓ PgUp/Dn read on` · `Esc clear · close` |
-| filtering, scrolled | `keys — /a · 26/31 · ↑↓ more · Esc clears` | as above |
+| filtering | `keys — /mov · 4 shown · ↵ runs · Esc clears` | `type filter` · `↑↓ PgUp/Dn move` · `↵ run` · `Esc clear · close` |
+| filtering, scrolled | `keys — /a · 26/31 · ↑↓ move · ↵ runs · Esc clears` | as above |
+
+[C41] The filtering rows changed when the palette landed. `read on` became
+`move` and `↑↓ more` became `↑↓ move` because the arrows now drive a cursor,
+not a view — a hint that says "read on" over a cursor is teaching the wrong
+model. `↵ runs`/`↵ run` sits between the motion that chooses a row and the
+way out, so the bar reads in the order the hands move, and it appears only
+when a row under the query is runnable (`help_title`'s `runnable`, for F1's
+reason: a title teaching a key that does nothing here is worse than none).
+The two un-filtered rows are untouched — that is still C15's poster.
 
 The filtered hint row is C27's roster pairs, for C27's reason. The
 unfiltered rows gain only `/ filter` — the affordance has to be visible or
@@ -5446,14 +5455,27 @@ because in this table that line is usually the group heading that says what
 the command is for; the tighter arithmetic pushed `PANES` off the top the
 moment the cursor walked back to the first row.
 
+**The wheel is a motion key too.** [Amended 2026-08-28] While filtering it
+moves the cursor one command per notch — the arrow keys' own step, C27's
+roster wheel verbatim — because the rule above does not care which device
+the motion came from: a wheel that scrolled the view out from under the
+cursor leaves the overlay one `↵` from firing a row nobody can see. C41
+shipped with the keyboard path converted and the wheel still calling
+`help_scroll`, which is exactly that failure;
+`the_wheel_moves_the_palette_cursor_rather_than_scrolling_past_it` now holds
+it. Un-filtered the wheel still reads C15's poster on by the page, unchanged.
+
 **The mark spends no width.** The cursor is `❯` — C14's picker marker and
-C27's roster marker, the same "`↵` acts on this row" idiom in its third
-overlay — and it is drawn *into the leading space `help_key_prefix` already
-opens every key column with*. A marker column of its own would widen every
+C27's roster marker (and C20's feed), the same "`↵` acts on this row"
+idiom in its fourth surface — and it is drawn *into the leading space
+`help_key_prefix` already opens every key column with*. A marker column of its own would widen every
 row by one, which re-trips `elide_key` and moves `HELP_COL_FLOOR`: the exact
-accounting C38 and C39 each had to correct once already. Gated by measuring
-the laid-out column width with the cursor on and off, not by restating the
-glyph's width.
+accounting C38 and C39 each had to correct once already. Gated by drawing
+the row marked and unmarked and asserting that the marked one, with the
+glyph put back to the space it spent, is byte-identical to the other. Not by
+restating the glyph's width — and not by comparing two calls to a
+`help_layout` that never sees the cursor, which is how the original gate
+passed by construction.
 
 **`↵ runs` is earned, not assumed.** The title offers it only when the query
 actually has a command under the cursor. A query isolating the `CONTROL CLI`
