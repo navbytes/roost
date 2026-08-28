@@ -40,10 +40,12 @@ each adapter's own session ids.
   itself** from Cargo.toml's version, publishes with SHA256SUMS.txt, and
   syncs the Homebrew tap — but the tap sync needs the `HOMEBREW_TAP_TOKEN`
   secret, which is **still not configured** as of 2026-08-21 (the step skips
-  with a warning). **Every release since v0.1.5 has needed a hand-sync, and
-  v0.1.8 and v0.1.9 did not get one** — the tap sat on 0.1.8 for two
-  releases while `brew install roost` quietly served it. So the sync is not
-  optional cleanup: render with
+  with a warning). **Every release since v0.1.5 has needed a hand-sync**,
+  and v0.1.8 and v0.1.9 never got one — the tap sat on 0.1.8 for two
+  releases while `brew install roost` quietly served it. That gap is
+  historical: v0.1.10, v0.1.11 and v0.1.12 were hand-synced (tap PRs #3,
+  #4, #5), so the tap is at most one release behind, not four. The sync is
+  not optional cleanup: render with
   `RENDER_ONLY=1 RELEASE_TAG=vX.Y.Z scripts/update-homebrew-formula.sh`
   and PR the result to navbytes/homebrew-tap as part of the release, or set
   the secret and stop paying this every time. Built this way (v0.1.7,
@@ -51,6 +53,13 @@ each adapter's own session ids.
   agent-session credentials can merge PRs but get 403 on both
   `refs/tags/*` pushes and the workflow-dispatch API — don't re-derive
   that. Human tag pushes and the Actions "Run workflow" button still work.
+  **Keep the version bump as a separate second commit** on the release PR:
+  GitHub defaults a squash subject to the sole commit's subject when a PR
+  has exactly one commit — the PR title only wins with two or more, so a
+  one-commit release PR lands on `main` under the feature's subject instead
+  of `vX.Y.Z everywhere: …` (v0.1.13, commit cb4747c). Nothing downstream
+  breaks — the release keys off Cargo.toml — but the log stops being
+  readable by release.
 - **`main` is protected** (2026-08-21): PRs required, both CI matrix jobs
   must be green, no force-push, no branch deletion, zero required
   approvals so a solo maintainer can self-merge. Admins are exempt, and
