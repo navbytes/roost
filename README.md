@@ -8,7 +8,7 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, codex,
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-0.1.13-informational.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.1.14-informational.svg)](Cargo.toml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
 <img src="docs/roost-hero.png" alt="Screenshot of roost running in iTerm2: a single focused shell pane in ~/workspace, showing the ink-and-paper chrome — accent-red focused border, tab bar with save status, a top-right corner badge, and the bottom hint bar." width="800">
@@ -88,8 +88,8 @@ Or build from source, if you'd rather (needs a Rust toolchain):
 mise use -g "cargo:https://github.com/navbytes/roost@branch:main"
 ```
 
-Pin a version by appending it, e.g. `github:navbytes/roost@0.1.13`, or swap
-`@branch:main` for `@tag:v0.1.13` on the cargo backend. Drop `-g` to pin roost
+Pin a version by appending it, e.g. `github:navbytes/roost@0.1.14`, or swap
+`@branch:main` for `@tag:v0.1.14` on the cargo backend. Drop `-g` to pin roost
 per-project in that directory's `mise.toml` instead of globally.
 
 Only one roost runs per workspace at a time — a second instance on the same
