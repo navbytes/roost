@@ -95,3 +95,76 @@ fn a_letter_still_closes_an_unfiltered_keymap() {
         h.screen().contents(),
     );
 }
+
+/// [C41] The palette end to end: type until the row is there, press `↵`,
+/// and the thing happens. The unit tests pin the dispatch and the drawing
+/// separately; this is the check that they meet on a screen — that the
+/// title offers `↵ runs`, that a row is visibly marked as the one it will
+/// run, and that pressing it both closes the overlay and fires the action.
+///
+/// `toggle the hint bar` is the target because its effect is *visible in
+/// the same frame that proves the overlay closed*: the C9 bar is either
+/// drawn or it is not. A verb whose result lives in the layout would need
+/// a second, softer assertion about pane geometry.
+#[test]
+fn enter_runs_the_command_under_the_cursor() {
+    let Some(mut h) = open_keymap("palette") else { return };
+    // The C9 bar is *behind* the overlay, so there is nothing to observe
+    // until this closes. `enter_still_just_closes_when_the_query_names_no_
+    // command` below is the control for the final assertion: it closes the
+    // same overlay the same way and finds the bar still there.
+    h.write_bytes(b"/toggle the hint bar");
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("↵ runs")).is_some(),
+        "the title never offered the palette's key:\n{}",
+        h.screen().contents(),
+    );
+    let armed = h.screen().contents();
+    assert!(armed.contains('❯'), "and the row it will run is marked:\n{armed}");
+    assert!(armed.contains("↵ run"), "the hint bar says so too:\n{armed}");
+
+    // Waited on the overlay's own title rather than the C9 mode word,
+    // because the command under test *removes the bar the mode word lives
+    // in* — `NORMAL` can never appear here, and waiting for it would time
+    // out on a screen that is already correct.
+    h.write_bytes(b"\r");
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| !s.contents().contains("keys — ")).is_some(),
+        "Enter did not close the overlay:\n{}",
+        h.screen().contents(),
+    );
+    let after = h.screen().contents();
+    assert!(
+        !after.contains("Alt+n new"),
+        "...and it must have RUN the row, not merely closed on it:\n{after}",
+    );
+}
+
+/// [C41] A query can match rows that are not commands — the CONTROL CLI
+/// block is six of them. The title must not offer `↵ runs` there, and
+/// `↵` must do what it did before the palette existed: close.
+#[test]
+fn enter_still_just_closes_when_the_query_names_no_command() {
+    let Some(mut h) = open_keymap("no-command") else { return };
+    h.write_bytes(b"/roost read");
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("/roost read")).is_some(),
+        "the query never reached the title:\n{}",
+        h.screen().contents(),
+    );
+    let armed = h.screen().contents();
+    assert!(!armed.contains("↵ runs"), "nothing here is runnable, so nothing is offered:\n{armed}");
+    assert!(!armed.contains('❯'), "and no row is marked:\n{armed}");
+
+    h.write_bytes(b"\r");
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("NORMAL")).is_some(),
+        "Enter must still close:\n{}",
+        h.screen().contents(),
+    );
+    assert!(
+        h.screen().contents().contains("Alt+n new"),
+        "and the hint bar is untouched — closing is not running:\n{}",
+        h.screen().contents(),
+    );
+}

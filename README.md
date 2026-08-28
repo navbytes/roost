@@ -8,7 +8,7 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, codex,
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-0.1.12-informational.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.1.13-informational.svg)](Cargo.toml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
 <img src="docs/roost-hero.png" alt="Screenshot of roost running in iTerm2: a single focused shell pane in ~/workspace, showing the ink-and-paper chrome — accent-red focused border, tab bar with save status, a top-right corner badge, and the bottom hint bar." width="800">
@@ -88,8 +88,8 @@ Or build from source, if you'd rather (needs a Rust toolchain):
 mise use -g "cargo:https://github.com/navbytes/roost@branch:main"
 ```
 
-Pin a version by appending it, e.g. `github:navbytes/roost@0.1.12`, or swap
-`@branch:main` for `@tag:v0.1.12` on the cargo backend. Drop `-g` to pin roost
+Pin a version by appending it, e.g. `github:navbytes/roost@0.1.13`, or swap
+`@branch:main` for `@tag:v0.1.13` on the cargo backend. Drop `-g` to pin roost
 per-project in that directory's `mise.toml` instead of globally.
 
 Only one roost runs per workspace at a time — a second instance on the same
@@ -160,7 +160,7 @@ you're in.
 | `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
 | `Alt+Shift+p` | raw pass-through for the focused pane — same chord exits it |
 | `Alt+/` | toggle the shortcut hint bar |
-| `Alt+?` | show the full keymap (`/` filters it, any key closes it) |
+| `Alt+?` | show the full keymap (`/` filters it, `↵` runs the row it lands on, any key closes it) |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 
 A shortcut hint bar runs along the bottom by default (zellij-style), showing
@@ -195,6 +195,15 @@ It reads `config.json` directly and needs no running roost, so it answers
 before you launch: remapped and disabled chords are marked `config.json`, and
 an entry roost had to skip is named on stderr with a non-zero exit — so a
 dotfile test can gate on it instead of you catching a startup toast.
+**`Alt+?` is also the command palette.** Press `/` inside it and the keymap
+becomes a picker: type to narrow, `↑`/`↓` to choose, `↵` to run the row —
+no need to dismiss the overlay and remember the chord. The rows it can run
+are the single-verb ones (flip split, cycle layout, zoom, undo, rename,
+mark/pull a pane, the raw/float/feed/roster toggles); direction families
+like `Alt+←↓↑→` and the `roost send`/`read` reference rows stay read-only,
+because "resize one notch, then close" is worse than the chord it would
+replace. The title says `↵ runs` exactly when there is something to run.
+
 **`Alt+?` and the hint bar follow your remaps** — both read the live keymap,
 so they show the chord you bound and stop showing the one you disabled,
 rather than teaching the defaults at you. A

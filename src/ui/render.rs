@@ -196,9 +196,16 @@ fn hint_pairs(
         // say what replaced it — C27's roster pairs exactly, for the same
         // reason its comment gives: a letter is filter text now, so `Esc`
         // is the way out and the bar must lead with that.
-        Mode::Help { filter: Some(_), .. } => {
-            vec![lit("type", "filter"), lit("↑↓ PgUp/Dn", "read on"), lit("Esc", "clear · close")]
-        }
+        // [C41] `↵` joins the pair, between the motion that chooses a row
+        // and the way out — the bar reads in the order the hands move.
+        // `read on` became `move` for the same reason: while filtering the
+        // arrows drive a cursor, not a view.
+        Mode::Help { filter: Some(_), .. } => vec![
+            lit("type", "filter"),
+            lit("↑↓ PgUp/Dn", "move"),
+            lit("↵", "run"),
+            lit("Esc", "clear · close"),
+        ],
         Mode::Help { .. } if help_scrolled => {
             vec![lit("↑↓ PgUp/Dn", "read on"), lit("/", "filter"), lit("any other key", "close")]
         }
@@ -892,7 +899,7 @@ fn help_content_width(lines: &[HelpLine]) -> u16 {
     lines
         .iter()
         .filter_map(|l| match l {
-            HelpLine::Row(k, d) => {
+            HelpLine::Row(k, d, _) => {
                 Some(mouse::display_width(&help_key_prefix(k)) + mouse::display_width(d))
             }
             HelpLine::Head(_) => None,
@@ -904,10 +911,59 @@ fn help_content_width(lines: &[HelpLine]) -> u16 {
 /// C15: one line of the drawn keymap — a group heading or a chord row.
 /// The row's key column is owned rather than `&'static`: since F1 it is
 /// resolved from the live keymap, not compiled in.
+///
+/// [C41] A row also carries the action `↵` runs on it, or `None` when the
+/// row is not a command — see `help_row_action` for which rows are which.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum HelpLine {
     Head(&'static str),
-    Row(String, &'static str),
+    Row(String, &'static str, Option<Action>),
+}
+
+/// [C41] The action `↵` runs on a row, or `None` when the row is not a
+/// command the overlay can execute.
+///
+/// **A row is a command only when it documents exactly one action.** That
+/// rule is not a simplification — it is the whole reason the palette is
+/// worth having, and it falls out of what the two shapes mean:
+///
+/// - `Chords([a])` is one verb with one outcome. Running it is unambiguous.
+/// - `Family(_, [a, b, …])` and any multi-action `Chords` are a *direction
+///   set* — focus, resize, tab motion, pane carry. There is no answer to
+///   "which one does `↵` run", and even if you picked one it would be the
+///   wrong feature: those are the chords you press five times in a row, and
+///   a palette that runs one step and then closes is strictly worse than
+///   the chord it is standing in for.
+/// - `Text(_)` binds nothing at all — the control-CLI reference block, the
+///   glyph legend, the dead-pane keys `main.rs` claims. Nothing to run.
+///
+/// So what stays runnable is exactly the set a palette is for: the rare,
+/// one-shot, hard-to-remember verbs (flip split, cycle layout, mark/pull a
+/// pane, toggle raw/float/zoom/feed/roster, undo, rename). The rows that
+/// resist execution are the ones nobody would drive this way anyway.
+fn help_row_action(key: &HelpKey) -> Option<Action> {
+    match key {
+        HelpKey::Chords([only]) => Some(*only),
+        HelpKey::Chords(_) | HelpKey::Family(..) | HelpKey::Text(_) => None,
+    }
+}
+
+/// [C41] The runnable rows under `filter`, in the order the overlay draws
+/// them — the list `Mode::Help`'s cursor indexes and `↵` dispatches from.
+///
+/// Layout-independent by construction: it reads `help_lines`, which is the
+/// flat table *before* `help_layout` decides how many columns to pour it
+/// into. So the cursor means the same row whether the overlay is drawn in
+/// one column or two, and a terminal resize under an open palette cannot
+/// move what `↵` is pointing at.
+pub fn help_actions(keymap: &Keymap, filter: &str) -> Vec<Action> {
+    help_lines(keymap, filter)
+        .into_iter()
+        .filter_map(|l| match l {
+            HelpLine::Row(_, _, action) => action,
+            HelpLine::Head(_) => None,
+        })
+        .collect()
 }
 
 /// C15: the keymap flattened into drawable lines, in group order — each
@@ -923,7 +979,8 @@ fn help_lines(keymap: &Keymap, filter: &str) -> Vec<HelpLine> {
             .rows
             .iter()
             .filter_map(|r| {
-                help_key_text(&r.key, r.desc, &bindings).map(|k| HelpLine::Row(k, r.desc))
+                help_key_text(&r.key, r.desc, &bindings)
+                    .map(|k| HelpLine::Row(k, r.desc, help_row_action(&r.key)))
             })
             .filter(|l| help_row_matches(l, filter))
             .collect();
@@ -1013,11 +1070,13 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
     // Found by driving it in a PTY; no unit test was looking at the title
     // and the frame together.
     let tallest_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    let runnable = columns.iter().flatten().any(|l| matches!(l, HelpLine::Row(_, _, Some(_))));
     let title = help_title(
         filter,
         tallest_rows,
         tallest_rows,
         tallest_rows > height as usize,
+        runnable,
         body.width.saturating_sub(2),
     );
     let title_w = mouse::display_width(&title) + 2; // the two border columns
@@ -1046,16 +1105,26 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
 /// the dialog cannot help here: at the 80-column floor a 46-character query
 /// exceeds the whole terminal, so *something* must give and it has to be
 /// the part the user can already see themselves typing.
+/// [C41] `runnable` is whether any row under the query is a command, and it
+/// gates the `↵ runs` clause. Announced rather than assumed, for F1's reason
+/// in the row below: a title teaching a key that does nothing here is worse
+/// than no title. A query isolating the control-CLI block matches rows but
+/// no *commands*, and there `↵` really does just close, exactly as it did
+/// before the palette existed.
 fn help_title(
     filter: Option<&str>,
     shown: usize,
     total: usize,
     scrolled: bool,
+    runnable: bool,
     avail: u16,
 ) -> String {
+    let run = if runnable { " · ↵ runs" } else { "" };
     let (head, tail) = match (filter, scrolled) {
-        (Some(_), true) => (" keys — /", format!(" · {shown}/{total} · ↑↓ more · Esc clears ")),
-        (Some(_), false) => (" keys — /", format!(" · {total} shown · Esc clears ")),
+        (Some(_), true) => {
+            (" keys — /", format!(" · {shown}/{total} · ↑↓ move{run} · Esc clears "))
+        }
+        (Some(_), false) => (" keys — /", format!(" · {total} shown{run} · Esc clears ")),
         (None, true) => {
             return format!(" keys — {shown}/{total} · ↑↓ more · / filters · any key closes ");
         }
@@ -1099,7 +1168,7 @@ fn help_row_matches(line: &HelpLine, filter: &str) -> bool {
     }
     let needle = filter.to_lowercase();
     match line {
-        HelpLine::Row(key, desc) => {
+        HelpLine::Row(key, desc, _) => {
             key.to_lowercase().contains(&needle) || desc.to_lowercase().contains(&needle)
         }
         HelpLine::Head(_) => true,
@@ -1116,8 +1185,15 @@ const HELP_GUTTER: u16 = 2;
 /// A heading borrows C6's idiom, the same one the roster's group rows use:
 /// uppercase, `quiet()`, underlined across its own column so it reads as a
 /// rule rather than as another chord.
-fn draw_help_columns(f: &mut Frame<'_>, layout: &HelpLayout, top: usize, inner: Rect) {
+fn draw_help_columns(
+    f: &mut Frame<'_>,
+    layout: &HelpLayout,
+    top: usize,
+    cursor: Option<usize>,
+    inner: Rect,
+) {
     let content = layout.content;
+    let at = cursor.and_then(|c| help_cursor_pos(layout, c));
     for (i, column) in layout.columns.iter().enumerate() {
         let x = inner.x + i as u16 * (content + HELP_GUTTER);
         if x >= inner.x + inner.width {
@@ -1126,9 +1202,10 @@ fn draw_help_columns(f: &mut Frame<'_>, layout: &HelpLayout, top: usize, inner: 
         let width = content.min(inner.x + inner.width - x);
         let lines: Vec<Line<'_>> = column
             .iter()
+            .enumerate()
             .skip(top)
             .take(layout.height as usize)
-            .map(|line| match line {
+            .map(|(row, line)| match line {
                 HelpLine::Head(title) => {
                     let pad =
                         (width as usize).saturating_sub(mouse::display_width(title) as usize + 1);
@@ -1137,13 +1214,88 @@ fn draw_help_columns(f: &mut Frame<'_>, layout: &HelpLayout, top: usize, inner: 
                         theme::quiet().add_modifier(Modifier::UNDERLINED),
                     ))
                 }
-                HelpLine::Row(k, d) => Line::from(vec![
-                    Span::styled(help_key_prefix(k), theme::accent()),
-                    Span::styled(d.to_string(), theme::quiet()),
-                ]),
+                // [C41] The cursor spends the key column's leading space
+                // rather than a column of its own: `help_key_prefix` opens
+                // with one, `❯` is single-width, and the row measures the
+                // same either way — so the palette's mark cannot widen the
+                // dialog, cannot re-trip `elide_key`, and cannot move
+                // `HELP_COL_FLOOR`. The glyph is C14's picker marker and
+                // C27's roster marker, the same "↵ acts on this row" idiom
+                // in its third overlay, so nothing new is being taught.
+                HelpLine::Row(k, d, _) => {
+                    let prefix = help_key_prefix(k);
+                    let marked = at == Some((i, row));
+                    let key = if marked {
+                        format!("{}{}", theme::PICKER_SELECTED, &prefix[1..])
+                    } else {
+                        prefix
+                    };
+                    Line::from(vec![
+                        Span::styled(key, theme::accent()),
+                        Span::styled(d.to_string(), theme::quiet()),
+                    ])
+                }
             })
             .collect();
         f.render_widget(Paragraph::new(lines), Rect::new(x, inner.y, width, inner.height));
+    }
+}
+
+/// [C41] Where the `cursor`-th runnable row sits in a laid-out overlay, as
+/// `(column, row within that column)` — the one place the drawer's highlight
+/// and `help_follow_top`'s scroll agree about the cursor's position.
+///
+/// `None` when the query matches no runnable row (a filter isolating the
+/// control-CLI block, say): there is nothing to mark and nothing to scroll
+/// to, which is also the state in which `↵` falls back to closing.
+fn help_cursor_pos(layout: &HelpLayout, cursor: usize) -> Option<(usize, usize)> {
+    let mut seen = 0;
+    for (i, column) in layout.columns.iter().enumerate() {
+        for (row, line) in column.iter().enumerate() {
+            if matches!(line, HelpLine::Row(_, _, Some(_))) {
+                if seen == cursor {
+                    return Some((i, row));
+                }
+                seen += 1;
+            }
+        }
+    }
+    None
+}
+
+/// [C41] The `top` that keeps the cursor on screen — unchanged whenever it
+/// already is, which on any terminal showing the whole table is always.
+///
+/// The palette scrolls by *following the cursor* rather than by moving a
+/// view of its own, which is C27's rule verbatim ("`↵` acts on the cursor,
+/// so a view that scrolled the list out from under it would leave the
+/// overlay pointing at a row nobody can see"). Both columns share one `top`
+/// (they scroll as one sheet), so a cursor in the right-hand column steers
+/// the left one too — correct, because they are one table.
+pub fn help_follow_top(
+    body: Rect,
+    keymap: &Keymap,
+    filter: Option<&str>,
+    cursor: usize,
+    top: usize,
+) -> usize {
+    let layout = help_layout(body, keymap, filter);
+    let Some((_, row)) = help_cursor_pos(&layout, cursor) else { return top };
+    let height = layout.height as usize;
+    if row <= top {
+        // One line of context above the cursor, not zero — and in *this*
+        // table that line is very often the group heading, which is what
+        // says what the command underneath it is for. Scrolling to `row`
+        // exactly was the tighter arithmetic and it read worse: walking the
+        // cursor back to the first command left `top` at 1, pushing `PANES`
+        // off the top of a dialog whose first visible line was then a bare
+        // chord. Caught by `the_palette_view_follows_its_cursor_below_the_fold`
+        // asserting on Home rather than on visibility alone.
+        row.saturating_sub(1)
+    } else if height > 0 && row >= top + height {
+        row + 1 - height
+    } else {
+        top
     }
 }
 
@@ -1699,7 +1851,7 @@ fn draw_mode_overlay<B: PaneBackend>(
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
         }
-        Mode::Help { top, filter } => {
+        Mode::Help { top, filter, cursor } => {
             // C15 (amended): the §8 key table, grouped, in as few columns as
             // fit and scrolled when even those don't. `HELP_GROUPS` is the
             // single source and `help_layout` the single geometry — the same
@@ -1717,15 +1869,21 @@ fn draw_mode_overlay<B: PaneBackend>(
             // a reader who cannot see why would be stuck. The un-filtered
             // wordings below are untouched, so the amendment is invisible
             // until `/` is pressed.
+            // [C41] The cursor is drawn only while the filter is open. Un-
+            // filtered, C15's overlay is a poster you read and dismiss with
+            // any key — marking a row there would advertise an `↵` that the
+            // "any key closes it" contract still owns.
+            let cursor = filter.as_ref().map(|_| *cursor);
             let heading = help_title(
                 filter.as_deref(),
                 (top + visible).min(total),
                 total,
                 total > visible,
+                help_cursor_pos(&layout, cursor.unwrap_or(0)).is_some(),
                 body.width.saturating_sub(2),
             );
             let inner = modal_frame(f, body, rect, Line::from(heading).style(theme::ink()));
-            draw_help_columns(f, &layout, top, inner);
+            draw_help_columns(f, &layout, top, cursor, inner);
         }
         Mode::Feed { offset } => {
             let inner = modal_frame(f, body, rect, Line::from(" activity ").style(theme::ink()));
@@ -3789,7 +3947,7 @@ mod tests {
         let widest = lines
             .iter()
             .filter_map(|l| match l {
-                HelpLine::Row(k, d) => {
+                HelpLine::Row(k, d, _) => {
                     Some(mouse::display_width(&super::help_key_prefix(k)) + mouse::display_width(d))
                 }
                 HelpLine::Head(_) => None,
@@ -3865,7 +4023,10 @@ mod tests {
         );
         assert_eq!(mode_word(&Mode::Scroll, false, false), "SCROLL");
         assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false), "COPY");
-        assert_eq!(mode_word(&Mode::Help { top: 0, filter: None }, false, false), "HELP");
+        assert_eq!(
+            mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false),
+            "HELP"
+        );
     }
 
     #[test]
@@ -3875,7 +4036,7 @@ mod tests {
         assert_eq!(mode_word(&Mode::Normal, true, false), "ZOOM");
         assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
         assert_eq!(mode_word(&Mode::Scroll, true, false), "SCROLL");
-        assert_eq!(mode_word(&Mode::Help { top: 0, filter: None }, true, false), "HELP");
+        assert_eq!(mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, true, false), "HELP");
     }
 
     #[test]
@@ -4050,23 +4211,33 @@ mod tests {
     /// afford — it is the surface you open *because* you are lost.
     #[test]
     fn the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls() {
-        let whole = hint_pairs(&Mode::Help { top: 0, filter: None }, false, false, false, false);
+        let whole =
+            hint_pairs(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false, false, false);
         assert_eq!(whole, p(&[("Alt+?", "all keys"), ("/", "filter"), ("any key", "close")]));
-        let scrolled = hint_pairs(&Mode::Help { top: 0, filter: None }, false, false, false, true);
+        let scrolled =
+            hint_pairs(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false, false, true);
         assert_eq!(
             scrolled,
             p(&[("↑↓ PgUp/Dn", "read on"), ("/", "filter"), ("any other key", "close")]),
         );
         let filtered = hint_pairs(
-            &Mode::Help { top: 0, filter: Some("mov".into()) },
+            &Mode::Help { top: 0, filter: Some("mov".into()), cursor: 0 },
             false,
             false,
             false,
             false,
         );
+        // [C41] `↵ run` joins between the motion and the way out, and the
+        // motion is relabelled: filtering, the arrows drive the palette's
+        // cursor rather than scrolling a view.
         assert_eq!(
             filtered,
-            p(&[("type", "filter"), ("↑↓ PgUp/Dn", "read on"), ("Esc", "clear · close")]),
+            p(&[
+                ("type", "filter"),
+                ("↑↓ PgUp/Dn", "move"),
+                ("↵", "run"),
+                ("Esc", "clear · close"),
+            ]),
         );
         assert!(
             !filtered.iter().any(|(_, l)| l.contains("any key")),
@@ -4445,7 +4616,7 @@ mod tests {
         let quit_row = help_lines(&keymap, "")
             .into_iter()
             .find_map(|l| match l {
-                HelpLine::Row(k, d) if d.starts_with("quit") => Some(k),
+                HelpLine::Row(k, d, _) if d.starts_with("quit") => Some(k),
                 _ => None,
             })
             .expect("a quit row");
@@ -4516,7 +4687,7 @@ mod tests {
         ] {
             let (keymap, _) = Keymap::parse(cfg, "config.json");
             for line in help_lines(&keymap, "") {
-                let HelpLine::Row(k, d) = line else { continue };
+                let HelpLine::Row(k, d, _) = line else { continue };
                 let rendered = format!("{}{d}", super::help_key_prefix(&k));
                 assert!(
                     super::help_key_prefix(&k).ends_with(' '),
@@ -4534,7 +4705,7 @@ mod tests {
         let focus = help_lines(&keymap, "")
             .into_iter()
             .find_map(|l| match l {
-                HelpLine::Row(k, d) if d.starts_with("move focus") => Some(k),
+                HelpLine::Row(k, d, _) if d.starts_with("move focus") => Some(k),
                 _ => None,
             })
             .expect("a focus row");
@@ -4545,7 +4716,7 @@ mod tests {
         // And the description survived intact — it is the half that cannot
         // be reconstructed by widening the terminal.
         let full = help_lines(&keymap, "").into_iter().any(|l| {
-            matches!(l, HelpLine::Row(_, d)
+            matches!(l, HelpLine::Row(_, d, _)
                 if d == "move focus (←/→ continue to next/prev tab at an edge)")
         });
         assert!(full, "the description is never what yields");
@@ -4596,7 +4767,7 @@ mod tests {
         let drawn = help_lines(&keymap, "")
             .iter()
             .filter_map(|l| match l {
-                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Row(k, d, _) => Some(format!("{k} {d}")),
                 HelpLine::Head(_) => None,
             })
             .collect::<Vec<_>>()
@@ -4616,7 +4787,7 @@ mod tests {
         let drawn = help_lines(&keymap, "")
             .iter()
             .filter_map(|l| match l {
-                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Row(k, d, _) => Some(format!("{k} {d}")),
                 HelpLine::Head(_) => None,
             })
             .collect::<Vec<_>>()
@@ -4634,7 +4805,7 @@ mod tests {
         let compact = |keymap: &Keymap| {
             help_lines(keymap, "")
                 .iter()
-                .any(|l| matches!(l, HelpLine::Row(k, _) if k == "Alt+←↓↑→ / hjkl"))
+                .any(|l| matches!(l, HelpLine::Row(k, _, _) if k == "Alt+←↓↑→ / hjkl"))
         };
         assert!(compact(&Keymap::default()), "the defaults render compactly");
 
@@ -4645,7 +4816,7 @@ mod tests {
         let drawn = help_lines(&moved, "")
             .iter()
             .filter_map(|l| match l {
-                HelpLine::Row(k, _) => Some(k.clone()),
+                HelpLine::Row(k, _, _) => Some(k.clone()),
                 HelpLine::Head(_) => None,
             })
             .collect::<Vec<_>>()
@@ -4684,7 +4855,7 @@ mod tests {
         let desc = help_lines(&Keymap::default(), "")
             .into_iter()
             .find_map(|l| match l {
-                HelpLine::Row(k, d) if k == "status" => Some(d),
+                HelpLine::Row(k, d, _) if k == "status" => Some(d),
                 _ => None,
             })
             .expect("the overlay carries a status-glyph legend row");
@@ -4911,7 +5082,7 @@ mod tests {
         let key_columns: Vec<String> = help_lines(&Keymap::default(), "")
             .iter()
             .filter_map(|l| match l {
-                HelpLine::Row(k, _) => Some(k.clone()),
+                HelpLine::Row(k, _, _) => Some(k.clone()),
                 HelpLine::Head(_) => None,
             })
             .collect();
@@ -4974,7 +5145,8 @@ mod tests {
         let layout = help_layout(body, &km, Some("zzzzz-no-such-thing"));
         assert_eq!(layout.columns.iter().map(|c| c.len()).max().unwrap_or(0), 0, "nothing matched");
         assert_eq!(layout.size.1, 2, "two border rows — a frame, not a void");
-        let title = super::help_title(Some("zzzzz-no-such-thing"), 0, 0, false, body.width - 2);
+        let title =
+            super::help_title(Some("zzzzz-no-such-thing"), 0, 0, false, false, body.width - 2);
         assert!(title.contains("0 shown"), "and it says the result is empty: {title:?}");
         assert!(title.contains("Esc clears"), "and how to leave: {title:?}");
         assert!(
@@ -5015,11 +5187,14 @@ mod tests {
         for q in ["this keymap", "hint bar", "toggle the hint", "quit", "zoom"] {
             let layout = help_layout(body, &km, Some(q));
             let rows = layout.columns.iter().map(|c| c.len()).max().unwrap_or(0);
+            let runnable =
+                layout.columns.iter().flatten().any(|l| matches!(l, HelpLine::Row(_, _, Some(_))));
             let title = super::help_title(
                 Some(q),
                 rows,
                 rows,
                 rows > layout.height as usize,
+                runnable,
                 body.width - 2,
             );
             assert!(
@@ -5075,7 +5250,9 @@ mod tests {
         let km = Keymap::default();
         let long = "a".repeat(120);
         for scrolled in [false, true] {
-            let title = super::help_title(Some(&long), 3, 40, scrolled, floor.width - 2);
+            // `runnable` true is the widest the title can get — the case a
+            // floor gate has to hold against.
+            let title = super::help_title(Some(&long), 3, 40, scrolled, true, floor.width - 2);
             assert!(
                 mouse::display_width(&title) <= floor.width - 2,
                 "the title outgrew the terminal: {} cols",
@@ -5088,6 +5265,114 @@ mod tests {
         // function, which is why there is only one.
         let layout = help_layout(floor, &km, Some(&long));
         assert!(layout.asked <= floor.width, "asked for {} at the floor", layout.asked);
+    }
+
+    /// [C41] The palette's cursor is drawn, lands on the right row, and
+    /// **costs no column** — it spends the space `help_key_prefix` already
+    /// opens every key column with. That last clause is the one worth
+    /// gating: the alternative (a marker column of its own) would widen
+    /// every row by one, which re-trips `elide_key` and moves
+    /// `HELP_COL_FLOOR` — the exact accounting C38/C39 had to correct twice
+    /// already. Compare the drawn row against the unfiltered overlay's own
+    /// width for the same query, so the check is a measurement rather than
+    /// a restatement of the marker's width.
+    #[test]
+    fn the_palette_cursor_marks_a_row_without_costing_it_a_column() {
+        use crate::core::app::Mode;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let body = Rect::new(0, 0, 120, 40);
+        let km = Keymap::default();
+        let q = "toggle";
+        assert!(super::help_actions(&km, q).len() >= 2, "the query needs rows to choose between");
+        let unmarked = help_layout(body, &km, Some(q)).content;
+
+        let draw = |cursor: usize| -> Vec<String> {
+            let mut app = mk_app(Size::new(120, 40));
+            app.apply(Action::Help);
+            app.mode = Mode::Help { top: 0, filter: Some(q.into()), cursor };
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| super::draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..40)
+                .map(|y| {
+                    (0..120)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let marker = theme::PICKER_SELECTED.to_string();
+        for cursor in [0usize, 1] {
+            let rows = draw(cursor);
+            let marked: Vec<&String> = rows.iter().filter(|r| r.contains(&marker)).collect();
+            assert_eq!(marked.len(), 1, "exactly one row carries the cursor at {cursor}");
+        }
+        assert_ne!(
+            draw(0).iter().position(|r| r.contains(&marker)),
+            draw(1).iter().position(|r| r.contains(&marker)),
+            "and ↓ moved it to a different row",
+        );
+        assert_eq!(
+            help_layout(body, &km, Some(q)).content,
+            unmarked,
+            "the marker rides in the key column's own leading space, so nothing widened",
+        );
+    }
+
+    /// [C41] The un-filtered overlay is still C15's poster: nothing is
+    /// marked, because "any key closes it" still owns `↵` there and a
+    /// cursor would advertise an action the state does not offer.
+    #[test]
+    fn the_unfiltered_keymap_marks_no_row() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(120, 40));
+        app.apply(Action::Help);
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            screen.contains("new shell pane"),
+            "the overlay really is up — or this gate passes by drawing nothing",
+        );
+        assert!(!screen.contains(theme::PICKER_SELECTED), "an unfiltered keymap points at nothing",);
+    }
+
+    /// [C41] The title earns its `↵ runs` — it appears when the query has a
+    /// command under the cursor and stays away when it does not. F1's rule
+    /// applied to the heading: a title teaching a key that does nothing
+    /// here is worse than no title.
+    #[test]
+    fn the_title_offers_enter_only_when_there_is_something_to_run() {
+        let body = Rect::new(0, 0, 120, 40);
+        let km = Keymap::default();
+        let title = |q: &str| {
+            let layout = help_layout(body, &km, Some(q));
+            let rows = layout.columns.iter().map(|c| c.len()).max().unwrap_or(0);
+            super::help_title(
+                Some(q),
+                rows,
+                rows,
+                rows > layout.height as usize,
+                super::help_cursor_pos(&layout, 0).is_some(),
+                body.width - 2,
+            )
+        };
+        assert!(title("toggle the hint bar").contains("↵ runs"), "a command row offers it");
+        assert!(!title("roost read").contains("↵ runs"), "the control-CLI block does not");
+        assert!(!title("zzzzz-no-such-thing").contains("↵ runs"), "and neither does no match");
+        for q in ["toggle the hint bar", "roost read", "zzzzz-no-such-thing"] {
+            assert!(title(q).contains("Esc clears"), "the way out survives either way: {q}");
+        }
     }
 
     /// C14 (U20): every picker row's cwd column starts at the same place,
@@ -5207,7 +5492,7 @@ row's — widen ADAPTER_COL",
         let text = help_lines(&Keymap::default(), "")
             .iter()
             .filter_map(|l| match l {
-                HelpLine::Row(k, d) => Some(format!("{k} {d}")),
+                HelpLine::Row(k, d, _) => Some(format!("{k} {d}")),
                 HelpLine::Head(_) => None,
             })
             .collect::<Vec<_>>()
@@ -5871,7 +6156,7 @@ row's — widen ADAPTER_COL",
             Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
             Mode::Scroll,
             Mode::Copy { cursor: (0, 0) },
-            Mode::Help { top: 0, filter: None },
+            Mode::Help { top: 0, filter: None, cursor: 0 },
             Mode::Feed { offset: 0 },
             Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None },
             Mode::Broadcast { lines: vec![String::new()], row: 0, col: 0, status_filter: None },
@@ -6777,7 +7062,7 @@ row's — widen ADAPTER_COL",
             term.draw(|f| super::draw(f, &mut app)).unwrap();
             // …and scrolled to its end, where `top` is at its largest.
             let (visible, total) = super::help_scroll_extent(app.body_area(), app.keymap(), None);
-            app.mode = Mode::Help { top: total.saturating_sub(visible), filter: None };
+            app.mode = Mode::Help { top: total.saturating_sub(visible), filter: None, cursor: 0 };
             term.draw(|f| super::draw(f, &mut app)).unwrap();
         }
     }
