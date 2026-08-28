@@ -5385,6 +5385,93 @@ so emacs' `M-x` and `M-v` keep reaching the pane through U5 — the same reason
 this verb belongs anyway: C28 and C33's rule is that a shifted chord carries
 the *pane* where its unshifted sibling carries *you*.
 
+### C41 — The keymap overlay runs what it teaches (`Alt+?` `/` … `↵`) — [Added 2026-08-28]
+
+**No new chord, no new overlay, no second list.** C15's keymap already draws
+every binding grouped and labelled; F9 already gave it a `/` type-ahead over
+both columns; F1 already made each row declare the *actions* it documents
+rather than a compiled-in spelling. That is a command palette in every
+respect but one — it could not press the button. C41 is that one keystroke:
+while the filter is open, `↵` runs the row under the cursor.
+
+The alternative was a separate palette mode on its own chord. It was rejected
+for the reason F1 exists: a second list of commands is a second thing to keep
+true, and this table is already the one roost audits (`HELP_GROUPS` is swept
+against `Action` for coverage). The palette's command list *is* the keymap.
+
+**Only the filtering state is a palette.** Un-filtered, C15's overlay is
+unchanged down to the byte — a poster you read, where any key dismisses it
+and no row is marked. `/` is what turns it into a picker, and that is the
+state whose title and C9 bar advertise `↵`. This keeps C15's shipped contract
+whole rather than widening it, and it is the shape F9 already chose for the
+same surface ("the two carve-outs are deliberately different shapes").
+
+**A row is runnable only when it documents exactly one action** — and the
+rows that resist are precisely the ones nobody would drive this way:
+
+- `Chords([a])` is one verb with one outcome. Unambiguous.
+- A multi-action row — `Family` (`Alt+←↓↑→ / hjkl`, `Alt+Shift+←↓↑→`) or a
+  multi-action `Chords` (`previous / next tab`) — is a *direction set*.
+  There is no answer to which one `↵` runs, and picking one would be the
+  wrong feature anyway: those are the chords you press five times running,
+  and a palette that performs one step and then closes is strictly worse
+  than the chord it would be standing in for. **The ambiguity and the
+  uselessness coincide**, which is why one rule covers both.
+- `Text` rows bind nothing — the `CONTROL CLI` block, the glyph legend, the
+  dead-pane keys `main.rs` claims. Nothing to run.
+
+What survives is what a palette is *for*: the rare, one-shot, hard-to-
+remember verbs — flip split, cycle layout, mark/pull, toggle
+raw/float/zoom/feed/roster, undo, rename, quit.
+
+**The cursor indexes commands, not drawn lines.** `↑`/`↓`/`PgUp`/`PgDn`/
+`Home`/`End` step it over runnable rows only, so it can never park somewhere
+`↵` has no answer for; it is clamped at both ends rather than wrapping (C27's
+rule, and the stakes are a rung higher here — the row it lands on is one
+keystroke from running); and it is read from `help_lines`, which is the flat
+table *before* `help_layout` pours it into one column or two, so a resize
+under an open palette cannot move what `↵` is pointing at.
+
+**Editing the query resets the cursor to the first command**, alongside the
+`top` reset F9 already did — and for a sharper reason than tidiness. It is
+what makes the core gesture work: type until the row is there, press `↵`, no
+arrow key. Clamping instead would leave `↵` aimed at a row the reader chose
+under a *different* list.
+
+**The view follows the cursor; the cursor does not follow the view.** C27's
+rule verbatim — a view that scrolled independently would leave the overlay
+pointing at a row nobody can see. Both columns share one `top` because they
+are one table. Scrolling up keeps one line of context above the cursor,
+because in this table that line is usually the group heading that says what
+the command is for; the tighter arithmetic pushed `PANES` off the top the
+moment the cursor walked back to the first row.
+
+**The mark spends no width.** The cursor is `❯` — C14's picker marker and
+C27's roster marker, the same "`↵` acts on this row" idiom in its third
+overlay — and it is drawn *into the leading space `help_key_prefix` already
+opens every key column with*. A marker column of its own would widen every
+row by one, which re-trips `elide_key` and moves `HELP_COL_FLOOR`: the exact
+accounting C38 and C39 each had to correct once already. Gated by measuring
+the laid-out column width with the cursor on and off, not by restating the
+glyph's width.
+
+**`↵ runs` is earned, not assumed.** The title offers it only when the query
+actually has a command under the cursor. A query isolating the `CONTROL CLI`
+block matches rows but no *commands*, and there `↵` does exactly what it did
+before C41 — close. F1's rule applied to the heading: a title teaching a key
+that does nothing here is worse than no title.
+
+**The overlay closes before the action lands.** Several of the verbs it can
+run open a mode of their own (`Alt+r`'s editor, `Alt+Enter`'s picker,
+`Alt+Shift+r`'s rename). Dispatching under a live `Mode::Help` would stack
+two modals, and the one the renderer drew would not be the one the keys
+reached.
+
+**Not taken: click-to-run.** C15's "any click dismisses it" (the mouse form
+of "any key closes it") is unchanged. A click that ran a command would make
+the dismissal gesture and the fire gesture the same shape, distinguished only
+by where the pointer happened to be.
+
 ### On gates that pass by construction
 **[Added 2026-08-20, after the eighth instance]**
 
@@ -5503,7 +5590,7 @@ shows only the C9-curated subsets.
 | 17 | `Alt+PgUp` | scroll mode | — |
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
-| 20 | `Alt+?` | full keymap overlay (this table); `/` filters it | C15, C39 |
+| 20 | `Alt+?` | full keymap overlay (this table); `/` filters it, **and `↵` runs the row it lands on** | C15, C39, C41 |
 
 *Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
 terminals disagree about which half of that they report: some deliver

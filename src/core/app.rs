@@ -178,9 +178,19 @@ pub enum Mode {
     /// than an empty string standing in for "not filtering". An empty
     /// `Some` is a real state: `/` then Backspace, still filtering, showing
     /// everything.
+    ///
+    /// **[C41] `cursor` indexes the *runnable* rows under the query**
+    /// (`render::help_actions`), not the drawn lines — headings, the
+    /// control-CLI block and the multi-action direction rows are all skipped,
+    /// so `↑`/`↓` never park on a row `↵` cannot act on. It is meaningful
+    /// only while `filter` is `Some`: unfiltered, C15's overlay is still the
+    /// poster any key dismisses, and nothing is marked. Every edit to the
+    /// query resets it to 0, exactly as `top` does — a filtered list is a new
+    /// list, and C14/C27 both put the cursor at its start.
     Help {
         top: usize,
         filter: Option<String>,
+        cursor: usize,
     },
     /// C20 activity-feed overlay; `offset` counts entries back from the
     /// newest (0 = live tail).
@@ -3966,7 +3976,7 @@ impl<B: PaneBackend> App<B> {
             }
             Action::ToggleHints => self.hints = !self.hints,
             Action::Undo => self.undo_close(),
-            Action::Help => self.mode = Mode::Help { top: 0, filter: None },
+            Action::Help => self.mode = Mode::Help { top: 0, filter: None, cursor: 0 },
             Action::JumpAttention => self.jump_attention(),
             Action::ToggleRoster => self.toggle_roster(),
             Action::ToggleZoom => {
@@ -5399,6 +5409,55 @@ impl<B: PaneBackend> App<B> {
         moved
     }
 
+    /// [C41] The action `↵` would run right now, or `None` when the query
+    /// matches no runnable row (or the filter is closed, where `↵` is not
+    /// the palette's key at all and C15's "any key closes it" still owns it).
+    fn help_cursor_action(&self) -> Option<Action> {
+        let Mode::Help { filter: Some(q), cursor, .. } = &self.mode else { return None };
+        crate::ui::render::help_actions(&self.keymap, q).get(*cursor).copied()
+    }
+
+    /// [C41] Move the palette cursor `delta` runnable rows (negative = up;
+    /// `isize::MIN`/`MAX` mean Home/End), then drag `top` along so the row
+    /// stays on screen.
+    ///
+    /// **Clamped at both ends rather than wrapping**, which is C27's rule and
+    /// its reason: a cursor that teleported from the last command to the
+    /// first on an overshoot would make a held `↓` a hazard — and here the
+    /// stakes are a rung higher than the roster's, because the row it lands
+    /// on is one `↵` from running.
+    fn help_cursor_move(&mut self, delta: isize) {
+        let q = self.help_filter().map(str::to_string);
+        let n = crate::ui::render::help_actions(&self.keymap, q.as_deref().unwrap_or("")).len();
+        // No runnable row: nothing to move and, deliberately, nothing to
+        // scroll. The keys are inert rather than falling back to scrolling
+        // the view, because a filtering reader is choosing a command, not
+        // reading the poster.
+        if n == 0 {
+            return;
+        }
+        let Mode::Help { cursor, .. } = &mut self.mode else { return };
+        *cursor = match delta {
+            isize::MIN => 0,
+            isize::MAX => n as isize - 1,
+            d => (*cursor as isize + d).clamp(0, n as isize - 1),
+        } as usize;
+        let (cursor, top) = match &self.mode {
+            Mode::Help { cursor, top, .. } => (*cursor, *top),
+            _ => return,
+        };
+        let next = crate::ui::render::help_follow_top(
+            self.body_area(),
+            &self.keymap,
+            q.as_deref(),
+            cursor,
+            top,
+        );
+        if let Mode::Help { top, .. } = &mut self.mode {
+            *top = next;
+        }
+    }
+
     /// The cursor's index among the rows currently shown, if it is still one
     /// of them (a pane can exit, close, or be filtered away underneath it).
     fn roster_cursor_index(&self, rows: &[RosterRow]) -> Option<usize> {
@@ -6459,13 +6518,40 @@ impl<B: PaneBackend> App<B> {
                 // in one state and "type" in another is the ambiguity U20
                 // resolved the same way for the picker.
                 if !filtering && key.code == KeyCode::Char('/') {
-                    if let Mode::Help { filter, .. } = &mut self.mode {
+                    if let Mode::Help { filter, cursor, .. } = &mut self.mode {
                         *filter = Some(String::new());
+                        *cursor = 0;
                     }
                     return true;
                 }
 
                 if filtering {
+                    // [C41] `↵` runs the row under the cursor: the overlay
+                    // that has always told you which chord does the thing
+                    // now does the thing. Only while filtering — that is
+                    // the state whose title and hint bar advertise it, and
+                    // it leaves C15's un-filtered "any key closes it"
+                    // contract exactly as it shipped.
+                    //
+                    // Order matters both ways: the action is read out of
+                    // `Mode::Help` first (that is where the cursor lives),
+                    // then the mode is cleared, and only then does `apply`
+                    // run. Several of the verbs reachable here open a mode
+                    // of their own — Alt+r's editor, Alt+Enter's picker,
+                    // Alt+Shift+r's rename — and applying under a live
+                    // `Mode::Help` would stack two modals, leaving the one
+                    // the renderer drew and the one the keys reach out of
+                    // step. Falls through to the default arm when the query
+                    // matches no runnable row, which closes: the title does
+                    // not offer `↵ runs` there, so that is the pre-C41
+                    // behaviour untouched rather than a dead key.
+                    if key.code == KeyCode::Enter {
+                        if let Some(action) = self.help_cursor_action() {
+                            self.mode = Mode::Normal;
+                            self.apply(action);
+                            return true;
+                        }
+                    }
                     // Delete is an *edit* key, and a reader reaching for it
                     // is erasing a typo — closing the overlay instead is the
                     // sharpest way there is to lose a query. It has nothing
@@ -6492,7 +6578,7 @@ impl<B: PaneBackend> App<B> {
                         _ => None,
                     };
                     if let Some(edit) = typed {
-                        if let Mode::Help { filter: Some(q), top } = &mut self.mode {
+                        if let Mode::Help { filter: Some(q), top, cursor } = &mut self.mode {
                             match edit {
                                 Some(c) => q.push(c),
                                 None => {
@@ -6504,7 +6590,17 @@ impl<B: PaneBackend> App<B> {
                             // the new one's end. Reset rather than clamp:
                             // a filtered list is a new list, and C14/C27
                             // both put the cursor at its start.
+                            //
+                            // [C41] The cursor resets with it, and for a
+                            // sharper reason than tidiness: it is what makes
+                            // the palette's core gesture — type until one row
+                            // is left, press `↵` — land on that row without
+                            // an arrow key. Clamping instead would leave the
+                            // cursor wherever the *previous* query had put
+                            // it, so `↵` would run a row the reader chose
+                            // under a different list.
                             *top = 0;
+                            *cursor = 0;
                         }
                         return true;
                     }
@@ -6516,9 +6612,10 @@ impl<B: PaneBackend> App<B> {
                         let empty = matches!(&self.mode, Mode::Help { filter: Some(q), .. } if q.is_empty());
                         if empty {
                             self.mode = Mode::Normal;
-                        } else if let Mode::Help { filter, top } = &mut self.mode {
+                        } else if let Mode::Help { filter, top, cursor } = &mut self.mode {
                             *filter = Some(String::new());
                             *top = 0;
+                            *cursor = 0;
                         }
                         return true;
                     }
@@ -6548,12 +6645,23 @@ impl<B: PaneBackend> App<B> {
                         return true;
                     }
                 };
-                if !self.help_scroll(delta) && !filtering {
-                    // While filtering, a scroll key that hit the end must
-                    // NOT close: the reader is mid-query, and losing it to
-                    // an over-pressed ↓ is the "modal you open when you are
-                    // lost is the one with a surprising way out" failure
-                    // C15 rejected scrolling over in the first place.
+                // [C41] The two states move different things. Filtering, the
+                // overlay is a picker and these keys drive its *cursor*,
+                // with the view following (`help_cursor_move`) — a detached
+                // view would scroll the list out from under the row `↵` acts
+                // on, which is C27's stated reason for the roster's wheel
+                // doing the same. Un-filtered it is still C15's poster and
+                // they scroll it, unchanged.
+                //
+                // The end-of-list rule below is unchanged and now covers
+                // both: while filtering, a motion key that hit the end must
+                // NOT close — the reader is mid-query, and losing it to an
+                // over-pressed ↓ is the "modal you open when you are lost is
+                // the one with a surprising way out" failure C15 rejected
+                // scrolling over in the first place.
+                if filtering {
+                    self.help_cursor_move(delta);
+                } else if !self.help_scroll(delta) {
                     self.mode = Mode::Normal;
                 }
                 true
@@ -15363,13 +15471,203 @@ pub(crate) mod tests {
     fn editing_the_query_returns_to_the_top_of_the_new_list() {
         let (mut app, _) = mk_app(shell_ws());
         open_help(&mut app);
-        app.mode = Mode::Help { top: 4, filter: Some(String::new()) };
+        app.mode = Mode::Help { top: 4, filter: Some(String::new()), cursor: 0 };
         help_type(&mut app, "t");
         assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "typing went back to the top");
 
-        app.mode = Mode::Help { top: 4, filter: Some("tab".into()) };
+        app.mode = Mode::Help { top: 4, filter: Some("tab".into()), cursor: 0 };
         help_key(&mut app, crossterm::event::KeyCode::Backspace);
         assert!(matches!(app.mode, Mode::Help { top: 0, .. }), "so did backspacing");
+    }
+
+    /// [C41] The palette's whole reason to exist: the overlay that told you
+    /// which chord does the thing now does the thing. Type until the row is
+    /// there, press `↵`.
+    ///
+    /// `toggle the hint bar` is the target because it is observable from
+    /// here with no PTY and no layout — the point under test is the
+    /// *dispatch*, not what any particular verb does once dispatched.
+    #[test]
+    fn enter_runs_the_command_on_the_filtered_row() {
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.hints;
+        open_help(&mut app);
+        help_type(&mut app, "/toggle the hint bar");
+        help_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal), "the overlay closed to run it");
+        assert_ne!(app.hints, before, "and the row's action actually fired");
+    }
+
+    /// The overlay must be **gone before the action lands**, because several
+    /// of the verbs it can run open a mode of their own (`Alt+r`'s editor,
+    /// `Alt+p`'s picker). Dispatching under a live `Mode::Help` would stack
+    /// two modals, and the one the renderer drew would not be the one the
+    /// keys reached.
+    #[test]
+    fn a_command_that_opens_its_own_mode_replaces_the_overlay_rather_than_stacking() {
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/rename this tab");
+        help_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(
+            matches!(app.mode, Mode::Rename { .. }),
+            "the rename dialog took the overlay's place: {:?}",
+            std::mem::discriminant(&app.mode),
+        );
+    }
+
+    /// [C41] `↵` is the palette's key only where the palette exists. On an
+    /// un-filtered overlay C15's "any key closes it" still owns it — which
+    /// `the_help_overlay_is_unchanged_until_slash_opens_the_filter` already
+    /// gates for `Enter` specifically, and this pins the consequence: no
+    /// command runs on the way out.
+    #[test]
+    fn enter_runs_nothing_on_an_unfiltered_overlay() {
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.hints;
+        open_help(&mut app);
+        help_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.hints, before, "closing is not running");
+    }
+
+    /// A query can match rows that are not commands — the CONTROL CLI block
+    /// is six of them. There `↵` falls back to closing, which is precisely
+    /// what it did before C41, and the title never offered `↵ runs` in the
+    /// first place.
+    #[test]
+    fn enter_closes_when_the_query_names_no_command() {
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.hints;
+        open_help(&mut app);
+        help_type(&mut app, "/roost read");
+        assert!(
+            crate::ui::render::help_actions(app.keymap(), "roost read").is_empty(),
+            "the query really does isolate non-command rows",
+        );
+        help_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal), "it closed");
+        assert_eq!(app.hints, before, "without running anything");
+    }
+
+    /// [C41] The cursor walks **commands**, never the rows in between — no
+    /// group heading, no legend, no control-CLI reference, and no
+    /// direction-set row. The last is the one worth gating: `previous /
+    /// next tab` is a two-action `Chords`, so excluding it cannot ride on
+    /// "is it a `Family`" and a future single-spelling multi-action row
+    /// would have to keep passing this.
+    #[test]
+    fn the_cursor_walks_only_rows_enter_can_act_on() {
+        let km = Keymap::default();
+        let all = crate::ui::render::help_actions(&km, "");
+        assert!(all.contains(&Action::FlipSplit), "a one-verb row is a command");
+        for excluded in [
+            Action::PrevTab,                               // half of a two-action `Chords` row
+            Action::NextTab,                               // the other half
+            Action::Focus(crate::core::layout::Dir::Left), // a `Family`
+            Action::Resize { horizontal: true, grow: true },
+        ] {
+            assert!(
+                !all.contains(&excluded),
+                "{excluded:?} is one of several on its row — `↵` has no answer for it",
+            );
+        }
+        assert!(
+            crate::ui::render::help_actions(&km, "wheel scrolls").is_empty(),
+            "a legend row binds nothing",
+        );
+    }
+
+    /// Clamped at both ends, never wrapping — C27's rule, and here the
+    /// stakes are a rung higher than the roster's, because the row the
+    /// cursor lands on is one `↵` from running.
+    #[test]
+    fn the_palette_cursor_clamps_at_both_ends_instead_of_wrapping() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/toggle");
+        let n = crate::ui::render::help_actions(app.keymap(), "toggle").len();
+        assert!(n >= 2, "the query needs a few rows to move through: {n}");
+
+        for _ in 0..n * 2 {
+            help_key(&mut app, KeyCode::Down);
+        }
+        let Mode::Help { cursor, .. } = app.mode else { panic!("still open") };
+        assert_eq!(cursor, n - 1, "↓ parked on the last command, it did not wrap");
+
+        for _ in 0..n * 2 {
+            help_key(&mut app, KeyCode::Up);
+        }
+        let Mode::Help { cursor, .. } = app.mode else { panic!("still open") };
+        assert_eq!(cursor, 0, "and ↑ parked on the first");
+    }
+
+    /// Editing the query resets the cursor as well as the scroll, and for a
+    /// sharper reason: it is what makes "type until one row is left, press
+    /// `↵`" land on that row without an arrow key. Clamping instead would
+    /// leave `↵` pointing at a row the reader chose under a *different*
+    /// list.
+    #[test]
+    fn editing_the_query_puts_the_cursor_back_on_the_first_command() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_type(&mut app, "/toggle");
+        help_key(&mut app, KeyCode::Down);
+        assert!(matches!(app.mode, Mode::Help { cursor: 1, .. }), "moved off the first row");
+
+        help_type(&mut app, " ");
+        assert!(matches!(app.mode, Mode::Help { cursor: 0, .. }), "typing reset it");
+
+        help_key(&mut app, KeyCode::Down);
+        help_key(&mut app, KeyCode::Backspace);
+        assert!(matches!(app.mode, Mode::Help { cursor: 0, .. }), "so did backspacing");
+
+        help_key(&mut app, KeyCode::Down);
+        help_key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Help { cursor: 0, .. }), "and so did Esc clearing it");
+    }
+
+    /// [C41] The view follows the cursor rather than scrolling on its own.
+    /// C27's stated reason, and it bites here for real: at 120×40 the whole
+    /// keymap already does not fit in one column, so a cursor walked to the
+    /// end of an empty query lands well below the fold.
+    ///
+    /// The invariant is `help_follow_top`'s own fixpoint — after the move,
+    /// asking again must change nothing, which is exactly "the cursor is on
+    /// screen". Asserting `top > 0` alone would pass on a view that
+    /// scrolled to the wrong place.
+    #[test]
+    fn the_palette_view_follows_its_cursor_below_the_fold() {
+        use crossterm::event::KeyCode;
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        help_key(&mut app, KeyCode::Char('/'));
+
+        let n = crate::ui::render::help_actions(app.keymap(), "").len();
+        assert!(n > 0, "the unfiltered keymap has commands in it");
+        for _ in 0..n {
+            help_key(&mut app, KeyCode::Down);
+        }
+        let Mode::Help { top, cursor, .. } = app.mode else { panic!("still open") };
+        assert_eq!(cursor, n - 1, "the cursor reached the last command");
+        assert!(top > 0, "which is below the fold at this geometry, so the view moved");
+        assert_eq!(
+            crate::ui::render::help_follow_top(
+                app.body_area(),
+                app.keymap(),
+                Some(""),
+                cursor,
+                top
+            ),
+            top,
+            "and it moved far enough: the cursor is on screen, so following again is a no-op",
+        );
+
+        help_key(&mut app, KeyCode::Home);
+        let Mode::Help { top, cursor, .. } = app.mode else { panic!("still open") };
+        assert_eq!((top, cursor), (0, 0), "Home brings both back to the start");
     }
 
     /// A scroll key that hits the end must **not** close while filtering.
@@ -17840,7 +18138,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleRaw);
         assert!(app.raw_routing_active());
 
-        app.mode = Mode::Help { top: 0, filter: None };
+        app.mode = Mode::Help { top: 0, filter: None, cursor: 0 };
         assert!(!app.raw_routing_active(), "only applies in Normal mode");
         app.mode = Mode::Normal;
         assert!(app.raw_routing_active());
@@ -18065,7 +18363,7 @@ pub(crate) mod tests {
             ("Picker", Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false }),
             ("Scroll", Mode::Scroll),
             ("Copy", Mode::Copy { cursor: (0, 0) }),
-            ("Help", Mode::Help { top: 0, filter: None }),
+            ("Help", Mode::Help { top: 0, filter: None, cursor: 0 }),
             ("Feed", Mode::Feed { offset: 0 }),
             (
                 "Roster",
@@ -18115,7 +18413,7 @@ pub(crate) mod tests {
     /// C24b's rule is under real pressure, and the sweeps were proving
     /// nothing about it. Named by the C39 design audit.
     fn extra_mode_states() -> Vec<(&'static str, Mode)> {
-        vec![("Help (filtering)", Mode::Help { top: 0, filter: Some("pane".into()) })]
+        vec![("Help (filtering)", Mode::Help { top: 0, filter: Some("pane".into()), cursor: 0 })]
     }
 
     /// Every mode surface the C24b sweeps must cover: one of each variant,
