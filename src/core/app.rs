@@ -1979,6 +1979,7 @@ impl<B: PaneBackend> App<B> {
             Method::Broadcast { text, submit } => self.ctl_broadcast(actor, &text, submit),
             Method::Read { pane, mode } => self.ctl_read(actor, pane, mode),
             Method::Close { pane, force } => self.ctl_close(actor, pane, force),
+            Method::Focus { pane } => self.ctl_focus(actor, pane),
             // `wait` is handled asynchronously; only reached if a caller sends
             // it down the synchronous path.
             Method::Wait { .. } => Reply::err("wait is asynchronous; issue it over the socket"),
@@ -2559,6 +2560,29 @@ impl<B: PaneBackend> App<B> {
         self.relayout();
         self.save();
         Reply::ok(serde_json::json!({ "closed": pane }))
+    }
+
+    /// `focus` — the TUI's own focus move (see `focus_attention_target`)
+    /// exposed to the control plane: switch tab, exit zoom, expand stacks,
+    /// set focus. Nothing is spawned or killed, but the move can still
+    /// change the layout (stack expand, zoom exit, tab switch), and
+    /// relayout is the one place a pane's PTY gets resized to match its new
+    /// on-screen rect. `save` persists the active-tab switch so a restart
+    /// lands the human back on the tab they were shown.
+    fn ctl_focus(&mut self, actor: Actor, pane: PaneId) -> Reply {
+        if self.find_spec(pane).is_none() {
+            return Reply::err("no such pane");
+        }
+        if let Some(msg) = self.float_refusal(pane, "focus") {
+            return Reply::err(msg);
+        }
+        if !self.may_target(actor, pane) {
+            return Reply::err("forbidden: pane not in your subtree");
+        }
+        self.focus_attention_target(pane);
+        self.relayout();
+        self.save();
+        Reply::ok(serde_json::json!({ "pane": pane }))
     }
 
     /// Close a specific pane (any tab) — the single removal path shared by
@@ -6895,6 +6919,7 @@ fn method_summary(m: &Method) -> String {
         }
         Method::Read { pane, .. } => format!("read pane={pane}"),
         Method::Close { pane, force } => format!("close pane={pane} force={force}"),
+        Method::Focus { pane } => format!("focus pane={pane}"),
         Method::Wait { panes, until, .. } => format!("wait panes={panes:?} until={until}"),
     }
 }
@@ -16761,6 +16786,112 @@ pub(crate) mod tests {
             .handle_control(Request { token: ct, method: Method::Close { pane: 1, force: false } });
         assert!(matches!(reply, Reply::Ok { .. }));
         assert!(app.zoomed(), "closing an unrelated pane must not touch an unrelated zoom");
+    }
+
+    /// `focus` from the control plane is the same move the TUI's own
+    /// attention jumps make: land focus on the pane, switching tabs when it
+    /// lives on another one (go_to_tab semantics, zoom exit included).
+    #[test]
+    fn ctl_focus_switches_tab_and_lands_focus_on_a_remote_pane() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws()); // tab0: pane 1
+        let first = app.focused;
+        app.apply(Action::NewTab); // tab1: pane 2
+        let second = app.focused;
+        assert_eq!(app.ws.active_tab, 1);
+        let ct = app.control_token().to_string();
+        let reply =
+            app.handle_control(Request { token: ct, method: Method::Focus { pane: first } });
+        match reply {
+            Reply::Ok { ok } => assert_eq!(ok["pane"], first),
+            other => panic!("expected ok, got {other:?}"),
+        }
+        assert_ne!(app.focused, second, "focus must move off the old pane");
+        assert_eq!(app.focused, first);
+        assert_eq!(app.ws.active_tab, 0, "a cross-tab focus must switch to the pane's tab");
+    }
+
+    #[test]
+    fn ctl_focus_of_a_missing_pane_is_an_error() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let reply = app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Focus { pane: 999 },
+        });
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "no such pane"),
+            other => panic!("expected err, got {other:?}"),
+        }
+    }
+
+    /// `focus_attention_target` is a safe no-op when already focused — the
+    /// control plane must inherit that, not re-switch tabs under a caller
+    /// that asked for where the human already is.
+    #[test]
+    fn ctl_focus_of_the_focused_pane_is_an_ok_no_op() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let before = app.focused;
+        let tab_before = app.ws.active_tab;
+        let reply = app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Focus { pane: before },
+        });
+        assert!(matches!(reply, Reply::Ok { .. }), "{reply:?}");
+        assert_eq!(app.focused, before);
+        assert_eq!(app.ws.active_tab, tab_before, "a no-op focus must not switch tabs");
+    }
+
+    /// Same subtree scoping as every other pane-scoped verb: a pane actor
+    /// may focus itself (and its subtree), never a fleet-spawned stranger.
+    #[test]
+    fn ctl_focus_stays_inside_a_pane_actors_subtree() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let ct = app.control_token().to_string();
+        app.tokens.set_pane_token(1, "tok1".into());
+        // The fleet spawns a pane outside pane 1's subtree.
+        let other = match app.handle_control(Request {
+            token: ct,
+            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+        }) {
+            Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
+            Reply::Err { err } => panic!("{err}"),
+        };
+        let reply =
+            app.handle_control(Request { token: "tok1".into(), method: Method::Focus { pane: other } });
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "forbidden: pane not in your subtree"),
+            other_reply => panic!("expected refusal, got {other_reply:?}"),
+        }
+        // Its own pane is in its own subtree (itself included).
+        assert!(matches!(
+            app.handle_control(Request { token: "tok1".into(), method: Method::Focus { pane: 1 } }),
+            Reply::Ok { .. }
+        ));
+        assert_eq!(app.focused, 1);
+    }
+
+    /// M1: the float is the human's private scratch shell — the control
+    /// plane may not even steer focus onto it, same guard as close/send/read.
+    #[test]
+    fn control_focus_of_the_float_is_refused() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let real_pane = app.focused;
+        app.apply(Action::ToggleFloat);
+        let float_id = app.focused;
+        app.apply(Action::ToggleFloat); // hide it again
+        let reply = app.handle_control(Request {
+            token: app.control_token().to_string(),
+            method: Method::Focus { pane: float_id },
+        });
+        match reply {
+            Reply::Err { err } => assert_eq!(err, "cannot focus the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert_eq!(app.focused, real_pane, "the refusal must not move focus");
     }
 
     #[test]

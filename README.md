@@ -479,6 +479,7 @@ roost status 5                                # working | waiting | needs_input 
 roost wait 5 --until waiting --timeout 300    # block until the agent finishes
 roost fork 5                                  # a sibling in the same context
 roost close 5 [--force]
+roost focus 5                                 # focus a pane: switch to its tab, land focus on it
 ```
 
 (`roost --help` prints the same verb set, in a different order.)

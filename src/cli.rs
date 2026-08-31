@@ -23,7 +23,8 @@ use std::time::Duration;
 use crate::infra::sock::{socket_path, OVERSIZE_LINE_MSG};
 use crate::infra::store::FsStore;
 
-const VERBS: &[&str] = &["list", "status", "spawn", "fork", "send", "read", "close", "wait"];
+const VERBS: &[&str] =
+    &["list", "status", "spawn", "fork", "send", "read", "close", "focus", "wait"];
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
 /// code. Otherwise return None so `main` launches the TUI. Only a genuinely
@@ -187,6 +188,7 @@ roost — control a running instance:
   roost send --all TEXT... [--enter]
   roost read PANE [--tail N | --full]
   roost close PANE [--force]
+  roost focus PANE
   roost wait PANE... [--until STATUS] [--timeout SEC]
   roost VERB --help              (a verb's own usage)
 and locally, with no running instance:
@@ -212,6 +214,7 @@ fn verb_help(verb: &str) -> &'static str {
         "send" => "roost send PANE TEXT... [--enter]\nroost send --all TEXT... [--enter]\nType TEXT into PANE (or, with --all, every reachable pane). --enter also submits it.",
         "read" => "roost read PANE [--tail N | --full]\nA pane's current screen (default), its last N lines, or its full scrollback.",
         "close" => "roost close PANE [--force]\nClose a pane; --force kills its process instead of asking it to exit.",
+        "focus" => "roost focus PANE\nFocus a pane: switch to its tab and land focus on it (a no-op if it already is).",
         "wait" => "roost wait PANE... [--until STATUS] [--timeout SEC]\nBlock until a pane reaches STATUS (default: waiting) or the timeout elapses.",
         _ => unreachable!("verb_help called with {verb:?}, not a member of VERBS"),
     }
@@ -380,6 +383,12 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             let pane = pos.first().ok_or("close needs a PANE")?;
             m.insert("pane".into(), parse_pane(pane)?.into());
             m.insert("force".into(), has_flag(rest, "--force").into());
+        }
+        "focus" => {
+            reject_unknown_flags(verb, rest, &[])?;
+            let pos = positional(rest);
+            let pane = pos.first().ok_or("focus needs a PANE")?;
+            m.insert("pane".into(), parse_pane(pane)?.into());
         }
         "wait" => {
             reject_unknown_flags(verb, rest, &["--until", "--timeout"])?;
@@ -692,6 +701,10 @@ mod tests {
                 assert_eq!(pane, 4);
                 assert!(force);
             }
+            _ => panic!(),
+        }
+        match parse(&["focus", "5"]).method {
+            Method::Focus { pane } => assert_eq!(pane, 5),
             _ => panic!(),
         }
     }

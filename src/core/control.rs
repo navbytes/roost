@@ -87,6 +87,14 @@ pub enum Method {
         #[serde(default)]
         force: bool,
     },
+    /// Focus a pane: switch to its tab, exit zoom, expand it out of any
+    /// collapsed stack, and land focus on it — the same move the TUI's own
+    /// attention jumps make. Called by surfaces outside the TUI (the
+    /// menubar, click-to-focus notifications) that want the *human's* eyes
+    /// on a pane. A no-op when the pane is already focused.
+    Focus {
+        pane: PaneId,
+    },
     /// Block until any of `panes` reaches status `until` (e.g. "waiting" =
     /// finished its turn), or `timeout_ms` elapses. A deferred reply: the reply
     /// is sent later by the event loop, not synchronously. This is what turns
@@ -394,6 +402,9 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"token":"t","method":"list"}"#).unwrap().method,
             Method::List
         ));
+        let r: Request = serde_json::from_str(r#"{"token":"t","method":"focus","pane":5}"#)
+            .unwrap();
+        assert!(matches!(r.method, Method::Focus { pane: 5 }));
         let r: Request = serde_json::from_str(r#"{"token":"t","method":"read","pane":1}"#).unwrap();
         assert!(matches!(r.method, Method::Read { mode: ReadMode::Screen, .. }));
     }
