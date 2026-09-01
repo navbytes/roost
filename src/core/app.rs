@@ -4236,8 +4236,9 @@ impl<B: PaneBackend> App<B> {
     /// has exactly one answer in roost and the move can never disagree with
     /// the focus key that taught the user the direction. Stacks need no
     /// special case for the same reason: every member already carries its
-    /// own `PaneRect` (collapsed ones a single row), so `Down` inside a
-    /// stack finds the next member the way it finds the next split.
+    /// own `PaneRect` (collapsed ones a shallow bar or box), so `Down`
+    /// inside a stack finds the next member the way it finds the next
+    /// split.
     ///
     /// **No cross-tab handoff at the edge.** `focus_dir` falls through to
     /// `focus_dir_cross_tab`; this deliberately does not. Moving a pane out
@@ -7567,7 +7568,7 @@ fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode 
 /// C31: the geometric edge pane of a destination tab's rects — leftmost
 /// when `rightmost` is false, rightmost when true. Ties on x — every member
 /// of a stack shares its column's x — are broken by `collapsed` (false
-/// first): the currently-*expanded* member wins over a 1-row collapsed
+/// first): the currently-*expanded* member wins over a collapsed
 /// title bar, so a navigation key lands on what the tab was actually left
 /// showing rather than rearranging it. Only below that does position decide
 /// (smallest y), then smallest id — `layout::neighbor`'s own tie-break,
@@ -16859,8 +16860,10 @@ pub(crate) mod tests {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
         };
-        let reply =
-            app.handle_control(Request { token: "tok1".into(), method: Method::Focus { pane: other } });
+        let reply = app.handle_control(Request {
+            token: "tok1".into(),
+            method: Method::Focus { pane: other },
+        });
         match reply {
             Reply::Err { err } => assert_eq!(err, "forbidden: pane not in your subtree"),
             other_reply => panic!("expected refusal, got {other_reply:?}"),

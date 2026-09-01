@@ -2480,12 +2480,29 @@ fn draw_pane<B: PaneBackend>(
     };
 
     if pr.collapsed {
-        // C8: collapsed stack member — a single-row fleet-view bar. `Some`,
+        // C8: collapsed stack member — the fleet-view title bar. `Some`,
         // always: a drawn row belongs to the active tab (or the float), and
         // those are spawned by construction — only C27's roster reaches
         // across into tabs that aren't.
+        //
+        // [Amended 2026-09-01] Where the C6 geometry granted the member its
+        // 3 rows, the row gets a border in the quiet stack-chrome red (C7's
+        // hue), so a collapsed pane reads as a pane rather than as a rule
+        // between its bordered neighbours; the shallow fallback stays the
+        // bare 1-row bar. Focus on a collapsed member is transient (it
+        // auto-expands) but honest while it lasts: the border sharpens to
+        // C3's focus accent.
+        let row = if pr.rect.height >= layout::COLLAPSED_BOX_ROWS {
+            let border = if focused { theme::accent() } else { theme::accent_quiet() };
+            let block = Block::bordered().border_style(border);
+            let inner = block.inner(pr.rect);
+            f.render_widget(block, pr.rect);
+            inner
+        } else {
+            pr.rect
+        };
         let spans = collapsed_row_spans(
-            pr.rect.width,
+            row.width,
             focused,
             Some(status),
             pr.id,
@@ -2496,7 +2513,7 @@ fn draw_pane<B: PaneBackend>(
             note.is_some(),
             spinner,
         );
-        f.render_widget(Paragraph::new(Line::from(spans)), pr.rect);
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
         return;
     }
 
@@ -4436,6 +4453,98 @@ mod tests {
             theme::GLYPH_WORKING,
         );
         assert!(spans.is_empty());
+    }
+
+    /// C8 (amended 2026-09-01): where the C6 geometry grants a collapsed
+    /// member its 3 rows, the row draws inside an `accent_quiet()` bordered
+    /// box — a collapsed pane reads as a pane, not as a rule between its
+    /// bordered neighbours.
+    #[test]
+    fn boxed_collapsed_member_draws_a_quiet_red_border_around_its_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        // Focus the first pane so Alt+s reaches the *outer* split and stacks
+        // all three (`toggle_stack` folds the innermost split that directly
+        // holds the target).
+        app.focused = app.pane_order()[0];
+        app.apply(Action::ToggleStack);
+        let collapsed: Vec<crate::core::layout::PaneRect> =
+            app.rects().into_iter().filter(|p| p.collapsed).collect();
+        assert_eq!(collapsed.len(), 2, "a stack of three shows two collapsed members");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        for pr in &collapsed {
+            let r = pr.rect;
+            assert_eq!(
+                r.height,
+                crate::core::layout::COLLAPSED_BOX_ROWS,
+                "boxed in a 28-row stack"
+            );
+            // Expectations derive from the token, not restated literals, so
+            // the test follows theme.rs rather than passing an inlined hue.
+            let want = theme::accent_quiet();
+            for (x, y, glyph) in [
+                (r.x, r.y, "┌"),
+                (r.x + r.width - 1, r.y, "┐"),
+                (r.x, r.y + r.height - 1, "└"),
+                (r.x + r.width - 1, r.y + r.height - 1, "┘"),
+            ] {
+                let cell = &buf[(x, y)];
+                assert_eq!(cell.symbol(), glyph, "box corner at ({x},{y})");
+                assert_eq!(cell.style().fg, want.fg, "the border wears accent_quiet()'s hue…");
+                assert!(
+                    cell.style().add_modifier.contains(want.add_modifier),
+                    "…and its modifier (C7's stack-chrome rung)"
+                );
+            }
+            // The C8 row rides the box's single inner line.
+            let inner: String = (r.x + 1..r.x + r.width - 1)
+                .map(|x| buf[(x, r.y + 1)].symbol().to_string())
+                .collect();
+            assert!(inner.contains("shell"), "row text inside the box: {inner:?}");
+        }
+    }
+
+    /// …and the C6 fallback regime is untouched: a stack too short for the
+    /// boxes keeps its bare 1-row bars, with no border cells around them.
+    #[test]
+    fn a_shallow_stack_keeps_bare_one_row_collapsed_bars() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        // Body height 12 (14 − tab bar − hint bar): above the C6 header
+        // threshold (n+3 = 6), below the boxed threshold (3n+8 = 17).
+        let mut app = mk_app(Size::new(100, 14));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        // Outer split, as above: all three panes into one stack.
+        app.focused = app.pane_order()[0];
+        app.apply(Action::ToggleStack);
+        let collapsed: Vec<crate::core::layout::PaneRect> =
+            app.rects().into_iter().filter(|p| p.collapsed).collect();
+        assert_eq!(collapsed.len(), 2);
+
+        let mut term = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        for pr in &collapsed {
+            let r = pr.rect;
+            assert_eq!(r.height, 1, "below the boxed threshold the bar stays 1 row");
+            let row: String =
+                (r.x..r.x + r.width).map(|x| buf[(x, r.y)].symbol().to_string()).collect();
+            assert!(row.contains("shell"), "the bar still carries the C8 row: {row:?}");
+            assert!(!row.contains('┌'), "no border cells in the fallback form: {row:?}");
+        }
     }
 
     #[test]

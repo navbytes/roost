@@ -97,6 +97,18 @@ the indicator, its `accent()` styling and its columns are unchanged — only
 which of two existing things yields to the other. Details, including the
 floor case, live in C2's own dated amendment.
 
+**Amendment 2026-09-01 (boxed collapsed rows):** a collapsed stack member
+was easy to miss — a bare 1-row strip of text between two fully bordered
+panes, the one pane-shaped thing on screen with no frame around it (client
+report, with screenshot: "in the stacked view, the collapsed pane is easy to
+miss"). **C6** and **C8** are amended together: where the stack's area
+affords it, each collapsed member now occupies a **3-row `accent_quiet()`
+bordered box** with the unchanged C8 row on its single inner line; where it
+doesn't, the 1-row bar renders exactly as before. The §4 "every bar stays
+exactly 1 row" translation row carries the matching exception. No new glyph;
+no new colour — the box border reuses the quiet red that already means
+"stack chrome" (C7's expanded-member edge).
+
 ---
 
 ## 1. Design thesis
@@ -141,9 +153,9 @@ should be read against C5's spinner amendment, not looked up as an accessor.
 |---|---|---|
 | `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text, the `¶` note marker and the focused badge's note headline (C32) |
 | `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…`, the note age tag (C32) |
-| `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders, tab separators `│`. Never text (see the legibility principle). |
+| `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders (except a boxed collapsed member's, which is stack chrome — C8, amended 2026-09-01), tab separators `│`. Never text (see the legibility principle). |
 | `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, the Working spinner (C5, amended 2026-08-07 — one steady red, no second phase), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
-| `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, `raw` badge token (C23), `↑N` badge token (U3) |
+| `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, collapsed-member box border (C8, amended 2026-09-01), `raw` badge token (C23), `↑N` badge token (U3) |
 | `attention()` | `Modifier::REVERSED`, no colour | the **neutral** attention surface: the transient flash (C10) |
 | `attention_problem()` | `Color::Red` + `Modifier::REVERSED` | the **problem** bars: alt-warning (C11), dead-pane action bar (C16) |
 | `ok` / `warn` / `info` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
@@ -612,6 +624,12 @@ title** (C4) left-aligned; its bottom border carries its **note title**
 served first — identity yields the columns zoom takes plus one, so the two
 never touch.
 
+**[Cross-reference 2026-09-01, boxed collapsed rows]** "Unfocused border =
+`rule()`" governs panes drawn *as panes* (the border around live content).
+A **boxed collapsed member** is the one unfocused border not drawn in
+`rule()`: its box is C8's stack chrome — `accent_quiet()`, `accent()` in
+the transient focused case — audited under C8, not here.
+
 The 2026-07-27 reading was that a border is structure and text on it is
 noise. Measured against real frames, the alternative was worse: the badge
 was painted over the pane's own **first content row**, which is its most
@@ -953,6 +971,26 @@ nothing announces "this region is a stack".
 is unchanged, and is the right shape for the new stance — a rule expressed as
 an attribute rather than a colour cannot be swallowed by a theme. Still no bg.
 
+**[Amended 2026-09-01, boxed collapsed rows]** Collapsed members are no
+longer always 1-row bars. When the stack's area affords it, each collapsed
+member gets **3 rows** (C8's bordered box: border + row + border):
+- Boxed geometry applies iff `area.height >= 1 + 3·(n−1) + MIN_SPLIT_ROWS`
+  (header + boxes + the expanded member's own split floor, `layout.rs`'s
+  `MIN_SPLIT_ROWS = 10`) — i.e. `area.height >= 3n + 8`. The expanded member
+  never pays for the boxes out of its floor: the boxes are a legibility
+  upgrade where rows are plentiful, not a new fixed cost.
+- In boxed geometry the expanded member's height is
+  `area.height − 1 − 3·(n−1)`; the header is always shown there (the boxed
+  threshold clears `n + 3` for every `n`).
+- **Below the boxed threshold, geometry is exactly the pre-amendment rules**
+  — 1-row bars, header iff `area.height >= n + 3` — so the scarcity
+  arithmetic that set the old thresholds still holds where it bites, and
+  nothing changes at the sizes where rows were already contended.
+- Click-to-expand and focus math need no cases: a collapsed member's
+  `PaneRect` simply grew, and every consumer (hit test, `layout::neighbor`,
+  C33 swaps) is rect-driven. The C25 fit predicate keeps exempting collapsed
+  rects whatever their height.
+
 ### C7 — Expanded-member edge marker
 
 **Current:** the expanded stack member renders as an ordinary bordered pane
@@ -973,6 +1011,16 @@ an attribute rather than a colour cannot be swallowed by a theme. Still no bg.
 **[Amended 2026-07-27, theme inheritance]** The `▌` edge is `accent_quiet()`
 and the focused member's full border is `accent()`; the reasoning (don't stack
 a quiet red inside a red frame) is unchanged.
+
+**[Clarified 2026-09-01, boxed collapsed rows]** The smear this contract
+guards against is two reds fused **within one frame** — the `▌` edge
+overpaints a column of the member's own border, so frame and edge read as
+one object in two reds. A boxed collapsed member (C8) sitting above or
+below a focused member's `accent()` border is different in kind: two
+*separate* frames meeting at a row boundary, the same adjacency two
+`rule()`-bordered split panes have always had. The box therefore stands
+next to a focused member, and this contract's own rule — the `▌` edge is
+withheld from the focused member — is unchanged.
 
 ### C8 — Collapsed stack rows
 
@@ -1034,6 +1082,29 @@ collapsed rows and the roster stay reveal-on-visit surfaces. It rides the
 right segment, so a narrow row sheds it with the segment — the C32 marker
 is a courtesy, identity and status stay the row's priority. The roster's
 rows (C27) inherit it through the shared `collapsed_row_spans`.
+
+**[Amended 2026-09-01, the collapsed row becomes a box]** A 1-row bar
+between two fully bordered panes read as a rule, not a pane — the one
+pane-shaped surface in the body with no frame around it, and the easiest
+thing on screen to miss (client report with screenshot). When the stack's
+area affords the rows (C6's boxed-geometry amendment: the member's rect is
+3 rows tall), the collapsed member draws as a **bordered box**:
+- `Block::bordered()`, plain line glyphs (the C3/C12 border shape), border
+  fg **`accent_quiet()`** — the quiet red that already means "stack chrome"
+  (C7's expanded-member edge), so the box reads "collapsed pane of this
+  stack" without spending a new colour. When the row is the focused pane
+  (transient — focus on a collapsed member auto-expands it), the border is
+  **`accent()`**, C3's focus signal verbatim.
+- The row itself is unchanged: the same `collapsed_row_spans` output —
+  marker, glyph, id + name, right segment, same styles, same width-shedding
+  order — rendered on the box's single inner row at `width − 2`.
+- A collapsed rect below 3 rows (the C6 fallback regime, or a clamped last
+  member) renders the 1-row bar exactly as before. The roster (C27) and
+  feed reuse of the row format are untouched — the box is stack chrome,
+  not part of the row.
+- Click-to-expand covers the whole box, borders included (the rect grew;
+  the hit test is rect-driven); `route_mouse` still forwards nothing for a
+  collapsed member.
 
 ### C9 — Hint bar
 
@@ -4085,7 +4156,7 @@ Every px-only construct in the mockup, and its cell-level fate:
 | 2px `--tui-red-dim` left edge on expanded stack member (`:662`) | left border column overpainted `▌` U+258C fg `accent_quiet()` (C7); half-block ≈ "thicker than 1px". |
 | 1px borders throughout | `BorderType::Plain` single-line glyphs (C3, C12). |
 | 6px pane gap + 12–14px pane padding (`:636, :639`) | **dropped** — border cells already separate panes; spending whole cell columns on gaps wastes terminal real estate. |
-| ~9px vertical padding on every bar (tab/hint/stack-header/collapsed-row) → each renders ~2 text-lines tall in the browser | **height dropped — every bar stays exactly 1 row.** A terminal row is indivisible and scarce; reproducing the padding means adding blank rows, burning ~3 of ~44 rows for pure air. No serious TUI (tmux/zellij/lazygit) uses multi-row bars. The mockup's tall bars are a CSS-padding rendering artifact, not a directive. Only *horizontal* padding translates (space cells, C2 gutter); vertical does not. |
+| ~9px vertical padding on every bar (tab/hint/stack-header/collapsed-row) → each renders ~2 text-lines tall in the browser | **height dropped — every bar stays exactly 1 row.** A terminal row is indivisible and scarce; reproducing the padding means adding blank rows, burning ~3 of ~44 rows for pure air. No serious TUI (tmux/zellij/lazygit) uses multi-row bars. The mockup's tall bars are a CSS-padding rendering artifact, not a directive. Only *horizontal* padding translates (space cells, C2 gutter); vertical does not. [Amended 2026-09-01] The **collapsed row** is now the one exception, and only where rows are plentiful: when its stack clears C6's boxed threshold the row grows into C8's 3-row `accent_quiet()` box; the 1-row bar remains its floor form and the other bars stay exactly 1 row. |
 | ~18px horizontal tab padding (`:628`) | ~1 gutter cell per separator (C2, amended 2026-07-23) — the translatable half of the mockup's tab padding. |
 | letterspacing (0.02–0.11em) | **dropped** — no letterspacing in a cell grid; spacing out characters by hand is a gimmick that breaks widths. |
 | tab strip `border-bottom` / hint bar `border-top` (1px rules) | **dropped** — no spare rows. [Amended 2026-07-27] the `TAB_STRIP`/`BAR` bg steps that used to carry the separation are gone too (§2 background policy): the bars are set off by the ink weight of what is on them, and the panes' own top/bottom borders are the rules that survive. |
@@ -4503,7 +4574,8 @@ answer in roost, so the move can never disagree with the focus key that taught
 the user the direction.
 
 **Stacks need no special case.** Every stack member already owns a `PaneRect`
-(collapsed ones a single row, C8), so `Down` inside a stack finds the next
+(collapsed ones a 1-row bar or 3-row box, C8 amended 2026-09-01), so `Down`
+inside a stack finds the next
 member exactly as it finds the next split, and the gesture reorders the stack.
 One thing does need handling: `Stack`'s `expanded` is an **index**, not an id,
 so a bare id exchange would leave the moved pane collapsed and expand whichever
