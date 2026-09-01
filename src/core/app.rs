@@ -6552,17 +6552,46 @@ impl<B: PaneBackend> App<B> {
                 // rule, and it is confined to a state the title declares.
                 let filtering = matches!(&self.mode, Mode::Help { filter: Some(_), .. });
 
-                // `/` opens the filter — and only from the un-filtered
-                // state. Once filtering, `/` is a character like any other:
-                // a query can contain a slash, and a key that means "open"
-                // in one state and "type" in another is the ambiguity U20
-                // resolved the same way for the picker.
-                if !filtering && key.code == KeyCode::Char('/') {
-                    if let Mode::Help { filter, cursor, .. } = &mut self.mode {
-                        *filter = Some(String::new());
-                        *cursor = 0;
+                // [Amended 2026-09-01, C39] Bare typing opens the filter.
+                // C39 stopped at `/` ("`/` is the only unconditional new
+                // key"); field use said otherwise — the owner reached for
+                // the palette by typing, exactly as C27's roster taught
+                // ("a letter is filter text"), and the overlay answered by
+                // closing on the first letter. The roster rule now starts
+                // at the first key: every bare printable except space
+                // opens the filter seeded with itself; `/` opens it empty
+                // — muscle memory, and the route to a query that really
+                // starts with a slash (`/` then `/`; once filtering, `/`
+                // is text, U20's picker rule). Both entries reset `top`
+                // with the cursor: the palette's `❯` sits on the list's
+                // first row and C41 wants the view holding it — the old
+                // `/` branch left a scrolled poster's `top` in place and
+                // opened the cursor off-screen (design-supervisor D1).
+                //
+                // Space, Enter, Esc and every *chorded* key still close
+                // (C15's poster rule): no query starts with a space, Space
+                // stays "the key a reader hits to make it go away", and a
+                // Ctrl-chord is not typing — only SHIFT rides along (an
+                // uppercase letter is still typing). `j`/`k` are text
+                // under this rule, so their un-filtered scroll arms below
+                // are retired — the arrows and paging keys keep both jobs.
+                if !filtering {
+                    if let KeyCode::Char(c) = key.code {
+                        if c != ' '
+                            && key
+                                .modifiers
+                                .difference(crossterm::event::KeyModifiers::SHIFT)
+                                .is_empty()
+                        {
+                            if let Mode::Help { filter, top, cursor } = &mut self.mode {
+                                *filter =
+                                    Some(if c == '/' { String::new() } else { String::from(c) });
+                                *top = 0;
+                                *cursor = 0;
+                            }
+                            return true;
+                        }
                     }
-                    return true;
                 }
 
                 if filtering {
@@ -6665,12 +6694,12 @@ impl<B: PaneBackend> App<B> {
                 let delta = match key.code {
                     KeyCode::Down => 1,
                     KeyCode::Up => -1,
-                    // `j`/`k` scroll only while the filter is closed. Once
-                    // it is open they are query text — the same trade C27's
-                    // roster makes for every letter, and the reason its
-                    // hint bar drops `q`.
-                    KeyCode::Char('j') if !filtering => 1,
-                    KeyCode::Char('k') if !filtering => -1,
+                    // `j`/`k` used to scroll while the filter was closed;
+                    // the 2026-09-01 typing amendment makes every bare
+                    // printable filter text (they open the query, seeded),
+                    // so the arms are gone — a chorded `Ctrl+j` falls to
+                    // the default arm and closes like any other chord. The
+                    // arrows and paging keys keep both jobs.
                     // Space is deliberately NOT a page key. In a modal whose
                     // contract is "any key closes it", Space is the key a
                     // reader hits to make it go away — pressing it and
@@ -8965,12 +8994,15 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::Normal), "↓ at the end closes");
 
         app.apply(Action::Help);
-        app.handle_mode_key(KeyEvent::from(KeyCode::Char('x')));
-        assert!(matches!(app.mode, Mode::Normal), "an ordinary key still closes it");
+        // [Amended 2026-09-01] a letter is filter text now, so the
+        // "ordinary key still closes" probe is a non-printable.
+        app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal), "an ordinary non-printable still closes it");
     }
 
-    /// …and on a terminal that shows the whole table, the amendment is
-    /// invisible: every key closes it, arrows included, exactly as before.
+    /// …and on a terminal that shows the whole table, the scroll amendment
+    /// is invisible: a scroll key with nowhere to go closes, exactly as
+    /// before. (`j` left this sample on 2026-09-01 — it is filter text now.)
     #[test]
     fn the_keymap_closes_on_every_key_when_the_whole_table_fits() {
         use crossterm::event::{KeyCode, KeyEvent};
@@ -8981,7 +9013,7 @@ pub(crate) mod tests {
         let (visible, total) =
             crate::ui::render::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert_eq!(visible, total, "a tall body shows the whole keymap at once");
-        for key in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Char('j')] {
+        for key in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Char(' ')] {
             app.apply(Action::Help);
             app.handle_mode_key(KeyEvent::from(key));
             assert!(matches!(app.mode, Mode::Normal), "{key:?} closes when nothing scrolls");
@@ -15442,19 +15474,80 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::Help { filter: None, .. }), "opens unfiltered");
     }
 
-    /// [F9] The whole point of `Option<String>` rather than a bare `String`:
-    /// until `/` is pressed the overlay behaves exactly as it did before the
-    /// amendment, so every key still closes it — `/`'s neighbours included.
+    /// [F9, amended 2026-09-01] `Option<String>` still carries the state
+    /// split, but the un-filtered overlay is no longer letter-proof: a bare
+    /// printable OPENS the filter seeded with itself — C27's roster rule
+    /// ("a letter is filter text") applied from the very first key, which
+    /// is how the owner reached for the palette in the field. `j` and `q`
+    /// are deliberately in the sample: the two letters the old contract
+    /// reserved (scroll, close) are query text now.
     #[test]
-    fn the_help_overlay_is_unchanged_until_slash_opens_the_filter() {
-        use crossterm::event::KeyCode;
-        for code in [KeyCode::Char('a'), KeyCode::Char('q'), KeyCode::Char('?'), KeyCode::Enter] {
+    fn a_bare_printable_opens_the_filter_seeded_with_itself() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (code, want) in [
+            (KeyCode::Char('a'), "a"),
+            (KeyCode::Char('q'), "q"),
+            (KeyCode::Char('j'), "j"),
+            (KeyCode::Char('?'), "?"),
+        ] {
             let (mut app, _) = mk_app(shell_ws());
             open_help(&mut app);
             help_key(&mut app, code);
+            assert_eq!(app.help_filter(), Some(want), "{code:?} seeds the query");
+            assert!(matches!(app.mode, Mode::Help { top: 0, cursor: 0, .. }), "reset to the top");
+        }
+        // SHIFT rides along (an uppercase letter is still typing) …
+        let (mut app, _) = mk_app(shell_ws());
+        open_help(&mut app);
+        app.handle_mode_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        assert_eq!(app.help_filter(), Some("T"), "SHIFT still types");
+    }
+
+    /// …while the keys that are not typing keep C15's "closes it": Enter,
+    /// Space (deliberately — no query starts with one, and Space stays the
+    /// key a reader hits to make the poster go away), Esc, and any chorded
+    /// printable.
+    #[test]
+    fn the_nonprintables_still_close_an_unfiltered_keymap() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for key in [
+            KeyEvent::from(KeyCode::Enter),
+            KeyEvent::from(KeyCode::Char(' ')),
+            KeyEvent::from(KeyCode::Esc),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            // `/` under CTRL is a chord too, not the filter key (D2).
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        ] {
+            let (mut app, _) = mk_app(shell_ws());
+            open_help(&mut app);
+            app.handle_mode_key(key);
             assert!(
                 matches!(app.mode, Mode::Normal),
-                "{code:?} must still close an unfiltered overlay",
+                "{key:?} must still close an unfiltered overlay",
+            );
+        }
+    }
+
+    /// [C41, via the 2026-09-01 amendment] Both filter entries return the
+    /// view to the top with the cursor. The old `/` branch reset only the
+    /// cursor, so `/` pressed on a *scrolled* poster opened the palette
+    /// with its `❯` off-screen — the view was not holding the row `↵`
+    /// would run (design-supervisor D1).
+    #[test]
+    fn opening_the_filter_on_a_scrolled_poster_returns_the_view_to_the_top() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        for opener in [KeyCode::Char('/'), KeyCode::Char('t')] {
+            let (mut app, _) = mk_app(shell_ws());
+            open_help(&mut app);
+            app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+            assert!(
+                matches!(app.mode, Mode::Help { top: 1, .. }),
+                "fixture body must be short enough to scroll"
+            );
+            app.handle_mode_key(KeyEvent::from(opener));
+            assert!(
+                matches!(app.mode, Mode::Help { top: 0, cursor: 0, filter: Some(_) }),
+                "{opener:?} must open the filter at the top of the list",
             );
         }
     }

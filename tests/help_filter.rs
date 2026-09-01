@@ -33,7 +33,7 @@ fn slash_narrows_the_keymap_and_the_title_says_so() {
     // The unfiltered overlay advertises the filter, and shows groups a
     // query will remove.
     let before = h.screen().contents();
-    assert!(before.contains("/ filters"), "the affordance is visible:\n{before}");
+    assert!(before.contains("type to filter"), "the affordance is visible:\n{before}");
     assert!(before.contains("LAYOUT"), "the LAYOUT group is drawn:\n{before}");
 
     h.write_bytes(b"/stack");
@@ -53,8 +53,9 @@ fn slash_narrows_the_keymap_and_the_title_says_so() {
     //
     // The wait between them is load-bearing, and getting it wrong is what
     // made this test fail on macOS and pass on Linux. It first waited for
-    // the screen to contain `"/ "` — which `Alt+/` and this very row's
-    // "`/` filters it" already put there, so the predicate was true before
+    // the screen to contain `"/ "` — which `Alt+/` (and, at the time, the
+    // `Alt+?` row's "`/` filters it") already put there, so the predicate
+    // was true before
     // the first Esc was even parsed. `wait_for` returned instantly and the
     // second ESC byte went out on the heels of the first; two ESCs arriving
     // together fuse into one event (roost's README documents the same
@@ -83,15 +84,46 @@ fn slash_narrows_the_keymap_and_the_title_says_so() {
     );
 }
 
-/// C15 unchanged: with no query open, a letter still dismisses — including
-/// `q`, which only becomes text once `/` has been pressed.
+/// [Amended 2026-09-01] A bare letter no longer dismisses: it OPENS the
+/// filter seeded with itself — `q` included, the letter the old contract
+/// reserved for closing. The way out while un-filtered is Esc (or Space),
+/// pinned in the second half.
 #[test]
-fn a_letter_still_closes_an_unfiltered_keymap() {
-    let Some(mut h) = open_keymap("unfiltered") else { return };
+fn a_letter_opens_the_filter_seeded_with_itself() {
+    let Some(mut h) = open_keymap("seeded") else { return };
     h.write_bytes(b"q");
     assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("keys — /q")).is_some(),
+        "`q` must open the filter already holding itself:\n{}",
+        h.screen().contents(),
+    );
+    assert!(h.screen().contents().contains("Esc clears"), "…in the filtering state");
+
+    // Esc clears the seeded query (transition-waited, per the fused-ESC
+    // lesson in the slash test above), a second Esc closes.
+    h.write_bytes(b"\x1b");
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| !s.contents().contains("keys — /q")).is_some(),
+        "the first Esc did not clear the seeded query:\n{}",
+        h.screen().contents(),
+    );
+    h.write_bytes(b"\x1b");
+    assert!(
+        h.wait_for(Duration::from_secs(10), |s| s.contents().contains("NORMAL")).is_some(),
+        "the second Esc did not close the overlay:\n{}",
+        h.screen().contents(),
+    );
+}
+
+/// …and the keys that are not typing keep C15's "closes it": Space is the
+/// poster's escape hatch, un-filtered, exactly as before.
+#[test]
+fn space_still_closes_an_unfiltered_keymap() {
+    let Some(mut h) = open_keymap("space-closes") else { return };
+    h.write_bytes(b" ");
+    assert!(
         h.wait_for(Duration::from_secs(5), |s| s.contents().contains("NORMAL")).is_some(),
-        "`q` must still close an overlay with no query open:\n{}",
+        "Space must still close an overlay with no query open:\n{}",
         h.screen().contents(),
     );
 }
