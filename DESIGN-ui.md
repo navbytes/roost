@@ -104,7 +104,7 @@ report, with screenshot: "in the stacked view, the collapsed pane is easy to
 miss"). **C6** and **C8** are amended together: where the stack's area
 affords it, each collapsed member now occupies a **3-row `accent_quiet()`
 bordered box** with the unchanged C8 row on its single inner line; where it
-doesn't, the 1-row bar renders exactly as before. The §5 "every bar stays
+doesn't, the 1-row bar renders exactly as before. The §4 "every bar stays
 exactly 1 row" translation row carries the matching exception. No new glyph;
 no new colour — the box border reuses the quiet red that already means
 "stack chrome" (C7's expanded-member edge).
@@ -153,7 +153,7 @@ should be read against C5's spinner amendment, not looked up as an accessor.
 |---|---|---|
 | `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text, the `¶` note marker and the focused badge's note headline (C32) |
 | `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…`, the note age tag (C32) |
-| `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders, tab separators `│`. Never text (see the legibility principle). |
+| `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders (except a boxed collapsed member's, which is stack chrome — C8, amended 2026-09-01), tab separators `│`. Never text (see the legibility principle). |
 | `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, the Working spinner (C5, amended 2026-08-07 — one steady red, no second phase), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
 | `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, collapsed-member box border (C8, amended 2026-09-01), `raw` badge token (C23), `↑N` badge token (U3) |
 | `attention()` | `Modifier::REVERSED`, no colour | the **neutral** attention surface: the transient flash (C10) |
@@ -624,6 +624,12 @@ title** (C4) left-aligned; its bottom border carries its **note title**
 served first — identity yields the columns zoom takes plus one, so the two
 never touch.
 
+**[Cross-reference 2026-09-01, boxed collapsed rows]** "Unfocused border =
+`rule()`" governs panes drawn *as panes* (the border around live content).
+A **boxed collapsed member** is the one unfocused border not drawn in
+`rule()`: its box is C8's stack chrome — `accent_quiet()`, `accent()` in
+the transient focused case — audited under C8, not here.
+
 The 2026-07-27 reading was that a border is structure and text on it is
 noise. Measured against real frames, the alternative was worse: the badge
 was painted over the pane's own **first content row**, which is its most
@@ -1005,6 +1011,16 @@ member gets **3 rows** (C8's bordered box: border + row + border):
 **[Amended 2026-07-27, theme inheritance]** The `▌` edge is `accent_quiet()`
 and the focused member's full border is `accent()`; the reasoning (don't stack
 a quiet red inside a red frame) is unchanged.
+
+**[Clarified 2026-09-01, boxed collapsed rows]** The smear this contract
+guards against is two reds fused **within one frame** — the `▌` edge
+overpaints a column of the member's own border, so frame and edge read as
+one object in two reds. A boxed collapsed member (C8) sitting above or
+below a focused member's `accent()` border is different in kind: two
+*separate* frames meeting at a row boundary, the same adjacency two
+`rule()`-bordered split panes have always had. The box therefore stands
+next to a focused member, and this contract's own rule — the `▌` edge is
+withheld from the focused member — is unchanged.
 
 ### C8 — Collapsed stack rows
 

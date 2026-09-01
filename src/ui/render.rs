@@ -4488,6 +4488,9 @@ mod tests {
                 crate::core::layout::COLLAPSED_BOX_ROWS,
                 "boxed in a 28-row stack"
             );
+            // Expectations derive from the token, not restated literals, so
+            // the test follows theme.rs rather than passing an inlined hue.
+            let want = theme::accent_quiet();
             for (x, y, glyph) in [
                 (r.x, r.y, "┌"),
                 (r.x + r.width - 1, r.y, "┐"),
@@ -4496,10 +4499,10 @@ mod tests {
             ] {
                 let cell = &buf[(x, y)];
                 assert_eq!(cell.symbol(), glyph, "box corner at ({x},{y})");
-                assert_eq!(cell.style().fg, Some(Color::Red), "the border is the one red…");
+                assert_eq!(cell.style().fg, want.fg, "the border wears accent_quiet()'s hue…");
                 assert!(
-                    cell.style().add_modifier.contains(Modifier::DIM),
-                    "…at its quiet rung (C7's stack-chrome hue)"
+                    cell.style().add_modifier.contains(want.add_modifier),
+                    "…and its modifier (C7's stack-chrome rung)"
                 );
             }
             // The C8 row rides the box's single inner line.
