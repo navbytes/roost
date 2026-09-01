@@ -206,14 +206,17 @@ fn hint_pairs(
             lit("↵", "run"),
             lit("Esc", "clear · close"),
         ],
+        // [Amended 2026-09-01, C39] Bare typing opens the filter now, so
+        // the un-filtered rows teach `type filter` and the one exit that
+        // survives it (`Esc`) — "any key close" stopped being true.
         Mode::Help { .. } if help_scrolled => {
-            vec![lit("↑↓ PgUp/Dn", "read on"), lit("/", "filter"), lit("any other key", "close")]
+            vec![lit("↑↓ PgUp/Dn", "read on"), lit("type", "filter"), lit("Esc", "close")]
         }
         Mode::Help { .. } => {
             let mut pairs = Vec::new();
             pairs.extend(alt(&[Action::Help], "Alt+?", "all keys"));
-            pairs.push(lit("/", "filter"));
-            pairs.push(lit("any key", "close"));
+            pairs.push(lit("type", "filter"));
+            pairs.push(lit("Esc", "close"));
             pairs
         }
         // 48 columns. Tab is Rename's one remaining target (C32).
@@ -1125,10 +1128,14 @@ fn help_title(
             (" keys — /", format!(" · {shown}/{total} · ↑↓ move{run} · Esc clears "))
         }
         (Some(_), false) => (" keys — /", format!(" · {total} shown{run} · Esc clears ")),
+        // [Amended 2026-09-01, C39] The un-filtered rows teach the typing
+        // rule and its one guaranteed exit: bare printables open the filter
+        // now, so "any key closes" is no longer true and `Esc` is the key
+        // to teach (C27's roster wording, for its reason).
         (None, true) => {
-            return format!(" keys — {shown}/{total} · ↑↓ more · / filters · any key closes ");
+            return format!(" keys — {shown}/{total} · ↑↓ more · type to filter · Esc closes ");
         }
-        (None, false) => return " keys — / filters · any key closes ".to_string(),
+        (None, false) => return " keys — type to filter · Esc closes ".to_string(),
     };
     let q = filter.unwrap_or("");
     let fixed = mouse::display_width(head) + mouse::display_width(&tail);
@@ -1567,7 +1574,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             // rides the `Alt+c` row rather than taking one). A key that
             // appears in §8 and in the live title but in no printed row is
             // a key the overlay does not actually teach.
-            chords(&[Action::Help], "this keymap — / filters it"),
+            chords(&[Action::Help], "this keymap — type filters it"),
             chords(&[Action::Quit], "quit (workspace saved; sessions live)"),
         ],
     },
@@ -1865,10 +1872,11 @@ fn draw_mode_overlay<B: PaneBackend>(
             // because there is nothing to scroll.
             // [F9] The title is where the filter announces itself, exactly
             // as C14's picker and C27's roster do — and it has to, because
-            // while a query is open "any key closes" is no longer true and
-            // a reader who cannot see why would be stuck. The un-filtered
-            // wordings below are untouched, so the amendment is invisible
-            // until `/` is pressed.
+            // a reader who cannot see the rule would be stuck. [Amended
+            // 2026-09-01] The un-filtered wordings teach it too ("type to
+            // filter · Esc closes"): bare typing opens the query now, so
+            // there is no state left where "any key closes" is true of the
+            // printables.
             // [C41] The cursor is drawn only while the filter is open. Un-
             // filtered, C15's overlay is a poster you read and dismiss with
             // any key — marking a row there would advertise an `↵` that the
@@ -4228,15 +4236,15 @@ mod tests {
     /// afford — it is the surface you open *because* you are lost.
     #[test]
     fn the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls() {
+        // [Amended 2026-09-01] The un-filtered rows teach the typing rule
+        // and its guaranteed exit — bare printables open the filter now, so
+        // "any key close" stopped being true of the letters.
         let whole =
             hint_pairs(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false, false, false);
-        assert_eq!(whole, p(&[("Alt+?", "all keys"), ("/", "filter"), ("any key", "close")]));
+        assert_eq!(whole, p(&[("Alt+?", "all keys"), ("type", "filter"), ("Esc", "close")]));
         let scrolled =
             hint_pairs(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false, false, true);
-        assert_eq!(
-            scrolled,
-            p(&[("↑↓ PgUp/Dn", "read on"), ("/", "filter"), ("any other key", "close")]),
-        );
+        assert_eq!(scrolled, p(&[("↑↓ PgUp/Dn", "read on"), ("type", "filter"), ("Esc", "close")]),);
         let filtered = hint_pairs(
             &Mode::Help { top: 0, filter: Some("mov".into()), cursor: 0 },
             false,
@@ -6940,7 +6948,8 @@ row's — widen ADAPTER_COL",
 
         assert!(frame.contains("PANES"), "a group heading:\n{frame}");
         assert!(frame.contains("Alt+n"), "a chord from it:\n{frame}");
-        assert!(frame.contains("any key closes"), "the way out is in the title:\n{frame}");
+        assert!(frame.contains("Esc closes"), "the way out is in the title:\n{frame}");
+        assert!(frame.contains("type to filter"), "…and the typing rule:\n{frame}");
 
         // The heading wears C6's rule across its own column, exactly as the
         // roster's group rows do — not just uppercase text.

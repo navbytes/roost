@@ -109,6 +109,18 @@ exactly 1 row" translation row carries the matching exception. No new glyph;
 no new colour — the box border reuses the quiet red that already means
 "stack chrome" (C7's expanded-member edge).
 
+**Amendment 2026-09-01 (typing filters the keymap):** **C39**'s `/` gate
+opens — a bare printable in the un-filtered overlay now opens the filter
+seeded with itself, the trade C27's roster made first ("a letter is filter
+text"); the owner reached for the palette by typing and the overlay closed
+on the first letter, reading as broken. `/` still opens an empty query;
+`j`/`k` become query text (the arrows and paging keys keep the un-filtered
+scroll); Esc, Enter, Space, chords, clicks and dead-end scroll keys keep
+closing. **C15**'s "any key closes it" narrows accordingly, and the C39
+announce wordings change to `type to filter · Esc closes` /
+`type filter` · `Esc close`. Details in C39's dated amendment; no new
+glyph, no new colour.
+
 ---
 
 ## 1. Design thesis
@@ -1924,6 +1936,11 @@ So the cap goes, and with it the merges:
   `↑`/`↓`/`j`/`k` step, `PgUp`/`PgDn` page by half the visible height
   (C20's `overlay_page` rule), `Home`/`End` jump; the wheel pages, and any
   **click** still dismisses (U8's mouse form of the same rule).
+  **[Amended 2026-09-01, C39 typing amendment]** `j`/`k` leave the step
+  set — every bare printable is filter text now (it opens the query,
+  seeded), so the arrows and paging keys carry the un-filtered scroll
+  alone, and the title wordings quoted above read
+  `type to filter · Esc closes` in place of `/ filters · any key closes`.
   **`Space` is deliberately not a page key** — in a modal whose contract is
   "any key closes it", `Space` is what a reader hits to make it go away, and
   answering with another screenful is the opposite of the ask.
@@ -5343,6 +5360,42 @@ lockstep, applied to a modal's own heading.
   because they were lost. `help_layout` floors its width on
   `help_title`'s.
 
+**[Amended 2026-09-01, typing filters — the `/` gate opens]** The rule
+above stopped at `/` and said so plainly ("`/` is the only unconditional
+new key"). Field use said otherwise: the owner reached for the palette by
+*typing* — the reflex C14's picker and C27's roster teach — and the
+un-filtered overlay answered by closing on the first letter, which read as
+the feature being broken. The roster rule now starts at the first key:
+
+- **A bare printable opens the filter seeded with itself** — any
+  `KeyCode::Char` except space, carrying no modifier beyond SHIFT (an
+  uppercase letter is still typing). `top` and `cursor` reset to 0 exactly
+  as a query edit does. `/` still opens an *empty* query — muscle memory,
+  and the route to a query that genuinely starts with a slash (`/` then
+  `/`); once filtering, `/` is text as before.
+- **`j`/`k` are query text now**, so their un-filtered scroll carve-out is
+  retired — the arrows and paging keys keep both jobs (scroll the poster
+  un-filtered, drive the palette cursor while filtering). A chorded
+  printable (`Ctrl+j`) is not typing and closes like any other chord.
+- **What still closes the un-filtered poster:** `Esc`, `Enter`, `Space` —
+  Space deliberately: C15's own "the key a reader hits to make it go
+  away", and no query starts with one — every non-printable, any click
+  (U8's mouse form), and a scroll key with nothing to scroll (C15's
+  conditional rule, untouched).
+- **The announce table's two un-filtered rows are superseded:** title
+  `keys — type to filter · Esc closes` (scrolled:
+  `keys — 26/36 · ↑↓ more · type to filter · Esc closes`); hint bar
+  `Alt+? all keys` · `type filter` · `Esc close` (scrolled:
+  `↑↓ PgUp/Dn read on` · `type filter` · `Esc close`). The two filtering
+  rows are unchanged. The overlay's own `Alt+?` row becomes
+  `this keymap — type filters it`.
+- **"`/` is the only unconditional new key" is withdrawn.** The whole
+  printable set is claimed, un-conditionally — which is exactly the trade
+  this section documented C27's roster making first, now made on the
+  surface that had declined it. What licensed the roster licenses this: a
+  list you filter by typing cannot reserve letters (U20), and the way out
+  is taught in the title, the hint bar, and by `Esc` itself.
+
   **Found by driving the overlay in a PTY, not by any unit test**, and the
   reason is worth keeping: every test here looked at the frame *or* the
   title, never at the two together. The same shape as the C15 padding bug —
@@ -5684,7 +5737,7 @@ shows only the C9-curated subsets.
 | 17 | `Alt+PgUp` | scroll mode | — |
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
-| 20 | `Alt+?` | full keymap overlay (this table); `/` filters it, **and `↵` runs the row it lands on** | C15, C39, C41 |
+| 20 | `Alt+?` | full keymap overlay (this table); typing filters it (2026-09-01; `/` still works), **and `↵` runs the row it lands on** | C15, C39, C41 |
 
 *Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
 terminals disagree about which half of that they report: some deliver
