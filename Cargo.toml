@@ -1,6 +1,6 @@
 [package]
 name = "roost"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 # File::try_lock (main.rs instance lock) landed in 1.89; isqrt in 1.84.
 # Pinned so a source build (Homebrew, cargo install) on older stable fails
