@@ -25,7 +25,9 @@ pub enum LayoutNode {
         ratios: Vec<f32>,
         children: Vec<LayoutNode>,
     },
-    /// Zellij-style stack: collapsed panes are 1-row title bars, one pane expanded.
+    /// Zellij-style stack: collapsed panes are shallow title bars — 3-row
+    /// boxes when the area affords them, 1-row bars below that (C6/C8,
+    /// amended 2026-09-01) — one pane expanded.
     Stack {
         children: Vec<PaneId>,
         expanded: usize,
@@ -472,7 +474,10 @@ pub fn expand_in_stacks(node: &mut LayoutNode, target: PaneId) {
 pub struct PaneRect {
     pub id: PaneId,
     pub rect: Rect,
-    /// Collapsed stack member: rendered as a 1-row title bar only.
+    /// Collapsed stack member: rendered as a title bar only — boxed
+    /// (`COLLAPSED_BOX_ROWS` tall, bordered) when the stack's area affords
+    /// it, a bare 1-row bar below that. The renderer picks the form off
+    /// `rect.height`; no second flag.
     pub collapsed: bool,
 }
 
@@ -491,9 +496,32 @@ pub struct StackHeader {
 /// C6: a stack spares a header row only when every member still clears its
 /// floor afterward — 1 row each for the `n-1` collapsed members, and at
 /// least 3 for the expanded one, plus the header's own row. Below that,
-/// geometry is exactly as if there were no header at all.
+/// geometry is exactly as if there were no header at all. (The boxed
+/// regime below sits far above this threshold for every `n`, so a boxed
+/// stack always carries its header.)
 fn stack_header_shown(area_height: u16, n: usize) -> bool {
     area_height >= n as u16 + 3
+}
+
+/// C6/C8 (amended 2026-09-01): a boxed collapsed member's height — border,
+/// title row, border. The box is what keeps a collapsed pane from reading
+/// as a rule between its bordered neighbours.
+pub const COLLAPSED_BOX_ROWS: u16 = 3;
+
+/// Rows each collapsed member of an `n`-stack gets in `area_height`:
+/// `COLLAPSED_BOX_ROWS` when the whole boxed arrangement still fits —
+/// header + `3·(n−1)` boxes + the expanded member's own split floor
+/// (`MIN_SPLIT_ROWS`) — else the pre-amendment 1-row bar. The expanded
+/// member never pays for the boxes out of its floor: boxes are a
+/// legibility upgrade where rows are plentiful, not a new fixed cost.
+fn collapsed_member_rows(area_height: u16, n: usize) -> u16 {
+    let boxes = COLLAPSED_BOX_ROWS.saturating_mul((n as u16).saturating_sub(1));
+    let boxed = boxes.saturating_add(1).saturating_add(MIN_SPLIT_ROWS);
+    if area_height >= boxed {
+        COLLAPSED_BOX_ROWS
+    } else {
+        1
+    }
 }
 
 /// Walk the layout tree and assign every pane a rectangle within `area`.
@@ -522,6 +550,7 @@ pub fn compute_rects_and_headers(
             }
             let n16 = n as u16;
             let show_header = stack_header_shown(area.height, n);
+            let collapsed_h = collapsed_member_rows(area.height, n);
             let mut y = area.y;
             if show_header {
                 headers.push(StackHeader { rect: Rect::new(area.x, area.y, area.width, 1), n });
@@ -529,8 +558,11 @@ pub fn compute_rects_and_headers(
             }
             let avail = area.height.saturating_sub(if show_header { 1 } else { 0 });
             for (i, id) in children.iter().enumerate() {
-                let h =
-                    if i == *expanded { avail.saturating_sub(n16.saturating_sub(1)) } else { 1 };
+                let h = if i == *expanded {
+                    avail.saturating_sub(collapsed_h.saturating_mul(n16.saturating_sub(1)))
+                } else {
+                    collapsed_h
+                };
                 let h = h.min((area.y + area.height).saturating_sub(y));
                 out.push(PaneRect {
                     id: *id,
@@ -716,7 +748,7 @@ pub const MIN_SPLIT_ROWS: u16 = 10;
 /// C25 fit predicate: true iff every non-collapsed rect the arrangement
 /// would produce in `area` is at least `MIN_SPLIT_COLS` × `MIN_SPLIT_ROWS` —
 /// reuses `compute_rects`, so it can't drift from the real geometry walk.
-/// Collapsed stack rows (1-row title bars) are exempt by design.
+/// Collapsed stack rows (1-row bars or 3-row boxes) are exempt by design.
 pub fn arrangement_fits(node: &LayoutNode, area: Rect) -> bool {
     let mut rects = Vec::new();
     compute_rects(node, area, &mut rects);
@@ -990,19 +1022,57 @@ mod tests {
 
     #[test]
     fn stack_rects_collapse_to_title_bars() {
-        // height 20 for 3 members clears the C6 header threshold (>= 3+3=6),
-        // so this scenario carries a header row too — see the dedicated
-        // header tests below for the threshold boundary itself.
+        // height 20 for 3 members clears the C6 header threshold (>= 3+3=6)
+        // *and* the boxed threshold (>= 3·3+8=17), so this scenario carries
+        // a header row and 3-row collapsed boxes — see the dedicated
+        // threshold tests below for both boundaries.
         let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
         let mut out = vec![];
         let mut headers = vec![];
         compute_rects_and_headers(&node, Rect::new(0, 0, 80, 20), &mut out, &mut headers);
         assert_eq!(headers.len(), 1);
         assert_eq!(out.iter().filter(|p| p.collapsed).count(), 2);
+        for p in out.iter().filter(|p| p.collapsed) {
+            assert_eq!(p.rect.height, COLLAPSED_BOX_ROWS, "boxed collapsed member");
+        }
         let expanded = out.iter().find(|p| !p.collapsed).unwrap();
-        assert_eq!(expanded.rect.height, 17); // 20 − 1 header − 2 collapsed
+        assert_eq!(expanded.rect.height, 13); // 20 − 1 header − 2·3 collapsed
         let total: u16 = out.iter().map(|p| p.rect.height).sum::<u16>() + headers[0].rect.height;
         assert_eq!(total, 20);
+    }
+
+    /// C6/C8 (amended 2026-09-01): the boxed-collapsed threshold, both
+    /// sides. Boxes appear only when header + 3·(n−1) boxes + the expanded
+    /// member's own `MIN_SPLIT_ROWS` floor all fit; one row short of that,
+    /// geometry is exactly the pre-amendment 1-row-bar formula.
+    #[test]
+    fn collapsed_members_box_only_when_the_expanded_floor_survives() {
+        // n=2: threshold = 1 + 3 + 10 = 14.
+        let node = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        let mut out = vec![];
+        let mut headers = vec![];
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 13), &mut out, &mut headers);
+        assert_eq!(headers.len(), 1, "13 rows clears the n+3 header threshold");
+        assert_eq!(
+            out.iter().find(|p| p.collapsed).unwrap().rect.height,
+            1,
+            "one row short of the boxed threshold → the old 1-row bar"
+        );
+        assert_eq!(out.iter().find(|p| !p.collapsed).unwrap().rect.height, 11);
+
+        out.clear();
+        headers.clear();
+        compute_rects_and_headers(&node, Rect::new(0, 0, 80, 14), &mut out, &mut headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(out.iter().find(|p| p.collapsed).unwrap().rect.height, COLLAPSED_BOX_ROWS);
+        assert_eq!(
+            out.iter().find(|p| !p.collapsed).unwrap().rect.height,
+            MIN_SPLIT_ROWS,
+            "at the boundary the expanded member sits exactly on its split floor"
+        );
+        // The parts still tile the area exactly.
+        let total: u16 = out.iter().map(|p| p.rect.height).sum::<u16>() + 1;
+        assert_eq!(total, 14);
     }
 
     /// A stack of one is a pane, and must become one — a `Split` never
@@ -1046,8 +1116,11 @@ mod tests {
     #[test]
     fn stack_header_shrinks_expanded_height_by_exactly_one() {
         let n = 3u16;
-        let area = Rect::new(0, 0, 80, 20); // comfortably above the n+3 threshold
-        let pre_c6_height = area.height - (n - 1); // the no-header formula: 18
+        // Above the n+3 header threshold (6) but below the boxed-collapsed
+        // threshold (3n+8 = 17), so the header's 1-row cost is measured in
+        // the regime where collapsed members are 1-row bars.
+        let area = Rect::new(0, 0, 80, 10);
+        let pre_c6_height = area.height - (n - 1); // the no-header formula: 8
         let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
         let mut out = vec![];
         let mut headers = vec![];

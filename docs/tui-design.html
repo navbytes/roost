@@ -685,11 +685,13 @@ textarea.input { min-height: 90px; resize: vertical; }
           </div>
         </div>
 
-        <!-- collapsed members: one-line title bars -->
-        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border-top:1px solid var(--tui-line);color:var(--tui-fg)"><span class="tui-working" style="color:var(--tui-red)"></span> api-worker <span style="margin-left:auto;color:var(--tui-dim);font-size:11px">pi · running build</span></div>
-        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border-top:1px solid var(--tui-line);color:var(--tui-mut)"><span style="color:var(--tui-fg)">○</span> write docs <span style="margin-left:auto;color:var(--tui-dim);font-size:11px">claude · your turn</span></div>
-        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border-top:1px solid var(--tui-line);color:var(--tui-mut)"><span style="color:var(--tui-dim)">·</span> scratch <span style="margin-left:auto;color:var(--tui-dim);font-size:11px">shell · idle</span></div>
-        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border-top:1px solid var(--tui-line);color:var(--tui-dim)"><span style="color:var(--tui-red-dim)">✕</span> old build <span style="margin-left:auto;font-size:11px">pi · exited 130</span></div>
+        <!-- collapsed members: boxed title bars — a red-dim border makes each
+             read as a collapsed *pane*, not a rule (C8, amended 2026-09-01;
+             the cell translation is a 3-row accent_quiet() bordered box) -->
+        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border:1px solid var(--tui-red-dim);color:var(--tui-fg)"><span class="tui-working" style="color:var(--tui-red)"></span> api-worker <span style="margin-left:auto;color:var(--tui-dim);font-size:11px">pi · running build</span></div>
+        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border:1px solid var(--tui-red-dim);color:var(--tui-mut)"><span style="color:var(--tui-fg)">○</span> write docs <span style="margin-left:auto;color:var(--tui-dim);font-size:11px">claude · your turn</span></div>
+        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border:1px solid var(--tui-red-dim);color:var(--tui-mut)"><span style="color:var(--tui-dim)">·</span> scratch <span style="margin-left:auto;color:var(--tui-dim);font-size:11px">shell · idle</span></div>
+        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:12.5px;border:1px solid var(--tui-red-dim);color:var(--tui-dim)"><span style="color:var(--tui-red-dim)">✕</span> old build <span style="margin-left:auto;font-size:11px">pi · exited 130</span></div>
       </section>
     </div>
 
