@@ -6552,33 +6552,29 @@ impl<B: PaneBackend> App<B> {
                 // rule, and it is confined to a state the title declares.
                 let filtering = matches!(&self.mode, Mode::Help { filter: Some(_), .. });
 
-                // `/` opens the filter — and only from the un-filtered
-                // state. Once filtering, `/` is a character like any other:
-                // a query can contain a slash, and a key that means "open"
-                // in one state and "type" in another is the ambiguity U20
-                // resolved the same way for the picker.
-                if !filtering && key.code == KeyCode::Char('/') {
-                    if let Mode::Help { filter, cursor, .. } = &mut self.mode {
-                        *filter = Some(String::new());
-                        *cursor = 0;
-                    }
-                    return true;
-                }
-
-                // [Amended 2026-09-01, C39] ...and so does bare typing,
-                // seeded with the key that opened it. C39 stopped at `/`
-                // ("`/` is the only unconditional new key"); field use said
-                // otherwise — the owner reached for the palette by typing,
-                // exactly as C27's roster taught ("a letter is filter
-                // text"), and the overlay answered by closing on the first
-                // letter. The roster rule now starts at the first key:
-                // every printable except space opens the filter already
-                // holding that character. `j`/`k` are text under this rule,
-                // so their un-filtered scroll arms below are retired — the
-                // arrows and paging keys keep both jobs. Space, Enter, Esc
-                // and every chorded key still close (C15's poster rule):
-                // no query starts with a space, and Space stays "the key a
-                // reader hits to make it go away".
+                // [Amended 2026-09-01, C39] Bare typing opens the filter.
+                // C39 stopped at `/` ("`/` is the only unconditional new
+                // key"); field use said otherwise — the owner reached for
+                // the palette by typing, exactly as C27's roster taught
+                // ("a letter is filter text"), and the overlay answered by
+                // closing on the first letter. The roster rule now starts
+                // at the first key: every bare printable except space
+                // opens the filter seeded with itself; `/` opens it empty
+                // — muscle memory, and the route to a query that really
+                // starts with a slash (`/` then `/`; once filtering, `/`
+                // is text, U20's picker rule). Both entries reset `top`
+                // with the cursor: the palette's `❯` sits on the list's
+                // first row and C41 wants the view holding it — the old
+                // `/` branch left a scrolled poster's `top` in place and
+                // opened the cursor off-screen (design-supervisor D1).
+                //
+                // Space, Enter, Esc and every *chorded* key still close
+                // (C15's poster rule): no query starts with a space, Space
+                // stays "the key a reader hits to make it go away", and a
+                // Ctrl-chord is not typing — only SHIFT rides along (an
+                // uppercase letter is still typing). `j`/`k` are text
+                // under this rule, so their un-filtered scroll arms below
+                // are retired — the arrows and paging keys keep both jobs.
                 if !filtering {
                     if let KeyCode::Char(c) = key.code {
                         if c != ' '
@@ -6588,7 +6584,8 @@ impl<B: PaneBackend> App<B> {
                                 .is_empty()
                         {
                             if let Mode::Help { filter, top, cursor } = &mut self.mode {
-                                *filter = Some(String::from(c));
+                                *filter =
+                                    Some(if c == '/' { String::new() } else { String::from(c) });
                                 *top = 0;
                                 *cursor = 0;
                             }
@@ -15518,6 +15515,8 @@ pub(crate) mod tests {
             KeyEvent::from(KeyCode::Char(' ')),
             KeyEvent::from(KeyCode::Esc),
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            // `/` under CTRL is a chord too, not the filter key (D2).
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
         ] {
             let (mut app, _) = mk_app(shell_ws());
             open_help(&mut app);
@@ -15525,6 +15524,30 @@ pub(crate) mod tests {
             assert!(
                 matches!(app.mode, Mode::Normal),
                 "{key:?} must still close an unfiltered overlay",
+            );
+        }
+    }
+
+    /// [C41, via the 2026-09-01 amendment] Both filter entries return the
+    /// view to the top with the cursor. The old `/` branch reset only the
+    /// cursor, so `/` pressed on a *scrolled* poster opened the palette
+    /// with its `❯` off-screen — the view was not holding the row `↵`
+    /// would run (design-supervisor D1).
+    #[test]
+    fn opening_the_filter_on_a_scrolled_poster_returns_the_view_to_the_top() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        for opener in [KeyCode::Char('/'), KeyCode::Char('t')] {
+            let (mut app, _) = mk_app(shell_ws());
+            open_help(&mut app);
+            app.handle_mode_key(KeyEvent::from(KeyCode::Down));
+            assert!(
+                matches!(app.mode, Mode::Help { top: 1, .. }),
+                "fixture body must be short enough to scroll"
+            );
+            app.handle_mode_key(KeyEvent::from(opener));
+            assert!(
+                matches!(app.mode, Mode::Help { top: 0, cursor: 0, filter: Some(_) }),
+                "{opener:?} must open the filter at the top of the list",
             );
         }
     }

@@ -5289,6 +5289,11 @@ Both C15 surfaces, because while a query is open "any key closes it" is
 false and a reader who cannot see why is stuck — on the one modal you open
 *because* you are lost.
 
+*[Amended 2026-09-01 — the two un-filtered rows below are superseded; the
+dated amendment at the end of this section carries the current wordings
+(`type to filter · Esc closes` / `type filter` · `Esc close`). The two
+filtering rows are still current.]*
+
 | state | title | hint bar |
 |---|---|---|
 | plain | `keys — / filters · any key closes` | `Alt+? all keys` · `/ filter` · `any key close` |
@@ -5395,6 +5400,13 @@ the feature being broken. The roster rule now starts at the first key:
   surface that had declined it. What licensed the roster licenses this: a
   list you filter by typing cannot reserve letters (U20), and the way out
   is taught in the title, the hint bar, and by `Esc` itself.
+- **`/` and the seeded printables are one entry path now**, which fixed
+  two things the audit of this amendment caught: the old `/` branch reset
+  only the cursor, so `/` pressed on a *scrolled* poster opened the
+  palette with its `❯` off-screen (C41 wants the view holding the row `↵`
+  would run — both entries reset `top` with the cursor); and it took `/`
+  under any modifier, so `Ctrl+/` opened the filter while `Ctrl+j` closed
+  — the SHIFT-only gate now covers `/` like every other printable.
 
   **Found by driving the overlay in a PTY, not by any unit test**, and the
   reason is worth keeping: every test here looked at the frame *or* the
