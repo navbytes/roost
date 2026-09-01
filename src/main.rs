@@ -1347,6 +1347,12 @@ mod tests {
             alt_shift(KeyCode::Left),
             alt_shift(KeyCode::Up),
             alt_shift(KeyCode::Down),
+            alt(KeyCode::Char('-')),
+            alt(KeyCode::Char('=')),
+            alt(KeyCode::Char('<')),
+            alt(KeyCode::Char('>')),
+            alt_shift(KeyCode::Char(',')),
+            alt_shift(KeyCode::Char('.')),
         ];
         for key in chords {
             let mut app = mk_app();

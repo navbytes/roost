@@ -4242,8 +4242,8 @@ impl<B: PaneBackend> App<B> {
     ///
     /// **No cross-tab handoff at the edge.** `focus_dir` falls through to
     /// `focus_dir_cross_tab`; this deliberately does not. Moving a pane out
-    /// of its tab is a structural edit rather than a look, `Alt+Shift+i`/
-    /// `Alt+Shift+m` (C28) already do exactly that and say so, and a no-op
+    /// of its tab is a structural edit rather than a look, `Alt+i`/
+    /// `Alt+Shift+i` (C28) already do exactly that and say so, and a no-op
     /// is the recoverable failure — see DESIGN-ui.md C33 for the full
     /// argument.
     ///
@@ -4361,8 +4361,8 @@ impl<B: PaneBackend> App<B> {
     ///
     /// Horizontally it names the chord that *does* cross tabs, so the dead
     /// end teaches the way out rather than just reporting one — C33
-    /// declined the cross-tab handoff precisely because `Alt+Shift+i` /
-    /// `Alt+Shift+m` (C28) "already do exactly that job and name it", and
+    /// declined the cross-tab handoff precisely because `Alt+i` /
+    /// `Alt+Shift+i` (C28) "already do exactly that job and name it", and
     /// this is where the user is holding the question. Vertically there is
     /// no such chord (tabs are roost's horizontal axis, C31), so the flash
     /// only says what happened.
@@ -4398,8 +4398,8 @@ impl<B: PaneBackend> App<B> {
     /// next/previous tab instead of stopping
     /// dead — "keep going right" should behave like it sounds. `Up`/`Down`
     /// are untouched: tabs are roost's own horizontal axis (the strip,
-    /// `Alt+i`/`Alt+m`), so only the two keys that already share that axis
-    /// pick up tab-switching semantics; giving all four directions that
+    /// `Alt+m`/`Alt+Shift+m`), so only the two keys that already share that
+    /// axis pick up tab-switching semantics; giving all four directions that
     /// meaning would surprise a vertical split's Up/Down.
     ///
     /// The landing pane is geometric, read from the *destination* tab's own
@@ -4407,8 +4407,8 @@ impl<B: PaneBackend> App<B> {
     /// lands on the destination's leftmost pane, `Left` on its rightmost
     /// (`edge_pane`) — the edge nearest the one just crossed, matching "keep
     /// going right" rather than wherever that tab was last left. Wraps at
-    /// both ends, exactly like `Alt+i`/`Alt+m` (`step_tab`); a no-op below
-    /// two tabs.
+    /// both ends, exactly like `Alt+m`/`Alt+Shift+m` (`step_tab`); a no-op
+    /// below two tabs.
     ///
     /// Same skeleton as `go_to_tab` — C21 zoom exit, C22 float hide, U11
     /// bookkeeping, lazy spawn — with the target swapped for `edge_pane`'s
@@ -4784,12 +4784,12 @@ impl<B: PaneBackend> App<B> {
         self.set_focus(target);
     }
 
-    /// U7: step `delta` tabs, wrapping at both ends — Alt+m forward, Alt+i
-    /// back. Wrapping is what makes the strip navigable with two keys: no
-    /// dead end at either edge, and tabs past the ninth (unreachable by
-    /// digit) are always a few presses away. A single tab wraps onto itself
-    /// and `go_to_tab`'s same-tab rule (U11) makes that the no-op it should
-    /// be — zoom and the float survive.
+    /// U7: step `delta` tabs, wrapping at both ends — Alt+m forward,
+    /// Alt+Shift+m back. Wrapping is what makes the strip navigable with two
+    /// keys: no dead end at either edge, and tabs past the ninth
+    /// (unreachable by digit) are always a few presses away. A single tab
+    /// wraps onto itself and `go_to_tab`'s same-tab rule (U11) makes that
+    /// the no-op it should be — zoom and the float survive.
     fn step_tab(&mut self, delta: isize) {
         let n = self.ws.tabs.len();
         if n == 0 {
@@ -4828,8 +4828,8 @@ impl<B: PaneBackend> App<B> {
         self.carry_pane_to_tab(id, si, di);
     }
 
-    /// The carry itself, shared by C28's `Alt+Shift+i`/`Alt+Shift+m` and
-    /// C40's pull: take `id` out of tab `si` and land it in tab `di`, with
+    /// The carry itself, shared by C28's `Alt+i`/`Alt+Shift+i` and C40's
+    /// pull: take `id` out of tab `si` and land it in tab `di`, with
     /// focus. Split out rather than duplicated because the interesting half
     /// is the *refusal* — the fit check, the emptied-source rule and the
     /// index fixup below are the contract, and a second copy of them would
@@ -15218,7 +15218,7 @@ pub(crate) mod tests {
 
     /// C33's stated edge rule, and the one deliberate divergence from
     /// `focus_dir`: `Alt+←/→` continues into the next tab at an edge (C31),
-    /// but moving a pane there does **not** — `Alt+Shift+i`/`Alt+Shift+m`
+    /// but moving a pane there does **not** — `Alt+i`/`Alt+Shift+i`
     /// (C28) are the chords that take a pane out of its tab, and they say
     /// so. A no-op is the recoverable failure.
     #[test]
@@ -16143,7 +16143,8 @@ pub(crate) mod tests {
 
     // ---- U7: tab reachability -------------------------------------------
 
-    /// Alt+m / Alt+i step the strip and wrap at both ends — with `Alt+1..9`
+    /// Alt+m / Alt+Shift+m step the strip and wrap at both ends — with
+    /// `Alt+1..9`
     /// stopping at nine and no cycle chord at all, tabs 10+ were reachable
     /// by nothing but the mouse (and only if they happened to be drawn).
     #[test]
@@ -16218,7 +16219,7 @@ pub(crate) mod tests {
         assert_eq!(app.ws.active_tab, 1);
         assert_eq!(app.focused, 10, "lands on the destination's leftmost pane");
         let saved = store.0.lock().unwrap().clone().unwrap();
-        assert_eq!(saved.active_tab, 1, "the tab switch persists, same as Alt+i/Alt+m");
+        assert_eq!(saved.active_tab, 1, "the tab switch persists, same as Alt+m/Alt+Shift+m");
     }
 
     /// The mirror: `Alt+Left` at a tab's leftmost pane continues into the
@@ -16234,8 +16235,9 @@ pub(crate) mod tests {
         assert_eq!(app.focused, 2, "lands on the previous tab's rightmost pane, not its first (1)");
     }
 
-    /// Wraps at both ends, exactly like `Alt+i`/`Alt+m` — two ways of moving
-    /// between tabs disagreeing about hitting an end would be its own bug.
+    /// Wraps at both ends, exactly like `Alt+m`/`Alt+Shift+m` — two ways of
+    /// moving between tabs disagreeing about hitting an end would be its own
+    /// bug.
     #[test]
     fn cross_tab_focus_wraps_at_both_ends() {
         let (mut app, _) = mk_app(shell_ws());
@@ -16467,8 +16469,8 @@ pub(crate) mod tests {
         assert!(app.ws.tabs[0].panes.contains_key(&1), "the source tab's other pane stayed");
     }
 
-    /// It wraps at both ends, exactly like the `Alt+i`/`Alt+m` pair it is
-    /// the shifted sibling of.
+    /// It wraps at both ends, exactly like the `Alt+i`/`Alt+Shift+i` pair it
+    /// shares the carry machinery with.
     #[test]
     fn move_pane_to_tab_wraps_at_both_ends() {
         let (mut app, _) = mk_app(shell_ws());

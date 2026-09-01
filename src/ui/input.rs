@@ -23,12 +23,13 @@ pub enum Action {
     /// only one that goes back.
     FocusAlternate,
     /// C33: swap the focused pane with its neighbour in that direction,
-    /// within the active tab — `Alt+Shift+hjkl`. The shifted siblings of
-    /// `Alt+hjkl` carry the *pane* the way the unshifted ones carry *you*,
-    /// which is C28's rule (`Alt+Shift+i`/`Alt+Shift+m`) on the within-tab
-    /// axis instead of the across-tab one. Focus follows the pane for free:
-    /// the tree swaps two ids, so the focused id is unchanged and simply
-    /// occupies a different slot.
+    /// within the active tab — `Alt+Shift+arrows`, the same verb
+    /// `Alt+Shift+hjkl` has always spelled. The shifted siblings of the
+    /// focus chords carry the *pane* the way the unshifted ones carry
+    /// *you* (the 2026-09-01 map amendment unified the arrow and letter
+    /// spellings; resize moved to vim's `-`/`=`/`<`/`>`). Focus follows
+    /// the pane for free: the tree swaps two ids, so the focused id is
+    /// unchanged and simply occupies a different slot.
     MovePane(Dir),
     NewTab,
     GoToTab(usize),
@@ -38,9 +39,10 @@ pub enum Action {
     PrevTab,
     /// U7: jump to the last tab (`Alt+0`), whatever its number.
     LastTab,
-    /// C28: carry the focused pane to the previous / next tab, wrapping —
-    /// `Alt+Shift+i` / `Alt+Shift+m`, the shifted siblings of the two chords
-    /// that move *you* between tabs. Focus follows the pane.
+    /// C28: carry the focused pane to the next / previous tab, wrapping —
+    /// `Alt+i` / `Alt+Shift+i`, the letter family beside the `m` family
+    /// that moves *you* between tabs (each a shift-reverse pair since the
+    /// 2026-09-01 re-key). Focus follows the pane.
     MovePaneToTab {
         forward: bool,
     },
@@ -157,11 +159,29 @@ fn translate(key: KeyEvent) -> InputResult {
 /// handled, arm by arm, exactly as before this was split out of `translate`.
 fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
     match code {
-        // Alt+Shift+arrows: resize
-        KeyCode::Right if shift => Some(Action::Resize { horizontal: true, grow: true }),
-        KeyCode::Left if shift => Some(Action::Resize { horizontal: true, grow: false }),
-        KeyCode::Down if shift => Some(Action::Resize { horizontal: false, grow: true }),
-        KeyCode::Up if shift => Some(Action::Resize { horizontal: false, grow: false }),
+        // C33 + the 2026-09-01 map amendment: Shift+arrows move the *pane*,
+        // exactly what Shift+hjkl has done since C33 — one family, one verb,
+        // both spellings. (They sat on resize until resize moved to the
+        // vim-idiom punctuation below.)
+        KeyCode::Right if shift => Some(Action::MovePane(Dir::Right)),
+        KeyCode::Left if shift => Some(Action::MovePane(Dir::Left)),
+        KeyCode::Down if shift => Some(Action::MovePane(Dir::Down)),
+        KeyCode::Up if shift => Some(Action::MovePane(Dir::Up)),
+        // Vim's Ctrl-w resize idioms, on Alt: `-`/`=` height, `<`/`>` width.
+        // One physical key, two delivery spellings — some terminals report
+        // the shifted half as the glyph (`+` for Alt+Shift+=), others as the
+        // base character with SHIFT set (`,` for Alt+<) — so both spellings
+        // are bound, the arm ignoring shift where the glyph is the code.
+        // The unshifted base keys `,`/`.` stay free on purpose: they are
+        // readline's M-, / M-. and must keep forwarding (U5).
+        KeyCode::Char('-') => Some(Action::Resize { horizontal: false, grow: false }),
+        KeyCode::Char('=') | KeyCode::Char('+') => {
+            Some(Action::Resize { horizontal: false, grow: true })
+        }
+        KeyCode::Char('<') => Some(Action::Resize { horizontal: true, grow: false }),
+        KeyCode::Char(',') if shift => Some(Action::Resize { horizontal: true, grow: false }),
+        KeyCode::Char('>') => Some(Action::Resize { horizontal: true, grow: true }),
+        KeyCode::Char('.') if shift => Some(Action::Resize { horizontal: true, grow: true }),
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('n') => Some(Action::NewPane),
         KeyCode::Char('w') => Some(Action::ClosePane),
@@ -210,35 +230,37 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
         // U7: tabs 10+ had no keyboard route at all. `Alt+0` closes the
         // digit row's own gap (last tab, the "and the rest" slot), and
-        // Alt+i/Alt+m step the strip. Both letters come from §8's free
-        // pool, and both survive U5: they were unbound, so they used to
-        // forward to the pane — now they're roost's, like every other
-        // chord in this table. See §8's amendment for why these two.
+        // Alt+m steps the strip. The letters come from §8's free pool, and
+        // both survive U5: they were unbound, so they used to forward to
+        // the pane — now they're roost's, like every other chord in this
+        // table. See §8's amendment for why these two.
         KeyCode::Char('0') => Some(Action::LastTab),
-        // C28: the shifted siblings carry the *pane* the way the
-        // unshifted ones carry *you* — Alt+i/Alt+m move focus between
-        // tabs, Alt+Shift+i/Alt+Shift+m move the focused pane there and
-        // follow it. `Alt+I`/`Alt+M` are the same uppercase-delivery
-        // tolerance Alt+Shift+r / Alt+Shift+a / Alt+Shift+p carry.
+        // 2026-09-01 map amendment: both tab families are same-letter,
+        // shift-reverses now — `Alt+m`/`Alt+Shift+m` step next/previous
+        // tab, `Alt+i`/`Alt+Shift+i` carry the focused pane to the next/
+        // previous tab and follow it (C28's carry verb, re-homed off the
+        // Shift+m/Shift+i spellings so both families share the idiom C37's
+        // `g`/`Shift+g` established). `Alt+I`/`Alt+M` are the uppercase-
+        // delivery tolerance Alt+Shift+r / Alt+Shift+a / Alt+Shift+p carry.
         // (Alt+[ / Alt+] were the brief's suggestion and are rejected in
         // §8: `ESC [` is the CSI introducer.)
-        KeyCode::Char('i') => {
-            Some(if shift { Action::MovePaneToTab { forward: false } } else { Action::PrevTab })
-        }
+        KeyCode::Char('i') => Some(if shift {
+            Action::MovePaneToTab { forward: false }
+        } else {
+            Action::MovePaneToTab { forward: true }
+        }),
         KeyCode::Char('I') => Some(Action::MovePaneToTab { forward: false }),
-        KeyCode::Char('m') => {
-            Some(if shift { Action::MovePaneToTab { forward: true } } else { Action::NextTab })
-        }
-        KeyCode::Char('M') => Some(Action::MovePaneToTab { forward: true }),
-        // C40: the same "shifted carries the pane" rule one step further —
-        // mark here, pull there, for a destination too far to walk with
-        // `Alt+Shift+m`. `x`/`v` come from §8's free pool, where they were
-        // reserved for clipboard vocabulary; this is that vocabulary, on
-        // panes rather than on text. Only the *shifted* forms are taken:
-        // bare `Alt+x`/`Alt+v` stay unbound so emacs' `M-x` and `M-v` keep
-        // reaching the pane through U5, which is why `b`/`d` were struck
-        // out of the pool in the first place. Both delivery spellings,
-        // same reason as every shifted letter above.
+        KeyCode::Char('m') => Some(if shift { Action::PrevTab } else { Action::NextTab }),
+        KeyCode::Char('M') => Some(Action::PrevTab),
+        // C40: the same "carry the pane without walking" rule one step
+        // further — mark here, pull there, for a destination too far to
+        // walk with `Alt+Shift+i`. `x`/`v` come from §8's free pool, where
+        // they were reserved for clipboard vocabulary; this is that
+        // vocabulary, on panes rather than on text. Only the *shifted*
+        // forms are taken: bare `Alt+x`/`Alt+v` stay unbound so emacs'
+        // `M-x` and `M-v` keep reaching the pane through U5, which is why
+        // `b`/`d` were struck out of the pool in the first place. Both
+        // delivery spellings, same reason as every shifted letter above.
         KeyCode::Char('x') if shift => Some(Action::MarkPane),
         KeyCode::Char('X') => Some(Action::MarkPane),
         KeyCode::Char('v') if shift => Some(Action::PullPane),
@@ -909,8 +931,15 @@ fn shifted_char(c: char) -> Option<char> {
     })
 }
 
+/// The inverse of `shifted_char`: the base key whose shifted form is `c`
+/// (`+` → `=`, `<` → `,`, `?` → `/`). Derived from `shifted_char` itself,
+/// not a second table, so the two can never disagree.
+fn glyph_base(c: char) -> Option<char> {
+    (0x20u8..=0x7e).map(|b| b as char).find(|&b| shifted_char(b) == Some(c))
+}
+
 /// Is this entry a *second spelling* of a chord already in the table, rather
-/// than a chord of its own? Three shapes, all of which would otherwise make
+/// than a chord of its own? Four shapes, all of which would otherwise make
 /// the help overlay print one physical key twice — or print a key that is
 /// not really bound at all.
 ///
@@ -929,10 +958,15 @@ fn shifted_char(c: char) -> Option<char> {
 ///    to `GoToTab(0)` exactly as `('1', no shift)` does. That is not a
 ///    binding anyone should be taught — nothing is bound to `Alt+Shift+1`;
 ///    the arm simply ignores shift. The unshifted spelling is the chord.
+/// 4. **The shiftless glyph of a bound base key.** `Alt+=` and `Alt++` are
+///    one physical chord (`+` is Shift+`=`); when both spellings carry the
+///    same action, the base-key spelling is the one roost documents
+///    (vim's resize idiom is written `=`), so bare `'+'` drops — the mirror
+///    of rule 2, which drops the *shifted* base spelling.
 ///
 /// Every rule fires only when both spellings carry the **same action**: when
 /// they differ, both are real and distinct (`Alt+←` focuses, `Alt+Shift+←`
-/// resizes; `Alt+h` focuses, `Alt+Shift+h` moves the pane).
+/// moves the pane; `Alt+h` focuses, `Alt+Shift+h` moves the pane).
 fn is_redundant_spelling(chord: &Chord, action: &Action, table: &HashMap<Chord, Action>) -> bool {
     let same = |code: KeyCode, shift: bool| table.get(&Chord { code, shift }) == Some(action);
     // 3: the arm ignored shift.
@@ -953,6 +987,8 @@ fn is_redundant_spelling(chord: &Chord, action: &Action, table: &HashMap<Chord, 
     } else {
         // 1: bare `'P'` when `('p', SHIFT)` says the same thing.
         c.is_ascii_uppercase() && same(KeyCode::Char(c.to_ascii_lowercase()), true)
+            // 4: bare `'+'` when `('=', no shift)` says the same thing.
+            || glyph_base(c).is_some_and(|b| same(KeyCode::Char(b), false))
     }
 }
 
@@ -1014,18 +1050,20 @@ pub fn chord_for(keymap: &Keymap, action: Action) -> Option<String> {
 
 /// Every `(code, shift)` the default table already treats as the *same*
 /// logical chord as `(code, shift)` itself — the terminal-delivery duality
-/// `default_chord_action` already carries for a handful of letters (p/P,
+/// `default_chord_action` already carries for the shifted letters (p/P,
 /// r/R, a/A, i/I, m/M: some terminals send `Alt+Shift+p` as `('p', SHIFT)`,
 /// others as `('P', no SHIFT)`, and the default table binds both to
-/// `ToggleRaw` so either works). A config entry naming *one* delivery form
-/// must disable or remap *all* of them — otherwise it silently no-ops on
-/// whichever terminal happens to send the other one.
+/// `ToggleRaw` so either works) **and** for the shifted punctuation (the
+/// `/`↔`?` and `,`↔`<`, `.`↔`>`, `=`↔`+` pairs). A config entry naming *one*
+/// delivery form must disable or remap *all* of them — otherwise it
+/// silently no-ops on whichever terminal happens to send the other one.
 ///
-/// Derived from `default_chord_action`, not a hand-kept letter list: two
-/// `Char` chords are twins exactly when they share a case-folded letter and
-/// both already default to the same action. That reuses the one source of
-/// truth `default_keymap`/`translate` already run on, so a future letter
-/// gaining this pattern is covered automatically — see
+/// Derived from `default_chord_action`, not a hand-kept list: starting from
+/// the chord itself, candidates are its case-folded siblings and (via
+/// `shifted_char`/`glyph_base`) the other half of its physical key, kept
+/// while they default to the same action, to a fixed point. That reuses the
+/// one source of truth `default_keymap`/`translate` already run on, so a
+/// future chord gaining this pattern is covered automatically — see
 /// `twin_derivation_finds_every_same_letter_same_action_default_chord`.
 /// Always includes `(code, shift)` itself; non-`Char` codes and chords with
 /// no default action (nothing to be a twin of) have no other twins.
@@ -1033,14 +1071,34 @@ fn twins(code: KeyCode, shift: bool) -> Vec<Chord> {
     let (Some(action), KeyCode::Char(c)) = (default_chord_action(code, shift), code) else {
         return vec![Chord { code, shift }];
     };
-    let mut found = Vec::new();
-    for cased in [c.to_ascii_lowercase(), c.to_ascii_uppercase()] {
-        for s in [false, true] {
-            let candidate = Chord { code: KeyCode::Char(cased), shift: s };
+    let mut found = vec![Chord { code, shift }];
+    let mut frontier = vec![(c, shift)];
+    while let Some((ch, _)) = frontier.pop() {
+        // Case-folded siblings arrive in either shift state (some terminals
+        // report Alt+Shift+f as bare 'F', others as 'f'+SHIFT — the duality
+        // is a cross-product, not a flip).
+        let mut candidates = Vec::new();
+        for cased in [ch.to_ascii_lowercase(), ch.to_ascii_uppercase()] {
+            candidates.push((cased, false));
+            candidates.push((cased, true));
+        }
+        // The other half of the physical key, in the delivery form it
+        // arrives as: this key's glyph is reported as the bare character
+        // (Shift applied by the terminal), and this glyph's base key
+        // arrives with SHIFT still set. Both directions, from either half.
+        if let Some(g) = shifted_char(ch) {
+            candidates.push((g, false));
+        }
+        if let Some(b) = glyph_base(ch) {
+            candidates.push((b, true));
+        }
+        for (cc, cs) in candidates {
+            let candidate = Chord { code: KeyCode::Char(cc), shift: cs };
             if !found.contains(&candidate)
-                && default_chord_action(candidate.code, s) == Some(action)
+                && default_chord_action(candidate.code, cs) == Some(action)
             {
                 found.push(candidate);
+                frontier.push((cc, cs));
             }
         }
     }
@@ -1152,31 +1210,34 @@ mod tests {
         ));
     }
 
-    /// C28: the shifted siblings of U7's tab steps carry the *pane*. The
-    /// unshifted pair must stay exactly what it was — the whole idiom is
-    /// "shift makes the chord take the pane with you", so a regression here
-    /// would silently move panes when the user meant to change tabs.
+    /// C28's carry verb, re-homed by the 2026-09-01 map amendment: the two
+    /// tab families are same-letter, shift-reverses — `m`/`Shift+m` step
+    /// next/previous tab, `i`/`Shift+i` carry the pane to the next/previous
+    /// tab. `Shift+i` keeps the direction it always had (carry-prev); bare
+    /// `i` and both `m` spellings moved, so a regression here would silently
+    /// carry panes when the user meant to change tabs (or vice versa).
     #[test]
-    fn alt_shift_i_and_m_move_the_pane_with_uppercase_delivery_tolerance() {
-        for (code, forward) in [('i', false), ('m', true)] {
+    fn alt_i_carries_and_alt_m_cycles_tabs_with_uppercase_delivery_tolerance() {
+        // Carry family: bare `i` = next; `Shift+i` / uppercase `I` = previous
+        // (Shift+i keeps the direction it always had).
+        assert!(matches!(
+            translate(alt(KeyCode::Char('i'))),
+            InputResult::Action(Action::MovePaneToTab { forward: true })
+        ));
+        for key in [alt_shift(KeyCode::Char('i')), alt(KeyCode::Char('I'))] {
             assert!(
                 matches!(
-                    translate(alt_shift(KeyCode::Char(code))),
-                    InputResult::Action(Action::MovePaneToTab { forward: f }) if f == forward
+                    translate(key),
+                    InputResult::Action(Action::MovePaneToTab { forward: false })
                 ),
-                "Alt+Shift+{code}",
-            );
-            let upper = code.to_ascii_uppercase();
-            assert!(
-                matches!(
-                    translate(alt(KeyCode::Char(upper))),
-                    InputResult::Action(Action::MovePaneToTab { forward: f }) if f == forward
-                ),
-                "Alt+{upper} (uppercase delivery)",
+                "{key:?} carries to the previous tab",
             );
         }
-        assert!(matches!(translate(alt(KeyCode::Char('i'))), InputResult::Action(Action::PrevTab)));
+        // Tab-step family: bare `m` = next; `Shift+m` / uppercase `M` = previous.
         assert!(matches!(translate(alt(KeyCode::Char('m'))), InputResult::Action(Action::NextTab)));
+        for key in [alt_shift(KeyCode::Char('m')), alt(KeyCode::Char('M'))] {
+            assert!(matches!(translate(key), InputResult::Action(Action::PrevTab)), "{key:?}");
+        }
     }
 
     #[test]
@@ -1218,15 +1279,23 @@ mod tests {
         ));
     }
 
+    /// 2026-09-01 map amendment: Shift+arrows joined Shift+hjkl as
+    /// move-the-pane — one family, one verb, both spellings — and resize
+    /// moved to the vim idiom punctuation (`-`/`=` height, `<`/`>` width).
     #[test]
-    fn alt_shift_arrows_resize_not_focus() {
+    fn alt_shift_arrows_move_pane_not_focus() {
         assert!(matches!(
             translate(alt_shift(KeyCode::Right)),
-            InputResult::Action(Action::Resize { horizontal: true, grow: true })
+            InputResult::Action(Action::MovePane(Dir::Right))
         ));
         assert!(matches!(
             translate(alt_shift(KeyCode::Up)),
-            InputResult::Action(Action::Resize { horizontal: false, grow: false })
+            InputResult::Action(Action::MovePane(Dir::Up))
+        ));
+        // ...and the letter spellings still say the same thing.
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('h'))),
+            InputResult::Action(Action::MovePane(Dir::Left))
         ));
         // plain Alt+arrow still moves focus
         assert!(matches!(
@@ -1237,6 +1306,34 @@ mod tests {
             translate(alt(KeyCode::Char('h'))),
             InputResult::Action(Action::Focus(Dir::Left))
         ));
+    }
+
+    /// Vim's Ctrl-w resize idioms, on Alt: `-` shrink / `=` grow the height,
+    /// `<` shrink / `>` grow the width. Every arm ignores shift (the glyph
+    /// spellings `+` and the `,`/`.` base deliveries land on the same
+    /// arms), and the unshifted base keys `,`/`.` stay free for readline.
+    #[test]
+    fn alt_vim_punctuation_resizes_height_and_width() {
+        let cases: &[(KeyEvent, Action)] = &[
+            (alt(KeyCode::Char('-')), Action::Resize { horizontal: false, grow: false }),
+            (alt(KeyCode::Char('=')), Action::Resize { horizontal: false, grow: true }),
+            (alt(KeyCode::Char('+')), Action::Resize { horizontal: false, grow: true }),
+            (alt_shift(KeyCode::Char('=')), Action::Resize { horizontal: false, grow: true }),
+            (alt(KeyCode::Char('<')), Action::Resize { horizontal: true, grow: false }),
+            (alt_shift(KeyCode::Char(',')), Action::Resize { horizontal: true, grow: false }),
+            (alt(KeyCode::Char('>')), Action::Resize { horizontal: true, grow: true }),
+            (alt_shift(KeyCode::Char('.')), Action::Resize { horizontal: true, grow: true }),
+        ];
+        for (key, want) in cases {
+            assert_eq!(translate(*key), InputResult::Action(*want), "{key:?}");
+        }
+        // The unshifted base keys are the pane's vocabulary, not roost's:
+        // M-, and M-. must keep reaching the shell (U5).
+        assert!(matches!(translate(alt(KeyCode::Char(','))), InputResult::Forward(_)));
+        assert!(matches!(translate(alt(KeyCode::Char('.'))), InputResult::Forward(_)));
+        // The shifted spelling of `-` (`_`) was never claimed: vim has no
+        // `Ctrl-w _` grow, and M-_ stays the pane's.
+        assert!(matches!(translate(alt(KeyCode::Char('_'))), InputResult::Forward(_)));
     }
 
     #[test]
@@ -1610,6 +1707,8 @@ mod tests {
             ('b', &[0x1b, b'b']), // readline backward-word — the live-QA probe
             ('d', &[0x1b, b'd']), // readline kill-word
             ('.', &[0x1b, b'.']), // readline yank-last-arg
+            (',', &[0x1b, b',']), // its neighbour: still free after Alt+< took the glyph
+            ('_', &[0x1b, b'_']), // the shifted spelling of Alt+- was never claimed
             ('p', &[0x1b, b'p']),
             ('x', &[0x1b, b'x']),
             ('v', &[0x1b, b'v']), // still free after U7 took i/m/0
@@ -1659,14 +1758,22 @@ mod tests {
             (alt(KeyCode::PageUp), Action::ScrollMode),
             (alt(KeyCode::Char('3')), Action::GoToTab(2)),
             (alt(KeyCode::Char('0')), Action::LastTab), // U7
-            (alt(KeyCode::Char('i')), Action::PrevTab),
+            (alt(KeyCode::Char('i')), Action::MovePaneToTab { forward: true }),
+            (alt_shift(KeyCode::Char('i')), Action::MovePaneToTab { forward: false }),
             (alt(KeyCode::Char('m')), Action::NextTab),
+            (alt_shift(KeyCode::Char('m')), Action::PrevTab),
             (alt(KeyCode::Right), Action::Focus(Dir::Right)),
             (alt(KeyCode::Char('h')), Action::Focus(Dir::Left)),
             (alt(KeyCode::Char('j')), Action::Focus(Dir::Down)),
             (alt(KeyCode::Char('k')), Action::Focus(Dir::Up)),
-            (alt_shift(KeyCode::Right), Action::Resize { horizontal: true, grow: true }),
-            (alt_shift(KeyCode::Up), Action::Resize { horizontal: false, grow: false }),
+            (alt_shift(KeyCode::Right), Action::MovePane(Dir::Right)),
+            (alt_shift(KeyCode::Up), Action::MovePane(Dir::Up)),
+            (alt(KeyCode::Char('-')), Action::Resize { horizontal: false, grow: false }),
+            (alt(KeyCode::Char('=')), Action::Resize { horizontal: false, grow: true }),
+            (alt(KeyCode::Char('<')), Action::Resize { horizontal: true, grow: false }),
+            (alt_shift(KeyCode::Char(',')), Action::Resize { horizontal: true, grow: false }),
+            (alt(KeyCode::Char('>')), Action::Resize { horizontal: true, grow: true }),
+            (alt_shift(KeyCode::Char('.')), Action::Resize { horizontal: true, grow: true }),
         ];
         for (key, want) in bound {
             match translate(*key) {
@@ -1967,10 +2074,12 @@ mod tests {
         // C15 `HelpKey::Family` shorthands, which give way to enumeration
         // the moment any member moves.
         "Alt+←↓↑→ / hjkl",
-        "Alt+Shift+←↓↑→",
-        "Alt+Shift+hjkl",
+        "Alt+Shift+←↓↑→ / hjkl",
+        "Alt+- / Alt+=",
+        "Alt+< / Alt+>",
         "Alt+1..9 / Alt+0",
-        "Alt+Shift+i / +m",
+        "Alt+m / Alt+Shift+m",
+        "Alt+i / Alt+Shift+i",
         // The one authored `HelpKey::Text` row that names a chord: a mouse
         // chord, outside config.json's grammar, so it cannot move (C34).
         "Alt+click / o",
@@ -2099,7 +2208,13 @@ mod tests {
         assert!(!has("Alt+Shift+1"), "nothing is bound to Alt+Shift+1");
         // ... and where the two shift states really differ, both survive.
         assert!(has("Alt+h") && has("Alt+Shift+h"), "focus and move are distinct");
-        assert!(has("Alt+←") && has("Alt+Shift+←"), "focus and resize are distinct");
+        assert!(has("Alt+←") && has("Alt+Shift+←"), "focus and pane-move are distinct");
+        // Rule 4 — the shiftless glyph of a bound base key keeps the base
+        // spelling: `Alt+=` is the resize chord, bare `Alt++` its delivery
+        // twin, and the shifted spellings bind no row of their own.
+        assert!(has("Alt+=") && has("Alt+<"));
+        assert!(!has("Alt++"), "the + glyph collapses into Alt+=");
+        assert!(!has("Alt+Shift+=") && !has("Alt+Shift+,") && !has("Alt+Shift+<"));
 
         let mut sorted = labels.clone();
         sorted.sort();
@@ -2168,6 +2283,47 @@ mod tests {
         ));
     }
 
+    /// (a') The glyph/base delivery pairs close the same way: `Alt+<` is
+    /// delivered by some terminals as `,`+SHIFT, `Alt+=` as bare `+` or
+    /// `=`+SHIFT — and `Alt+?` as `/`+SHIFT, the pre-existing member of
+    /// this family whose gap this twin closure closed (a `{"alt+?":
+    /// "disable"}` used to leave the `('/')+SHIFT` delivery live).
+    #[test]
+    fn disabling_a_glyph_chord_disables_every_delivery_form() {
+        let (keymap, diagnostics) = Keymap::parse(
+            r#"{"keys": {"alt+<": "disable", "alt+=": "disable", "alt+?": "disable"}}"#,
+            "config.json",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for key in [
+            alt(KeyCode::Char('<')),
+            alt_shift(KeyCode::Char('<')),
+            alt_shift(KeyCode::Char(',')),
+            alt(KeyCode::Char('=')),
+            alt_shift(KeyCode::Char('=')),
+            alt(KeyCode::Char('+')),
+            alt_shift(KeyCode::Char('+')),
+            alt(KeyCode::Char('?')),
+            alt_shift(KeyCode::Char('?')),
+            alt_shift(KeyCode::Char('/')),
+        ] {
+            assert!(
+                !matches!(translate_with(key, &keymap), InputResult::Action(_)),
+                "{key:?} must be dead — every delivery form of a disabled chord goes with it",
+            );
+        }
+        // The chords on the *other* half of those keys stay alive: Alt+,
+        // (M-,) forwards and Alt+/ still toggles the hint bar.
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char(',')), &keymap),
+            InputResult::Forward(_)
+        ));
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('/')), &keymap),
+            InputResult::Action(Action::ToggleHints)
+        ));
+    }
+
     /// (b) Remapping a twinned chord moves EVERY delivery form to the new
     /// action. Named via the `"alt+A"` spelling here (rather than
     /// `"alt+shift+a"`) to prove both spellings reach the identical twin
@@ -2195,15 +2351,23 @@ mod tests {
         ));
     }
 
-    /// (c) The twin derivation is mechanical, not a hand-kept letter list:
+    /// (c) The twin derivation is mechanical, not a hand-kept list:
     /// for every chord the default table binds, its twin set must contain
     /// every OTHER default-bound chord that shares its action and its
-    /// letter (case-insensitively) — so a future letter gaining this same
+    /// physical key — case-folded siblings (h/H) and glyph/base pairs
+    /// (`+`/`=`, `,`/`<`) alike — so a future chord gaining this same
     /// delivery-duality pattern is covered automatically, with nothing here
     /// that has to be remembered and updated by hand.
     #[test]
     fn twin_derivation_finds_every_same_letter_same_action_default_chord() {
         let table = default_keymap();
+        // Two characters name the same physical key when one is the other's
+        // case-folded sibling or its shifted glyph (either direction).
+        let same_key = |a: char, b: char| {
+            a.eq_ignore_ascii_case(&b)
+                || shifted_char(a) == Some(b)
+                || glyph_base(a).is_some_and(|base| base == b)
+        };
         for (&chord, &action) in table {
             let KeyCode::Char(c) = chord.code else {
                 continue;
@@ -2213,7 +2377,7 @@ mod tests {
                 let KeyCode::Char(oc) = other.code else {
                     continue;
                 };
-                if oc.eq_ignore_ascii_case(&c) && other_action == action {
+                if same_key(c, oc) && other_action == action {
                     assert!(
                         found.contains(&other),
                         "{chord:?} ({action:?})'s twins must include {other:?}"

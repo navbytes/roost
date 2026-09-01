@@ -167,11 +167,12 @@ next/prev-tab chord exists; overflow-clipped tabs aren't clickable. Tabs ≥ 10
 are unreachable by keyboard entirely.
 **Proposed contract:** next/prev-tab chords from the documented free-key pool;
 `Alt+0` → tab 10 or last-tab; the strip scrolls to keep the active tab visible.
-**Fixed:** all three. `Alt+i`/`Alt+m` step previous/next with wrap-around and
+**Fixed:** all three. `Alt+m`/`Alt+Shift+m` step next/previous with wrap-around and
 `Alt+0` jumps to the last tab, whatever its number — chords taken from §8's
 free pool after excluding the readline-critical `b`/`d` (live since U5),
 C23's reserved `p`, and the clipboard letters `v/x/y` (§8 amendment
-2026-07-27 justifies the pick). The strip scrolls: `mouse::tab_strip` picks
+2026-07-27 justifies the pick; re-keyed 2026-09-01 so `i` carries the pane —
+see §8's modifier-consistency amendment). The strip scrolls: `mouse::tab_strip` picks
 the leftmost window that still fits the active tab whole, `…` marks each end
 that hides tabs (never a tab, never clickable), and `tab_at_x` reads the same
 layout, so a click on a scrolled strip selects the real tab index (C2 amended

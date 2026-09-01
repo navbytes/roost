@@ -136,8 +136,9 @@ you're in.
 | `Alt+n` | new shell pane (auto split direction) |
 | `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
 | `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
-| `Alt+Shift+arrow` | resize along that axis |
-| `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
+| `Alt+-` / `Alt+=` | resize height: shrink / grow (vim's Ctrl-w `−`/`+`) |
+| `Alt+<` / `Alt+>` | resize width: shrink / grow (vim's Ctrl-w `<`/`>`) |
+| `Alt+Shift+arrow` / `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
 | `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
 | `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
@@ -151,8 +152,8 @@ you're in.
 | `Alt+r` | edit pane — name and parking note in one dialog; the note's first line shows on the badge |
 | `Alt+Shift+r` | rename tab (e.g. one tab per project) |
 | `Alt+t`, `Alt+1..9`, `Alt+0` | new tab / go to tab / go to the last tab |
-| `Alt+i` / `Alt+m` | previous / next tab (wraps — the route to tabs past the ninth) |
-| `Alt+Shift+i` / `Alt+Shift+m` | carry the focused pane to the previous / next tab |
+| `Alt+m` / `Alt+Shift+m` | next / previous tab (wraps — the route to tabs past the ninth) |
+| `Alt+i` / `Alt+Shift+i` | carry the focused pane to the next / previous tab |
 | `Alt+Shift+x` / `Alt+Shift+v` | mark a pane / pull the marked pane into the tab you're on — a move whose destination is any tab, not the next one |
 | `Alt+w` | close pane (press twice to confirm when the agent is busy or it's the last pane) |
 | `Alt+u` | undo — reopen the last closed pane or tab, sessions resumed (exact scope below) |

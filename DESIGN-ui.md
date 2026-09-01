@@ -583,7 +583,7 @@ C27 closes from the other side (the tribunal's provenance is recorded there).
   two** — the +1 only costs a tab when it crosses a multiple of the tab width.
   Per U7 the strip *scrolls*, so the effect is fewer tabs visible before the
   `…` marker, never a tab you cannot reach: every tab stays reachable by
-  `Alt+1..9`/`Alt+0`/`Alt+i`/`Alt+m`, and the active one is always drawn. That
+  `Alt+1..9`/`Alt+0`/`Alt+m`/`Alt+Shift+m`, and the active one is always drawn. That
   is the cost this amendment is worth paying — an unreadable count is worse
   than a shorter strip, and C27's roster now answers "which panes, exactly"
   for anything the bar cannot say.
@@ -3254,7 +3254,7 @@ mixing an instrumented ◆, an uninstrumented agent resting on a heuristic ○,
 and plain shells — the roster sorts the ○ ahead of every shell, and the ring
 opens the cursor on the real ◆, never the resting agent or a shell.
 
-### C28 — Move a pane between tabs (Alt+Shift+i / Alt+Shift+m) — [Added 2026-07-28]
+### C28 — Move a pane between tabs (Alt+i / Alt+Shift+i) — [Added 2026-07-28, re-keyed 2026-09-01]
 
 **Current:** a pane is born in a tab and dies in it. Every arrangement verb
 roost has (`Alt+s`, `Alt+o`, `Alt+g`, `Alt+Shift+arrows`) rearranges panes
@@ -3266,16 +3266,22 @@ concerns get reassigned — a pane started in `main` while exploring belongs in
 
 **Target — the pane changes tabs and you go with it.**
 
-- **Binding: `Alt+Shift+i` / `Alt+Shift+m`** (`Action::MovePaneToTab
-  { forward }`), also accepted as `Alt+I`/`Alt+M` (the uppercase-delivery
-  tolerance `Alt+Shift+r`/`a`/`p` already carry). The shifted siblings of
-  U7's `Alt+i`/`Alt+m`: **the unshifted chords move you between tabs, the
-  shifted ones move the focused pane there and follow it.** Costs the
-  unshifted Alt pool nothing (§8's amendment).
+- **Binding: `Alt+i` / `Alt+Shift+i`** (`Action::MovePaneToTab
+  { forward }`), also accepted as `Alt+I` (the uppercase-delivery
+  tolerance `Alt+Shift+r`/`a`/`p` already carry). **[Re-keyed
+  2026-09-01]** — the verb moved off `Alt+Shift+i`/`Alt+Shift+m` so the
+  two tab families are same-letter, shift-reverse pairs like C37's
+  `g`/`Shift+g` (§8 amendment): `m`/`Shift+m` step the strip, `i`/`Shift+i`
+  carry the pane — **the unshifted chord of either family moves you or
+  your pane forward, the shifted one backward.** `Alt+Shift+i` keeps the
+  direction it has always had (carry-previous); `Alt+M` follows
+  `Shift+m` to previous-tab. Costs the unshifted Alt pool nothing (§8's
+  amendment).
   `Alt+[`/`Alt+]` — the brief's suggestion — are rejected: `ESC [` is the
   CSI introducer, so `Alt+[` cannot be told apart from the start of an
   escape sequence (§8's standing rejection, same hazard as C23's `ESC`+`P`).
-- **Wraps at both ends**, exactly like the pair it is the shifted form of.
+- **Wraps at both ends**, exactly like the tab-step pair it shares the
+  idiom with.
 - **The process is never touched.** `runtimes` is keyed by `PaneId` across
   the whole workspace, so a running agent keeps its PTY, its scrollback and
   its resume session through the move; only the layout trees and the spec
@@ -3859,7 +3865,7 @@ spatially within the active tab via `layout::neighbor` and stop dead at an
 edge — `neighbor` returns `None` when nothing lies that way, and
 `App::focus_dir` leaves focus exactly where it was. Reaching a pane in
 another tab has always taken a separate chord first — a digit or
-`Alt+i`/`Alt+m`, then an arrow to reach a specific pane once there, or
+`Alt+m`, then an arrow to reach a specific pane once there, or
 `Alt+a`'s direct ring jump (C19) — never a plain arrow at an edge.
 `neighbor`'s own edge/overlap/gap/id tie-break predates this document's
 contract numbering and stays uncontracted here — C31 governs only what
@@ -3873,7 +3879,7 @@ lands somewhere surprising is worse than one that predictably does nothing.
 **Target:**
 - **`Left`/`Right` only.** `Up`/`Down` keep today's dead end,
   unconditionally. Tabs are roost's own horizontal axis — the strip draws
-  left to right, and `Alt+i`/`Alt+m` (U7, C2) already step it horizontally
+  left to right, and `Alt+m`/`Alt+Shift+m` (U7, C2) already step it horizontally
   — so only the two keys sharing that axis pick up tab-switching semantics.
   All four would hand a vertical split's `Up`/`Down` a surprise nothing
   about them advertises. `h`/`l` inherit the behavior for free (§8 row 3:
@@ -3920,7 +3926,7 @@ lands somewhere surprising is worse than one that predictably does nothing.
   position still can't break — a real tab never produces one (two panes at
   the same x, collapsed-state, *and* y), but the guard costs one field and
   keeps the pick total rather than order-dependent.
-- **Wraps at both ends**, exactly like `Alt+i`/`Alt+m` (`step_tab`):
+- **Wraps at both ends**, exactly like `Alt+m`/`Alt+Shift+m` (`step_tab`):
   `next = (active_tab + delta).rem_euclid(tab_count)`. Two ways to move
   between tabs disagreeing about hitting an end would be its own bug.
 - **Only when more than one tab exists.** Below two tabs this is exactly
@@ -3952,7 +3958,7 @@ lands somewhere surprising is worse than one that predictably does nothing.
   amendment closed for mouse verbs.
 - **Persistence and PTY sizing are unremarkable.** The switch runs inside
   `App::apply`, whose trailing `relayout()`/`save()` (unconditional, after
-  every action) is exactly what `Alt+i`/`Alt+m`/`Alt+1..9` already rely on;
+  every action) is exactly what `Alt+m`/`Alt+Shift+m`/`Alt+1..9` already rely on;
   C31 adds no save/resize call of its own, so it cannot disagree with them
   about when a switch persists.
 - **`go_to_tab` is deliberately not reused for the switch itself.** It would
@@ -4541,7 +4547,15 @@ Blocked on nothing but a decision. Whichever way it goes, C24b's amendment
 and its gates stand — they pin *which* chords a mode keeps, not what a mode
 throws away on the way out.
 
-### C33 — Move a pane within its tab (`Alt+Shift+hjkl`) — [Added 2026-08-19, comparative UX review]
+### C33 — Move a pane within its tab (`Alt+Shift+hjkl`, and its arrow spellings) — [Added 2026-08-19, comparative UX review; re-keyed 2026-09-01]
+
+> **[2026-09-01 amendment, read first for the live map.]** Resize moved off
+> `Alt+Shift+arrows` to vim's Ctrl-w punctuation (`Alt+-`/`=` height,
+> `Alt+<`/`>` width — §8), and the arrows **joined** `Alt+Shift+hjkl` as
+> spellings of the same move-the-pane verb: one verb, two spellings, the
+> unification this contract's own adjacency rationale anticipated. The
+> paragraphs below describe the contract as added, when only the letters
+> carried the verb; the operation, guarantees and edge rules are unchanged.
 
 **Origin.** The comparative review against zellij / lazygit / gh dash
 (`docs/engagements/2026-08-19-comparative-ux-review/`) opened two findings
@@ -4561,10 +4575,15 @@ them had no chord at all. C33 spends them on the verb.
 **The binding, and why it is not a new idiom.** C28 already established that
 the shifted sibling *carries the pane* the way the unshifted one *carries
 you*: `Alt+i`/`Alt+m` move you between tabs, `Alt+Shift+i`/`Alt+Shift+m` move
-the focused pane there. `Alt+hjkl` moves you within a tab; `Alt+Shift+hjkl`
+the focused pane there (the spellings C28 carried until the 2026-09-01 re-key
+put the carry on `i`/`Shift+i` — see that contract's amendment).
+`Alt+hjkl` moves you within a tab; `Alt+Shift+hjkl`
 moves the pane within a tab is the same sentence on the other axis. Shifted-
 letter-carries-the-pane stops being a tab special case and becomes a rule that
-holds on both axes.
+holds on both axes. **[2026-09-01: the rule is now spelled the same way on
+both halves of the keyboard — the arrows took the verb too, and resize
+re-keyed to `-`/`=`/`<`/`>` (§8); the tab families were re-homed to
+same-letter shift-reverses.]**
 
 Both delivery forms are bound (`Char('h')` + SHIFT and bare `Char('H')`, for
 all four letters), the same tolerance C23's `Alt+P`, C27's `Alt+A` and C28's
@@ -4610,7 +4629,7 @@ documents.
 `focus_dir`.** C31 lets `Alt+←/→` continue into the next tab at a tab's edge;
 `Alt+Shift+hjkl` at an edge is a **no-op**. Three reasons. Moving a pane out of
 its tab is a structural edit rather than a look, so the recoverable failure is
-doing nothing. `Alt+Shift+i`/`Alt+Shift+m` (C28) already do exactly that job and
+doing nothing. `Alt+i`/`Alt+Shift+i` (C28) already do exactly that job and
 name it. And C31's own rule — "tabs are roost's own horizontal axis, so only
 the two keys that already share that axis pick up tab-switching semantics" —
 would give `h`/`l` a cross-tab meaning that `j`/`k` could never have, splitting
@@ -4629,12 +4648,21 @@ C22 rule 2's grounds.
 directly under `Alt+Shift+←↓↑→ resize` — the two shifted-direction chords sit
 adjacent so the one thing a reader must learn (**arrows resize, letters carry
 the pane**) is visible at a glance rather than inferred.
+**[2026-09-01: the re-key inverted the lesson this paragraph taught — arrows
+and letters now carry the pane together (row 4b spells both), and the resize
+rows above them are the punctuation `-`/`=`/`<`/`>`. The adjacency survives:
+the family still sits under the resize rows, which is now the distinction a
+reader is most likely to blur — shifted direction moves, punctuation
+resizes.]**
 
 **This is a different adjacency rule from C28's, deliberately** (caught by the
 design-supervisor audit of this contract, which found the first draft claiming
 C28's argument as its own). C28 seats a row under *its own unshifted form* —
 `Alt+Shift+i / +m` directly below `Alt+i / Alt+m`, both in `TABS` — so the
-pairing itself explains the chord. C33 cannot do that: `Alt+hjkl` is a focus
+pairing itself explains the chord. **[2026-09-01: C28's row spellings moved
+to `Alt+i / Alt+Shift+i` under `Alt+m / Alt+Shift+m` — the adjacency rule
+itself is unchanged.]**
+C33 cannot do that: `Alt+hjkl` is a focus
 verb and lives in `PANES`, while this is a layout verb and belongs in
 `LAYOUT`. What C33 seats itself under is therefore the chord it is most likely
 to be *confused with* rather than the one it derives from — the other
@@ -4858,7 +4886,7 @@ measures rather than rediscovers.
 ### C35 — Go back (`Alt+;`) — [Added 2026-08-19, comparative UX review F6]
 
 **The gap.** Every navigation chord roost had was absolute (`Alt+1..9`,
-`Alt+0`) or forward-directional (`Alt+a`, `Alt+i`/`Alt+m`, `Alt+hjkl`).
+`Alt+0`) or forward-directional (`Alt+a`, `Alt+m`, `Alt+hjkl`).
 Nothing returned you to the pane you were just on. At fleet scale the
 dominant motion is "check on B, come back to A", and `Alt+a` only ever walks
 *on* through the attention ring — on a two-pane hop it is the wrong tool, and
@@ -4869,7 +4897,11 @@ last-pane since forever; vim has `Ctrl-^`.
 available is worth recording, because this table's own §8 accounting had
 declared the pool empty. That accounting enumerated **letters**. Outside
 `Alt+/` and `Alt+?` every punctuation chord was, and mostly still is, free
-(`;` `'` `,` `.` `]` `-` `=` `` ` ``). `Alt+[` remains rejected — `ESC [` is
+(`;` `'` `,` `.` `]` `-` `=` `` ` ``). **[2026-09-01: `-` `=` and the
+`<`/`>` glyph are now bound (resize, §8's re-key), and `,`/`.` are taken in
+their SHIFT delivery only — the unshifted keys still forward as M-, / M-.;
+the list records the pool as this contract found it.]** `Alt+[` remains
+rejected — `ESC [` is
 the CSI introducer (§8) — but the rest were never counted. So F7's leader key
 is **not** a prerequisite for this contract, and the "concrete feature needs
 a chord and finds none free" trigger has not fired here.
@@ -5057,7 +5089,7 @@ behaviour each one implements.
 
 **The gap.** C25's cycle is forward-only, so the arrangement you want can be
 two presses away and there is no way to step back to the one you just left.
-Every other cycle in roost goes both ways — `Alt+i`/`Alt+m` for tabs,
+Every other cycle in roost goes both ways — `Alt+m`/`Alt+Shift+m` for tabs,
 `Tab`/`Shift+Tab` for the roster's status filter — and C28 established that a
 shifted chord is its unshifted sibling's inverse. zellij's swap-layout keys
 (`Alt+[` / `Alt+]`) are bidirectional for the same reason.
@@ -5102,7 +5134,9 @@ exceeded what the rule exists to prevent. Two rows is also the more correct pres
 adjacency rule seats a row under *its own unshifted form*, which is precisely
 what this is. The other kind of adjacency — seating a row under the chord it
 is most likely to be *confused with* — is **C33's** (`Alt+Shift+hjkl` under
-`Alt+Shift+←↓↑→`), and C33's own design audit is where the two rules were
+`Alt+Shift+←↓↑→`; since the 2026-09-01 re-key the family spells both
+`Alt+Shift+←↓↑→ / hjkl` and seats under the `-`/`=`/`<`/`>` resize rows),
+and C33's own design audit is where the two rules were
 first told apart. An earlier draft of this paragraph credited that to C36;
 corrected by this contract's audit. C15's row cap was retired in 2026-07-28
 specifically so rows need not be merged to fit; this is the first change to
@@ -5149,14 +5183,14 @@ that hands you a second dead end is worth less than silence.
 | `Alt+Shift+h/l` at a tab edge, single tab | `at the tab's edge` |
 | `Alt+Shift+j/k` at a layout edge | `nothing {above\|below} to swap with` |
 | `Alt+Shift+hjkl` on the float | `the scratch pane sits outside the layout` |
-| `Alt+s` / `Alt+o` / `Alt+Shift+arrow`, tab has one pane | `nothing to {stack\|flip\|resize}: this tab has one pane — {chord} splits it` |
-| `Alt+s` / `Alt+o` / `Alt+Shift+arrow`, shape has no such move | `nothing to {stack\|flip\|resize} here` |
+| `Alt+s` / `Alt+o` / `Alt+- = < >`, tab has one pane | `nothing to {stack\|flip\|resize}: this tab has one pane — {chord} splits it` |
+| `Alt+s` / `Alt+o` / `Alt+- = < >`, shape has no such move | `nothing to {stack\|flip\|resize} here` |
 | `Alt+1..9` past the last tab | `no tab {n}: this workspace has {n} {tab\|tabs}` |
 | `Alt+n` / picker launch, split refused | `no room to split — {side by side needs 36 columns, has 30 \| stacked needs 10 rows, has 7}` |
 
 Decisions inside that table, each load-bearing:
 
-- **The horizontal edge names `Alt+Shift+i`/`Alt+Shift+m`, resolved from the
+- **The horizontal edge names `Alt+i`/`Alt+Shift+i`, resolved from the
   live keymap, and only with somewhere to carry the pane to.** C33 declined
   the cross-tab handoff *because* those chords "already do exactly that job
   and name it" — and the moment the user needs to know that is the moment
@@ -5556,7 +5590,7 @@ same surface ("the two carve-outs are deliberately different shapes").
 rows that resist are precisely the ones nobody would drive this way:
 
 - `Chords([a])` is one verb with one outcome. Unambiguous.
-- A multi-action row — `Family` (`Alt+←↓↑→ / hjkl`, `Alt+Shift+←↓↑→`) or a
+- A multi-action row — `Family` (`Alt+←↓↑→ / hjkl`, `Alt+Shift+←↓↑→ / hjkl`) or a
   multi-action `Chords` (`previous / next tab`) — is a *direction set*.
   There is no answer to which one `↵` runs, and picking one would be the
   wrong feature anyway: those are the chords you press five times running,
@@ -5727,8 +5761,9 @@ shows only the C9-curated subsets.
 | 1 | `Alt+n` | new shell pane (auto split) | — |
 | 2 | `Alt+Enter` | quick-launch picker (pi / claude / shell) | C14 |
 | 3 | `Alt+←↓↑→ / hjkl` | move focus (`←`/`→` continue into the next/prev tab at an edge) | C31 |
-| 4 | `Alt+Shift+←↓↑→` | resize along that axis | — |
-| 4b | `Alt+Shift+hjkl` | **move this pane that way inside the tab (swaps with its neighbour)** | C33 |
+| 4 | `Alt+- / Alt+=` | **resize height: shrink / grow** (vim's Ctrl-w − / +) | — |
+| 4a | `Alt+< / Alt+>` | **resize width: shrink / grow** (vim's Ctrl-w < / >) | — |
+| 4b | `Alt+Shift+←↓↑→ / hjkl` | **move this pane that way inside the tab (swaps with its neighbour)** | C33 |
 | 5 | `Alt+s` | toggle split ⇄ stack | C6–C8 |
 | 6 | `Alt+o` | flip split orientation | — |
 | 7 | `Alt+g / Alt+Shift+g` | **cycle layout: grid / main+stack / all-stack, forward / back** | C25/C37 |
@@ -5740,8 +5775,8 @@ shows only the C9-curated subsets.
 | 11 | `Alt+e` | **activity feed (status / spawns / exits / control)** | C20 |
 | 12 | `Alt+r / Alt+Shift+r` | **edit pane (name + parking note, one dialog)** / rename tab | C32/C13 |
 | 13 | `Alt+t / Alt+1..9 / Alt+0` | new tab / go to tab / **last tab** | C2 |
-| 13b | `Alt+i / Alt+m` | **previous / next tab (wraps)** | C2 |
-| 13c | `Alt+Shift+i / Alt+Shift+m` | **move this pane to the previous / next tab (wraps)** | C28 |
+| 13b | `Alt+m / Alt+Shift+m` | **next / previous tab (wraps)** | C2 |
+| 13c | `Alt+i / Alt+Shift+i` | **move this pane to the next / previous tab (wraps)** | C28 |
 | 13d | `Alt+Shift+x / Alt+Shift+v` | **mark this pane / pull the marked pane into this tab** | C40 |
 | 14 | `Alt+w` | close pane (confirm if busy / last) | — |
 | 15 | `Alt+u` | undo — reopen last closed pane/tab | C26 |
@@ -5763,6 +5798,26 @@ use on macOS, where the unshifted arm was claiming the event first and row
 20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
 | 22 | `Alt+'` | **broadcast: type once, send to every pane (`Tab` picks who)** | C36 |
+
+[Amended 2026-09-01, the modifier-consistency re-key. Three families moved;
+the verb set is unchanged. **(1) Rows 4/4a/4b:** resize leaves
+`Alt+Shift+arrows` for vim's Ctrl-w punctuation — `-`/`=` height,
+`<`/`>` width — and the arrows join `Alt+Shift+hjkl` as spellings of the
+same move-the-pane verb, so Shift+direction now means *move the pane* on
+both halves of the keyboard. The four resize actions keep their config
+names (`resize_{horizontal,vertical}_{grow,shrink}`). **(2) Rows
+13b/13c:** the two tab families are same-letter, shift-reverse pairs,
+matching C37's `g`/`Shift+g` — `Alt+m`/`Alt+Shift+m` step next/previous
+tab, `Alt+i`/`Alt+Shift+i` carry the pane to the next/previous tab.
+`Alt+Shift+i` keeps the direction it always had (carry-previous); bare
+`i` and both `m` spellings moved, so Shift+m muscle memory for
+carry-next now lands on previous-tab — the overlay teaches the new rows
+and `roost keys` prints the effective map. **(3) Delivery twins:** bare
+`+` and `,`/`.` with SHIFT are accepted as the `=`/`<`/`>` spellings (the
+row-20 rule), the unshifted `,`/`.`/`_` stay free so readline's M-, M-.
+M-_ keep reaching the pane (U5), and the `twins` closure now covers
+glyph/base pairs — which also closes the pre-existing gap where
+`{"alt+?": "disable"}` left the `('/')+SHIFT` delivery of Alt+? live.]
 
 [Amended 2026-08-19, C34: this table is still the canonical *list* of what
 roost binds by default, but it is no longer what the chrome *prints*. The
@@ -5804,7 +5859,10 @@ asymmetrically with `Alt+PgUp` = scroll mode. That leaves `i` and `m`,
 assigned alphabetically — i before m, previous before next.
 The overlay (C15) absorbs both rows within its ≤20 cap by merging
 `Alt+c`/`Alt+PgUp` (the two look-back modes) and `Alt+/`/`Alt+?` (the two
-help toggles) into one row each.]
+help toggles) into one row each.
+[2026-09-01: i and m were later re-assigned by the modifier-consistency
+re-key — `m`/`Shift+m` step the strip, `i`/`Shift+i` carry the pane; see
+that amendment above.]
 
 [Amended 2026-08-27, C40 — the `v`/`x` reservation, spent.] `Alt+Shift+x`
 and `Alt+Shift+v` are mark-pane and pull-pane (row 13d). That *is* the
@@ -5918,7 +5976,9 @@ Free Alt keys remaining after this engagement: `b d p v x y PgDn`
 (`i m 0` were taken by U7, 2026-07-27).
 [Amended 2026-07-28, C28] Row 13c costs the **unshifted** pool nothing: it
 spends `Alt+Shift+i`/`Alt+Shift+m`, the shifted siblings of row 13b, so the
-free list above is unchanged. That is the fourth use of the shifted-sibling
+free list above is unchanged. [2026-09-01: row 13c now spends
+`Alt+i`/`Alt+Shift+i` (§8's re-key); the pool is unchanged either way.] That
+is the fourth use of the shifted-sibling
 idiom (`Alt+Shift+r` renames the tab its unshifted form's pane belongs to,
 `Alt+Shift+a` lists the fleet its unshifted form jumps through,
 `Alt+Shift+p` has no unshifted twin by C23's design) and the tightest

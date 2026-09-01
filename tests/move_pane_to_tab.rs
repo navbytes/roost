@@ -1,11 +1,14 @@
-//! C28, end to end: `Alt+Shift+m` carries the focused pane into the next tab
+//! C28, end to end: `Alt+i` carries the focused pane into the next tab
 //! and takes focus with it — **without restarting the process running in it**.
 //!
 //! A unit test can prove the layout trees changed hands. Only a real PTY can
-//! prove the chord survives terminal delivery (`ESC` + uppercase `M`, no kitty
-//! disambiguation), that the shell in the moved pane is the *same* shell
-//! afterwards, and that `roost list` — an independent process reading the
-//! control socket — agrees about which tab the pane now lives in.
+//! prove the chord survives terminal delivery (`ESC` + `i`, the plain
+//! meta-ESC printable shape U5 forwards — no kitty disambiguation), that the
+//! shell in the moved pane is the *same* shell afterwards, and that
+//! `roost list` — an independent process reading the control socket —
+//! agrees about which tab the pane now lives in. (The re-key of 2026-09-01
+//! moved this verb off `Alt+Shift+M`, whose `ESC` + uppercase `M` delivery
+//! this test used to pin.)
 
 // The shared harness is compiled per test binary; helpers other tenants use
 // are dead code from this binary's view — not real rot.
@@ -15,11 +18,12 @@ mod harness;
 use std::process::Command;
 use std::time::Duration;
 
-/// `Alt+Shift+m` as a terminal delivers it: ESC + uppercase `M`. (Like
-/// `Alt+Shift+a`, and unlike C23's `ESC`+`P`, this pair introduces nothing —
-/// no DCS-style ambiguity. `ESC [` would have, which is why `Alt+]` was
-/// rejected for this verb; see §8.)
-const ALT_SHIFT_M: &[u8] = b"\x1bM";
+/// `Alt+i` as a terminal delivers it: ESC + `i` — the same meta-ESC shape
+/// readline's M-b arrives in, introducing nothing on the wire. (The brief
+/// for this verb's first spelling, `ESC [` via `Alt+]`, was rejected for
+/// exactly the CSI-collision reason §8 records; `ESC i` has no such
+/// ambiguity.)
+const ALT_I: &[u8] = b"\x1bi";
 
 /// Control-plane ground truth: `(tab index, focused)` for pane `id`.
 fn pane_tab(state_dir: &std::path::Path, id: u64) -> Option<(u64, bool)> {
@@ -37,7 +41,7 @@ fn pane_tab(state_dir: &std::path::Path, id: u64) -> Option<(u64, bool)> {
 }
 
 #[test]
-fn alt_shift_m_moves_the_focused_pane_into_the_next_tab_without_restarting_it() {
+fn alt_i_carries_the_focused_pane_into_the_next_tab_without_restarting_it() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
     let Some(mut h) = harness::spawn_or_skip("move-pane e2e", &harness::two_tabs(cwd)) else {
@@ -65,7 +69,7 @@ fn alt_shift_m_moves_the_focused_pane_into_the_next_tab_without_restarting_it() 
     );
 
     // -- move it ------------------------------------------------------------
-    h.write_bytes(ALT_SHIFT_M);
+    h.write_bytes(ALT_I);
     assert!(
         h.wait_for(Duration::from_secs(5), |s| pane_tab(&sd, 1).is_some_and(|(t, _)| t == 0)
             && s.contents().contains("1 api"))

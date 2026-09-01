@@ -1453,25 +1453,32 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "LAYOUT",
         rows: &[
             family(
-                "Alt+Shift+←↓↑→",
+                "Alt+- / Alt+=",
+                &[
+                    Action::Resize { horizontal: false, grow: false },
+                    Action::Resize { horizontal: false, grow: true },
+                ],
+                "resize height: shrink / grow (vim's Ctrl-w − / +)",
+            ),
+            family(
+                "Alt+< / Alt+>",
                 &[
                     Action::Resize { horizontal: true, grow: false },
-                    Action::Resize { horizontal: false, grow: true },
-                    Action::Resize { horizontal: false, grow: false },
                     Action::Resize { horizontal: true, grow: true },
                 ],
-                "resize along that axis",
+                "resize width: shrink / grow (vim's Ctrl-w < / >)",
             ),
-            // C33 sits directly under the resize row on purpose: the two
-            // shifted-direction chords are adjacent, so the one thing a
-            // reader has to learn — arrows resize, letters carry the pane —
-            // is visible in a single glance rather than inferred. This is a
-            // *different* criterion from C28's adjacency in TABS (which
-            // seats a row under its own unshifted form): C33 seats itself
-            // under the chord it is most likely to be confused with. Same
-            // tactic, different rule — see C33 in DESIGN-ui.md.
+            // The move-pane family sits directly under the resize rows on
+            // purpose — C33's adjacency rule survives the 2026-09-01 re-key
+            // intact. What changed is the lesson it makes visible: the
+            // shifted directions (arrows and hjkl alike) all *move the
+            // pane*, one verb in two spellings, while the punctuation above
+            // them *resizes* — the distinction a reader is most likely to
+            // blur is still one glance apart. Same tactic as C28's
+            // adjacency in TABS, which seats a row under its own unshifted
+            // form; here the family is its own unshifted form's sibling.
             family(
-                "Alt+Shift+hjkl",
+                "Alt+Shift+←↓↑→ / hjkl",
                 &[
                     Action::MovePane(Dir::Left),
                     Action::MovePane(Dir::Down),
@@ -1518,16 +1525,24 @@ const HELP_GROUPS: &[HelpGroup] = &[
                 ],
                 "go to that tab / the last one",
             ),
-            chords(&[Action::PrevTab, Action::NextTab], "previous / next tab (wraps)"),
-            // C28: the shifted siblings sit directly under the chords they
-            // are the shifted form of — the pairing *is* the explanation.
+            // The two tab families, re-homed by the 2026-09-01 map
+            // amendment: same-letter, shift-reverse pairs, like C37's
+            // `g`/`Shift+g` — `m` steps your view between tabs, `i` carries
+            // the pane to the tab. The carry row sits directly under the
+            // step row: the adjacency is still the explanation, C28's rule
+            // kept even as the spellings moved.
             family(
-                "Alt+Shift+i / +m",
+                "Alt+m / Alt+Shift+m",
+                &[Action::NextTab, Action::PrevTab],
+                "next / previous tab (wraps)",
+            ),
+            family(
+                "Alt+i / Alt+Shift+i",
                 &[
-                    Action::MovePaneToTab { forward: false },
                     Action::MovePaneToTab { forward: true },
+                    Action::MovePaneToTab { forward: false },
                 ],
-                "move this pane to the previous / next tab",
+                "move this pane to the next / previous tab",
             ),
             // C40 sits under C28 for the same reason C28 sits under the
             // chords it shifts: it is the same verb, for a destination too
@@ -4941,11 +4956,13 @@ mod tests {
         assert!(drawn.contains("Alt+b"), "the real chord is named instead");
     }
 
-    /// C28's pair is documented as a pair, directly under the chords it is
-    /// the shifted form of — the adjacency *is* the explanation ("shift
-    /// makes the tab chord take the pane with you").
+    /// The two tab families are documented as adjacent pairs — the step row
+    /// (`m`/`Shift+m`) with the carry row (`i`/`Shift+i`) directly under it.
+    /// C28's rule survives the 2026-09-01 re-key: the adjacency *is* the
+    /// explanation ("the i-family carries the pane the way the m-family
+    /// carries you").
     #[test]
-    fn the_tabs_group_teaches_the_move_pane_chords_under_their_unshifted_siblings() {
+    fn the_tabs_group_teaches_the_carry_chords_under_the_tab_steps() {
         // F1: rows resolve their key column from the keymap, so this walks
         // the drawn lines rather than the const table — which is also the
         // stronger check: adjacency in the *table* would not prove adjacency
@@ -4957,11 +4974,10 @@ mod tests {
             .iter()
             .filter_map(|r| super::help_key_text(&r.key, r.desc, &bindings))
             .collect();
-        let step = keys.iter().position(|k| k == "Alt+i / Alt+m").expect("the step row");
-        let move_row =
-            keys.iter().position(|k| k.starts_with("Alt+Shift+i")).expect("the move row");
-        assert_eq!(move_row, step + 1, "the shifted pair sits directly under the unshifted one");
-        assert!(tabs.rows[move_row].desc.contains("move this pane"));
+        let step = keys.iter().position(|k| k == "Alt+m / Alt+Shift+m").expect("the step row");
+        let carry = keys.iter().position(|k| k.starts_with("Alt+i /")).expect("the carry row");
+        assert_eq!(carry, step + 1, "the carry pair sits directly under the step pair");
+        assert!(tabs.rows[carry].desc.contains("move this pane"));
     }
 
     /// U23: the legend is the C5 glyph table, not a hand-copied lookalike —
