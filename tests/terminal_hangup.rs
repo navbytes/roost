@@ -65,12 +65,17 @@ fn closing_the_tab_takes_roost_and_its_fleet_with_it() {
     .expect("seed workspace.json");
 
     let (mut master, mut slave) = (0i32, 0i32);
-    let ws = libc::winsize { ws_row: 30, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 };
+    // `openpty`'s last two parameters are `*const` on glibc and `*mut` on
+    // the BSDs (macOS included), so a `*const` argument compiles on Linux and
+    // breaks the macOS half of the CI matrix. `*mut` satisfies both: Rust
+    // coerces `*mut T` to `*const T` at a call site, never the reverse.
+    let mut ws = libc::winsize { ws_row: 30, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 };
+    let ws_ptr: *mut libc::winsize = &mut ws;
     // SAFETY: `master`/`slave` are plain out-params on the stack and `ws` is
     // a fully-initialized, valid `winsize` — the documented `openpty(3)`
     // contract.
     let opened = unsafe {
-        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws)
+        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), ws_ptr)
     };
     if opened != 0 {
         eprintln!("SKIP terminal-hangup gate: no pty available on this host");
@@ -119,7 +124,12 @@ fn closing_the_tab_takes_roost_and_its_fleet_with_it() {
     unsafe {
         cmd.pre_exec(move || {
             libc::setsid();
-            if libc::ioctl(slave, libc::TIOCSCTTY, 0) < 0 {
+            // `TIOCSCTTY` is already `c_ulong` on Linux but `u32` on macOS,
+            // where `ioctl` still wants `c_ulong`. `from` widens where it
+            // must and is the identity where it need not, which a plain
+            // `as` cast could not be without tripping `trivial_numeric_casts`
+            // on the platform that needs no cast at all.
+            if libc::ioctl(slave, libc::c_ulong::from(libc::TIOCSCTTY), 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
