@@ -393,6 +393,50 @@ fn keys_reports_bad_config_entries_on_stderr_and_exits_nonzero() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The exit code answers **"did roost have to skip something?"** — nothing
+/// weaker. A remap that displaces a bound default is the ordinary use of
+/// the escape hatch: roost did exactly what the file asked, so the gate a
+/// dotfile puts on this command must stay green.
+///
+/// This is a regression test with a specific regression behind it. When the
+/// displacement notice was first added it went into the same vector the
+/// exit code reads, and `{"alt+w": "new_pane"}` — a valid one-line config —
+/// started exiting 2 with nothing skipped, breaking every dotfile that
+/// remaps a bound chord.
+#[test]
+fn keys_exits_zero_for_a_config_that_merely_displaces_a_default() {
+    let dir = state_with_config("displace", Some(r#"{"keys": {"alt+w": "new_pane"}}"#));
+    let o = keys_in(&dir);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "nothing was skipped, so the gate stays green — stderr: {}",
+        err(&o),
+    );
+    // Silent it is not: the notice is still worth reading, it simply does
+    // not set the exit code.
+    assert!(
+        err(&o).contains("replaces default close_pane"),
+        "the notice still reaches stderr: {}",
+        err(&o),
+    );
+    assert!(out(&o).contains("Alt+w\tnew_pane"), "and the table shows the remap:\n{}", out(&o));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ...and a swap says nothing at all, because nothing lost its chord.
+#[test]
+fn keys_is_silent_for_a_swap_that_orphans_nothing() {
+    let dir = state_with_config(
+        "swap",
+        Some(r#"{"keys": {"alt+w": "new_pane", "alt+n": "close_pane"}}"#),
+    );
+    let o = keys_in(&dir);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", err(&o));
+    assert!(err(&o).is_empty(), "a swap orphans nothing, so it says nothing: {}", err(&o));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Same conventions as every other verb: `--help` on stdout at exit 0, an
 /// unexpected argument is a usage error rather than being silently dropped.
 #[test]

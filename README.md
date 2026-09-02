@@ -186,8 +186,10 @@ is rejected, deliberately), and `<key>` is one character (`alt+f`, `alt+3`,
 `alt+/`) or a named key: `enter`, `pageup`, `up`, `down`, `left`, `right`
 (`alt+enter`, `alt+pageup`, …).
 
-A value is `"disable"` (the chord passes straight through to the pane, like
-an unbound key) or a snake_case `Action` name — **`roost keys` prints every
+A value is `"disable"` (the chord passes straight through to the pane — the
+bytes a terminal sends for it, `ESC f` for `Alt+f`, `ESC ESC [ D` for
+`Alt+←`, so a shell that binds `Alt+←` to word motion gets it back) or a
+snake_case `Action` name — **`roost keys` prints every
 one of them**, alongside the chord it is currently on:
 
 ```console
@@ -200,7 +202,12 @@ Alt+1	go_to_tab_1
 It reads `config.json` directly and needs no running roost, so it answers
 before you launch: remapped and disabled chords are marked `config.json`, and
 an entry roost had to skip is named on stderr with a non-zero exit — so a
-dotfile test can gate on it instead of you catching a startup toast.
+dotfile test can gate on it instead of you catching a startup toast. Only a
+*skipped* entry sets that exit code. Rebinding a chord that already had a
+default is ordinary use, not a failure: it exits 0, and stderr says so only
+when the displaced action is left with no chord at all — a swap like
+`{"alt+w": "new_pane", "alt+n": "close_pane"}` is silent, because neither
+action lost its way in.
 **`Alt+?` is also the command palette.** Press `/` inside it and the keymap
 becomes a picker: type to narrow, `↑`/`↓` to choose, `↵` to run the row —
 no need to dismiss the overlay and remember the chord. The rows it can run
