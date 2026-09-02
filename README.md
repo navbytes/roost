@@ -181,6 +181,11 @@ file — the default — and roost behaves exactly as documented above.
 { "keys": { "alt+f": "disable", "alt+v": "toggle_float" } }
 ```
 
+A chord is `alt+<key>` or `alt+shift+<key>` — nothing else parses (`ctrl+f`
+is rejected, deliberately), and `<key>` is one character (`alt+f`, `alt+3`,
+`alt+/`) or a named key: `enter`, `pageup`, `up`, `down`, `left`, `right`
+(`alt+enter`, `alt+pageup`, …).
+
 A value is `"disable"` (the chord passes straight through to the pane, like
 an unbound key) or a snake_case `Action` name — **`roost keys` prints every
 one of them**, alongside the chord it is currently on:

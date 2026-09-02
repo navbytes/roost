@@ -3859,6 +3859,28 @@ mod tests {
         );
     }
 
+    /// F1, pinned at the bar itself: every Alt chord on the footer is
+    /// resolved from the live keymap, so a config.json remap moves the bar
+    /// too — the chord that replaced a default takes the pair over, and the
+    /// displaced chord (disabled here) never teaches itself.
+    #[test]
+    fn hint_pairs_name_the_chord_the_live_keymap_binds_not_the_displaced_default() {
+        let (keymap, diagnostics) = Keymap::parse(
+            r#"{"keys": {"alt+w": "disable", "alt+x": "close_pane"}}"#,
+            "config.json",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pairs = super::hint_pairs(&Mode::Normal, false, false, false, false, false, &keymap);
+        assert!(
+            !pairs.iter().any(|(k, _)| k.contains("Alt+w")),
+            "the displaced default chord is off the bar: {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("Alt+x".to_string(), "close")),
+            "the live chord carries the pair: {pairs:?}"
+        );
+    }
+
     /// U6, the live-QA case that started it: at 120 columns with the
     /// needs-you segment up (`◆ 1 needs you · Alt+a  NORMAL `, 30 cols),
     /// the bar used to drop `Alt+? keys` — the discoverability pointer —

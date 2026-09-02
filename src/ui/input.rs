@@ -663,7 +663,10 @@ impl Keymap {
     /// a repeated JSON key the same way (documented in README). A chord
     /// with more than one terminal-delivery encoding (`twins`) is disabled
     /// or remapped on *every* encoding at once — never just the one the
-    /// entry happened to name.
+    /// entry happened to name. Rebinding a chord that already carries a
+    /// different default action is legal — it displaces that default — and
+    /// says so in the diagnostics, since the displaced action may lose its
+    /// only chord.
     pub fn parse(raw: &str, source: &str) -> (Keymap, Vec<String>) {
         let mut diagnostics = Vec::new();
         let value: serde_json::Value = match serde_json::from_str(raw) {
@@ -697,6 +700,14 @@ impl Keymap {
                     }
                     match action_by_name(action_str) {
                         Some(action) => {
+                            if let Some(old) =
+                                default_keymap().get(&chord).filter(|old| **old != action)
+                            {
+                                diagnostics.push(format!(
+                                    "{source}: {chord_str:?}: replaces default {}",
+                                    action_name(old)
+                                ));
+                            }
                             for t in twins(chord.code, chord.shift) {
                                 keymap.overrides.insert(t, Override::Bound(action));
                             }
@@ -1906,7 +1917,10 @@ mod tests {
     #[test]
     fn a_chord_remapped_to_a_different_action_stops_producing_its_old_one() {
         let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+g": "quit"}}"#, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().all(|d| d.contains("replaces default cycle_layout")),
+            "the only diagnostics are the displacement notices: {diagnostics:?}"
+        );
         assert!(matches!(
             translate_with(alt(KeyCode::Char('g')), &keymap),
             InputResult::Action(Action::Quit)
@@ -1917,6 +1931,27 @@ mod tests {
         ));
     }
 
+    /// A bind that takes a chord away from its default action names the
+    /// displaced default — informational only, never a rejection (the
+    /// binding applies). A chord with no default binding stays silent:
+    /// nothing was displaced.
+    #[test]
+    fn a_displacing_bind_names_the_default_it_replaces_and_binds_anyway() {
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+w": "new_pane"}}"#, "config.json");
+        assert_eq!(
+            diagnostics,
+            vec![r#"config.json: "alt+w": replaces default close_pane"#.to_string()],
+        );
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('w')), &keymap),
+            InputResult::Action(Action::NewPane)
+        ));
+
+        let (_, diagnostics) = Keymap::parse(r#"{"keys": {"alt+x": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "alt+x has no default to displace: {diagnostics:?}");
+    }
+
     /// A chord listed twice keeps only its last value (README) — inherited
     /// for free from `serde_json`, which already collapses a repeated JSON
     /// key to its last-written one.
@@ -1924,7 +1959,10 @@ mod tests {
     fn a_chord_listed_twice_keeps_only_the_last_value() {
         let json = r#"{"keys": {"alt+g": "quit", "alt+g": "toggle_zoom"}}"#;
         let (keymap, diagnostics) = Keymap::parse(json, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().all(|d| d.contains("replaces default cycle_layout")),
+            "the surviving entry's displacement notice, once: {diagnostics:?}"
+        );
         assert!(matches!(
             translate_with(alt(KeyCode::Char('g')), &keymap),
             InputResult::Action(Action::ToggleZoom)
@@ -2058,7 +2096,10 @@ mod tests {
     fn remapping_a_shifted_vim_letter_reaches_both_delivery_forms() {
         let (keymap, diagnostics) =
             Keymap::parse(r#"{"keys": {"alt+shift+h": "quit"}}"#, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().all(|d| d.contains("replaces default move_pane_left")),
+            "the only diagnostics are the displacement notices: {diagnostics:?}"
+        );
         assert_eq!(
             translate_with(alt_shift(KeyCode::Char('h')), &keymap),
             InputResult::Action(Action::Quit),
@@ -2362,7 +2403,10 @@ mod tests {
     #[test]
     fn remapping_a_twinned_chord_moves_every_delivery_form() {
         let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+A": "quit"}}"#, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().all(|d| d.contains("replaces default toggle_roster")),
+            "the only diagnostics are the displacement notices: {diagnostics:?}"
+        );
         // Both delivery forms of the shifted chord (default: ToggleRoster)
         // now quit instead...
         assert!(matches!(

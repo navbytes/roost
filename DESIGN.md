@@ -97,7 +97,7 @@ enum LayoutNode {
 
 **The workspace file** is the whole product, morally:
 
-`~/.local/state/roost/workspace.json` on Linux; `~/Library/Application Support/roost/workspace.json` on macOS, which has no XDG state dir (state, not config — the planned `~/.config/roost/config.toml` is still unbuilt; roost is zero-config)
+`~/.local/state/roost/workspace.json` on Linux; `~/Library/Application Support/roost/workspace.json` on macOS, which has no XDG state dir (state, not config — the one escape hatch, `config.json` beside it, holds keybindings only; the generic TOML adapter is still unbuilt; roost is otherwise zero-config)
 
 ```jsonc
 {
@@ -291,7 +291,7 @@ Each milestone is independently usable; stop anywhere and still have a tool.
 - **M2 ✓ — persistence + resume**: workspace.json, atomic debounced saves, restore-on-launch with the pi adapter (`--session`). Session detection via session-dir diffing (works before the extension exists). **← daily-driver threshold for the reboot story**
 - **M3 ✓ — status**: heuristic detector + the roost pi extension over the unix socket; border colors, badges, bell on NeedsInput. **← the v1 bar from the interview**
 - **M4 ✓ — stacked panes**: stack node, collapsed title bars, stack navigation. Fleet-at-a-glance.
-- **M5 ✓ — polish**: claude adapter, quick-launch picker, macOS notifications. Floating panes landed later as the `Alt+f` scratch shell; the config file and the generic TOML adapter are still unbuilt — roost is deliberately zero-config (see [ROADMAP.md](ROADMAP.md)).
+- **M5 ✓ — polish**: claude adapter, quick-launch picker, macOS notifications. Floating panes landed later as the `Alt+f` scratch shell; the config file shipped as `config.json` — keybindings only, read once at startup; the generic TOML adapter is still unbuilt — roost is otherwise deliberately zero-config (see [ROADMAP.md](ROADMAP.md)).
 
 Risk notes: vt100 fidelity is the main unknown (agents use rich TUIs — pi and Claude Code both redraw aggressively). Mitigation: M0 exists precisely to stress this early; if `vt100` falls short, wezterm's `termwiz` is the upgrade path. Second risk: `NeedsInput` semantics differ per tool ("turn ended" vs "explicit question") — the adapter owns that interpretation, so wrongness stays local.
 
