@@ -186,9 +186,25 @@ is rejected, deliberately), and `<key>` is one character (`alt+f`, `alt+3`,
 `alt+/`) or a named key: `enter`, `pageup`, `up`, `down`, `left`, `right`
 (`alt+enter`, `alt+pageup`, …).
 
-A value is `"disable"` (the chord passes straight through to the pane — the
-bytes a terminal sends for it, `ESC f` for `Alt+f`, `ESC ESC [ D` for
-`Alt+←`, so a shell that binds `Alt+←` to word motion gets it back) or a
+**What `"disable"` sends.** roost reads *parsed* key events, not the byte
+stream, so `Alt+←` arrives identically whether your terminal spells it
+`ESC [1;3D` or `ESC ESC [ D` — roost cannot replay what it never saw, and has
+to pick one spelling to forward. It picks **meta-ESC**, the same convention
+every forwarded Alt chord already uses: `ESC f` for `Alt+f`, `ESC ESC [ D`
+for `Alt+←`, `ESC CR` for `Alt+↵`. So this gives word motion back to a shell
+that binds the meta-ESC form:
+
+```json
+{ "keys": { "alt+left": "disable", "alt+right": "disable" } }
+```
+
+and `Alt+h` / `Alt+l` still move focus between panes — the arrows and the vim
+letters are separate bindings, so disabling one spelling keeps the other.
+If your shell only binds the CSI form, add the meta-ESC one next to it —
+`bindkey "^[^[[D" backward-word` (zsh) or `"\e\e[D": backward-word`
+(`~/.inputrc`).
+
+A value is `"disable"` (the chord passes straight through to the pane) or a
 snake_case `Action` name — **`roost keys` prints every
 one of them**, alongside the chord it is currently on:
 

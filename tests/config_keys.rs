@@ -53,3 +53,59 @@ fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
 
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }
+
+/// Alt+Left as a modern terminal delivers it: the xterm CSI-modifier form,
+/// `CSI 1;3D` (modifier 3 = alt).
+const ALT_LEFT_CSI: &[u8] = b"\x1b[1;3D";
+
+/// The reported need: "I rely on Opt+arrow to move the cursor by words."
+/// `disable` has to actually hand the key to the pane for that to work — and
+/// until 2026-09-02 it did not: a disabled non-`Char` chord was *swallowed*,
+/// so the chord reached neither roost nor the shell. A key that vanishes is
+/// the worst of the three possible outcomes, and it was the one `disable`
+/// produced on exactly the chords the keyword exists to give back.
+///
+/// This needs a PTY rather than a unit test because the interesting part is
+/// the whole path: a real terminal's bytes in, crossterm's parse, the
+/// override lookup, and the re-encode out into a live shell.
+///
+/// **What it pins, precisely.** roost reads parsed `KeyEvent`s
+/// (`crossterm::event::read`), never the byte stream, so it cannot replay
+/// what arrived — Alt+Left reaches it identically whether the terminal sent
+/// `CSI 1;3D` or `ESC ESC [ D`, and it must therefore *choose* an encoding.
+/// It chooses meta-ESC, the same convention every other forwarded Alt chord
+/// already uses (`ESC f` for Alt+f, two tests above), so `disable` speaks one
+/// language rather than two. A shell binding the other spelling wants
+/// `bindkey "^[[1;3D"` as well — documented in the README, and the reason
+/// this test asserts the exact bytes instead of merely "something arrived".
+#[test]
+fn a_disabled_alt_arrow_is_handed_to_the_pane_rather_than_swallowed() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let config = serde_json::json!({ "keys": { "alt+left": "disable", "alt+right": "disable" } })
+        .to_string();
+    let Some(mut h) =
+        harness::spawn_or_skip_with_config("disabled arrows", &harness::one_pane(cwd), &config)
+    else {
+        return;
+    };
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+    assert!(
+        h.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 main")).is_some(),
+        "roost never drew its tab bar",
+    );
+
+    // `cat -v` renders control bytes literally, so the pane's own view of
+    // what arrived is on screen — no guessing from behaviour.
+    h.write_bytes(b"cat -v\r");
+    h.settle(Duration::from_secs(2));
+    h.write_bytes(ALT_LEFT_CSI);
+    h.write_bytes(b"\r");
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[^[[D")).is_some(),
+        "a disabled Alt+Left never reached the shell — it was swallowed:\n{}",
+        h.screen().contents(),
+    );
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
