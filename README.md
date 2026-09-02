@@ -204,6 +204,15 @@ If your shell only binds the CSI form, add the meta-ESC one next to it —
 `bindkey "^[^[[D" backward-word` (zsh) or `"\e\e[D": backward-word`
 (`~/.inputrc`).
 
+The one exception is a pane that negotiated the **kitty keyboard protocol**
+(most modern TUIs do). Asking for disambiguation is asking to be told which
+modifiers were held, and meta-ESC cannot say — `ESC ESC [ D` is the same
+bytes with or without Alt. Those panes get the CSI form (`ESC [1;3D`)
+instead, so no shell-side binding is needed. It is the only case where roost
+picks the encoding rather than defaulting to meta-ESC, and the only one
+where it can do so without guessing, because the pane declared what it
+wants.
+
 A value is `"disable"` (the chord passes straight through to the pane) or a
 snake_case `Action` name — **`roost keys` prints every
 one of them**, alongside the chord it is currently on:
