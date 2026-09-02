@@ -1487,7 +1487,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
                 ],
                 "move this pane that way (swaps with its neighbour)",
             ),
-            chords(&[Action::StackPane], "stack this pane (collapses its split; it expands)"),
+            chords(&[Action::StackPane], "stack this pane (repeat to collapse further out)"),
             chords(&[Action::ExplodeStack], "explode the stack around this pane into a split"),
             chords(&[Action::FlipSplit], "flip this split's orientation"),
             chords(

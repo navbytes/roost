@@ -3945,16 +3945,46 @@ impl<B: PaneBackend> App<B> {
             Action::StackPane => {
                 let focused = self.focused;
                 let before = self.ws.active_tab().layout.clone();
-                let refused = !layout::stack_pane(&mut self.ws.active_tab_mut().layout, focused)
-                    && layout::pane_is_stacked(&self.ws.active_tab().layout, focused);
-                if refused {
-                    // C38: an already-stacked pane is a different refusal
-                    // from "one pane" and names the way out — the explode
-                    // half of the old toggle, now on its own chord.
+                let took_a_rung = layout::stack_pane(&mut self.ws.active_tab_mut().layout, focused);
+                // C42: the ladder can now collapse a whole tab into one
+                // stack, and a stack costs about a row per member — so on a
+                // small enough terminal a rung can ask for more rows than
+                // exist, and `compute_rects` answers with empty rects:
+                // panes still running, still holding a PTY, drawing nothing.
+                // No chord may do that, so a rung that would is rolled back
+                // and refused in `flash_no_room`'s existing vocabulary. The
+                // check is drawability, NOT `arrangement_fits` — the latter
+                // is a comfort floor that a legitimately tight terminal
+                // fails while rendering perfectly (a 4-member stack at
+                // 36x10), and refusing there would break the common case to
+                // guard the rare one. `cycle_layout` needs no such guard:
+                // its own `arrangement_fits` check excludes these shapes as
+                // a side effect.
+                let area = self.body_area();
+                let undrawable = took_a_rung
+                    && !layout::every_pane_is_drawable(&self.ws.active_tab().layout, area);
+                if undrawable {
+                    // Roll the rung back rather than returning early: this
+                    // arm falls through to `apply`'s tail (`relayout` +
+                    // `save`), which every other arm relies on.
+                    self.ws.active_tab_mut().layout = before.clone();
+                }
+                let refused =
+                    !took_a_rung && layout::pane_is_stacked(&self.ws.active_tab().layout, focused);
+                if undrawable {
+                    self.set_flash("no room to stack: this tab has more panes than rows");
+                } else if refused {
+                    // C38 + C42: this refusal now means one specific thing.
+                    // Since the collapse climbs, a stack with a split still
+                    // above it gets absorbed rather than refused — so the
+                    // only way to land here is a stack that already holds
+                    // the whole tab. The old wording ("already stacked")
+                    // was true of every rung and so named none of them;
+                    // this names the ceiling, and still names the way out.
                     let explode = self.chord_clause(Action::ExplodeStack, |c| {
                         format!(" — {c} explodes it back into a split")
                     });
-                    self.set_flash(format!("already stacked{explode}"));
+                    self.set_flash(format!("the whole tab is one stack{explode}"));
                 } else {
                     self.flash_if_layout_unchanged(&before, "stack");
                 }
@@ -12450,7 +12480,7 @@ pub(crate) mod tests {
     fn inv_check_node(node: &LayoutNode, ctx: &str, tab: usize) {
         match node {
             LayoutNode::Pane(_) => {}
-            LayoutNode::Stack { children, expanded } => {
+            LayoutNode::Stack { children, expanded, .. } => {
                 // >= 2, not merely non-empty (C6, clarified 2026-08-20): a
                 // stack of one is a pane, and `layout.rs` normalizes it into
                 // one wherever it can arise. The weaker assertion let the
@@ -15409,6 +15439,89 @@ pub(crate) mod tests {
         assert!(app.flash().is_none(), "explode on a real stack: {:?}", app.flash());
     }
 
+    /// C42's guard: a rung that would leave a pane with no pixels is rolled
+    /// back and says so. A pane in that state still has its process and its
+    /// PTY — it is simply gone from the screen — so this is the one outcome
+    /// the ladder must never produce, however small the terminal.
+    #[test]
+    fn a_rung_that_would_leave_a_pane_undrawable_is_rolled_back_and_says_so() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.on_resize(Size::new(40, 12), (0, 0)); // small, but a legal terminal
+        for _ in 0..15 {
+            app.apply(Action::NewPane);
+        }
+        // Climb until something stops it — either the ceiling or the guard.
+        let mut last = String::new();
+        for _ in 0..20 {
+            app.flash = None;
+            let before = format!("{:?}", app.ws.tabs[0].layout);
+            app.apply(Action::StackPane);
+            if let Some(f) = app.flash() {
+                last = f.to_string();
+                assert_eq!(
+                    format!("{:?}", app.ws.tabs[0].layout),
+                    before,
+                    "a refused rung must leave the tree exactly as it found it",
+                );
+                break;
+            }
+        }
+        assert!(!last.is_empty(), "the climb never stopped");
+
+        // Whatever stopped it, the invariant that matters holds: every pane
+        // in the tab is still drawable.
+        assert!(
+            layout::every_pane_is_drawable(&app.ws.tabs[0].layout, app.body_area()),
+            "the ladder left a pane with no pixels: {last}",
+        );
+        assert!(
+            last.starts_with("no room to stack") || last.starts_with("the whole tab is one stack"),
+            "and it said which of the two stopped it: {last}",
+        );
+    }
+
+    /// C42 at the `apply` level: `Alt+s` held down climbs rung by rung and
+    /// stays quiet the whole way, then says what stopped it. The old
+    /// wording ("already stacked") fired on the *first* rung, so this test
+    /// is as much about the presses that must NOT flash as the one that
+    /// must.
+    #[test]
+    fn holding_the_stack_chord_climbs_quietly_and_names_the_ceiling_once() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // four panes, nested splits
+
+        // Every rung that does something is silent. The tab has four panes,
+        // so there are at most three; the loop stops at the first refusal.
+        let mut rungs = 0;
+        loop {
+            app.flash = None;
+            app.apply(Action::StackPane);
+            if app.flash().is_some() {
+                break;
+            }
+            rungs += 1;
+            assert!(rungs <= 4, "the ladder never reached a ceiling — it must terminate");
+        }
+        assert!(rungs >= 2, "only {rungs} rung(s) — the climb is the whole point of C42");
+
+        // ...and the one flash names the ceiling and the way out of it.
+        let flash = app.flash().expect("the ceiling speaks").to_string();
+        assert!(flash.starts_with("the whole tab is one stack"), "{flash}");
+        let explode = app.chord_label(Action::ExplodeStack).expect("Alt+Shift+s is bound");
+        assert!(flash.contains(&explode), "it still names the way out: {flash}");
+
+        // The ceiling is real: every pane in the tab is in that one stack.
+        let ids = app.pane_order();
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Stack { children, .. } => {
+                assert_eq!(children.len(), ids.len(), "the stack holds the whole tab");
+            }
+            other => panic!("the ceiling is a stack at the root: {other:?}"),
+        }
+    }
+
     /// The composer's `Tab` must never stop on a tier it cannot deliver to.
     ///
     /// `broadcast_targets` filters `Exited` unconditionally — a pane that is
@@ -16118,7 +16231,7 @@ pub(crate) mod tests {
                 },
             );
         }
-        let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
         let ws = Workspace {
             version: 1,
             active_tab: 0,
@@ -16130,7 +16243,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleZoom);
 
         match &app.ws.tabs[0].layout {
-            LayoutNode::Stack { expanded, children } => assert_eq!(children[*expanded], 3),
+            LayoutNode::Stack { expanded, children, .. } => assert_eq!(children[*expanded], 3),
             other => panic!("expected a stack, got {other:?}"),
         }
         assert!(app.zoomed());
@@ -16402,7 +16515,11 @@ pub(crate) mod tests {
                         ratios: vec![0.5, 0.5],
                         children: vec![
                             LayoutNode::Pane(20),
-                            LayoutNode::Stack { children: vec![21, 22, 23], expanded: 1 }, // 22 expanded
+                            LayoutNode::Stack {
+                                children: vec![21, 22, 23],
+                                expanded: 1,
+                                from: None,
+                            }, // 22 expanded
                         ],
                     },
                     panes: panes1,
@@ -16420,7 +16537,7 @@ pub(crate) mod tests {
         assert_eq!(app.focused, 22, "lands on the member already visible, not the topmost");
         match &app.ws.tabs[1].layout {
             LayoutNode::Split { children, .. } => match &children[1] {
-                LayoutNode::Stack { expanded, children } => {
+                LayoutNode::Stack { expanded, children, .. } => {
                     assert_eq!(
                         children[*expanded], 22,
                         "the stack's shape is untouched — still 22 expanded"

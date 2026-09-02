@@ -28,6 +28,7 @@ use std::time::Duration;
 /// spellings are the *glyph* (`ESC S`, `ESC >`), not a modifier byte —
 /// there is nowhere else to put the shift in this encoding, which is why
 /// `default_chord_action` binds both the glyph and the base+SHIFT form.
+const ALT_N: &[u8] = b"\x1bn";
 const ALT_S: &[u8] = b"\x1bs";
 const ALT_SHIFT_S: &[u8] = b"\x1bS";
 const ALT_GROW_WIDTH: &[u8] = b"\x1b>";
@@ -62,6 +63,17 @@ fn wait_for_control(h: &mut harness::Harness) -> std::path::PathBuf {
         std::thread::sleep(Duration::from_millis(100));
     }
     sd
+}
+
+/// How many panes the frame is drawing, counted by their top-left border
+/// corner — enough to watch `Alt+n` land without reaching for the control
+/// plane, and it works the same whether the panes are split or stacked.
+fn pane_count(screen: &vt100::Screen) -> usize {
+    let (rows, cols) = screen.size();
+    (0..rows)
+        .flat_map(|r| (0..cols).map(move |c| (r, c)))
+        .filter(|&(r, c)| screen.cell(r, c).map(|cell| cell.contents()) == Some("┌".to_string()))
+        .count()
 }
 
 /// The columns of the body's vertical pane borders on the widest body row —
@@ -120,6 +132,77 @@ fn alt_s_stacks_and_alt_shift_s_explodes_through_a_real_terminal() {
     assert!(
         !h.screen().contents().contains("STACK · 2 PANES"),
         "Alt+Shift+s re-stacked — it is the explode half only:\n{}",
+        h.screen().contents(),
+    );
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// C42, the reported flow, at a real terminal: four panes built with
+/// `Alt+n` the way a user builds them, then `Alt+s` pressed repeatedly from
+/// the last one. Each press must absorb one more split — the stack header
+/// counts up — and the run must end by naming its ceiling rather than
+/// refusing on the second press, which is what it did before C42.
+///
+/// The header is the right observable precisely because it is what the user
+/// sees: "STACK · N PANES" is the count going up.
+#[test]
+fn holding_alt_s_climbs_the_tab_pane_by_pane_through_a_real_terminal() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let Some(mut h) = harness::spawn_or_skip("stack ladder e2e", &harness::one_pane(cwd)) else {
+        return;
+    };
+    assert!(h.settle(Duration::from_secs(15)), "roost never drew a first frame");
+    assert!(
+        h.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 main")).is_some(),
+        "roost never drew its tab bar",
+    );
+
+    // Four panes, built as `Alt+n` builds them — nested splits, not a flat
+    // row, which is exactly the shape the one-rung collapse got stuck in.
+    for n in 2..=4 {
+        h.write_bytes(ALT_N);
+        assert!(
+            h.wait_for(Duration::from_secs(5), |s| pane_count(s) == n).is_some(),
+            "Alt+n never produced pane {n}:\n{}",
+            h.screen().contents(),
+        );
+    }
+
+    // Rung 1 — the innermost split only.
+    h.write_bytes(ALT_S);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("STACK · 2 PANES")).is_some(),
+        "the first press did not collapse the innermost split:\n{}",
+        h.screen().contents(),
+    );
+
+    // Rungs 2 and 3 — this is the whole contract. Before C42 the header
+    // stayed at 2 PANES and the second press flashed "already stacked".
+    for want in [3, 4] {
+        h.write_bytes(ALT_S);
+        assert!(
+            h.wait_for(Duration::from_secs(5), |s| s
+                .contents()
+                .contains(&format!("STACK · {want} PANES")))
+                .is_some(),
+            "the ladder stalled below {want} panes — this is the reported bug:\n{}",
+            h.screen().contents(),
+        );
+    }
+
+    // The ceiling: one more press changes nothing and says why.
+    h.write_bytes(ALT_S);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("the whole tab is one stack"))
+            .is_some(),
+        "the ceiling did not name itself:\n{}",
+        h.screen().contents(),
+    );
+    assert!(
+        h.screen().contents().contains("STACK · 4 PANES"),
+        "a refusal must not disturb the stack it refused to grow:\n{}",
         h.screen().contents(),
     );
 

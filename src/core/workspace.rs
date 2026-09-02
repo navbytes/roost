@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn validate_replaces_a_workspace_of_empty_tabs() {
         let mut ws = Workspace::default_in(PathBuf::from("/tmp"));
-        ws.tabs[0].layout = LayoutNode::Stack { children: Vec::new(), expanded: 0 };
+        ws.tabs[0].layout = LayoutNode::Stack { children: Vec::new(), expanded: 0, from: None };
         ws.validate_and_repair();
         assert_eq!(ws.tabs.len(), 1);
         assert!(!ws.tabs[0].panes.is_empty(), "a loaded workspace always has a pane to draw");
@@ -444,7 +444,7 @@ mod tests {
         let mut ws = Workspace::default_in(PathBuf::from("/tmp"));
         ws.tabs.push(Tab {
             name: "tab2".into(),
-            layout: LayoutNode::Stack { children: Vec::new(), expanded: 0 },
+            layout: LayoutNode::Stack { children: Vec::new(), expanded: 0, from: None },
             panes: HashMap::new(),
         });
         ws.active_tab = 1;
