@@ -336,7 +336,7 @@ fn hint_pairs(
                 alt(&[Action::Help], "Alt+?", "keys"),
                 alt(&[Action::NewPane], "Alt+n", "new"),
                 alt(&[Action::QuickLaunch], "Alt+↵", "launch"),
-                alt(&[Action::ToggleStack], "Alt+s", "stack"),
+                alt(&[Action::StackPane], "Alt+s", "stack"),
                 alt(FOCUS, "Alt+←↓↑→", "focus"),
                 alt(&[Action::ClosePane], "Alt+w", "close"),
                 alt(&[Action::EditPane], "Alt+r", "edit"),
@@ -1487,7 +1487,8 @@ const HELP_GROUPS: &[HelpGroup] = &[
                 ],
                 "move this pane that way (swaps with its neighbour)",
             ),
-            chords(&[Action::ToggleStack], "toggle split ⇄ stack"),
+            chords(&[Action::StackPane], "stack this pane (collapses its split; it expands)"),
+            chords(&[Action::ExplodeStack], "explode the stack around this pane into a split"),
             chords(&[Action::FlipSplit], "flip this split's orientation"),
             chords(
                 &[Action::CycleLayout { forward: true }],
@@ -4492,10 +4493,10 @@ mod tests {
         app.apply(Action::NewPane);
         app.apply(Action::NewPane);
         // Focus the first pane so Alt+s reaches the *outer* split and stacks
-        // all three (`toggle_stack` folds the innermost split that directly
+        // all three (`stack_pane` folds the innermost split that directly
         // holds the target).
         app.focused = app.pane_order()[0];
-        app.apply(Action::ToggleStack);
+        app.apply(Action::StackPane);
         let collapsed: Vec<crate::core::layout::PaneRect> =
             app.rects().into_iter().filter(|p| p.collapsed).collect();
         assert_eq!(collapsed.len(), 2, "a stack of three shows two collapsed members");
@@ -4551,7 +4552,7 @@ mod tests {
         app.apply(Action::NewPane);
         // Outer split, as above: all three panes into one stack.
         app.focused = app.pane_order()[0];
-        app.apply(Action::ToggleStack);
+        app.apply(Action::StackPane);
         let collapsed: Vec<crate::core::layout::PaneRect> =
             app.rects().into_iter().filter(|p| p.collapsed).collect();
         assert_eq!(collapsed.len(), 2);
@@ -5419,7 +5420,7 @@ mod tests {
 
         let body = Rect::new(0, 0, 120, 40);
         let km = Keymap::default();
-        let q = "toggle";
+        let q = "tab";
         assert!(super::help_actions(&km, q).len() >= 2, "the query needs rows to choose between");
         let unmarked = help_layout(body, &km, Some(q)).content;
 
@@ -5844,7 +5845,7 @@ row's — widen ADAPTER_COL",
                     4 => Action::MovePane(d),
                     5 => Action::NewTab,
                     6 => Action::NextTab,
-                    7 => Action::ToggleStack,
+                    7 => Action::StackPane,
                     8 => Action::FlipSplit,
                     9 => Action::Resize { horizontal: rng.below(2) == 0, grow: rng.below(2) == 0 },
                     10 => Action::ToggleZoom,
@@ -5991,7 +5992,7 @@ row's — widen ADAPTER_COL",
         out.push(("normal, three tiled panes", snap(&mut app)));
 
         let mut app = three_panes();
-        app.apply(Action::ToggleStack);
+        app.apply(Action::StackPane);
         out.push(("collapsed stack rows", snap(&mut app)));
 
         let mut app = three_panes();
@@ -6117,7 +6118,7 @@ row's — widen ADAPTER_COL",
             spec.note = Some("tests green, PR up\nnext: rebase onto main".into());
             spec.noted_at = Some(0);
             out.push(("noted badges, focused and not", snap(&mut app)));
-            app.apply(Action::ToggleStack);
+            app.apply(Action::StackPane);
             out.push(("noted collapsed rows", snap(&mut app)));
         }
 

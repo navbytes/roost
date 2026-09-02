@@ -139,7 +139,7 @@ you're in.
 | `Alt+-` / `Alt+=` | resize height: shrink / grow (vim's Ctrl-w `−`/`+`) |
 | `Alt+<` / `Alt+>` | resize width: shrink / grow (vim's Ctrl-w `<`/`>`) |
 | `Alt+Shift+arrow` / `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
-| `Alt+s` | toggle: collapse the surrounding split into a stack / explode it |
+| `Alt+s` / `Alt+Shift+s` | stack: collapse the surrounding split into a stack (focused pane expands) / explode the stack back into an even split |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
 | `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
 | `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |

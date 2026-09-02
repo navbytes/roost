@@ -130,7 +130,7 @@ pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
     // A stack of one is a pane. Splits have always collapsed at one child;
     // stacks did not, and the leftover `Stack { children: [x] }` was not just
     // cosmetic chrome ("STACK · 1 PANES", a header row stolen from the only
-    // member). `toggle_stack` explodes a stack into an even split of its
+    // member). `explode_stack` explodes a stack into an even split of its
     // members, so Alt+s on a stack of one built a `Split` with a single
     // child — a shape the rest of this module states it never constructs and
     // does not handle. Close panes out of a stack until one is left, press
@@ -209,28 +209,21 @@ pub fn dedupe_pane_ids(node: &mut LayoutNode, seen: &mut HashSet<PaneId>) -> boo
     empty
 }
 
-/// Alt+s: if `target` is in a stack, explode the stack back into an even
-/// split; otherwise collapse the innermost split that directly contains
-/// `target` into a stack of all its leaf panes (with `target` expanded).
-pub fn toggle_stack(node: &mut LayoutNode, target: PaneId) -> bool {
+/// Alt+s: collapse the innermost split that directly contains `target` into
+/// a stack of all its leaf panes (with `target` expanded). False when the
+/// target already sits in a stack, or is the tab's only pane — the caller
+/// distinguishes those refusals (`pane_is_stacked`).
+pub fn stack_pane(node: &mut LayoutNode, target: PaneId) -> bool {
     match node {
         LayoutNode::Pane(_) => false,
-        LayoutNode::Stack { children, .. } => {
-            if !children.contains(&target) {
-                return false;
-            }
-            let n = children.len();
-            let panes: Vec<LayoutNode> = children.iter().map(|id| LayoutNode::Pane(*id)).collect();
-            *node = LayoutNode::Split {
-                dir: SplitDir::Horizontal,
-                ratios: vec![1.0 / n as f32; n],
-                children: panes,
-            };
-            true
-        }
+        // Stacks hold only panes, so reaching one at all means the target is
+        // either already stacked or lives elsewhere — nothing to collapse.
+        // (The 2026-09-01 re-key: the collapse half of the old `toggle_stack`
+        // toggle; exploding moved to `explode_stack`.)
+        LayoutNode::Stack { .. } => false,
         LayoutNode::Split { children, .. } => {
             for c in children.iter_mut() {
-                if toggle_stack(c, target) {
+                if stack_pane(c, target) {
                     return true;
                 }
             }
@@ -247,6 +240,39 @@ pub fn toggle_stack(node: &mut LayoutNode, target: PaneId) -> bool {
             *node = LayoutNode::Stack { children: panes, expanded };
             true
         }
+    }
+}
+
+/// Is `target` a member of a stack anywhere in the tree? The refusal
+/// distinguisher for `stack_pane`.
+pub fn pane_is_stacked(node: &LayoutNode, target: PaneId) -> bool {
+    match node {
+        LayoutNode::Pane(_) => false,
+        LayoutNode::Stack { children, .. } => children.contains(&target),
+        LayoutNode::Split { children, .. } => children.iter().any(|c| pane_is_stacked(c, target)),
+    }
+}
+
+/// Alt+Shift+s: explode the stack containing `target` back into an even
+/// split of its members. False when the target is not in a stack — the
+/// explode half of the old `toggle_stack` toggle, now its own chord.
+pub fn explode_stack(node: &mut LayoutNode, target: PaneId) -> bool {
+    match node {
+        LayoutNode::Pane(_) => false,
+        LayoutNode::Stack { children, .. } => {
+            if !children.contains(&target) {
+                return false;
+            }
+            let n = children.len();
+            let panes: Vec<LayoutNode> = children.iter().map(|id| LayoutNode::Pane(*id)).collect();
+            *node = LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![1.0 / n as f32; n],
+                children: panes,
+            };
+            true
+        }
+        LayoutNode::Split { children, .. } => children.iter_mut().any(|c| explode_stack(c, target)),
     }
 }
 
@@ -930,9 +956,9 @@ mod tests {
     }
 
     #[test]
-    fn toggle_stack_roundtrip() {
+    fn stack_pane_then_explode_stack_roundtrip() {
         let mut root = tree();
-        assert!(toggle_stack(&mut root, 2));
+        assert!(stack_pane(&mut root, 2));
         match &root {
             LayoutNode::Stack { children, expanded } => {
                 assert_eq!(children, &vec![1, 2]);
@@ -940,11 +966,17 @@ mod tests {
             }
             _ => panic!("expected stack"),
         }
-        assert!(toggle_stack(&mut root, 2));
+        // the collapse half refuses what it cannot collapse: an already-stacked pane
+        assert!(!stack_pane(&mut root, 2));
+        assert!(pane_is_stacked(&root, 2));
+        assert!(explode_stack(&mut root, 2));
         assert!(matches!(root, LayoutNode::Split { .. }));
         let mut order = vec![];
         pane_order(&root, &mut order);
         assert_eq!(order, vec![1, 2]);
+        // ...and the explode half refuses what it cannot explode: a split
+        assert!(!explode_stack(&mut root, 2));
+        assert!(!pane_is_stacked(&root, 2));
     }
 
     #[test]
@@ -1076,7 +1108,7 @@ mod tests {
     }
 
     /// A stack of one is a pane, and must become one — a `Split` never
-    /// carries a single child, and `toggle_stack` on a one-member stack
+    /// carries a single child, and `explode_stack` on a one-member stack
     /// would build exactly that.
     #[test]
     fn a_stack_shrunk_to_one_member_stops_being_a_stack() {
@@ -1085,10 +1117,10 @@ mod tests {
         remove_pane(&mut node, 2);
         assert!(matches!(node, LayoutNode::Pane(1)), "a stack of one is a pane, not {node:?}",);
 
-        // ...and the illegal shape it used to make: Alt+s on that stack.
+        // ...and the illegal shape it used to make: Alt+Shift+s on that stack.
         let mut stack = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
         remove_pane(&mut stack, 2);
-        toggle_stack(&mut stack, 1);
+        explode_stack(&mut stack, 1);
         if let LayoutNode::Split { children, .. } = &stack {
             panic!("Alt+s built a Split with {} child(ren): {stack:?}", children.len());
         }

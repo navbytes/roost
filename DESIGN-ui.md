@@ -945,6 +945,9 @@ becomes the only glyph that ever asks the user to look. Concretely:
 
 ### C6 — Stack header row
 
+> **[2026-09-01: the `Alt+s` toggle became the `s`/`Shift+s` pair — see §8's
+> second amendment. This contract's geometry is unchanged.]**
+
 **Current:** none — stack members are laid out directly (`layout.rs:302–322`);
 nothing announces "this region is a stack".
 
@@ -5183,8 +5186,9 @@ that hands you a second dead end is worth less than silence.
 | `Alt+Shift+h/l` at a tab edge, single tab | `at the tab's edge` |
 | `Alt+Shift+j/k` at a layout edge | `nothing {above\|below} to swap with` |
 | `Alt+Shift+hjkl` on the float | `the scratch pane sits outside the layout` |
-| `Alt+s` / `Alt+o` / `Alt+- = < >`, tab has one pane | `nothing to {stack\|flip\|resize}: this tab has one pane — {chord} splits it` |
-| `Alt+s` / `Alt+o` / `Alt+- = < >`, shape has no such move | `nothing to {stack\|flip\|resize} here` |
+| `Alt+s` / `Alt+o` / `Alt+- = < >`, tab has one pane | `nothing to {stack\|explode\|flip\|resize}: this tab has one pane — {chord} splits it` |
+| `Alt+s` / `Alt+o` / `Alt+- = < >`, shape has no such move | `nothing to {stack\|explode\|flip\|resize} here` |
+| `Alt+s`, pane already stacked | `already stacked — {chord} explodes it back into a split` |
 | `Alt+1..9` past the last tab | `no tab {n}: this workspace has {n} {tab\|tabs}` |
 | `Alt+n` / picker launch, split refused | `no room to split — {side by side needs 36 columns, has 30 \| stacked needs 10 rows, has 7}` |
 
@@ -5764,7 +5768,7 @@ shows only the C9-curated subsets.
 | 4 | `Alt+- / Alt+=` | **resize height: shrink / grow** (vim's Ctrl-w − / +) | — |
 | 4a | `Alt+< / Alt+>` | **resize width: shrink / grow** (vim's Ctrl-w < / >) | — |
 | 4b | `Alt+Shift+←↓↑→ / hjkl` | **move this pane that way inside the tab (swaps with its neighbour)** | C33 |
-| 5 | `Alt+s` | toggle split ⇄ stack | C6–C8 |
+| 5 | `Alt+s / Alt+Shift+s` | **stack this pane (collapse its split; it expands) / explode the stack around it into a split** | C6–C8 |
 | 6 | `Alt+o` | flip split orientation | — |
 | 7 | `Alt+g / Alt+Shift+g` | **cycle layout: grid / main+stack / all-stack, forward / back** | C25/C37 |
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
@@ -5785,6 +5789,16 @@ shows only the C9-curated subsets.
 | 18 | `Alt+Shift+p` | **raw pass-through for this pane (same chord exits)** | C23 |
 | 19 | `Alt+/` | toggle hint bar | C9 |
 | 20 | `Alt+?` | full keymap overlay (this table); typing filters it (2026-09-01; `/` still works), **and `↵` runs the row it lands on** | C15, C39, C41 |
+
+[Amended 2026-09-01 (2), the `s` pair. Row 5's toggle is split into two
+one-way chords on the shift-reverse idiom the same day's map re-key
+established: `Alt+s` stacks (collapse half), `Alt+Shift+s` explodes. A
+stacked pane's `Alt+s` now **refuses** — "already stacked — {explode chord}
+explodes it back into a split" (C38's name-the-way-out rule) — where the old
+toggle exploded silently, so toggle muscle memory in a stack now gets a
+message, not a surprise. `toggle_stack` survives as a parse-only config
+alias mapped to the collapse half. The layout operations, fit degradation
+and expanded-slot repair are unchanged (C6–C8).]
 
 *Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
 terminals disagree about which half of that they report: some deliver

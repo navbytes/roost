@@ -1316,6 +1316,8 @@ mod tests {
             alt(KeyCode::Char('w')),
             alt(KeyCode::Char('t')),
             alt(KeyCode::Char('s')),
+            alt_shift(KeyCode::Char('s')),
+            alt(KeyCode::Char('S')),
             alt(KeyCode::Char('o')),
             alt(KeyCode::Char('r')),
             alt_shift(KeyCode::Char('r')),
@@ -2054,7 +2056,7 @@ mod tests {
     fn a_pane_collapsing_mid_drag_releases_the_freeze() {
         let mut app = mk_app();
         app.apply(Action::NewPane); // panes 1|2, focus 2
-        app.apply(Action::ToggleStack); // stacks them: focused (2) expands, 1 collapses
+        app.apply(Action::StackPane); // stacks them: focused (2) expands, 1 collapses
         let id = app.focused;
         app.runtimes.get_mut(&id).unwrap().grab = "original text".into();
         let r = app.display_rects().iter().find(|p| p.id == id).unwrap().rect;
@@ -2364,7 +2366,7 @@ mod tests {
                     0 | 1 => app.apply(Action::NewPane),
                     2 => app.apply(Action::NewTab),
                     3 => app.apply(Action::ToggleRaw), // C23 pass-through on/off
-                    4 => app.apply(Action::ToggleStack),
+                    4 => app.apply(Action::StackPane),
                     5 => app.apply(Action::ToggleFloat),
                     6 => app.apply(Action::CopyMode),
                     7 => app.apply(Action::ScrollMode),
@@ -2462,7 +2464,7 @@ mod tests {
                     0 | 1 => app.apply(Action::NewPane),
                     2 => app.apply(Action::ClosePane),
                     3 => app.apply(Action::NewTab),
-                    4 => app.apply(Action::ToggleStack),
+                    4 => app.apply(Action::StackPane),
                     5 => app.apply(Action::ToggleZoom),
                     6 => app.apply(Action::ToggleFloat),
                     7 => app.apply(Action::NextTab),

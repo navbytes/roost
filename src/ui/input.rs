@@ -58,7 +58,14 @@ pub enum Action {
     /// same split rule, same refusal when the tab has no room. Focus
     /// follows the pane.
     PullPane,
-    ToggleStack,
+    /// Alt+s: collapse the focused pane's innermost split into a stack with
+    /// the focused pane expanded (C6–C8). Refuses when the pane is already
+    /// stacked — the 2026-09-01 re-key split the old `ToggleStack` toggle
+    /// into two one-way chords, matching the shift-reverse idiom (C37/C28).
+    StackPane,
+    /// Alt+Shift+s: explode the stack containing the focused pane back into
+    /// an even split. The other half of the old `ToggleStack` toggle.
+    ExplodeStack,
     /// Flip the focused pane's split between vertical and horizontal.
     FlipSplit,
     /// Grow (+) or shrink (−) the focused pane along an axis.
@@ -186,7 +193,8 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         KeyCode::Char('n') => Some(Action::NewPane),
         KeyCode::Char('w') => Some(Action::ClosePane),
         KeyCode::Char('t') => Some(Action::NewTab),
-        KeyCode::Char('s') => Some(Action::ToggleStack),
+        KeyCode::Char('s') => Some(if shift { Action::ExplodeStack } else { Action::StackPane }),
+        KeyCode::Char('S') => Some(Action::ExplodeStack),
         KeyCode::Char('o') => Some(Action::FlipSplit), // orientation
         // Alt+r edits the pane (name + note, one dialog — C32; it also
         // retired Alt+Shift+n after one release, returning `n` to §8's
@@ -751,7 +759,11 @@ const NAMES: &[(&str, Action)] = &[
     ("move_pane_to_tab_prev", Action::MovePaneToTab { forward: false }),
     ("mark_pane", Action::MarkPane),
     ("pull_pane", Action::PullPane),
-    ("toggle_stack", Action::ToggleStack),
+    ("stack_pane", Action::StackPane),
+    ("explode_stack", Action::ExplodeStack),
+    // Parse-only alias: config.json files written against the pre-2026-09-01
+    // toggle keep working, mapped to the collapse half (the half Alt+s kept).
+    ("toggle_stack", Action::StackPane),
     ("flip_split", Action::FlipSplit),
     ("resize_horizontal_grow", Action::Resize { horizontal: true, grow: true }),
     ("resize_horizontal_shrink", Action::Resize { horizontal: true, grow: false }),
@@ -1126,7 +1138,15 @@ mod tests {
         assert!(matches!(translate(alt(KeyCode::Char('n'))), InputResult::Action(Action::NewPane)));
         assert!(matches!(
             translate(alt(KeyCode::Char('s'))),
-            InputResult::Action(Action::ToggleStack)
+            InputResult::Action(Action::StackPane)
+        ));
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('s'))),
+            InputResult::Action(Action::ExplodeStack)
+        ));
+        assert!(matches!(
+            translate(alt(KeyCode::Char('S'))),
+            InputResult::Action(Action::ExplodeStack)
         ));
         assert!(matches!(translate(alt(KeyCode::Enter)), InputResult::Action(Action::QuickLaunch)));
         assert!(matches!(
@@ -1735,7 +1755,9 @@ mod tests {
             (alt(KeyCode::Char('n')), Action::NewPane),
             (alt(KeyCode::Char('w')), Action::ClosePane),
             (alt(KeyCode::Char('t')), Action::NewTab),
-            (alt(KeyCode::Char('s')), Action::ToggleStack),
+            (alt(KeyCode::Char('s')), Action::StackPane),
+            (alt_shift(KeyCode::Char('s')), Action::ExplodeStack),
+            (alt(KeyCode::Char('S')), Action::ExplodeStack),
             (alt(KeyCode::Char('o')), Action::FlipSplit),
             (alt(KeyCode::Char('r')), Action::EditPane),
             (alt_shift(KeyCode::Char('r')), Action::RenameTab),

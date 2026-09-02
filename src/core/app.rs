@@ -2346,8 +2346,8 @@ impl<B: PaneBackend> App<B> {
             // so the actionable advice here is to stack rather than the
             // pane's shortfall. The divergence is deliberate and contracted;
             // what both surfaces must share is that the refusal is *said*.
-            let hint = self
-                .chord_clause(Action::ToggleStack, |c| format!("; stack a pane with {c} first"));
+            let hint =
+                self.chord_clause(Action::StackPane, |c| format!("; stack a pane with {c} first"));
             return Reply::err(format!("{verb} refused: not enough room to split{hint}"));
         };
         if let Some(text) = initial_input {
@@ -3902,7 +3902,8 @@ impl<B: PaneBackend> App<B> {
         if matches!(
             action,
             Action::NewPane
-                | Action::ToggleStack
+                | Action::StackPane
+                | Action::ExplodeStack
                 | Action::FlipSplit
                 | Action::Resize { .. }
                 | Action::CycleLayout { .. }
@@ -3941,11 +3942,28 @@ impl<B: PaneBackend> App<B> {
             // returns `true` at the 0.1/0.9 clamp ("handled, no change"),
             // which is a no-op the user has every reason to hear about.
             // One rule, one mechanism, no per-site special cases.
-            Action::ToggleStack => {
+            Action::StackPane => {
                 let focused = self.focused;
                 let before = self.ws.active_tab().layout.clone();
-                layout::toggle_stack(&mut self.ws.active_tab_mut().layout, focused);
-                self.flash_if_layout_unchanged(&before, "stack");
+                let refused = !layout::stack_pane(&mut self.ws.active_tab_mut().layout, focused)
+                    && layout::pane_is_stacked(&self.ws.active_tab().layout, focused);
+                if refused {
+                    // C38: an already-stacked pane is a different refusal
+                    // from "one pane" and names the way out — the explode
+                    // half of the old toggle, now on its own chord.
+                    let explode = self.chord_clause(Action::ExplodeStack, |c| {
+                        format!(" — {c} explodes it back into a split")
+                    });
+                    self.set_flash(format!("already stacked{explode}"));
+                } else {
+                    self.flash_if_layout_unchanged(&before, "stack");
+                }
+            }
+            Action::ExplodeStack => {
+                let focused = self.focused;
+                let before = self.ws.active_tab().layout.clone();
+                layout::explode_stack(&mut self.ws.active_tab_mut().layout, focused);
+                self.flash_if_layout_unchanged(&before, "explode");
             }
             Action::FlipSplit => {
                 let focused = self.focused;
@@ -4287,7 +4305,7 @@ impl<B: PaneBackend> App<B> {
         layout::expand_in_stacks(layout, focused);
         // No save/relayout here: `apply` does both on the way out, which is
         // also what resizes each pane's PTY to the rect it just moved into
-        // (same as `FlipSplit`/`Resize`/`ToggleStack` — none of them persist
+        // (same as `FlipSplit`/`Resize`/the stack verbs — none of them persist
         // by hand either).
     }
 
@@ -5238,7 +5256,7 @@ impl<B: PaneBackend> App<B> {
             }
         }
         let hint =
-            self.chord_clause(Action::ToggleStack, |c| format!("; stack a pane with {c} first"));
+            self.chord_clause(Action::StackPane, |c| format!("; stack a pane with {c} first"));
         self.set_flash(format!("no room to rearrange{hint}"));
     }
 
@@ -10965,7 +10983,7 @@ pub(crate) mod tests {
     fn toggle_stack_then_click_expands_member() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
-        app.apply(Action::ToggleStack);
+        app.apply(Action::StackPane);
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
         app.on_click(1);
         assert_eq!(app.focused, 1);
@@ -12632,7 +12650,8 @@ pub(crate) mod tests {
                         14 => ("MovePaneToTab-", Action::MovePaneToTab { forward: false }),
                         15 => ("NextTab", Action::NextTab),
                         16 => ("PrevTab", Action::PrevTab),
-                        17 | 18 => ("ToggleStack", Action::ToggleStack),
+                        17 => ("StackPane", Action::StackPane),
+                        18 => ("ExplodeStack", Action::ExplodeStack),
                         19 => ("FlipSplit", Action::FlipSplit),
                         20 => (
                             "Resize",
@@ -15349,7 +15368,8 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws()); // one pane
 
         for (action, verb) in [
-            (Action::ToggleStack, "stack"),
+            (Action::StackPane, "stack"),
+            (Action::ExplodeStack, "explode"),
             (Action::FlipSplit, "flip"),
             (Action::Resize { horizontal: true, grow: true }, "resize"),
         ] {
@@ -15370,17 +15390,23 @@ pub(crate) mod tests {
         // `Alt+s` turns the split into a stack, and `Alt+o` then has
         // nothing to flip and correctly says so. That is the code being
         // right, so each verb gets the shape it applies to.
-        for action in [
-            Action::ToggleStack,
-            Action::FlipSplit,
-            Action::Resize { horizontal: true, grow: true },
-        ] {
+        for action in
+            [Action::StackPane, Action::FlipSplit, Action::Resize { horizontal: true, grow: true }]
+        {
             let (mut app, _) = mk_app(shell_ws());
             app.apply(Action::NewPane); // a real split to work on
             app.flash = None;
             app.apply(action);
             assert!(app.flash().is_none(), "{:?}: {:?}", action, app.flash());
         }
+        // ExplodeStack joins the quiet set only once something is stacked:
+        // stack first, then explode the very stack it made.
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::StackPane);
+        app.flash = None;
+        app.apply(Action::ExplodeStack);
+        assert!(app.flash().is_none(), "explode on a real stack: {:?}", app.flash());
     }
 
     /// The composer's `Tab` must never stop on a tier it cannot deliver to.
@@ -15720,8 +15746,8 @@ pub(crate) mod tests {
         use crossterm::event::KeyCode;
         let (mut app, _) = mk_app(shell_ws());
         open_help(&mut app);
-        help_type(&mut app, "/toggle");
-        let n = crate::ui::render::help_actions(app.keymap(), "toggle").len();
+        help_type(&mut app, "/tab");
+        let n = crate::ui::render::help_actions(app.keymap(), "tab").len();
         assert!(n >= 2, "the query needs a few rows to move through: {n}");
 
         for _ in 0..n * 2 {
@@ -15747,7 +15773,7 @@ pub(crate) mod tests {
         use crossterm::event::KeyCode;
         let (mut app, _) = mk_app(shell_ws());
         open_help(&mut app);
-        help_type(&mut app, "/toggle");
+        help_type(&mut app, "/tab");
         help_key(&mut app, KeyCode::Down);
         assert!(matches!(app.mode, Mode::Help { cursor: 1, .. }), "moved off the first row");
 
@@ -16021,7 +16047,7 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         app.apply(Action::NewPane); // three panes
-        app.apply(Action::ToggleStack); // ... collapsed into one stack
+        app.apply(Action::StackPane); // ... collapsed into one stack
         let moved = app.focused;
 
         let order_before: Vec<_> = app.rects().iter().map(|p| p.id).collect();
@@ -16115,7 +16141,8 @@ pub(crate) mod tests {
     fn zoom_exits_on_every_structural_or_new_tab_action() {
         let triggers = [
             Action::NewPane,
-            Action::ToggleStack,
+            Action::StackPane,
+            Action::ExplodeStack,
             Action::FlipSplit,
             Action::Resize { horizontal: true, grow: true },
             Action::CycleLayout { forward: true },
