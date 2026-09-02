@@ -210,10 +210,27 @@ pub fn watch_for_hangup() {
         // way — that release, not any cleanup here, is what lets the next
         // `roost` start.
         //
+        // What this path skips, and why none of it is missed: the socket
+        // file and `control.token` are normally unlinked on the way out
+        // (`main.rs`), but `sock`'s bind already unlinks a stale socket
+        // before listening, the token is rewritten at every startup and
+        // authorizes nothing while no process is listening, and the
+        // workspace is saved atomically on every mutation, so the copy on
+        // disk is already current.
+        //
+        // **Not `_exit(0)`.** Forcibly killing the fleet is not success, and
+        // reporting it as success makes "the terminal vanished and I had to
+        // shoot four agents" indistinguishable from Alt+q to a supervisor,
+        // a wrapper script or a shell loop. 128 + SIGHUP is the encoding
+        // every shell already uses for "died because its terminal went
+        // away", which is exactly what happened — roost simply had to
+        // deliver the verdict itself because the signal alone could not
+        // reach a wedged main thread.
+        //
         // SAFETY: `_exit(2)` takes only an exit status; nothing here can be
         // unsound, only abrupt (which is the point).
         unsafe {
-            libc::_exit(0);
+            libc::_exit(128 + libc::SIGHUP);
         }
     });
 }

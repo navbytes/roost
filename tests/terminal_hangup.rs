@@ -135,7 +135,7 @@ fn closing_the_tab_takes_roost_and_its_fleet_with_it() {
             Ok(())
         });
     }
-    let Ok(child) = cmd.spawn() else {
+    let Ok(mut child) = cmd.spawn() else {
         eprintln!("SKIP terminal-hangup gate: could not spawn roost under the test pty");
         let _ = std::fs::remove_dir_all(&state);
         return;
@@ -200,6 +200,22 @@ fn closing_the_tab_takes_roost_and_its_fleet_with_it() {
         "roost died but left its fleet running: {fleet_left:?} — the hangup \
          watchdog's pane registry (infra::pty::live_pane_pgids) should have \
          reached them too"
+    );
+
+    // The verdict roost reports, not just that it reported one. Forcibly
+    // shooting the fleet is not success: a supervisor, wrapper script or
+    // shell loop has to be able to tell "the terminal vanished and roost
+    // had to kill four agents" from a clean Alt+q. 128 + SIGHUP is the
+    // encoding every shell already uses for "died because its terminal went
+    // away", which is precisely what happened.
+    //
+    // `wait` here also reaps the child, so the temp state dir below is
+    // removed after the process is genuinely gone rather than racing it.
+    let status = child.wait().expect("roost was spawned, so it can be waited on");
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGHUP),
+        "the forced hangup teardown must not report success: {status:?}",
     );
 
     let _ = std::fs::remove_dir_all(&state);
