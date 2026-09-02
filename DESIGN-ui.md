@@ -2507,6 +2507,21 @@ design-supervisor audit of C33, which is the check that exists to catch
 exactly this.) C22 rule 3's sibling list takes the same addition on the same
 date.
 
+**[Amended 2026-09-01, the map re-key]** The list is re-spelled to the map
+that now exists, on this section's own "enumerated by name ⇒ false when
+stale" rule: **`Alt+Shift+s`** joins it (explode is as structural as the
+collapse half it split off from), and the resize entry is the punctuation
+family **`Alt+- = < >`** rather than `Alt+Shift+arrows` — the shifted arrows
+still exit zoom, but now as the *move-the-pane* family alongside
+`Alt+Shift+hjkl`, and they do it from inside `move_pane_dir` (C38) rather
+than from `apply`'s guard. The guard's own arms are the ground truth for
+all but one entry: `NewPane · StackPane · ExplodeStack · FlipSplit · Resize ·
+CycleLayout`. **Picker launch is the exception** and always was — it exits
+zoom and hides the float from its own call site (`App::launch`, "picker
+launch is a structural action"), because *opening* the picker must not, and
+only the launch step is structural. It belongs on this list; it is simply not
+reachable by reading the guard.
+
 **[Amended 2026-07-27, SPEC-parity P5 — the round trip is lossless]** Zoom
 resizing the pane's PTY both ways is only safe because the resize itself now
 preserves the grid: the vendored parser **reflows the live grid** on a size
@@ -2629,6 +2644,25 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   pane actions and hide the float like the rest. Same reasoning as C21's
   amendment of the same date: a list this one enumerates by name is wrong,
   not merely incomplete, when an action is missing from it.
+
+  **[Amended 2026-09-01, the map re-key — and one older correction it
+  surfaced]** Rule 3's list is now **Alt+n · picker launch · Alt+s ·
+  Alt+Shift+s · Alt+o · Alt+- = < > · Alt+g · Alt+Shift+g** — `apply`'s
+  structural guard, plus picker launch, which hides the float from its own
+  call site for the reason C21's amendment records (opening the picker is
+  not structural; launching from it is). Three changes, by the same enumerated-by-name
+  rule: `Alt+Shift+s` (explode) is new and belongs; the resize entry
+  re-spells to the punctuation family; and **`Alt+Shift+hjkl` /
+  `Alt+Shift+arrows` and `Alt+z` come off the list** — that half is a
+  correction of an older drift, not of the re-key. `MovePane` left the
+  guard with C38 (see that contract: while it was there, C38's float row
+  was dead code and the swap silently landed on the pane the float was
+  covering), and `Alt+z` was never in the guard at all — it is excluded
+  deliberately, taking the "can't zoom the float" no-op instead of a
+  retarget onto `prev_focus`. Both now refuse the float themselves rather
+  than hiding it first, which is a different rule with a different visible
+  result, so listing them here made rule 3 say something the code does not
+  do.
 - **Mouse:** when shown, the float's rect is **first** in the hit-test list
   (`hit_test` takes the first match — the caller orders the slice; topmost
   wins). Wheel, clicks, drags, and copy-mode selection inside it behave as
@@ -2870,8 +2904,12 @@ Pinned three ways, all added 2026-08-20:
 
 **Current:** layout shape is built up manually (splits Alt+n/Alt+o, stacks
 Alt+s, ratios Alt+Shift+arrows); no way to snap the tab to a known-good
-arrangement. Tree ops live in `layout.rs` (`toggle_stack :129–166`,
-`split_pane :54–78`); `MIN_SPLIT_COLS/ROWS = 36/10` gate splits
+arrangement. **[2026-09-01: this paragraph is the world as C25 found it, and
+two of its spellings have since moved — ratios are `Alt+- = < >` now, and
+`toggle_stack` is the `stack_pane`/`explode_stack` pair. Left as written
+because it is a dated snapshot, annotated because a reader looking for the
+current map should not have to know that.]** Tree ops live in `layout.rs`
+(`toggle_stack :129–166`, `split_pane :54–78`); `MIN_SPLIT_COLS/ROWS = 36/10` gate splits
 (`app.rs:31–32`).
 
 **Target:**
@@ -3260,7 +3298,9 @@ opens the cursor on the real ◆, never the resting agent or a shell.
 ### C28 — Move a pane between tabs (Alt+i / Alt+Shift+i) — [Added 2026-07-28, re-keyed 2026-09-01]
 
 **Current:** a pane is born in a tab and dies in it. Every arrangement verb
-roost has (`Alt+s`, `Alt+o`, `Alt+g`, `Alt+Shift+arrows`) rearranges panes
+roost has (`Alt+s`, `Alt+o`, `Alt+g`, `Alt+Shift+arrows` — the last of which
+resized when this was written and moves the pane since the 2026-09-01
+re-key) rearranges panes
 *within* one tab; the only way to get a running agent into a different tab is
 to close it and start another one over there, which throws away its PTY, its
 scrollback and its session. Tabs are how roost separates concerns, and
@@ -4791,7 +4831,8 @@ press:
    `Alt+Shift+1`; the arm ignores shift, and the unshifted spelling is the
    chord.
 Each rule fires only when both spellings carry the same action — where they
-differ, both are real (`Alt+←` focuses, `Alt+Shift+←` resizes).
+differ, both are real (`Alt+←` focuses, `Alt+Shift+←` moves the pane — the
+2026-09-01 re-key, which is also why the example no longer reads "resizes").
 
 **Row model (C15).** A help row declares the **actions** it documents, not a
 chord string:
@@ -5831,7 +5872,16 @@ and `roost keys` prints the effective map. **(3) Delivery twins:** bare
 row-20 rule), the unshifted `,`/`.`/`_` stay free so readline's M-, M-.
 M-_ keep reaching the pane (U5), and the `twins` closure now covers
 glyph/base pairs — which also closes the pre-existing gap where
-`{"alt+?": "disable"}` left the `('/')+SHIFT` delivery of Alt+? live.]
+`{"alt+?": "disable"}` left the `('/')+SHIFT` delivery of Alt+? live.
+**What this family costs, stated rather than implied:** the `<`/`>` glyphs
+*are* readline's M-< / M-> (beginning- and end-of-history), so the shifted
+half of the width pair shadows two live bindings. U5's guarantee here is
+about the **unshifted** keys, not the whole punctuation vocabulary — this
+table has always been allowed to spend a key the pane wanted, and C23's raw
+mode is the escape hatch, the same one every other chord in it relies on.
+The trade was taken because vim's `Ctrl-w <`/`>` is the resize idiom a
+multiplexer user already has in their fingers, and history-start/end have
+alternatives in every shell that M-,/M-. word-ops do not.]
 
 [Amended 2026-08-19, C34: this table is still the canonical *list* of what
 roost binds by default, but it is no longer what the chrome *prints*. The

@@ -10980,7 +10980,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn toggle_stack_then_click_expands_member() {
+    fn stacking_then_clicking_a_member_expands_it() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         app.apply(Action::StackPane);
@@ -12454,7 +12454,7 @@ pub(crate) mod tests {
                 // >= 2, not merely non-empty (C6, clarified 2026-08-20): a
                 // stack of one is a pane, and `layout.rs` normalizes it into
                 // one wherever it can arise. The weaker assertion let the
-                // one-member stack that `toggle_stack` turns into a
+                // one-member stack that `explode_stack` turns into a
                 // single-child `Split` walk right past this checker — the
                 // design audit had to find it by reading. Nothing guards a
                 // future construction path unless this does.

@@ -179,8 +179,17 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         // the shifted half as the glyph (`+` for Alt+Shift+=), others as the
         // base character with SHIFT set (`,` for Alt+<) — so both spellings
         // are bound, the arm ignoring shift where the glyph is the code.
-        // The unshifted base keys `,`/`.` stay free on purpose: they are
-        // readline's M-, / M-. and must keep forwarding (U5).
+        // The unshifted base keys `,`/`.`/`_` stay free on purpose: they are
+        // readline's M-, / M-. / M-_ and must keep forwarding (U5).
+        //
+        // What the shifted half *does* cost, recorded rather than glossed:
+        // `<`/`>` are readline's M-< / M-> (beginning- and end-of-history),
+        // so this family does shadow two live bindings — U5 protects the
+        // unshifted keys, not the whole punctuation vocabulary. The trade is
+        // deliberate (vim's resize idiom is the one every user of a
+        // multiplexer already knows, and history-start/end have PgUp-class
+        // alternatives in every shell), and C23's raw mode is the escape
+        // hatch, as it is for every chord that takes a key the pane wanted.
         KeyCode::Char('-') => Some(Action::Resize { horizontal: false, grow: false }),
         KeyCode::Char('=') | KeyCode::Char('+') => {
             Some(Action::Resize { horizontal: false, grow: true })
@@ -2407,5 +2416,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The 2026-09-01 re-key split `toggle_stack` into the `Alt+s` /
+    /// `Alt+Shift+s` pair, on both delivery forms — the same
+    /// uppercase-delivery tolerance every other shifted letter carries.
+    #[test]
+    fn alt_s_stacks_and_alt_shift_s_explodes_on_both_delivery_forms() {
+        assert_eq!(
+            translate(alt(KeyCode::Char('s'))),
+            InputResult::Action(Action::StackPane),
+            "the unshifted chord keeps the collapse half the toggle had",
+        );
+        assert_eq!(
+            translate(alt_shift(KeyCode::Char('s'))),
+            InputResult::Action(Action::ExplodeStack),
+            "Alt+Shift+s on a terminal that sends the shift bit",
+        );
+        assert_eq!(
+            translate(alt(KeyCode::Char('S'))),
+            InputResult::Action(Action::ExplodeStack),
+            "Alt+Shift+s on a terminal that sends bare uppercase S",
+        );
+    }
+
+    /// The re-key's compatibility promise, which nothing else pins: a
+    /// `config.json` written against the pre-2026-09-01 `toggle_stack`
+    /// action still parses — silently, with no diagnostic — and lands on
+    /// the collapse half (`Alt+s`'s, the half that kept the chord).
+    /// The reverse direction is the other half of the promise: `roost keys`
+    /// and the overlay must print the *canonical* name, never the alias, or
+    /// the printed map would not paste back as itself.
+    #[test]
+    fn the_toggle_stack_config_alias_still_parses_and_never_prints_back() {
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+x": "toggle_stack"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "a v0.1.16 config must not warn: {diagnostics:?}");
+        assert_eq!(
+            translate_with(alt(KeyCode::Char('x')), &keymap),
+            InputResult::Action(Action::StackPane),
+            "the retired toggle name maps to the collapse half",
+        );
+        // Reverse lookup: `stack_pane` is first in NAMES, so it wins.
+        assert_eq!(action_name(&Action::StackPane), "stack_pane");
+        assert_eq!(action_name(&Action::ExplodeStack), "explode_stack");
+        assert!(
+            !effective_bindings(&keymap).iter().any(|(_, a)| action_name(a) == "toggle_stack"),
+            "no surface may spell the parse-only alias",
+        );
+        // And it is a real alias, not a second action: both names resolve
+        // to the same variant.
+        assert_eq!(action_by_name("toggle_stack"), action_by_name("stack_pane"));
     }
 }
