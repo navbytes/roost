@@ -10,6 +10,12 @@ name: Release
 # v0.1.7 release was staged by credentials that could merge PRs but not
 # push tags. Dispatch from the commit to be released (normally main's HEAD,
 # right after the version-bump PR lands).
+#
+# **The button releases Cargo.toml's version at the commit you dispatch
+# from — it does not pick a version for you.** Dispatching before the
+# version bump has merged is refused by `preflight` below rather than
+# quietly re-publishing the previous release; see that job for the incident
+# that rule exists for.
 on:
   push:
     tags:
@@ -17,7 +23,47 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Dispatch-only gate, and the reason it exists is a real incident.
+  #
+  # A dispatch releases whatever version `Cargo.toml` names *at the commit
+  # you dispatch from*. If that version is already released, the publish
+  # step below does not refuse — `action-gh-release` updates the existing
+  # release in place. So clicking "Run workflow" before the version-bump PR
+  # has merged does not no-op: it rebuilds the binaries from the current
+  # commit and **overwrites the published artifacts of the previous
+  # release**, green and silent.
+  #
+  # That happened on 2026-09-02: a dispatch at d90bfd7 replaced every
+  # v0.1.16 tarball (the tag points at c714b60, five commits earlier), so
+  # the published v0.1.16 shipped code that was never in v0.1.16 — and the
+  # regenerated SHA256SUMS.txt made it self-consistent, which is what kept
+  # it invisible.
+  #
+  # `release-request.yml` already refuses in this situation. The button
+  # bypassed that check because the check lived in the requester rather
+  # than here. It lives here now, so both routes are guarded.
+  #
+  # Always runs, so `build` can plainly `needs` it: on a tag push the step
+  # is skipped (a tag push has a tag by definition, and the version match
+  # is checked in `build` instead) and the job still succeeds.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Refuse to re-release a version that is already tagged
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+          if git ls-remote --exit-code origin "refs/tags/v${version}" >/dev/null 2>&1; then
+            echo "::error title=v${version} is already released::Cargo.toml at this commit says ${version}, and v${version} is already tagged. Continuing would overwrite that release's published artifacts with binaries built from this commit. Merge the version-bump PR first, then dispatch again (or just touch .github/release-request and let release-request.yml do it)."
+            exit 1
+          fi
+          echo "v${version} is not yet tagged — proceeding."
+
   build:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:

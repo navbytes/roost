@@ -55,6 +55,16 @@ each adapter's own session ids.
   agent-session credentials can merge PRs but get 403 on both
   `refs/tags/*` pushes and the workflow-dispatch API — don't re-derive
   that. Human tag pushes and the Actions "Run workflow" button still work.
+  **The button releases whatever version `Cargo.toml` names at the commit
+  you dispatch from** — it does not choose a version for you. Pressing it
+  before the bump has merged used to rebuild the *previous* release's
+  artifacts from the current commit and overwrite them in place, green and
+  silent: on 2026-09-02 a dispatch at d90bfd7 replaced every v0.1.16
+  tarball (the tag points five commits earlier, at c714b60), and the
+  regenerated SHA256SUMS.txt made the result self-consistent, which is what
+  hid it. release.yml's `preflight` job refuses that now — the check had
+  only ever lived in release-request.yml, which the button bypasses — so
+  the button is safe, but the order is still bump, merge, *then* release.
   **Keep the version bump as a separate second commit** on the release PR:
   GitHub defaults a squash subject to the sole commit's subject when a PR
   has exactly one commit — the PR title only wins with two or more, so a
