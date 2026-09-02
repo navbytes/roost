@@ -947,6 +947,16 @@ becomes the only glyph that ever asks the user to look. Concretely:
 
 > **[2026-09-01: the `Alt+s` toggle became the `s`/`Shift+s` pair — see §8's
 > second amendment. This contract's geometry is unchanged.]**
+>
+> **[2026-09-02, C42: `Alt+s` now repeats, absorbing the next enclosing split
+> on each press. This contract's geometry is still unchanged — a climbing
+> rung produces a flat `Stack` of more members, which is a shape this
+> header already sizes for (`height >= n + 3`, any n) and which
+> `all_stack_layout` has always been able to build. What the ladder does add
+> is a *reason to read the header*: `STACK · 2 PANES` becoming
+> `STACK · 3 PANES` is the only feedback a rung gives, so the header is now
+> load-bearing for teaching the gesture, not merely for labelling the
+> region. C7 and C8 are likewise unchanged, for the same reason.]**
 
 **Current:** none — stack members are laid out directly (`layout.rs:302–322`);
 nothing announces "this region is a stack".
@@ -2507,6 +2517,21 @@ design-supervisor audit of C33, which is the check that exists to catch
 exactly this.) C22 rule 3's sibling list takes the same addition on the same
 date.
 
+**[Amended 2026-09-01, the map re-key]** The list is re-spelled to the map
+that now exists, on this section's own "enumerated by name ⇒ false when
+stale" rule: **`Alt+Shift+s`** joins it (explode is as structural as the
+collapse half it split off from), and the resize entry is the punctuation
+family **`Alt+- = < >`** rather than `Alt+Shift+arrows` — the shifted arrows
+still exit zoom, but now as the *move-the-pane* family alongside
+`Alt+Shift+hjkl`, and they do it from inside `move_pane_dir` (C38) rather
+than from `apply`'s guard. The guard's own arms are the ground truth for
+all but one entry: `NewPane · StackPane · ExplodeStack · FlipSplit · Resize ·
+CycleLayout`. **Picker launch is the exception** and always was — it exits
+zoom and hides the float from its own call site (`App::launch`, "picker
+launch is a structural action"), because *opening* the picker must not, and
+only the launch step is structural. It belongs on this list; it is simply not
+reachable by reading the guard.
+
 **[Amended 2026-07-27, SPEC-parity P5 — the round trip is lossless]** Zoom
 resizing the pane's PTY both ways is only safe because the resize itself now
 preserves the grid: the vendored parser **reflows the live grid** on a size
@@ -2629,6 +2654,25 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   pane actions and hide the float like the rest. Same reasoning as C21's
   amendment of the same date: a list this one enumerates by name is wrong,
   not merely incomplete, when an action is missing from it.
+
+  **[Amended 2026-09-01, the map re-key — and one older correction it
+  surfaced]** Rule 3's list is now **Alt+n · picker launch · Alt+s ·
+  Alt+Shift+s · Alt+o · Alt+- = < > · Alt+g · Alt+Shift+g** — `apply`'s
+  structural guard, plus picker launch, which hides the float from its own
+  call site for the reason C21's amendment records (opening the picker is
+  not structural; launching from it is). Three changes, by the same enumerated-by-name
+  rule: `Alt+Shift+s` (explode) is new and belongs; the resize entry
+  re-spells to the punctuation family; and **`Alt+Shift+hjkl` /
+  `Alt+Shift+arrows` and `Alt+z` come off the list** — that half is a
+  correction of an older drift, not of the re-key. `MovePane` left the
+  guard with C38 (see that contract: while it was there, C38's float row
+  was dead code and the swap silently landed on the pane the float was
+  covering), and `Alt+z` was never in the guard at all — it is excluded
+  deliberately, taking the "can't zoom the float" no-op instead of a
+  retarget onto `prev_focus`. Both now refuse the float themselves rather
+  than hiding it first, which is a different rule with a different visible
+  result, so listing them here made rule 3 say something the code does not
+  do.
 - **Mouse:** when shown, the float's rect is **first** in the hit-test list
   (`hit_test` takes the first match — the caller orders the slice; topmost
   wins). Wheel, clicks, drags, and copy-mode selection inside it behave as
@@ -2870,8 +2914,12 @@ Pinned three ways, all added 2026-08-20:
 
 **Current:** layout shape is built up manually (splits Alt+n/Alt+o, stacks
 Alt+s, ratios Alt+Shift+arrows); no way to snap the tab to a known-good
-arrangement. Tree ops live in `layout.rs` (`toggle_stack :129–166`,
-`split_pane :54–78`); `MIN_SPLIT_COLS/ROWS = 36/10` gate splits
+arrangement. **[2026-09-01: this paragraph is the world as C25 found it, and
+two of its spellings have since moved — ratios are `Alt+- = < >` now, and
+`toggle_stack` is the `stack_pane`/`explode_stack` pair. Left as written
+because it is a dated snapshot, annotated because a reader looking for the
+current map should not have to know that.]** Tree ops live in `layout.rs`
+(`toggle_stack :129–166`, `split_pane :54–78`); `MIN_SPLIT_COLS/ROWS = 36/10` gate splits
 (`app.rs:31–32`).
 
 **Target:**
@@ -3260,7 +3308,9 @@ opens the cursor on the real ◆, never the resting agent or a shell.
 ### C28 — Move a pane between tabs (Alt+i / Alt+Shift+i) — [Added 2026-07-28, re-keyed 2026-09-01]
 
 **Current:** a pane is born in a tab and dies in it. Every arrangement verb
-roost has (`Alt+s`, `Alt+o`, `Alt+g`, `Alt+Shift+arrows`) rearranges panes
+roost has (`Alt+s`, `Alt+o`, `Alt+g`, `Alt+Shift+arrows` — the last of which
+resized when this was written and moves the pane since the 2026-09-01
+re-key) rearranges panes
 *within* one tab; the only way to get a running agent into a different tab is
 to close it and start another one over there, which throws away its PTY, its
 scrollback and its session. Tabs are how roost separates concerns, and
@@ -3904,6 +3954,28 @@ lands somewhere surprising is worse than one that predictably does nothing.
   — which necessarily spans the full width *and* height, and is
   unambiguously both ends at once: the ordinary single-pane-tab case every
   other test here relies on.
+  **[Amended 2026-09-02 — the exemption was too narrow, and it trapped
+  people.]** `rects.len() == 1` is the right *idea* stated as the wrong
+  *test*. What earns the refusal is not "this pane is alone" but "this tab
+  has somewhere better to cross from" — and where it does not, the refusal
+  has nowhere to send the user. Every pane in the tab spans the full width,
+  so every one of them is refused, and `Alt+←`/`→` is dead in that tab with
+  no pane to move to first. Reported from a fully stacked tab; the shape
+  that shows it was never about stacks is `Alt+n` `Alt+o` — **two panes,
+  top and bottom**, as plain a layout as roost has, and equally trapped.
+  C42's ladder endpoint and `Alt+g`'s all-stack reach it too.
+  So the condition is now: refuse when the focused pane spans the full width
+  **and some other pane in the tab does not**. The single-pane tab is that
+  same condition with one pane in it (nothing narrower exists), so the
+  original exemption is subsumed rather than special-cased, and the layout
+  this bullet was written for — a full-width row above a split row —
+  still refuses, because the split row's panes are narrower. Pinned by
+  `a_tab_with_no_horizontal_structure_still_crosses_from_any_of_its_panes`
+  (all three shapes, every pane, both directions),
+  `a_full_width_pane_still_refuses_while_the_tab_has_a_narrower_one` (the
+  other half, so the fix cannot become "everything crosses"), and
+  `alt_arrow_leaves_a_fully_stacked_tab_through_a_real_terminal` at a real
+  PTY.
 - **Motion continues in the same direction.** `Right` at the right edge
   switches to the **next** tab and focuses its **leftmost** pane; `Left` at
   the left edge switches to the **previous** tab and focuses its
@@ -4791,7 +4863,8 @@ press:
    `Alt+Shift+1`; the arm ignores shift, and the unshifted spelling is the
    chord.
 Each rule fires only when both spellings carry the same action — where they
-differ, both are real (`Alt+←` focuses, `Alt+Shift+←` resizes).
+differ, both are real (`Alt+←` focuses, `Alt+Shift+←` moves the pane — the
+2026-09-01 re-key, which is also why the example no longer reads "resizes").
 
 **Row model (C15).** A help row declares the **actions** it documents, not a
 chord string:
@@ -5188,7 +5261,8 @@ that hands you a second dead end is worth less than silence.
 | `Alt+Shift+hjkl` on the float | `the scratch pane sits outside the layout` |
 | `Alt+s` / `Alt+o` / `Alt+- = < >`, tab has one pane | `nothing to {stack\|explode\|flip\|resize}: this tab has one pane — {chord} splits it` |
 | `Alt+s` / `Alt+o` / `Alt+- = < >`, shape has no such move | `nothing to {stack\|explode\|flip\|resize} here` |
-| `Alt+s`, pane already stacked | `already stacked — {chord} explodes it back into a split` |
+| `Alt+s`, the stack already holds the whole tab (C42) | `the whole tab is one stack — {chord} explodes it back into a split` |
+| `Alt+s`, the rung would leave a pane with no pixels (C42) | `no room to stack: this tab has more panes than rows` |
 | `Alt+1..9` past the last tab | `no tab {n}: this workspace has {n} {tab\|tabs}` |
 | `Alt+n` / picker launch, split refused | `no room to split — {side by side needs 36 columns, has 30 \| stacked needs 10 rows, has 7}` |
 
@@ -5753,6 +5827,165 @@ Three rules follow, and they are cheap:
 A test that cannot fail is worse than a missing one: the missing test is
 visible in coverage, and this one reads as a guarantee.
 
+### C42 — The collapse ladder (`Alt+s`, held) — [Added 2026-09-02, reported flow]
+
+**The gap, as reported.** Four panes built with `Alt+n` — one left, one
+top-right, two bottom-right — then `Alt+s` from the bottom-right pane. It
+collapsed the innermost split and then **refused every press after**:
+*"already stacked."* The reporter's words: "I can't continuously keep on
+collapsing panes."
+
+They are right, for two reasons this contract acts on.
+
+**One: the verb has an obvious iteration and nothing said otherwise.** There
+is always a next enclosing split, up to the tab root. A user who has just
+watched one press collapse a split has no way to learn from the interface
+that this was the only rung available — collapsing is a zoom-out gesture, and
+zoom-out gestures repeat. `Alt+g`'s layout cycle repeats, `Alt+m` repeats,
+`Alt+- = < >` repeat. This one stopping after one press is the odd one out.
+
+**Two: the refusal taught a dead end, and could not have done otherwise.**
+"already stacked — {chord} explodes it back into a split" answers "what now?"
+with only the *reverse* of what the user just asked for. Worse, it fired
+identically whether or not a split remained above — the old `stack_pane` did
+not look, so the message could not distinguish "you are at the top" from
+"there is more, but this chord will not do it." A refusal that cannot tell
+those apart is C38's rule broken from the inside: it says *that* it refused
+without being able to say *why*.
+
+**The contract.** `Alt+s` collapses the split that contains the focused pane
+— and each press after it absorbs the **next enclosing split** into the same
+stack, until the stack holds the whole tab. `stack_pane` collapses a split
+that directly holds either the target pane (the first rung) or the stack the
+target is already in (every rung after).
+
+- **It terminates, structurally.** Each rung replaces a `Split` subtree with
+  a `Stack` leaf, so the tree gets strictly shallower. The ceiling is the
+  root.
+- **The endpoint is a shape roost already draws.** Every pane of the tab in
+  one stack is exactly what `Alt+g`'s `all-stack` preset builds, so C6's
+  header, C7's edge marker, C8's fit degradation and `rects` all meet a
+  stack they have seen before. This is why the ladder needs no new
+  rendering and no new invariant.
+- **Flat, not nested.** `pane_order` flattens a nested stack into its member
+  ids, so absorbing one yields a flat stack of every leaf below that split —
+  the same shape the first rung produces, which is what keeps `Stack`'s
+  "children are panes, never nodes" invariant true at every rung.
+- **The focused pane stays expanded on every rung**, which is what makes the
+  ladder legible: the thing you are looking at does not move while the
+  things around it fold away.
+- **The ceiling names itself.** The refusal is now reachable only when the
+  stack already holds the tab, so it can finally say so: **"the whole tab is
+  one stack — {explode chord} explodes it back into a split."** It still
+  names the way out (C38), but it no longer claims a rung is a ceiling.
+
+**The round trip had to be fixed with it, and this is the honest part.**
+Auditing the ladder surfaced a pre-existing bug in its inverse:
+`explode_stack` hardcoded `SplitDir::Horizontal` and even ratios, so
+`Alt+s` → `Alt+Shift+s` **rotated** a side-by-side pair into a stacked one
+and discarded any widths `Alt+< >` had set. Verified against the reporter's
+own tree: panes 3|4 went in `Vertical` and came back `Horizontal`. With
+`Alt+u` scoped to closes (C26), nothing walked that back. A one-rung ladder
+made this rare; a three-rung one would have made it routine.
+
+So `Stack` gains `from: Option<StackOrigin>` — the direction and ratios of
+the split it replaced:
+
+- **`dir` and `ratios` are trusted separately.** A direction means the same
+  thing at any member count; a ratio list does not, so it is used only while
+  it still has one entry per member. A C42 rung that absorbs another split
+  records ratios for fewer slots than the stack ends up holding, so it keeps
+  the direction and falls back to even ratios. The length check is not
+  defensive politeness — handing two ratios to a four-member split is an
+  index straight off the end of `rects`.
+- **A length check alone is not enough, and this contract's audit is why
+  that is written down.** A member count can change and change *back*:
+  collapse a `0.3/0.7` pair, `Alt+n` a pane into the stack, close a
+  different one, and there are two members and two remembered ratios again —
+  the check passes, describing a split those two panes were never in. So
+  `split_pane` and `remove_pane` **clear `from`** when they add or drop a
+  member, making the real rule *valid iff the membership is unchanged since
+  the collapse*; the length check stays as the second line of defence for
+  the rung case above. `swap_in` deliberately does not clear: a swap
+  reorders without changing the count, and split ratios are positional, so
+  slot 0 keeps its share whichever pane now sits in it. Pinned by
+  `a_stack_forgets_its_origin_once_its_membership_changes` and
+  `a_swap_inside_a_stack_keeps_the_remembered_shape`.
+- **`None` is a real answer, not a missing one**: `all_stack_layout`'s
+  stacks, and every stack in a `workspace.json` written before this field,
+  explode to the pre-C42 even-horizontal split. That is the fallback, still.
+- **Additive in both directions, deliberately.** `#[serde(default)]` means an
+  older `workspace.json` loads unchanged; `skip_serializing_if` means a stack
+  with nothing remembered writes byte-identical JSON to what it always wrote,
+  so a newer roost does not churn files it merely touches. Nothing in the
+  crate sets `deny_unknown_fields`, so an older roost reading a newer file
+  ignores the key and takes the fallback. No migration, no version bump —
+  pinned by `a_stack_origin_round_trips_and_older_workspaces_still_load`,
+  which asserts the exact pre-C42 JSON byte for byte.
+
+**One guard the ladder needed and the one-rung version did not.** A stack
+costs about a row per member, so a tab collapsed whole can ask for more rows
+than the terminal has — past roughly 12 members at 36x10, or 32 at 80x24,
+`compute_rects` starts returning **empty rects**. A pane with an empty rect
+still has its process and its PTY; it receives no pixels and no resize. It
+is gone from the screen while alive, which no chord may cause. So a rung
+whose result is not fully drawable is **rolled back** and refused: *"no room
+to stack: this tab has more panes than rows."*
+
+The predicate is `every_pane_is_drawable`, deliberately **not**
+`arrangement_fits`. `arrangement_fits` is a comfort floor —
+`MIN_SPLIT_COLS/ROWS` on the expanded member — and a legitimately tight
+terminal fails it while rendering perfectly: a 4-member stack at 36x10 is
+"unfitting" by that measure and looks fine. Guarding with it would refuse
+the common case to protect the rare one. Drawability is the question with
+no matter of taste in it. (`cycle_layout` needs no equivalent guard: its own
+`arrangement_fits` check happens to exclude these shapes as a side effect,
+which is why this hazard had never surfaced.) Pinned by
+`every_pane_is_drawable_separates_tight_from_actually_broken` and
+`a_rung_that_would_leave_a_pane_undrawable_is_rolled_back_and_says_so`,
+which also pins that a refused rung leaves the tree byte-identical.
+
+**What this deliberately does not do.** `Alt+Shift+s` stays **one press to a
+flat split** — it does not descend the ladder rung by rung. Climbing three
+levels and exploding once lands you in an even split of all the panes, not
+back in your original tree. This is a chosen asymmetry, not an oversight:
+the symmetric version needs the stack to remember every shape it swallowed,
+and the one-sentence rule ("`Alt+s` collapses more, `Alt+Shift+s` blows the
+stack apart") is worth more than an exact inverse a user would have to count
+presses to predict. The one-level case — collapse, explode, get your split
+back — *is* exact, and that is the case people actually round-trip.
+
+**Chrome.** Nothing new. No chord added, no row added to §8 or C15 (row 5
+already spells the pair), no glyph, no colour. C6's header text does the
+teaching for free: `STACK · 2 PANES` becoming `STACK · 3 PANES` on the next
+press *is* the ladder, visible without a legend. One row's **wording**
+changes: C15's stack line read "stack this pane (collapses its split; it
+expands)", which describes a single press, and now reads "stack this pane
+(repeat to collapse further out)" — same length class, still inside C15's
+`HELP_FLOOR_COLS` budget, which `one_help_column_fits_the_floor_under_a_remap_too`
+measures rather than assumes.
+
+**The config alias climbs too, and that is the intended reading.**
+`toggle_stack` — the parse-only alias §8's 2026-09-01 amendment kept for
+`config.json` files written against the old toggle — maps to `StackPane`, so
+a user's existing remap now climbs like the default chord. That is what an
+alias means: it names the action, not a frozen copy of the behaviour the
+action had. Nothing to migrate.
+
+**Tests.** `stack_pane_climbs_one_enclosing_split_per_press_until_the_tab_is_one_stack`
+walks the reported tree rung by rung;
+`climbing_keeps_the_focused_pane_expanded_at_every_rung` and
+`climbing_leaves_untouched_siblings_alone_until_it_reaches_them` pin the two
+properties that make it legible; `the_ceiling_is_a_property_of_the_tree_not_of_how_the_stack_was_built`
+pins that the climb reads the tree rather than a history;
+`holding_the_stack_chord_climbs_quietly_and_names_the_ceiling_once` pins the
+flash discipline (silent on every rung, one message at the top); and
+`holding_alt_s_climbs_the_tab_pane_by_pane_through_a_real_terminal` drives
+it at a real PTY and watches the header count up. The round trip is
+`collapse_then_explode_restores_the_splits_direction_and_ratios` plus
+`a_stack_with_nothing_to_remember_explodes_to_the_even_horizontal_fallback`
+for all three ways to reach the fallback.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -5800,6 +6033,15 @@ message, not a surprise. `toggle_stack` survives as a parse-only config
 alias mapped to the collapse half. The layout operations, fit degradation
 and expanded-slot repair are unchanged (C6–C8).]
 
+[Amended 2026-09-02, C42 — the collapse ladder. Row 5's `Alt+s` **repeats**:
+each press absorbs the next enclosing split into the same stack, until the
+stack holds the whole tab. The refusal above is re-aimed with it — it now
+fires only at that ceiling, and says so — because a rung is no longer a
+refusal. `Alt+Shift+s` is unchanged (one press, one flat split) and now
+restores the collapsed split's direction and ratios instead of always
+rebuilding an even horizontal one. No chord moves and no row is added; see
+C42 for why the asymmetry is chosen rather than missed.]
+
 *Amended 2026-08-07 (row 20, delivery tolerance).* `?` is Shift+`/`, and
 terminals disagree about which half of that they report: some deliver
 `Char('?')` with the shift folded in, others deliver `Char('/')` and leave
@@ -5831,7 +6073,16 @@ and `roost keys` prints the effective map. **(3) Delivery twins:** bare
 row-20 rule), the unshifted `,`/`.`/`_` stay free so readline's M-, M-.
 M-_ keep reaching the pane (U5), and the `twins` closure now covers
 glyph/base pairs — which also closes the pre-existing gap where
-`{"alt+?": "disable"}` left the `('/')+SHIFT` delivery of Alt+? live.]
+`{"alt+?": "disable"}` left the `('/')+SHIFT` delivery of Alt+? live.
+**What this family costs, stated rather than implied:** the `<`/`>` glyphs
+*are* readline's M-< / M-> (beginning- and end-of-history), so the shifted
+half of the width pair shadows two live bindings. U5's guarantee here is
+about the **unshifted** keys, not the whole punctuation vocabulary — this
+table has always been allowed to spend a key the pane wanted, and C23's raw
+mode is the escape hatch, the same one every other chord in it relies on.
+The trade was taken because vim's `Ctrl-w <`/`>` is the resize idiom a
+multiplexer user already has in their fingers, and history-start/end have
+alternatives in every shell that M-,/M-. word-ops do not.]
 
 [Amended 2026-08-19, C34: this table is still the canonical *list* of what
 roost binds by default, but it is no longer what the chrome *prints*. The

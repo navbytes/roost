@@ -31,8 +31,48 @@ pub enum LayoutNode {
     Stack {
         children: Vec<PaneId>,
         expanded: usize,
+        /// C42: the split this stack replaced, so `explode_stack` can put
+        /// that split back instead of guessing. `None` is the honest answer
+        /// wherever there was no single split to remember — a stack from
+        /// `all_stack_layout`, from a `workspace.json` written before this
+        /// field existed, or one the ladder built by absorbing several.
+        ///
+        /// **Additive by construction**: `default` means an older
+        /// `workspace.json` loads unchanged, and `skip_serializing_if`
+        /// means a stack with nothing to remember writes exactly the JSON
+        /// it always did. Nothing in this crate sets `deny_unknown_fields`,
+        /// so an older roost reading a newer file ignores it and falls back
+        /// to the pre-C42 explode. Both directions are pinned by
+        /// `a_stack_origin_round_trips_and_older_workspaces_still_load`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<StackOrigin>,
     },
     Pane(PaneId),
+}
+
+/// C42: what a `Stack` was collapsed *from*. Recorded by `stack_pane` at the
+/// moment it replaces a `Split`, read by `explode_stack` to rebuild that
+/// split rather than inventing an even horizontal one.
+///
+/// **Valid iff the membership has not changed since the collapse.**
+/// `split_pane` and `remove_pane` clear it when they add or drop a member,
+/// because a count that changes and changes back would otherwise pass
+/// `explode_stack`'s length check while describing a shape that no longer
+/// exists. That length check remains, as a second line of defence and for
+/// the one case clearing cannot cover: a C42 rung that absorbs another
+/// split records a `ratios` shorter than the stack it produces, so `dir` is
+/// used and `ratios` dropped. `dir` survives a length mismatch — a
+/// direction stays meaningful at any member count — which is why the two
+/// are read separately rather than as a unit.
+///
+/// `swap_in` deliberately does **not** clear it: a swap reorders members
+/// without changing how many there are, and a split's ratios are positional,
+/// so slot 0 keeps its share whichever pane now sits in it. The remembered
+/// *shape* is still this stack's shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackOrigin {
+    pub dir: SplitDir,
+    pub ratios: Vec<f32>,
 }
 
 /// DFS pane order — used for focus cycling.
@@ -69,10 +109,21 @@ pub fn split_pane(node: &mut LayoutNode, target: PaneId, new: PaneId, dir: Split
             true
         }
         LayoutNode::Pane(_) => false,
-        LayoutNode::Stack { children, expanded } => {
+        LayoutNode::Stack { children, expanded, from } => {
             if children.contains(&target) {
                 children.push(new);
                 *expanded = children.len() - 1;
+                // C42: the membership no longer matches the split this
+                // stack was collapsed from, so what it remembered about
+                // that split is no longer about *this* stack. Dropping it
+                // here rather than length-checking at the read site is what
+                // makes `from`'s rule "valid iff the membership has not
+                // changed since the collapse" — a count that changes and
+                // changes back (add a pane, close another) would otherwise
+                // sail through a length check with ratios describing a
+                // shape that is gone. `explode_stack`'s length check stays
+                // as the second line of defence, not the only one.
+                *from = None;
                 true
             } else {
                 false
@@ -90,12 +141,15 @@ pub fn split_pane(node: &mut LayoutNode, target: PaneId, new: PaneId, dir: Split
 pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
     let empty = match node {
         LayoutNode::Pane(id) => *id == target,
-        LayoutNode::Stack { children, expanded } => {
+        LayoutNode::Stack { children, expanded, from } => {
             if let Some(pos) = children.iter().position(|c| *c == target) {
                 children.remove(pos);
                 if !children.is_empty() && *expanded >= children.len() {
                     *expanded = children.len() - 1;
                 }
+                // C42, same rule as `split_pane`'s push: membership changed,
+                // so the remembered split is no longer this stack's.
+                *from = None;
             }
             children.is_empty()
         }
@@ -157,7 +211,7 @@ pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
 pub fn dedupe_pane_ids(node: &mut LayoutNode, seen: &mut HashSet<PaneId>) -> bool {
     let empty = match node {
         LayoutNode::Pane(id) => !seen.insert(*id),
-        LayoutNode::Stack { children, expanded } => {
+        LayoutNode::Stack { children, expanded, .. } => {
             children.retain(|id| seen.insert(*id));
             if !children.is_empty() && *expanded >= children.len() {
                 *expanded = children.len() - 1;
@@ -209,15 +263,31 @@ pub fn dedupe_pane_ids(node: &mut LayoutNode, seen: &mut HashSet<PaneId>) -> boo
     empty
 }
 
-/// Alt+s: collapse the innermost split that directly contains `target` into
-/// a stack of all its leaf panes (with `target` expanded). False when the
-/// target already sits in a stack, or is the tab's only pane — the caller
-/// distinguishes those refusals (`pane_is_stacked`).
+/// Alt+s: collapse the split that contains `target` into a stack of all its
+/// leaf panes, with `target` expanded — and **repeat outward**. The first
+/// press takes the innermost split; each press after it absorbs the next
+/// enclosing split into the same stack, until the whole tab is one stack.
+/// False only at that ceiling (or when the target is the tab's only pane) —
+/// the caller distinguishes those refusals (`pane_is_stacked`).
+///
+/// **Why it climbs (C42).** The verb has an obvious iteration — there is
+/// always a next enclosing split — and nothing about the first press says
+/// otherwise, so a second press that refused read as a dead end rather than
+/// a ceiling. It could not even tell the two apart: the old refusal fired
+/// identically whether or not a split remained above. Now it fires only at
+/// the real ceiling, which is what makes the message able to name it.
+///
+/// Each press replaces a `Split` subtree with a `Stack` leaf, so the tree
+/// gets strictly shallower and the ladder terminates at the root. The
+/// endpoint — every pane of the tab in one stack — is the shape `Alt+g`'s
+/// `all-stack` preset already builds, so nothing downstream meets a stack
+/// it has not seen before.
 pub fn stack_pane(node: &mut LayoutNode, target: PaneId) -> bool {
     match node {
         LayoutNode::Pane(_) => false,
-        // Stacks hold only panes, so reaching one at all means the target is
-        // either already stacked or lives elsewhere — nothing to collapse.
+        // A stack cannot collapse itself any further — the rung above is its
+        // *parent* split's to take, in the `absorbs` arm below. Returning
+        // false here is what walks the recursion back up to it.
         // (The 2026-09-01 re-key: the collapse half of the old `toggle_stack`
         // toggle; exploding moved to `explode_stack`.)
         LayoutNode::Stack { .. } => false,
@@ -227,9 +297,18 @@ pub fn stack_pane(node: &mut LayoutNode, target: PaneId) -> bool {
                     return true;
                 }
             }
-            let direct =
-                children.iter().any(|c| matches!(c, LayoutNode::Pane(id) if *id == target));
-            if !direct {
+            // This split collapses when it *directly* holds the target — the
+            // first press — or when it directly holds the stack the target is
+            // already in, which is every press after it. `pane_order`
+            // flattens a nested stack into its member ids, so absorbing one
+            // yields a flat stack of every leaf below this split, exactly as
+            // the first press does.
+            let absorbs = children.iter().any(|c| match c {
+                LayoutNode::Pane(id) => *id == target,
+                LayoutNode::Stack { children, .. } => children.contains(&target),
+                LayoutNode::Split { .. } => false,
+            });
+            if !absorbs {
                 return false;
             }
             let mut panes = Vec::new();
@@ -237,7 +316,18 @@ pub fn stack_pane(node: &mut LayoutNode, target: PaneId) -> bool {
                 pane_order(c, &mut panes);
             }
             let expanded = panes.iter().position(|&p| p == target).unwrap_or(0);
-            *node = LayoutNode::Stack { children: panes, expanded };
+            // C42: remember the split being replaced, so exploding puts *it*
+            // back. `ratios` is worth keeping only when this split's children
+            // were all bare panes — on a climbing rung one of them was a
+            // stack, so the ratios describe fewer slots than the stack ends
+            // up holding and `explode_stack`'s length check drops them. The
+            // direction is kept either way; it means the same thing at any
+            // member count.
+            let LayoutNode::Split { dir, ratios, .. } = &*node else {
+                unreachable!("this arm matched a Split");
+            };
+            let from = Some(StackOrigin { dir: *dir, ratios: ratios.clone() });
+            *node = LayoutNode::Stack { children: panes, expanded, from };
             true
         }
     }
@@ -259,17 +349,30 @@ pub fn pane_is_stacked(node: &LayoutNode, target: PaneId) -> bool {
 pub fn explode_stack(node: &mut LayoutNode, target: PaneId) -> bool {
     match node {
         LayoutNode::Pane(_) => false,
-        LayoutNode::Stack { children, .. } => {
+        LayoutNode::Stack { children, from, .. } => {
             if !children.contains(&target) {
                 return false;
             }
             let n = children.len();
             let panes: Vec<LayoutNode> = children.iter().map(|id| LayoutNode::Pane(*id)).collect();
-            *node = LayoutNode::Split {
-                dir: SplitDir::Horizontal,
-                ratios: vec![1.0 / n as f32; n],
-                children: panes,
-            };
+            // C42: put back the split this stack replaced, in two
+            // independently-checked halves. Before C42 this arm hardcoded
+            // `Horizontal` and even ratios, so `Alt+s` then `Alt+Shift+s`
+            // silently *rotated* a side-by-side pair into a stacked one and
+            // discarded whatever widths `Alt+< >` had set — a round trip
+            // that changed the layout, with no undo to walk it back (C26:
+            // undo is for closes).
+            //
+            // `Horizontal` remains the fallback, and is what every stack
+            // with nothing remembered still gets: `all_stack_layout`'s, one
+            // from an older `workspace.json`, or one the ladder grew past
+            // the shape it started from.
+            let dir = from.as_ref().map_or(SplitDir::Horizontal, |o| o.dir);
+            let ratios = from
+                .as_ref()
+                .filter(|o| o.ratios.len() == n)
+                .map_or_else(|| vec![1.0 / n as f32; n], |o| o.ratios.clone());
+            *node = LayoutNode::Split { dir, ratios, children: panes };
             true
         }
         LayoutNode::Split { children, .. } => children.iter_mut().any(|c| explode_stack(c, target)),
@@ -373,7 +476,7 @@ fn swap_in(node: &mut LayoutNode, a: PaneId, b: PaneId) {
                 *id = a;
             }
         }
-        LayoutNode::Stack { children, expanded } => {
+        LayoutNode::Stack { children, expanded, .. } => {
             let (mut ia, mut ib) = (None, None);
             for (i, c) in children.iter_mut().enumerate() {
                 if *c == a {
@@ -479,7 +582,7 @@ pub fn neighbor(rects: &[PaneRect], focused: PaneId, dir: Dir) -> Option<PaneId>
 pub fn expand_in_stacks(node: &mut LayoutNode, target: PaneId) {
     match node {
         LayoutNode::Pane(_) => {}
-        LayoutNode::Stack { children, expanded } => {
+        LayoutNode::Stack { children, expanded, .. } => {
             if let Some(pos) = children.iter().position(|&c| c == target) {
                 *expanded = pos;
             }
@@ -569,7 +672,7 @@ pub fn compute_rects_and_headers(
     }
     match node {
         LayoutNode::Pane(id) => out.push(PaneRect { id: *id, rect: area, collapsed: false }),
-        LayoutNode::Stack { children, expanded } => {
+        LayoutNode::Stack { children, expanded, .. } => {
             let n = children.len();
             if n == 0 {
                 return;
@@ -656,7 +759,7 @@ pub fn stack_headers(node: &LayoutNode, area: Rect) -> Vec<StackHeader> {
 pub fn stack_expanded_ids(node: &LayoutNode, out: &mut HashSet<PaneId>) {
     match node {
         LayoutNode::Pane(_) => {}
-        LayoutNode::Stack { children, expanded } => {
+        LayoutNode::Stack { children, expanded, .. } => {
             if let Some(&id) = children.get(*expanded) {
                 out.insert(id);
             }
@@ -703,7 +806,7 @@ fn grid_row(panes: &[PaneId]) -> LayoutNode {
 /// two-over-one, n=4 2×2, n=5 three-over-two, n=7 three/three/one.
 pub fn grid_layout(panes: &[PaneId]) -> LayoutNode {
     match panes {
-        [] => LayoutNode::Stack { children: Vec::new(), expanded: 0 },
+        [] => LayoutNode::Stack { children: Vec::new(), expanded: 0, from: None },
         [id] => LayoutNode::Pane(*id),
         _ => {
             let n = panes.len();
@@ -742,7 +845,7 @@ pub fn main_stack_layout(focused: PaneId, rest: &[PaneId]) -> LayoutNode {
             ratios: vec![0.6, 0.4],
             children: vec![
                 LayoutNode::Pane(focused),
-                LayoutNode::Stack { children: rest.to_vec(), expanded: 0 },
+                LayoutNode::Stack { children: rest.to_vec(), expanded: 0, from: None },
             ],
         },
     }
@@ -755,11 +858,11 @@ pub fn main_stack_layout(focused: PaneId, rest: &[PaneId]) -> LayoutNode {
 /// stack" rule the main+stack `n = 2` case states explicitly.
 pub fn all_stack_layout(panes: &[PaneId], focused: PaneId) -> LayoutNode {
     match panes {
-        [] => LayoutNode::Stack { children: Vec::new(), expanded: 0 },
+        [] => LayoutNode::Stack { children: Vec::new(), expanded: 0, from: None },
         [id] => LayoutNode::Pane(*id),
         _ => {
             let expanded = panes.iter().position(|&id| id == focused).unwrap_or(0);
-            LayoutNode::Stack { children: panes.to_vec(), expanded }
+            LayoutNode::Stack { children: panes.to_vec(), expanded, from: None }
         }
     }
 }
@@ -775,6 +878,31 @@ pub const MIN_SPLIT_ROWS: u16 = 10;
 /// would produce in `area` is at least `MIN_SPLIT_COLS` × `MIN_SPLIT_ROWS` —
 /// reuses `compute_rects`, so it can't drift from the real geometry walk.
 /// Collapsed stack rows (1-row bars or 3-row boxes) are exempt by design.
+/// C42: would every pane in `node` actually get pixels at `area`?
+///
+/// A far weaker question than `arrangement_fits`, and deliberately so. That
+/// one asks whether every *expanded* pane clears `MIN_SPLIT_COLS/ROWS` — a
+/// comfort floor, and one a legitimately tight terminal fails while still
+/// drawing everything correctly (a 4-member stack at 36x10 is "unfitting"
+/// by that measure and looks fine). This one asks the only question that is
+/// never a matter of taste: **does any pane get no rect, or a rect with no
+/// area?** A pane in that state keeps its process and its PTY but receives
+/// no pixels and no resize — it is gone from the screen while still alive,
+/// which no chord should be able to cause.
+///
+/// It exists because the C42 ladder can now collapse a whole tab into one
+/// stack, and a stack needs roughly a row per member: past ~12 members at
+/// 36x10 (or ~32 at 80x24) `compute_rects` starts handing out empty rects.
+/// `cycle_layout` never had to ask, because `arrangement_fits` — which it
+/// checks for its own reasons — happens to exclude these shapes too.
+pub fn every_pane_is_drawable(node: &LayoutNode, area: Rect) -> bool {
+    let mut expected = Vec::new();
+    pane_order(node, &mut expected);
+    let mut rects = Vec::new();
+    compute_rects(node, area, &mut rects);
+    rects.len() == expected.len() && rects.iter().all(|pr| pr.rect.width > 0 && pr.rect.height > 0)
+}
+
 pub fn arrangement_fits(node: &LayoutNode, area: Rect) -> bool {
     let mut rects = Vec::new();
     compute_rects(node, area, &mut rects);
@@ -902,10 +1030,10 @@ mod tests {
     /// expand the one it displaced. The expanded *slot* follows its pane.
     #[test]
     fn swapping_inside_one_stack_carries_the_expanded_slot_with_the_pane() {
-        let mut root = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let mut root = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
         assert!(swap_panes(&mut root, 1, 2));
         match &root {
-            LayoutNode::Stack { children, expanded } => {
+            LayoutNode::Stack { children, expanded, .. } => {
                 assert_eq!(children, &vec![2, 1, 3], "pane 1 moved down one slot");
                 assert_eq!(*expanded, 1, "and stayed expanded — it is at index 1 now");
             }
@@ -918,10 +1046,10 @@ mod tests {
     /// moves when it is one of the two being exchanged.
     #[test]
     fn a_stack_swap_that_misses_the_expanded_pane_leaves_it_expanded() {
-        let mut root = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let mut root = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
         assert!(swap_panes(&mut root, 2, 3));
         match &root {
-            LayoutNode::Stack { children, expanded } => {
+            LayoutNode::Stack { children, expanded, .. } => {
                 assert_eq!(children, &vec![1, 3, 2]);
                 assert_eq!(*expanded, 0, "pane 1 is still the expanded member");
             }
@@ -944,10 +1072,10 @@ mod tests {
 
     #[test]
     fn stack_gains_new_pane_and_expands_it() {
-        let mut root = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        let mut root = LayoutNode::Stack { children: vec![1, 2], expanded: 0, from: None };
         assert!(split_pane(&mut root, 2, 3, SplitDir::Horizontal));
         match &root {
-            LayoutNode::Stack { children, expanded } => {
+            LayoutNode::Stack { children, expanded, .. } => {
                 assert_eq!(children, &vec![1, 2, 3]);
                 assert_eq!(*expanded, 2);
             }
@@ -960,7 +1088,7 @@ mod tests {
         let mut root = tree();
         assert!(stack_pane(&mut root, 2));
         match &root {
-            LayoutNode::Stack { children, expanded } => {
+            LayoutNode::Stack { children, expanded, .. } => {
                 assert_eq!(children, &vec![1, 2]);
                 assert_eq!(*expanded, 1);
             }
@@ -977,6 +1105,370 @@ mod tests {
         // ...and the explode half refuses what it cannot explode: a split
         assert!(!explode_stack(&mut root, 2));
         assert!(!pane_is_stacked(&root, 2));
+    }
+
+    /// C42, the reported flow: four panes as `Alt+n` builds them — one on
+    /// the left, one top-right, two bottom-right — and `Alt+s` held down
+    /// from the bottom-right pane. Each press absorbs the next enclosing
+    /// split; the fourth finds no split above and refuses. Before C42 the
+    /// *second* press refused, which is the bug.
+    #[test]
+    fn stack_pane_climbs_one_enclosing_split_per_press_until_the_tab_is_one_stack() {
+        // Split[ 1 | Split[ 2 / Split[ 3 | 4 ] ] ]
+        let mut root = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![
+                LayoutNode::Pane(1),
+                LayoutNode::Split {
+                    dir: SplitDir::Horizontal,
+                    ratios: vec![0.5, 0.5],
+                    children: vec![
+                        LayoutNode::Pane(2),
+                        LayoutNode::Split {
+                            dir: SplitDir::Vertical,
+                            ratios: vec![0.5, 0.5],
+                            children: vec![LayoutNode::Pane(3), LayoutNode::Pane(4)],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        // Rung 1: the innermost split only — the pane keeps its neighbours
+        // 1 and 2 visible, which is the whole point of collapsing locally.
+        assert!(stack_pane(&mut root, 4));
+        assert_eq!(stack_members(&root, 4), Some((vec![3, 4], 1)));
+
+        // Rung 2: the split above absorbs pane 2. `pane_order` flattening
+        // the nested stack is what keeps the result a flat stack.
+        assert!(stack_pane(&mut root, 4));
+        assert_eq!(stack_members(&root, 4), Some((vec![2, 3, 4], 2)));
+
+        // Rung 3: the root absorbs pane 1 — every pane in the tab, which is
+        // the same shape `all_stack_layout` builds.
+        assert!(stack_pane(&mut root, 4));
+        assert_eq!(stack_members(&root, 4), Some((vec![1, 2, 3, 4], 3)));
+        assert!(matches!(root, LayoutNode::Stack { .. }), "the stack is the whole tab now");
+
+        // The ceiling, and the only refusal left: nothing above to absorb.
+        assert!(!stack_pane(&mut root, 4));
+        assert!(pane_is_stacked(&root, 4));
+        assert_eq!(
+            stack_members(&root, 4),
+            Some((vec![1, 2, 3, 4], 3)),
+            "a refusal changes nothing"
+        );
+    }
+
+    /// The focused pane stays expanded on every rung, whichever pane it is —
+    /// climbing must not quietly hand the expanded slot to a newcomer. Run
+    /// from pane 3 (position 0 of its own stack) as well as pane 4, because
+    /// an off-by-one in the `position` lookup would only show on one of them.
+    #[test]
+    fn climbing_keeps_the_focused_pane_expanded_at_every_rung() {
+        for target in [3, 4] {
+            let mut root = LayoutNode::Split {
+                dir: SplitDir::Vertical,
+                ratios: vec![0.5, 0.5],
+                children: vec![
+                    LayoutNode::Pane(1),
+                    LayoutNode::Split {
+                        dir: SplitDir::Horizontal,
+                        ratios: vec![0.5, 0.5],
+                        children: vec![LayoutNode::Pane(2), LayoutNode::Pane(3)],
+                    },
+                ],
+            };
+            if target == 4 {
+                // Give pane 3's split a fourth pane so both targets exist.
+                assert!(split_pane(&mut root, 3, 4, SplitDir::Vertical));
+            }
+            while stack_pane(&mut root, target) {
+                let (members, expanded) = stack_members(&root, target).expect("target is stacked");
+                assert_eq!(
+                    members[expanded], target,
+                    "pane {target} lost the expanded slot on a rung: {members:?}",
+                );
+            }
+        }
+    }
+
+    /// Climbing does not disturb a sibling subtree it never reaches: the
+    /// ladder walks *up* from the target, so a split elsewhere in the tab
+    /// keeps its own shape until a rung actually swallows it.
+    #[test]
+    fn climbing_leaves_untouched_siblings_alone_until_it_reaches_them() {
+        // Split[ Split[ 1 | 2 ] , Split[ 3 | 4 ] ] — collapse from 4.
+        let side = |a, b| LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(a), LayoutNode::Pane(b)],
+        };
+        let mut root = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![0.5, 0.5],
+            children: vec![side(1, 2), side(3, 4)],
+        };
+        assert!(stack_pane(&mut root, 4));
+        match &root {
+            LayoutNode::Split { children, .. } => {
+                assert!(
+                    matches!(&children[0], LayoutNode::Split { .. }),
+                    "1|2 is not this press's business: {:?}",
+                    children[0],
+                );
+                assert!(matches!(&children[1], LayoutNode::Stack { .. }));
+            }
+            other => panic!("the root split survives the first rung: {other:?}"),
+        }
+        // The next rung is the root, which takes 1 and 2 with it.
+        assert!(stack_pane(&mut root, 4));
+        assert_eq!(stack_members(&root, 4), Some((vec![1, 2, 3, 4], 3)));
+    }
+
+    /// A stack the ladder never built — `all_stack_layout`'s, or one
+    /// restored from `workspace.json` — is at the ceiling too when it holds
+    /// the tab, and is absorbed normally when it does not. The climb reads
+    /// the tree, not a history of how it got there.
+    #[test]
+    fn the_ceiling_is_a_property_of_the_tree_not_of_how_the_stack_was_built() {
+        let mut whole_tab = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
+        assert!(!stack_pane(&mut whole_tab, 1), "a stack that is the tab has nothing above it");
+
+        let mut with_a_neighbour = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![
+                LayoutNode::Pane(9),
+                LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None },
+            ],
+        };
+        assert!(stack_pane(&mut with_a_neighbour, 1), "a split above it is a rung");
+        assert_eq!(stack_members(&with_a_neighbour, 1), Some((vec![9, 1, 2, 3], 1)));
+    }
+
+    /// C42: the round trip has to be a round trip. Before it, `Alt+s` then
+    /// `Alt+Shift+s` came back as an even **horizontal** split whatever it
+    /// went in as — so a side-by-side pair silently became a stacked one and
+    /// hand-set widths were discarded, with no undo to walk it back (C26).
+    #[test]
+    fn collapse_then_explode_restores_the_splits_direction_and_ratios() {
+        for dir in [SplitDir::Vertical, SplitDir::Horizontal] {
+            let mut root = LayoutNode::Split {
+                dir,
+                ratios: vec![0.3, 0.7], // deliberately not the 0.5/0.5 default
+                children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+            };
+            assert!(stack_pane(&mut root, 2));
+            assert!(explode_stack(&mut root, 2));
+            match &root {
+                LayoutNode::Split { dir: back, ratios, .. } => {
+                    assert_eq!(*back, dir, "the split came back rotated");
+                    assert_eq!(ratios, &vec![0.3, 0.7], "hand-set ratios were discarded");
+                }
+                other => panic!("expected a split back, got {other:?}"),
+            }
+        }
+    }
+
+    /// The fallback is deliberate, and there are three ways to reach it.
+    /// None of them may panic or produce a mismatched split — a `ratios`
+    /// remembered for two slots must never be handed to a four-member
+    /// stack, which `rects` would then index straight off the end.
+    #[test]
+    fn a_stack_with_nothing_to_remember_explodes_to_the_even_horizontal_fallback() {
+        // (a) never collapsed from a split at all — `all_stack_layout`'s
+        // shape, or one read from a pre-C42 workspace.json.
+        let mut built = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
+        assert!(explode_stack(&mut built, 1));
+        assert!(matches!(&built, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+
+        // (b) the ladder grew the stack past the split it started from: the
+        // remembered ratios describe 2 slots, the stack now holds 3.
+        let mut climbed = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![0.5, 0.5],
+            children: vec![
+                LayoutNode::Pane(1),
+                LayoutNode::Split {
+                    dir: SplitDir::Vertical,
+                    ratios: vec![0.25, 0.75],
+                    children: vec![LayoutNode::Pane(2), LayoutNode::Pane(3)],
+                },
+            ],
+        };
+        assert!(stack_pane(&mut climbed, 3)); // rung 1: remembers 0.25/0.75
+        assert!(stack_pane(&mut climbed, 3)); // rung 2: 3 members, 2 ratios
+        assert!(explode_stack(&mut climbed, 3));
+        match &climbed {
+            LayoutNode::Split { dir, ratios, children } => {
+                assert_eq!(*dir, SplitDir::Horizontal, "the outer split's direction survives");
+                assert_eq!(ratios.len(), children.len(), "a ratio per child, always");
+                assert_eq!(ratios.len(), 3);
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+
+        // (c) a pane joined the stack after it was collapsed.
+        let mut grown = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.4, 0.6],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        assert!(stack_pane(&mut grown, 2));
+        assert!(split_pane(&mut grown, 2, 3, SplitDir::Vertical)); // joins the stack
+        assert!(explode_stack(&mut grown, 3));
+        match &grown {
+            LayoutNode::Split { ratios, children, .. } => {
+                assert_eq!(ratios.len(), children.len(), "a ratio per child, always");
+                assert_eq!(children.len(), 3);
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+    }
+
+    /// The persistence contract for `from`, both directions, because it is
+    /// the only part of C42 that touches `workspace.json`.
+    #[test]
+    fn a_stack_origin_round_trips_and_older_workspaces_still_load() {
+        // Forward: a remembered origin survives a save/load cycle, so the
+        // explode is still faithful after roost restarts.
+        let mut collapsed = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.3, 0.7],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        assert!(stack_pane(&mut collapsed, 2));
+        let json = serde_json::to_string(&collapsed).expect("a layout serializes");
+        let mut reloaded: LayoutNode = serde_json::from_str(&json).expect("and loads back");
+        assert!(explode_stack(&mut reloaded, 2));
+        match &reloaded {
+            LayoutNode::Split { dir, ratios, .. } => {
+                assert_eq!(*dir, SplitDir::Vertical);
+                assert_eq!(ratios, &vec![0.3, 0.7]);
+            }
+            other => panic!("expected the remembered split back, got {other:?}"),
+        }
+
+        // Backward: a stack written before this field existed has no `from`
+        // key at all. It must load (not error) and take the fallback.
+        let pre_c42 = r#"{"stack":{"children":[1,2],"expanded":0}}"#;
+        let mut old: LayoutNode = serde_json::from_str(pre_c42).expect("a pre-C42 stack loads");
+        assert!(explode_stack(&mut old, 1));
+        assert!(matches!(&old, LayoutNode::Split { dir: SplitDir::Horizontal, .. }));
+
+        // ...and a stack with nothing to remember writes exactly the JSON it
+        // always did, so a newer roost does not churn every workspace.json
+        // it touches, and an older one reads them back unchanged.
+        let plain = LayoutNode::Stack { children: vec![1, 2], expanded: 0, from: None };
+        assert_eq!(serde_json::to_string(&plain).expect("serializes"), pre_c42);
+    }
+
+    /// The exact path a C42 audit found: a length check alone is not enough,
+    /// because a member count can change and change *back*. Collapse a
+    /// 0.3/0.7 pair, add a pane to the stack, close a different one — two
+    /// members again, two remembered ratios again, and the length check
+    /// waves through a shape that no longer exists. `split_pane` and
+    /// `remove_pane` clear `from` so the round trip cannot happen.
+    #[test]
+    fn a_stack_forgets_its_origin_once_its_membership_changes() {
+        let mut root = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.3, 0.7],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        assert!(stack_pane(&mut root, 2)); // remembers Vertical + 0.3/0.7
+        assert!(split_pane(&mut root, 2, 3, SplitDir::Vertical)); // 3 members
+        assert!(!remove_pane(&mut root, 1)); // back to 2 — the count round-trips
+        assert!(explode_stack(&mut root, 2));
+        match &root {
+            LayoutNode::Split { ratios, children, .. } => {
+                assert_eq!(children.len(), 2);
+                assert_eq!(
+                    ratios,
+                    &vec![0.5, 0.5],
+                    "the ratios of a split these two panes were never in must not be reused",
+                );
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+    }
+
+    /// ...but a swap is not a membership change. Slot 0 keeps its share
+    /// whichever pane sits in it, so the remembered shape is still this
+    /// stack's and must survive — C42 says so explicitly, and the rule
+    /// would be arbitrary if nothing checked it.
+    #[test]
+    fn a_swap_inside_a_stack_keeps_the_remembered_shape() {
+        let mut root = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.3, 0.7],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        assert!(stack_pane(&mut root, 2));
+        assert!(swap_panes(&mut root, 1, 2));
+        assert!(explode_stack(&mut root, 2));
+        match &root {
+            LayoutNode::Split { dir, ratios, .. } => {
+                assert_eq!(*dir, SplitDir::Vertical);
+                assert_eq!(ratios, &vec![0.3, 0.7], "a reorder is not a reshape");
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+    }
+
+    /// C42's guard predicate, at the boundary it exists to police. A stack
+    /// needs roughly a row per member, so past some member count
+    /// `compute_rects` hands out empty rects — a pane with a live process
+    /// and a PTY, drawing nothing. These are the measured thresholds; the
+    /// point of pinning them is that the guard fires *before* them, not
+    /// that the numbers themselves are sacred.
+    #[test]
+    fn every_pane_is_drawable_separates_tight_from_actually_broken() {
+        let stack_of = |n: usize| LayoutNode::Stack {
+            children: (1..=n as PaneId).collect(),
+            expanded: 0,
+            from: None,
+        };
+        // Tight but perfectly drawable: `arrangement_fits` says no (the
+        // expanded member is under the 36x10 comfort floor) while every
+        // pane still gets real pixels. Refusing here — which using
+        // `arrangement_fits` as the guard would do — would break stacking
+        // on any small terminal.
+        let small = Rect::new(0, 0, 36, 10);
+        assert!(!arrangement_fits(&stack_of(4), small), "4 at 36x10 is under the comfort floor");
+        assert!(every_pane_is_drawable(&stack_of(4), small), "...and yet it draws fine");
+
+        // Actually broken: more members than there are rows to give them.
+        assert!(!every_pane_is_drawable(&stack_of(16), small));
+
+        // A roomy terminal draws all of these, and the predicate agrees.
+        let roomy = Rect::new(0, 0, 100, 30);
+        for n in [2, 4, 8, 16] {
+            assert!(every_pane_is_drawable(&stack_of(n), roomy), "{n} members at 100x30");
+        }
+
+        // It is not stack-specific: a split rounded past existence fails too.
+        let wide_split = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![1.0 / 64.0; 64],
+            children: (1..=64).map(LayoutNode::Pane).collect(),
+        };
+        assert!(!every_pane_is_drawable(&wide_split, small));
+    }
+
+    /// Helper: the stack `target` belongs to, as `(members, expanded)`.
+    fn stack_members(node: &LayoutNode, target: PaneId) -> Option<(Vec<PaneId>, usize)> {
+        match node {
+            LayoutNode::Pane(_) => None,
+            LayoutNode::Stack { children, expanded, .. } => {
+                children.contains(&target).then(|| (children.clone(), *expanded))
+            }
+            LayoutNode::Split { children, .. } => {
+                children.iter().find_map(|c| stack_members(c, target))
+            }
+        }
     }
 
     #[test]
@@ -1018,7 +1510,7 @@ mod tests {
 
     #[test]
     fn flip_split_noop_in_a_stack() {
-        let mut node = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        let mut node = LayoutNode::Stack { children: vec![1, 2], expanded: 0, from: None };
         assert!(!flip_split(&mut node, 1));
     }
 
@@ -1058,7 +1550,7 @@ mod tests {
         // *and* the boxed threshold (>= 3·3+8=17), so this scenario carries
         // a header row and 3-row collapsed boxes — see the dedicated
         // threshold tests below for both boundaries.
-        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
         let mut out = vec![];
         let mut headers = vec![];
         compute_rects_and_headers(&node, Rect::new(0, 0, 80, 20), &mut out, &mut headers);
@@ -1080,7 +1572,7 @@ mod tests {
     #[test]
     fn collapsed_members_box_only_when_the_expanded_floor_survives() {
         // n=2: threshold = 1 + 3 + 10 = 14.
-        let node = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        let node = LayoutNode::Stack { children: vec![1, 2], expanded: 0, from: None };
         let mut out = vec![];
         let mut headers = vec![];
         compute_rects_and_headers(&node, Rect::new(0, 0, 80, 13), &mut out, &mut headers);
@@ -1112,13 +1604,13 @@ mod tests {
     /// would build exactly that.
     #[test]
     fn a_stack_shrunk_to_one_member_stops_being_a_stack() {
-        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
         remove_pane(&mut node, 3);
         remove_pane(&mut node, 2);
         assert!(matches!(node, LayoutNode::Pane(1)), "a stack of one is a pane, not {node:?}",);
 
         // ...and the illegal shape it used to make: Alt+Shift+s on that stack.
-        let mut stack = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        let mut stack = LayoutNode::Stack { children: vec![1, 2], expanded: 0, from: None };
         remove_pane(&mut stack, 2);
         explode_stack(&mut stack, 1);
         if let LayoutNode::Split { children, .. } = &stack {
@@ -1128,7 +1620,7 @@ mod tests {
 
     #[test]
     fn stack_header_shown_iff_height_at_least_n_plus_3() {
-        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 }; // n=3, threshold=6
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None }; // n=3, threshold=6
         let mut out = vec![];
         let mut headers = vec![];
         compute_rects_and_headers(&node, Rect::new(0, 0, 80, 5), &mut out, &mut headers);
@@ -1153,7 +1645,7 @@ mod tests {
         // the regime where collapsed members are 1-row bars.
         let area = Rect::new(0, 0, 80, 10);
         let pre_c6_height = area.height - (n - 1); // the no-header formula: 8
-        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
         let mut out = vec![];
         let mut headers = vec![];
         compute_rects_and_headers(&node, area, &mut out, &mut headers);
@@ -1164,7 +1656,7 @@ mod tests {
 
     #[test]
     fn stack_header_row_belongs_to_no_pane() {
-        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 };
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
         let area = Rect::new(0, 0, 80, 20);
         let mut out = vec![];
         let mut headers = vec![];
@@ -1183,7 +1675,7 @@ mod tests {
             dir: SplitDir::Vertical,
             ratios: vec![0.5, 0.5],
             children: vec![
-                LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1 },
+                LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None },
                 LayoutNode::Pane(9),
             ],
         };
@@ -1194,7 +1686,7 @@ mod tests {
 
     #[test]
     fn expand_in_stacks_expands_target() {
-        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
         expand_in_stacks(&mut node, 3);
         assert!(matches!(node, LayoutNode::Stack { expanded: 2, .. }));
     }
@@ -1280,7 +1772,7 @@ mod tests {
         // n=2 is the smallest real stack (1 collapsed row) — a different
         // arithmetic regime from the n=3 case above; pin the threshold here
         // too. Threshold = n+3 = 5.
-        let node = LayoutNode::Stack { children: vec![1, 2], expanded: 0 };
+        let node = LayoutNode::Stack { children: vec![1, 2], expanded: 0, from: None };
         let mut out = vec![];
         let mut headers = vec![];
         compute_rects_and_headers(&node, Rect::new(0, 0, 80, 4), &mut out, &mut headers);
@@ -1299,7 +1791,7 @@ mod tests {
     fn compute_rects_on_zero_area_yields_nothing() {
         // Degenerate terminal size (zero width or height): must not panic,
         // and must not fabricate rects/headers out of no area.
-        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0 };
+        let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
         let mut out = vec![];
         let mut headers = vec![];
         compute_rects_and_headers(&node, Rect::new(0, 0, 0, 20), &mut out, &mut headers);
@@ -1422,7 +1914,7 @@ mod tests {
                 assert_eq!(ratios, vec![0.6, 0.4]);
                 assert!(matches!(&children[0], LayoutNode::Pane(1)));
                 match &children[1] {
-                    LayoutNode::Stack { children, expanded } => {
+                    LayoutNode::Stack { children, expanded, .. } => {
                         assert_eq!(children, &vec![2, 3, 4]);
                         assert_eq!(*expanded, 0);
                     }
@@ -1453,7 +1945,7 @@ mod tests {
     #[test]
     fn all_stack_layout_expands_the_focused_member() {
         match all_stack_layout(&[10, 20, 30], 20) {
-            LayoutNode::Stack { children, expanded } => {
+            LayoutNode::Stack { children, expanded, .. } => {
                 assert_eq!(children, vec![10, 20, 30]);
                 assert_eq!(expanded, 1);
             }

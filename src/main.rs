@@ -2362,11 +2362,19 @@ mod tests {
             let (mut w, mut h) = (100u16, 30u16);
             let mut trail: Vec<String> = Vec::new();
             for _ in 0..150 {
-                match rng.below(15) {
+                match rng.below(16) {
                     0 | 1 => app.apply(Action::NewPane),
                     2 => app.apply(Action::NewTab),
                     3 => app.apply(Action::ToggleRaw), // C23 pass-through on/off
                     4 => app.apply(Action::StackPane),
+                    // Both halves of the retired `ToggleStack`, which used
+                    // to reach the exploded shape by alternating with
+                    // itself. Since the 2026-09-01 split, a walk that only
+                    // ever collapses never builds a stack back into a
+                    // `Split` — the one construction path that produced the
+                    // single-child `Split` the layout invariant checker was
+                    // written for.
+                    14 => app.apply(Action::ExplodeStack),
                     5 => app.apply(Action::ToggleFloat),
                     6 => app.apply(Action::CopyMode),
                     7 => app.apply(Action::ScrollMode),
@@ -2458,13 +2466,18 @@ mod tests {
                 // Reshape underneath the pointer every few events, so a
                 // gesture's latch and the tree it points into disagree as
                 // often as they can.
-                let __pick = rng.below(16);
+                let __pick = rng.below(17);
                 trail.push(format!("A{__pick}"));
                 match __pick {
                     0 | 1 => app.apply(Action::NewPane),
                     2 => app.apply(Action::ClosePane),
                     3 => app.apply(Action::NewTab),
                     4 => app.apply(Action::StackPane),
+                    // The explode half, for the reason the key walk records:
+                    // collapsing alone never reaches the shape a stack
+                    // exploding back into a split can build, and a click
+                    // landing mid-explode is exactly this walk's business.
+                    16 => app.apply(Action::ExplodeStack),
                     5 => app.apply(Action::ToggleZoom),
                     6 => app.apply(Action::ToggleFloat),
                     7 => app.apply(Action::NextTab),
