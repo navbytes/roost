@@ -455,6 +455,35 @@ pub fn kitty_upgrade(key: KeyEvent, bytes: Vec<u8>, kitty: bool) -> Vec<u8> {
         // The unshifted codepoint: crossterm hands us the *shifted* char for
         // `Ctrl+Shift+a` on some terminals, and kitty wants `97;6u`.
         KeyCode::Char(c) if ctrl_or_alt => csi_u(c.to_ascii_lowercase() as u32, m),
+        // Functional keys keep their **legacy CSI shape** under the kitty
+        // protocol — `CSI 1;3D` for Alt+Left, not a `u` form. Only keys with
+        // no legacy encoding move to `CSI code;mods u`, which is why the
+        // arms above (Esc, Enter, printables) are the ones that do.
+        //
+        // Reached because `disable` forwards these now: a pane that
+        // negotiated disambiguation asked to be told which modifiers were
+        // held, and the meta-ESC fallback (`ESC ESC [ D`) does not say. This
+        // is the one case where roost can pick the encoding without
+        // guessing — the pane declared what it wants — so it is the only
+        // case where it picks something other than meta-ESC.
+        KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Insert
+        | KeyCode::Delete
+        | KeyCode::BackTab
+            if ctrl_or_alt || m.contains(KeyModifiers::SHIFT) =>
+        {
+            match encode_key(key) {
+                InputResult::Forward(b) => b,
+                _ => bytes,
+            }
+        }
         _ => bytes,
     }
 }
@@ -465,12 +494,20 @@ pub fn kitty_upgrade(key: KeyEvent, bytes: Vec<u8>, kitty: bool) -> Vec<u8> {
 fn encode_key(key: KeyEvent) -> InputResult {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // xterm's modifier parameter: 1 + shift(1) + alt(2) + ctrl(4). Alt never
-    // reaches this table — in cooked routing it's roost's own chord layer,
-    // and `encode_raw` strips it before delegating here — so only Shift/Ctrl
-    // contribute (xm ∈ {1, 2, 5, 6}). xm == 1 means "unmodified": the keys
-    // below keep their bare legacy forms, exactly as a terminal would.
-    let xm = 1 + u8::from(shift) + 4 * u8::from(ctrl);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // xterm's modifier parameter, in full: 1 + shift(1) + alt(2) + ctrl(4).
+    // xm == 1 means "unmodified": the keys below keep their bare legacy
+    // forms, exactly as a terminal would.
+    //
+    // Alt used to be excluded here, on the true observation that nothing
+    // ever passed this function an Alt key — in cooked routing Alt is
+    // roost's own chord layer, and `encode_raw` strips it before delegating.
+    // `kitty_upgrade` now does pass one (a forwarded Alt+arrow for a pane
+    // that negotiated the kitty protocol), and it wants exactly the arithmetic
+    // xterm documents. The `Char` arms below are unaffected either way: they
+    // never consult `xm`, so an Alt+printable still goes out as the meta-ESC
+    // `encode_raw` builds rather than through here.
+    let xm = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
     // A navigation key with xm > 1 becomes `CSI 1;xm X` (Ctrl+Right = word
     // jump in readline/zsh arrives as `\x1b[1;5C`); a tilde key becomes
     // `CSI n;xm ~`. Unmodified, both keep the exact bytes they always sent.
@@ -2752,5 +2789,73 @@ mod tests {
                 "the vim focus letters are untouched: {code:?}"
             );
         }
+    }
+    /// A pane that negotiated the kitty keyboard protocol asked to be told
+    /// which modifiers were held. Meta-ESC cannot say: `ESC ESC [ D` is the
+    /// same bytes whether or not Alt was down, which is precisely the
+    /// ambiguity disambiguation exists to remove. So a forwarded functional
+    /// key gets the CSI-modifier form for those panes.
+    ///
+    /// This is the *only* place roost picks an encoding other than meta-ESC
+    /// for a forwarded chord, and it is the only place it can do so without
+    /// guessing — the pane declared what it wants. A pane that never
+    /// negotiated keeps meta-ESC, unchanged.
+    #[test]
+    fn a_kitty_pane_gets_functional_keys_in_the_csi_modifier_form() {
+        // Alt+Left. mods = 1 + alt(2) = 3.
+        let key = alt(KeyCode::Left);
+        let meta_esc = encode_raw(key);
+        assert_eq!(meta_esc, b"\x1b\x1b[D", "the fallback every other pane keeps");
+        assert_eq!(
+            kitty_upgrade(key, meta_esc.clone(), false),
+            meta_esc,
+            "a pane that never negotiated is untouched",
+        );
+        assert_eq!(
+            kitty_upgrade(key, meta_esc, true),
+            b"\x1b[1;3D".to_vec(),
+            "a kitty pane is told the modifier",
+        );
+
+        // The whole family, and the arithmetic behind each: 1 + shift(1) +
+        // alt(2) + ctrl(4). A tilde key keeps its number, a cursor key its
+        // letter — kitty leaves functional keys in their legacy CSI shape.
+        let cases: &[(KeyEvent, &[u8])] = &[
+            (alt(KeyCode::Right), b"\x1b[1;3C"),
+            (alt(KeyCode::Up), b"\x1b[1;3A"),
+            (alt(KeyCode::Down), b"\x1b[1;3B"),
+            (alt_shift(KeyCode::Left), b"\x1b[1;4D"),
+            (alt(KeyCode::PageUp), b"\x1b[5;3~"),
+            (alt(KeyCode::Home), b"\x1b[1;3H"),
+        ];
+        for (key, want) in cases {
+            assert_eq!(kitty_upgrade(*key, encode_raw(*key), true), want.to_vec(), "{key:?}",);
+        }
+    }
+
+    /// The change to `encode_key`'s modifier arithmetic must not reach any
+    /// existing caller: Alt still never gets there through `translate` (it is
+    /// roost's chord layer) or through `encode_raw` (which strips it), and an
+    /// Alt+printable still leaves as meta-ESC rather than acquiring a
+    /// modifier parameter it never had.
+    #[test]
+    fn admitting_alt_to_the_modifier_arithmetic_changes_no_existing_path() {
+        // Unmodified and Shift/Ctrl-modified navigation: byte-identical.
+        for key in [
+            plain(KeyCode::Left),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+            plain(KeyCode::PageUp),
+        ] {
+            assert_eq!(translate(key), encode_key(key), "{key:?} still round-trips");
+        }
+        assert_eq!(translate(plain(KeyCode::Left)), InputResult::Forward(b"\x1b[D".to_vec()));
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+            InputResult::Forward(b"\x1b[1;5C".to_vec()),
+            "Ctrl+Right is readline's word jump — unchanged",
+        );
+        // An unbound Alt+printable is still meta-ESC, not a CSI form.
+        assert_eq!(encode_raw(alt(KeyCode::Char('f'))), b"\x1bf".to_vec());
     }
 }
