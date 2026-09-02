@@ -67,7 +67,9 @@ a raw-focused pane collapses it to one pair (`Alt+Shift+p exit raw`).
 
 Every shortcut above lives on `Alt`, which can collide with your shell's own
 readline bindings (`Alt+f`/`Alt+b`/`Alt+d` are the usual culprits). Fix one in
-`config.json`, next to `workspace.json` (`ROOST_STATE` redirects both). No
+`config.json`, next to `workspace.json` — [`ROOST_STATE` redirects
+both](../README.md#a-separate-workspace-is-one-environment-variable), which is
+also how you try a remap without touching your real one. No
 file — the default — and roost behaves exactly as documented above.
 
 ```json

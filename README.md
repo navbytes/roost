@@ -92,12 +92,29 @@ Pin a version by appending it, e.g. `github:navbytes/roost@0.1.17`, or swap
 `@branch:main` for `@tag:v0.1.17` on the cargo backend. Drop `-g` to pin roost
 per-project in that directory's `mise.toml` instead of globally.
 
-Only one roost runs per workspace at a time — a second instance on the same
-state dir refuses to start (they'd race and corrupt `workspace.json`). Run an
-isolated one with `ROOST_STATE=/some/dir roost`. This isolates workspace
-state only — it still installs and updates the pi extension and the Claude
-Code hooks in your real `~/.pi` and `~/.claude` (below). Add
-`ROOST_NO_EXT_INSTALL=1` if you don't want that too. Deliberate:
+### A separate workspace is one environment variable
+
+Point `ROOST_STATE` somewhere else and you get an independent roost — its own
+`workspace.json`, its own `config.json`, and its own control socket, so
+`roost list` from that shell talks to *that* instance and not your main one:
+
+```console
+$ ROOST_STATE=/tmp/roost-scratch roost
+```
+
+Nothing to create first — roost makes the directory. Useful for a throwaway
+fleet you don't want mixed into your real workspace, a per-project set of
+panes you keep separate, or trying a `config.json` remap without touching
+your own. Delete the directory to throw the whole thing away.
+
+This is also how you run **two roosts at once**: only one roost runs per
+workspace at a time — a second instance on the same state dir refuses to
+start, since they'd race and corrupt `workspace.json` — but two state dirs
+are two independent fleets.
+
+It isolates workspace state *only*. It still installs and updates the pi
+extension and the Claude Code hooks in your real `~/.pi` and `~/.claude`
+(below); add `ROOST_NO_EXT_INSTALL=1` if you don't want that too. Deliberate:
 `ROOST_STATE` doesn't imply "don't touch my global config" because two
 concurrent real roost fleets, each in its own state dir, both legitimately
 want the one real `~/.claude` wired up.
