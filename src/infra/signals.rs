@@ -64,6 +64,39 @@ pub fn install() {
 /// hand instead.
 const HANGUP_GRACE_FOR_MAIN_LOOP: Duration = Duration::from_millis(500);
 
+/// How much longer the watchdog waits once the ordinary teardown has
+/// actually *started*.
+///
+/// The 500 ms above is sized for "did the main thread notice at all?", not
+/// for "has it finished?". `App::kill_fleet` spends `pty::HANGUP_GRACE`
+/// (200 ms) plus a reap budget plus a workspace save — comfortably inside
+/// 500 ms on an idle machine, and not reliably so on a loaded one or a slow
+/// disk. Forcing at a flat deadline would then SIGKILL agents *mid-flush*,
+/// destroying the final turn that `hangup` exists to let them write. So once
+/// teardown is visibly under way the watchdog stands back and gives it room.
+///
+/// Waiting costs nothing when teardown succeeds: the process exits the
+/// moment `main` returns, taking this thread with it. The cap only bounds
+/// the pathological case where teardown itself wedges.
+const TEARDOWN_COMPLETION_CAP: Duration = Duration::from_secs(5);
+
+/// Set by `App::kill_fleet` the moment the ordinary teardown begins, so the
+/// hangup watchdog can tell "the main thread is wedged" from "the main
+/// thread is doing the job right now".
+static TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Called by `App::kill_fleet`. Idempotent; the teardown path may be reached
+/// from Alt+q, a signal, the panic hook or the watchdog itself.
+pub fn note_teardown_started() {
+    TEARDOWN_STARTED.store(true, Ordering::SeqCst);
+}
+
+/// Whether the ordinary teardown has begun. Read by the watchdog, and by the
+/// test that pins `kill_fleet` announcing itself.
+pub fn teardown_started() -> bool {
+    TEARDOWN_STARTED.load(Ordering::SeqCst)
+}
+
 /// How long the watchdog gives a SIGHUP'd pane to exit on its own — an agent
 /// flushing its last turn to its session file, the same courtesy
 /// `App::kill_fleet`/`PtyPane::hangup` extend on every other exit path —
@@ -137,6 +170,13 @@ pub fn watch_for_hangup() {
         // this thread can do by hand.
         TERMINATING.store(true, Ordering::SeqCst);
         std::thread::sleep(HANGUP_GRACE_FOR_MAIN_LOOP);
+        // Never truncate a teardown that is already running: it does
+        // everything below and does it better, hanging agents up gently so
+        // they can flush. Only a main thread that never got started — the
+        // stdin-EOF spin this watchdog exists for — reaches the forced path.
+        if teardown_started() {
+            std::thread::sleep(TEARDOWN_COMPLETION_CAP);
+        }
 
         // Still executing after that sleep means the process is still
         // alive (an exited process takes every thread with it, this one
