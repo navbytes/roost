@@ -15,8 +15,9 @@
 //!   "this run must not touch anything outside itself", already set on every
 //!   roost `tests/harness/mod.rs` spawns.
 //!
-//! Both functions write into the operator's real, often dotfiles-managed
-//! `~/.pi`/`~/.claude` regardless of `ROOST_STATE` — an isolated *workspace*
+//! All three write into the operator's real, often dotfiles-managed
+//! `~/.pi`/`~/.claude`/`~/.config/opencode` regardless of `ROOST_STATE` — an
+//! isolated *workspace*
 //! is not an isolated *machine*, so `ROOST_STATE` alone does not suppress
 //! this (deliberate: someone running two concurrent, equally-real roost
 //! fleets on one box, each with its own `ROOST_STATE`, still wants both
@@ -32,11 +33,19 @@
 //! - Claude Code: three hook entries inside `~/.claude/settings.json`, a file
 //!   the *user* owns and may already have their own content in — merge, not
 //!   overwrite, see `ensure_claude_hooks`.
+//! - opencode: a single file we own outright
+//!   (`~/.config/opencode/plugin/opencode-plugin.ts`) — compare-and-overwrite,
+//!   see `ensure_opencode_plugin`. Unlike the two above, creating the
+//!   `plugin/` subdir *is* part of the install: opencode auto-globs that dir,
+//!   so there is no existing file to merge into. The config dir itself still
+//!   must exist — a user who never ran opencode has no `~/.config/opencode`,
+//!   and we never create that.
 
 use std::path::{Path, PathBuf};
 
-/// Whether either install path (`ensure_pi_extension`, `ensure_claude_hooks`)
-/// must no-op — see the module doc for what each of the two knobs means.
+/// Whether any install path (`ensure_pi_extension`, `ensure_claude_hooks`,
+/// `ensure_opencode_plugin`) must no-op — see the module doc for what each of
+/// the two knobs means.
 /// Checked before either function even resolves `dirs::home_dir()`, not just
 /// before it writes: the bug this exists to fix was a real, global
 /// `~/.claude/settings.json` getting mutated by a run that believed
@@ -101,6 +110,59 @@ pub fn ensure_claude_hooks() -> Option<String> {
     // execute. Bail rather than install something broken.
     let exe = exe.to_str()?;
     merge_claude_hooks(&claude_dir.join("settings.json"), exe)
+}
+
+/// The opencode plugin source, embedded at build time like `BUNDLED`.
+const BUNDLED_OPENCODE: &str = include_str!("../../extensions/opencode-plugin.ts");
+
+/// Ensure `~/.config/opencode/plugin/opencode-plugin.ts` matches this build —
+/// the plugin that reports opencode's session id over roost's socket (see
+/// `extensions/opencode-plugin.ts`; without it roost has no way to learn the
+/// id, since opencode keeps sessions in one global SQLite database with no
+/// directory to scan). Returns a short message to surface when it installed
+/// or updated the file, else None.
+///
+/// Like the pi extension, this is a file roost owns outright — no merge —
+/// with one difference: the `plugin/` subdir is created on demand, because
+/// opencode auto-globs it and a working install needs nothing else in it.
+/// Only when opencode is set up: `~/.config/opencode` itself must already
+/// exist (we never create it — a user who never ran opencode would get a
+/// config dir that exists for nothing).
+pub fn ensure_opencode_plugin() -> Option<String> {
+    if ext_install_disabled() {
+        return None;
+    }
+    let config_dir = dirs::home_dir()?.join(".config").join("opencode");
+    // Only touch things when opencode is present — never create
+    // ~/.config/opencode ourselves.
+    if !config_dir.is_dir() {
+        return None;
+    }
+    install_opencode_plugin(&config_dir)
+}
+
+/// The real work of `ensure_opencode_plugin`, split out (like
+/// `merge_claude_hooks`) so it's independently testable against a tempdir.
+/// `config_dir` is opencode's config directory (the one containing
+/// `opencode.json`), not the `plugin/` subdir itself.
+fn install_opencode_plugin(config_dir: &Path) -> Option<String> {
+    let plugin_dir = config_dir.join("plugin");
+    let target = plugin_dir.join("opencode-plugin.ts");
+
+    let existing = std::fs::read_to_string(&target).ok();
+    if existing.as_deref() == Some(BUNDLED_OPENCODE) {
+        return None; // already current
+    }
+    let updating = existing.is_some();
+
+    std::fs::create_dir_all(&plugin_dir).ok()?;
+    write_atomic(&target, BUNDLED_OPENCODE)?;
+
+    Some(if updating {
+        "updated the roost opencode plugin to match this build".into()
+    } else {
+        "installed the roost opencode plugin (~/.config/opencode/plugin/opencode-plugin.ts)".into()
+    })
 }
 
 /// The Claude Code hook events roost wires up, and the status each reports.
@@ -723,14 +785,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Fixture `$HOME` with both `.pi/agent` and `.claude` present — ready to
-    /// receive an install — so a test run against it proves whichever gate
-    /// is under test is what stopped the write, not "tool not present" (the
-    /// other, unrelated reason both `ensure_*` functions no-op).
+    /// Fixture `$HOME` with `.pi/agent`, `.claude` and `.config/opencode`
+    /// present — ready to receive an install — so a test run against it
+    /// proves whichever gate is under test is what stopped the write, not
+    /// "tool not present" (the other, unrelated reason the `ensure_*`
+    /// functions no-op).
     fn ready_fixture_home(name: &str) -> PathBuf {
         let dir = scratch_dir(name);
         std::fs::create_dir_all(dir.join(".pi").join("agent")).unwrap();
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".config").join("opencode")).unwrap();
         dir
     }
 
@@ -739,7 +803,7 @@ mod tests {
     /// `core::app`'s `stale_session_falls_back_to_fresh_launch` fixture —
     /// no crate-wide lock serializes `$HOME` mutation against other tests in
     /// this binary there, and none is added here either; see that test's own
-    /// note. `ensure_pi_extension`/`ensure_claude_hooks` read `$HOME` once
+    /// note. The `ensure_*` functions read `$HOME` once
     /// per call, uncached, exactly like `host_io_disabled` reads its env var
     /// — so this is trusted regardless of how many times it runs.
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
@@ -762,36 +826,107 @@ mod tests {
     /// or `clipboard`'s own env-mutating unit tests elsewhere in this same
     /// binary — a pre-existing, accepted risk, not one this test adds.
     #[test]
-    fn host_io_gate_blocks_both_installs_even_when_both_tools_are_present() {
+    fn host_io_gate_blocks_all_three_installs_even_when_all_three_tools_are_present() {
         let home = ready_fixture_home("host-io-gate");
         std::env::remove_var("ROOST_NO_EXT_INSTALL");
 
         // Phase 1: gate on, ROOST_NO_EXT_INSTALL deliberately left unset —
         // a pass here proves ROOST_TEST_NO_HOST_IO alone is sufficient.
         std::env::set_var("ROOST_TEST_NO_HOST_IO", "1");
-        let (pi_gated, claude_gated) =
-            with_home(&home, || (ensure_pi_extension(), ensure_claude_hooks()));
+        let (pi_gated, claude_gated, oc_gated) = with_home(&home, || {
+            (ensure_pi_extension(), ensure_claude_hooks(), ensure_opencode_plugin())
+        });
         assert!(pi_gated.is_none(), "pi extension installed despite the gate: {pi_gated:?}");
         assert!(
             claude_gated.is_none(),
             "Claude Code hooks installed despite the gate: {claude_gated:?}"
         );
+        assert!(oc_gated.is_none(), "opencode plugin installed despite the gate: {oc_gated:?}");
         assert!(!home.join(".pi/agent/extensions/roost.ts").exists(), "pi extension file written");
         assert!(!home.join(".claude/settings.json").exists(), "settings.json written");
+        // The gate must stop the opencode install before even the mkdir —
+        // a stray (empty) plugin dir would be litter in a gated run.
+        assert!(!home.join(".config/opencode/plugin").exists(), "opencode plugin dir created");
 
         // Phase 2 (positive control): identical fixture, gate off, must
         // actually install — proves phase 1 passed *because of* the gate,
         // not because the fixture was never "ready" (e.g. a typo'd path).
         std::env::remove_var("ROOST_TEST_NO_HOST_IO");
-        let (pi_msg, claude_msg) =
-            with_home(&home, || (ensure_pi_extension(), ensure_claude_hooks()));
+        let (pi_msg, claude_msg, oc_msg) = with_home(&home, || {
+            (ensure_pi_extension(), ensure_claude_hooks(), ensure_opencode_plugin())
+        });
         let pi_msg = pi_msg.expect("pi extension should install once the gate is off");
         assert!(pi_msg.contains("installed"), "{pi_msg}");
         let claude_msg = claude_msg.expect("claude hooks should install once the gate is off");
         assert!(claude_msg.contains("installed"), "{claude_msg}");
+        let oc_msg = oc_msg.expect("opencode plugin should install once the gate is off");
+        assert!(oc_msg.contains("installed"), "{oc_msg}");
         assert!(home.join(".pi/agent/extensions/roost.ts").exists());
         assert!(home.join(".claude/settings.json").exists());
+        assert!(home.join(".config/opencode/plugin/opencode-plugin.ts").exists());
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- opencode plugin installer ----
+    // (env-mutating tests below share the gate test's accepted-race note:
+    // no crate-wide lock serializes env against this binary's other
+    // env-touching tests.)
+
+    #[test]
+    fn opencode_installs_into_an_absent_plugin_dir() {
+        // The fresh-machine shape: ~/.config/opencode exists but has no
+        // plugin/ yet — the installer must create it (opencode auto-globs
+        // the dir; nothing else can create it for us).
+        let dir = scratch_dir("opencode-absent");
+        let msg = install_opencode_plugin(&dir).expect("should install");
+        assert!(msg.contains("installed"), "{msg}");
+        assert!(msg.contains("opencode"), "{msg}");
+        let target = dir.join("plugin").join("opencode-plugin.ts");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), BUNDLED_OPENCODE);
+        assert!(no_tmp_litter(&dir.join("plugin")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_running_twice_does_not_duplicate() {
+        let dir = scratch_dir("opencode-idempotent");
+        let first = install_opencode_plugin(&dir).expect("first run installs");
+        assert!(first.contains("installed"), "{first}");
+        let second = install_opencode_plugin(&dir);
+        assert!(second.is_none(), "unchanged second run must be silent: {second:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("plugin").join("opencode-plugin.ts")).unwrap(),
+            BUNDLED_OPENCODE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_a_stale_file_is_updated_not_left_stale() {
+        // An older build's copy (or a hand-copied one) must be replaced in
+        // place — the same rot the pi/claude paths exist to fix.
+        let dir = scratch_dir("opencode-stale");
+        let target = dir.join("plugin").join("opencode-plugin.ts");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "// an older build's plugin").unwrap();
+        let msg = install_opencode_plugin(&dir).expect("stale file must be updated");
+        assert!(msg.contains("updated"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), BUNDLED_OPENCODE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_is_a_no_op_when_the_config_dir_is_absent() {
+        // "Only when the tool is set up": no ~/.config/opencode means a
+        // silent no-op — and critically, no ~/.config created either.
+        let home = scratch_dir("opencode-no-tool");
+        std::fs::create_dir_all(home.join(".pi").join("agent")).unwrap();
+        std::env::remove_var("ROOST_NO_EXT_INSTALL");
+        std::env::remove_var("ROOST_TEST_NO_HOST_IO");
+        let msg = with_home(&home, ensure_opencode_plugin);
+        assert!(msg.is_none(), "absent opencode must be a silent no-op: {msg:?}");
+        assert!(!home.join(".config").exists(), "must never create ~/.config/opencode");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

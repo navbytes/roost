@@ -463,6 +463,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     if let Some(msg) = infra::extension::ensure_claude_hooks() {
         app.set_flash(msg);
     }
+    // Same idea for opencode: drop roost's session-reporting plugin into
+    // ~/.config/opencode/plugin/. No-op when opencode isn't set up or
+    // ROOST_NO_EXT_INSTALL is set — see infra::extension module docs.
+    if let Some(msg) = infra::extension::ensure_opencode_plugin() {
+        app.set_flash(msg);
+    }
 
     // Write the fleet control token where an external `roost <verb>` client can
     // read it (0600, owner-only, next to the socket). Never placed in a pane's
