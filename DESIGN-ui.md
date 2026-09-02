@@ -3954,6 +3954,28 @@ lands somewhere surprising is worse than one that predictably does nothing.
   — which necessarily spans the full width *and* height, and is
   unambiguously both ends at once: the ordinary single-pane-tab case every
   other test here relies on.
+  **[Amended 2026-09-02 — the exemption was too narrow, and it trapped
+  people.]** `rects.len() == 1` is the right *idea* stated as the wrong
+  *test*. What earns the refusal is not "this pane is alone" but "this tab
+  has somewhere better to cross from" — and where it does not, the refusal
+  has nowhere to send the user. Every pane in the tab spans the full width,
+  so every one of them is refused, and `Alt+←`/`→` is dead in that tab with
+  no pane to move to first. Reported from a fully stacked tab; the shape
+  that shows it was never about stacks is `Alt+n` `Alt+o` — **two panes,
+  top and bottom**, as plain a layout as roost has, and equally trapped.
+  C42's ladder endpoint and `Alt+g`'s all-stack reach it too.
+  So the condition is now: refuse when the focused pane spans the full width
+  **and some other pane in the tab does not**. The single-pane tab is that
+  same condition with one pane in it (nothing narrower exists), so the
+  original exemption is subsumed rather than special-cased, and the layout
+  this bullet was written for — a full-width row above a split row —
+  still refuses, because the split row's panes are narrower. Pinned by
+  `a_tab_with_no_horizontal_structure_still_crosses_from_any_of_its_panes`
+  (all three shapes, every pane, both directions),
+  `a_full_width_pane_still_refuses_while_the_tab_has_a_narrower_one` (the
+  other half, so the fix cannot become "everything crosses"), and
+  `alt_arrow_leaves_a_fully_stacked_tab_through_a_real_terminal` at a real
+  PTY.
 - **Motion continues in the same direction.** `Right` at the right edge
   switches to the **next** tab and focuses its **leftmost** pane; `Left` at
   the left edge switches to the **previous** tab and focuses its

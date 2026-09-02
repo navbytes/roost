@@ -36,6 +36,10 @@ const ALT_SHRINK_WIDTH: &[u8] = b"\x1b<";
 const ALT_GROW_HEIGHT: &[u8] = b"\x1b=";
 const ALT_SHRINK_HEIGHT: &[u8] = b"\x1b-";
 const ALT_M: &[u8] = b"\x1bm";
+/// Alt+arrow arrives as a CSI sequence with xterm modifier 3 (Alt), not as
+/// meta-ESC — a different delivery path entirely from the printable chords.
+const ALT_LEFT: &[u8] = b"\x1b[1;3D";
+const ALT_RIGHT: &[u8] = b"\x1b[1;3C";
 const ALT_SHIFT_M: &[u8] = b"\x1bM";
 
 /// Control-plane ground truth: the pane the workspace says is focused.
@@ -203,6 +207,74 @@ fn holding_alt_s_climbs_the_tab_pane_by_pane_through_a_real_terminal() {
     assert!(
         h.screen().contents().contains("STACK · 4 PANES"),
         "a refusal must not disturb the stack it refused to grow:\n{}",
+        h.screen().contents(),
+    );
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// The reported cross-tab bug, end to end: stack the panes in a tab, then
+/// press `Alt+←` to get to another tab. It used to refuse — "full-width
+/// pane — nothing to cross into" — from *every* pane in that tab, so the
+/// key was simply dead there with nowhere to move to first.
+///
+/// Worth a PTY test rather than only a unit one because the symptom is a
+/// user being stuck: the proof that matters is a real roost, a real stack,
+/// and the tab bar actually changing.
+#[test]
+fn alt_arrow_leaves_a_fully_stacked_tab_through_a_real_terminal() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let Some(mut h) = harness::spawn_or_skip("cross-tab from a stack", &harness::two_tabs(cwd))
+    else {
+        return;
+    };
+    assert!(
+        h.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 main")).is_some(),
+        "roost never drew its tab bar",
+    );
+    let sd = wait_for_control(&mut h);
+
+    // Work in tab 2 (`api`), which has two panes to stack.
+    h.write_bytes(ALT_M);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |_| matches!(focused_pane(&sd), Some(2) | Some(3)))
+            .is_some(),
+        "never reached the second tab:\n{}",
+        h.screen().contents(),
+    );
+    h.write_bytes(ALT_S);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("STACK · 2 PANES")).is_some(),
+        "the panes never stacked:\n{}",
+        h.screen().contents(),
+    );
+
+    // The whole tab is now one stack — every pane in it spans the full
+    // width. This is the press that used to be refused.
+    h.write_bytes(ALT_LEFT);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |_| focused_pane(&sd) == Some(1)).is_some(),
+        "Alt+← could not leave the stacked tab — the reported bug (focus is {:?}):\n{}",
+        focused_pane(&sd),
+        h.screen().contents(),
+    );
+
+    // ...and going back finds the stack exactly as it was left: a
+    // navigation key must not rearrange a tab on its way through.
+    h.write_bytes(ALT_RIGHT);
+    assert!(
+        h.wait_for(Duration::from_secs(5), |_| matches!(focused_pane(&sd), Some(2) | Some(3)))
+            .is_some(),
+        "Alt+→ did not come back:\n{}",
+        h.screen().contents(),
+    );
+    // Wait on the *frame*, not just the control socket: the socket reports
+    // the new focus before roost has repainted, so reading `screen()`
+    // straight off the focus assertion above races the redraw.
+    assert!(
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("STACK · 2 PANES")).is_some(),
+        "crossing out and back reshaped the stack:\n{}",
         h.screen().contents(),
     );
 
