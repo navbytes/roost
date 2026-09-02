@@ -362,6 +362,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // whole fleet running detached. Turn SIGHUP/SIGTERM/SIGINT into an
     // ordinary loop exit instead, so they get Alt+q's teardown.
     infra::signals::install();
+    // `install`'s handler only sets a flag for the main loop to notice — and
+    // a terminal hanging up never gives it the chance: the main thread is
+    // usually already wedged inside `crossterm::event::poll`'s stdin-EOF
+    // spin when it happens, which never returns to let the loop check
+    // anything. This watchdog is the rescue for that one case; see its own
+    // doc comment for the full story.
+    infra::signals::watch_for_hangup();
     let (tx, rx) = mpsc::sync_channel::<AppEvent>(EVENT_CHANNEL_BOUND);
 
     // Wire production adapters to the core's ports.
@@ -539,6 +546,18 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             perf.record_iteration(poll_started.elapsed().saturating_sub(Duration::from_millis(33)));
             if had_event {
                 let mut keys_drained: u64 = 0;
+                // Bounded, not `loop { ... if !poll(ZERO) break }` unconditionally:
+                // that drains for as long as the terminal keeps reporting an event
+                // ready, which a resize storm or a giant bracketed paste can do for
+                // a while and a misbehaving/hostile terminal could do forever —
+                // starving the draw, the resize reconciliation below, and the PTY
+                // drain the same way the outer `event::poll` hang starves the whole
+                // loop, just from the input side instead of stdin's EOF spin. Events
+                // left over past the cap simply wait for next tick's drain — nothing
+                // is lost, only delayed by ~33ms, and the resize coalescing this
+                // loop exists for (see its comment above) still holds within a tick.
+                const MAX_DRAINED_EVENTS_PER_TICK: u32 = 1024;
+                let mut drained: u32 = 0;
                 loop {
                     match crossterm::event::read()? {
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -582,7 +601,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         Event::Paste(s) => app.handle_paste(&s),
                         _ => {}
                     }
-                    if !crossterm::event::poll(Duration::ZERO)? {
+                    drained += 1;
+                    if drained >= MAX_DRAINED_EVENTS_PER_TICK
+                        || !crossterm::event::poll(Duration::ZERO)?
+                    {
                         break;
                     }
                 }

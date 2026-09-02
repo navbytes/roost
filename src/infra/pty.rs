@@ -8,7 +8,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::agents::CommandSpec;
@@ -483,6 +483,59 @@ fn all_pids() -> Vec<u32> {
     buf[..n].iter().filter(|p| **p > 0).map(|p| *p as u32).collect()
 }
 
+/// Every currently-live pane's process-group id, kept outside `PtyPane`
+/// itself so something *other* than the main thread can find the fleet to
+/// signal it.
+///
+/// That "something else" is `infra::signals::watch_for_hangup`: when the
+/// terminal hangs up while the main thread is wedged inside
+/// `crossterm::event::poll` (stdin EOF spins the library forever — see that
+/// function's doc comment), the App and its `runtimes` map are unreachable
+/// from any other thread, so the watchdog cannot walk them the way
+/// `App::kill_fleet` does. A flat, std-only registry it can read instead is
+/// the whole fix. A pane is `setsid`'d at spawn (see `session_members`
+/// above), which makes its pid double as its own process-group id, so one
+/// list of ids answers both "who do I SIGHUP" and "who do I SIGKILL".
+///
+/// `Mutex<Vec<_>>` rather than anything fancier: a fleet is panes in the
+/// tens, not thousands, register/unregister only happen at spawn and
+/// exit/kill, and the watchdog reads it at most once in a process's entire
+/// life (the happy path never hangs up). A linear scan is free at that
+/// scale and the type stays legible.
+static PANE_PGIDS: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+/// Record a freshly spawned pane's process group so the hangup watchdog can
+/// find it later. Called once, from `spawn`, right after the child (and
+/// therefore its group) exists.
+fn register_pane_pgid(pgid: libc::pid_t) {
+    if let Ok(mut pgids) = PANE_PGIDS.lock() {
+        if !pgids.contains(&pgid) {
+            pgids.push(pgid);
+        }
+    }
+}
+
+/// Forget a pane's process group once it is no longer roost's to signal —
+/// either it exited on its own (`on_exit`, the moment `self.pid` is cleared)
+/// or roost killed it outright (`kill`). Left registered past that point it
+/// would eventually be a stale id the OS is free to have recycled for some
+/// unrelated process by the time the watchdog ever reads it — the same pid-
+/// reuse hazard `kill`'s own comments accept elsewhere, minimized here for
+/// free since removing is no more than the same linear scan `register` did.
+fn unregister_pane_pgid(pgid: libc::pid_t) {
+    if let Ok(mut pgids) = PANE_PGIDS.lock() {
+        pgids.retain(|&p| p != pgid);
+    }
+}
+
+/// A snapshot of every pane process group currently registered. Cloned out
+/// from under the lock rather than handed out by reference, so the caller —
+/// `infra::signals::watch_for_hangup`, signalling processes one at a time —
+/// never holds `PANE_PGIDS` while making a syscall.
+pub fn live_pane_pgids() -> Vec<libc::pid_t> {
+    PANE_PGIDS.lock().map(|pgids| pgids.clone()).unwrap_or_default()
+}
+
 pub struct PtyPane {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -771,6 +824,16 @@ impl PaneBackend for PtyPane {
             pair.slave.spawn_command(cmd).with_context(|| format!("spawning {}", spec.program))?;
         let pid = child.process_id();
         drop(pair.slave);
+
+        // Same `pid > 1` guard `kill` uses below: `process_id()` isn't
+        // documented to promise > 1, and registering 0/1 would let the
+        // hangup watchdog's emergency `kill(-pgid, ...)` reach roost's own
+        // process group or init's session instead of a pane.
+        if let Some(p) = pid {
+            if p > 1 {
+                register_pane_pgid(p as libc::pid_t);
+            }
+        }
 
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let mut writer = pair.master.take_writer().context("take pty writer")?;
@@ -1144,6 +1207,14 @@ impl PaneBackend for PtyPane {
                 _ => break, // reaped, or errored (already gone)
             }
         }
+        // The SIGKILLs above are this pane's group's death warrant, signed
+        // and delivered — nothing left for the hangup watchdog to add here,
+        // so it no longer needs to find this pgid.
+        if let Some(pid) = self.pid {
+            if pid > 1 {
+                unregister_pane_pgid(pid as libc::pid_t);
+            }
+        }
     }
 
     fn status(&self) -> AgentStatus {
@@ -1218,7 +1289,15 @@ impl PaneBackend for PtyPane {
         // on every runtime during App::shutdown), can't signal it.
         if let Ok(Some(_)) = self.child.try_wait() {
             // The sweep above already ran; this branch now only lets go of
-            // the pid.
+            // the pid — and with it, this pgid's place in the hangup
+            // watchdog's registry: the process this pid named is gone, so
+            // there is nothing left here for the watchdog to signal, and
+            // leaving the id registered would only risk it later being
+            // re-signalled onto some unrelated process the kernel recycled
+            // the pid for.
+            if let Some(pid) = self.pid {
+                unregister_pane_pgid(pid as libc::pid_t);
+            }
             self.pid = None;
         }
     }
