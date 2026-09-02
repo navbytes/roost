@@ -321,6 +321,33 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
 /// `"disable"` entry in config.json (`translate_with`) reuses it verbatim —
 /// a disabled chord must forward exactly like a naturally unbound one, never
 /// a hand-derived approximation of it.
+/// What `{"alt+left": "disable"}` sends to the pane.
+///
+/// **Not** `unbound_alt`, and the difference is the whole point of the
+/// keyword. U5 scoped roost's forward-the-key promise to *printables*, so an
+/// unbound Alt+arrow is swallowed — a defensible default for a key the user
+/// never said anything about. `disable` is the opposite situation: the user
+/// went to a config file specifically to say "roost, stop taking this key",
+/// and swallowing it turns the chord into a black hole that reaches neither
+/// roost nor the shell — strictly worse than leaving it bound, and the exact
+/// failure the canonical use case (giving Alt+arrow back to a shell that
+/// binds it to word motion) is trying to avoid.
+///
+/// `encode_raw` is the right encoder and `encode_key` is not: `encode_key`
+/// drops the ALT bit entirely (`Alt+Left` → a bare `ESC [ D`, i.e. plain
+/// Left; `Alt+f` → `f`), which would send the pane a *different key*.
+/// `encode_raw` keeps it as the meta-ESC prefix every one of these already
+/// arrives in — `ESC f` for Alt+f, `ESC ESC [ D` for Alt+Left, `ESC CR` for
+/// Alt+Enter. `Ignore` survives only for a chord with no encoding at all.
+fn disabled_chord(key: KeyEvent) -> InputResult {
+    let bytes = encode_raw(key);
+    if bytes.is_empty() {
+        InputResult::Ignore
+    } else {
+        InputResult::Forward(bytes)
+    }
+}
+
 fn unbound_alt(key: KeyEvent) -> InputResult {
     match key.code {
         KeyCode::Char(_) => {
@@ -652,6 +679,44 @@ pub struct Keymap {
     overrides: HashMap<Chord, Override>,
 }
 
+/// What `Keymap::parse` has to say about a `config.json`, split by whether
+/// roost *did what the file asked*.
+///
+/// Two channels rather than one list, because a caller has to be able to
+/// tell them apart and the single list made that impossible. `roost keys`
+/// exits non-zero so a dotfile test can gate on a config being broken
+/// (README), and the startup toast has exactly one slot — both of those are
+/// answers to "did something go wrong?", and neither may be triggered by a
+/// remark about a config that worked perfectly.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Diagnostics {
+    /// Entries roost could **not** use: bad JSON, an unparseable chord, an
+    /// unknown action. The config asked for something and did not get it.
+    /// These, and only these, gate `roost keys`' exit code.
+    pub problems: Vec<String>,
+    /// True and worth saying about a config that *worked*. Never gates
+    /// anything, never outranks a problem for the one toast slot.
+    pub notices: Vec<String>,
+}
+
+impl Diagnostics {
+    /// Nothing at all to report — the quiet case a valid, unremarkable
+    /// config produces.
+    pub fn is_empty(&self) -> bool {
+        self.problems.is_empty() && self.notices.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.problems.len() + self.notices.len()
+    }
+
+    /// Everything, **problems first**: a surface with one line to spend
+    /// spends it on the thing that went wrong, not on a remark.
+    pub fn all(&self) -> impl Iterator<Item = &String> {
+        self.problems.iter().chain(self.notices.iter())
+    }
+}
+
 impl Keymap {
     /// Parse config.json's contents. Never fails outright: invalid JSON,
     /// `"keys"` not an object, an unparseable chord, a non-string value, and
@@ -663,28 +728,33 @@ impl Keymap {
     /// a repeated JSON key the same way (documented in README). A chord
     /// with more than one terminal-delivery encoding (`twins`) is disabled
     /// or remapped on *every* encoding at once — never just the one the
-    /// entry happened to name.
-    pub fn parse(raw: &str, source: &str) -> (Keymap, Vec<String>) {
-        let mut diagnostics = Vec::new();
+    /// entry happened to name. Rebinding a chord that already carries a
+    /// different default action is legal — it displaces that default — and
+    /// is reported as a **notice**, not a problem, and then only when the
+    /// displaced action is left with no chord at all (see below).
+    pub fn parse(raw: &str, source: &str) -> (Keymap, Diagnostics) {
+        let mut diagnostics = Diagnostics::default();
         let value: serde_json::Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
-                diagnostics.push(format!("{source}: invalid JSON ({e}) — using defaults"));
+                diagnostics.problems.push(format!("{source}: invalid JSON ({e}) — using defaults"));
                 return (Keymap::default(), diagnostics);
             }
         };
         let mut keymap = Keymap::default();
+        let mut displaced: Vec<(String, Action)> = Vec::new();
         match value.get("keys") {
             None => {}
             Some(serde_json::Value::Object(keys)) => {
                 for (chord_str, action_val) in keys {
                     let Some(chord) = Chord::parse(chord_str) else {
                         diagnostics
+                            .problems
                             .push(format!("{source}: unrecognized chord {chord_str:?} — skipped"));
                         continue;
                     };
                     let Some(action_str) = action_val.as_str() else {
-                        diagnostics.push(format!(
+                        diagnostics.problems.push(format!(
                             "{source}: {chord_str:?}: value must be a string — skipped"
                         ));
                         continue;
@@ -697,17 +767,46 @@ impl Keymap {
                     }
                     match action_by_name(action_str) {
                         Some(action) => {
+                            // Recorded, not reported: whether this
+                            // displacement actually costs the user anything
+                            // cannot be known until every entry is merged.
+                            // A deliberate swap (`alt+w`→new_pane plus
+                            // `alt+n`→close_pane) displaces two defaults and
+                            // orphans neither.
+                            if let Some(old) =
+                                default_keymap().get(&chord).filter(|old| **old != action)
+                            {
+                                displaced.push((chord_str.clone(), *old));
+                            }
                             for t in twins(chord.code, chord.shift) {
                                 keymap.overrides.insert(t, Override::Bound(action));
                             }
                         }
-                        None => diagnostics.push(format!(
+                        None => diagnostics.problems.push(format!(
                             "{source}: {chord_str:?}: unknown action {action_str:?} — skipped"
                         )),
                     }
                 }
             }
-            Some(_) => diagnostics.push(format!("{source}: \"keys\" must be an object — ignored")),
+            Some(_) => {
+                diagnostics.problems.push(format!("{source}: \"keys\" must be an object — ignored"))
+            }
+        }
+        // Now that every entry is merged, ask the only question worth
+        // warning about: is the displaced action reachable at all any more?
+        // `effective_bindings` is the same defaults-plus-overrides merge
+        // `translate_with` dispatches on, so this reads the map the user
+        // will actually be typing against rather than re-deriving one.
+        if !displaced.is_empty() {
+            let live = effective_bindings(&keymap);
+            for (chord_str, old) in displaced {
+                if !live.iter().any(|(_, a)| *a == old) {
+                    diagnostics.notices.push(format!(
+                        "{source}: {chord_str:?}: replaces default {} — which now has no chord",
+                        action_name(&old)
+                    ));
+                }
+            }
         }
         (keymap, diagnostics)
     }
@@ -723,7 +822,7 @@ pub fn translate_with(key: KeyEvent, keymap: &Keymap) -> InputResult {
     {
         let chord = Chord { code: key.code, shift: key.modifiers.contains(KeyModifiers::SHIFT) };
         match keymap.overrides.get(&chord) {
-            Some(Override::Disabled) => return unbound_alt(key),
+            Some(Override::Disabled) => return disabled_chord(key),
             Some(Override::Bound(action)) => return InputResult::Action(*action),
             None => {}
         }
@@ -1906,7 +2005,7 @@ mod tests {
     #[test]
     fn a_chord_remapped_to_a_different_action_stops_producing_its_old_one() {
         let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+g": "quit"}}"#, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(diagnostics.problems.is_empty(), "a valid remap is not a problem: {diagnostics:?}");
         assert!(matches!(
             translate_with(alt(KeyCode::Char('g')), &keymap),
             InputResult::Action(Action::Quit)
@@ -1917,6 +2016,66 @@ mod tests {
         ));
     }
 
+    /// A bind that takes a chord away from its default action names the
+    /// displaced default — informational only, never a rejection (the
+    /// binding applies). A chord with no default binding stays silent:
+    /// nothing was displaced.
+    #[test]
+    fn a_displacing_bind_names_the_default_it_replaces_and_binds_anyway() {
+        let (keymap, diagnostics) =
+            Keymap::parse(r#"{"keys": {"alt+w": "new_pane"}}"#, "config.json");
+        // A notice, never a problem — nothing was skipped, and `roost keys`
+        // must still exit 0 for this file.
+        assert_eq!(
+            diagnostics.notices,
+            vec![r#"config.json: "alt+w": replaces default close_pane — which now has no chord"#
+                .to_string()],
+        );
+        assert!(diagnostics.problems.is_empty(), "{diagnostics:?}");
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('w')), &keymap),
+            InputResult::Action(Action::NewPane)
+        ));
+
+        let (_, diagnostics) = Keymap::parse(r#"{"keys": {"alt+x": "quit"}}"#, "config.json");
+        assert!(diagnostics.is_empty(), "alt+x has no default to displace: {diagnostics:?}");
+    }
+
+    /// The notice is about an action losing its **last** chord, not about
+    /// displacement as such — so a deliberate swap, where both actions keep
+    /// one, says nothing at all. This was the false positive that made the
+    /// warning noisy on exactly the configs an advanced user writes.
+    #[test]
+    fn a_swap_displaces_two_defaults_and_warns_about_neither() {
+        let (keymap, diagnostics) = Keymap::parse(
+            r#"{"keys": {"alt+w": "new_pane", "alt+n": "close_pane"}}"#,
+            "config.json",
+        );
+        assert!(diagnostics.is_empty(), "a swap orphans nothing: {diagnostics:?}");
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('w')), &keymap),
+            InputResult::Action(Action::NewPane)
+        ));
+        assert!(matches!(
+            translate_with(alt(KeyCode::Char('n')), &keymap),
+            InputResult::Action(Action::ClosePane)
+        ));
+    }
+
+    /// ...and the notice still fires when the displaced action really is
+    /// left unreachable, so the test above cannot be satisfied by simply
+    /// never warning.
+    #[test]
+    fn displacing_an_actions_only_chord_still_says_so() {
+        let (_, diagnostics) = Keymap::parse(r#"{"keys": {"alt+t": "quit"}}"#, "config.json");
+        assert!(diagnostics.problems.is_empty(), "{diagnostics:?}");
+        assert_eq!(diagnostics.notices.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics.notices[0].contains("replaces default new_tab"),
+            "it names the action that lost its chord: {diagnostics:?}",
+        );
+    }
+
     /// A chord listed twice keeps only its last value (README) — inherited
     /// for free from `serde_json`, which already collapses a repeated JSON
     /// key to its last-written one.
@@ -1924,7 +2083,7 @@ mod tests {
     fn a_chord_listed_twice_keeps_only_the_last_value() {
         let json = r#"{"keys": {"alt+g": "quit", "alt+g": "toggle_zoom"}}"#;
         let (keymap, diagnostics) = Keymap::parse(json, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(diagnostics.problems.is_empty(), "a valid remap is not a problem: {diagnostics:?}");
         assert!(matches!(
             translate_with(alt(KeyCode::Char('g')), &keymap),
             InputResult::Action(Action::ToggleZoom)
@@ -1936,8 +2095,8 @@ mod tests {
     #[test]
     fn malformed_json_keeps_defaults_and_names_the_file() {
         let (keymap, diagnostics) = Keymap::parse("{ not json", "config.json");
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].contains("config.json"), "{diagnostics:?}");
+        assert_eq!(diagnostics.problems.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics.problems[0].contains("config.json"), "{diagnostics:?}");
         assert!(matches!(
             translate_with(alt(KeyCode::Char('q')), &keymap),
             InputResult::Action(Action::Quit)
@@ -1951,9 +2110,9 @@ mod tests {
     fn unknown_action_name_is_skipped_and_named_in_the_diagnostic() {
         let json = r#"{"keys": {"alt+z": "not_a_real_action"}}"#;
         let (keymap, diagnostics) = Keymap::parse(json, "config.json");
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].contains("not_a_real_action"), "{diagnostics:?}");
-        assert!(diagnostics[0].contains("alt+z"), "{diagnostics:?}");
+        assert_eq!(diagnostics.problems.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics.problems[0].contains("not_a_real_action"), "{diagnostics:?}");
+        assert!(diagnostics.problems[0].contains("alt+z"), "{diagnostics:?}");
         assert!(matches!(
             translate_with(alt(KeyCode::Char('z')), &keymap),
             InputResult::Action(Action::ToggleZoom)
@@ -1966,8 +2125,8 @@ mod tests {
     fn unrecognized_chord_is_skipped_and_named_in_the_diagnostic() {
         let json = r#"{"keys": {"ctrl+f": "quit"}}"#;
         let (_keymap, diagnostics) = Keymap::parse(json, "config.json");
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].contains("ctrl+f"), "{diagnostics:?}");
+        assert_eq!(diagnostics.problems.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics.problems[0].contains("ctrl+f"), "{diagnostics:?}");
     }
 
     /// The Action-name mapping is exhaustive: `action_name`'s match has no
@@ -2058,7 +2217,7 @@ mod tests {
     fn remapping_a_shifted_vim_letter_reaches_both_delivery_forms() {
         let (keymap, diagnostics) =
             Keymap::parse(r#"{"keys": {"alt+shift+h": "quit"}}"#, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(diagnostics.problems.is_empty(), "a valid remap is not a problem: {diagnostics:?}");
         assert_eq!(
             translate_with(alt_shift(KeyCode::Char('h')), &keymap),
             InputResult::Action(Action::Quit),
@@ -2362,7 +2521,7 @@ mod tests {
     #[test]
     fn remapping_a_twinned_chord_moves_every_delivery_form() {
         let (keymap, diagnostics) = Keymap::parse(r#"{"keys": {"alt+A": "quit"}}"#, "config.json");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(diagnostics.problems.is_empty(), "a valid remap is not a problem: {diagnostics:?}");
         // Both delivery forms of the shifted chord (default: ToggleRoster)
         // now quit instead...
         assert!(matches!(
@@ -2467,5 +2626,131 @@ mod tests {
         // And it is a real alias, not a second action: both names resolve
         // to the same variant.
         assert_eq!(action_by_name("toggle_stack"), action_by_name("stack_pane"));
+    }
+
+    // ---- the override contract, swept ------------------------------------
+
+    /// config.json's spelling of any chord the default table binds — the
+    /// inverse of `Chord::parse`, test-side, so the sweeps below go through
+    /// the real grammar instead of hand-building keymaps.
+    fn config_spelling(chord: Chord) -> String {
+        let key = match chord.code {
+            KeyCode::Enter => "enter".to_string(),
+            KeyCode::PageUp => "pageup".to_string(),
+            KeyCode::Up => "up".to_string(),
+            KeyCode::Down => "down".to_string(),
+            KeyCode::Left => "left".to_string(),
+            KeyCode::Right => "right".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            other => panic!("default table binds {other:?}, which the grammar cannot spell"),
+        };
+        format!("alt+{}{}", if chord.shift { "shift+" } else { "" }, key)
+    }
+
+    /// Every chord the default table binds is expressible in the config
+    /// grammar and disable-able with no diagnostic, and what a disabled
+    /// chord then does is pinned: a `Char` forwards as ESC+char (the
+    /// readline fix — M-b/M-f/M-d keep working), while a non-Char (arrows,
+    /// enter) is swallowed — roost has no faithful byte encoding to hand
+    /// back for those, so `disable` there means "roost stops owning it" and
+    /// nothing more.
+    #[test]
+    fn every_default_chord_is_disableable_through_the_config_grammar() {
+        for (&chord, &default) in default_keymap() {
+            let spelling = config_spelling(chord);
+            let json = format!(r#"{{"keys": {{"{spelling}": "disable"}}}}"#);
+            let (keymap, diagnostics) = Keymap::parse(&json, "config.json");
+            assert!(diagnostics.is_empty(), "{spelling}: {diagnostics:?}");
+            let key = if chord.shift { alt_shift(chord.code) } else { alt(chord.code) };
+            let result = translate_with(key, &keymap);
+            assert_ne!(
+                result,
+                InputResult::Action(default),
+                "{spelling} must stop producing its default {default:?}"
+            );
+            // Every default chord — Char or not — has a meta-ESC encoding,
+            // so `disable` reaches the pane in every single case. The
+            // earlier version of this test asserted that non-Char chords
+            // were *swallowed*, which pinned the bug rather than the
+            // contract: it made `disable` a black hole on exactly the
+            // Alt+arrow chords the keyword exists to hand back.
+            assert!(
+                matches!(result, InputResult::Forward(_)),
+                "{spelling}: a disabled chord reaches the pane, got {result:?}"
+            );
+        }
+    }
+
+    /// Every action name `roost keys` can print parses and dispatches end to
+    /// end on a chord the default table never bound — the full pipe
+    /// (`Chord::parse` → `action_by_name` → `translate_with`), not just the
+    /// name table's round-trip.
+    #[test]
+    fn every_config_action_name_parses_and_dispatches_on_a_free_chord() {
+        for (name, expected) in NAMES {
+            let json = format!(r#"{{"keys": {{"alt+x": "{name}"}}}}"#);
+            let (keymap, diagnostics) = Keymap::parse(&json, "config.json");
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+            assert_eq!(
+                translate_with(alt(KeyCode::Char('x')), &keymap),
+                InputResult::Action(*expected),
+                "{name} must bind and dispatch"
+            );
+        }
+    }
+
+    /// The canonical readline rescue: take the arrows away from roost (some
+    /// shells bind Alt+arrow to word motion), and the vim letters keep
+    /// focus while the *shifted* arrows keep moving panes — an override is
+    /// per-chord, never per-family.
+    ///
+    /// The rescue only rescues if the key actually *arrives*: this used to
+    /// assert `Ignore`, i.e. roost stopped acting on Alt+arrow and the shell
+    /// never received it either. `disable` forwards the meta-ESC bytes now
+    /// (`disabled_chord`), so the shell gets its word motion back — which is
+    /// the entire scenario this test is named for.
+    #[test]
+    fn disabling_the_arrows_leaves_the_rest_of_the_map_alone() {
+        let json = r#"{"keys": {
+            "alt+left": "disable", "alt+right": "disable",
+            "alt+up": "disable", "alt+down": "disable" }}"#;
+        let (keymap, diagnostics) = Keymap::parse(json, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (code, bytes) in [
+            (KeyCode::Left, b"\x1b\x1b[D".as_slice()),
+            (KeyCode::Right, b"\x1b\x1b[C".as_slice()),
+            (KeyCode::Up, b"\x1b\x1b[A".as_slice()),
+            (KeyCode::Down, b"\x1b\x1b[B".as_slice()),
+        ] {
+            assert_eq!(
+                translate_with(alt(code), &keymap),
+                InputResult::Forward(bytes.to_vec()),
+                "{code:?} must reach the shell as meta-ESC, not vanish",
+            );
+        }
+        for (code, dir) in [
+            (KeyCode::Left, Dir::Left),
+            (KeyCode::Right, Dir::Right),
+            (KeyCode::Up, Dir::Up),
+            (KeyCode::Down, Dir::Down),
+        ] {
+            assert_eq!(
+                translate_with(alt_shift(code), &keymap),
+                InputResult::Action(Action::MovePane(dir)),
+                "only the unshifted chord was disabled: {code:?}"
+            );
+        }
+        for (code, dir) in [
+            (KeyCode::Char('h'), Dir::Left),
+            (KeyCode::Char('j'), Dir::Down),
+            (KeyCode::Char('k'), Dir::Up),
+            (KeyCode::Char('l'), Dir::Right),
+        ] {
+            assert_eq!(
+                translate_with(alt(code), &keymap),
+                InputResult::Action(Action::Focus(dir)),
+                "the vim focus letters are untouched: {code:?}"
+            );
+        }
     }
 }

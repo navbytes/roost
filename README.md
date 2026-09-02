@@ -181,8 +181,31 @@ file — the default — and roost behaves exactly as documented above.
 { "keys": { "alt+f": "disable", "alt+v": "toggle_float" } }
 ```
 
-A value is `"disable"` (the chord passes straight through to the pane, like
-an unbound key) or a snake_case `Action` name — **`roost keys` prints every
+A chord is `alt+<key>` or `alt+shift+<key>` — nothing else parses (`ctrl+f`
+is rejected, deliberately), and `<key>` is one character (`alt+f`, `alt+3`,
+`alt+/`) or a named key: `enter`, `pageup`, `up`, `down`, `left`, `right`
+(`alt+enter`, `alt+pageup`, …).
+
+**What `"disable"` sends.** roost reads *parsed* key events, not the byte
+stream, so `Alt+←` arrives identically whether your terminal spells it
+`ESC [1;3D` or `ESC ESC [ D` — roost cannot replay what it never saw, and has
+to pick one spelling to forward. It picks **meta-ESC**, the same convention
+every forwarded Alt chord already uses: `ESC f` for `Alt+f`, `ESC ESC [ D`
+for `Alt+←`, `ESC CR` for `Alt+↵`. So this gives word motion back to a shell
+that binds the meta-ESC form:
+
+```json
+{ "keys": { "alt+left": "disable", "alt+right": "disable" } }
+```
+
+and `Alt+h` / `Alt+l` still move focus between panes — the arrows and the vim
+letters are separate bindings, so disabling one spelling keeps the other.
+If your shell only binds the CSI form, add the meta-ESC one next to it —
+`bindkey "^[^[[D" backward-word` (zsh) or `"\e\e[D": backward-word`
+(`~/.inputrc`).
+
+A value is `"disable"` (the chord passes straight through to the pane) or a
+snake_case `Action` name — **`roost keys` prints every
 one of them**, alongside the chord it is currently on:
 
 ```console
@@ -195,7 +218,12 @@ Alt+1	go_to_tab_1
 It reads `config.json` directly and needs no running roost, so it answers
 before you launch: remapped and disabled chords are marked `config.json`, and
 an entry roost had to skip is named on stderr with a non-zero exit — so a
-dotfile test can gate on it instead of you catching a startup toast.
+dotfile test can gate on it instead of you catching a startup toast. Only a
+*skipped* entry sets that exit code. Rebinding a chord that already had a
+default is ordinary use, not a failure: it exits 0, and stderr says so only
+when the displaced action is left with no chord at all — a swap like
+`{"alt+w": "new_pane", "alt+n": "close_pane"}` is silent, because neither
+action lost its way in.
 **`Alt+?` is also the command palette.** Press `/` inside it and the keymap
 becomes a picker: type to narrow, `↑`/`↓` to choose, `↵` to run the row —
 no need to dismiss the overlay and remember the chord. The rows it can run

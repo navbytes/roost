@@ -427,10 +427,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // Surface every config.json problem on the activity feed, so none are
     // silently lost, and the first as a toast — same non-fatal contract as
     // everything else here: roost already started fine, with its defaults.
-    for diag in &keymap_diagnostics {
+    for diag in keymap_diagnostics.all() {
         app.note_config_issue(diag.clone());
     }
-    if let Some(first) = keymap_diagnostics.first() {
+    // `all()` yields problems before notices, so the one toast slot goes to
+    // something that actually went wrong whenever one exists. It did not
+    // before: `serde_json` preserves object order, so a config whose first
+    // entry merely displaced a default pushed the genuinely skipped entry
+    // behind a "(+1 more)" and the user never saw it directly.
+    if let Some(first) = keymap_diagnostics.all().next() {
         let msg = if keymap_diagnostics.len() == 1 {
             first.clone()
         } else {

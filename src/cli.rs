@@ -649,13 +649,22 @@ fn run_keys() -> i32 {
     if diagnostics.is_empty() {
         return 0;
     }
-    // Diagnostics to stderr so the table above still pipes cleanly, and a
-    // non-zero exit so a dotfile test can gate on it — the whole point of
-    // being able to ask this outside the TUI.
-    for d in &diagnostics {
+    // Diagnostics to stderr so the table above still pipes cleanly. Both
+    // channels print — a notice is worth reading — but only a **problem**
+    // sets the exit code. README's contract is precise about this: a
+    // non-zero exit means "an entry roost had to skip", so a dotfile test
+    // can gate on it. A config that displaced a default did nothing wrong
+    // and roost did exactly what it asked; failing the gate for that would
+    // break every dotfile that remaps a bound chord, which is the ordinary
+    // case the escape hatch exists for.
+    for d in diagnostics.all() {
         eprintln!("roost keys: {d}");
     }
-    2
+    if diagnostics.problems.is_empty() {
+        0
+    } else {
+        2
+    }
 }
 
 #[cfg(test)]

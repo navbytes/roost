@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::infra::store::FsStore;
-use crate::ui::input::Keymap;
+use crate::ui::input::{Diagnostics, Keymap};
 
 pub fn config_path() -> PathBuf {
     FsStore::state_dir().join("config.json")
@@ -17,16 +17,26 @@ pub fn config_path() -> PathBuf {
 /// directory sitting where the file should be, ...) degrades the same way
 /// malformed content does, via one diagnostic naming the problem. Parsing
 /// itself is `Keymap::parse`'s job, unit-tested directly in `ui::input`.
-pub fn load_keymap() -> (Keymap, Vec<String>) {
+pub fn load_keymap() -> (Keymap, Diagnostics) {
     load_keymap_from(&config_path())
 }
 
-fn load_keymap_from(path: &Path) -> (Keymap, Vec<String>) {
+fn load_keymap_from(path: &Path) -> (Keymap, Diagnostics) {
     let source = path.display().to_string();
     match std::fs::read_to_string(path) {
         Ok(raw) => Keymap::parse(&raw, &source),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Keymap::default(), Vec::new()),
-        Err(e) => (Keymap::default(), vec![format!("{source}: {e} — using defaults")]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (Keymap::default(), Diagnostics::default())
+        }
+        Err(e) => (
+            Keymap::default(),
+            // A read failure is a problem, not a notice: the file exists and
+            // roost could not honour it.
+            Diagnostics {
+                problems: vec![format!("{source}: {e} — using defaults")],
+                notices: Vec::new(),
+            },
+        ),
     }
 }
 
