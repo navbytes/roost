@@ -92,12 +92,29 @@ Pin a version by appending it, e.g. `github:navbytes/roost@0.1.17`, or swap
 `@branch:main` for `@tag:v0.1.17` on the cargo backend. Drop `-g` to pin roost
 per-project in that directory's `mise.toml` instead of globally.
 
-Only one roost runs per workspace at a time — a second instance on the same
-state dir refuses to start (they'd race and corrupt `workspace.json`). Run an
-isolated one with `ROOST_STATE=/some/dir roost`. This isolates workspace
-state only — it still installs and updates the pi extension and the Claude
-Code hooks in your real `~/.pi` and `~/.claude` (below). Add
-`ROOST_NO_EXT_INSTALL=1` if you don't want that too. Deliberate:
+### A separate workspace is one environment variable
+
+Point `ROOST_STATE` somewhere else and you get an independent roost — its own
+`workspace.json`, its own `config.json`, and its own control socket, so
+`roost list` from that shell talks to *that* instance and not your main one:
+
+```console
+$ ROOST_STATE=/tmp/roost-scratch roost
+```
+
+Nothing to create first — roost makes the directory. Useful for a throwaway
+fleet you don't want mixed into your real workspace, a per-project set of
+panes you keep separate, or trying a `config.json` remap without touching
+your own. Delete the directory to throw the whole thing away.
+
+This is also how you run **two roosts at once**: only one roost runs per
+workspace at a time — a second instance on the same state dir refuses to
+start, since they'd race and corrupt `workspace.json` — but two state dirs
+are two independent fleets.
+
+It isolates workspace state *only*. It still installs and updates the pi
+extension and the Claude Code hooks in your real `~/.pi` and `~/.claude`
+(below); add `ROOST_NO_EXT_INSTALL=1` if you don't want that too. Deliberate:
 `ROOST_STATE` doesn't imply "don't touch my global config" because two
 concurrent real roost fleets, each in its own state dir, both legitimately
 want the one real `~/.claude` wired up.
@@ -106,6 +123,23 @@ State lives in `~/.local/state/roost/workspace.json` on Linux and
 `~/Library/Application Support/roost/workspace.json` on macOS (auto-saved on
 every change, atomic writes) — alongside the control socket, token and audit
 log. Delete it to start clean.
+
+### Environment
+
+roost has no flags for any of this — the whole outside-the-TUI surface is
+four variables, set on the command that launches it:
+
+| Variable | Effect |
+|---|---|
+| `ROOST_STATE=DIR` | use `DIR` as the state dir: an independent workspace, config and control socket (above). Created if missing |
+| `ROOST_NO_EXT_INSTALL=1` | don't install or update the pi extension and Claude Code hooks in `~/.pi` / `~/.claude` (below) |
+| `ROOST_NO_QOS=1` | don't raise input-thread scheduling priority on macOS (below) |
+| `ROOST_DEBUG=1` | append control-plane diagnostics — dropped socket lines, shed connections — to `<state>/roost.log`. Any value enables it; the file is written only when there is something to say, and never to the TUI's own output |
+
+Inside every pane roost exports three more, so an agent can call back into
+the fleet — `$ROOST_SOCK` (the control socket), `$ROOST_PANE` (which pane it
+is) and `$ROOST_TOKEN` (authenticates *as* that pane). You don't set these;
+[Controlling roost](#controlling-roost-cli--llm) covers what they're for.
 
 On macOS roost promotes its own input threads to interactive scheduling
 priority so typing stays crisp while agent panes saturate the CPU (the
@@ -131,190 +165,33 @@ you're in.
 
 ## Keys
 
+Every shortcut lives on `Alt`. These twelve get you through a session:
+
 | Key | Action |
 |---|---|
 | `Alt+n` | new shell pane (auto split direction) |
 | `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
-| `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
-| `Alt+-` / `Alt+=` | resize height: shrink / grow (vim's Ctrl-w `−`/`+`) |
-| `Alt+<` / `Alt+>` | resize width: shrink / grow (vim's Ctrl-w `<`/`>`) |
-| `Alt+Shift+arrow` / `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
-| `Alt+s` / `Alt+Shift+s` | stack: collapse the surrounding split into a stack, focused pane expanded — **press again to absorb the next split out**, up to the whole tab / explode the stack back into the split it came from |
-| `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
-| `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
-| `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |
-| `Alt+f` | toggle the floating scratch shell (readline forward-word collision — already swallowed; raw mode below gets it back) |
-| `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
-| `Alt+;` | go back to the pane you came from — toggles, and follows across tabs (tmux's `prefix ;`) |
-| `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |
-| `Alt+'` | broadcast — compose one message, send it to every pane (`Tab` picks who: all, or one status tier); the title shows how many will get it |
-| `Alt+e` | activity feed — status changes, spawns, closes/reopens, exits, control calls |
-| `Alt+r` | edit pane — name and parking note in one dialog; the note's first line shows on the badge |
-| `Alt+Shift+r` | rename tab (e.g. one tab per project) |
-| `Alt+t`, `Alt+1..9`, `Alt+0` | new tab / go to tab / go to the last tab |
-| `Alt+m` / `Alt+Shift+m` | next / previous tab (wraps — the route to tabs past the ninth) |
-| `Alt+i` / `Alt+Shift+i` | carry the focused pane to the next / previous tab |
-| `Alt+Shift+x` / `Alt+Shift+v` | mark a pane / pull the marked pane into the tab you're on — a move whose destination is any tab, not the next one |
-| `Alt+w` | close pane (press twice to confirm when the agent is busy or it's the last pane) |
-| `Alt+u` | undo — reopen the last closed pane or tab, sessions resumed (exact scope below) |
-| `Alt+c` | copy mode — `hjkl`/arrows + `v` mark + `y`/`Enter` yank, or drag with the mouse (`Esc`/`q` exits) |
-| `Alt+PgUp` | scroll mode (`↑/↓/PgUp/PgDn` scroll, `Esc`/`q` exit) |
-| `Alt+Shift+p` | raw pass-through for the focused pane — same chord exits it |
-| `Alt+/` | toggle the shortcut hint bar |
-| `Alt+?` | show the full keymap (type to filter it, `↵` runs the row it lands on, `Esc` closes) |
+| `Alt+arrow` / `Alt+hjkl` | move focus |
+| `Alt+w` | close pane (twice to confirm when the agent is busy) |
+| `Alt+t`, `Alt+1..9` | new tab / go to tab |
+| `Alt+m` | next tab (wraps — the route past the ninth) |
+| `Alt+z` | zoom the focused pane to fill the screen |
+| `Alt+s` | stack the surrounding split — press again to absorb the next one out |
+| `Alt+a` | jump to the next pane that needs input, across tabs |
+| `Alt+c` | copy mode (`v` marks, `y` yanks) |
+| `Alt+?` | the full keymap — type to filter, `↵` runs the row |
 | `Alt+q` | quit — workspace saved; agents die, sessions live |
 
-A shortcut hint bar runs along the bottom by default (zellij-style), showing
-the keys you can press right now — it changes with context, so rename /
-picker / scroll / copy / feed / dead-pane modes each show their own keys, and
-a raw-focused pane collapses it to one pair (`Alt+Shift+p exit raw`).
-`Alt+/` hides it to reclaim the row.
+**→ [Full keybinding reference](docs/KEYBINDINGS.md)** — every chord roost
+binds, the `config.json` escape hatch for moving or switching any of them off
+(including handing `Alt+arrow` back to your shell), `roost keys`, mouse and
+text selection, and the Shift+Enter story.
 
-### Escape hatch: remap or disable a key
-
-Every shortcut above lives on `Alt`, which can collide with your shell's own
-readline bindings (`Alt+f`/`Alt+b`/`Alt+d` are the usual culprits). Fix one in
-`config.json`, next to `workspace.json` (`ROOST_STATE` redirects both). No
-file — the default — and roost behaves exactly as documented above.
-
-```json
-{ "keys": { "alt+f": "disable", "alt+v": "toggle_float" } }
-```
-
-A chord is `alt+<key>` or `alt+shift+<key>` — nothing else parses (`ctrl+f`
-is rejected, deliberately), and `<key>` is one character (`alt+f`, `alt+3`,
-`alt+/`) or a named key: `enter`, `pageup`, `up`, `down`, `left`, `right`
-(`alt+enter`, `alt+pageup`, …).
-
-**What `"disable"` sends.** roost reads *parsed* key events, not the byte
-stream, so `Alt+←` arrives identically whether your terminal spells it
-`ESC [1;3D` or `ESC ESC [ D` — roost cannot replay what it never saw, and has
-to pick one spelling to forward. It picks **meta-ESC**, the same convention
-every forwarded Alt chord already uses: `ESC f` for `Alt+f`, `ESC ESC [ D`
-for `Alt+←`, `ESC CR` for `Alt+↵`. So this gives word motion back to a shell
-that binds the meta-ESC form:
-
-```json
-{ "keys": { "alt+left": "disable", "alt+right": "disable" } }
-```
-
-and `Alt+h` / `Alt+l` still move focus between panes — the arrows and the vim
-letters are separate bindings, so disabling one spelling keeps the other.
-If your shell only binds the CSI form, add the meta-ESC one next to it —
-`bindkey "^[^[[D" backward-word` (zsh) or `"\e\e[D": backward-word`
-(`~/.inputrc`).
-
-The one exception is a pane that negotiated the **kitty keyboard protocol**
-(most modern TUIs do). Asking for disambiguation is asking to be told which
-modifiers were held, and meta-ESC cannot say — `ESC ESC [ D` is the same
-bytes with or without Alt. Those panes get the CSI form (`ESC [1;3D`)
-instead, so no shell-side binding is needed. It is the only case where roost
-picks the encoding rather than defaulting to meta-ESC, and the only one
-where it can do so without guessing, because the pane declared what it
-wants.
-
-A value is `"disable"` (the chord passes straight through to the pane) or a
-snake_case `Action` name — **`roost keys` prints every
-one of them**, alongside the chord it is currently on:
-
-```console
-$ roost keys | head -3
-Alt+/	toggle_hints
-Alt+0	last_tab
-Alt+1	go_to_tab_1
-```
-
-It reads `config.json` directly and needs no running roost, so it answers
-before you launch: remapped and disabled chords are marked `config.json`, and
-an entry roost had to skip is named on stderr with a non-zero exit — so a
-dotfile test can gate on it instead of you catching a startup toast. Only a
-*skipped* entry sets that exit code. Rebinding a chord that already had a
-default is ordinary use, not a failure: it exits 0, and stderr says so only
-when the displaced action is left with no chord at all — a swap like
-`{"alt+w": "new_pane", "alt+n": "close_pane"}` is silent, because neither
-action lost its way in.
-**`Alt+?` is also the command palette.** Press `/` inside it and the keymap
-becomes a picker: type to narrow, `↑`/`↓` to choose, `↵` to run the row —
-no need to dismiss the overlay and remember the chord. The rows it can run
-are the single-verb ones (flip split, cycle layout, zoom, undo, rename,
-mark/pull a pane, the raw/float/feed/roster toggles); direction families
-like `Alt+←↓↑→` and the `roost send`/`read` reference rows stay read-only,
-because "resize one notch, then close" is worse than the chord it would
-replace. The title says `↵ runs` exactly when there is something to run.
-
-**`Alt+?` and the hint bar follow your remaps** — both read the live keymap,
-so they show the chord you bound and stop showing the one you disabled,
-rather than teaching the defaults at you. A
-chord entry covers however your terminal happens to report that key (e.g.
-`alt+shift+p` and `alt+P` are the same chord), so one entry is enough
-regardless of which encoding your terminal uses. A chord listed twice keeps
-only its last value. Bad JSON, an unknown action, or an unparseable chord
-never blocks startup — roost starts with its defaults and names the bad
-entry (toast + activity feed). Read once at startup, not watched for
-changes.
-
-Everything else passes straight through to the focused pane. **Shift+Enter**
-and **Ctrl+Enter** are sent as "insert newline" rather than "submit", so you
-can compose multi-line prompts in agent TUIs that support it — this needs a
-terminal that reports modified keys via the CSI-u ("kitty") keyboard
-protocol (**iTerm2, Ghostty, kitty, WezTerm**), which roost negotiates on
-start.
-
-> ⚠️ **Not macOS Terminal.app.** It sends Shift+Enter and Option+Enter as the
-> same bytes (`ESC CR`), which roost can only read as Alt+Enter — so on
-> Terminal.app, Shift+Enter opens the quick-launch picker instead of
-> inserting a newline. Use one of the CSI-u terminals above to compose
-> multi-line prompts.
-
-In a **dead pane** (process exited or spawn failed): `Enter` relaunches or
-resumes, `f` starts fresh (drops the stored session id).
-
-<details>
-<summary><strong>Mouse, links & text selection</strong></summary>
-
-**Mouse**: the wheel scrolls the pane under the cursor — forwarded to the
-inner app when it has mouse reporting enabled (pi/claude TUIs, vim, less),
-otherwise it scrolls roost's own scrollback for that pane; typing snaps back
-to the live tail. A left click focuses a pane (and expands collapsed stack
-members). Over a mouse-aware app, clicks and drags are forwarded too, so you
-can interact with an agent's TUI directly (menus, buttons, selection). Click
-a tab in the tab bar to switch to it.
-
-**Opening links**: `Alt`+click a URL in any pane to open it in your browser
-(`open` on macOS, `xdg-open` on Linux). roost uses `Alt`+click rather than a
-plain click so it doesn't fight click-to-focus, and because a terminal can't
-report Cmd-clicks to it.
-
-**Text selection**: in a normal pane, **drag to select — the highlight stays
-lit until the next click or keypress**. Double-click selects a word,
-triple-click selects the whole line, Shift+click extends the selection. On
-release, roost copies the text to your system clipboard (via a native helper
-— pbcopy / wl-copy / xclip — and OSC 52, so it works locally and over SSH).
-No mode, no chord: exactly like a native macOS or Linux terminal.
-
-If a pane is running an app that asked to handle the mouse itself (vim, Claude
-Code's TUI, or any interactive command), roost stays out of the way — the app
-sees clicks and drags directly, and you can use **`Alt+c` copy mode** instead
-(press `Alt+c`, move the cursor with hjkl/arrows, press `v` to mark, press `y`
-or `Enter` to copy and exit). That's also the way to copy from scrollback: scroll
-with `Alt+PgUp`, then `Alt+c` to select.
-
-**Why there's no ⌘C to press:** a terminal application cannot receive ⌘C on
-macOS at all — Terminal.app routes it to its own Edit menu, kitty and Ghostty
-bind it to their own copy, and iTerm2 only delivers it if you remap Command
-and give up system-wide copy/paste in that profile. So roost doesn't try:
-it puts the text on the system pasteboard itself the moment you release the
-mouse (or press `y` in copy mode), which is why ⌘V works everywhere
-afterwards and there is nothing to press in between. On Linux, your terminal's own
-clipboard shortcuts (Shift+Ctrl+C/V, middle-click, etc.) work for the system
-clipboard; roost's own selection uses the same pasteboard they do.
-
-If your terminal has a modifier to suspend mouse reporting (Shift+drag in
-Ghostty/kitty, Option+drag in iTerm2), you can use it to fall back to your
-terminal's native selection in any pane — but a mouse-aware app keeps the
-mouse regardless, and copy mode is there if you need it.
-
-</details>
+You do not have to learn the rest from a page: `Alt+?` draws the whole table
+live, filtered as you type, and shows *your* bindings rather than the
+defaults. A shortcut hint bar along the bottom (zellij-style) shows what you
+can press right now and changes with context; `Alt+/` hides it to reclaim the
+row.
 
 ## Fleet features
 
