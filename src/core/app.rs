@@ -6979,6 +6979,10 @@ impl<B: PaneBackend> App<B> {
     /// the copy on disk is at most one action old: writing again is all
     /// downside.
     pub fn kill_fleet(&mut self) {
+        // Tell the hangup watchdog the ordinary teardown is under way, so it
+        // waits for this rather than forcing over the top of it and killing
+        // agents mid-flush (`infra::signals::note_teardown_started`).
+        crate::infra::signals::note_teardown_started();
         // Graceful stop: SIGHUP everything (agents flush their final turn like
         // a closed terminal would allow), a short grace window, then the
         // guaranteed SIGKILL + reap for anything that ignored the hangup.
@@ -19152,5 +19156,21 @@ pub(crate) mod tests {
             }
             assert!(app.quit, "{label}: Alt+q did not quit");
         }
+    }
+    /// The hangup watchdog forces a teardown only when the main thread never
+    /// got there. `kill_fleet` therefore has to *announce itself*, or the
+    /// watchdog would SIGKILL agents part-way through the graceful hangup
+    /// they were flushing into — the exact loss `infra::signals` exists to
+    /// prevent, caused by the thing added to prevent it.
+    #[test]
+    fn tearing_the_fleet_down_tells_the_hangup_watchdog_to_stand_back() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        assert!(!app.runtimes.is_empty(), "the fixture needs a fleet to tear down");
+        app.kill_fleet();
+        assert!(
+            crate::infra::signals::teardown_started(),
+            "kill_fleet must announce itself before spending the hangup grace",
+        );
     }
 }
