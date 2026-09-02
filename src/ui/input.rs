@@ -2512,4 +2512,116 @@ mod tests {
         // to the same variant.
         assert_eq!(action_by_name("toggle_stack"), action_by_name("stack_pane"));
     }
+
+    // ---- the override contract, swept ------------------------------------
+
+    /// config.json's spelling of any chord the default table binds — the
+    /// inverse of `Chord::parse`, test-side, so the sweeps below go through
+    /// the real grammar instead of hand-building keymaps.
+    fn config_spelling(chord: Chord) -> String {
+        let key = match chord.code {
+            KeyCode::Enter => "enter".to_string(),
+            KeyCode::PageUp => "pageup".to_string(),
+            KeyCode::Up => "up".to_string(),
+            KeyCode::Down => "down".to_string(),
+            KeyCode::Left => "left".to_string(),
+            KeyCode::Right => "right".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            other => panic!("default table binds {other:?}, which the grammar cannot spell"),
+        };
+        format!("alt+{}{}", if chord.shift { "shift+" } else { "" }, key)
+    }
+
+    /// Every chord the default table binds is expressible in the config
+    /// grammar and disable-able with no diagnostic, and what a disabled
+    /// chord then does is pinned: a `Char` forwards as ESC+char (the
+    /// readline fix — M-b/M-f/M-d keep working), while a non-Char (arrows,
+    /// enter) is swallowed — roost has no faithful byte encoding to hand
+    /// back for those, so `disable` there means "roost stops owning it" and
+    /// nothing more.
+    #[test]
+    fn every_default_chord_is_disableable_through_the_config_grammar() {
+        for (&chord, &default) in default_keymap() {
+            let spelling = config_spelling(chord);
+            let json = format!(r#"{{"keys": {{"{spelling}": "disable"}}}}"#);
+            let (keymap, diagnostics) = Keymap::parse(&json, "config.json");
+            assert!(diagnostics.is_empty(), "{spelling}: {diagnostics:?}");
+            let key = if chord.shift { alt_shift(chord.code) } else { alt(chord.code) };
+            let result = translate_with(key, &keymap);
+            assert_ne!(
+                result,
+                InputResult::Action(default),
+                "{spelling} must stop producing its default {default:?}"
+            );
+            match chord.code {
+                KeyCode::Char(_) => assert!(
+                    matches!(result, InputResult::Forward(_)),
+                    "{spelling}: a disabled Char forwards, got {result:?}"
+                ),
+                _ => assert_eq!(
+                    result,
+                    InputResult::Ignore,
+                    "{spelling}: a disabled non-Char is swallowed, got {result:?}"
+                ),
+            }
+        }
+    }
+
+    /// Every action name `roost keys` can print parses and dispatches end to
+    /// end on a chord the default table never bound — the full pipe
+    /// (`Chord::parse` → `action_by_name` → `translate_with`), not just the
+    /// name table's round-trip.
+    #[test]
+    fn every_config_action_name_parses_and_dispatches_on_a_free_chord() {
+        for (name, expected) in NAMES {
+            let json = format!(r#"{{"keys": {{"alt+x": "{name}"}}}}"#);
+            let (keymap, diagnostics) = Keymap::parse(&json, "config.json");
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+            assert_eq!(
+                translate_with(alt(KeyCode::Char('x')), &keymap),
+                InputResult::Action(*expected),
+                "{name} must bind and dispatch"
+            );
+        }
+    }
+
+    /// The canonical readline rescue: take the arrows away from roost (some
+    /// shells bind Alt+arrow to word motion), and the vim letters keep
+    /// focus while the *shifted* arrows keep moving panes — an override is
+    /// per-chord, never per-family.
+    #[test]
+    fn disabling_the_arrows_leaves_the_rest_of_the_map_alone() {
+        let json = r#"{"keys": {
+            "alt+left": "disable", "alt+right": "disable",
+            "alt+up": "disable", "alt+down": "disable" }}"#;
+        let (keymap, diagnostics) = Keymap::parse(json, "config.json");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Up, KeyCode::Down] {
+            assert_eq!(translate_with(alt(code), &keymap), InputResult::Ignore, "{code:?}");
+        }
+        for (code, dir) in [
+            (KeyCode::Left, Dir::Left),
+            (KeyCode::Right, Dir::Right),
+            (KeyCode::Up, Dir::Up),
+            (KeyCode::Down, Dir::Down),
+        ] {
+            assert_eq!(
+                translate_with(alt_shift(code), &keymap),
+                InputResult::Action(Action::MovePane(dir)),
+                "only the unshifted chord was disabled: {code:?}"
+            );
+        }
+        for (code, dir) in [
+            (KeyCode::Char('h'), Dir::Left),
+            (KeyCode::Char('j'), Dir::Down),
+            (KeyCode::Char('k'), Dir::Up),
+            (KeyCode::Char('l'), Dir::Right),
+        ] {
+            assert_eq!(
+                translate_with(alt(code), &keymap),
+                InputResult::Action(Action::Focus(dir)),
+                "the vim focus letters are untouched: {code:?}"
+            );
+        }
+    }
 }
