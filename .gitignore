@@ -10,3 +10,18 @@
 # main tree. They are whole repo copies and pure scratch — auto-removed when
 # the agent finishes. `.claude/` itself stays tracked (agents/, settings).
 /.claude/worktrees/
+
+# graphify (the knowledge-graph tool wired up in `.opencode/`): its *outputs*
+# are committed on purpose — `graph.json`, `graph.html`, `GRAPH_REPORT.md`,
+# `manifest.json` and the curated `.graphify_labels.json` are the artifact the
+# repo wants to keep and diff. What it writes *beside* them is not:
+#   - `cost.json` is one machine's token-spend ledger, appended to every run.
+#   - `cache/` is ~130 content-hash blobs (4.5 MB and growing per rebuild) —
+#     re-derivable from the tree, so it costs history weight and buys nothing.
+#   - `.graphify_python` / `.graphify_root` hold **absolute paths on whoever
+#     ran it** (a home directory and a checkout location), so they are wrong
+#     for every other clone by construction.
+/graphify-out/cost.json
+/graphify-out/cache/
+/graphify-out/.graphify_python
+/graphify-out/.graphify_root
