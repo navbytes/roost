@@ -124,6 +124,23 @@ State lives in `~/.local/state/roost/workspace.json` on Linux and
 every change, atomic writes) — alongside the control socket, token and audit
 log. Delete it to start clean.
 
+### Environment
+
+roost has no flags for any of this — the whole outside-the-TUI surface is
+four variables, set on the command that launches it:
+
+| Variable | Effect |
+|---|---|
+| `ROOST_STATE=DIR` | use `DIR` as the state dir: an independent workspace, config and control socket (above). Created if missing |
+| `ROOST_NO_EXT_INSTALL=1` | don't install or update the pi extension and Claude Code hooks in `~/.pi` / `~/.claude` (below) |
+| `ROOST_NO_QOS=1` | don't raise input-thread scheduling priority on macOS (below) |
+| `ROOST_DEBUG=1` | append control-plane diagnostics — dropped socket lines, shed connections — to `<state>/roost.log`. Any value enables it; the file is written only when there is something to say, and never to the TUI's own output |
+
+Inside every pane roost exports three more, so an agent can call back into
+the fleet — `$ROOST_SOCK` (the control socket), `$ROOST_PANE` (which pane it
+is) and `$ROOST_TOKEN` (authenticates *as* that pane). You don't set these;
+[Controlling roost](#controlling-roost-cli--llm) covers what they're for.
+
 On macOS roost promotes its own input threads to interactive scheduling
 priority so typing stays crisp while agent panes saturate the CPU (the
 agents themselves keep normal priority); set `ROOST_NO_QOS=1` to switch
