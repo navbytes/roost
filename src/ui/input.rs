@@ -1172,8 +1172,8 @@ fn is_redundant_spelling(chord: &Chord, action: &Action, table: &HashMap<Chord, 
 ///
 /// This exists so the chrome can *derive* what it teaches. Before F1 the
 /// help overlay and the hint bar spelled their chords as `&'static str`
-/// literals, so `{"keys": {"alt+f": "disable"}}` — the README's own escape
-/// hatch — produced a roost whose `Alt+?` still taught `Alt+f`. Any surface
+/// literals, so `{"keys": {"alt+z": "disable"}}` — the README's own escape
+/// hatch — produced a roost whose `Alt+?` still taught `Alt+z`. Any surface
 /// that renders from this cannot say that.
 ///
 /// **Twins are collapsed.** A shifted letter is delivered as `('h', SHIFT)`

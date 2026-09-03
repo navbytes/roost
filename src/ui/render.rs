@@ -1389,8 +1389,11 @@ struct HelpGroup {
 /// second column when the terminal is wide enough and scrolls when it is
 /// not (`help_layout`), so the keymap can grow with roost rather than
 /// rationing itself. Unmerged rows are also plainly easier to read —
-/// "Alt+z / Alt+f → zoom pane (view only) / floating scratch shell" made
-/// the reader pair the halves up themselves.
+/// "Alt+z / Alt+Shift+z → zoom pane (view only) / floating scratch shell"
+/// made the reader pair the halves up themselves. (That merged example
+/// used `Alt+f` for the float half until the 2026-09-03 re-key moved it
+/// onto `Alt+Shift+z` — `Alt+f` collided at the byte level with Alt+Right;
+/// see `default_chord_action` in `src/ui/input.rs`.)
 ///
 /// Group order is "how often you reach for it": panes, then their layout,
 /// then tabs, then the fleet surfaces, then reading, then the session.

@@ -1859,10 +1859,14 @@ explain-itself surface, and it explained only the chords. It now ends with
   `Alt+t / Alt+1..9` idiom the cap has always demanded: `Alt+s / Alt+o`
   (split ops), `Alt+z / Alt+f` (the two view toggles), `Alt+w / Alt+u`
   (close and its undo). 20 rows before, 20 rows after.
-  **[2026-09-03: the float half of this pair re-keyed from `Alt+f` to
-  `Alt+Shift+z` — see the dated amendment below. "The two view toggles"
-  is exactly why that destination was chosen: this line is what made the
-  pairing structural instead of coincidental.]**
+  **[This merge was retired at C28, 2026-07-28 (below) — the cap it paid
+  for is gone, and `Alt+z`/`Alt+f` drew as two rows from that point on. The
+  2026-09-03 re-key later moved the float half off `Alt+f` onto
+  `Alt+Shift+z`, so the overlay today draws `Alt+z` and `Alt+Shift+z` as
+  two separate, unmerged rows (§8, rows 8–9) — not the merged pair this
+  bullet describes. "The two view toggles" is still why `Alt+Shift+z` was
+  chosen as the float chord's destination; see the dated amendment on
+  C22 below.]**
 - **Rejected: scrolling the overlay** (the U23 proposal's other option). It
   would have bought unlimited rows at the cost of C15's "any key closes it"
   — the dismiss rule would have to carve out arrow/PgUp/PgDn keys, so the
@@ -2730,10 +2734,13 @@ shift-pair idiom the 2026-09-01 modifier-consistency re-key established for
 *pane* toggle they are next to in every other sense. `Alt+Z` (uppercase, no
 SHIFT bit) is accepted too, the same delivery tolerance every other shifted
 letter in this table carries. `Alt+v`/`Alt+x` were considered and rejected —
-C40 reserves them deliberately (mark/pull), and they are the only two
-unshifted letters still free in both roost and the shells this table's
-collision-flags paragraph tracks; spending one there would trade a
-still-open readline collision for a permanently closed one.
+C40 already spent this letter pair's *shifted* forms (`Alt+Shift+x`
+mark-pane, `Alt+Shift+v` pull-pane, row 13d) and deliberately left the bare
+chords unbound so emacs' `M-x`/`M-v` keep reaching the pane; they are the
+only two unshifted letters still free in both roost and the shells this
+table's collision-flags paragraph tracks, and spending one on float would
+undo that deliberate choice, trading a still-open readline collision for a
+permanently closed one.
 
 **What `Alt+f` becomes.** Unbound, falling through to U5's forward-the-key
 default: `ESC f` now reaches the pane, restoring `M-f` (readline
@@ -6121,7 +6128,8 @@ use on macOS, where the unshifted arm was claiming the event first and row
 
 [Amended 2026-09-03, the Alt+f re-key. Row 9 moves from `Alt+f` to
 `Alt+Shift+z`, paired with row 8's `Alt+z` as the same-letter shift-pair
-idiom the 2026-09-01 re-key below established for rows 7, 13b and 13c —
+idiom C37 established for row 7's `g`/`Shift+g` (2026-08-19) and the
+2026-09-01 re-key below carried forward for rows 5, 13b and 13c —
 `Alt+z` zooms (the view toggle), `Alt+Shift+z` floats (the pane toggle).
 `Alt+f` is now unbound and falls through to U5's forward default, closing
 the collision-flags paragraph's oldest open item (below): on a terminal
