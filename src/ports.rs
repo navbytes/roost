@@ -328,8 +328,12 @@ pub enum ClaimError {
 /// roost pane across all running instances drives a given
 /// `(adapter, session id)`. Implemented by `infra::claims::FsClaims` (lock
 /// files under the state root; the OS releases them when a process dies).
-/// Acquire is idempotent for the owner: re-claiming a session this instance
-/// already holds (a pane respawn) succeeds.
+/// Acquire is **NOT** idempotent: a second `acquire` for a session this same
+/// instance already holds still contends with the first (two separate locks
+/// on one file, even from the same process) and is refused. `App::
+/// claim_session` is what makes a pane respawn safe — it releases its own
+/// handle before re-acquiring — so no implementation needs to special-case
+/// its own prior claim.
 pub trait SessionClaims: Send {
     fn acquire(&self, adapter: &str, session: &str) -> Result<ClaimHandle, ClaimError>;
     /// Session ids currently claimed by anyone (any instance, any workspace)

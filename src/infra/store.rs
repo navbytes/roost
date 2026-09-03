@@ -143,14 +143,17 @@ impl FsStore {
     /// Every workspace that could hold state: the default plus one name
     /// per directory under `root/workspaces`. Names that fail validation
     /// are skipped — a stray directory there is not a workspace roost
-    /// created.
+    /// created. A symlink is skipped too, even one pointing at a real
+    /// directory: `symlink_metadata` (not `is_dir`, which follows the link)
+    /// is what keeps `ws ls` and every listing built on this from aliasing
+    /// some other directory the entry merely points at.
     pub fn workspace_names() -> Vec<String> {
         let mut out = vec![DEFAULT_WORKSPACE.to_string()];
         let mut named: Vec<String> = fs::read_dir(Self::root_dir().join("workspaces"))
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.path().is_dir())
+            .filter(|e| fs::symlink_metadata(e.path()).is_ok_and(|m| m.is_dir()))
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| check_creatable_name(n).is_ok())
             .collect();

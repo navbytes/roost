@@ -216,6 +216,28 @@ fn bare_invocation_off_tty_fails_cleanly_instead_of_panicking() {
     assert!(!err(&o).is_empty(), "must say something on stderr");
 }
 
+/// B5: `__status` is the Claude Code hook's own callback into this binary,
+/// and its whole contract is "never fail loudly" — a `$ROOST_WORKSPACE` that
+/// would be a usage error (exit 2, `USAGE` on stderr) for every other verb
+/// must instead degrade silently to the default workspace here, since a
+/// hook runs inside the agent's own process on every status transition.
+/// Regression guard for ordering: this is exactly what a bad `-w`/env
+/// resolution running *before* the `__status` dispatch would produce.
+#[test]
+fn status_hook_never_fails_on_a_bad_roost_workspace() {
+    let o = Command::new(env!("CARGO_BIN_EXE_roost"))
+        .args(["__status", "working"])
+        .env("ROOST_WORKSPACE", "Bad Workspace")
+        .env_remove("ROOST_PANE")
+        .env_remove("ROOST_SOCK")
+        .env_remove("ROOST_TOKEN")
+        .output()
+        .expect("run roost __status");
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert!(out(&o).is_empty(), "stdout: {:?}", out(&o));
+    assert!(err(&o).is_empty(), "stderr: {:?}", err(&o));
+}
+
 /// Fix 1, driven end to end: `wait`'s timeout reply must be a distinguishable
 /// nonzero exit, not the same 0 as a resolved wait — `wait … && read` used
 /// to proceed as though the pane had actually finished. The pane waits on

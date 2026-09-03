@@ -376,6 +376,24 @@ protect.
    the registry — no daemon, no discovery protocol: the client enumerates
    `workspaces/` and probes each `workspace.lock` to say which workspaces are
    running when the one it tried is not.
+
+   **[Amended 2026-09-04, B1.]** `-w`/`--workspace` is recognised anywhere on
+   the line — before the verb, or after it — except inside `send`'s own
+   text, where scanning stops at its first word: `send` is the one verb
+   whose positionals are free text (`spawn`'s text rides in `--input`), so
+   only there does a flag-shaped word risk being misread as a selection —
+   `roost send 3 -w b hi` sends the literal text "-w b hi" to pane 3,
+   exactly as if `-w` had never been special. A token already consumed as
+   the value of one of the verb's own options (`--cwd`, `--input`, `--tail`,
+   `--until`, `--timeout`) never counts as `-w` either, so `roost spawn
+   --cwd x -w b claude` still selects `b`. Every other verb's own
+   positionals (pane ids, adapter names) are never free text, so `-w` stays
+   recognised through them too: `roost close 3 -w b` selects `b` (this
+   widening's own fix — `close` used to freeze at its PANE positional
+   exactly like `send`, silently swallowing a trailing `-w` as an unused
+   extra positional instead of ever selecting anything). The same widening
+   makes any other leftover single-dash token past a verb's own options a
+   hard usage error (exit 2) rather than a silently ignored positional.
 8. **Preserve single-owner + daemonless.** Commands marshal through the mpsc onto
    the one loop; replies via non-blocking one-shot (never a blocking send from
    main); no detach/reattach; server dies with the process.

@@ -463,3 +463,206 @@ fn pane_env_title_and_guarded_ws_verbs() {
     assert!(!root.join("workspaces/b").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---- C1/C2: implicit creation + root/default composition -----------------
+
+/// spec `workspaces` "Implicit creation": opening a name that doesn't exist
+/// yet starts fresh, no confirmation step, and `ws ls` sees it immediately.
+#[test]
+fn a_new_workspace_name_is_created_implicitly() {
+    let root = harness::shared_state_dir("implicit");
+    let Some(mut h) = spawn_named(&root, "scratch", "implicit-creation gate", &[]) else {
+        return;
+    };
+    assert!(h.settle(WAIT), "the new workspace never painted");
+    wait_for_workspace_socket(&root, "scratch");
+
+    let o = cli(&root, &["ws", "ls"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", err(&o));
+    assert!(out(&o).contains("scratch\trunning"), "{}", out(&o));
+
+    let _ = h.quit_and_wait(WAIT);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// spec `workspaces` "Root override composes" and "Isolation and storage":
+/// `ROOST_STATE` names the root a named workspace's files live under, and
+/// the default workspace's own files stay exactly where they always have —
+/// untouched by a named workspace existing alongside them.
+#[test]
+fn root_override_composes_and_the_default_workspace_stays_untouched() {
+    let root = harness::shared_state_dir("compose");
+    // Seeded, like every other multi-instance scenario here: `workspace.json`
+    // is only written on an actual save (a resize, a pane action, quit), not
+    // at bare startup, so this is what actually proves "under root/workspaces/a"
+    // rather than racing a save that may not happen inside the test's window.
+    seed_workspace(&root, "a", 1, "shell", None);
+    let Some(mut h) = spawn_named(&root, "a", "composition gate", &[]) else {
+        return;
+    };
+    assert!(h.settle(WAIT), "instance a never settled");
+    wait_for_workspace_socket(&root, "a");
+
+    assert!(root.join("workspaces/a/workspace.json").exists(), "a lives under root/workspaces/a");
+    assert!(root.join("workspaces/a/roost.sock").exists(), "a's socket lives there too");
+    assert!(!root.join("workspace.json").exists(), "the default workspace's own file is untouched");
+    assert!(!root.join("roost.sock").exists(), "the default workspace's own socket is untouched");
+
+    let o = cli(&root, &["ws", "ls"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", err(&o));
+    assert!(out(&o).contains("a\trunning"), "{}", out(&o));
+
+    let _ = h.quit_and_wait(WAIT);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- C3: in-pane targeting (A1 end-to-end guard) --------------------------
+
+/// A1 end to end: from inside a pane of workspace `a` (its own
+/// `$ROOST_SOCK`/`$ROOST_TOKEN` set, exactly what a nested `roost` call
+/// inherits), a plain `roost list` targets `a` on its own credentials, and
+/// `roost -w b list` targets `b` — which must NOT try `a`'s pane token
+/// against `b`'s socket (the bug A1 fixes: that used to be "unauthorized").
+#[test]
+fn in_pane_credentials_target_their_own_instance_and_the_flag_targets_another() {
+    let root = harness::shared_state_dir("inpane");
+    seed_workspace(&root, "a", 1, "shell", None);
+    seed_workspace(&root, "b", 1, "shell", None);
+
+    let Some(mut ha) = spawn_named(&root, "a", "in-pane targeting gate", &[]) else { return };
+    let Some(mut hb) = spawn_named(&root, "b", "in-pane targeting gate", &[]) else {
+        let _ = ha.quit_and_wait(WAIT);
+        return;
+    };
+    assert!(ha.settle(WAIT), "instance a never settled");
+    assert!(hb.settle(WAIT), "instance b never settled");
+    wait_for_workspace_socket(&root, "a");
+    wait_for_workspace_socket(&root, "b");
+
+    let a_dir = root.join("workspaces/a");
+    let a_sock = a_dir.join("roost.sock");
+    let a_token = std::fs::read_to_string(a_dir.join("control.token"))
+        .expect("read a's control token")
+        .trim()
+        .to_string();
+
+    // A pane of `a` calling out with its own inherited env, no `-w`: must
+    // reach `a`, on its own socket and token, exactly like today.
+    let o = Command::new(env!("CARGO_BIN_EXE_roost"))
+        .args(["list"])
+        .env("ROOST_STATE", &root)
+        .env("ROOST_SOCK", &a_sock)
+        .env("ROOST_TOKEN", &a_token)
+        .env_remove("ROOST_CONTROL_TOKEN")
+        .output()
+        .expect("run roost list");
+    assert!(o.status.success(), "a pane of a must reach a on its own token: {o:?}");
+
+    // The same pane env, but `-w b`: must reach b — and authenticate with
+    // b's own fleet token, not a's pane token (A1's whole point).
+    let o = Command::new(env!("CARGO_BIN_EXE_roost"))
+        .args(["-w", "b", "list"])
+        .env("ROOST_STATE", &root)
+        .env("ROOST_SOCK", &a_sock)
+        .env("ROOST_TOKEN", &a_token)
+        .env_remove("ROOST_CONTROL_TOKEN")
+        .output()
+        .expect("run roost -w b list");
+    assert!(o.status.success(), "-w b from a's pane must reach b: {o:?} stderr={}", err(&o));
+
+    let _ = ha.quit_and_wait(WAIT);
+    let _ = hb.quit_and_wait(WAIT);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- C4: nothing running ---------------------------------------------------
+
+/// spec `control-targeting` "Nothing running": with no instance anywhere
+/// under the root, a plain `roost list` says so plainly and exits 1.
+#[test]
+fn nothing_running_says_so_and_exits_1() {
+    let root = harness::shared_state_dir("nothing");
+    let o = cli(&root, &["list"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(err(&o).contains("No roost is running in any workspace"), "{}", err(&o));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- C6: claim released on crash ------------------------------------------
+
+/// spec `session-claims` "Claim released on crash": the OS releases a
+/// claim's flock the instant its holder dies for any reason, not only on a
+/// clean quit — so a SIGKILLed instance's session is free for the very next
+/// restore, with no sweep or timeout to wait out.
+#[test]
+fn a_sigkilled_instance_releases_its_claim_for_the_next_restore() {
+    let root = harness::shared_state_dir("sigkill");
+    let home = harness::shared_state_dir("sigkillhome");
+    let session = "roost-claim-sigkill-test";
+    seed_workspace(&root, "a", 1, "pi", Some(session));
+    seed_workspace(&root, "b", 1, "pi", Some(session));
+
+    let Some(mut ha) = spawn_named(
+        &root,
+        "a",
+        "sigkill gate (holder)",
+        &[("HOME", home.as_os_str().to_str().expect("utf8"))],
+    ) else {
+        return;
+    };
+    assert!(ha.settle(WAIT), "instance a never settled");
+
+    let roost_a = ha.pid();
+    // SAFETY: `kill(2)` on a pid this test owns, with SIGKILL — no pointers.
+    unsafe { libc::kill(roost_a as libc::pid_t, libc::SIGKILL) };
+    let deadline = Instant::now() + WAIT;
+    while harness::is_alive(roost_a) {
+        assert!(Instant::now() < deadline, "the SIGKILLed instance never died");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let Some(mut hb) = spawn_named(
+        &root,
+        "b",
+        "sigkill gate (restorer)",
+        &[("HOME", home.as_os_str().to_str().expect("utf8"))],
+    ) else {
+        return;
+    };
+    assert!(hb.settle(WAIT), "instance b never settled");
+    let resumed = hb.wait_for(WAIT, |s| {
+        let c = s.contents();
+        c.contains("main") && !c.contains("held by workspace")
+    });
+    assert!(
+        resumed.is_some(),
+        "b never resumed after a's crash; screen:\n{}",
+        hb.screen().contents()
+    );
+
+    let _ = hb.quit_and_wait(WAIT);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- C7: end-to-end name rejection -----------------------------------------
+
+/// spec `workspaces` "Workspace names": every rejection happens before any
+/// state is touched — a bad `-w` must never create a stray directory, let
+/// alone a workspace, and always exits 2 with the reason on stderr.
+#[test]
+fn invalid_workspace_names_are_rejected_before_touching_the_root() {
+    let root = harness::shared_state_dir("badnames");
+    let too_long = "a".repeat(33);
+    for args in [vec!["-w", "my ws"], vec!["-w", "Tripto"], vec!["-w", too_long.as_str()]] {
+        let o = cli(&root, &args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {o:?}");
+        assert!(!err(&o).is_empty(), "{args:?} must print why: {o:?}");
+    }
+    assert!(
+        std::fs::read_dir(&root).map(|mut d| d.next().is_none()).unwrap_or(true),
+        "a rejected name must leave the root untouched: {}",
+        dump_tree(&root)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

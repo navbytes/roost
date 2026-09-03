@@ -736,8 +736,10 @@ with tests `:530–555`.
   display name}` so two windows are distinguishable in the terminal's own
   tab strip; the default workspace renders nothing new and keeps today's
   exact title (`roost · {pane}`), and the on-screen chrome (badge, tab bar,
-  hint bar) is unchanged for both — the title is the only surface the
-  workspace name reaches.
+  hint bar) is unchanged for both — the title and host notifications
+  (`App::notify_host`'s `[{workspace}] ` prefix, D8) are the two surfaces
+  the workspace name reaches; `roost status`'s `workspace` field is a third,
+  off-screen.
 - Style: text fg `MUTED`; glyph fg per C5 status colors. **[Amended
   2026-08-07]** Working no longer pulses the colour — the glyph itself
   animates (the C5 spinner) while its colour stays the steady one red.

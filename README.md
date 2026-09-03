@@ -141,14 +141,19 @@ $ roost ws rm scratch          # delete an idle workspace (its agent sessions ar
   `ROOST_STATE=/tmp/r roost -w a` puts workspace `a` under `/tmp/r`, and
   `ROOST_STATE=/tmp/r roost ws ls` lists it. Plain `ROOST_STATE` isolation
   (above) keeps its exact old behaviour, including per-directory config.
-- **Keybindings are shared.** A named workspace reads the root
-  `config.json`; if the workspace directory has its own `config.json`, that
-  file replaces the root one for that workspace (never merged).
-- **Targeting from a plain shell.** Out-of-pane verbs take `-w` before or
-  after the verb (`roost -w b list`); inside a pane your own instance is
-  targeted automatically; the flag beats `ROOST_WORKSPACE`, which beats the
-  default. When nothing answers, the error names the workspace it tried and
-  lists the ones that are running.
+- **Keybindings are shared.** A named workspace reads whatever the default
+  workspace would (below: the root `config.json` or the `~/.config/roost/`
+  one, whichever is live); if the workspace directory has its own
+  `config.json`, that file replaces it wholesale for that workspace (never
+  merged).
+- **Targeting from a plain shell.** Out-of-pane verbs take `-w` anywhere on
+  the line, before or after the verb (`roost -w b list`, `roost close 3 -w
+  b`) — except inside `send`'s own text, where `-w` is data, not a flag,
+  past its PANE argument (`roost send 3 -w b hi` sends the literal text
+  "-w b hi" to pane 3); inside a pane your own instance is targeted
+  automatically; the flag beats `ROOST_WORKSPACE`, which beats the default.
+  When nothing answers, the error names the workspace it tried and lists
+  the ones that are running.
 - **One agent session, one driver.** Every running instance holds an
   exclusive claim per agent session it drives, so two windows can never
   resume or adopt the same conversation — the second one shows a placeholder
@@ -183,19 +188,22 @@ workspace's own directory replaces it wholesale for that workspace.
 ### Environment
 
 roost has no flags for any of this — the whole outside-the-TUI surface is
-four variables, set on the command that launches it:
+five variables, set on the command that launches it:
 
 | Variable | Effect |
 |---|---|
 | `ROOST_STATE=DIR` | use `DIR` as the state dir: an independent workspace, config and control socket (above). Created if missing |
+| `ROOST_WORKSPACE=NAME` | launch directly into the named workspace instead of `default` (same as `-w NAME`; see Workspaces) |
 | `ROOST_NO_EXT_INSTALL=1` | don't install or update the pi extension and Claude Code hooks in `~/.pi` / `~/.claude` (below) |
 | `ROOST_NO_QOS=1` | don't raise input-thread scheduling priority on macOS (below) |
 | `ROOST_DEBUG=1` | append control-plane diagnostics — dropped socket lines, shed connections — to `<state>/roost.log`. Any value enables it; the file is written only when there is something to say, and never to the TUI's own output |
 
-Inside every pane roost exports three more, so an agent can call back into
-the fleet — `$ROOST_SOCK` (the control socket), `$ROOST_PANE` (which pane it
-is) and `$ROOST_TOKEN` (authenticates *as* that pane). You don't set these;
-[Controlling roost](#controlling-roost-cli--llm) covers what they're for.
+Inside every pane roost exports four more, so an agent can call back into the
+fleet or know where it's running — `$ROOST_SOCK` (the control socket),
+`$ROOST_PANE` (which pane it is), `$ROOST_TOKEN` (authenticates *as* that
+pane) and `$ROOST_WORKSPACE` (which workspace it's in, `default` for the
+unnamed one). You don't set these; [Controlling roost](#controlling-roost-cli--llm)
+covers what they're for.
 
 On macOS roost promotes its own input threads to interactive scheduling
 priority so typing stays crisp while agent panes saturate the CPU (the

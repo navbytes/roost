@@ -47,13 +47,26 @@ fn is_unsafe_socket_dir(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains(crate::infra::sock::UNSAFE_SOCKET_DIR_MSG)
 }
 
-/// The one other `spawn_listener` failure that must stay fatal: the socket
-/// path exceeds the platform's `sun_path` limit and can never bind — a
+/// The other `spawn_listener` failure that can be fatal: the socket path
+/// exceeds the platform's `sun_path` limit and can never bind — a
 /// deterministic, user-fixable condition (`sock::check_socket_path_len`
-/// already names the fix), not something roost should paper over by
-/// running with no control plane at all.
+/// already names the fix). Whether it actually stays fatal here or degrades
+/// like every other listener failure depends on the workspace — see
+/// `socket_path_too_long_is_fatal`.
 fn is_socket_path_too_long(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains(crate::infra::sock::SOCKET_PATH_TOO_LONG_MSG)
+}
+
+/// B3 (D4 scope): a named workspace's socket has nowhere else to live — its
+/// directory *is* the workspace — so a path over the limit must stop it from
+/// starting at all. The default workspace (and plain `ROOST_STATE`
+/// isolation, which is still the default workspace as far as
+/// `FsStore::workspace_name` is concerned) keeps the pre-existing "no
+/// control plane" degrade, so behaviour there is unchanged by this branch.
+/// Pure — takes the resolved name rather than reading `FsStore` itself — so
+/// it's unit-testable without the process-global raciness that state carries.
+fn socket_path_too_long_is_fatal(workspace: &str) -> bool {
+    workspace != infra::store::DEFAULT_WORKSPACE
 }
 
 fn main() -> Result<()> {
@@ -169,6 +182,19 @@ fn main() -> Result<()> {
     let _ = execute!(std::io::stdout(), cursor_style(None));
     reset_host_title();
     ratatui::restore();
+    // B3: a named workspace's socket-path-too-long refusal reads like every
+    // other startup refusal (`acquire_instance_lock` above) — a bare
+    // `roost: ...` line on stderr, exit 1 — not anyhow's `Error: ...` debug
+    // wrapper. Handled here, after the teardown above has already run
+    // unconditionally, rather than exiting on the spot inside `run` (which
+    // would skip that teardown: the terminal is already live by the time
+    // `spawn_listener` can detect this).
+    if let Err(e) = &result {
+        if is_socket_path_too_long(e) {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
     result
 }
 
@@ -434,7 +460,20 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // into "quietly no socket" is the wrong default.
     let (sock_path, sock_err) = match infra::sock::spawn_listener(tx.clone(), tokens.reader()) {
         Ok(p) => (Some(p), None),
-        Err(e) if is_unsafe_socket_dir(&e) || is_socket_path_too_long(&e) => return Err(e),
+        Err(e) if is_unsafe_socket_dir(&e) => return Err(e),
+        Err(e)
+            if is_socket_path_too_long(&e)
+                && socket_path_too_long_is_fatal(FsStore::workspace_name()) =>
+        {
+            // Propagated as `Err` rather than exiting here: the terminal is
+            // already live at this point (`run` is called after
+            // `ratatui::init()`), and `main`'s unconditional teardown after
+            // `run` returns is what actually hands it back cleanly — `main`
+            // also downgrades this one specific error to a bare `roost: ...`
+            // line afterwards instead of anyhow's `Error: ...` wrapper, to
+            // read like every other startup refusal.
+            return Err(e);
+        }
         Err(e) => (None, Some(format!("no control plane: {e:#}"))),
     };
     let sock_cleanup = sock_path.clone();
@@ -1328,6 +1367,16 @@ mod tests {
         let wrapped = anyhow::anyhow!("roost: socket directory /tmp/x has {UNSAFE_SOCKET_DIR_MSG}")
             .context("starting the control listener");
         assert!(super::is_unsafe_socket_dir(&wrapped));
+    }
+
+    /// B3: a path over the `sun_path` limit is fatal for a named workspace
+    /// (D4 — its socket has nowhere else to live) and degrades exactly like
+    /// today for the default workspace, so `ROOST_STATE`-only isolation
+    /// (which never changes `FsStore::workspace_name`) is unaffected.
+    #[test]
+    fn socket_path_too_long_is_fatal_only_for_a_named_workspace() {
+        assert!(!super::socket_path_too_long_is_fatal(crate::infra::store::DEFAULT_WORKSPACE));
+        assert!(super::socket_path_too_long_is_fatal("scratch"));
     }
     use super::*;
     use crate::core::app::Mode;

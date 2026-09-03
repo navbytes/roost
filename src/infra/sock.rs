@@ -217,8 +217,10 @@ pub const UNSAFE_SOCKET_DIR_MSG: &str = "unsafe ownership/permissions";
 
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
 /// an attacker who pre-created the runtime dir from hosting our control socket
-/// (tmux does the same for its socket dir).
-fn dir_is_private_and_ours(dir: &Path) -> bool {
+/// (tmux does the same for its socket dir). `pub(crate)`: `infra::claims`
+/// reuses this same check for the claims directory (B6) rather than
+/// duplicating it.
+pub(crate) fn dir_is_private_and_ours(dir: &Path) -> bool {
     match fs::metadata(dir) {
         // SAFETY: `geteuid(2)` takes no arguments, touches no memory and
         // cannot fail — the one libc call with nothing to get wrong.
@@ -260,19 +262,20 @@ pub fn socket_path() -> PathBuf {
         .join("roost.sock")
 }
 
-/// `sockaddr_un.sun_path` caps a unix socket path at 104 bytes on macOS
-/// (108 on Linux, the trailing NUL included in both). Socket paths are
-/// built from state directories the user controls — a deep `ROOST_STATE`
-/// root or a long workspace name can exceed the cap, which `bind` then
-/// reports only as a generic error at best. Refuse up front with the fix.
-/// (nt lesson 3YXWPQ.)
-const SUN_PATH_LIMIT: usize = 104;
+/// `sockaddr_un.sun_path` caps a unix socket path at 104 bytes on macOS/BSD,
+/// 108 on Linux (the trailing NUL included in both — hence the strict `<`
+/// below, not `<=`). Socket paths are built from state directories the user
+/// controls — a deep `ROOST_STATE` root or a long workspace name can exceed
+/// the cap, which `bind` then reports only as a generic error at best.
+/// Refuse up front with the fix. (nt lesson 3YXWPQ.)
+const SUN_PATH_LIMIT: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
 
-/// The stable substring `main.rs` matches a `spawn_listener` failure
-/// against to decide this is fatal — same shared-const pattern as
-/// `UNSAFE_SOCKET_DIR_MSG` below, so the `bail!` and the check cannot
-/// drift apart.
-pub const SOCKET_PATH_TOO_LONG_MSG: &str = "unix-socket path limit is 104 bytes";
+/// The stable substring `main.rs` matches a `spawn_listener` failure against
+/// to decide this is fatal — same shared-const pattern as
+/// `UNSAFE_SOCKET_DIR_MSG` below, so the `bail!` and the check cannot drift
+/// apart. Deliberately doesn't name the limit itself (`SUN_PATH_LIMIT` is
+/// per-platform); the `bail!` below states the actual number separately.
+pub const SOCKET_PATH_TOO_LONG_MSG: &str = "unix-socket path limit";
 
 fn check_socket_path_len(path: &Path) -> Result<()> {
     let len = path.as_os_str().as_encoded_bytes().len();
@@ -280,8 +283,9 @@ fn check_socket_path_len(path: &Path) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "roost: socket path {} is {len} bytes, over the {SOCKET_PATH_TOO_LONG_MSG} — \
-         use a shorter workspace name (-w) or a shorter ROOST_STATE root",
+        "roost: socket path {} is {len} bytes, over the {SOCKET_PATH_TOO_LONG_MSG} \
+         ({SUN_PATH_LIMIT} bytes) — use a shorter workspace name (-w) or a shorter \
+         ROOST_STATE root",
         path.display()
     );
 }
@@ -1506,8 +1510,18 @@ mod tests {
         assert!(check_socket_path_len(&PathBuf::from("/tmp/roost.sock")).is_ok());
         let long = PathBuf::from("/tmp").join("x".repeat(300));
         let err = check_socket_path_len(&long).unwrap_err().to_string();
-        assert!(err.contains("104"), "must name the limit: {err}");
+        // The limit itself is per-platform (104 macOS/BSD, 108 Linux) — name
+        // it via the constant, not a literal, so this passes on both.
+        assert!(err.contains(&SUN_PATH_LIMIT.to_string()), "must name the limit: {err}");
         assert!(err.contains("shorter"), "must suggest the fix: {err}");
+    }
+
+    /// B3: the constant itself, pinned to the two platforms roost ships for
+    /// — a NUL byte is included in both, hence `<`, not `<=`, above.
+    #[test]
+    fn sun_path_limit_is_104_on_macos_bsd_and_108_on_linux() {
+        let expected = if cfg!(target_os = "linux") { 108 } else { 104 };
+        assert_eq!(SUN_PATH_LIMIT, expected);
     }
 
     #[test]

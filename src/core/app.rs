@@ -544,6 +544,12 @@ pub struct App<B: PaneBackend> {
     /// file in the project whenever it was written, i.e. a conversation
     /// from days ago. See `PROMOTION_GRACE`.
     last_shell_seen: HashMap<PaneId, SystemTime>,
+    /// Panes for which a detection candidate has already been skipped and
+    /// reported this conflict (D7: another running instance claims it).
+    /// Latched so the feed gets exactly one line per pane, not one every
+    /// tick for as long as the other workspace keeps the session — cleared
+    /// when the pane adopts a session or closes.
+    detect_conflict_latched: HashSet<PaneId>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
     /// `$HOME`, resolved once at startup — `focused_cwd()`'s `~`-abbreviation
@@ -788,6 +794,7 @@ impl<B: PaneBackend> App<B> {
             host_pixels,
             pending_detect: HashMap::new(),
             last_shell_seen: HashMap::new(),
+            detect_conflict_latched: HashSet::new(),
             last_detect: Instant::now(),
             sock_path,
             home: dirs::home_dir(),
@@ -1324,8 +1331,13 @@ impl<B: PaneBackend> App<B> {
         // the launch we are about to skip.)
         if let Some(s) = &resolution.session {
             if let Err(owner) = self.claim_session(id, &spec.adapter, s) {
+                // `owner` (`quit that workspace`, not `close`): the
+                // placeholder renders after the renderer's own "spawn
+                // failed: " prefix, and "close" reads as roost's own
+                // pane-close action — this names a *different running
+                // instance*, which only quitting can free.
                 let msg =
-                    format!("session {s} is held by {owner} — close that workspace to resume here");
+                    format!("session {s} is held by {owner}; quit that workspace to resume here");
                 self.push_feed(format!("resume blocked: {msg}"), false, Some(id));
                 self.dead.insert(id, msg);
                 return;
@@ -1339,13 +1351,15 @@ impl<B: PaneBackend> App<B> {
             // scope above; the registry is static for the process's life).
             (_, None) => return,
         };
+        // D8: panes know their workspace — a nested `roost -w x` inside a
+        // pane targets `x`, and scripts can read which workspace they live
+        // in. Always set, "default" included, and unconditionally (unlike
+        // ROOST_SOCK/ROOST_TOKEN below, which need a live control socket to
+        // mean anything): a pane spawned with no control plane must still
+        // see it, so the variable never reads as unset-inside-roost.
+        cmd.env.push(("ROOST_WORKSPACE".into(), self.workspace.clone()));
         if let Some(sock) = &self.sock_path {
             cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
-            // D8: panes know their workspace — a nested `roost -w x` inside a
-            // pane targets `x`, and scripts can read which workspace they
-            // live in. Always set, "default" included, so the variable never
-            // reads as unset-inside-roost.
-            cmd.env.push(("ROOST_WORKSPACE".into(), self.workspace.clone()));
             // Fresh per-spawn token: the pane authenticates its socket messages
             // with it, and no other pane knows it. Reissued on every (re)spawn.
             let token = crate::core::control::gen_token();
@@ -1365,6 +1379,11 @@ impl<B: PaneBackend> App<B> {
         // adapter / registry borrow ends here.
 
         if resolution.stale {
+            // B2: release this pane's claim along with the id it named — a
+            // claim that outlives the session it was taken for is exactly
+            // the leak D7 exists to prevent, and nothing below re-claims for
+            // this pane (no session survived `resolve` to claim instead).
+            self.pane_claims.remove(&id);
             // Persist the correction so the dead id isn't retried next launch.
             if let Some(s) = self.find_spec_mut(id) {
                 s.session = None;
@@ -1505,14 +1524,26 @@ impl<B: PaneBackend> App<B> {
                 // Claim before adopting (D7): between the snapshot above and
                 // now another instance may have taken it — then keep scanning
                 // on the next tick rather than adopting a claimed session.
+                // Unlike the restore conflict above (once per spawn),
+                // detection retries every tick — latched so a held candidate
+                // gets exactly one feed line per pane, not one every tick
+                // for as long as the other workspace keeps running.
                 match self.claim_session(id, &spec.adapter, &session) {
-                    Ok(()) => self.set_session(id, session),
+                    Ok(()) => {
+                        self.detect_conflict_latched.remove(&id);
+                        self.set_session(id, session);
+                    }
                     Err(owner) => {
-                        self.push_feed(
-                            format!("session {} held by {owner}; still looking", &session),
-                            false,
-                            Some(id),
-                        );
+                        if self.detect_conflict_latched.insert(id) {
+                            self.push_feed(
+                                format!(
+                                    "{}: session {session} is held by {owner} — still scanning",
+                                    self.feed_label(id)
+                                ),
+                                false,
+                                Some(id),
+                            );
+                        }
                     }
                 }
             }
@@ -2737,6 +2768,9 @@ impl<B: PaneBackend> App<B> {
         // unrelated one.
         self.last_shell_seen.remove(&id);
         self.pending_detect.remove(&id);
+        // Same recycled-id reason once more: an inherited latch would
+        // silently swallow the new pane's own first conflict notification.
+        self.detect_conflict_latched.remove(&id);
         // D7: drop the pane's session claim, releasing it for every other
         // running instance. Pane ids are recycled, so an unremoved entry is
         // not just a leak — a later pane with this id would inherit the
@@ -2903,7 +2937,7 @@ impl<B: PaneBackend> App<B> {
         // D8: notifications raised from a named workspace carry its name, so
         // two windows' rings are distinguishable; the default workspace's
         // bytes are unchanged.
-        let msg = if self.workspace == "default" {
+        let msg = if self.workspace == crate::infra::store::DEFAULT_WORKSPACE {
             text.to_string()
         } else {
             format!("[{}] {}", self.workspace, text)
@@ -2955,7 +2989,7 @@ impl<B: PaneBackend> App<B> {
         // C4 (amended 2026-09-03, named workspaces): a named workspace adds
         // its name between `roost` and the pane segment; the default
         // workspace renders nothing new and keeps today's exact title.
-        let want = if self.workspace == "default" {
+        let want = if self.workspace == crate::infra::store::DEFAULT_WORKSPACE {
             format!("roost · {label}")
         } else {
             format!("roost · {} · {label}", self.workspace)
@@ -3971,6 +4005,11 @@ impl<B: PaneBackend> App<B> {
     pub fn respawn_focused(&mut self, fresh: bool) {
         let id = self.focused;
         if fresh {
+            // B2: drop the claim along with the session id it named —
+            // otherwise a pane that gives up on a dead session keeps the
+            // claim held, blocking every other workspace from ever
+            // resuming it even though this pane no longer represents it.
+            self.pane_claims.remove(&id);
             if let Some(spec) = self.find_spec_mut(id) {
                 spec.session = None;
             }
@@ -6000,6 +6039,10 @@ impl<B: PaneBackend> App<B> {
         self.dead.remove(&f.id);
         self.pending_input.remove(&f.id);
         self.raw.remove(&f.id);
+        // D7: a float promoted to an agent claims a session like any other
+        // pane (`claim_session`) — drop it here too, or a closed scratch
+        // float keeps holding it for every other running instance forever.
+        self.pane_claims.remove(&f.id);
         let target = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
             f.prev_focus
         } else {
@@ -8093,6 +8136,26 @@ pub(crate) mod tests {
 
     fn shell_ws() -> Workspace {
         Workspace::default_in(PathBuf::from("/tmp"))
+    }
+
+    /// B4 (spec `workspaces`, "Identity signals"): every pane sees
+    /// `ROOST_WORKSPACE`, unconditionally — `mk_app` spawns with no control
+    /// socket at all, so `ROOST_SOCK`/`ROOST_TOKEN` (which need one to mean
+    /// anything) are absent, but the workspace identity is not gated on it.
+    #[test]
+    fn pane_env_carries_the_workspace_even_with_no_control_socket() {
+        let (app, _s) = mk_app(shell_ws());
+        let cmd = &app.runtimes.get(&1).expect("pane 1 spawned").cmd;
+        assert!(
+            cmd.env.iter().any(|(k, v)| k == "ROOST_WORKSPACE" && v == "default"),
+            "{:?}",
+            cmd.env
+        );
+        assert!(
+            !cmd.env.iter().any(|(k, _)| k == "ROOST_SOCK"),
+            "no control socket, so none to carry: {:?}",
+            cmd.env
+        );
     }
 
     /// P2: a pane's OSC 9/777 notification reaches the user through the same
@@ -12178,6 +12241,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Models the TOCTOU race the D7 comment in the detection scan
+    /// describes: `claimed()` (the snapshot the scan filters candidates
+    /// through) reports nothing held, but `acquire()` (the claim attempt
+    /// moments later) always refuses — another instance grabbing it in
+    /// that exact gap is the one way the scan's `Err` branch is reached in
+    /// real operation. `MemClaims` can't model this on its own: both its
+    /// methods read the same map, so within one synchronous tick they can
+    /// never disagree.
+    struct AlwaysContestedClaims;
+    impl SessionClaims for AlwaysContestedClaims {
+        fn acquire(&self, _adapter: &str, _session: &str) -> Result<ClaimHandle, ClaimError> {
+            Err(ClaimError::Held("workspace 'other'".into()))
+        }
+        fn claimed(&self, _adapter: &str) -> HashSet<String> {
+            HashSet::new()
+        }
+    }
+
     /// A pane promoted to an agent must not claim a session from *before*
     /// it was a shell.
     ///
@@ -12476,6 +12557,73 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The latch: a detection candidate skipped for the same held session
+    /// across repeated ticks must log exactly once per pane, not once per
+    /// tick for as long as the other workspace keeps running. Real-world
+    /// this branch is a TOCTOU race (see `AlwaysContestedClaims`), so it's
+    /// forced deterministically rather than modelled with `MemClaims`,
+    /// which cannot disagree with itself within one tick.
+    #[test]
+    fn a_detection_conflict_logs_exactly_one_feed_line_across_repeated_ticks() {
+        let dir = std::env::temp_dir().join(format!("roost-claim-latch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("taken.jsonl"), "").unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+            "b".into(),
+            Box::new(AlwaysContestedClaims),
+        )
+        .unwrap();
+
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick(); // first skip
+
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick(); // second skip, same conflict — must not log again
+
+        assert_eq!(app.find_spec(1).unwrap().session, None, "still not adopted");
+        let skips = app.feed().iter().filter(|e| e.text.contains("held by")).count();
+        assert_eq!(skips, 1, "one line for two skipped ticks, not one per tick: {:?}", app.feed());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Single instance, never blocked (spec `session-claims`): one instance's
     /// own restore is never refused by its own claim — and a respawn (the
     /// restore path re-running for a live pane) releases and re-claims
@@ -12500,6 +12648,95 @@ pub(crate) mod tests {
         assert!(app.runtimes.contains_key(&1), "the respawn was not blocked by the held claim");
         assert_eq!(app.pane_claims.len(), 1, "still exactly one handle for the pane");
         assert!(!app.dead.contains_key(&1));
+    }
+
+    // -- B2: a claim must never outlive the session id it names ------------
+
+    /// `respawn_focused(fresh: true)` drops the session id to force a fresh
+    /// launch — the claim on the OLD id must go with it, or a pane that
+    /// gives up on a dead session leaves it held forever, blocking every
+    /// other workspace from ever resuming it.
+    #[test]
+    fn respawn_fresh_releases_the_old_claim() {
+        let claims = crate::ports::fakes::MemClaims::new("b");
+        let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
+        assert!(app.pane_claims.contains_key(&1), "the restore claimed sess-1");
+        assert!(claims.snapshot().contains_key("detect.sess-1"));
+
+        app.respawn_focused(true);
+        assert!(!app.pane_claims.contains_key(&1), "the app-side bookkeeping is gone too");
+        assert!(
+            !claims.snapshot().contains_key("detect.sess-1"),
+            "the claim on the dropped id must be released, not held forever"
+        );
+    }
+
+    /// `spawn_pane`'s `resolution.stale` branch (a malformed or
+    /// adapter-confirmed-gone id) clears the persisted session id — the
+    /// claim taken for that id at an earlier spawn must be released in the
+    /// same stroke, since nothing re-claims for this pane afterwards.
+    #[test]
+    fn a_stale_session_releases_its_claim() {
+        let claims = crate::ports::fakes::MemClaims::new("b");
+        let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
+        assert!(claims.snapshot().contains_key("detect.sess-1"), "the initial restore claimed it");
+
+        // `resolve`'s other route to `stale` — a malformed id — needs no
+        // real filesystem `session_state`, so this simulates the stored id
+        // having gone bad since the pane last spawned.
+        let mut spec = app.find_spec(1).unwrap().clone();
+        spec.session = Some("not a valid session id".into());
+        app.spawn_pane(1, &spec, Rect::new(0, 0, 80, 24));
+
+        assert_eq!(app.find_spec(1).unwrap().session, None, "the stale id is cleared");
+        assert!(
+            !claims.snapshot().contains_key("detect.sess-1"),
+            "the claim on the now-stale id must be released, not held forever"
+        );
+    }
+
+    /// A pane's claimed session changing (a freshly detected id displacing a
+    /// stale one, or an extension reporting a different one) must release
+    /// the old claim and take the new one — never hold both, never hold
+    /// neither.
+    #[test]
+    fn changing_a_panes_claimed_session_releases_the_old_and_claims_the_new() {
+        let claims = crate::ports::fakes::MemClaims::new("b");
+        let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
+        assert!(claims.snapshot().contains_key("detect.sess-1"));
+
+        assert!(app.claim_session(1, "detect", "sess-2").is_ok());
+        let snap = claims.snapshot();
+        assert!(!snap.contains_key("detect.sess-1"), "the old claim is released: {snap:?}");
+        assert!(snap.contains_key("detect.sess-2"), "the new one is held: {snap:?}");
+    }
+
+    /// C22 rule 4 + D7: a float promoted to an agent claims a session like
+    /// any other pane — closing it for real (`close_float`) must release
+    /// that claim too, or a scratch pane holds a session hostage from every
+    /// other workspace for as long as the process runs.
+    #[test]
+    fn close_float_releases_a_claim_the_float_held() {
+        let claims = crate::ports::fakes::MemClaims::new("b");
+        let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
+
+        app.spawn_float();
+        let float_id = app.float.as_ref().expect("float now exists").id;
+        assert!(app.claim_session(float_id, "detect", "sess-2").is_ok());
+        assert!(app.pane_claims.contains_key(&float_id));
+        assert!(claims.snapshot().contains_key("detect.sess-2"), "the float holds its claim");
+
+        app.close_float();
+        assert!(
+            !app.pane_claims.contains_key(&float_id),
+            "the float's own bookkeeping is gone too"
+        );
+        assert!(
+            !claims.snapshot().contains_key("detect.sess-2"),
+            "closing the float must release its claim, not hold it forever"
+        );
+        // Pane 1's own, unrelated claim survives untouched.
+        assert!(claims.snapshot().contains_key("detect.sess-1"));
     }
 
     /// ...and the same must hold for a pane that *inherits* an id, which is

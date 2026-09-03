@@ -22,16 +22,27 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use crate::infra::sock::dir_is_private_and_ours;
 use crate::ports::{ClaimError, ClaimHandle, SessionClaims};
+
+/// Retry budget for a lock that's held only for a moment (B6): a handful of
+/// short tries, so a passing probe can't be mistaken for a real conflict —
+/// without making a real conflict noticeably slower to report.
+const ACQUIRE_ATTEMPTS: u32 = 3;
+const ACQUIRE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 pub struct FsClaims {
     /// The shared state root (`FsStore::root_dir()`) — claims live under
     /// `<root>/claims/` so every workspace's instances see the same store.
     root: PathBuf,
-    /// This instance's workspace name; re-acquiring a claim this workspace
-    /// already holds is idempotent (a pane respawn re-runs the restore
-    /// path), which is what makes respawns not self-deadlock.
+    /// This instance's workspace name, recorded in a claim file's owner
+    /// line so a conflict can name the holder. `acquire` itself is NOT
+    /// idempotent for it (see `SessionClaims`'s own doc) — `App::
+    /// claim_session` is what makes a pane respawn safe, by releasing its
+    /// existing handle before re-acquiring, so this port never needs to
+    /// recognise a claim as "already mine".
     workspace: String,
 }
 
@@ -49,6 +60,17 @@ impl FsClaims {
         // with a restrictive mode is not enough (mkdir's mode is a umask
         // request), so set it explicitly, like `FsStore::save`.
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        // ...and actually check it stuck: the same private-and-ours check
+        // the control socket's directory gets (an attacker who pre-created
+        // this directory, or a filesystem that ignores the chmod, is
+        // exactly what that check exists to catch). A failure here becomes
+        // `ClaimError::Failed` up in `acquire`, which is advisory-only —
+        // the caller degrades to unclaimed with a feed line, never panics,
+        // never blocks a restore (spec: claims are private to the user, not
+        // a hard gate on using roost at all).
+        if !dir_is_private_and_ours(&dir) {
+            anyhow::bail!("{} is not private to this user", dir.display());
+        }
         Ok(dir)
     }
 
@@ -94,11 +116,29 @@ impl SessionClaims for FsClaims {
             .mode(0o600)
             .open(&path)
             .map_err(|e| ClaimError::Failed(format!("opening {}: {e}", path.display())))?;
-        match file.try_lock() {
+        // A concurrent `claimed()` probe (or another instance's own
+        // `acquire` attempt) holds the lock for a moment, not indefinitely —
+        // a few retries keep that from being mistaken for a real conflict
+        // and turning a legitimate restore into a sticky "held by"
+        // placeholder.
+        let mut locked = file.try_lock();
+        for _ in 1..ACQUIRE_ATTEMPTS {
+            if locked.is_ok() {
+                break;
+            }
+            std::thread::sleep(ACQUIRE_RETRY_DELAY);
+            locked = file.try_lock();
+        }
+        match locked {
             Ok(()) => {
                 // Informational only — the lock is the truth. Best-effort:
                 // a read-only claims dir would still have granted the lock
                 // had the file existed, and the owner line is a nicety.
+                // Truncate first: without it, a shorter owner line than
+                // whatever was written here last time leaves that write's
+                // trailing bytes in place — e.g. a stale pid digit tacked
+                // onto the new one.
+                let _ = file.set_len(0);
                 let _ = std::io::Write::write_all(
                     &mut file,
                     format!("{}\t{}\n", self.workspace, std::process::id()).as_bytes(),
