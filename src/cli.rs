@@ -648,17 +648,22 @@ fn run_keys() -> i32 {
 
     // Where the file is — the question this command was getting asked and
     // could not answer. stderr, so the table above still pipes cleanly.
-    // Unconditional: "which of my two config.json files is live?" and "where
-    // do I create one?" are both worth a line, and both are otherwise
-    // guesswork.
+    //
+    // Not under `$ROOST_STATE`: setting it *is* naming the directory, so
+    // there is nothing to discover, and "a clean config says nothing on
+    // stderr" is a contract worth keeping for the scripted case (tests/cli.rs
+    // pins it). The line is for the user who never chose a directory and has
+    // no way to know which of two roost would read.
     let resolved = crate::infra::config::resolve_config();
-    if resolved.exists {
-        eprintln!("roost keys: reading {}", resolved.path.display());
-    } else {
-        eprintln!(
-            "roost keys: no config.json — create {} to change these bindings",
-            resolved.path.display()
-        );
+    if std::env::var_os("ROOST_STATE").is_none() {
+        if resolved.exists {
+            eprintln!("roost keys: reading {}", resolved.path.display());
+        } else {
+            eprintln!(
+                "roost keys: no config.json — create {} to change these bindings",
+                resolved.path.display()
+            );
+        }
     }
 
     if diagnostics.is_empty() {

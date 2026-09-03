@@ -130,7 +130,7 @@ you write by hand: `config.json` lives in `~/.config/roost/` (on macOS,
 the state dir beside `workspace.json`, so nothing breaks if you already have
 one there — but `~/.config` is where a new one belongs, and `roost keys`
 prints the exact path it uses. Under `ROOST_STATE` the search stops in that
-directory, by design.
+directory, by design — you named it, so there is nothing to report.
 
 ### Environment
 
