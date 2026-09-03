@@ -54,6 +54,53 @@ fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
     let _ = h.quit_and_wait(Duration::from_secs(5));
 }
 
+/// The `~/.config/roost/config.json` fallback, end to end, with no
+/// `ROOST_STATE` in sight — the route a user who never read the docs
+/// actually takes. Nothing is written to the state dir, so a `disable` that
+/// takes effect can only have been read from the config dir.
+///
+/// Linux only, and not for lack of care: on macOS `dirs::state_dir()` is
+/// `None`, so the state dir falls back to `dirs::data_local_dir()` —
+/// `~/Library/Application Support` — which is exactly what
+/// `dirs::config_dir()` returns there too. The two candidate paths are the
+/// same file, so there is no fallback for a macOS test to distinguish. The
+/// resolver's own handling of that equal-paths case is unit-tested in
+/// `src/infra/config.rs` instead, on every platform.
+#[cfg(target_os = "linux")]
+#[test]
+fn config_json_disabling_alt_f_is_found_in_the_xdg_config_dir() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let config = serde_json::json!({ "keys": { "alt+f": "disable" } }).to_string();
+    let mut h = match harness::Harness::try_spawn_xdg(&harness::one_pane(cwd), Some(&config)) {
+        Ok(h) => h,
+        Err(reason) => {
+            eprintln!("SKIP xdg-config gate: {reason}");
+            return;
+        }
+    };
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+
+    h.write_bytes(b"printf READY; cat\r");
+    h.wait_for(Duration::from_secs(5), |s| s.contents().contains("READY"))
+        .expect("pane never reached the cat sink");
+
+    h.write_bytes(ALT_F);
+    // Same reasoning as the ROOST_STATE test above: without the disable
+    // entry alt+f is roost's own ToggleFloat chord and never reaches the
+    // pane, so `^[f` on screen proves the file was read — and here it could
+    // only have come from $XDG_CONFIG_HOME/roost/.
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[f")).is_none() {
+        panic!(
+            "alt+f was not forwarded to the pane — config.json was not picked up from \
+             $XDG_CONFIG_HOME/roost/:\n{}",
+            h.screen().contents()
+        );
+    }
+
+    let _ = h.quit_and_wait(Duration::from_secs(5));
+}
+
 /// Alt+Left as a modern terminal delivers it: the xterm CSI-modifier form,
 /// `CSI 1;3D` (modifier 3 = alt).
 const ALT_LEFT_CSI: &[u8] = b"\x1b[1;3D";

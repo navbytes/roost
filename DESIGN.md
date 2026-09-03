@@ -97,7 +97,7 @@ enum LayoutNode {
 
 **The workspace file** is the whole product, morally:
 
-`~/.local/state/roost/workspace.json` on Linux; `~/Library/Application Support/roost/workspace.json` on macOS, which has no XDG state dir (state, not config — the one escape hatch, `config.json` beside it, holds keybindings only; the generic TOML adapter is still unbuilt; roost is otherwise zero-config)
+`~/.local/state/roost/workspace.json` on Linux; `~/Library/Application Support/roost/workspace.json` on macOS, which has no XDG state dir. State, not config: it is machine-written on every change, so it belongs in the state dir and not in a directory people keep in a dotfiles repo. The one escape hatch, `config.json`, is the opposite — hand-authored, so it reads from `~/.config/roost/` (and still from the state dir, where it used to live). It holds keybindings only; the generic TOML adapter is still unbuilt; roost is otherwise zero-config
 
 ```jsonc
 {

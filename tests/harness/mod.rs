@@ -81,7 +81,7 @@ impl Harness {
         let state_dir = fresh_state_dir();
         std::fs::write(state_dir.join("workspace.json"), workspace_json)
             .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
-        Self::spawn_in(state_dir, envs, rows, cols)
+        Self::spawn_in(state_dir, true, envs, rows, cols)
     }
 
     /// Like `try_spawn`, but also seeds `config.json` — the key-bindings
@@ -95,13 +95,76 @@ impl Harness {
             .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
         std::fs::write(state_dir.join("config.json"), config_json)
             .map_err(|e| format!("writing fixture config.json: {e}"))?;
-        Self::spawn_in(state_dir, &[], ROWS, COLS)
+        Self::spawn_in(state_dir, true, &[], ROWS, COLS)
+    }
+
+    /// Spawn with **no `ROOST_STATE`**, so roost resolves its own
+    /// directories the way a real install does — from the XDG variables,
+    /// every one of them pointed into a fresh temp tree so a test run can
+    /// never read or write the developer's real `~`.
+    ///
+    /// The seam for asserting *where roost looks* for `config.json`.
+    /// `try_spawn_with_config` structurally cannot answer that: it sets
+    /// `ROOST_STATE`, whose entire contract is to end the search at one
+    /// directory.
+    ///
+    /// `config_json`, when given, is written to the **XDG config dir**
+    /// (`$XDG_CONFIG_HOME/roost/config.json`) — the location under test.
+    /// Nothing is ever written to the state dir here, so a file found at all
+    /// can only have come from the fallback.
+    pub fn try_spawn_xdg(workspace_json: &str, config_json: Option<&str>) -> Result<Self, String> {
+        let root = fresh_state_dir();
+        // roost's own state dir is `$XDG_STATE_HOME/roost` (src/infra/store.rs).
+        let state_dir = root.join("state").join("roost");
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|e| format!("creating fixture state dir: {e}"))?;
+        std::fs::write(state_dir.join("workspace.json"), workspace_json)
+            .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
+
+        let config_dir = root.join("cfg").join("roost");
+        std::fs::create_dir_all(&config_dir)
+            .map_err(|e| format!("creating fixture config dir: {e}"))?;
+        if let Some(config_json) = config_json {
+            std::fs::write(config_dir.join("config.json"), config_json)
+                .map_err(|e| format!("writing fixture config.json: {e}"))?;
+        }
+
+        let home = root.to_string_lossy().into_owned();
+        let xdg_state = root.join("state").to_string_lossy().into_owned();
+        let xdg_config = root.join("cfg").to_string_lossy().into_owned();
+        // `XDG_RUNTIME_DIR` is where the control socket lands
+        // (src/infra/sock.rs) and would otherwise be *inherited* — pointing
+        // every concurrent test at one real runtime dir. `root` itself, not a
+        // subdirectory: `sockaddr_un.sun_path` is 104 bytes on macOS, which
+        // is the same budget `fresh_state_dir` is kept short for.
+        let runtime = root.to_string_lossy().into_owned();
+        Self::spawn_in(
+            state_dir,
+            false,
+            &[
+                ("HOME", home.as_str()),
+                ("XDG_STATE_HOME", xdg_state.as_str()),
+                ("XDG_CONFIG_HOME", xdg_config.as_str()),
+                ("XDG_DATA_HOME", xdg_state.as_str()),
+                ("XDG_RUNTIME_DIR", runtime.as_str()),
+            ],
+            ROWS,
+            COLS,
+        )
     }
 
     /// Shared spawn logic once `state_dir` already holds whatever fixture
     /// files the caller wants roost to see at startup.
+    ///
+    /// `pin_roost_state` is what separates the two spawn styles. Almost every
+    /// scenario wants `true`: `ROOST_STATE` is one variable that isolates the
+    /// whole instance. A scenario asserting *where roost looks* for a file
+    /// cannot use it — that variable exists precisely to short-circuit the
+    /// search — and passes `false`, taking responsibility for isolating
+    /// `$HOME` and the XDG variables itself (see `try_spawn_xdg`).
     fn spawn_in(
         state_dir: PathBuf,
+        pin_roost_state: bool,
         envs: &[(&str, &str)],
         rows: u16,
         cols: u16,
@@ -113,7 +176,9 @@ impl Harness {
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_roost"));
         cmd.cwd(env!("CARGO_MANIFEST_DIR"));
-        cmd.env("ROOST_STATE", &state_dir);
+        if pin_roost_state {
+            cmd.env("ROOST_STATE", &state_dir);
+        }
         // Deterministic pane shell: no user rc files / prompt themes to
         // confuse content-based screen assertions.
         cmd.env("SHELL", "/bin/sh");

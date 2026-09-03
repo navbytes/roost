@@ -124,6 +124,14 @@ State lives in `~/.local/state/roost/workspace.json` on Linux and
 every change, atomic writes) — alongside the control socket, token and audit
 log. Delete it to start clean.
 
+**Config** is the other half and goes somewhere else, because it is the half
+you write by hand: `config.json` lives in `~/.config/roost/` (on macOS,
+`~/Library/Application Support/roost/`). roost still reads an older one from
+the state dir beside `workspace.json`, so nothing breaks if you already have
+one there — but `~/.config` is where a new one belongs, and `roost keys`
+prints the exact path it uses. Under `ROOST_STATE` the search stops in that
+directory, by design — you named it, so there is nothing to report.
+
 ### Environment
 
 roost has no flags for any of this — the whole outside-the-TUI surface is

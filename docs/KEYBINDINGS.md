@@ -67,14 +67,37 @@ a raw-focused pane collapses it to one pair (`Alt+Shift+p exit raw`).
 
 Every shortcut above lives on `Alt`, which can collide with your shell's own
 readline bindings (`Alt+f`/`Alt+b`/`Alt+d` are the usual culprits). Fix one in
-`config.json`, next to `workspace.json` — [`ROOST_STATE` redirects
-both](../README.md#a-separate-workspace-is-one-environment-variable), which is
-also how you try a remap without touching your real one. No
-file — the default — and roost behaves exactly as documented above.
+`config.json`. No file — the default — and roost behaves exactly as
+documented above.
 
 ```json
 { "keys": { "alt+f": "disable", "alt+v": "toggle_float" } }
 ```
+
+### Where the file goes
+
+`~/.config/roost/config.json`. On macOS, `~/Library/Application
+Support/roost/config.json`.
+
+roost also still reads it from the state dir next to `workspace.json`
+(`~/.local/state/roost/config.json` on Linux), which is where it lived
+before — an existing file there keeps working and keeps winning if you
+somehow have both, and `roost keys` names the one actually in force. New
+files belong in the config dir above.
+
+Not sure? Ask:
+
+```console
+$ roost keys >/dev/null
+roost keys: no config.json — create /home/you/.config/roost/config.json to change these bindings
+```
+
+Under [`ROOST_STATE`](../README.md#a-separate-workspace-is-one-environment-variable)
+the search stops there and `$ROOST_STATE/config.json` is the only file read —
+that is the point of the variable, and it is how you try a remap without
+touching your real one. (`roost keys` skips the location line in that case:
+you named the directory, and a clean config saying nothing on stderr is a
+property scripts rely on.)
 
 A chord is `alt+<key>` or `alt+shift+<key>` — nothing else parses (`ctrl+f`
 is rejected, deliberately), and `<key>` is one character (`alt+f`, `alt+3`,
@@ -124,7 +147,10 @@ Alt+1	go_to_tab_1
 ```
 
 It reads `config.json` directly and needs no running roost, so it answers
-before you launch: remapped and disabled chords are marked `config.json`, and
+before you launch. Stderr names the file it read, or the one to create —
+except under `ROOST_STATE`, where you have already named the directory
+yourself and a clean config stays silent. Remapped and disabled chords are
+marked `config.json`, and
 an entry roost had to skip is named on stderr with a non-zero exit — so a
 dotfile test can gate on it instead of you catching a startup toast. Only a
 *skipped* entry sets that exit code. Rebinding a chord that already had a
