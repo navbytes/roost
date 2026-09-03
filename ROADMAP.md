@@ -70,8 +70,9 @@ decided, across four patch releases. Newest work first.
   frame. Content-anchoring was assessed and **rejected**: the vendored vt100
   parser has no stable row identity and a resize rewraps the grid. Spec:
   DESIGN-ui.md C29 amendment + SPEC-parity P1.
-- **[done] A minimal key-remap config file (v0.1.3).** `config.json`, next to
-  `workspace.json` (`ROOST_STATE` redirects both), disables or remaps
+- **[done] A minimal key-remap config file (v0.1.3).** `config.json` — read
+  from `~/.config/roost/` and, still, from beside `workspace.json` where it
+  shipped (`ROOST_STATE` redirects to its own dir and stops there) — disables or remaps
   individual `Alt` bindings — the escape hatch for the `Alt+f`/`b`/`d` readline
   collisions this roadmap flagged. Absent file = prior behavior byte-for-byte;
   a malformed file never blocks startup (defaults + a toast naming the bad
