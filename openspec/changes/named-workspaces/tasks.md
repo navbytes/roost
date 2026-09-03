@@ -55,6 +55,6 @@
 
 ## 8. Verify and ship
 
-- [ ] 8.1 Run `cargo fmt`, `cargo +$LINT_TOOLCHAIN clippy --all-targets -- -D warnings` and `cargo test`
-- [ ] 8.2 Design-supervisor audit: C4 amendment aligned, no other chrome contract touched
-- [ ] 8.3 Reviewer pass on the diff, then a PR against `main` with CI green
+- [x] 8.1 Run `cargo fmt`, `cargo +$LINT_TOOLCHAIN clippy --all-targets -- -D warnings` and `cargo test`
+- [x] 8.2 Design-supervisor audit: C4 amendment aligned, no other chrome contract touched
+- [x] 8.3 Reviewer pass on the diff, then a PR against `main` with CI green
