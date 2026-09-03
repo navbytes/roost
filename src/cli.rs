@@ -625,8 +625,8 @@ fn run_keys() -> i32 {
         rows.push((chord.clone(), action_name(action), note));
     }
     // Disabled chords are the other half of the answer, and the half a table
-    // of live bindings structurally cannot show: "why doesn't Alt+f work"
-    // is exactly the question this command gets asked.
+    // of live bindings structurally cannot show: "why doesn't Alt+Shift+z
+    // work" is exactly the question this command gets asked.
     for (chord, _) in &defaults {
         if !live.iter().any(|(c, _)| c == chord) {
             rows.push((chord.clone(), "disabled".to_string(), "config.json"));

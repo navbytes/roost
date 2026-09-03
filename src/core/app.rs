@@ -648,7 +648,7 @@ pub struct App<B: PaneBackend> {
     /// persisted.
     feed: VecDeque<FeedEntry>,
     /// C22: the one app-wide floating scratch pane slot, spawned on first
-    /// Alt+f. `None` until then.
+    /// Alt+Shift+z (Alt+f before the 2026-09-03 re-key). `None` until then.
     float: Option<Float>,
     /// C23: panes currently in raw (hard pass-through) mode, by id.
     /// Per-pane, session-only — never persisted.
@@ -5773,8 +5773,9 @@ impl<B: PaneBackend> App<B> {
 
     // -- float (C22) ---------------------------------------------------------
 
-    /// Alt+f: first press spawns the float (a shell in the focused pane's
-    /// cwd, preset title "scratch") and shows+focuses it; later presses
+    /// Alt+Shift+z (Alt+f before the 2026-09-03 re-key): first press spawns
+    /// the float (a shell in the focused pane's cwd, preset title
+    /// "scratch") and shows+focuses it; later presses
     /// hide/show it (the process stays alive while hidden). Refuses (flash,
     /// no state change) when the body is too small for the geometry
     /// formula to place a sane rect — checked here so both the first spawn
@@ -5832,9 +5833,9 @@ impl<B: PaneBackend> App<B> {
 
     /// C22 rules 2/3: hide the float (if shown) and restore focus to
     /// whatever was focused before it appeared — the single mechanism
-    /// behind Alt+f's toggle-off, every focus-moving/structural action that
-    /// must not leave it focused, and a mouse click landing outside its
-    /// rect. A no-op when the float isn't currently shown.
+    /// behind Alt+Shift+z's toggle-off, every focus-moving/structural
+    /// action that must not leave it focused, and a mouse click landing
+    /// outside its rect. A no-op when the float isn't currently shown.
     fn hide_float(&mut self) {
         let Some(f) = &mut self.float else { return };
         if !f.shown {
@@ -18660,8 +18661,8 @@ pub(crate) mod tests {
     #[test]
     fn float_never_receives_a_fleet_broadcast() {
         // LOW-1: the float is the human's private interactive scratch shell
-        // (Alt+f), never a fleet member — `send --all` must not type/submit
-        // into it, and it must not inflate the reported count.
+        // (Alt+Shift+z), never a fleet member — `send --all` must not
+        // type/submit into it, and it must not inflate the reported count.
         use crate::core::control::{Method, Reply, Request};
         let (mut app, _) = mk_app(shell_ws());
         let ct = app.control_token().to_string();

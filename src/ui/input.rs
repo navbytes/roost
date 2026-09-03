@@ -105,7 +105,8 @@ pub enum Action {
     /// Toggle the C20 activity-feed overlay (status/spawn/close/exit/control
     /// events), Alt+e.
     ToggleFeed,
-    /// Toggle the app-wide floating scratch pane, Alt+f (C22).
+    /// Toggle the app-wide floating scratch pane, Alt+Shift+z (C22; moved
+    /// off Alt+f by the 2026-09-03 re-key — see `default_chord_action`).
     ToggleFloat,
     /// Toggle the focused pane's raw (hard pass-through) membership,
     /// Alt+Shift+p — also the chord that exits raw (C23).
@@ -235,14 +236,29 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
             Some(if shift { Action::ToggleRoster } else { Action::JumpAttention })
         }
         KeyCode::Char('A') => Some(Action::ToggleRoster),
-        KeyCode::Char('z') => Some(Action::ToggleZoom),
+        // 2026-09-03 re-key: Alt+f used to be ToggleFloat, but on terminals
+        // without the kitty keyboard protocol Alt+Right is delivered as the
+        // meta-ESC pair `ESC f` — byte-identical to Alt+f — so pressing
+        // Alt+Right opened a floating pane. That collision is unfixable at
+        // the byte level; the only fix is to stop binding `Alt+f`, which is
+        // now deliberately absent from this table and falls through to
+        // `unbound_alt` (forwarded to the pane, e.g. bash's M-f
+        // forward-word — see U5's `b`/`d` note, which left the other two of
+        // that same readline trio free for exactly this reason).
+        // ToggleFloat moves onto the already-spent `z`, pairing it with
+        // ToggleZoom as the two view toggles (DESIGN-ui.md's U23 merged
+        // overlay row) via the same same-letter shift-pair house style as
+        // `s`/`S` above: Alt+z zooms, Alt+Shift+z floats, and Alt+Z (the
+        // uppercase-delivery tolerance every shifted letter carries) floats
+        // too.
+        KeyCode::Char('z') => Some(if shift { Action::ToggleFloat } else { Action::ToggleZoom }),
+        KeyCode::Char('Z') => Some(Action::ToggleFloat),
         // C37: the shifted sibling reverses the cycle — C28's idiom
         // (shift = the inverse of the unshifted chord), and the same
         // both-delivery-forms tolerance every shifted letter carries.
         KeyCode::Char('g') => Some(Action::CycleLayout { forward: !shift }),
         KeyCode::Char('G') => Some(Action::CycleLayout { forward: false }),
         KeyCode::Char('e') => Some(Action::ToggleFeed),
-        KeyCode::Char('f') => Some(Action::ToggleFloat),
         KeyCode::PageUp => Some(Action::ScrollMode),
         KeyCode::Char(c @ '1'..='9') => Some(Action::GoToTab(c as usize - '1' as usize)),
         // U7: tabs 10+ had no keyboard route at all. `Alt+0` closes the
@@ -1156,8 +1172,8 @@ fn is_redundant_spelling(chord: &Chord, action: &Action, table: &HashMap<Chord, 
 ///
 /// This exists so the chrome can *derive* what it teaches. Before F1 the
 /// help overlay and the hint bar spelled their chords as `&'static str`
-/// literals, so `{"keys": {"alt+f": "disable"}}` — the README's own escape
-/// hatch — produced a roost whose `Alt+?` still taught `Alt+f`. Any surface
+/// literals, so `{"keys": {"alt+z": "disable"}}` — the README's own escape
+/// hatch — produced a roost whose `Alt+?` still taught `Alt+z`. Any surface
 /// that renders from this cannot say that.
 ///
 /// **Twins are collapsed.** A shifted letter is delivered as `('h', SHIFT)`
@@ -1325,9 +1341,26 @@ mod tests {
     }
 
     #[test]
-    fn alt_f_maps_to_toggle_float() {
+    fn alt_f_is_unbound_and_forwards() {
+        // 2026-09-03 re-key: Alt+f collides at the byte level with Alt+Right
+        // (both arrive as the meta-ESC pair `ESC f` without the kitty
+        // keyboard protocol), so it is deliberately left free to forward —
+        // see the comment on the `z`/`Z` arms in default_chord_action.
         assert!(matches!(
             translate(alt(KeyCode::Char('f'))),
+            InputResult::Forward(bytes) if bytes == [0x1b, b'f']
+        ));
+    }
+
+    #[test]
+    fn alt_shift_z_and_alt_cap_z_map_to_toggle_float() {
+        assert!(matches!(
+            translate(alt_shift(KeyCode::Char('z'))),
+            InputResult::Action(Action::ToggleFloat)
+        ));
+        // uppercase-delivery tolerance, same shape as Alt+Shift+r / Alt+R.
+        assert!(matches!(
+            translate(alt(KeyCode::Char('Z'))),
             InputResult::Action(Action::ToggleFloat)
         ));
     }
@@ -1877,6 +1910,11 @@ mod tests {
             ('p', &[0x1b, b'p']),
             ('x', &[0x1b, b'x']),
             ('v', &[0x1b, b'v']), // still free after U7 took i/m/0
+            // 2026-09-03: Alt+f is deliberately free — it collides at the
+            // byte level with Alt+Right (both arrive as `ESC f` without the
+            // kitty keyboard protocol), and bash's own M-f is forward-word,
+            // completing the b/d/f readline trio U5 leaves free.
+            ('f', &[0x1b, b'f']),
         ];
         for (c, want) in cases {
             match translate(alt(KeyCode::Char(*c))) {
@@ -1919,9 +1957,10 @@ mod tests {
             (alt_shift(KeyCode::Char('/')), Action::Help),
             (alt(KeyCode::Char('a')), Action::JumpAttention),
             (alt(KeyCode::Char('z')), Action::ToggleZoom),
+            (alt_shift(KeyCode::Char('z')), Action::ToggleFloat),
+            (alt(KeyCode::Char('Z')), Action::ToggleFloat),
             (alt(KeyCode::Char('g')), Action::CycleLayout { forward: true }),
             (alt(KeyCode::Char('e')), Action::ToggleFeed),
-            (alt(KeyCode::Char('f')), Action::ToggleFloat),
             (alt(KeyCode::PageUp), Action::ScrollMode),
             (alt(KeyCode::Char('3')), Action::GoToTab(2)),
             (alt(KeyCode::Char('0')), Action::LastTab), // U7
@@ -2001,29 +2040,35 @@ mod tests {
 
     /// `"disable"` ⇒ the chord produces no Action and forwards to the pane
     /// exactly like an unbound key does today (the readline fix itself).
+    /// Uses `alt+e` (ToggleFeed) rather than the old `alt+f` example: since
+    /// the 2026-09-03 re-key, `alt+f` is no longer bound to anything, so
+    /// disabling it would prove nothing.
     #[test]
     fn disable_forwards_the_chord_instead_of_its_default_action() {
         let (keymap, diagnostics) =
-            Keymap::parse(r#"{"keys": {"alt+f": "disable"}}"#, "config.json");
+            Keymap::parse(r#"{"keys": {"alt+e": "disable"}}"#, "config.json");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        // Without the override, alt+f is its documented default: ToggleFloat.
+        // Without the override, alt+e is its documented default: ToggleFeed.
         assert!(matches!(
-            translate(alt(KeyCode::Char('f'))),
-            InputResult::Action(Action::ToggleFloat)
+            translate(alt(KeyCode::Char('e'))),
+            InputResult::Action(Action::ToggleFeed)
         ));
-        match translate_with(alt(KeyCode::Char('f')), &keymap) {
-            InputResult::Forward(b) => assert_eq!(b, vec![0x1b, b'f']),
-            other => panic!("disabled alt+f must forward to the pane, got {other:?}"),
+        match translate_with(alt(KeyCode::Char('e')), &keymap) {
+            InputResult::Forward(b) => assert_eq!(b, vec![0x1b, b'e']),
+            other => panic!("disabled alt+e must forward to the pane, got {other:?}"),
         }
     }
 
     /// Remap ⇒ the new chord triggers the action, and the old one — only
-    /// disabled here, not itself remapped — no longer does. This is the
-    /// design doc's own worked example: move ToggleFloat off alt+f (the
-    /// readline collision) onto a free chord instead.
+    /// disabled here, not itself remapped — no longer does. Worked example
+    /// updated for the 2026-09-03 re-key: ToggleFloat's default chord is now
+    /// `alt+shift+z`, paired with ToggleZoom on `alt+z`; this proves it can
+    /// still be moved off that default onto a free chord, same as `alt+f`
+    /// could before the re-key (see docs/KEYBINDINGS.md for spending `alt+f`
+    /// back on purpose).
     #[test]
     fn remap_moves_an_action_off_its_default_chord_onto_a_new_one() {
-        let json = r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#;
+        let json = r#"{"keys": {"alt+shift+z": "disable", "alt+v": "toggle_float"}}"#;
         let (keymap, diagnostics) = Keymap::parse(json, "config.json");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert!(matches!(
@@ -2031,7 +2076,7 @@ mod tests {
             InputResult::Action(Action::ToggleFloat)
         ));
         assert!(!matches!(
-            translate_with(alt(KeyCode::Char('f')), &keymap),
+            translate_with(alt_shift(KeyCode::Char('z')), &keymap),
             InputResult::Action(Action::ToggleFloat)
         ));
     }
@@ -2451,11 +2496,14 @@ mod tests {
 
     /// The point of the exercise: a remap moves what the chrome will draw,
     /// and a disable removes it. Before F1 the help overlay and hint bar
-    /// spelled their chords as `&'static str`, so neither could.
+    /// spelled their chords as `&'static str`, so neither could. Uses the
+    /// 2026-09-03 default (`alt+shift+z`) rather than the pre-re-key
+    /// `alt+f` example — `alt+f` is unbound now, so disabling it would no
+    /// longer remove anything from the render.
     #[test]
     fn a_remap_moves_the_reported_binding_and_a_disable_removes_it() {
         let (keymap, diagnostics) = Keymap::parse(
-            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            r#"{"keys": {"alt+shift+z": "disable", "alt+v": "toggle_float"}}"#,
             "config.json",
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -2464,7 +2512,7 @@ mod tests {
             bindings.iter().filter(|(_, a)| *a == Action::ToggleFloat).map(|(l, _)| l).collect();
         assert_eq!(float, vec!["Alt+v"], "the float is on Alt+v now, and only there");
         assert!(
-            !bindings.iter().any(|(l, _)| l == "Alt+f"),
+            !bindings.iter().any(|(l, _)| l == "Alt+Shift+z"),
             "the disabled chord is gone entirely — it forwards to the pane now",
         );
     }

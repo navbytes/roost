@@ -351,21 +351,25 @@ fn keys_prints_the_default_map_without_a_running_roost() {
 /// The question this command exists to answer: what did my config.json do?
 /// A remap moves the chord, and — the half a table of live bindings
 /// structurally cannot show — a disabled chord is still listed, because
-/// "why doesn't Alt+f work any more" is exactly what gets asked.
+/// "why doesn't Alt+Shift+z work any more" is exactly what gets asked.
+///
+/// Uses `alt+shift+z` (ToggleFloat's 2026-09-03 default) rather than the
+/// pre-re-key `alt+f` example: `alt+f` is unbound now, so disabling it
+/// would no longer be a disable of anything live.
 #[test]
 fn keys_reports_what_config_json_changed_including_what_it_disabled() {
     let dir = state_with_config(
         "remap",
-        Some(r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#),
+        Some(r#"{"keys": {"alt+shift+z": "disable", "alt+v": "toggle_float"}}"#),
     );
     let o = keys_in(&dir);
     assert_eq!(o.status.code(), Some(0), "a valid config is a clean exit: {}", err(&o));
     let text = out(&o);
     assert!(text.contains("Alt+v\ttoggle_float\tconfig.json"), "the remap is attributed:\n{text}");
-    assert!(text.contains("Alt+f\tdisabled\tconfig.json"), "the disable is shown:\n{text}");
+    assert!(text.contains("Alt+Shift+z\tdisabled\tconfig.json"), "the disable is shown:\n{text}");
     assert!(
-        !text.contains("Alt+f\ttoggle_float"),
-        "and the float is no longer claimed to be on Alt+f:\n{text}"
+        !text.contains("Alt+Shift+z\ttoggle_float"),
+        "and the float is no longer claimed to be on Alt+Shift+z:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

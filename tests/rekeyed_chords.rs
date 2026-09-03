@@ -14,6 +14,18 @@
 //! Three families, one file, because they share the re-key and its fixtures:
 //! the `Alt+s`/`Alt+Shift+s` stack pair (C6–C8), the `Alt+- = < >` resize
 //! punctuation, and `Alt+m`/`Alt+Shift+m` tab stepping (C2/U7).
+//!
+//! **Extended 2026-09-03** for the `Alt+f` re-key (a second re-key, not the
+//! 2026-09-01 one above): `Action::ToggleFloat` moved off `Alt+f` onto
+//! `Alt+Shift+z`, and `Alt+f` itself is now deliberately unbound. The bug
+//! this closes was reported end to end — "Alt+Right opens a floating
+//! pane" — and until this file's `alt_right_s_legacy_bytes_...` test below,
+//! nothing proved it dead except the unit table in `src/ui/input.rs`, which
+//! only pins that `Alt+f`'s `KeyEvent` no longer maps to `ToggleFloat`. It
+//! cannot prove the actual symptom: that the *bytes* a legacy terminal
+//! sends for Alt+Right (`ESC f` — byte-identical to Alt+f's own meta-ESC
+//! encoding, see `default_chord_action`'s 2026-09-03 amendment) now reach
+//! the pane instead of being swallowed as a chord.
 
 // The shared harness is compiled per test binary; helpers other tenants use
 // are dead code from this binary's view — not real rot.
@@ -41,6 +53,14 @@ const ALT_M: &[u8] = b"\x1bm";
 const ALT_LEFT: &[u8] = b"\x1b[1;3D";
 const ALT_RIGHT: &[u8] = b"\x1b[1;3C";
 const ALT_SHIFT_M: &[u8] = b"\x1bM";
+/// What a legacy terminal (no kitty keyboard protocol negotiated) sends for
+/// Alt+Right: meta-ESC + `f`, the same readline-word-motion encoding as
+/// `Alt+f` itself — `0x1b, 0x66`. There is no byte in this stream that says
+/// "this was Alt+Right, not Alt+f"; the two chords are genuinely
+/// indistinguishable at the wire, which is the entire reported bug and the
+/// reason the 2026-09-03 re-key could only fix it by leaving `Alt+f`
+/// unbound (see `default_chord_action` in `src/ui/input.rs`).
+const ALT_RIGHT_LEGACY: &[u8] = b"\x1bf";
 
 /// Control-plane ground truth: the pane the workspace says is focused.
 fn focused_pane(state_dir: &std::path::Path) -> Option<u64> {
@@ -405,6 +425,65 @@ fn alt_m_steps_the_tab_strip_both_ways_through_a_real_terminal() {
             "stepping the strip moved pane {id} between tabs — that is the carry verb (Alt+i)",
         );
     }
+
+    assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+}
+
+/// The reported bug, end to end, on a **default** config (no config.json —
+/// this is what every user without a remap actually runs): a legacy
+/// terminal's Alt+Right bytes must reach the pane rather than being read as
+/// `ToggleFloat`. Before the 2026-09-03 re-key, `default_chord_action`
+/// bound `Alt+f` to `ToggleFloat`, and since `ESC f` is exactly what Alt+f
+/// itself sends, every legacy-terminal Alt+Right silently opened the float
+/// pane instead of moving the cursor a word to the right in the shell.
+///
+/// Same `printf READY; cat` sink + `^[f` echo technique as
+/// `tests/config_keys.rs`'s `config_json_disabling_alt_shift_z_...` test:
+/// `cat` echoes back verbatim whatever roost forwards, so `^[f` on screen
+/// (crossterm/vt100's caret notation for `ESC f`) is direct proof the bytes
+/// reached the pane rather than being swallowed as a chord.
+#[test]
+fn alt_right_s_legacy_bytes_reach_the_pane_instead_of_opening_the_float() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let Some(mut h) = harness::spawn_or_skip("legacy alt-right vs alt+f", &harness::one_pane(cwd))
+    else {
+        return;
+    };
+    assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
+    assert!(
+        h.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 main")).is_some(),
+        "roost never drew its tab bar",
+    );
+
+    let panes_before = pane_count(h.screen());
+
+    h.write_bytes(b"printf READY; cat\r");
+    h.wait_for(Duration::from_secs(5), |s| s.contents().contains("READY"))
+        .expect("pane never reached the cat sink");
+
+    h.write_bytes(ALT_RIGHT_LEGACY);
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[f")).is_none() {
+        panic!(
+            "legacy Alt+Right bytes (ESC f) were not forwarded to the pane — roost is still \
+             reading them as ToggleFloat, which is the reported bug (Alt+Right opening the \
+             float pane):\n{}",
+            h.screen().contents()
+        );
+    }
+
+    // And the float pane must not actually have opened — belt and braces
+    // alongside the byte-echo proof above, and the more direct statement of
+    // the user-visible symptom. The float draws its own bordered rect (see
+    // `the_float_never_gets_the_zoom_title_only_the_tiled_target_does` in
+    // `src/ui/render.rs`), so a second one appearing is the tell; `cat`'s
+    // own echo of `f` cannot itself add a border.
+    assert_eq!(
+        pane_count(h.screen()),
+        panes_before,
+        "the float pane opened on legacy Alt+Right bytes:\n{}",
+        h.screen().contents(),
+    );
 
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
 }

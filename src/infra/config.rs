@@ -214,7 +214,13 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         let live = dir.join("config.json");
-        std::fs::write(&live, r#"{"keys": {"alt+f": "disable"}}"#).unwrap();
+        // `alt+shift+z` (ToggleFloat's default chord since the 2026-09-03
+        // re-key) rather than the old `alt+f` example: `alt+f` is
+        // deliberately unbound now, and while an override entry still makes
+        // `Keymap` compare unequal to its default regardless of whether the
+        // chord was bound (see `Keymap::parse`), a disabled chord that was
+        // actually live is the clearer proof this test wants.
+        std::fs::write(&live, r#"{"keys": {"alt+shift+z": "disable"}}"#).unwrap();
 
         // `load_keymap` reads the environment, so exercise its shadow arm
         // through the same two steps it takes rather than by setting env
@@ -265,7 +271,9 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.json");
-        std::fs::write(&path, r#"{"keys": {"alt+f": "disable"}}"#).unwrap();
+        // See the shadow test above: `alt+shift+z` replaces the old
+        // `alt+f` example now that `alt+f` is unbound by default.
+        std::fs::write(&path, r#"{"keys": {"alt+shift+z": "disable"}}"#).unwrap();
         let (keymap, diagnostics) = load_keymap_from(&path);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_ne!(keymap, Keymap::default(), "the disable entry must have been applied");

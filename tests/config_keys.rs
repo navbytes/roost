@@ -13,15 +13,26 @@ mod harness;
 
 use std::time::Duration;
 
-/// Alt+f, meta-ESC encoding — the readline collision this whole feature
-/// exists to fix (DESIGN doc). Same convention as `harness::ALT_Q`.
-const ALT_F: &[u8] = b"\x1bf";
+/// Alt+Shift+z, meta-ESC encoding: `ESC` then the shifted glyph, the same
+/// shape `tests/rekeyed_chords.rs`'s `ALT_SHIFT_S`/`ALT_SHIFT_M` use for
+/// every other shifted-letter chord. This is roost's own ToggleFloat chord
+/// (the 2026-09-03 re-key moved it here off `alt+f`, which collided at the
+/// byte level with Alt+Right — see the amendment on `default_chord_action`
+/// in `src/ui/input.rs`), so disabling it is a live discriminator the same
+/// way disabling `alt+f` used to be: without the disable entry below, this
+/// chord never reaches the pane at all, and only config.json being read
+/// from the right place makes it arrive.
+///
+/// Deliberately *not* `alt+f` any more: `alt+f` is unbound by default after
+/// the re-key, so it forwards to the pane whether or not config.json is
+/// read at all — a test built on it would stay green while proving nothing.
+const ALT_SHIFT_Z: &[u8] = b"\x1bZ";
 
 #[test]
-fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
+fn config_json_disabling_alt_shift_z_is_read_from_the_roost_state_dir() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let config = serde_json::json!({ "keys": { "alt+f": "disable" } }).to_string();
+    let config = serde_json::json!({ "keys": { "alt+shift+z": "disable" } }).to_string();
     let Some(mut h) =
         harness::spawn_or_skip_with_config("config-keys gate", &harness::one_pane(cwd), &config)
     else {
@@ -30,22 +41,20 @@ fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
     assert!(h.settle(Duration::from_secs(5)), "initial frame never settled");
 
     // Same ECHOCTL trick tests/cursor_mode.rs uses: park a dumb `cat` sink
-    // so the bytes roost forwards echo back onto the screen verbatim,
-    // independent of the shell's own readline (which would otherwise
-    // swallow Alt+f as its own forward-word binding and leave nothing to
-    // observe either way).
+    // so the bytes roost forwards echo back onto the screen verbatim.
     h.write_bytes(b"printf READY; cat\r");
     h.wait_for(Duration::from_secs(5), |s| s.contents().contains("READY"))
         .expect("pane never reached the cat sink");
 
-    h.write_bytes(ALT_F);
-    // Without the disable entry, alt+f is roost's own ToggleFloat chord — it
-    // would never reach the pane at all, so this can only pass if
-    // config.json was actually read from the harness's own ROOST_STATE dir
-    // (which starts empty but for what the harness itself wrote into it).
-    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[f")).is_none() {
+    h.write_bytes(ALT_SHIFT_Z);
+    // Without the disable entry, alt+shift+z is roost's own ToggleFloat
+    // chord — it would never reach the pane at all, so this can only pass
+    // if config.json was actually read from the harness's own ROOST_STATE
+    // dir (which starts empty but for what the harness itself wrote into
+    // it).
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[Z")).is_none() {
         panic!(
-            "alt+f was not forwarded to the pane — config.json's disable entry \
+            "alt+shift+z was not forwarded to the pane — config.json's disable entry \
              was not picked up from ROOST_STATE:\n{}",
             h.screen().contents()
         );
@@ -68,10 +77,10 @@ fn config_json_disabling_alt_f_is_read_from_the_roost_state_dir() {
 /// `src/infra/config.rs` instead, on every platform.
 #[cfg(target_os = "linux")]
 #[test]
-fn config_json_disabling_alt_f_is_found_in_the_xdg_config_dir() {
+fn config_json_disabling_alt_shift_z_is_found_in_the_xdg_config_dir() {
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
-    let config = serde_json::json!({ "keys": { "alt+f": "disable" } }).to_string();
+    let config = serde_json::json!({ "keys": { "alt+shift+z": "disable" } }).to_string();
     let mut h = match harness::Harness::try_spawn_xdg(&harness::one_pane(cwd), Some(&config)) {
         Ok(h) => h,
         Err(reason) => {
@@ -85,14 +94,14 @@ fn config_json_disabling_alt_f_is_found_in_the_xdg_config_dir() {
     h.wait_for(Duration::from_secs(5), |s| s.contents().contains("READY"))
         .expect("pane never reached the cat sink");
 
-    h.write_bytes(ALT_F);
+    h.write_bytes(ALT_SHIFT_Z);
     // Same reasoning as the ROOST_STATE test above: without the disable
-    // entry alt+f is roost's own ToggleFloat chord and never reaches the
-    // pane, so `^[f` on screen proves the file was read — and here it could
-    // only have come from $XDG_CONFIG_HOME/roost/.
-    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[f")).is_none() {
+    // entry alt+shift+z is roost's own ToggleFloat chord and never reaches
+    // the pane, so `^[Z` on screen proves the file was read — and here it
+    // could only have come from $XDG_CONFIG_HOME/roost/.
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("^[Z")).is_none() {
         panic!(
-            "alt+f was not forwarded to the pane — config.json was not picked up from \
+            "alt+shift+z was not forwarded to the pane — config.json was not picked up from \
              $XDG_CONFIG_HOME/roost/:\n{}",
             h.screen().contents()
         );
@@ -121,7 +130,7 @@ const ALT_LEFT_CSI: &[u8] = b"\x1b[1;3D";
 /// what arrived — Alt+Left reaches it identically whether the terminal sent
 /// `CSI 1;3D` or `ESC ESC [ D`, and it must therefore *choose* an encoding.
 /// It chooses meta-ESC, the same convention every other forwarded Alt chord
-/// already uses (`ESC f` for Alt+f, two tests above), so `disable` speaks one
+/// already uses (`ESC Z` for Alt+Shift+z, two tests above), so `disable` speaks one
 /// language rather than two. A shell binding the other spelling wants
 /// `bindkey "^[[1;3D"` as well — documented in the README, and the reason
 /// this test asserts the exact bytes instead of merely "something arrived".
