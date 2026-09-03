@@ -1,27 +1,51 @@
-//! Filesystem `StateStore`: workspace.json under the XDG state dir,
+//! Filesystem `StateStore`: workspace.json under the state directory,
 //! written atomically (temp file + rename).
+//!
+//! The state tree has one root and any number of workspaces under it. The
+//! root is `$ROOST_STATE` or the XDG state dir (`root_dir`); the default
+//! workspace keeps its files in the root itself and every named workspace
+//! (`roost -w <name>`) gets `root/workspaces/<name>`, a complete instance
+//! directory of its own. The workspace is chosen once per process at
+//! startup (`init_workspace`) and read through `FsStore::state_dir`, so a
+//! process that never selects one behaves exactly as before this existed.
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::core::workspace::Workspace;
 use crate::ports::StateStore;
+
+/// The name of the workspace that keeps its files in the root itself —
+/// the files a pre-workspaces roost used, no migration. Accepted wherever
+/// a workspace name is (`roost -w default` is the plain TUI), but reserved
+/// for `ws rm`/`ws mv`/creation paths: the default cannot be renamed or
+/// deleted, only lived in.
+pub const DEFAULT_WORKSPACE: &str = "default";
+
+/// The workspace this process runs in, resolved once at startup by
+/// `FsStore::init_workspace` and never touched again. Unset (unit tests,
+/// any process that skipped startup resolution) means the default
+/// workspace — which is why default behavior is bit-identical to before.
+static WORKSPACE: OnceLock<String> = OnceLock::new();
 
 pub struct FsStore {
     path: PathBuf,
 }
 
 impl FsStore {
-    /// The directory roost's per-instance state lives in: `$ROOST_STATE`
-    /// when set (isolated profiles / parallel instances), else the XDG
-    /// state dir's `roost` subdirectory. Shared by `default_path`
-    /// (workspace.json) and `infra::config` (config.json — the
-    /// key-bindings escape hatch), so `$ROOST_STATE` redirects both
-    /// together: an isolated fleet's config stays isolated with it.
-    pub fn state_dir() -> PathBuf {
+    /// The state ROOT: `$ROOST_STATE` when set (isolated profiles /
+    /// parallel instances), else the XDG state dir's `roost` subdirectory.
+    /// Read fresh on every call — the variable is honored per call, the
+    /// way it always was; only the *workspace* below the root is cached.
+    /// Shared by `default_path` (workspace.json) and `infra::config`
+    /// (config.json — the key-bindings escape hatch), so `$ROOST_STATE`
+    /// redirects both together: an isolated fleet's config stays isolated
+    /// with it.
+    pub fn root_dir() -> PathBuf {
         if let Some(dir) = std::env::var_os("ROOST_STATE") {
             return PathBuf::from(dir);
         }
@@ -31,8 +55,61 @@ impl FsStore {
             .join("roost")
     }
 
+    /// The directory of the workspace named `name`: the root itself for
+    /// the default workspace, `root/workspaces/<name>` for a named one.
+    /// One name, one directory, one complete instance of per-instance
+    /// state (workspace.json, the lock, socket, token, logs).
+    pub fn workspace_dir(name: &str) -> PathBuf {
+        if name == DEFAULT_WORKSPACE {
+            Self::root_dir()
+        } else {
+            Self::root_dir().join("workspaces").join(name)
+        }
+    }
+
+    /// The directory of the workspace this process runs in — the root for
+    /// the default workspace, `root/workspaces/<name>` for a named one.
+    /// Every per-instance file hangs off it (workspace.json, the instance
+    /// lock, the socket for named workspaces, control.token/log,
+    /// perf.jsonl), and `infra::config` composes it with the root's
+    /// config.json. The workspace is resolved once at startup
+    /// (`init_workspace`); unset, this is exactly the old directory, so
+    /// `$ROOST_STATE` still redirects a whole instance and a process that
+    /// never selects a workspace behaves bit-identically to before.
+    pub fn state_dir() -> PathBuf {
+        Self::workspace_dir(Self::workspace_name())
+    }
+
+    /// The name of the workspace this process runs in: the `-w`/
+    /// `--workspace` flag or `ROOST_WORKSPACE` resolved at startup,
+    /// `default` when neither was given (including every unit test and
+    /// every subprocess that skipped `init_workspace`).
+    pub fn workspace_name() -> &'static str {
+        WORKSPACE.get().map(String::as_str).unwrap_or(DEFAULT_WORKSPACE)
+    }
+
+    /// Resolve the workspace selection once, at startup. `flag` is the
+    /// `-w`/`--workspace` value, `env` the `ROOST_WORKSPACE` value (pass
+    /// `None` when unset); the flag wins. First call wins and later calls
+    /// are no-ops, so both entry points (the CLI pre-pass and the TUI
+    /// startup in main) can call it unconditionally. Invalid names are an
+    /// `Err` before anything is set — the caller exits 2, touching no
+    /// state. This deliberately does NOT set `ROOST_STATE` in the
+    /// environment: `std::env::set_var` is unsafe under Rust 2024 once
+    /// threads exist, and panes would inherit a workspace-scoped value
+    /// that nests workspaces inside workspaces.
+    pub fn init_workspace(flag: Option<&str>, env: Option<&str>) -> Result<(), String> {
+        if WORKSPACE.get().is_some() {
+            return Ok(());
+        }
+        let name = select_workspace(flag, env)?;
+        let _ = WORKSPACE.set(name);
+        Ok(())
+    }
+
     /// `$ROOST_STATE/workspace.json` when set (isolated profiles / parallel
-    /// instances), else the XDG state dir.
+    /// instances), else the XDG state dir — now the workspace-aware
+    /// directory, since workspace.json is per-workspace state.
     pub fn default_path() -> PathBuf {
         Self::state_dir().join("workspace.json")
     }
@@ -40,6 +117,122 @@ impl FsStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
+
+    /// Does an instance hold this workspace directory's lock right now?
+    /// Non-blocking: opens `<dir>/workspace.lock` (creating the file is
+    /// harmless — an instance does the same) and attempts `try_lock`; a
+    /// failure means a live instance holds the lock. The handle drops
+    /// immediately, so the probe never holds the lock and a crashed
+    /// instance's stale file reads as free. The one liveness signal
+    /// without a daemon.
+    pub fn instance_running(dir: &Path) -> bool {
+        // truncate(false) is the point: the file is a lock *handle*, its
+        // contents are never written — truncating another instance's file
+        // would be the one thing this probe must not do.
+        let Ok(file) = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("workspace.lock"))
+        else {
+            return false;
+        };
+        file.try_lock().is_err()
+    }
+
+    /// Every workspace that could hold state: the default plus one name
+    /// per directory under `root/workspaces`. Names that fail validation
+    /// are skipped — a stray directory there is not a workspace roost
+    /// created.
+    pub fn workspace_names() -> Vec<String> {
+        let mut out = vec![DEFAULT_WORKSPACE.to_string()];
+        let mut named: Vec<String> = fs::read_dir(Self::root_dir().join("workspaces"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| check_creatable_name(n).is_ok())
+            .collect();
+        named.sort();
+        out.extend(named);
+        out
+    }
+
+    /// Workspace names with a live instance — the `ws ls` running flag and
+    /// the control client's unreachable-error list share this probe.
+    pub fn running_workspaces() -> Vec<String> {
+        Self::workspace_names()
+            .into_iter()
+            .filter(|n| Self::instance_running(&Self::workspace_dir(n)))
+            .collect()
+    }
+}
+
+/// Workspace-name syntax: 1–32 characters, starting with a lowercase
+/// letter or digit, then only lowercase letters, digits, `.`, `_` and `-`.
+/// Lowercase is not pedantry — the name is a directory name and part of a
+/// socket path, and case-folding filesystems (APFS) would collide two
+/// names ext4 would keep apart. Pure: no env, no filesystem.
+pub fn check_workspace_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(
+            "workspace name cannot be empty — use 1-32 characters of a-z, 0-9, '.', '_' or '-'"
+                .into(),
+        );
+    }
+    if name.chars().count() > 32 {
+        let n = name.chars().count();
+        return Err(format!("workspace name '{name}' is {n} characters — the limit is 32"));
+    }
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
+        let lower = name.to_lowercase();
+        return Err(format!(
+            "workspace name '{name}' must be lowercase — try '{lower}' (allowed: a-z, 0-9, '.', '_', '-')"
+        ));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap_or('?');
+    let rest_ok =
+        |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-');
+    // The grammar is `^[a-z0-9][a-z0-9._-]{0,31}$`: the FIRST character is
+    // letters/digits only, so a name can never start with `.` (hidden files)
+    // or `-` (flag-shaped).
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) || !chars.all(rest_ok) {
+        return Err(format!(
+            "invalid workspace name '{name}' — use 1-32 characters of a-z, 0-9, '.', '_' or '-', starting with a letter or digit"
+        ));
+    }
+    Ok(())
+}
+
+/// The creation-path check (`ws rm`/`ws mv`/later verbs): valid syntax AND
+/// not the reserved default, which can be selected (`-w default`) but never
+/// renamed or deleted.
+pub fn check_creatable_name(name: &str) -> Result<(), String> {
+    check_workspace_name(name)?;
+    if name == DEFAULT_WORKSPACE {
+        return Err("'default' is reserved for the default workspace".into());
+    }
+    Ok(())
+}
+
+/// Selection precedence, pure: the `-w` flag, then `ROOST_WORKSPACE`, then
+/// the default. `default` is a legal selection (it names the default
+/// workspace), so the syntax check is the only gate here; the reserved
+/// check is the creation paths' (`check_creatable_name`). Callers read the
+/// environment themselves and pass it in — in-process env writes are
+/// process-global and racy across parallel tests.
+pub fn select_workspace(flag: Option<&str>, env: Option<&str>) -> Result<String, String> {
+    if let Some(name) = flag {
+        check_workspace_name(name)?;
+        return Ok(name.to_string());
+    }
+    if let Some(name) = env {
+        check_workspace_name(name)?;
+        return Ok(name.to_string());
+    }
+    Ok(DEFAULT_WORKSPACE.to_string())
 }
 
 impl Default for FsStore {
@@ -220,6 +413,98 @@ mod tests {
             .flatten()
             .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
         assert!(salvaged);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- workspace names (pure: no env, no filesystem) ---
+
+    #[test]
+    fn valid_names_pass_the_grammar() {
+        for name in ["a", "0x", "my-ws_1.2", "tripto", "default", &"a".repeat(32)] {
+            assert!(check_workspace_name(name).is_ok(), "{name} must be valid");
+        }
+    }
+
+    #[test]
+    fn an_empty_name_is_rejected() {
+        let err = check_workspace_name("").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn a_33_character_name_is_rejected_with_the_limit_named() {
+        let name = "a".repeat(33);
+        let err = check_workspace_name(&name).unwrap_err();
+        assert!(err.contains("32"), "must state the limit: {err}");
+    }
+
+    /// The hint must show the lowercase form: the name is a directory name
+    /// and case-folding filesystems (APFS) would collide the two anyway.
+    #[test]
+    fn an_uppercase_name_is_rejected_with_the_lowercase_hint() {
+        for (bad, fixed) in [("Tripto", "tripto"), ("My_ws", "my_ws")] {
+            let err = check_workspace_name(bad).unwrap_err();
+            assert!(err.contains("lowercase"), "{err}");
+            assert!(err.contains(fixed), "must suggest '{fixed}': {err}");
+        }
+    }
+
+    #[test]
+    fn invalid_characters_are_rejected_with_what_is_allowed() {
+        for bad in ["my ws", ".hidden", "_x", "-x", "a/b", "café"] {
+            let err = check_workspace_name(bad).unwrap_err();
+            assert!(err.contains("a-z"), "must name the allowed characters: {err}");
+        }
+    }
+
+    /// `default` is a legal *selection* — it names the default workspace —
+    /// but never a creatable one: `ws rm/mv default` must refuse.
+    #[test]
+    fn default_is_selectable_but_not_creatable() {
+        assert_eq!(select_workspace(Some("default"), None), Ok("default".into()));
+        assert!(check_creatable_name("default").is_err());
+        assert!(check_creatable_name("scratch").is_ok());
+        // The creatable check is the syntax check plus the reservation.
+        assert!(check_creatable_name("Bad Name").is_err());
+    }
+
+    #[test]
+    fn selection_precedence_is_flag_then_env_then_default() {
+        assert_eq!(select_workspace(Some("flag"), Some("env")), Ok("flag".into()));
+        assert_eq!(select_workspace(None, Some("env")), Ok("env".into()));
+        assert_eq!(select_workspace(None, None), Ok("default".into()));
+        // An invalid value from either source is rejected, not silently
+        // fallen through: a typo'd ROOST_WORKSPACE must not open the
+        // default workspace and look like everything vanished.
+        assert!(select_workspace(Some("Bad Name"), Some("ok-name")).is_err());
+        assert!(select_workspace(None, Some("no good")).is_err());
+    }
+
+    // --- the lock probe (filesystem, but no env: the dir is explicit) ---
+
+    /// `instance_running` is the whole liveness mechanism: lock held means
+    /// running, lock free (including a stale file from a crash) means
+    /// idle, and the probe itself must never hold the lock afterwards.
+    #[test]
+    fn the_lock_probe_reports_held_and_releases_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "roost-store-probe-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!FsStore::instance_running(&dir));
+        let holder = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("workspace.lock"))
+            .unwrap();
+        holder.try_lock().unwrap();
+        assert!(FsStore::instance_running(&dir), "a held lock reads as running");
+        drop(holder);
+        assert!(!FsStore::instance_running(&dir), "a freed lock reads as idle");
         let _ = fs::remove_dir_all(dir);
     }
 }

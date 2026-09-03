@@ -31,10 +31,18 @@
 //! (`~/Library/Application Support`), which is also what `dirs::config_dir`
 //! returns. `resolve_in` collapses that case rather than reporting a file as
 //! shadowing itself.
+//!
+//! For a **named** workspace (`roost -w x`) the candidates change: it reads
+//! the *root* `config.json`, and a `config.json` inside the workspace's own
+//! directory replaces it **wholesale** — never merged, so a workspace-local
+//! file is the whole keymap for that workspace and nothing bleeds in from
+//! the root. When both exist the ignored root file is reported as the
+//! shadow, exactly like the two-candidate case above. The default workspace
+//! and plain `$ROOST_STATE` isolation keep the resolution above, unchanged.
 
 use std::path::{Path, PathBuf};
 
-use crate::infra::store::FsStore;
+use crate::infra::store::{FsStore, DEFAULT_WORKSPACE};
 use crate::ui::input::{Diagnostics, Keymap};
 
 const FILE: &str = "config.json";
@@ -55,6 +63,15 @@ pub struct Resolved {
 
 /// The real resolution: reads the environment, stats the filesystem.
 pub fn resolve_config() -> Resolved {
+    // A named workspace never sees the two-candidate logic below: its base
+    // is the root file, and its own directory replaces it wholesale.
+    if FsStore::workspace_name() != DEFAULT_WORKSPACE {
+        return resolve_named(
+            FsStore::root_dir().join(FILE),
+            FsStore::state_dir().join(FILE),
+            &|p| p.is_file(),
+        );
+    }
     if let Some(dir) = std::env::var_os("ROOST_STATE") {
         let path = PathBuf::from(dir).join(FILE);
         let exists = path.is_file();
@@ -63,6 +80,21 @@ pub fn resolve_config() -> Resolved {
     let state = FsStore::state_dir().join(FILE);
     let xdg = dirs::config_dir().map(|d| d.join("roost").join(FILE));
     resolve_in(state, xdg, &|p| p.is_file())
+}
+
+/// The named-workspace decision alone — no env, no filesystem — so it can
+/// be unit-tested like `resolve_in`. The workspace directory's file, when
+/// it exists, *replaces* the root's (D5: whole-file, never merged — the
+/// keymap loader takes one file, and merging keymap tables is speculative).
+/// Without one, the root file is what it reads; the ignored root file is
+/// reported as the shadow so an edit with no effect is never silent.
+fn resolve_named(root: PathBuf, local: PathBuf, exists: &dyn Fn(&Path) -> bool) -> Resolved {
+    if exists(&local) {
+        let shadowed = if exists(&root) { Some(root.clone()) } else { None };
+        return Resolved { path: local, exists: true, shadowed };
+    }
+    let root_exists = exists(&root);
+    Resolved { path: root, exists: root_exists, shadowed: None }
 }
 
 /// The decision alone — no env, no filesystem — so it can be unit-tested
@@ -145,6 +177,14 @@ mod tests {
     fn xdg() -> PathBuf {
         PathBuf::from("/config/roost/config.json")
     }
+    /// A named workspace's root and local candidates (distinct, unlike the
+    /// macOS default-workspace case).
+    fn root() -> PathBuf {
+        PathBuf::from("/state/roost/config.json")
+    }
+    fn local() -> PathBuf {
+        PathBuf::from("/state/roost/workspaces/a/config.json")
+    }
     /// An `exists` oracle over a fixed set of present files — the filesystem
     /// the resolver is allowed to see.
     fn present(files: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
@@ -201,6 +241,38 @@ mod tests {
             Resolved { path: state(), exists: true, shadowed: None },
             "a file cannot shadow itself"
         );
+    }
+
+    // --- named workspaces (pure: explicit paths, no env) ---
+
+    /// The base case: no workspace-local file, so the root's config is
+    /// what the workspace reads — a remap in the root reaches `roost -w a`
+    /// without being copied anywhere.
+    #[test]
+    fn a_named_workspace_reads_the_root_config_by_default() {
+        let r = resolve_named(root(), local(), &present(&[root()]));
+        assert_eq!(r, Resolved { path: root(), exists: true, shadowed: None });
+        let r = resolve_named(root(), local(), &present(&[]));
+        assert_eq!(
+            r,
+            Resolved { path: root(), exists: false, shadowed: None },
+            "with neither file, the root path is the one named (that is where a config goes)"
+        );
+    }
+
+    /// D5: whole-file, never merged. The workspace-local file is the
+    /// entire keymap for that workspace, and the ignored root file is
+    /// named — an edit there must not look like it took effect.
+    #[test]
+    fn a_workspace_local_config_replaces_the_root_whole_file() {
+        let r = resolve_named(root(), local(), &present(&[root(), local()]));
+        assert_eq!(
+            r,
+            Resolved { path: local(), exists: true, shadowed: Some(root()) },
+            "the local file is read and the root file is the shadow"
+        );
+        let r = resolve_named(root(), local(), &present(&[local()]));
+        assert_eq!(r, Resolved { path: local(), exists: true, shadowed: None });
     }
 
     /// The shadow is a *notice*: `roost keys` prints it but must still exit

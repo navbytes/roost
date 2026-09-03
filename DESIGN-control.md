@@ -368,6 +368,14 @@ protect.
    earlier draft of this section claimed.
 7. **Graceful at 0 instances; defined addressing at N.** Absent socket → clean
    no-op. (v1 scopes to one instance; multi-instance discovery is a non-goal.)
+
+   **[Amended 2026-09-03, named workspaces — the N is defined now, still no
+   discovery.]** Out-of-pane verbs take `-w <name>` (or `ROOST_WORKSPACE`),
+   resolving to that workspace's own socket under the state root; flag beats
+   `ROOST_SOCK` beats `ROOST_WORKSPACE` beats the default. The filesystem is
+   the registry — no daemon, no discovery protocol: the client enumerates
+   `workspaces/` and probes each `workspace.lock` to say which workspaces are
+   running when the one it tried is not.
 8. **Preserve single-owner + daemonless.** Commands marshal through the mpsc onto
    the one loop; replies via non-blocking one-shot (never a blocking send from
    main); no detach/reattach; server dies with the process.
@@ -492,7 +500,7 @@ live-terminal smoke test and, if ever wanted, the Phase 3 niceties above.
 | Daemonless fit | **best** (stateless) | worst (persistent subscriber) | adds a helper process |
 | Security (adversary rank) | **1st** | 3rd (passive keylogger) | 2nd (external client, but façade) |
 | New surface | smallest | medium | largest (tokio/rmcp) |
-| Discovery | `$ROOST_SOCK` in-pane; friction for N | same | elegant via env inheritance |
+| Discovery | `$ROOST_SOCK` in-pane; friction for N. **[Amended 2026-09-03]** N is addressed by `-w <name>` over one state root — lock files are the liveness signal, no discovery daemon | same | elegant via env inheritance |
 
 **Why layered wins:** the CLI is the safest, simplest default and the best
 daemonless fit; MCP is the most LLM-native; both are thin clients of one core

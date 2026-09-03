@@ -731,7 +731,13 @@ with tests `:530–555`.
   `OSC 2 ; roost · {focused pane's display name}` on focus and title changes
   (throttled to at most one update per 200 ms), and reset to a plain `roost`
   on exit and in the panic hook — roost's chrome and the outer tab now agree
-  on what a pane is called.
+  on what a pane is called. **[Amended 2026-09-03, named workspaces]** a
+  named workspace publishes `OSC 2 ; roost · {workspace} · {focused pane's
+  display name}` so two windows are distinguishable in the terminal's own
+  tab strip; the default workspace renders nothing new and keeps today's
+  exact title (`roost · {pane}`), and the on-screen chrome (badge, tab bar,
+  hint bar) is unchanged for both — the title is the only surface the
+  workspace name reaches.
 - Style: text fg `MUTED`; glyph fg per C5 status colors. **[Amended
   2026-08-07]** Working no longer pulses the colour — the glyph itself
   animates (the C5 spinner) while its colour stays the steady one red.

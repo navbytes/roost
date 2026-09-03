@@ -81,7 +81,27 @@ impl Harness {
         let state_dir = fresh_state_dir();
         std::fs::write(state_dir.join("workspace.json"), workspace_json)
             .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
-        Self::spawn_in(state_dir, true, envs, rows, cols)
+        Self::spawn_in(state_dir, true, &[], envs, rows, cols)
+    }
+
+    /// Spawn roost with explicit **argv** (`-w <name>`, a verb, …) in a state
+    /// dir the caller prepared and owns — the seam the named-workspaces
+    /// scenarios need: two instances share one `ROOST_STATE` root, each
+    /// aiming at its own `-w` workspace, and fixture `workspace.json` files
+    /// go under `<root>/workspaces/<name>/` before either spawn.
+    ///
+    /// The caller owns the directory (no fixture is written here, and `Drop`
+    /// still removes it — the first harness to drop cleans up, which is
+    /// correct when both harnesses share one root only if the shared root
+    /// outlives... it does not: the first `Drop` deletes it. Scenarios quit
+    /// both instances before dropping either, or accept the best-effort
+    /// cleanup like every other tenant).
+    pub fn try_spawn_at(
+        state_dir: &std::path::Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        Self::spawn_in(state_dir.to_path_buf(), true, args, envs, ROWS, COLS)
     }
 
     /// Like `try_spawn`, but also seeds `config.json` — the key-bindings
@@ -95,7 +115,7 @@ impl Harness {
             .map_err(|e| format!("writing fixture workspace.json: {e}"))?;
         std::fs::write(state_dir.join("config.json"), config_json)
             .map_err(|e| format!("writing fixture config.json: {e}"))?;
-        Self::spawn_in(state_dir, true, &[], ROWS, COLS)
+        Self::spawn_in(state_dir, true, &[], &[], ROWS, COLS)
     }
 
     /// Spawn with **no `ROOST_STATE`**, so roost resolves its own
@@ -141,6 +161,7 @@ impl Harness {
         Self::spawn_in(
             state_dir,
             false,
+            &[],
             &[
                 ("HOME", home.as_str()),
                 ("XDG_STATE_HOME", xdg_state.as_str()),
@@ -162,9 +183,14 @@ impl Harness {
     /// cannot use it — that variable exists precisely to short-circuit the
     /// search — and passes `false`, taking responsibility for isolating
     /// `$HOME` and the XDG variables itself (see `try_spawn_xdg`).
+    ///
+    /// `args` is extra argv passed to the roost binary verbatim (the `-w`
+    /// seam for the named-workspaces scenarios; every other tenant passes
+    /// `&[]` — roost with no arguments is the TUI).
     fn spawn_in(
         state_dir: PathBuf,
         pin_roost_state: bool,
+        args: &[&str],
         envs: &[(&str, &str)],
         rows: u16,
         cols: u16,
@@ -176,6 +202,7 @@ impl Harness {
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_roost"));
         cmd.cwd(env!("CARGO_MANIFEST_DIR"));
+        cmd.args(args);
         if pin_roost_state {
             cmd.env("ROOST_STATE", &state_dir);
         }
@@ -381,6 +408,26 @@ impl Harness {
             }
             if start.elapsed() >= timeout {
                 return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// `wait_for_exit` with the exit code as the answer: `None` when roost
+    /// never exited within `timeout`, else its status code. The named-
+    /// workspaces refusal scenarios assert exit 1 — the message alone
+    /// cannot distinguish a refusal (1) from a usage error (2).
+    pub fn wait_for_exit_status(&mut self, timeout: Duration) -> Option<i32> {
+        let start = Instant::now();
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                // portable_pty's ExitStatus carries the raw exit code (u32);
+                // a signal death surfaces as 128+signal, which no assertion
+                // here can confuse with a refusal.
+                return Some(status.exit_code() as i32);
+            }
+            if start.elapsed() >= timeout {
+                return None;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -648,5 +695,15 @@ fn fresh_state_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rst{}{:x}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create ROOST_STATE dir");
+    dir
+}
+
+/// `fresh_state_dir`, public: the named-workspaces scenarios share one root
+/// across two spawned instances and need to build its `workspaces/` tree
+/// before either instance starts.
+pub fn shared_state_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rst{}{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create shared ROOST_STATE root");
     dir
 }

@@ -17,7 +17,9 @@ use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
 use crate::core::workspace::{PaneSpec, Tab, Workspace};
-use crate::ports::{ClipboardOutcome, Observation, PaneBackend, StateStore};
+use crate::ports::{
+    ClaimError, ClaimHandle, ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore,
+};
 use crate::ui::input::{Action, Keymap};
 use crate::ui::render::state_word;
 
@@ -505,6 +507,19 @@ pub struct App<B: PaneBackend> {
     /// C25: index of the arrangement Alt+g tries first on the next press
     /// (grid=0 / main+stack=1 / all-stack=2). Session-only.
     layout_cycle: usize,
+    /// The workspace this instance runs in (named workspaces): "default" or
+    /// the `-w` name. Carried in from the composition root because core is
+    /// filesystem/env free — it feeds the pane environment (`ROOST_WORKSPACE`),
+    /// the host title (C4's workspace segment), the `status` reply and
+    /// desktop notifications (D8: identity is title, env and status only).
+    workspace: String,
+    /// Cross-instance session claims (D7): the port every acquire/release
+    /// goes through, plus this instance's open handles keyed by pane.
+    /// `pane_claims` carries the claimed session id beside each handle so a
+    /// respawn can tell "same session, keep the handle" from "new session,
+    /// re-claim" without asking the port twice.
+    claims: Box<dyn SessionClaims>,
+    pane_claims: HashMap<PaneId, (String, ClaimHandle)>,
     store: Box<dyn StateStore>,
     /// Whether the most recent workspace save succeeded — the tab bar's
     /// right status area (C2) shows "saved ✓" while this is true and
@@ -740,6 +755,8 @@ impl<B: PaneBackend> App<B> {
         host_pixels: (u16, u16),
         sock_path: Option<PathBuf>,
         tokens: TokenTable,
+        workspace: String,
+        claims: Box<dyn SessionClaims>,
     ) -> Result<Self> {
         // A loaded workspace.json may be hand-edited, partially migrated, or
         // otherwise inconsistent — repair layout ↔ panes before spawning.
@@ -786,6 +803,9 @@ impl<B: PaneBackend> App<B> {
             confirm_quit: None,
             tokens,
             ext_link_counts: HashMap::new(),
+            workspace,
+            claims,
+            pane_claims: HashMap::new(),
             waiters: Vec::new(),
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
@@ -1287,20 +1307,45 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
-        let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
-
         // Validate a stored session id via SessionResolver (design doc
         // §6.1): only launch fresh + clear it when the session is
-        // *definitively* gone. All adapter queries happen here, before we
-        // borrow self mut.
-        let resolution =
-            session_resolver::resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref());
-        let mut cmd = match &resolution.session {
-            Some(s) => adapter.resume(&spec.cwd, s),
-            None => adapter.launch(&spec.cwd),
+        // *definitively* gone. All adapter queries happen here, in their own
+        // scope, before we borrow self mut (the D7 claim below mutates).
+        let resolution = {
+            let Some(adapter) = self.registry.get(spec.adapter.as_str()) else { return };
+            session_resolver::resolve(adapter.as_ref(), &spec.cwd, spec.session.as_deref())
+        };
+        // D7: claim the saved session BEFORE launching the resume command, so
+        // two instances can never drive the same conversation. On a conflict
+        // the pane degrades to the dead-pane placeholder naming the holder,
+        // and the saved session id is kept — a later restart, once the other
+        // workspace has quit, resumes normally. (`stale` and `session: Some`
+        // are mutually exclusive in `resolve`, so nothing below depends on
+        // the launch we are about to skip.)
+        if let Some(s) = &resolution.session {
+            if let Err(owner) = self.claim_session(id, &spec.adapter, s) {
+                let msg =
+                    format!("session {s} is held by {owner} — close that workspace to resume here");
+                self.push_feed(format!("resume blocked: {msg}"), false, Some(id));
+                self.dead.insert(id, msg);
+                return;
+            }
+        }
+        let adapter = self.registry.get(spec.adapter.as_str());
+        let mut cmd = match (&resolution.session, adapter) {
+            (Some(s), Some(a)) => a.resume(&spec.cwd, s),
+            (None, Some(a)) => a.launch(&spec.cwd),
+            // Unreachable in practice (the same lookup just succeeded in the
+            // scope above; the registry is static for the process's life).
+            (_, None) => return,
         };
         if let Some(sock) = &self.sock_path {
             cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
+            // D8: panes know their workspace — a nested `roost -w x` inside a
+            // pane targets `x`, and scripts can read which workspace they
+            // live in. Always set, "default" included, so the variable never
+            // reads as unset-inside-roost.
+            cmd.env.push(("ROOST_WORKSPACE".into(), self.workspace.clone()));
             // Fresh per-spawn token: the pane authenticates its socket messages
             // with it, and no other pane knows it. Reissued on every (re)spawn.
             let token = crate::core::control::gen_token();
@@ -1451,9 +1496,25 @@ impl<B: PaneBackend> App<B> {
             }
             // Session ids already owned by other panes — never re-assign one
             // (concurrent same-cwd launches otherwise cross-wire onto it).
-            let taken = session_resolver::claimed_sessions(&self.ws);
+            // D7 widens the set with ids other running instances hold claims
+            // on, so detection keeps scanning past anything another workspace
+            // is already driving instead of adopting it.
+            let mut taken = session_resolver::claimed_sessions(&self.ws);
+            taken.extend(self.claims.claimed(&spec.adapter));
             if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
-                self.set_session(id, session);
+                // Claim before adopting (D7): between the snapshot above and
+                // now another instance may have taken it — then keep scanning
+                // on the next tick rather than adopting a claimed session.
+                match self.claim_session(id, &spec.adapter, &session) {
+                    Ok(()) => self.set_session(id, session),
+                    Err(owner) => {
+                        self.push_feed(
+                            format!("session {} held by {owner}; still looking", &session),
+                            false,
+                            Some(id),
+                        );
+                    }
+                }
             }
         }
     }
@@ -2224,6 +2285,9 @@ impl<B: PaneBackend> App<B> {
             "spawned_by": spec.and_then(|s| s.spawned_by),
             "status": self.status_str(id),
             "focused": id == self.focused,
+            // D8: every pane row names its workspace, so bare `roost status`
+            // (the list) and `roost status PANE` both answer "which fleet".
+            "workspace": self.workspace,
             // P0-2: null unless the pane is dead *and* roost knows why —
             // `list`/`status` are what a `spawn` caller polls afterward, so
             // this is the same reason `spawn_reply` folds into the spawn
@@ -2270,6 +2334,7 @@ impl<B: PaneBackend> App<B> {
                     "pane": p,
                     "status": self.status_str(p),
                     "error": self.dead.get(&p),
+                    "workspace": self.workspace,
                 }))
             }
             None => self.ctl_list(actor),
@@ -2672,6 +2737,12 @@ impl<B: PaneBackend> App<B> {
         // unrelated one.
         self.last_shell_seen.remove(&id);
         self.pending_detect.remove(&id);
+        // D7: drop the pane's session claim, releasing it for every other
+        // running instance. Pane ids are recycled, so an unremoved entry is
+        // not just a leak — a later pane with this id would inherit the
+        // claim (and, worse, its release-on-drop would later free a claim
+        // the new pane never took).
+        self.pane_claims.remove(&id);
         // C40: and the pull mark, for the same recycled-id reason — a mark
         // left pointing at a closed pane would be pulled by whichever pane
         // inherited the number next.
@@ -2748,6 +2819,39 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// D7: claim `(adapter, session)` for pane `id` across all running
+    /// instances, keeping one handle per pane in `pane_claims`. The bookkeeping
+    /// is deliberately here, not in the port: a pane respawn re-runs the
+    /// restore path, and re-acquiring while still holding the same claim is
+    /// refused by the lock itself — so the *app* releases before re-acquiring,
+    /// which is also what makes the single-instance case never self-block.
+    ///
+    /// - Same pane, same session: keep the existing handle (idempotent).
+    /// - Same pane, new session: drop the old handle, take the new claim.
+    /// - `Failed` (claims dir unreadable etc.): proceed **unclaimed** — claims
+    ///   are advisory best-effort (see `ports::ClaimError`), and a broken
+    ///   claims dir must not brick every restore.
+    /// - `Held`: refused; the caller owns the user-visible degradation.
+    fn claim_session(&mut self, id: PaneId, adapter: &str, session: &str) -> Result<(), String> {
+        if self.pane_claims.get(&id).is_some_and(|(s, _)| s == session) {
+            return Ok(());
+        }
+        self.pane_claims.remove(&id);
+        match self.claims.acquire(adapter, session) {
+            Ok(handle) => {
+                self.pane_claims.insert(id, (session.to_string(), handle));
+                Ok(())
+            }
+            Err(ClaimError::Held(desc)) => Err(desc),
+            Err(ClaimError::Failed(e)) => {
+                // Advisory port failed, not held: proceed without a claim.
+                // The feed line keeps the failure from being fully silent.
+                self.push_feed(format!("session claim unavailable: {e}"), false, Some(id));
+                Ok(())
+            }
+        }
+    }
+
     // -- event handling ----------------------------------------------------
 
     /// Returns a notification message when the pane's escape traffic asked
@@ -2796,7 +2900,15 @@ impl<B: PaneBackend> App<B> {
     /// as P2's relays and P6's title, so they land between frames like
     /// everything else roost writes to the host (W3).
     pub fn notify_host(&mut self, text: &str) {
-        if let Some(bytes) = crate::infra::notify::host_bytes(text) {
+        // D8: notifications raised from a named workspace carry its name, so
+        // two windows' rings are distinguishable; the default workspace's
+        // bytes are unchanged.
+        let msg = if self.workspace == "default" {
+            text.to_string()
+        } else {
+            format!("[{}] {}", self.workspace, text)
+        };
+        if let Some(bytes) = crate::infra::notify::host_bytes(&msg) {
             self.host_out.extend_from_slice(&bytes);
         }
     }
@@ -2840,7 +2952,14 @@ impl<B: PaneBackend> App<B> {
         // into this escape sequence. Same cap as the live title, so a
         // hostile name can't grow the sequence unbounded either.
         let label = sanitize_title(&self.feed_label(self.focused), LIVE_TITLE_CAP);
-        let want = format!("roost · {label}");
+        // C4 (amended 2026-09-03, named workspaces): a named workspace adds
+        // its name between `roost` and the pane segment; the default
+        // workspace renders nothing new and keeps today's exact title.
+        let want = if self.workspace == "default" {
+            format!("roost · {label}")
+        } else {
+            format!("roost · {} · {label}", self.workspace)
+        };
         if want == self.host_title {
             return;
         }
@@ -2877,7 +2996,22 @@ impl<B: PaneBackend> App<B> {
 
     /// Session id reported exactly by an agent-side extension.
     pub fn on_session(&mut self, id: PaneId, session: String) {
+        // D7: claim what the extension reports — exact truth, so record it
+        // even if the claim comes back held (the restore/detection gates
+        // should have kept this from happening; recording keeps the pane
+        // resumable either way).
+        let adapter = self.adapter_of_session_report(id).to_string();
+        if let Err(owner) = self.claim_session(id, &adapter, &session) {
+            self.push_feed(format!("session claim held by {owner}"), false, Some(id));
+        }
         self.set_session(id, session);
+    }
+
+    /// `on_session`'s adapter lookup: the pane's own spec names it; a spec
+    /// that is already gone means a report for a dead pane, which nothing
+    /// below should claim for.
+    fn adapter_of_session_report(&self, id: PaneId) -> &str {
+        self.find_spec(id).map(|s| s.adapter.as_str()).unwrap_or("shell")
     }
 
     /// The pane's status-socket connection went up or down (D2) — see
@@ -6963,6 +7097,11 @@ impl<B: PaneBackend> App<B> {
 
     /// Clean shutdown: save workspace, kill children (their sessions live on).
     pub fn shutdown(&mut self) {
+        // D7: release every session claim (dropping the handles) before the
+        // fleet dies, so a relaunch resumes immediately instead of racing a
+        // lock release. (`kill_fleet`'s panic path relies on process death
+        // releasing the flocks — no explicit handling needed there.)
+        self.pane_claims.clear();
         self.save();
         self.kill_fleet();
     }
@@ -7944,6 +8083,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         (app, store)
@@ -8053,6 +8194,8 @@ pub(crate) mod tests {
             (1000, 600),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         let id = app.pane_order()[0];
@@ -9200,6 +9343,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         let ct = app.control_token().to_string();
@@ -9613,6 +9758,8 @@ pub(crate) mod tests {
             (0, 0),
             Some(dir.join("roost.sock")),
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         let ct = app.control_token().to_string();
@@ -9707,6 +9854,8 @@ pub(crate) mod tests {
             (0, 0),
             Some(dir.join("roost.sock")),
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         let ct = app.control_token().to_string();
@@ -10118,6 +10267,8 @@ pub(crate) mod tests {
             (0, 0),
             Some(std::path::PathBuf::from("/tmp/roost-mc-ordering-test.sock")),
             table,
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         // If execution reaches here, `OrderingCheckPane::spawn`'s assertion
@@ -10393,6 +10544,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         (app, store)
@@ -11868,6 +12021,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -12084,6 +12239,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -12127,6 +12284,221 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- D7: cross-instance session claims ---------------------------------
+
+    /// `mk_app`, but with the caller supplying the claims port and the
+    /// workspace name, so a test can hold a claim from "another workspace"
+    /// through its own handle on the same fake.
+    fn mk_app_with_claims(
+        ws: Workspace,
+        workspace: &str,
+        claims: crate::ports::fakes::MemClaims,
+    ) -> App<FakePane> {
+        let (tx, _rx) = mpsc::sync_channel(64);
+        App::<FakePane>::new(
+            ws,
+            agents::registry(),
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+            workspace.into(),
+            Box::new(claims),
+        )
+        .unwrap()
+    }
+
+    /// `mk_app_with_claims` for tests that need a non-default registry —
+    /// everything else identical.
+    fn mk_app_with_claims_full(
+        ws: Workspace,
+        registry: Registry,
+        workspace: &str,
+        claims: crate::ports::fakes::MemClaims,
+    ) -> App<FakePane> {
+        let (tx, _rx) = mpsc::sync_channel(64);
+        App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+            workspace.into(),
+            Box::new(claims),
+        )
+        .unwrap()
+    }
+
+    /// `mk_app_with_claims` over `claims_registry()` — the restore-path
+    /// tests' default.
+    fn mk_app_with_claims_detect(
+        ws: Workspace,
+        workspace: &str,
+        claims: crate::ports::fakes::MemClaims,
+    ) -> App<FakePane> {
+        mk_app_with_claims_full(ws, claims_registry(), workspace, claims)
+    }
+
+    fn resume_ws(adapter: &str, session: &str) -> Workspace {
+        let mut panes = HashMap::new();
+        // A session root that does not exist on purpose: `resolve` must treat
+        // it as `Unknown` (session kept, no FS truth available), never as
+        // gone, or the claim path would never be reached.
+        let cwd = PathBuf::from(format!("/tmp/roost-claims-absent-{}", std::process::id()));
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: adapter.into(),
+                cwd,
+                session: Some(session.into()),
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        }
+    }
+
+    /// Registry with `DetectAdapter` under a name that also serves the
+    /// restore-path tests: paired with a session root that does not exist,
+    /// `session_state` is `Unknown` (never a real-FS `Gone`), so a stored
+    /// session id survives `resolve` and reaches the claim — which is the
+    /// path these tests exercise. (The real `pi` would consult the real
+    /// filesystem and call a made-up id gone.)
+    fn claims_registry() -> Registry {
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        registry
+    }
+
+    /// Restore conflict (spec `session-claims`): the saved session is held
+    /// by another running workspace — the pane must NOT launch its agent,
+    /// must show a placeholder naming the holder, and must KEEP its saved
+    /// session id so a later restart resumes normally once the claim frees.
+    #[test]
+    fn a_restore_conflict_shows_a_placeholder_and_keeps_the_saved_session() {
+        let claims = crate::ports::fakes::MemClaims::new("other");
+        // "Another instance" holds the session first.
+        let external = claims.acquire("detect", "sess-1").unwrap();
+        // The app's own port is a second claimant over the same store,
+        // running as workspace "b".
+        let mut app =
+            mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.fork("b"));
+        let msg = app.dead.get(&1).expect("the pane must degrade to the placeholder");
+        assert!(msg.contains("sess-1"), "names the session id: {msg}");
+        assert!(msg.contains("workspace 'other'"), "names the holding workspace: {msg}");
+        assert!(app.runtimes.is_empty(), "no agent is launched for a blocked restore");
+        assert_eq!(
+            app.find_spec(1).unwrap().session.as_deref(),
+            Some("sess-1"),
+            "the saved session id survives for a later restart"
+        );
+        // Conflict clears: the holder releases, a respawn resumes normally.
+        drop(external);
+        let rect = Rect::new(0, 0, 80, 24);
+        let spec = app.find_spec(1).unwrap().clone();
+        app.spawn_pane(1, &spec, rect);
+        assert!(app.runtimes.contains_key(&1), "the same restore resumes once the claim frees");
+        assert!(!app.dead.contains_key(&1), "the placeholder is gone");
+        assert!(app.pane_claims.contains_key(&1), "this instance now holds the claim");
+        assert_eq!(claims.snapshot()["detect.sess-1"], "b");
+    }
+
+    /// Detection conflict (D7): a candidate session another instance has
+    /// claimed is never adopted — the pane keeps scanning, and adopts the
+    /// moment the claim frees.
+    #[test]
+    fn detection_never_adopts_a_session_another_instance_holds_and_recovers_when_freed() {
+        let dir = std::env::temp_dir().join(format!("roost-claim-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("taken.jsonl"), "").unwrap();
+
+        let claims = crate::ports::fakes::MemClaims::new("other");
+        let external = claims.acquire("detect", "taken").unwrap();
+
+        let mut panes = HashMap::new();
+        panes.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: dir.clone(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("detect", Box::new(DetectAdapter));
+        let mut app = mk_app_with_claims_full(ws, registry, "b", claims);
+
+        // Promote the shell to the agent (the same two-tick promotion drive
+        // as `a_promoted_pane_never_claims_a_session_older_than_its_shell`).
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: None });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        app.runtimes.get_mut(&1).unwrap().observation =
+            Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(
+            app.find_spec(1).unwrap().session,
+            None,
+            "a session another instance holds is never adopted"
+        );
+
+        // Conflict clears: the holder releases, the next scan adopts.
+        drop(external);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+        assert_eq!(app.find_spec(1).unwrap().session.as_deref(), Some("taken"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Single instance, never blocked (spec `session-claims`): one instance's
+    /// own restore is never refused by its own claim — and a respawn (the
+    /// restore path re-running for a live pane) releases and re-claims
+    /// without deadlock.
+    #[test]
+    fn a_single_instance_never_blocks_itself() {
+        let mut app = mk_app_with_claims_detect(
+            resume_ws("detect", "sess-9"),
+            "default",
+            crate::ports::fakes::MemClaims::default(),
+        );
+        assert!(
+            !app.dead.contains_key(&1) && app.runtimes.contains_key(&1),
+            "an ordinary restore resumes"
+        );
+        assert!(app.pane_claims.contains_key(&1), "the instance holds its own claim");
+
+        // Respawn the same pane on the same session — the layout-driven
+        // respawn path re-runs spawn_pane with the saved session.
+        let spec = app.find_spec(1).unwrap().clone();
+        app.spawn_pane(1, &spec, Rect::new(0, 0, 80, 24));
+        assert!(app.runtimes.contains_key(&1), "the respawn was not blocked by the held claim");
+        assert_eq!(app.pane_claims.len(), 1, "still exactly one handle for the pane");
+        assert!(!app.dead.contains_key(&1));
     }
 
     /// ...and the same must hold for a pane that *inherits* an id, which is
@@ -12174,6 +12546,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -12645,6 +13019,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap()
     }
@@ -13035,6 +13411,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -13155,6 +13533,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -13242,6 +13622,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -13371,6 +13753,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -13467,6 +13851,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -13560,6 +13946,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
@@ -14022,6 +14410,8 @@ pub(crate) mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
         assert!(app.last_save_ok()); // startup counts as saved (we just loaded)
@@ -17653,6 +18043,47 @@ pub(crate) mod tests {
         app.find_spec_mut(1).unwrap().title = Some("TASK-8".into());
         app.last_host_title = None;
         assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 1 TASK-8\x07"));
+    }
+
+    /// C4 (amended 2026-09-03): a NAMED workspace's title gains the workspace
+    /// segment — `roost · {ws} · {pane}` — while the default workspace's
+    /// title stays byte-identical to the pre-workspaces form.
+    #[test]
+    fn a_named_workspace_titles_roost_ws_pane_and_default_titles_as_before() {
+        let ws = Workspace::default_in(PathBuf::from("/tmp"));
+        let mut named = mk_app_with_claims(ws, "tripto", crate::ports::fakes::MemClaims::default());
+        let label = named.feed_label(named.focused);
+        assert!(
+            host_contains(&mut named, format!("\x1b]2;roost · tripto · {label}\x07").as_bytes()),
+            "a named workspace titles roost · ws · pane"
+        );
+
+        // The default workspace's title has no workspace segment.
+        let (mut app, _) = mk_app(shell_ws());
+        let label = app.feed_label(app.focused);
+        assert!(
+            host_contains(&mut app, format!("\x1b]2;roost · {label}\x07").as_bytes()),
+            "the default title is unchanged"
+        );
+        let bytes = app.take_host_output();
+        assert!(
+            !bytes.windows(b"\xc2\xb7 default".len()).any(|w| w == b"\xc2\xb7 default"),
+            "the default workspace never renders its name"
+        );
+    }
+
+    /// D8: a notification raised from a named workspace carries its name;
+    /// the default workspace's notification bytes are unchanged.
+    #[test]
+    fn a_named_workspace_prefixes_its_notifications() {
+        let ws = Workspace::default_in(PathBuf::from("/tmp"));
+        let mut named = mk_app_with_claims(ws, "tripto", crate::ports::fakes::MemClaims::default());
+        named.notify_host("pi needs you");
+        let bytes = named.take_host_output();
+        assert!(
+            bytes.windows(b"[tripto] pi needs you".len()).any(|w| w == b"[tripto] pi needs you"),
+            "the workspace name prefixes the notification"
+        );
     }
 
     /// H1: `spec.title` reaches `sync_host_title` verbatim from

@@ -54,6 +54,7 @@ pub(crate) fn test_panic_thread_after() -> Option<std::time::Duration> {
     raw.parse().ok().map(std::time::Duration::from_millis)
 }
 
+pub mod claims;
 pub mod clipboard;
 pub mod config;
 pub mod extension;

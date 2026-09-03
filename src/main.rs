@@ -47,12 +47,29 @@ fn is_unsafe_socket_dir(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains(crate::infra::sock::UNSAFE_SOCKET_DIR_MSG)
 }
 
+/// The one other `spawn_listener` failure that must stay fatal: the socket
+/// path exceeds the platform's `sun_path` limit and can never bind — a
+/// deterministic, user-fixable condition (`sock::check_socket_path_len`
+/// already names the fix), not something roost should paper over by
+/// running with no control plane at all.
+fn is_socket_path_too_long(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(crate::infra::sock::SOCKET_PATH_TOO_LONG_MSG)
+}
+
 fn main() -> Result<()> {
     // Client mode: `roost <verb> ...` talks to a running instance and exits,
     // before any terminal/lock setup. No args → launch the multiplexer.
     if let Some(code) = cli::maybe_run() {
         std::process::exit(code);
     }
+
+    // The TUI path. `maybe_run`'s pre-pass already resolved the workspace
+    // (it runs even when no args remain); this re-init is an idempotent
+    // no-op that keeps the TUI correct even if an entry point ever skips
+    // the pre-pass — e.g. `ROOST_WORKSPACE=x roost` with no flag at all.
+    let roost_workspace =
+        std::env::var_os("ROOST_WORKSPACE").map(|v| v.to_string_lossy().into_owned());
+    let _ = infra::store::FsStore::init_workspace(None, roost_workspace.as_deref());
 
     // Reaching here means no args at all: launch the TUI. It needs a real
     // terminal on stdout — ratatui::init() below enables raw mode, which
@@ -208,8 +225,11 @@ fn push_kbd_enhancement() {
     );
 }
 
-/// Acquire an exclusive lock on `<state>/roost.lock`. Returns the held file
-/// (keep it alive for the process lifetime) or a user-facing error message.
+/// Acquire an exclusive lock on `<state dir>/workspace.lock` — the
+/// workspace's own directory (`FsStore::default_path()` is workspace-aware,
+/// so named workspaces lock against `workspaces/<name>/workspace.lock`).
+/// Returns the held file (keep it alive for the process lifetime) or a
+/// user-facing error message.
 fn acquire_instance_lock() -> std::result::Result<std::fs::File, String> {
     let path = FsStore::default_path().with_extension("lock");
     if let Some(dir) = path.parent() {
@@ -218,10 +238,15 @@ fn acquire_instance_lock() -> std::result::Result<std::fs::File, String> {
     let file = std::fs::File::create(&path)
         .map_err(|e| format!("roost: cannot open lock file {}: {e}", path.display()))?;
     file.try_lock().map_err(|_| {
-        let dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+        let ws = FsStore::workspace_name();
+        let place = if ws == infra::store::DEFAULT_WORKSPACE {
+            "the default workspace".to_string()
+        } else {
+            format!("workspace '{ws}'")
+        };
         format!(
-            "roost is already running for this workspace ({dir}).\n\
-             Close the other instance, or set ROOST_STATE=<dir> to run an isolated one."
+            "roost is already running in {place}.\n\
+             Open another with `roost -w <name>`; `roost ws ls` lists workspaces."
         )
     })?;
     Ok(file)
@@ -409,7 +434,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // into "quietly no socket" is the wrong default.
     let (sock_path, sock_err) = match infra::sock::spawn_listener(tx.clone(), tokens.reader()) {
         Ok(p) => (Some(p), None),
-        Err(e) if is_unsafe_socket_dir(&e) => return Err(e),
+        Err(e) if is_unsafe_socket_dir(&e) || is_socket_path_too_long(&e) => return Err(e),
         Err(e) => (None, Some(format!("no control plane: {e:#}"))),
     };
     let sock_cleanup = sock_path.clone();
@@ -423,6 +448,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         host_pixels(),
         sock_path,
         tokens,
+        infra::store::FsStore::workspace_name().to_string(),
+        Box::new(infra::claims::FsClaims::new(
+            infra::store::FsStore::root_dir(),
+            infra::store::FsStore::workspace_name().to_string(),
+        )),
     )?;
     app.relayout();
     app.set_keymap(keymap);
@@ -1323,6 +1353,8 @@ mod tests {
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap()
     }

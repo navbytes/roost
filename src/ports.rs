@@ -11,6 +11,7 @@
 //! Fakes return `None` and the renderer must tolerate that.
 
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
 
@@ -284,6 +285,59 @@ pub trait PaneBackend: Sized {
     }
 }
 
+/// A claim on one agent session (specs: session-claims). Held per pane for
+/// as long as the pane drives that session; released when the handle drops.
+pub struct ClaimHandle {
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for ClaimHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimHandle").finish_non_exhaustive()
+    }
+}
+
+impl ClaimHandle {
+    pub(crate) fn new(release: Box<dyn FnOnce() + Send>) -> Self {
+        Self { release: Some(release) }
+    }
+}
+
+impl Drop for ClaimHandle {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+/// Why `SessionClaims::acquire` refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimError {
+    /// Another running instance holds the claim — `String` describes the
+    /// owner (workspace name, pid when known) for placeholder messages.
+    Held(String),
+    /// The claim store itself could not be consulted (permissions, I/O).
+    /// Claims are advisory best-effort: a caller treats this as "unknown",
+    /// not as "held" — blocking every restore on a broken claims dir would
+    /// trade a rare race for a hard failure.
+    Failed(String),
+}
+
+/// Cross-instance exclusivity of one agent session (design D7): at most one
+/// roost pane across all running instances drives a given
+/// `(adapter, session id)`. Implemented by `infra::claims::FsClaims` (lock
+/// files under the state root; the OS releases them when a process dies).
+/// Acquire is idempotent for the owner: re-claiming a session this instance
+/// already holds (a pane respawn) succeeds.
+pub trait SessionClaims: Send {
+    fn acquire(&self, adapter: &str, session: &str) -> Result<ClaimHandle, ClaimError>;
+    /// Session ids currently claimed by anyone (any instance, any workspace)
+    /// for `adapter` — the cross-instance extension of
+    /// `session_resolver::claimed_sessions`'s exclusion set.
+    fn claimed(&self, adapter: &str) -> HashSet<String>;
+}
+
 /// Workspace persistence. Implemented by `infra::store::FsStore`.
 pub trait StateStore {
     fn load(&self) -> Result<Option<Workspace>>;
@@ -302,6 +356,7 @@ pub trait StateStore {
 #[cfg(test)]
 pub mod fakes {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     /// In-memory pane: records the spawn command and all input; status is
@@ -583,6 +638,68 @@ pub mod fakes {
         fn save(&self, ws: &Workspace) -> Result<()> {
             *self.0.lock().unwrap() = Some(ws.clone());
             Ok(())
+        }
+    }
+
+    /// In-memory claims, mirroring `FsClaims`'s semantics without files:
+    /// `key → owner workspace`, exclusive, released on handle drop. Clone to
+    /// keep a handle for assertions. `name` is the workspace this fake
+    /// claims for (the owner name only feeds `Held` messages). Acquire is
+    /// NOT idempotent — same as the file implementation, where a second
+    /// `try_lock` on an already-flocked file fails even in-process; callers
+    /// (the app's per-pane claim bookkeeping) release before re-acquiring.
+    #[derive(Clone)]
+    pub struct MemClaims {
+        name: String,
+        state: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    impl MemClaims {
+        pub fn new(name: &str) -> Self {
+            Self { name: name.to_string(), state: Arc::new(Mutex::new(HashMap::new())) }
+        }
+
+        /// A second claimant over the SAME store, under a different workspace
+        /// name — how tests model "another running instance".
+        pub fn fork(&self, name: &str) -> Self {
+            Self { name: name.to_string(), state: Arc::clone(&self.state) }
+        }
+
+        /// Every claim and its owner, for test assertions.
+        pub fn snapshot(&self) -> HashMap<String, String> {
+            self.state.lock().unwrap().clone()
+        }
+    }
+
+    impl Default for MemClaims {
+        fn default() -> Self {
+            Self::new("default")
+        }
+    }
+
+    impl SessionClaims for MemClaims {
+        fn acquire(&self, adapter: &str, session: &str) -> Result<ClaimHandle, ClaimError> {
+            let key = format!("{adapter}.{session}");
+            let mut state = self.state.lock().unwrap();
+            if let Some(owner) = state.get(&key) {
+                return Err(ClaimError::Held(format!("workspace '{owner}'")));
+            }
+            state.insert(key.clone(), self.name.clone());
+            let state = self.state.clone();
+            Ok(ClaimHandle::new(Box::new(move || {
+                state.lock().unwrap().remove(&key);
+            })))
+        }
+
+        fn claimed(&self, adapter: &str) -> HashSet<String> {
+            let prefix = format!("{adapter}.");
+            self.state
+                .lock()
+                .unwrap()
+                .keys()
+                .filter_map(|k| k.strip_prefix(&prefix))
+                .map(String::from)
+                .collect()
         }
     }
 }
