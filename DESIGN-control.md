@@ -368,6 +368,32 @@ protect.
    earlier draft of this section claimed.
 7. **Graceful at 0 instances; defined addressing at N.** Absent socket → clean
    no-op. (v1 scopes to one instance; multi-instance discovery is a non-goal.)
+
+   **[Amended 2026-09-03, named workspaces — the N is defined now, still no
+   discovery.]** Out-of-pane verbs take `-w <name>` (or `ROOST_WORKSPACE`),
+   resolving to that workspace's own socket under the state root; flag beats
+   `ROOST_SOCK` beats `ROOST_WORKSPACE` beats the default. The filesystem is
+   the registry — no daemon, no discovery protocol: the client enumerates
+   `workspaces/` and probes each `workspace.lock` to say which workspaces are
+   running when the one it tried is not.
+
+   **[Amended 2026-09-04, B1.]** `-w`/`--workspace` is recognised anywhere on
+   the line — before the verb, or after it — except inside `send`'s own
+   text, where scanning stops at its first word: `send` is the one verb
+   whose positionals are free text (`spawn`'s text rides in `--input`), so
+   only there does a flag-shaped word risk being misread as a selection —
+   `roost send 3 -w b hi` sends the literal text "-w b hi" to pane 3,
+   exactly as if `-w` had never been special. A token already consumed as
+   the value of one of the verb's own options (`--cwd`, `--input`, `--tail`,
+   `--until`, `--timeout`) never counts as `-w` either, so `roost spawn
+   --cwd x -w b claude` still selects `b`. Every other verb's own
+   positionals (pane ids, adapter names) are never free text, so `-w` stays
+   recognised through them too: `roost close 3 -w b` selects `b` (this
+   widening's own fix — `close` used to freeze at its PANE positional
+   exactly like `send`, silently swallowing a trailing `-w` as an unused
+   extra positional instead of ever selecting anything). The same widening
+   makes any other leftover single-dash token past a verb's own options a
+   hard usage error (exit 2) rather than a silently ignored positional.
 8. **Preserve single-owner + daemonless.** Commands marshal through the mpsc onto
    the one loop; replies via non-blocking one-shot (never a blocking send from
    main); no detach/reattach; server dies with the process.
@@ -492,7 +518,7 @@ live-terminal smoke test and, if ever wanted, the Phase 3 niceties above.
 | Daemonless fit | **best** (stateless) | worst (persistent subscriber) | adds a helper process |
 | Security (adversary rank) | **1st** | 3rd (passive keylogger) | 2nd (external client, but façade) |
 | New surface | smallest | medium | largest (tokio/rmcp) |
-| Discovery | `$ROOST_SOCK` in-pane; friction for N | same | elegant via env inheritance |
+| Discovery | `$ROOST_SOCK` in-pane; friction for N. **[Amended 2026-09-03]** N is addressed by `-w <name>` over one state root — lock files are the liveness signal, no discovery daemon | same | elegant via env inheritance |
 
 **Why layered wins:** the CLI is the safest, simplest default and the best
 daemonless fit; MCP is the most LLM-native; both are thin clients of one core

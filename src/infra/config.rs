@@ -31,10 +31,21 @@
 //! (`~/Library/Application Support`), which is also what `dirs::config_dir`
 //! returns. `resolve_in` collapses that case rather than reporting a file as
 //! shadowing itself.
+//!
+//! For a **named** workspace (`roost -w x`) the base changes, not the
+//! resolution: it is exactly what the default workspace would resolve
+//! (`resolve_default`, above) — the config-dir candidate included, not just
+//! the root's own `config.json` — and a `config.json` inside the
+//! workspace's own directory replaces that **wholesale** — never merged, so
+//! a workspace-local file is the whole keymap for that workspace and
+//! nothing bleeds in from the default resolution. When both exist the
+//! ignored default-resolution file is reported as the shadow, exactly like
+//! the two-candidate case above. The default workspace and plain
+//! `$ROOST_STATE` isolation keep the resolution above, unchanged.
 
 use std::path::{Path, PathBuf};
 
-use crate::infra::store::FsStore;
+use crate::infra::store::{FsStore, DEFAULT_WORKSPACE};
 use crate::ui::input::{Diagnostics, Keymap};
 
 const FILE: &str = "config.json";
@@ -55,14 +66,49 @@ pub struct Resolved {
 
 /// The real resolution: reads the environment, stats the filesystem.
 pub fn resolve_config() -> Resolved {
+    let default = resolve_default();
+    // A named workspace's own directory can replace it wholesale (D5) — but
+    // what it replaces is `default` in full, config-dir candidate included:
+    // a named workspace with no `config.json` of its own must see exactly
+    // what the default workspace would, not a re-derived, narrower version
+    // of it (the config-dir candidate used to be dropped here).
+    if FsStore::workspace_name() != DEFAULT_WORKSPACE {
+        return resolve_named(default, FsStore::state_dir().join(FILE), &|p| p.is_file());
+    }
+    default
+}
+
+/// The default workspace's own resolution: also what a named workspace
+/// falls back to when it has no `config.json` of its own (`resolve_named`).
+/// `FsStore::root_dir()`, not `state_dir()` — this must always be the
+/// default workspace's own directory regardless of which workspace is
+/// actually selected in this process; for the default workspace itself the
+/// two are the same path, so this changes nothing there.
+fn resolve_default() -> Resolved {
     if let Some(dir) = std::env::var_os("ROOST_STATE") {
         let path = PathBuf::from(dir).join(FILE);
         let exists = path.is_file();
         return Resolved { path, exists, shadowed: None };
     }
-    let state = FsStore::state_dir().join(FILE);
+    let state = FsStore::root_dir().join(FILE);
     let xdg = dirs::config_dir().map(|d| d.join("roost").join(FILE));
     resolve_in(state, xdg, &|p| p.is_file())
+}
+
+/// The named-workspace decision alone — no env, no filesystem — so it can
+/// be unit-tested like `resolve_in`. The workspace directory's file, when
+/// it exists, *replaces* `default` wholesale (D5: whole-file, never merged
+/// — the keymap loader takes one file, and merging keymap tables is
+/// speculative). Without one, `default` — the full default-workspace
+/// resolution, `resolve_default` above — is what it reads; if that file
+/// exists it's reported as the shadow, so an edit to a hidden
+/// workspace-local file that has no effect is never silent.
+fn resolve_named(default: Resolved, local: PathBuf, exists: &dyn Fn(&Path) -> bool) -> Resolved {
+    if exists(&local) {
+        let shadowed = if default.exists { Some(default.path) } else { None };
+        return Resolved { path: local, exists: true, shadowed };
+    }
+    default
 }
 
 /// The decision alone — no env, no filesystem — so it can be unit-tested
@@ -145,6 +191,14 @@ mod tests {
     fn xdg() -> PathBuf {
         PathBuf::from("/config/roost/config.json")
     }
+    /// A named workspace's root and local candidates (distinct, unlike the
+    /// macOS default-workspace case).
+    fn root() -> PathBuf {
+        PathBuf::from("/state/roost/config.json")
+    }
+    fn local() -> PathBuf {
+        PathBuf::from("/state/roost/workspaces/a/config.json")
+    }
     /// An `exists` oracle over a fixed set of present files — the filesystem
     /// the resolver is allowed to see.
     fn present(files: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
@@ -201,6 +255,61 @@ mod tests {
             Resolved { path: state(), exists: true, shadowed: None },
             "a file cannot shadow itself"
         );
+    }
+
+    // --- named workspaces (pure: explicit paths, no env) ---
+
+    /// The base case: no workspace-local file, so `default` (what the
+    /// default workspace would resolve) is what the workspace reads — a
+    /// remap in the root reaches `roost -w a` without being copied anywhere.
+    #[test]
+    fn a_named_workspace_reads_the_default_resolution_by_default() {
+        let default = Resolved { path: root(), exists: true, shadowed: None };
+        let r = resolve_named(default, local(), &present(&[]));
+        assert_eq!(r, Resolved { path: root(), exists: true, shadowed: None });
+
+        let default = Resolved { path: root(), exists: false, shadowed: None };
+        let r = resolve_named(default, local(), &present(&[]));
+        assert_eq!(
+            r,
+            Resolved { path: root(), exists: false, shadowed: None },
+            "with neither file, the default resolution's path is the one named"
+        );
+    }
+
+    /// D5: whole-file, never merged. The workspace-local file is the entire
+    /// keymap for that workspace, and the ignored default-resolution file
+    /// is named — an edit there must not look like it took effect.
+    #[test]
+    fn a_workspace_local_config_replaces_the_default_resolution_whole_file() {
+        let default = Resolved { path: root(), exists: true, shadowed: None };
+        let r = resolve_named(default, local(), &present(&[local()]));
+        assert_eq!(
+            r,
+            Resolved { path: local(), exists: true, shadowed: Some(root()) },
+            "the local file is read and the default resolution's file is the shadow"
+        );
+
+        let default = Resolved { path: root(), exists: false, shadowed: None };
+        let r = resolve_named(default, local(), &present(&[local()]));
+        assert_eq!(r, Resolved { path: local(), exists: true, shadowed: None });
+    }
+
+    /// A2: the config-dir candidate must reach a named workspace too, not
+    /// just the root's own `config.json` — composed exactly like
+    /// `resolve_config` composes `resolve_default` with `resolve_named`,
+    /// rather than re-deriving the candidates, so this proves the real
+    /// composition rather than a parallel one that could drift from it.
+    #[test]
+    fn a_named_workspace_falls_back_to_the_config_dir_candidate() {
+        // What `resolve_default` produces when only the config-dir file
+        // exists (the state-dir/root file is absent).
+        let default = resolve_in(state(), Some(xdg()), &present(&[xdg()]));
+        assert_eq!(default, Resolved { path: xdg(), exists: true, shadowed: None });
+
+        // No workspace-local override: the named workspace sees exactly that.
+        let r = resolve_named(default, local(), &present(&[]));
+        assert_eq!(r, Resolved { path: xdg(), exists: true, shadowed: None });
     }
 
     /// The shadow is a *notice*: `roost keys` prints it but must still exit

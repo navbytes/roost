@@ -30,7 +30,7 @@ It also removes the hardest parts of building a muxer: no daemon, no client/serv
 | Language | Rust |
 | Layout primitives (v1) | Tabs, splits, stacked panes (floating panes deferred) |
 | Status awareness | Core to v1: working / waiting-for-you / idle / exited per pane |
-| Workspaces | One implicit workspace, auto-saved, auto-restored |
+| Workspaces | One implicit workspace, auto-saved, auto-restored. **[Amended 2026-09-03, named workspaces]** alongside it: `roost -w <name>` opens a named workspace — a directory under the same state root holding exactly what a state dir holds — so several fleets run at once with no daemon; `ws ls/rm/mv` manage them offline; cross-instance session claims stop two windows driving one conversation |
 | First adapter | **pi** (Claude Code and others follow) |
 | Status detection | Hybrid per adapter; prefer clean signals via an installable extension (pi), fall back to output heuristics |
 | Audience | Personal tool; ship fast, optimize for one workflow |

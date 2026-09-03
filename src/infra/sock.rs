@@ -217,8 +217,10 @@ pub const UNSAFE_SOCKET_DIR_MSG: &str = "unsafe ownership/permissions";
 
 /// Is `dir` owned by us with no group/other access? Refusing otherwise stops
 /// an attacker who pre-created the runtime dir from hosting our control socket
-/// (tmux does the same for its socket dir).
-fn dir_is_private_and_ours(dir: &Path) -> bool {
+/// (tmux does the same for its socket dir). `pub(crate)`: `infra::claims`
+/// reuses this same check for the claims directory (B6) rather than
+/// duplicating it.
+pub(crate) fn dir_is_private_and_ours(dir: &Path) -> bool {
     match fs::metadata(dir) {
         // SAFETY: `geteuid(2)` takes no arguments, touches no memory and
         // cannot fail — the one libc call with nothing to get wrong.
@@ -235,8 +237,17 @@ pub fn cleanup(path: &Path) {
 use crate::core::event::AppEvent;
 use crate::core::status::AgentStatus;
 use crate::core::workspace::PaneId;
+use crate::infra::store::{FsStore, DEFAULT_WORKSPACE};
 
 pub fn socket_path() -> PathBuf {
+    // A named workspace's socket lives in its own directory (D4) — the
+    // same move the ROOST_STATE branch below makes, and composing with it,
+    // since `state_dir` builds on a root that honors ROOST_STATE. The
+    // default workspace keeps that branch untouched: `$XDG_RUNTIME_DIR`,
+    // with no roost subdirectory, exactly as before.
+    if FsStore::workspace_name() != DEFAULT_WORKSPACE {
+        return FsStore::state_dir().join("roost.sock");
+    }
     if let Some(dir) = std::env::var_os("ROOST_STATE") {
         return PathBuf::from(dir).join("roost.sock");
     }
@@ -249,6 +260,34 @@ pub fn socket_path() -> PathBuf {
                 .join("roost")
         })
         .join("roost.sock")
+}
+
+/// `sockaddr_un.sun_path` caps a unix socket path at 104 bytes on macOS/BSD,
+/// 108 on Linux (the trailing NUL included in both — hence the strict `<`
+/// below, not `<=`). Socket paths are built from state directories the user
+/// controls — a deep `ROOST_STATE` root or a long workspace name can exceed
+/// the cap, which `bind` then reports only as a generic error at best.
+/// Refuse up front with the fix. (nt lesson 3YXWPQ.)
+const SUN_PATH_LIMIT: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+
+/// The stable substring `main.rs` matches a `spawn_listener` failure against
+/// to decide this is fatal — same shared-const pattern as
+/// `UNSAFE_SOCKET_DIR_MSG` below, so the `bail!` and the check cannot drift
+/// apart. Deliberately doesn't name the limit itself (`SUN_PATH_LIMIT` is
+/// per-platform); the `bail!` below states the actual number separately.
+pub const SOCKET_PATH_TOO_LONG_MSG: &str = "unix-socket path limit";
+
+fn check_socket_path_len(path: &Path) -> Result<()> {
+    let len = path.as_os_str().as_encoded_bytes().len();
+    if len < SUN_PATH_LIMIT {
+        return Ok(());
+    }
+    bail!(
+        "roost: socket path {} is {len} bytes, over the {SOCKET_PATH_TOO_LONG_MSG} \
+         ({SUN_PATH_LIMIT} bytes) — use a shorter workspace name (-w) or a shorter \
+         ROOST_STATE root",
+        path.display()
+    );
 }
 
 #[derive(Deserialize)]
@@ -957,6 +996,9 @@ fn drain_until_quiet(reader: &mut BufReader<UnixStream>, deadline: Instant) {
 /// connection past the pre-auth guillotine, and never write it.
 pub fn spawn_listener(tx: SyncSender<AppEvent>, tokens: TokenReader) -> Result<PathBuf> {
     let path = socket_path();
+    // Before any directory setup: a path past `sun_path` can never bind,
+    // and the user needs the fix, not a generic bind error.
+    check_socket_path_len(&path)?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
         // The socket is the control plane (it can set session ids / status);
@@ -1457,6 +1499,30 @@ mod tests {
     use super::*;
     use crate::core::control::TokenTable;
     use std::io::Read;
+
+    /// A path the user controls (ROOST_STATE root, workspace name) can
+    /// drift past `sun_path`'s cap; the check must refuse with the fix,
+    /// not leave a generic bind error to surface as "no control plane".
+    /// Pure paths, no env — `socket_path` itself is only proven at the
+    /// PTY level, like every other env-driven resolver here.
+    #[test]
+    fn a_socket_path_past_the_sun_path_limit_is_refused_with_the_fix() {
+        assert!(check_socket_path_len(&PathBuf::from("/tmp/roost.sock")).is_ok());
+        let long = PathBuf::from("/tmp").join("x".repeat(300));
+        let err = check_socket_path_len(&long).unwrap_err().to_string();
+        // The limit itself is per-platform (104 macOS/BSD, 108 Linux) — name
+        // it via the constant, not a literal, so this passes on both.
+        assert!(err.contains(&SUN_PATH_LIMIT.to_string()), "must name the limit: {err}");
+        assert!(err.contains("shorter"), "must suggest the fix: {err}");
+    }
+
+    /// B3: the constant itself, pinned to the two platforms roost ships for
+    /// — a NUL byte is included in both, hence `<`, not `<=`, above.
+    #[test]
+    fn sun_path_limit_is_104_on_macos_bsd_and_108_on_linux() {
+        let expected = if cfg!(target_os = "linux") { 108 } else { 104 };
+        assert_eq!(SUN_PATH_LIMIT, expected);
+    }
 
     #[test]
     fn parses_string_and_numeric_pane_ids() {

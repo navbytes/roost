@@ -3,28 +3,48 @@
 //! actuation surface an LLM (or a human, or a script) drives — the same
 //! `control::Request` the socket executes on the main loop.
 //!
-//! Targeting is daemonless: `$ROOST_SOCK` (set in every pane, so an in-pane
-//! agent needs no config) else the default per-state-dir socket path.
+//! Targeting is daemonless. A control verb resolves its target instance in
+//! this order: an explicit `-w <name>` / `--workspace <name>` flag (the
+//! pre-pass below strips it from argv, recognised anywhere on the line —
+//! before the verb, or after it — except inside `send`'s own text, where
+//! scanning stops at its first word, so a flag-shaped word in the message
+//! itself is never misread as a selection), then `$ROOST_SOCK` (set
+//! in every pane, so an in-pane agent needs no config), then the workspace
+//! named by `$ROOST_WORKSPACE`, then the default per-state-dir socket path.
 //! Credential precedence: `$ROOST_CONTROL_TOKEN`, else `$ROOST_TOKEN` (an
 //! in-pane agent's own pane token — authenticates it as its pane, scoped to
-//! its spawned subtree and audited as that pane), else `<state>/control.token`
-//! (the fleet token, for an external operator with no pane env).
+//! its spawned subtree and audited as that pane), else
+//! `<workspace>/control.token` (the fleet token, for an external operator
+//! with no pane env). An explicit `-w` skips `$ROOST_TOKEN`: the pane token
+//! authenticates against the pane's *own* instance, not whatever `-w` is
+//! targeting, so a cross-workspace call falls straight to the target
+//! workspace's own fleet token — the flag is precisely how a pane talks to
+//! another one.
 //!
 //! `__status` is a separate, undocumented internal verb (not in `VERBS`):
 //! the Claude Code hooks `infra::extension::ensure_claude_hooks` installs
 //! call back into this same binary instead of piping through `nc`/`socat` —
 //! see `run_status_hook` below.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::BTreeSet;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::core::workspace::Workspace;
 use crate::infra::sock::{socket_path, OVERSIZE_LINE_MSG};
-use crate::infra::store::FsStore;
+use crate::infra::store::{check_creatable_name, check_workspace_name, FsStore, DEFAULT_WORKSPACE};
 
 const VERBS: &[&str] =
     &["list", "status", "spawn", "fork", "send", "read", "close", "focus", "wait"];
+
+/// Every verb option that consumes the next token as its value, across the
+/// whole verb table (confirmed against the `match` in `build_request`) —
+/// shared by `positional` (which skips the value) and `strip_workspace_flag`
+/// (which must not mistake one for a positional), so the two can't drift
+/// apart by editing one and not the other.
+const VALUE_TAKING_OPTIONS: &[&str] = &["--cwd", "--input", "--tail", "--until", "--timeout"];
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
 /// code. Otherwise return None so `main` launches the TUI. Only a genuinely
@@ -33,10 +53,35 @@ const VERBS: &[&str] =
 /// binary needs an answer it can act on, not a seized terminal.
 pub fn maybe_run() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let verb = args.first()?; // no args → launch the TUI
-    if verb == "__status" {
+    let workspace_env =
+        std::env::var_os("ROOST_WORKSPACE").map(|v| v.to_string_lossy().into_owned());
+    // The status hook answers before anything else can refuse: it runs
+    // inside an agent's own process on every status transition and must
+    // never fail loudly (see `run_status_hook`), so a `$ROOST_WORKSPACE`
+    // that would be a usage error anywhere else degrades to the default
+    // workspace here instead of printing usage and exiting 2.
+    if args.first().is_some_and(|v| v == "__status") {
+        let _ = FsStore::init_workspace(None, workspace_env.as_deref());
         return Some(run_status_hook(&args[1..]));
     }
+    // The workspace pre-pass runs before verb dispatch, so `-w` works
+    // before or among any verb's options — and before this function decides
+    // there is no verb at all (a bare `roost -w x` must launch the TUI *in
+    // x*). Invalid names and missing values exit 2 here, before any state is
+    // touched; the resolution itself is idempotent, so main's TUI-path
+    // re-init below cannot override it.
+    let (workspace_flag, args) = match strip_workspace_flag(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("roost: {e}\n\n{USAGE}");
+            return Some(2);
+        }
+    };
+    if let Err(e) = FsStore::init_workspace(workspace_flag.as_deref(), workspace_env.as_deref()) {
+        eprintln!("roost: {e}\n\n{USAGE}");
+        return Some(2);
+    }
+    let verb = args.first()?; // no args → launch the TUI
     if verb == "--help" || verb == "-h" {
         println!("{USAGE}"); // an explicit request, not an error: stdout, exit 0
         return Some(0);
@@ -63,6 +108,18 @@ pub fn maybe_run() -> Option<i32> {
         }
         return Some(run_keys());
     }
+    // The `ws` verb family is the other local surface (beside `keys`): it
+    // answers from the state root's files — workspace directories, their lock
+    // sentinels and `workspace.json` — and never opens a socket, which is the
+    // whole point: it exists to tell you what is on disk *before* you aim a
+    // control verb anywhere.
+    if verb == "ws" {
+        if args[1..].iter().any(|a| a == "--help" || a == "-h") {
+            println!("{}", verb_help("ws"));
+            return Some(0);
+        }
+        return Some(run_ws(&args[1..]));
+    }
     if !VERBS.contains(&verb.as_str()) {
         // Same convention as a bad flag inside a known verb: hard error,
         // instead of falling through to the TUI (which used to seize the
@@ -80,7 +137,93 @@ pub fn maybe_run() -> Option<i32> {
         println!("{}", verb_help(verb));
         return Some(0);
     }
-    Some(run(&args))
+    Some(run(&args, workspace_flag.as_deref()))
+}
+
+/// The workspace pre-pass (D2): pull `-w <name>`, `--workspace <name>` and
+/// `--workspace=<name>` out of argv and return the name plus the remaining
+/// argv, so the verb parser below never sees the flag. Recognised anywhere
+/// in argv — before the verb, or after it — for every verb except `send`.
+/// `send` is the one verb whose own positionals are free text (`spawn`'s
+/// text rides in `--input`, never a bare positional), so only there does
+/// scanning stop at the verb's first *positional* argument — a token that
+/// doesn't start with `-` and isn't the value of an immediately preceding
+/// value-taking verb option (`--cwd`, `--input`, `--tail`, `--until`,
+/// `--timeout`; see `positional` below, which skips the same set) — or at a
+/// literal `--`, the end-of-options marker every verb shares. Past that
+/// point every remaining token — `-w` included — is left alone: `roost send
+/// 3 -w b hi` sends the literal text "-w b hi" to pane 3 rather than
+/// mistaking it for a selection. Every other verb's own positionals (pane
+/// ids, adapter names) are never free text, so `-w` stays recognised
+/// through them too: `roost close 3 -w b` selects `b` (the bug this closes:
+/// `close` used to freeze at its own PANE positional exactly like `send`
+/// does, so a trailing `-w` there was silently left as an unread, ignored
+/// extra positional instead of ever selecting anything). Pure: no env, no
+/// dispatch — errors here are the caller's usage-error exit 2.
+fn strip_workspace_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut flag: Option<String> = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut verb: Option<&str> = None;
+    let mut scanning = true;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if scanning {
+            if a == "-w" || a == "--workspace" {
+                if flag.is_some() {
+                    return Err("workspace selected more than once".into());
+                }
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{a} needs a workspace name (roost -w <name>)"))?;
+                flag = Some(value.clone());
+                i += 2;
+                continue;
+            }
+            if let Some(value) = a.strip_prefix("--workspace=") {
+                if flag.is_some() {
+                    return Err("workspace selected more than once".into());
+                }
+                flag = Some(value.to_string());
+                i += 1;
+                continue;
+            }
+            if a == "--" {
+                scanning = false;
+                rest.push(a.clone());
+                i += 1;
+                continue;
+            }
+            if let Some(v) = verb {
+                if VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
+                    // The option and its value travel together, untouched —
+                    // the value never gets a chance to look like `-w` itself
+                    // or (for `send`) like the verb's first positional.
+                    rest.push(a.clone());
+                    i += 1;
+                    if i < args.len() {
+                        rest.push(args[i].clone());
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Only `send` carries trailing free text; every other
+                // verb's positionals (pane ids, adapter names) never look
+                // like `-w`, so scanning keeps going through them.
+                if v == "send" && !a.starts_with('-') {
+                    // The verb's first positional: freeze scanning here, not
+                    // just at this token — everything after it is the verb's
+                    // own data too.
+                    scanning = false;
+                }
+            } else {
+                verb = Some(a.as_str());
+            }
+        }
+        rest.push(a.clone());
+        i += 1;
+    }
+    Ok((flag, rest))
 }
 
 /// `roost __status <working|waiting|needs_input>` — what the auto-installed
@@ -192,10 +335,18 @@ roost — control a running instance:
   roost wait PANE... [--until STATUS] [--timeout SEC]
   roost VERB --help              (a verb's own usage)
 and locally, with no running instance:
+  roost ws ls [--json]           (every workspace: running/idle, tabs, panes, adapters, saved)
+  roost ws rm NAME               (delete an idle workspace's directory)
+  roost ws mv OLD NEW            (rename an idle workspace)
   roost keys                     (the effective keymap, config.json applied)
   roost --help | -h
   roost --version | -V
 (run `roost` with no args to launch the multiplexer)
+`-w NAME` / `--workspace NAME` targets another workspace, anywhere on the
+line, before or after the verb — except inside `send`'s own text, where it
+is data, not a flag, past the PANE argument (names: 1-32 of a-z, 0-9, '.',
+'_', '-'; `default` is the one roost opens with no flag and no
+$ROOST_WORKSPACE).
 `--` ends options for any verb — later words are taken verbatim, dashes and
 all (e.g. `roost send 5 -- --not-a-flag`).
 Exit codes: 0 ok / 1 runtime error / 2 usage error / 3 `wait` timed out.";
@@ -204,7 +355,8 @@ Exit codes: 0 ok / 1 runtime error / 2 usage error / 3 `wait` timed out.";
 /// `maybe_run`) before the verb is ever allowed to run for real, so a help
 /// request can't fall through into executing it (the `list --help` bug this
 /// closes: it used to return live pane JSON, exit 0). `verb` is always one
-/// of `VERBS` here — every caller checks membership first.
+/// of `VERBS` here — every caller checks membership first — plus the local
+/// `ws` family, whose own dispatch hands `"ws"` straight through.
 fn verb_help(verb: &str) -> &'static str {
     match verb {
         "list" => "roost list\nList every pane: id, adapter, cwd, status, …",
@@ -216,6 +368,11 @@ fn verb_help(verb: &str) -> &'static str {
         "close" => "roost close PANE [--force]\nClose a pane; --force kills its process instead of asking it to exit.",
         "focus" => "roost focus PANE\nFocus a pane: switch to its tab and land focus on it (a no-op if it already is).",
         "wait" => "roost wait PANE... [--until STATUS] [--timeout SEC]\nBlock until a pane reaches STATUS (default: waiting) or the timeout elapses.",
+        "ws" => "roost ws [ls [--json] | rm NAME | mv OLD NEW]\n\
+                 List every workspace (name, running/idle, tabs, panes, adapters, last saved;\n\
+                 --json as a JSON array), delete an idle workspace's directory (rm), or rename\n\
+                 one (mv). Read from the state root's files: no running roost is contacted,\n\
+                 and `default` can be listed but never renamed or deleted.",
         _ => unreachable!("verb_help called with {verb:?}, not a member of VERBS"),
     }
 }
@@ -228,16 +385,26 @@ fn verb_help(verb: &str) -> &'static str {
 /// from every other kind of failure. Documented in `USAGE`.
 const EXIT_WAIT_TIMEOUT: i32 = 3;
 
-fn run(args: &[String]) -> i32 {
+fn run(args: &[String], workspace_flag: Option<&str>) -> i32 {
     let verb = args[0].as_str();
-    let req = match build_request(args, resolve_token()) {
+    let req = match build_request(args, resolve_token(workspace_flag)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("roost: {e}\n\n{USAGE}");
             return 2;
         }
     };
-    let sock = std::env::var_os("ROOST_SOCK").map(Into::into).unwrap_or_else(socket_path);
+    // Target precedence (control-targeting spec): an explicit `-w` flag
+    // beats even `ROOST_SOCK` — the flag is the one way to reach *another*
+    // workspace from inside a pane, and `socket_path` already names the
+    // selected workspace's socket. Without a flag, `ROOST_SOCK` keeps
+    // winning exactly where it does today (in-pane), and `socket_path`
+    // falls back to the workspace `ROOST_WORKSPACE` named, else default.
+    let sock_env = std::env::var_os("ROOST_SOCK");
+    let sock = match workspace_flag {
+        Some(_) => socket_path(),
+        None => sock_env.clone().map(PathBuf::from).unwrap_or_else(socket_path),
+    };
     let deadline = reply_timeout(verb, &req);
     match send_request(&sock, &req, deadline) {
         Ok(reply) => {
@@ -284,23 +451,89 @@ fn run(args: &[String]) -> i32 {
             1
         }
         Err(e) => {
-            eprintln!("roost: cannot reach a running roost ({e}). Is one open in this workspace?");
+            // With several workspaces possible, "cannot reach" alone leaves
+            // the caller guessing which roost they meant. Name the place
+            // that was actually tried, probe the instance locks for ones
+            // actually running, and hand over the flag that targets them.
+            let running = FsStore::running_workspaces();
+            let place = target_place(workspace_flag, sock_env.as_deref());
+            eprintln!("{}", unreachable_message(&place, &running, &e));
             1
         }
     }
 }
 
+/// The place named in `unreachable_message` and the lock-refusal message
+/// (D9): the workspace this call targeted, in the words a user typed —
+/// `the default workspace` or `workspace '<name>'`. `-w` names its own
+/// value; with no flag, `FsStore::workspace_name()` (resolved once at
+/// startup from `-w`/`ROOST_WORKSPACE`/default, so it already agrees with
+/// whichever of those actually picked `sock` above) is what was tried.
+fn workspace_place(name: &str) -> String {
+    if name == DEFAULT_WORKSPACE {
+        "the default workspace".to_string()
+    } else {
+        format!("workspace '{name}'")
+    }
+}
+
+/// Same job as `workspace_place`, but for the one case a workspace name
+/// alone can't describe: an in-pane call with no `-w`, where `run` dials
+/// `$ROOST_SOCK` directly rather than anything `FsStore::workspace_name()`
+/// resolved (which may not even agree — `$ROOST_WORKSPACE`, if set at all,
+/// names the *calling* pane's workspace, not necessarily the socket it was
+/// pointed at). `sock_env` is `run`'s own already-read `$ROOST_SOCK`, so this
+/// can never disagree with what `sock` actually became.
+fn target_place(workspace_flag: Option<&str>, sock_env: Option<&std::ffi::OsStr>) -> String {
+    if let Some(name) = workspace_flag {
+        return workspace_place(name);
+    }
+    if let Some(s) = sock_env {
+        return format!("the roost at {}", Path::new(s).display());
+    }
+    workspace_place(FsStore::workspace_name())
+}
+
+/// The control client's unreachable error (D9): `place` (see `target_place`),
+/// the workspaces with a live instance (probed via their locks), and the
+/// `-w` suggestion — or the plain "nothing is running anywhere" when the
+/// probe comes back empty. `place` and `running` are injected so the wording
+/// is unit-testable without touching process env.
+fn unreachable_message(place: &str, running: &[String], e: &std::io::Error) -> String {
+    let mut msg = format!("roost: cannot reach a running roost in {place} ({e}).");
+    if running.is_empty() {
+        msg.push_str("\nNo roost is running in any workspace.");
+    } else {
+        // Suggest the first one literally: the whole point is a copy-pasteable
+        // next command, not a description.
+        msg.push_str(&format!(
+            "\nRunning in: {} — target one with `roost -w {}` (`roost ws ls` lists workspaces).",
+            running.join(", "),
+            running[0]
+        ));
+    }
+    msg
+}
+
 /// The control credential: explicit env, else the pane's own token (an
 /// in-pane agent authenticates as its pane — scoped to its spawned subtree
 /// and audited as that pane), else the fleet token file (an external
-/// operator, which has no `$ROOST_TOKEN` in its env).
-fn resolve_token() -> String {
+/// operator, which has no `$ROOST_TOKEN` in its env). An explicit `-w`
+/// skips `$ROOST_TOKEN`: it authenticates the *calling* pane against its own
+/// instance, not whatever `-w` is targeting, so a cross-workspace call falls
+/// straight through to the target workspace's own fleet token on disk.
+fn resolve_token(workspace_flag: Option<&str>) -> String {
     if let Ok(t) = std::env::var("ROOST_CONTROL_TOKEN") {
         return t;
     }
-    if let Ok(t) = std::env::var("ROOST_TOKEN") {
-        return t;
+    if workspace_flag.is_none() {
+        if let Ok(t) = std::env::var("ROOST_TOKEN") {
+            return t;
+        }
     }
+    // Workspace-aware even with no flag: `FsStore::state_dir()` already
+    // reflects whatever `init_workspace` resolved (flag, else
+    // `ROOST_WORKSPACE`, else default) by the time this runs.
     let path = FsStore::default_path().with_file_name("control.token");
     std::fs::read_to_string(path).map(|t| t.trim().to_string()).unwrap_or_default()
 }
@@ -437,9 +670,19 @@ fn end_of_options(args: &[String]) -> usize {
 /// with whatever it introduced) while the reply still said ok. Mirrors the
 /// wire side's own invalid-`--until` error: name what was wrong, then
 /// enumerate what's actually valid for this verb.
+///
+/// For every verb but `send`, a single-dash token (`-x`, or a malformed
+/// `-w` that `strip_workspace_flag` didn't recognise as one) is rejected
+/// the same way: none of these verbs' own positionals are free text, so a
+/// leftover `-`-prefixed token is always a mistake, never data — and
+/// `positional` below would otherwise silently swallow it as an unused
+/// extra positional instead of erroring (e.g. `close` only ever reads its
+/// first positional). `send`'s positionals ARE free text — a message may
+/// itself start with `-` — so there only a recognised `--flag` counts.
 fn reject_unknown_flags(verb: &str, args: &[String], allowed: &[&str]) -> Result<(), String> {
     for a in &args[..end_of_options(args)] {
-        if a.starts_with("--") && !allowed.contains(&a.as_str()) {
+        let flag_shaped = if verb == "send" { a.starts_with("--") } else { a.starts_with('-') };
+        if flag_shaped && !allowed.contains(&a.as_str()) {
             let opts = if allowed.is_empty() { "(none)".to_string() } else { allowed.join("|") };
             return Err(format!("{verb}: unknown flag {a} (valid: {opts})"));
         }
@@ -459,8 +702,8 @@ fn positional(args: &[String]) -> Vec<String> {
     while i < end {
         let a = &args[i];
         if a.starts_with("--") {
-            // --cwd/--input/--tail take a value; skip it.
-            if matches!(a.as_str(), "--cwd" | "--input" | "--tail" | "--until" | "--timeout") {
+            // --cwd/--input/--tail/--until/--timeout take a value; skip it.
+            if VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
                 i += 2;
             } else {
                 i += 1;
@@ -687,10 +930,517 @@ fn run_keys() -> i32 {
     }
 }
 
+const WS_HELP: &str = "\
+roost ws [ls [--json] | rm NAME | mv OLD NEW]
+Workspaces, answered from the state root's files with nothing running.
+
+  roost ws            same as `ws ls`: one line per workspace (default plus
+                      every directory under <root>/workspaces), tab-separated:
+                      name, running or idle, tabs=, panes=, adapters=, saved=
+  roost ws ls --json  the same fields as a JSON array on stdout
+  roost ws rm NAME    delete an idle workspace's directory and everything in
+                      it (claims under <root>/claims/ belong to sessions, not
+                      workspaces, and are never touched)
+  roost ws mv OLD NEW rename an idle workspace's directory
+
+`running`/`idle` comes from the workspace's instance lock, probed without
+holding it; tabs, panes and adapters come from reading the workspace's
+workspace.json read-only, and `saved` is that file's last-modified time
+(`-` or null when there is none). No socket is ever opened.
+
+Exit codes: 0 ok / 1 refused (running, unknown, reserved `default`) / 2
+usage error (bad name, wrong arguments).";
+
+/// A `ws` sub-command, parsed off argv before anything touches the
+/// filesystem — the pure half of the dispatch, so the argument grammar is
+/// unit-testable and the execution half below stays a straight line.
+#[derive(Debug, PartialEq)]
+enum WsCmd {
+    List { json: bool },
+    Rm(String),
+    Mv(String, String),
+}
+
+fn parse_ws_args(args: &[String]) -> Result<WsCmd, String> {
+    let Some(sub) = args.first() else {
+        // Bare `roost ws` is the listing — the one thing you want from it
+        // most of the time, and the cheapest thing to type.
+        return Ok(WsCmd::List { json: false });
+    };
+    let rest = &args[1..];
+    match sub.as_str() {
+        "ls" => match rest {
+            [] => Ok(WsCmd::List { json: false }),
+            [f] if f.as_str() == "--json" => Ok(WsCmd::List { json: true }),
+            _ => Err("ws ls takes at most --json and nothing else".into()),
+        },
+        "rm" => match rest {
+            [name] => Ok(WsCmd::Rm(name.clone())),
+            _ => Err("ws rm takes exactly one NAME (roost ws rm <name>)".into()),
+        },
+        "mv" => match rest {
+            [old, new] => Ok(WsCmd::Mv(old.clone(), new.clone())),
+            _ => Err("ws mv takes exactly OLD and NEW (roost ws mv <old> <new>)".into()),
+        },
+        other => Err(format!("unknown ws verb: {other} (ls, rm, mv)")),
+    }
+}
+
+/// The `ws` verb family: list, remove and rename workspaces straight off the
+/// state root. Like `keys`, it is a *local* verb — nothing here connects to
+/// a control socket or spawns a client — because its whole job is to answer
+/// "what exists and what is running" before any control verb is aimed
+/// anywhere. All state lives in one directory per workspace, so every
+/// operation below is a plain directory operation plus the same lock probe
+/// the unreachable-error path already uses.
+fn run_ws(args: &[String]) -> i32 {
+    match parse_ws_args(args) {
+        Ok(WsCmd::List { json }) => ws_list(json),
+        Ok(WsCmd::Rm(name)) => ws_rm(&name),
+        Ok(WsCmd::Mv(old, new)) => ws_mv(&old, &new),
+        Err(e) => {
+            eprintln!("roost ws: {e}\n\n{WS_HELP}");
+            2
+        }
+    }
+}
+
+/// `ws ls` / bare `ws`: enumerate every workspace and print one row each.
+/// Files only — the running flag is the lock probe (D6), never a socket
+/// connect. The list is never actually empty (`default` is always listed),
+/// but the spec pins exit 0 for the empty case, so it is handled, not
+/// assumed.
+fn ws_list(json: bool) -> i32 {
+    let rows: Vec<WsRow> = FsStore::workspace_names().iter().map(|n| ws_row(n)).collect();
+    if json {
+        let arr: Vec<serde_json::Value> = rows.iter().map(ws_row_json).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".into()));
+        return 0;
+    }
+    if rows.is_empty() {
+        println!("no workspaces");
+        return 0;
+    }
+    for row in &rows {
+        println!("{}", ws_row_text(row));
+    }
+    0
+}
+
+/// One workspace's row for `ws ls`: everything the listing shows, gathered
+/// without holding any lock and without opening any socket. `last_saved` is
+/// the workspace.json mtime as RFC3339 UTC — the timestamp the *save* path
+/// last touched, which is the honest answer to "when did I last work here".
+struct WsRow {
+    name: String,
+    running: bool,
+    tabs: usize,
+    panes: usize,
+    adapters: Vec<String>,
+    last_saved: Option<String>,
+}
+
+fn ws_row(name: &str) -> WsRow {
+    let dir = FsStore::workspace_dir(name);
+    let running = FsStore::instance_running(&dir);
+    let path = dir.join("workspace.json");
+    // Missing or unparseable state shows zeros, never an error: a workspace
+    // that has never been saved (or was hand-mangled) is still a workspace
+    // someone may be running, and the listing must not die on it. Same
+    // degrade for a file past `WS_ROW_READ_CAP` — a legitimate workspace.json
+    // is a few KiB even with dozens of panes, so anything that large is
+    // corrupt or not a workspace file at all, and `ws ls` must never balloon
+    // its own memory reading one.
+    let (tabs, panes, adapters) = read_capped(&path, WS_ROW_READ_CAP)
+        .map(|raw| ws_counts(&raw))
+        .unwrap_or((0, 0, Vec::new()));
+    let last_saved = std::fs::metadata(&path).and_then(|m| m.modified()).ok().map(rfc3339);
+    WsRow { name: name.to_string(), running, tabs, panes, adapters, last_saved }
+}
+
+/// `workspace.json`'s read cap for the listing (B7): past this, `ws_row`
+/// degrades to the same zeroed row a missing or corrupt file already gets.
+const WS_ROW_READ_CAP: u64 = 4 * 1024 * 1024;
+
+/// Read `path` as UTF-8, but never more than `cap` bytes — a file past the
+/// cap is truncated mid-read rather than fully buffered, so truncated (and
+/// therefore invalid) JSON is what a caller like `ws_counts` sees, not an
+/// unbounded allocation.
+fn read_capped(path: &Path, cap: u64) -> std::io::Result<String> {
+    let mut out = String::new();
+    std::fs::File::open(path)?.take(cap).read_to_string(&mut out)?;
+    Ok(out)
+}
+
+/// Tab count, pane count and the distinct adapters in use, from the text of
+/// a workspace.json read read-only. This deliberately parses *past* a future
+/// `version` — the SCHEMA_VERSION guard exists to protect write-back, and
+/// nothing here ever writes — and returns zeros for anything it cannot
+/// parse, so a corrupt or newer file can never crash the listing.
+fn ws_counts(raw: &str) -> (usize, usize, Vec<String>) {
+    let Ok(ws) = serde_json::from_str::<Workspace>(raw) else { return (0, 0, Vec::new()) };
+    let panes: usize = ws.tabs.iter().map(|t| t.panes.len()).sum();
+    let adapters: BTreeSet<String> =
+        ws.tabs.iter().flat_map(|t| t.panes.values()).map(|p| p.adapter.clone()).collect();
+    (ws.tabs.len(), panes, adapters.into_iter().collect())
+}
+
+/// The text row: tab-separated so `cut`/`awk` keep working (the same
+/// convention `roost keys` prints under — a caller who wants columns has
+/// `column -t`), with self-describing `key=value` fields and `-` for "none",
+/// so an empty adapters list or a never-saved workspace is unambiguous at a
+/// glance and never an empty field a parser silently drops.
+fn ws_row_text(row: &WsRow) -> String {
+    let state = if row.running { "running" } else { "idle" };
+    let adapters = if row.adapters.is_empty() { "-".to_string() } else { row.adapters.join(",") };
+    let saved = row.last_saved.clone().unwrap_or_else(|| "-".into());
+    format!(
+        "{}\t{}\ttabs={}\tpanes={}\tadapters={}\tsaved={}",
+        row.name, state, row.tabs, row.panes, adapters, saved
+    )
+}
+
+/// The JSON row for `ws ls --json`: the same fields, `last_saved` null when
+/// there is no workspace.json. Stdout carries nothing but the array.
+fn ws_row_json(row: &WsRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": row.name,
+        "running": row.running,
+        "tabs": row.tabs,
+        "panes": row.panes,
+        "adapters": row.adapters,
+        "last_saved": row.last_saved,
+    })
+}
+
+/// Why `lock_workspace_exclusive` failed — so the caller can tell a broken
+/// lock file (EACCES, a read-only mount) apart from an actually-running
+/// workspace, which is `try_lock`'s failure alone.
+enum LockExclusiveError {
+    /// Opening (or creating) the lock file itself failed — nothing to do
+    /// with whether an instance is running.
+    Open(PathBuf, std::io::Error),
+    /// The file opened fine; `try_lock` refused it, meaning another process
+    /// already holds it.
+    Running,
+}
+
+/// Take a workspace directory's own exclusive `workspace.lock` for the
+/// duration of a destructive `ws` operation (rm/mv), replacing the old
+/// probe-then-act window — `FsStore::instance_running` checked, then
+/// dropped its handle, *before* the remove/rename ran — during which an
+/// instance could start and race the operation out from under it. The
+/// caller holds the returned handle across the whole operation instead; a
+/// failed `try_lock` **is** the "running" refusal, not a separate check —
+/// but a failed *open* is a different problem (permissions, a read-only
+/// mount) that must not be misreported as one, see `LockExclusiveError`.
+fn lock_workspace_exclusive(dir: &Path) -> Result<std::fs::File, LockExclusiveError> {
+    let path = dir.join("workspace.lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| LockExclusiveError::Open(path, e))?;
+    file.try_lock().map_err(|_| LockExclusiveError::Running)?;
+    Ok(file)
+}
+
+/// `ws rm <name>`: delete one workspace's directory, nothing else. The
+/// guard order is the safety story: a reserved or invalid name is refused
+/// before any path is computed, a missing or running workspace before
+/// anything is removed — and what is removed is exactly
+/// `<root>/workspaces/<name>`, so the root and the sessions' claims beside
+/// it (D7) are unreachable by construction.
+fn ws_rm(name: &str) -> i32 {
+    if let Err(e) = check_workspace_name(name) {
+        eprintln!("roost ws rm: {e}\n\n{WS_HELP}");
+        return 2;
+    }
+    // The reserved half of the creatable check is the only way here (the
+    // grammar half already exited above): `default` cannot be deleted.
+    if let Err(e) = check_creatable_name(name) {
+        eprintln!("roost ws rm: {e}");
+        return 1;
+    }
+    let dir = FsStore::workspace_dir(name);
+    if !dir.is_dir() {
+        eprintln!("roost ws rm: no workspace named '{name}' (`roost ws ls` lists workspaces)");
+        return 1;
+    }
+    let _lock = match lock_workspace_exclusive(&dir) {
+        Ok(lock) => lock,
+        Err(LockExclusiveError::Open(path, e)) => {
+            eprintln!("roost ws rm: cannot open lock file {}: {e}", path.display());
+            return 1;
+        }
+        Err(LockExclusiveError::Running) => {
+            eprintln!(
+                "roost ws rm: workspace '{name}' is running — close it before removing \
+                 (`roost ws ls` lists workspaces)"
+            );
+            return 1;
+        }
+    };
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        eprintln!("roost ws rm: could not remove '{name}' ({e})");
+        return 1;
+    }
+    0
+}
+
+/// `ws mv <old> <new>`: rename one workspace's directory. Same guard order
+/// as `ws rm`, plus the new name's own validation — a bad NEW is a usage
+/// error (2, like every other name error), while refusals about OLD
+/// (`default`, unknown, running) and a taken destination are runtime
+/// refusals (1). The rename is one `fs::rename` inside `workspaces/`, same
+/// filesystem, atomic where the platform allows it to be.
+fn ws_mv(old: &str, new: &str) -> i32 {
+    if let Err(e) = check_creatable_name(new) {
+        eprintln!("roost ws mv: {e}\n\n{WS_HELP}");
+        return 2;
+    }
+    if old == DEFAULT_WORKSPACE {
+        // check_creatable_name's own message, verbatim: `default` is
+        // reserved for the default workspace, which is lived in, not moved.
+        eprintln!("roost ws mv: {}", check_creatable_name(old).unwrap_err());
+        return 1;
+    }
+    let from = FsStore::workspace_dir(old);
+    if !from.is_dir() {
+        eprintln!("roost ws mv: no workspace named '{old}' (`roost ws ls` lists workspaces)");
+        return 1;
+    }
+    let _lock = match lock_workspace_exclusive(&from) {
+        Ok(lock) => lock,
+        Err(LockExclusiveError::Open(path, e)) => {
+            eprintln!("roost ws mv: cannot open lock file {}: {e}", path.display());
+            return 1;
+        }
+        Err(LockExclusiveError::Running) => {
+            eprintln!(
+                "roost ws mv: workspace '{old}' is running — close it before renaming \
+                 (`roost ws ls` lists workspaces)"
+            );
+            return 1;
+        }
+    };
+    let to = FsStore::workspace_dir(new);
+    if to.exists() {
+        eprintln!("roost ws mv: workspace '{new}' already exists (`roost ws ls` lists workspaces)");
+        return 1;
+    }
+    if let Err(e) = std::fs::rename(&from, &to) {
+        eprintln!("roost ws mv: could not rename '{old}' to '{new}' ({e})");
+        return 1;
+    }
+    0
+}
+
+/// RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`), seconds precision, for a file
+/// mtime. Hand-rolled because the one wall-clock string in the CLI does not
+/// justify a date-time dependency: the conversion is the standard
+/// days-from-epoch algorithm (Hinnant), exact across the range `SystemTime`
+/// can name, and pinned to known timestamps in the tests below.
+fn rfc3339(t: SystemTime) -> String {
+    let secs = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let sod = secs.rem_euclid(86_400);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", sod / 3600, (sod % 3600) / 60, sod % 60)
+}
+
+/// Days since 1970-01-01 to (year, month, day), proleptic Gregorian —
+/// Howard Hinnant's `civil_from_days`. `div_euclid`/`rem_euclid` keep the
+/// era arithmetic correct for pre-epoch (negative) day counts too.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_request;
+    use super::{lock_workspace_exclusive, LockExclusiveError};
+    use super::{strip_workspace_flag, target_place, unreachable_message, VERBS};
     use crate::core::control::{Method, Request};
+    use std::path::Path;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The pre-pass must find the workspace flag in every position for
+    /// every verb — before the verb, after it, in either `-w` spelling —
+    /// and hand back argv with the verb still first.
+    #[test]
+    fn cli_workspace_flag_strips_from_every_position_of_every_verb() {
+        for verb in VERBS {
+            let (flag, rest) = strip_workspace_flag(&argv(&["-w", "x", verb])).unwrap();
+            assert_eq!(flag.as_deref(), Some("x"), "-w before {verb}");
+            assert_eq!(rest, vec![verb.to_string()]);
+
+            let (flag, rest) = strip_workspace_flag(&argv(&[verb, "-w", "x"])).unwrap();
+            assert_eq!(flag.as_deref(), Some("x"), "-w after {verb}");
+            assert_eq!(rest, vec![verb.to_string()]);
+
+            let (flag, rest) = strip_workspace_flag(&argv(&[verb, "--workspace", "x"])).unwrap();
+            assert_eq!(flag.as_deref(), Some("x"), "--workspace after {verb}");
+            assert_eq!(rest, vec![verb.to_string()]);
+
+            let (flag, rest) = strip_workspace_flag(&argv(&[verb, "--workspace=x"])).unwrap();
+            assert_eq!(flag.as_deref(), Some("x"), "--workspace= after {verb}");
+            assert_eq!(rest, vec![verb.to_string()]);
+        }
+    }
+
+    /// B1: `-w` before the verb, or immediately after it (before any
+    /// positional exists at all). A value-taking verb option's own value
+    /// doesn't count as that positional, so `-w` still reaches past `--cwd
+    /// <dir>` either side of it. None of these cases actually cross a
+    /// positional, so they hold the same for every verb, `send` included —
+    /// the verb-specific boundary itself (anywhere but `send`; `send`'s own
+    /// text past its PANE) is covered by the tests below.
+    #[test]
+    fn cli_workspace_flag_is_recognised_before_the_verb_and_up_to_its_first_positional() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["-w", "b", "list"], "list"),
+            (&["list", "-w", "b"], "list"),
+            (&["send", "-w", "b", "3", "hi"], "send"),
+            (&["spawn", "-w", "b", "--cwd", "x", "claude"], "spawn"),
+            (&["spawn", "--cwd", "x", "-w", "b", "claude"], "spawn"),
+        ];
+        for (args, verb) in cases {
+            let (flag, rest) = strip_workspace_flag(&argv(args)).unwrap();
+            assert_eq!(flag.as_deref(), Some("b"), "{args:?}");
+            assert!(rest[0] == *verb && !rest.contains(&"-w".to_string()), "{args:?}: {rest:?}");
+        }
+    }
+
+    /// The bug B1 closes: `-w` inside a verb's own text (past its first
+    /// positional) is data, not a selection — a literal `-w` past `--` is
+    /// the same case at the extreme.
+    #[test]
+    fn cli_workspace_flag_past_the_first_positional_is_never_a_selection() {
+        let (flag, rest) = strip_workspace_flag(&argv(&["send", "3", "-w", "b", "hi"])).unwrap();
+        assert_eq!(flag, None, "the PANE ends flag scanning for `send`");
+        assert_eq!(rest, argv(&["send", "3", "-w", "b", "hi"]));
+
+        let (flag, rest) =
+            strip_workspace_flag(&argv(&["send", "3", "add", "-w", "flag", "to", "it"])).unwrap();
+        assert_eq!(flag, None);
+        assert_eq!(rest, argv(&["send", "3", "add", "-w", "flag", "to", "it"]));
+
+        let (flag, rest) = strip_workspace_flag(&argv(&["send", "5", "--", "-w", "x"])).unwrap();
+        assert_eq!(flag, None, "past `--`, -w is text, not a selection");
+        assert_eq!(rest, argv(&["send", "5", "--", "-w", "x"]));
+    }
+
+    /// B1 widened (2026-09-04): every verb but `send` never carries free
+    /// text, so `-w` past the verb's own positional(s) is still a
+    /// selection, not data — `roost close 3 -w b` must target `b`, not
+    /// silently fall through to the default workspace.
+    #[test]
+    fn cli_workspace_flag_after_the_verbs_positional_selects_it_for_every_verb_but_send() {
+        let cases: &[&[&str]] = &[
+            &["close", "3", "-w", "b"],
+            &["focus", "2", "--workspace", "b"],
+            &["status", "-w", "b"],
+            &["read", "3", "--tail", "5", "-w", "b"],
+        ];
+        for args in cases {
+            let (flag, rest) = strip_workspace_flag(&argv(args)).unwrap();
+            assert_eq!(flag.as_deref(), Some("b"), "{args:?}");
+            assert!(
+                !rest.contains(&"-w".to_string()) && !rest.contains(&"--workspace".to_string()),
+                "{args:?}: {rest:?}"
+            );
+        }
+    }
+
+    /// The flip side of the widening above: `send`'s own text is untouched
+    /// by it — this is the one case that must NOT change.
+    #[test]
+    fn cli_workspace_flag_send_text_is_still_unaffected_by_the_widening() {
+        let (flag, rest) = strip_workspace_flag(&argv(&["send", "3", "-w", "b", "hi"])).unwrap();
+        assert_eq!(flag, None);
+        assert_eq!(rest, argv(&["send", "3", "-w", "b", "hi"]));
+    }
+
+    /// A stray single-dash token that isn't `-w` (a typo, or a flag this
+    /// verb doesn't have) must not be silently swallowed as an unused extra
+    /// positional — `close` only ever reads its first one, so `-x` used to
+    /// vanish instead of erroring. `send`'s own text is exempt: a message
+    /// may itself start with `-`.
+    #[test]
+    fn cli_close_with_a_stray_short_flag_is_a_usage_error() {
+        let (flag, rest) = strip_workspace_flag(&argv(&["close", "3", "-x"])).unwrap();
+        assert_eq!(flag, None, "-x is not -w, so it's left for build_request to reject");
+        let err = build_request(&rest, "T".into()).unwrap_err();
+        assert!(err.contains("unknown flag -x"), "{err}");
+
+        // send's own text may start with `-` and must still go through.
+        assert!(build_request(&argv(&["send", "3", "-x"]), "T".into()).is_ok());
+    }
+
+    /// The flag with no value (`-w` last, `$WORKSPACE` unset in a script)
+    /// is a usage error, not a silent fallthrough to the default workspace.
+    #[test]
+    fn cli_workspace_flag_missing_its_value_is_an_error() {
+        for args in [argv(&["-w"]), argv(&["list", "--workspace"])] {
+            let err = strip_workspace_flag(&args).unwrap_err();
+            assert!(err.contains("needs a workspace name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn cli_workspace_flag_given_twice_is_an_error() {
+        let err = strip_workspace_flag(&argv(&["-w", "a", "list", "--workspace=b"])).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    /// D9: the unreachable error must name the tried workspace, list the
+    /// running ones, and hand over a copy-pasteable `-w` command — or say
+    /// plainly that nothing runs anywhere.
+    #[test]
+    fn cli_unreachable_error_names_the_target_and_suggests_the_running_one() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no socket");
+        let msg =
+            unreachable_message("the default workspace", &["a".to_string(), "b".to_string()], &e);
+        assert!(msg.contains("the default workspace"), "{msg}");
+        assert!(msg.contains("a, b"), "must list every running workspace: {msg}");
+        assert!(msg.contains("-w a"), "must suggest a copy-pasteable command: {msg}");
+
+        let msg = unreachable_message("workspace 'x'", &["a".to_string()], &e);
+        assert!(msg.contains("workspace 'x'"), "{msg}");
+        assert!(msg.contains("-w a"), "{msg}");
+
+        let msg = unreachable_message("workspace 'x'", &[], &e);
+        assert!(msg.contains("roost is running in any workspace"), "{msg}");
+    }
+
+    /// A1: an in-pane call with no `-w` names the socket it actually dialed
+    /// (`$ROOST_SOCK`), not whatever workspace this process itself resolved
+    /// — the two can disagree (`$ROOST_WORKSPACE`, if set at all, names the
+    /// *calling* pane's own workspace). An explicit `-w` always names its
+    /// own value directly, with no dependency on process-global state.
+    #[test]
+    fn cli_target_place_names_the_flag_or_the_socket_actually_dialed() {
+        assert_eq!(target_place(Some("b"), None), "workspace 'b'");
+        assert_eq!(target_place(Some("default"), None), "the default workspace");
+        let sock = std::ffi::OsStr::new("/tmp/a/roost.sock");
+        assert_eq!(target_place(None, Some(sock)), "the roost at /tmp/a/roost.sock");
+    }
 
     fn parse(args: &[&str]) -> Request {
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -843,6 +1593,23 @@ mod tests {
                 super::verb_help(v).starts_with(&format!("roost {v}")),
                 "{v}'s help must lead with its own usage"
             );
+        }
+    }
+
+    /// A failed *open* (here: a parent directory that doesn't exist — stands
+    /// in for EACCES/a read-only mount, which a test can't rely on having
+    /// permission to provoke) must surface as an open error, not get
+    /// misreported as "the workspace is running" — that message belongs to
+    /// a failed `try_lock` alone.
+    #[test]
+    fn lock_workspace_exclusive_reports_open_failures_distinctly_from_running() {
+        let missing = Path::new("/roost-test-nonexistent-parent-dir/workspace");
+        match lock_workspace_exclusive(missing) {
+            Err(LockExclusiveError::Open(path, _)) => {
+                assert_eq!(path, missing.join("workspace.lock"))
+            }
+            Ok(_) => panic!("expected an open failure under a nonexistent parent directory"),
+            Err(LockExclusiveError::Running) => panic!("an open failure must not read as Running"),
         }
     }
 }

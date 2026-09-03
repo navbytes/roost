@@ -107,10 +107,61 @@ fleet you don't want mixed into your real workspace, a per-project set of
 panes you keep separate, or trying a `config.json` remap without touching
 your own. Delete the directory to throw the whole thing away.
 
-This is also how you run **two roosts at once**: only one roost runs per
-workspace at a time — a second instance on the same state dir refuses to
-start, since they'd race and corrupt `workspace.json` — but two state dirs
-are two independent fleets.
+`ROOST_STATE` is also the **root** named workspaces live under, and the two
+compose — [Workspaces](#workspaces) covers that. For the raw-variable route,
+the rule stands: only one roost runs per state dir at a time — a second
+instance on the same dir refuses to start, since they'd race and corrupt
+`workspace.json`.
+
+### Workspaces
+
+To run several roosts at once, give each one a **name** instead of a raw
+directory. A workspace is a named, independent fleet under the shared state
+root — its own layout, its own control socket, its own session claims — and
+exactly one roost runs in it at a time:
+
+```console
+$ roost -w tripto          # also --workspace tripto, or ROOST_WORKSPACE=tripto
+$ roost ws                 # list every workspace: running/idle, tabs, panes, adapters, last saved
+$ roost ws ls --json       # the same fields as JSON
+$ roost ws mv scratch tripto   # rename an idle workspace
+$ roost ws rm scratch          # delete an idle workspace (its agent sessions are untouched)
+```
+
+- **One window per workspace.** A second `roost -w tripto` is refused with
+  the name of the workspace and a pointer at `-w` and `roost ws ls`. There
+  is no in-TUI switcher: a switch is quit plus relaunch, and the quit guard
+  still confirms while an agent is working.
+- **Names** are 1–32 characters of `a-z`, `0-9`, `.`, `_`, `-` (lowercase
+  only, so names never collide on case-insensitive filesystems). Creation is
+  implicit: a new name starts fresh on first use. `default` is the unnamed
+  workspace roost opens with no flag — it can be listed but never renamed or
+  deleted.
+- **`ROOST_STATE` stays the root override** — the two compose:
+  `ROOST_STATE=/tmp/r roost -w a` puts workspace `a` under `/tmp/r`, and
+  `ROOST_STATE=/tmp/r roost ws ls` lists it. Plain `ROOST_STATE` isolation
+  (above) keeps its exact old behaviour, including per-directory config.
+- **Keybindings are shared.** A named workspace reads whatever the default
+  workspace would (below: the root `config.json` or the `~/.config/roost/`
+  one, whichever is live); if the workspace directory has its own
+  `config.json`, that file replaces it wholesale for that workspace (never
+  merged).
+- **Targeting from a plain shell.** Out-of-pane verbs take `-w` anywhere on
+  the line, before or after the verb (`roost -w b list`, `roost close 3 -w
+  b`) — except inside `send`'s own text, where `-w` is data, not a flag,
+  past its PANE argument (`roost send 3 -w b hi` sends the literal text
+  "-w b hi" to pane 3); inside a pane your own instance is targeted
+  automatically; the flag beats `ROOST_WORKSPACE`, which beats the default.
+  When nothing answers, the error names the workspace it tried and lists
+  the ones that are running.
+- **One agent session, one driver.** Every running instance holds an
+  exclusive claim per agent session it drives, so two windows can never
+  resume or adopt the same conversation — the second one shows a placeholder
+  naming the workspace that holds it, and resumes once that one quits.
+- **Identity.** Panes get `$ROOST_WORKSPACE`; the terminal title reads
+  `roost · <workspace> · <pane>` for named workspaces (`roost · <pane>` for
+  the default); `roost status` reports the workspace; desktop notifications
+  carry its name. On-screen chrome is unchanged.
 
 It isolates workspace state *only*. It still installs and updates the pi
 extension and the Claude Code hooks in your real `~/.pi` and `~/.claude`
@@ -130,24 +181,29 @@ you write by hand: `config.json` lives in `~/.config/roost/` (on macOS,
 the state dir beside `workspace.json`, so nothing breaks if you already have
 one there — but `~/.config` is where a new one belongs, and `roost keys`
 prints the exact path it uses. Under `ROOST_STATE` the search stops in that
-directory, by design — you named it, so there is nothing to report.
+directory, by design — you named it, so there is nothing to report. Named
+workspaces [share the root config](#workspaces); a `config.json` inside a
+workspace's own directory replaces it wholesale for that workspace.
 
 ### Environment
 
 roost has no flags for any of this — the whole outside-the-TUI surface is
-four variables, set on the command that launches it:
+five variables, set on the command that launches it:
 
 | Variable | Effect |
 |---|---|
 | `ROOST_STATE=DIR` | use `DIR` as the state dir: an independent workspace, config and control socket (above). Created if missing |
+| `ROOST_WORKSPACE=NAME` | launch directly into the named workspace instead of `default` (same as `-w NAME`; see Workspaces) |
 | `ROOST_NO_EXT_INSTALL=1` | don't install or update the pi extension and Claude Code hooks in `~/.pi` / `~/.claude` (below) |
 | `ROOST_NO_QOS=1` | don't raise input-thread scheduling priority on macOS (below) |
 | `ROOST_DEBUG=1` | append control-plane diagnostics — dropped socket lines, shed connections — to `<state>/roost.log`. Any value enables it; the file is written only when there is something to say, and never to the TUI's own output |
 
-Inside every pane roost exports three more, so an agent can call back into
-the fleet — `$ROOST_SOCK` (the control socket), `$ROOST_PANE` (which pane it
-is) and `$ROOST_TOKEN` (authenticates *as* that pane). You don't set these;
-[Controlling roost](#controlling-roost-cli--llm) covers what they're for.
+Inside every pane roost exports four more, so an agent can call back into the
+fleet or know where it's running — `$ROOST_SOCK` (the control socket),
+`$ROOST_PANE` (which pane it is), `$ROOST_TOKEN` (authenticates *as* that
+pane) and `$ROOST_WORKSPACE` (which workspace it's in, `default` for the
+unnamed one). You don't set these; [Controlling roost](#controlling-roost-cli--llm)
+covers what they're for.
 
 On macOS roost promotes its own input threads to interactive scheduling
 priority so typing stays crisp while agent panes saturate the CPU (the

@@ -5986,6 +5986,8 @@ row's — widen ADAPTER_COL",
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap()
     }
@@ -6221,6 +6223,8 @@ row's — widen ADAPTER_COL",
                 (0, 0),
                 None,
                 TokenTable::new().unwrap(),
+                "default".into(),
+                Box::new(crate::ports::fakes::MemClaims::default()),
             )
             .unwrap();
             let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
@@ -7056,6 +7060,8 @@ row's — widen ADAPTER_COL",
             (0, 0),
             None,
             TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
         )
         .unwrap();
 
