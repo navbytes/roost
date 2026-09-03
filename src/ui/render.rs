@@ -4793,7 +4793,7 @@ mod tests {
         for cfg in [
             r#"{}"#,
             // The README's own worked example.
-            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            r#"{"keys": {"alt+shift+z": "disable", "alt+v": "toggle_float"}}"#,
             // The four the audit measured at 99, 107, 107 and 123.
             r#"{"keys": {"alt+1": "disable"}}"#,
             r#"{"keys": {"alt+h": "disable"}}"#,
@@ -4911,11 +4911,13 @@ mod tests {
     /// the overlay teaches the new key and stops teaching the old one.
     /// Before F1 both surfaces were `&'static str` literals and this was
     /// impossible — the README's own escape-hatch example produced a roost
-    /// whose `Alt+?` still taught `Alt+f`.
+    /// whose `Alt+?` still taught the old chord. Uses `alt+shift+z`
+    /// (ToggleFloat's 2026-09-03 default) rather than the pre-re-key
+    /// `alt+f` — see the amendment on `default_chord_action` for why.
     #[test]
     fn a_remapped_chord_is_taught_at_its_new_key() {
         let (keymap, diagnostics) = Keymap::parse(
-            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            r#"{"keys": {"alt+shift+z": "disable", "alt+v": "toggle_float"}}"#,
             "config.json",
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -4929,7 +4931,7 @@ mod tests {
             .join("\n");
         assert!(drawn.contains("Alt+v floating scratch shell"), "taught at its new chord");
         assert!(
-            !drawn.contains("Alt+f "),
+            !drawn.contains("Alt+Shift+z "),
             "and not at the old one — that key forwards to the pane now",
         );
     }

@@ -35,8 +35,7 @@ these defaults.
 | `Alt+s` / `Alt+Shift+s` | stack: collapse the surrounding split into a stack, focused pane expanded — **press again to absorb the next split out**, up to the whole tab / explode the stack back into the split it came from |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
 | `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
-| `Alt+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) |
-| `Alt+f` | toggle the floating scratch shell (readline forward-word collision — already swallowed; raw mode below gets it back) |
+| `Alt+z` / `Alt+Shift+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) / toggle the floating scratch shell — the two view toggles, on one physical key |
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
 | `Alt+;` | go back to the pane you came from — toggles, and follows across tabs (tmux's `prefix ;`) |
 | `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |
@@ -66,12 +65,25 @@ a raw-focused pane collapses it to one pair (`Alt+Shift+p exit raw`).
 ## Remap or disable a key
 
 Every shortcut above lives on `Alt`, which can collide with your shell's own
-readline bindings (`Alt+f`/`Alt+b`/`Alt+d` are the usual culprits). Fix one in
-`config.json`. No file — the default — and roost behaves exactly as
-documented above.
+readline bindings (`Alt+b`/`Alt+d` are the usual culprits — `Alt+f` used to
+be a third, but roost stopped binding it by default on 2026-09-03: see
+below). Fix one in `config.json`. No file — the default — and roost behaves
+exactly as documented above.
 
 ```json
-{ "keys": { "alt+f": "disable", "alt+v": "toggle_float" } }
+{ "keys": { "alt+shift+z": "disable", "alt+v": "toggle_float" } }
+```
+
+**Want the old `Alt+f` chord back?** Roost bound `Action::ToggleFloat` to
+`Alt+f` through v0.1.x, and unbinding it by default was a deliberate,
+non-negotiable fix — on any terminal without the kitty keyboard protocol,
+Alt+Right is delivered as the *identical bytes* as Alt+f (`ESC f`), so
+binding `Alt+f` at all meant Alt+Right silently opened the float. If you
+still want the shell's readline `M-f` forward-word given up for the float
+instead, that is now an informed choice you make yourself:
+
+```json
+{ "keys": { "alt+f": "toggle_float" } }
 ```
 
 ### Where the file goes

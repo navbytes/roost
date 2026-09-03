@@ -238,7 +238,7 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   focus inside the tab; switching tabs, closing the zoomed pane, or any
   layout edit (new pane, split, stack, `Alt+g`) exits it first, so the
   layout never changes invisibly underneath you.
-- **Floating scratch pane (`Alt+f`).** One app-wide floating shell, toggled
+- **Floating scratch pane (`Alt+Shift+z`).** One app-wide floating shell, toggled
   in and out of view — the process keeps running while it's hidden. Moving
   focus away hides it automatically; `Alt+w` while it's focused kills it for
   real. Honest scope: it's session-only, never written to `workspace.json`,

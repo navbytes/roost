@@ -1859,6 +1859,10 @@ explain-itself surface, and it explained only the chords. It now ends with
   `Alt+t / Alt+1..9` idiom the cap has always demanded: `Alt+s / Alt+o`
   (split ops), `Alt+z / Alt+f` (the two view toggles), `Alt+w / Alt+u`
   (close and its undo). 20 rows before, 20 rows after.
+  **[2026-09-03: the float half of this pair re-keyed from `Alt+f` to
+  `Alt+Shift+z` — see the dated amendment below. "The two view toggles"
+  is exactly why that destination was chosen: this line is what made the
+  pairing structural instead of coincidental.]**
 - **Rejected: scrolling the overlay** (the U23 proposal's other option). It
   would have bought unlimited rows at the cost of C15's "any key closes it"
   — the dismiss rule would have to carve out arrow/PgUp/PgDn keys, so the
@@ -2580,7 +2584,7 @@ unicode-width measuring as C4's badge: the `· {n} hidden` clause drops
 first, then the whole title — the identity badge (a separate row, C4)
 always keeps its space. No new hitboxes: a border title is cosmetic only.
 
-### C22 — Floating scratch pane (Alt+f) — [Added 2026-07-22, fleet features]
+### C22 — Floating scratch pane (Alt+Shift+z) — [Added 2026-07-22, fleet features; re-keyed 2026-09-03]
 
 **Current:** no floating anything. All panes live in a tab's layout tree;
 `hit_test` scans tiled rects in order (`mouse.rs:37–47`); pane ids are
@@ -2591,6 +2595,19 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   own Alt+f. (Collision note, flagged per brief: Alt+f is readline
   forward-word; roost already swallows it today (`input.rs:72–77`), and raw
   mode (C23) is the remedy for panes that need it back.)
+  **[Re-keyed 2026-09-03]** — the collision note above turned out to
+  understate the cost: on a terminal without the kitty keyboard protocol,
+  Alt+Right is delivered as the *same bytes* as Alt+f (`ESC f`, the
+  meta-ESC pair), so pressing Alt+Right opened the float. Raw mode is a
+  per-pane opt-in and cannot fix a global chord, and the collision is
+  unfixable at the byte level — the only fix is to stop binding `Alt+f`.
+  `Action::ToggleFloat` now binds **Alt+Shift+z**, paired onto `Alt+z`
+  (`Action::ToggleZoom`) as the two view toggles this section's own U23
+  amendment already named them (§8); `Alt+f` is unbound by default and
+  forwards to the pane (U5), completing the `b`/`d`/`f` readline
+  word-motion trio §8 leaves free. See the dated amendment on
+  `default_chord_action` in `src/ui/input.rs` and the §8 amendment below
+  for the full reasoning.
 - **One float slot, app-wide** (not per tab): `Option<Float>` holding
   `{ id, spec, shown, prev_focus }`. The scratch's roadmap cousin (a floating
   *picker*) is explicitly out of scope.
@@ -2647,7 +2664,8 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
      without this, `spawn_child`'s empty-tab fallback at `app.rs:1425–1427`
      would wipe the tab's layout when asked to split a pane the tree doesn't
      contain.)
-  4. Alt+w closes it for real (above); Alt+f hides it.
+  4. Alt+w closes it for real (above); Alt+Shift+z hides it (`Alt+f`
+     before the 2026-09-03 re-key).
 
   **[Amended 2026-08-19, C33 and C37]** Rule 3's list gains `Alt+Shift+hjkl`
   and `Alt+Shift+g` — a swap and a reverse layout cycle are both structural
@@ -2683,6 +2701,52 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   `close` of the float is refused with `cannot close the scratch pane`.
 - Unit tests: spawn-once/hide/show lifecycle; id-allocation guard; geometry
   formula incl. refusal floor; focus rules 1–3; hit-test ordering.
+
+**[Amended 2026-09-03 — the Alt+f re-key.]** `Action::ToggleFloat` moves off
+`Alt+f` onto `Alt+Shift+z`; `Alt+f` is now deliberately unbound. **Why now:**
+Alt+Right, on any terminal that has not negotiated the kitty keyboard
+protocol, is delivered as the meta-ESC pair `ESC f` — the *identical bytes*
+roost already reads as Alt+f, because `encode_raw`/`translate` never see the
+wire form, only the parsed `KeyEvent`, and crossterm cannot tell "the user
+pressed Alt+Right on a terminal using the old encoding" apart from "the user
+pressed Alt+f" — they are the same input. Every other chord this table
+documents that collides with something a user wants (readline's `M-<`/`M->`
+in the resize family, §8's collision-flags list below) is a *shared* key the
+user opted into losing by choice of keymap; this one silently ate a
+navigation key nobody bound on purpose, on any terminal old enough to lack
+kitty's protocol — which is most of them. Raw mode (C23) cannot fix a global
+chord, and there is no byte-level fix: the only way to stop losing Alt+Right
+is to stop binding Alt+f.
+
+**Why `Alt+Shift+z`, not a fresh unshifted letter.** `Alt+z` is already
+`Action::ToggleZoom`, and this section's own 2026-07-27 U23 amendment (§8's
+copy: "`Alt+z / Alt+f` (the two view toggles)") had already named the two
+actions as a natural pair before this amendment existed — it just hadn't yet
+made that pairing cost a key. Landing `ToggleFloat` on `Alt+Shift+z` spends
+no new letter (`z` was already spent) and matches the same-letter
+shift-pair idiom the 2026-09-01 modifier-consistency re-key established for
+`g`/`Shift+g` (C37), `m`/`Shift+m` and `i`/`Shift+i` (§8), and `s`/`Shift+s`
+(C6–C8): the unshifted chord is the *view* toggle, the shifted one the
+*pane* toggle they are next to in every other sense. `Alt+Z` (uppercase, no
+SHIFT bit) is accepted too, the same delivery tolerance every other shifted
+letter in this table carries. `Alt+v`/`Alt+x` were considered and rejected —
+C40 reserves them deliberately (mark/pull), and they are the only two
+unshifted letters still free in both roost and the shells this table's
+collision-flags paragraph tracks; spending one there would trade a
+still-open readline collision for a permanently closed one.
+
+**What `Alt+f` becomes.** Unbound, falling through to U5's forward-the-key
+default: `ESC f` now reaches the pane, restoring `M-f` (readline
+forward-word) to shells that bind it — completing the `b`/`d`/`f` trio §8's
+free-key discussion already reserved two-thirds of. Anyone who preferred the
+old chord can still have it: `{"keys": {"alt+f": "toggle_float"}}` in
+config.json (`docs/KEYBINDINGS.md`) — now an informed choice to spend `M-f`,
+not roost's default.
+
+**No shim, same precedent as 2026-09-01.** No dual-binding period, no
+deprecation warning. The overlay (C15) teaches the new row the next time it
+is opened, and `roost keys` prints the effective map — the same answer the
+2026-09-01 re-key gave to "why did my chord move."
 
 ### C23 — Per-pane raw mode (Alt+Shift+p) — [Added 2026-07-22, fleet features]
 
@@ -6005,7 +6069,7 @@ shows only the C9-curated subsets.
 | 6 | `Alt+o` | flip split orientation | — |
 | 7 | `Alt+g / Alt+Shift+g` | **cycle layout: grid / main+stack / all-stack, forward / back** | C25/C37 |
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
-| 9 | `Alt+f` | **floating scratch shell (toggle)** | C22 |
+| 9 | `Alt+Shift+z` | **floating scratch shell (toggle)** | C22 |
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |
 | 10c | `Alt+;` | **go back to the pane you came from (toggles)** | C35 |
 | 10b | `Alt+Shift+a` | **fleet roster: every pane, grouped by tab — jump to one. `Tab`/`Shift+Tab` inside it cycle a status filter** | C27 |
@@ -6054,6 +6118,17 @@ use on macOS, where the unshifted arm was claiming the event first and row
 20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
 | 22 | `Alt+'` | **broadcast: type once, send to every pane (`Tab` picks who)** | C36 |
+
+[Amended 2026-09-03, the Alt+f re-key. Row 9 moves from `Alt+f` to
+`Alt+Shift+z`, paired with row 8's `Alt+z` as the same-letter shift-pair
+idiom the 2026-09-01 re-key below established for rows 7, 13b and 13c —
+`Alt+z` zooms (the view toggle), `Alt+Shift+z` floats (the pane toggle).
+`Alt+f` is now unbound and falls through to U5's forward default, closing
+the collision-flags paragraph's oldest open item (below): on a terminal
+without the kitty keyboard protocol, Alt+Right and Alt+f arrive as
+byte-identical meta-ESC pairs (`ESC f`), so binding `Alt+f` at all meant
+Alt+Right silently opened the float. See C22's own dated amendment for the
+full reasoning and the config.json line back to the old chord.]
 
 [Amended 2026-09-01, the modifier-consistency re-key. Three families moved;
 the verb set is unchanged. **(1) Rows 4/4a/4b:** resize leaves
@@ -6259,6 +6334,13 @@ Collision flags (all already swallowed by roost today, `input.rs:72–77`;
 raw mode C23 is the remedy): `Alt+f` readline forward-word · `Alt+a` zsh
 accept-and-hold · `Alt+b/d` left deliberately free (readline word ops — the
 most-missed bindings; do not assign them to chrome without strong cause).
+[Amended 2026-09-03: `Alt+f` is no longer one of these — see the Alt+f
+re-key amendment after row 22 and C22's own dated amendment. It is not a
+"raw mode is the remedy" collision any more; it is unbound outright, and
+joins `b`/`d` in the free-Alt-keys list above as the third of readline's
+high-frequency word-motion trio. `Alt+a` remains a live, deliberate
+collision — zsh's accept-and-hold is a far less common binding than
+readline's word ops, and jump-to-attention (C19) earns the trade.]
 
 [Amended 2026-08-07, client request — cross-tab arrow-key focus, C31] Row 3's
 `←`/`→` now continue past a tab's geometric edge into the next/previous tab
