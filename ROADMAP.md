@@ -74,7 +74,10 @@ decided, across four patch releases. Newest work first.
   from `~/.config/roost/` and, still, from beside `workspace.json` where it
   shipped (`ROOST_STATE` redirects to its own dir and stops there) — disables or remaps
   individual `Alt` bindings — the escape hatch for the `Alt+f`/`b`/`d` readline
-  collisions this roadmap flagged. Absent file = prior behavior byte-for-byte;
+  collisions this roadmap flagged (`Alt+f` itself was re-keyed off the
+  collision outright on 2026-09-03 — DESIGN-ui.md C22 — but the escape hatch
+  remains how anyone spends `b`/`d`, or gets `Alt+f` back on purpose).
+  Absent file = prior behavior byte-for-byte;
   a malformed file never blocks startup (defaults + a toast naming the bad
   entry). Scope is keybindings only — no theming (the chrome inherits the
   terminal), no scripting. The zero-config stance now has its one escape hatch
@@ -151,7 +154,7 @@ by default.
 - **[done] Navigate & arrange a bigger fleet.** Eight new surfaces landed on
   top of the restyled chrome: jump-to-attention (`Alt+a`, C19), an activity
   feed (`Alt+e`, C20), pane zoom (`Alt+z`, C21), a floating scratch pane
-  (`Alt+f`, C22), per-pane raw pass-through (`Alt+Shift+p`, C23), keyboard
+  (`Alt+f`, C22 — re-keyed to `Alt+Shift+z` 2026-09-03), per-pane raw pass-through (`Alt+Shift+p`, C23), keyboard
   copy mode (C24), canned layout cycling (`Alt+g`, C25), and broadcast send
   (`roost send --all` — CLI-only by design, no TUI key). Tab-undo (`Alt+u`)
   was already whole-tab capable; C26 is a scope statement + pinning test,

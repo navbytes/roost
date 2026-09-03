@@ -1389,8 +1389,11 @@ struct HelpGroup {
 /// second column when the terminal is wide enough and scrolls when it is
 /// not (`help_layout`), so the keymap can grow with roost rather than
 /// rationing itself. Unmerged rows are also plainly easier to read —
-/// "Alt+z / Alt+f → zoom pane (view only) / floating scratch shell" made
-/// the reader pair the halves up themselves.
+/// "Alt+z / Alt+Shift+z → zoom pane (view only) / floating scratch shell"
+/// made the reader pair the halves up themselves. (That merged example
+/// used `Alt+f` for the float half until the 2026-09-03 re-key moved it
+/// onto `Alt+Shift+z` — `Alt+f` collided at the byte level with Alt+Right;
+/// see `default_chord_action` in `src/ui/input.rs`.)
 ///
 /// Group order is "how often you reach for it": panes, then their layout,
 /// then tabs, then the fleet surfaces, then reading, then the session.
@@ -4793,7 +4796,7 @@ mod tests {
         for cfg in [
             r#"{}"#,
             // The README's own worked example.
-            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            r#"{"keys": {"alt+shift+z": "disable", "alt+v": "toggle_float"}}"#,
             // The four the audit measured at 99, 107, 107 and 123.
             r#"{"keys": {"alt+1": "disable"}}"#,
             r#"{"keys": {"alt+h": "disable"}}"#,
@@ -4911,11 +4914,13 @@ mod tests {
     /// the overlay teaches the new key and stops teaching the old one.
     /// Before F1 both surfaces were `&'static str` literals and this was
     /// impossible — the README's own escape-hatch example produced a roost
-    /// whose `Alt+?` still taught `Alt+f`.
+    /// whose `Alt+?` still taught the old chord. Uses `alt+shift+z`
+    /// (ToggleFloat's 2026-09-03 default) rather than the pre-re-key
+    /// `alt+f` — see the amendment on `default_chord_action` for why.
     #[test]
     fn a_remapped_chord_is_taught_at_its_new_key() {
         let (keymap, diagnostics) = Keymap::parse(
-            r#"{"keys": {"alt+f": "disable", "alt+v": "toggle_float"}}"#,
+            r#"{"keys": {"alt+shift+z": "disable", "alt+v": "toggle_float"}}"#,
             "config.json",
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -4929,7 +4934,7 @@ mod tests {
             .join("\n");
         assert!(drawn.contains("Alt+v floating scratch shell"), "taught at its new chord");
         assert!(
-            !drawn.contains("Alt+f "),
+            !drawn.contains("Alt+Shift+z "),
             "and not at the old one — that key forwards to the pane now",
         );
     }
