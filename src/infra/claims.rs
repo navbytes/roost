@@ -87,9 +87,13 @@ impl FsClaims {
         let Ok(raw) = fs::read_to_string(path) else {
             return "an unknown owner".into();
         };
-        let mut lines = raw.lines();
-        let ws = lines.next().unwrap_or_default().trim();
-        let pid = lines.next().unwrap_or_default().trim();
+        // The writer puts both fields on one line (`acquire`, above) — split
+        // on the first tab rather than treating them as two separate lines.
+        let line = raw.lines().next().unwrap_or_default();
+        let (ws, pid) = match line.split_once('\t') {
+            Some((ws, pid)) => (ws.trim(), pid.trim()),
+            None => (line.trim(), ""),
+        };
         if ws.is_empty() {
             return "an unknown owner".into();
         }
@@ -262,6 +266,35 @@ mod tests {
         let _ = a.acquire("pi", "s4").unwrap();
         let mode = fs::metadata(root.join("claims")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `owner_of` parses the writer's one-line `workspace\tpid` form, not
+    /// two lines — regression coverage for the mismatch this fixes.
+    #[test]
+    fn owner_of_parses_the_one_line_workspace_and_pid() {
+        let root = temp_root("owner-of-both");
+        let path = root.join("claim");
+        fs::write(&path, "a\t41335\n").unwrap();
+        assert_eq!(FsClaims::owner_of(&path), "workspace 'a' (pid 41335)");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owner_of_with_no_pid_names_just_the_workspace() {
+        let root = temp_root("owner-of-nopid");
+        let path = root.join("claim");
+        fs::write(&path, "a\n").unwrap();
+        assert_eq!(FsClaims::owner_of(&path), "workspace 'a'");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owner_of_an_empty_file_is_an_unknown_owner() {
+        let root = temp_root("owner-of-empty");
+        let path = root.join("claim");
+        fs::write(&path, "").unwrap();
+        assert_eq!(FsClaims::owner_of(&path), "an unknown owner");
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -18,7 +18,14 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = Duration::from_secs(30);
+
+/// PTY-spawning tests share this machine's process/tty budget; on a
+/// constrained CI runner, running several concurrently can starve one
+/// past `WAIT` even though it would settle fine alone. Only tests that
+/// spawn a roost instance take this — purely offline tests (no spawn)
+/// stay concurrent.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One shell pane (`panes` of them, actually) seeded straight into
 /// `<root>/workspaces/<name>/` — a named workspace's state directory holds
@@ -125,6 +132,7 @@ fn spawn_named(
 /// with their own counts — plus the default workspace, idle and untouched.
 #[test]
 fn two_instances_under_one_root_both_start_and_ws_ls_shows_both() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("wstwo");
     // A one-pane workspace and a two-pane one, so the counts are telling.
     seed_workspace(&root, "a", 1, "shell", None);
@@ -188,6 +196,7 @@ fn two_instances_under_one_root_both_start_and_ws_ls_shows_both() {
 /// a bare-subprocess run would prove nothing about the refusal itself.
 #[test]
 fn a_second_instance_on_a_running_workspace_is_refused() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("refuse");
     seed_workspace(&root, "a", 1, "shell", None);
     let Some(mut h) = spawn_named(&root, "a", "refusal gate", &[]) else { return };
@@ -226,6 +235,7 @@ fn a_second_instance_on_a_running_workspace_is_refused() {
 /// listing `b`, and suggesting `-w b`; `ROOST_WORKSPACE` targets too.
 #[test]
 fn control_verbs_target_the_flagged_workspace_and_name_what_is_running() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("target");
     seed_workspace(&root, "b", 1, "shell", None);
 
@@ -274,6 +284,7 @@ fn control_verbs_target_the_flagged_workspace_and_name_what_is_running() {
 /// never against a live agent pane.
 #[test]
 fn a_session_claimed_by_one_workspace_shows_a_placeholder_in_the_other() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("claims");
     let home = harness::shared_state_dir("claimshome");
     let session = "roost-claim-e2e-test";
@@ -371,6 +382,7 @@ fn a_session_claimed_by_one_workspace_shows_a_placeholder_in_the_other() {
 /// `ws ls` shows exactly the default workspace running.
 #[test]
 fn the_default_workspace_writes_the_same_files_in_the_same_places() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let cwd = std::env::temp_dir();
     let cwd = cwd.to_str().expect("temp dir is valid utf8");
     let Some(mut h) = harness::spawn_or_skip("default regression", &harness::one_pane(cwd)) else {
@@ -410,6 +422,7 @@ fn the_default_workspace_writes_the_same_files_in_the_same_places() {
 /// idle workspace.
 #[test]
 fn pane_env_title_and_guarded_ws_verbs() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root: PathBuf = harness::shared_state_dir("identity");
     seed_workspace(&root, "b", 1, "shell", None);
 
@@ -470,6 +483,7 @@ fn pane_env_title_and_guarded_ws_verbs() {
 /// yet starts fresh, no confirmation step, and `ws ls` sees it immediately.
 #[test]
 fn a_new_workspace_name_is_created_implicitly() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("implicit");
     let Some(mut h) = spawn_named(&root, "scratch", "implicit-creation gate", &[]) else {
         return;
@@ -491,6 +505,7 @@ fn a_new_workspace_name_is_created_implicitly() {
 /// untouched by a named workspace existing alongside them.
 #[test]
 fn root_override_composes_and_the_default_workspace_stays_untouched() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("compose");
     // Seeded, like every other multi-instance scenario here: `workspace.json`
     // is only written on an actual save (a resize, a pane action, quit), not
@@ -525,6 +540,7 @@ fn root_override_composes_and_the_default_workspace_stays_untouched() {
 /// against `b`'s socket (the bug A1 fixes: that used to be "unauthorized").
 #[test]
 fn in_pane_credentials_target_their_own_instance_and_the_flag_targets_another() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("inpane");
     seed_workspace(&root, "a", 1, "shell", None);
     seed_workspace(&root, "b", 1, "shell", None);
@@ -596,6 +612,7 @@ fn nothing_running_says_so_and_exits_1() {
 /// restore, with no sweep or timeout to wait out.
 #[test]
 fn a_sigkilled_instance_releases_its_claim_for_the_next_restore() {
+    let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let root = harness::shared_state_dir("sigkill");
     let home = harness::shared_state_dir("sigkillhome");
     let session = "roost-claim-sigkill-test";
