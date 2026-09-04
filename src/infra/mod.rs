@@ -67,4 +67,5 @@ pub mod qos;
 pub mod queries;
 pub mod signals;
 pub mod sock;
+pub mod stallwatch;
 pub mod store;
