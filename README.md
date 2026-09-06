@@ -188,7 +188,7 @@ workspace's own directory replaces it wholesale for that workspace.
 ### Environment
 
 roost has no flags for any of this — the whole outside-the-TUI surface is
-five variables, set on the command that launches it:
+six variables, set on the command that launches it:
 
 | Variable | Effect |
 |---|---|
@@ -197,6 +197,7 @@ five variables, set on the command that launches it:
 | `ROOST_NO_EXT_INSTALL=1` | don't install or update the pi extension and Claude Code hooks in `~/.pi` / `~/.claude` (below) |
 | `ROOST_NO_QOS=1` | don't raise input-thread scheduling priority on macOS (below) |
 | `ROOST_DEBUG=1` | append control-plane diagnostics — dropped socket lines, shed connections — to `<state>/roost.log`. Any value enables it; the file is written only when there is something to say, and never to the TUI's own output |
+| `ROOST_WATCHDOG=1` | run the stall watchdog: if the event loop stops ticking for 3s, write one line to `<state>/watchdog.log` and, on macOS, an all-threads backtrace beside it (below). Any value enables it; off by default |
 
 Inside every pane roost exports four more, so an agent can call back into the
 fleet or know where it's running — `$ROOST_SOCK` (the control socket),
@@ -212,6 +213,13 @@ that off. Either way roost keeps a tiny local latency log — one aggregate
 line a minute of event-loop scheduling stalls into `<state>/perf.jsonl`
 (size-capped, timings and counters only, nothing sensitive) — so the
 promotion's real-world effect on your machine is decidable from data.
+
+If roost ever freezes on you — unresponsive for seconds, CPU pinned — relaunch
+with `ROOST_WATCHDOG=1`. An independent thread then watches the event loop
+and, the moment it stops ticking for 3s, writes one line to
+`<state>/watchdog.log` (timestamp, pid, gap, load) and, on macOS, a full
+all-threads backtrace to `<state>/watchdog-<ts>.sample.txt` (newest five
+kept). Silent while healthy; attach both to a bug report.
 
 ### macOS: make Option send Alt
 
