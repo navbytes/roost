@@ -36,7 +36,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -196,7 +195,7 @@ fn prune_samples(state_dir: &Path, keep: usize) {
 /// line and nothing else, which is still strictly better than nothing.
 #[cfg(target_os = "macos")]
 fn sample_stacks(pid: u32, out: &Path) -> Option<PathBuf> {
-    let status = Command::new("/usr/bin/sample")
+    let status = std::process::Command::new("/usr/bin/sample")
         .arg(pid.to_string())
         .arg("2")
         .arg("-f")
