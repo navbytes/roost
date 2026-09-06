@@ -1,6 +1,6 @@
 //! Rendering: tab bar + pane borders + vt100 grid blit (design doc §8).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -54,12 +54,6 @@ pub fn draw<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>) {
             draw_stack_header(f, header);
         }
     }
-    // C7: which pane (if any) is the currently-expanded member of a stack —
-    // computed once per frame, independent of whether that stack's header
-    // row is shown.
-    let mut stack_expanded = HashSet::new();
-    layout::stack_expanded_ids(&app.ws.active_tab().layout, &mut stack_expanded);
-
     // C21/C22/§5: the zoom-and-float-aware display list — every
     // render/PTY-resize/mouse-hit path shares this one accessor so none of
     // them can disagree with what's actually on screen. It orders the float
@@ -70,7 +64,7 @@ pub fn draw<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>) {
     // singleton, or disjoint tiled rects that never overlap each other).
     let rects = app.display_rects();
     for pr in rects.iter().rev() {
-        draw_pane(f, app, *pr, stack_expanded.contains(&pr.id), spinner, now);
+        draw_pane(f, app, *pr, spinner, now);
     }
 
     if app.hints_shown() {
@@ -2461,7 +2455,6 @@ fn draw_pane<B: PaneBackend>(
     f: &mut Frame<'_>,
     app: &mut App<B>,
     pr: PaneRect,
-    stack_expanded: bool,
     spinner: char,
     now: u64,
 ) {
@@ -2596,14 +2589,6 @@ fn draw_pane<B: PaneBackend>(
     let inner = block.inner(pr.rect);
     f.render_widget(block, pr.rect);
 
-    // C7: an unfocused expanded stack member gets its left border column
-    // overpainted with the accent-dim edge marker. Suppressed when focused —
-    // the full accent border is already the stronger signal, and stacking
-    // a quiet red inside a red frame would smear the one-red discipline.
-    if stack_expanded && !focused {
-        paint_stack_edge(f, pr.rect);
-    }
-
     // U3/N1 + P7c: the cursor's honesty gate is computed before the screen
     // borrow, since it needs `app` immutably for the scroll offset.
     let scrolled = app.scroll_offset(pr.id);
@@ -2683,19 +2668,6 @@ fn dead_bar_text(resumable: bool, close_chord: Option<&str>) -> String {
         " {} exited — Enter: relaunch/resume · f: fresh (drops resume){copy_hint}{close} ",
         theme::GLYPH_EXITED
     )
-}
-
-/// C7: overpaint an expanded stack member's left border column with the
-/// accent-dim half-block edge — the cell translation of the mockup's 2px
-/// `--tui-red-dim` left edge (a half-block reads "thicker than a 1px line").
-fn paint_stack_edge(f: &mut Frame<'_>, rect: Rect) {
-    let buf = f.buffer_mut();
-    for y in rect.y..rect.y + rect.height {
-        if let Some(cell) = buf.cell_mut((rect.x, y)) {
-            cell.set_symbol(&theme::MARKER_EXPANDED_EDGE.to_string());
-            cell.set_style(theme::accent_quiet());
-        }
-    }
 }
 
 /// C8: one collapsed stack row's spans for the given width — marker, status
@@ -6291,10 +6263,11 @@ row's — widen ADAPTER_COL",
     /// **no wildcard arm** — the compiler refuses to build the moment a new
     /// `Mode` variant is added without a decision here ("fails until
     /// covered" rather than "silently passes"). It is not a general
-    /// solution: screen-size variants (C30), status combinations (the
-    /// roster filter), and focus permutations (C7's unfocused
-    /// expanded-stack edge) are not enum-shaped, so nothing here catches a
-    /// gap in those axes — that remainder is a human-must-remember list.
+    /// solution: screen-size variants (C30) and status combinations (the
+    /// roster filter) are not enum-shaped, so nothing here catches a gap in
+    /// those axes — that remainder is a human-must-remember list. (Focus
+    /// permutations used to be a third example here — C7's unfocused
+    /// expanded-stack edge — but that marker was retired 2026-09-06.)
     #[test]
     fn every_mode_variant_has_a_chrome_buffers_fixture() {
         // Exhaustive by construction: a new `Mode` variant is a compile

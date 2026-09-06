@@ -187,7 +187,8 @@ by default.
   through the real `draw()` path), and named one it left open —
   C7's *unfocused* expanded-stack-member edge marker, reachable only by
   moving keyboard focus onto a collapsed row while a stack's expanded
-  member stays put elsewhere — still no fixture exercises it. `tests/chrome_theme.rs`
+  member stays put elsewhere — never got a fixture; moot since the marker
+  was retired on 2026-09-06 (C8's boxes made it redundant). `tests/chrome_theme.rs`
   gained five PTY-level scenarios asserting on the real emitted SGR (not
   just the in-process buffer): the Working pulse (both guaranteed reds,
   never a third hue, never DIM), the dead-pane bar (red-reversed across
@@ -203,7 +204,7 @@ by default.
   exhaustively matches `Mode` with no wildcard arm, so a new modal surface
   is a compile error until it earns a fixture — genuinely self-enforcing
   for that one axis (C12-C16/C20/C22/C24/C27). Screen-size, status-
-  combination and focus-permutation axes (C30, the roster filter, C7)
+  combination and focus-permutation axes (C30, the roster filter)
   aren't enum-shaped and stay a human-must-remember list.
 
 ## Control interface — shipped

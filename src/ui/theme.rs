@@ -118,8 +118,6 @@ pub const GLYPH_EXITED: char = '✕'; // U+2715
 // Structural chrome glyphs.
 /// Active-tab / focused-collapsed-row marker.
 pub const MARKER_ACTIVE: char = '▎'; // U+258E
-/// Expanded-stack member's overpainted left edge.
-pub const MARKER_EXPANDED_EDGE: char = '▌'; // U+258C
 /// Tab bar separator, drawn after every tab.
 pub const TAB_SEPARATOR: char = '│'; // U+2502
 /// Rename-dialog input cursor (pre-existing glyph, now a named token).

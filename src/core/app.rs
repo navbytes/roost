@@ -838,7 +838,7 @@ impl<B: PaneBackend> App<B> {
         // really is the only writer of `focused` (P10). Nothing is reported
         // here: the panes were spawned microseconds ago and none has had a
         // chance to send `?1004h` yet.
-        let first = app.pane_order().first().copied().unwrap_or(0);
+        let first = app.first_visible().unwrap_or(0);
         app.set_focus(first);
         // U20: seed the picker's recent-cwd column from the workspace that
         // was just loaded — the directories this fleet already lives in.
@@ -1300,6 +1300,14 @@ impl<B: PaneBackend> App<B> {
         let mut v = Vec::new();
         layout::pane_order(&self.ws.active_tab().layout, &mut v);
         v
+    }
+
+    /// The active tab's pane that's actually visible with no other
+    /// information to go on — `pane_order().first()` would instead pick a
+    /// stack's `children[0]`, silently reassigning `expanded` the next time
+    /// `set_focus` runs over it.
+    fn first_visible(&self) -> Option<PaneId> {
+        layout::first_visible(&self.ws.active_tab().layout)
     }
 
     /// Spawn runtimes for every pane in the active tab that doesn't have one.
@@ -2434,8 +2442,11 @@ impl<B: PaneBackend> App<B> {
         if let Some(f) = &mut self.float {
             f.shown = float_shown;
         }
-        self.set_focus(focused);
+        // Restore the tab before focus: `set_focus`'s centralized expand
+        // walks whichever tab is active *at the time it runs*, so restoring
+        // `active_tab` first is what guarantees it lands on the human's tab.
         self.ws.active_tab = active_tab;
+        self.set_focus(focused);
         let Some(id) = id else {
             // C38: the same refusal the TUI flashes, phrased for a caller
             // rather than a reader — an API client cannot widen a terminal,
@@ -2827,7 +2838,7 @@ impl<B: PaneBackend> App<B> {
         // keep focus inside whatever tab is now on screen rather than
         // routing keystrokes to a pane in a tab nobody's looking at. U11:
         // being moved onto a tab is a tab switch like any other, so honor
-        // that tab's focus memory before falling back to its first pane.
+        // that tab's focus memory before falling back to its first visible pane.
         // C22 rule 1 first: the float lives outside every tab's map by
         // construction, so this test's answer for a focused float is always
         // "not in this tab" — without the guard the fallback fired on every
@@ -2836,10 +2847,8 @@ impl<B: PaneBackend> App<B> {
         // somewhere they could not see.
         if !self.float_focused() && !self.ws.active_tab().panes.contains_key(&self.focused) {
             let active = self.ws.active_tab;
-            let target = self
-                .tab_focus_target(active)
-                .or_else(|| self.pane_order().first().copied())
-                .unwrap_or(0);
+            let target =
+                self.tab_focus_target(active).or_else(|| self.first_visible()).unwrap_or(0);
             self.set_focus(target);
         }
         true
@@ -3647,7 +3656,6 @@ impl<B: PaneBackend> App<B> {
             self.hide_float();
         }
         self.set_focus(id);
-        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         self.relayout();
         self.save();
     }
@@ -4280,7 +4288,7 @@ impl<B: PaneBackend> App<B> {
                 self.ws.tabs.insert(i, tab);
                 self.ws.active_tab = i;
                 self.spawn_active_tab();
-                let first = self.pane_order().first().copied().unwrap_or(0);
+                let first = self.first_visible().unwrap_or(0);
                 self.set_focus(first);
                 self.push_feed(format!("reopened tab {name}"), false, None);
                 // U2: flashes name what they acted on.
@@ -4291,7 +4299,7 @@ impl<B: PaneBackend> App<B> {
                 // active one; split the focused pane and reuse the saved spec
                 // (session id preserved ⇒ the agent resumes).
                 self.ws.active_tab = tab_index.min(self.ws.tabs.len().saturating_sub(1));
-                let first = self.pane_order().first().copied().unwrap_or(0);
+                let first = self.first_visible().unwrap_or(0);
                 self.set_focus(first);
                 if !self.restore_pane(spec.clone()) {
                     // Refused for want of room. The close is NOT consumed:
@@ -4383,6 +4391,10 @@ impl<B: PaneBackend> App<B> {
             }
         }
         self.focused = id;
+        // A focused-but-collapsed stack member is invisible to the user;
+        // enforced here, the one writer, so no caller can forget it (a
+        // no-op when `id` isn't in the active tab's tree, e.g. the float).
+        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
         // F3: landing focus on a pane that's currently in the ○ fallback
         // takes it out of `attention_ring`'s rotation — see
         // `visited_waiting`. Every focus move funnels through here, so
@@ -4443,7 +4455,6 @@ impl<B: PaneBackend> App<B> {
         let rects = self.rects();
         if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
             self.set_focus(id);
-            layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, id);
             return;
         }
         self.focus_dir_cross_tab(dir, &rects);
@@ -4711,11 +4722,10 @@ impl<B: PaneBackend> App<B> {
         self.ws.active_tab = next;
         self.spawn_active_tab();
         self.set_focus(target);
-        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
     }
 
     /// C22: the pane a split would actually be taken off — the focused one
-    /// when it is in the active tab's tree, else that tab's first pane.
+    /// when it is in the active tab's tree, else that tab's first visible pane.
     ///
     /// `self.focused` can be the float, which lives outside the tree, and
     /// splitting "off" an id the tree does not contain is what trips
@@ -4726,7 +4736,7 @@ impl<B: PaneBackend> App<B> {
         if self.ws.active_tab().panes.contains_key(&self.focused) {
             Some(self.focused)
         } else {
-            self.pane_order().first().copied()
+            self.first_visible()
         }
     }
 
@@ -4987,7 +4997,7 @@ impl<B: PaneBackend> App<B> {
 
     /// U11: the pane tab `i` should return focus to — its remembered pane
     /// if that pane is still alive in it, else None (callers fall back to
-    /// the tab's first pane).
+    /// the tab's first visible pane).
     fn tab_focus_target(&self, i: usize) -> Option<PaneId> {
         let tab = self.ws.tabs.get(i)?;
         tab.panes.keys().find(|id| self.tab_focus.contains(id)).copied()
@@ -5018,11 +5028,9 @@ impl<B: PaneBackend> App<B> {
         self.ws.active_tab = i;
         self.spawn_active_tab();
         // U11: land on the pane this tab was left on; a first visit (or a
-        // remembered pane that has since closed) falls back to its first.
-        let target = self
-            .tab_focus_target(i)
-            .or_else(|| self.pane_order().first().copied())
-            .unwrap_or(self.focused);
+        // remembered pane that has since closed) falls back to its first visible one.
+        let target =
+            self.tab_focus_target(i).or_else(|| self.first_visible()).unwrap_or(self.focused);
         self.set_focus(target);
     }
 
@@ -5445,7 +5453,6 @@ impl<B: PaneBackend> App<B> {
             }
         }
         self.set_focus(target);
-        layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, target);
     }
 
     /// Alt+g: step the active tab through the three canned arrangements,
@@ -6022,7 +6029,7 @@ impl<B: PaneBackend> App<B> {
             // prev_focus may have been closed via the control plane while
             // the float was up — fall back to whatever's on screen now,
             // same recovery `close_pane_id` uses.
-            self.pane_order().first().copied().unwrap_or(0)
+            self.first_visible().unwrap_or(0)
         };
         self.set_focus(target);
     }
@@ -6046,7 +6053,7 @@ impl<B: PaneBackend> App<B> {
         let target = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
             f.prev_focus
         } else {
-            self.pane_order().first().copied().unwrap_or(0)
+            self.first_visible().unwrap_or(0)
         };
         self.set_focus(target);
         self.set_flash("scratch closed");
@@ -13155,6 +13162,29 @@ pub(crate) mod tests {
         }
     }
 
+    /// A stack that owns `focused` must have it in the expanded slot — a
+    /// collapsed-but-focused member is invisible to the user.
+    fn inv_check_focused_expanded(node: &LayoutNode, focused: PaneId, ctx: &str) {
+        match node {
+            LayoutNode::Pane(_) => {}
+            LayoutNode::Stack { children, expanded, .. } => {
+                if children.contains(&focused) {
+                    assert_eq!(
+                        children[*expanded], focused,
+                        "{ctx}: focused pane {focused} is a collapsed member of its stack \
+                         (expanded slot holds {})",
+                        children[*expanded]
+                    );
+                }
+            }
+            LayoutNode::Split { children, .. } => {
+                for c in children {
+                    inv_check_focused_expanded(c, focused, ctx);
+                }
+            }
+        }
+    }
+
     /// THE invariant: per tab, the set of PaneIds in `layout` == the keys of
     /// `panes`; ids are unique within a tab AND across tabs; the float is in
     /// no tree.
@@ -13198,6 +13228,9 @@ pub(crate) mod tests {
             "{ctx}: focused pane {} is in neither the active tab nor the float",
             app.focused
         );
+        if !app.float_focused() {
+            inv_check_focused_expanded(&app.ws.active_tab().layout, app.focused, ctx);
+        }
         // Nothing is drawn that does not exist.
         let live: HashSet<PaneId> = app.ws.active_tab().panes.keys().copied().collect();
         for pr in app.display_rects() {
@@ -16901,6 +16934,208 @@ pub(crate) mod tests {
         }
         assert!(app.zoomed());
         assert_eq!(app.display_rects()[0].id, 3);
+    }
+
+    /// A1 root cause: `App::new` seeds focus from `pane_order().first()` —
+    /// tree order, i.e. `children[0]` — which is not what's on screen for a
+    /// stack whose saved `expanded` points elsewhere. `set_focus`'s
+    /// centralized expand would then rewrite `expanded` to 0 and the next
+    /// `save()` would persist the loss, so startup must seed with
+    /// `first_visible` instead.
+    #[test]
+    fn startup_focuses_the_visible_stack_member_not_the_first() {
+        let mut panes = HashMap::new();
+        for id in [1u64, 2, 3] {
+            panes.insert(
+                id,
+                PaneSpec {
+                    adapter: "shell".into(),
+                    cwd: "/tmp".into(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
+            );
+        }
+        let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 2, from: None };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
+        let (mut app, store) = mk_app(ws);
+
+        assert_eq!(app.focused, 3, "startup must land on the expanded member, not children[0]");
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Stack { expanded, .. } => {
+                assert_eq!(*expanded, 2, "the saved expansion must survive startup")
+            }
+            other => panic!("expected a stack, got {other:?}"),
+        }
+
+        // Round-trip: `set_focus`'s expand must not have rewritten `expanded`
+        // to 0 by the time a save happens (the exact loss A1 was about).
+        app.save();
+        let saved = store.0.lock().unwrap().clone().unwrap();
+        match &saved.tabs[0].layout {
+            LayoutNode::Stack { expanded, .. } => {
+                assert_eq!(*expanded, 2, "the saved workspace must keep the original expansion")
+            }
+            other => panic!("expected a stack, got {other:?}"),
+        }
+    }
+
+    /// `undo_close`'s `Closed::Tab` arm is the exact twin of startup: it also
+    /// seeds focus from `first_visible()` rather than tree order. A *real*
+    /// sequential close of a 3-member stack can't be used to build this
+    /// fixture — `layout::remove_pane` collapses a stack down to a bare
+    /// `Pane` once one member is left, so by the time the tab's last pane
+    /// actually empties it, the captured snapshot is never a stack anymore
+    /// (and the test would pass either way, expanded or not). Construct the
+    /// parked `Closed::Tab` directly, as the undo stack would hold it right
+    /// after a close — then exercise the real restore, `Action::Undo`.
+    #[test]
+    fn undo_reopening_a_closed_tab_focuses_its_visible_stack_member() {
+        let mut panes0 = HashMap::new();
+        panes0.insert(
+            1,
+            PaneSpec {
+                adapter: "shell".into(),
+                cwd: "/tmp".into(),
+                session: None,
+                title: None,
+                spawned_by: None,
+                note: None,
+                noted_at: None,
+            },
+        );
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes: panes0 }],
+        };
+        let (mut app, _) = mk_app(ws);
+
+        let mut panes1 = HashMap::new();
+        for id in [4u64, 5, 6] {
+            panes1.insert(
+                id,
+                PaneSpec {
+                    adapter: "shell".into(),
+                    cwd: "/tmp".into(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
+            );
+        }
+        let closed_tab = Tab {
+            name: "stacked".into(),
+            layout: LayoutNode::Stack { children: vec![4, 5, 6], expanded: 2, from: None },
+            panes: panes1,
+        };
+        app.undo.push(Closed::Tab { index: 1, tab: closed_tab });
+
+        app.apply(Action::Undo);
+
+        assert_eq!(app.ws.tabs.len(), 2, "the parked tab must come back");
+        match &app.ws.tabs[1].layout {
+            LayoutNode::Stack { expanded, .. } => {
+                assert_eq!(*expanded, 2, "reopening must not disturb the saved expansion")
+            }
+            other => panic!("expected a stack, got {other:?}"),
+        }
+        assert_eq!(app.focused, 6, "reopening must land on the expanded member, not children[0]");
+    }
+
+    /// `close_pane_id`'s tail calls `set_focus` bare — the centralized
+    /// expand in `set_focus` must still catch it (A1 regression).
+    #[test]
+    fn closing_the_focused_stack_member_lands_on_an_expanded_survivor() {
+        let mut panes = HashMap::new();
+        for id in [1u64, 2, 3] {
+            panes.insert(
+                id,
+                PaneSpec {
+                    adapter: "shell".into(),
+                    cwd: "/tmp".into(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
+            );
+        }
+        let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
+        let (mut app, _) = mk_app(ws);
+        // Startup (fix 1) already lands here since 2 is the saved `expanded`
+        // slot; kept explicit so the test states its own precondition.
+        app.focused = 2;
+
+        // Closes the focused pane — 2 itself. FakePane is non-busy → closes immediately.
+        app.apply(Action::ClosePane);
+
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Stack { expanded, children, .. } => {
+                assert_eq!(children[*expanded], app.focused, "focus landed on a collapsed member")
+            }
+            other => panic!("expected a stack, got {other:?}"),
+        }
+    }
+
+    /// A2 regression: removing a stack member *before* the expanded slot
+    /// must not shift expansion onto a pane the user never had open.
+    #[test]
+    fn control_close_of_a_stack_member_does_not_steal_expansion() {
+        use crate::core::control::{Method, Request};
+        let mut panes = HashMap::new();
+        for id in [1u64, 2, 3] {
+            panes.insert(
+                id,
+                PaneSpec {
+                    adapter: "shell".into(),
+                    cwd: "/tmp".into(),
+                    session: None,
+                    title: None,
+                    spawned_by: None,
+                    note: None,
+                    noted_at: None,
+                },
+            );
+        }
+        let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab { name: "main".into(), layout, panes }],
+        };
+        let (mut app, _) = mk_app(ws);
+        // Startup (fix 1) already lands here since 2 is the saved `expanded`
+        // slot; kept explicit so the test states its own precondition.
+        app.focused = 2;
+
+        // Closes pane 1 — index 0, *before* the expanded slot (1) — not the
+        // focused pane, so this must take `remove_pane`'s `pos < *expanded` branch.
+        let ct = app.control_token().to_string();
+        app.handle_control(Request { token: ct, method: Method::Close { pane: 1, force: true } });
+
+        assert_eq!(app.focused, 2, "closing a different pane must not move focus");
+        match &app.ws.tabs[0].layout {
+            LayoutNode::Stack { expanded, children, .. } => {
+                assert_eq!(children[*expanded], 2, "pane 2 was expanded and must stay expanded")
+            }
+            other => panic!("expected a stack, got {other:?}"),
+        }
     }
 
     #[test]
