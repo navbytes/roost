@@ -88,6 +88,20 @@ pub fn pane_order(node: &LayoutNode, out: &mut Vec<PaneId>) {
     }
 }
 
+/// The pane actually on screen if focus lands on `node` with no other
+/// information — descends a stack through its expanded slot (not
+/// `children[0]`), so seeding focus with this never flips what the user had
+/// open.
+pub fn first_visible(node: &LayoutNode) -> Option<PaneId> {
+    match node {
+        LayoutNode::Pane(id) => Some(*id),
+        LayoutNode::Stack { children, expanded, .. } => {
+            children.get(*expanded).or_else(|| children.first()).copied()
+        }
+        LayoutNode::Split { children, .. } => children.iter().find_map(first_visible),
+    }
+}
+
 fn subtree_contains(node: &LayoutNode, target: PaneId) -> bool {
     match node {
         LayoutNode::Pane(id) => *id == target,
@@ -144,6 +158,13 @@ pub fn remove_pane(node: &mut LayoutNode, target: PaneId) -> bool {
         LayoutNode::Stack { children, expanded, from } => {
             if let Some(pos) = children.iter().position(|c| *c == target) {
                 children.remove(pos);
+                // Removing a member before the expanded slot shifts it onto
+                // the next neighbour — pull it back to the pane it pointed at.
+                // Removing the expanded member itself promotes that neighbour
+                // instead (the clamp below covers it being the last member).
+                if pos < *expanded {
+                    *expanded -= 1;
+                }
                 if !children.is_empty() && *expanded >= children.len() {
                     *expanded = children.len() - 1;
                 }
@@ -212,8 +233,15 @@ pub fn dedupe_pane_ids(node: &mut LayoutNode, seen: &mut HashSet<PaneId>) -> boo
     let empty = match node {
         LayoutNode::Pane(id) => !seen.insert(*id),
         LayoutNode::Stack { children, expanded, .. } => {
+            // Same index shift as `remove_pane`: retain can drop members
+            // before the expanded slot, so re-find the pane it pointed at
+            // rather than trust the old index. If that pane itself was the
+            // duplicate stripped, fall back to the old clamp.
+            let was_expanded = children.get(*expanded).copied();
             children.retain(|id| seen.insert(*id));
-            if !children.is_empty() && *expanded >= children.len() {
+            if let Some(pos) = was_expanded.and_then(|id| children.iter().position(|c| *c == id)) {
+                *expanded = pos;
+            } else if !children.is_empty() && *expanded >= children.len() {
                 *expanded = children.len() - 1;
             }
             children.is_empty()
@@ -751,25 +779,6 @@ pub fn stack_headers(node: &LayoutNode, area: Rect) -> Vec<StackHeader> {
     let mut headers = Vec::new();
     compute_rects_and_headers(node, area, &mut Vec::new(), &mut headers);
     headers
-}
-
-/// PaneIds that are the currently-expanded member of a `Stack` node (C7) —
-/// distinct from an ordinary split-pane leaf, which is never a member of
-/// this set. Independent of whether that stack's header row (C6) is shown.
-pub fn stack_expanded_ids(node: &LayoutNode, out: &mut HashSet<PaneId>) {
-    match node {
-        LayoutNode::Pane(_) => {}
-        LayoutNode::Stack { children, expanded, .. } => {
-            if let Some(&id) = children.get(*expanded) {
-                out.insert(id);
-            }
-        }
-        LayoutNode::Split { children, .. } => {
-            for c in children {
-                stack_expanded_ids(c, out);
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,6 +1627,66 @@ mod tests {
         }
     }
 
+    /// Removing a member before the expanded slot must not shift expansion
+    /// onto its neighbour — the member the user had open stays open.
+    #[test]
+    fn removing_a_stack_member_keeps_expansion_on_the_same_pane() {
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
+        remove_pane(&mut node, 1);
+        if let LayoutNode::Stack { children, expanded, .. } = &node {
+            assert_eq!(children, &vec![2, 3]);
+            assert_eq!(*expanded, 0, "pane 2 was expanded and must stay expanded");
+        } else {
+            panic!("expected a Stack, got {node:?}");
+        }
+
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
+        remove_pane(&mut node, 3);
+        if let LayoutNode::Stack { children, expanded, .. } = &node {
+            assert_eq!(children, &vec![1, 2]);
+            assert_eq!(*expanded, 1, "removing a member after the expanded slot leaves it put");
+        } else {
+            panic!("expected a Stack, got {node:?}");
+        }
+
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
+        remove_pane(&mut node, 2);
+        if let LayoutNode::Stack { children, expanded, .. } = &node {
+            assert_eq!(children, &vec![1, 3]);
+            assert!(*expanded < children.len(), "expanded={expanded} out of range");
+        } else {
+            panic!("expected a Stack, got {node:?}");
+        }
+    }
+
+    /// `dedupe_pane_ids`'s `retain` has the same index-shift hazard as
+    /// `remove_pane` — a duplicate before the expanded slot must not shift
+    /// expansion onto its neighbour.
+    #[test]
+    fn dedupe_keeps_expansion_on_the_same_pane() {
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
+        let mut seen = HashSet::from([1u64]); // 1 is a duplicate, dropped before slot 1
+        dedupe_pane_ids(&mut node, &mut seen);
+        if let LayoutNode::Stack { children, expanded, .. } = &node {
+            assert_eq!(children, &vec![2, 3]);
+            assert_eq!(*expanded, 0, "pane 2 was expanded and must stay expanded");
+        } else {
+            panic!("expected a Stack, got {node:?}");
+        }
+
+        // The expanded member itself is the duplicate: no pane to re-find,
+        // falls back to the existing clamp.
+        let mut node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
+        let mut seen = HashSet::from([2u64]);
+        dedupe_pane_ids(&mut node, &mut seen);
+        if let LayoutNode::Stack { children, expanded, .. } = &node {
+            assert_eq!(children, &vec![1, 3]);
+            assert!(*expanded < children.len(), "expanded={expanded} out of range");
+        } else {
+            panic!("expected a Stack, got {node:?}");
+        }
+    }
+
     #[test]
     fn stack_header_shown_iff_height_at_least_n_plus_3() {
         let node = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None }; // n=3, threshold=6
@@ -1667,21 +1736,6 @@ mod tests {
                 pr.rect.y <= header_row && header_row < pr.rect.y + pr.rect.height;
             assert!(!covers_header_row, "pane {} covers the header row", pr.id);
         }
-    }
-
-    #[test]
-    fn stack_expanded_ids_flags_only_the_expanded_member() {
-        let root = LayoutNode::Split {
-            dir: SplitDir::Vertical,
-            ratios: vec![0.5, 0.5],
-            children: vec![
-                LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None },
-                LayoutNode::Pane(9),
-            ],
-        };
-        let mut ids = HashSet::new();
-        stack_expanded_ids(&root, &mut ids);
-        assert_eq!(ids, HashSet::from([2u64]));
     }
 
     #[test]

@@ -107,7 +107,7 @@ bordered box** with the unchanged C8 row on its single inner line; where it
 doesn't, the 1-row bar renders exactly as before. The §4 "every bar stays
 exactly 1 row" translation row carries the matching exception. No new glyph;
 no new colour — the box border reuses the quiet red that already means
-"stack chrome" (C7's expanded-member edge).
+"stack chrome" (C7, retired 2026-09-06).
 
 **Amendment 2026-09-01 (typing filters the keymap):** **C39**'s `/` gate
 opens — a bare printable in the un-filtered overlay now opens the filter
@@ -167,7 +167,7 @@ should be read against C5's spinner amendment, not looked up as an accessor.
 | `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…`, the note age tag (C32) |
 | `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders (except a boxed collapsed member's, which is stack chrome — C8, amended 2026-09-01), tab separators `│`. Never text (see the legibility principle). |
 | `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, the Working spinner (C5, amended 2026-08-07 — one steady red, no second phase), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
-| `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, expanded-stack edge `▌`, collapsed-member box border (C8, amended 2026-09-01), `raw` badge token (C23), `↑N` badge token (U3) |
+| `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, collapsed-member box border (C8, amended 2026-09-01), `raw` badge token (C23), `↑N` badge token (U3) |
 | `attention()` | `Modifier::REVERSED`, no colour | the **neutral** attention surface: the transient flash (C10) |
 | `attention_problem()` | `Color::Red` + `Modifier::REVERSED` | the **problem** bars: alt-warning (C11), dead-pane action bar (C16) |
 | `ok` / `warn` / `info` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
@@ -269,8 +269,8 @@ Program output keeps whatever attributes it sent.
 **[Amended 2026-08-07, C5 — the Working dot retires]** the Working spinner
 (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, the Braille Patterns block U+2800, `theme::SPINNER_FRAMES` —
 pi-tui's own default loader frames, verbatim) · `◆` U+25C6 · `○` U+25CB · `·`
-U+00B7 · `✕` U+2715 · `▎` U+258E (active-tab / focused-row marker) · `▌`
-U+258C (expanded-stack edge) · `│` U+2502 (tab separator) · `▏` U+258F
+U+00B7 · `✕` U+2715 · `▎` U+258E (active-tab / focused-row marker) ·
+`│` U+2502 (tab separator) · `▏` U+258F
 (rename cursor, existing) · `❯` U+276F (picker selection) · `✓` U+2713
 (saved) · `…` U+2026 (tab overflow). All are single-width — including every
 spinner frame, so the swap costs no badge-column or tab-strip width anywhere.
@@ -964,7 +964,8 @@ becomes the only glyph that ever asks the user to look. Concretely:
 > is a *reason to read the header*: `STACK · 2 PANES` becoming
 > `STACK · 3 PANES` is the only feedback a rung gives, so the header is now
 > load-bearing for teaching the gesture, not merely for labelling the
-> region. C7 and C8 are likewise unchanged, for the same reason.]**
+> region. C7 and C8 are likewise unchanged, for the same reason (C7 itself
+> was later retired, 2026-09-06).]**
 
 **Current:** none — stack members are laid out directly (`layout.rs:302–322`);
 nothing announces "this region is a stack".
@@ -1055,6 +1056,12 @@ below a focused member's `accent()` border is different in kind: two
 next to a focused member, and this contract's own rule — the `▌` edge is
 withheld from the focused member — is unchanged.
 
+**[Retired 2026-09-06, boxed collapsed rows]** The `▌` edge is no longer
+drawn. C8's boxes already make each collapsed member read as a pane, so the
+expanded member needs no second signal and renders as an ordinary C3 pane —
+full `accent()` border when focused, `rule()` otherwise. `paint_stack_edge`,
+`MARKER_EXPANDED_EDGE` and `stack_expanded_ids` are gone.
+
 ### C8 — Collapsed stack rows
 
 **Current:** `render.rs:333–342` — 1-row Paragraph, text `" {glyph} {name} "`;
@@ -1123,8 +1130,9 @@ thing on screen to miss (client report with screenshot). When the stack's
 area affords the rows (C6's boxed-geometry amendment: the member's rect is
 3 rows tall), the collapsed member draws as a **bordered box**:
 - `Block::bordered()`, plain line glyphs (the C3/C12 border shape), border
-  fg **`accent_quiet()`** — the quiet red that already means "stack chrome"
-  (C7's expanded-member edge), so the box reads "collapsed pane of this
+  fg **`accent_quiet()`** — the quiet red that means "stack chrome" (the
+  box is its sole bearer in a stack since C7's edge, which it inherited the
+  colour from, was retired 2026-09-06), so the box reads "collapsed pane of this
   stack" without spending a new colour. When the row is the focused pane
   (transient — focus on a collapsed member auto-expands it), the border is
   **`accent()`**, C3's focus signal verbatim.
@@ -4330,7 +4338,7 @@ Every px-only construct in the mockup, and its cell-level fate:
 | Mockup construct | Translation |
 |---|---|
 | 2px `--color-accent` top edge on active tab (`:628`) | `▎` U+258E fg `accent()` as the active tab's first column (C2). A 1-row bar has no vertical edge to give; a left quarter-block preserves "one red edge marks the active tab". [Amended 2026-07-27] it now carries *more* weight than the mockup gave it: with the active tab's highlight fill gone, the marker plus full-strength ink is the whole signal. |
-| 2px `--tui-red-dim` left edge on expanded stack member (`:662`) | left border column overpainted `▌` U+258C fg `accent_quiet()` (C7); half-block ≈ "thicker than 1px". |
+| 2px `--tui-red-dim` left edge on expanded stack member (removed from the mockup) | **retired 2026-09-06** — C8's boxed collapsed rows already read as panes, so the edge was redundant and is no longer drawn (C7). |
 | 1px borders throughout | `BorderType::Plain` single-line glyphs (C3, C12). |
 | 6px pane gap + 12–14px pane padding (`:636, :639`) | **dropped** — border cells already separate panes; spending whole cell columns on gaps wastes terminal real estate. |
 | ~9px vertical padding on every bar (tab/hint/stack-header/collapsed-row) → each renders ~2 text-lines tall in the browser | **height dropped — every bar stays exactly 1 row.** A terminal row is indivisible and scarce; reproducing the padding means adding blank rows, burning ~3 of ~44 rows for pure air. No serious TUI (tmux/zellij/lazygit) uses multi-row bars. The mockup's tall bars are a CSS-padding rendering artifact, not a directive. Only *horizontal* padding translates (space cells, C2 gutter); vertical does not. [Amended 2026-09-01] The **collapsed row** is now the one exception, and only where rows are plentiful: when its stack clears C6's boxed threshold the row grows into C8's 3-row `accent_quiet()` box; the 1-row bar remains its floor form and the other bars stay exactly 1 row. |
@@ -5943,9 +5951,9 @@ target is already in (every rung after).
   root.
 - **The endpoint is a shape roost already draws.** Every pane of the tab in
   one stack is exactly what `Alt+g`'s `all-stack` preset builds, so C6's
-  header, C7's edge marker, C8's fit degradation and `rects` all meet a
-  stack they have seen before. This is why the ladder needs no new
-  rendering and no new invariant.
+  header, C8's fit degradation and `rects` all meet a stack they have seen
+  before. This is why the ladder needs no new rendering and no new
+  invariant.
 - **Flat, not nested.** `pane_order` flattens a nested stack into its member
   ids, so absorbing one yields a flat stack of every leaf below that split —
   the same shape the first rung produces, which is what keeps `Stack`'s
