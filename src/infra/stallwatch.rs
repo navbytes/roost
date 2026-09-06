@@ -13,9 +13,11 @@
 //! stuck state was mostly or entirely gone — one attempt landed on a process
 //! that had, in the meantime, exited on its own. Watching for it is the only
 //! way to reliably capture a report of *this specific hang*, wherever the
-//! real bug turns out to live: it runs unattended, on every real run, so the
-//! next occurrence — whenever that is, on whoever's machine — leaves
-//! evidence.
+//! real bug turns out to live: opted in (`ROOST_WATCHDOG=1`), it runs
+//! unattended for the whole session, so the next occurrence leaves evidence
+//! with nobody at the keyboard. Opt-in rather than always-on because it is
+//! a bug-chasing tool: the people chasing the bug set the variable, and
+//! everyone else keeps a sample-free state dir.
 //!
 //! Design constraint that drives everything here: the watcher must not be
 //! able to get stuck the same way as what it is watching for. So it is its
@@ -28,8 +30,9 @@
 //! `<state>/watchdog.log` (best-effort, never-break-the-app stance — same as
 //! `perf`'s and `control.log`'s writes) and, on macOS, shells out to
 //! `/usr/bin/sample` for a real all-threads backtrace into
-//! `<state>/watchdog-<ts>.sample.txt`. One report per stall episode, not one
-//! per check — a 30-second freeze must not become 30 near-identical lines.
+//! `<state>/watchdog-<ts>.sample.txt` (newest `SAMPLE_KEEP` kept). One
+//! report per stall episode, not one per check — a 30-second freeze must not
+//! become 30 near-identical lines.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -56,6 +59,19 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(3);
 /// healthy run, so the cap is about a pathological flapping case, not
 /// normal growth.
 const WATCHDOG_LOG_MAX: u64 = 1024 * 1024;
+
+/// How many `watchdog-<ts>.sample.txt` captures to keep; the oldest go when
+/// a new one is about to be written. `watchdog.log` is size-capped, and
+/// without this the companion files would not be — a flapping session could
+/// leave hundreds behind. The newest is the one anyone will look at.
+const SAMPLE_KEEP: usize = 5;
+
+/// Is the watchdog on for this run? `ROOST_WATCHDOG=1` (any value) — same
+/// any-value-enables shape as `ROOST_DEBUG`. Off by default; see the module
+/// doc for why.
+pub fn enabled() -> bool {
+    std::env::var_os("ROOST_WATCHDOG").is_some()
+}
 
 /// The main loop's liveness signal. `Clone` is cheap (an `Instant` plus an
 /// `Arc`): the loop keeps one, the watchdog thread keeps another, and
@@ -133,6 +149,7 @@ fn report_stall(state_dir: &Path, gap: Duration) {
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let pid = std::process::id();
     let sample_path = state_dir.join(format!("watchdog-{ts}.sample.txt"));
+    prune_samples(state_dir, SAMPLE_KEEP - 1);
     let sampled = sample_stacks(pid, &sample_path);
 
     let log_path = state_dir.join("watchdog.log");
@@ -146,6 +163,25 @@ fn report_stall(state_dir: &Path, gap: Duration) {
     super::perf::rotate_log(&log_path, WATCHDOG_LOG_MAX);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Delete every `watchdog-<ts>.sample.txt` but the newest `keep`. Names sort
+/// chronologically (fixed-width unix seconds), so no metadata reads needed.
+/// Best-effort like everything else here.
+fn prune_samples(state_dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(state_dir) else { return };
+    let mut samples: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("watchdog-") && n.ends_with(".sample.txt"))
+        })
+        .collect();
+    samples.sort();
+    for old in samples.iter().rev().skip(keep) {
+        let _ = std::fs::remove_file(old);
     }
 }
 
@@ -222,6 +258,27 @@ mod tests {
     fn threshold_boundary_is_inclusive() {
         assert_eq!(transition(false, STALL_THRESHOLD), (true, true));
         assert_eq!(transition(false, STALL_THRESHOLD - Duration::from_millis(1)), (false, false));
+    }
+
+    #[test]
+    fn prune_samples_keeps_the_newest_and_leaves_other_files_alone() {
+        let dir = std::env::temp_dir().join(format!("roost-watchdog-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for ts in [1700000001u64, 1700000003, 1700000002, 1700000005, 1700000004] {
+            std::fs::write(dir.join(format!("watchdog-{ts}.sample.txt")), "x").unwrap();
+        }
+        std::fs::write(dir.join("watchdog.log"), "x").unwrap();
+        prune_samples(&dir, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["watchdog-1700000004.sample.txt", "watchdog-1700000005.sample.txt", "watchdog.log"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -85,7 +85,8 @@ unimplemented = "warn"
 
 [profile.release]
 lto = true
-strip = true
+# "debuginfo", not `true`: keep the symbol table so a ROOST_WATCHDOG sample names roost's own frames
+strip = "debuginfo"
 
 # Lets `cargo binstall roost` resolve prebuilt binaries from GitHub Releases
 # instead of compiling from source, once a release exists. Matches the

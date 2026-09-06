@@ -500,12 +500,16 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     // isolated measurement behind the QoS keep-or-delete decision.
     let mut perf =
         infra::perf::PerfLog::new(infra::store::FsStore::state_dir(), infra::qos::enabled());
-    // Hang watchdog (infra::watchdog): an independent thread that notices if
-    // the loop below stops ticking and, on macOS, captures a real
-    // all-threads backtrace before whoever's watching can react — see the
-    // module doc for the report that motivated it.
+    // Stall watchdog (infra::stallwatch, opt-in via ROOST_WATCHDOG=1): an
+    // independent thread that notices if the loop below stops ticking and,
+    // on macOS, captures a real all-threads backtrace before whoever's
+    // watching can react — see the module doc for the report that motivated
+    // it. The heartbeat itself is unconditional: one atomic store per frame
+    // is cheaper than a branch around it.
     let heartbeat = infra::stallwatch::Heartbeat::new();
-    infra::stallwatch::spawn(infra::store::FsStore::state_dir(), heartbeat.clone());
+    if infra::stallwatch::enabled() {
+        infra::stallwatch::spawn(infra::store::FsStore::state_dir(), heartbeat.clone());
+    }
     // Surface every config.json problem on the activity feed, so none are
     // silently lost, and the first as a toast — same non-fatal contract as
     // everything else here: roost already started fine, with its defaults.
@@ -593,7 +597,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut dirty = true;
     let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         loop {
-            // infra::watchdog: prove this iteration was reached, before
+            // infra::stallwatch: prove this iteration was reached, before
             // anything in it has a chance to block. One atomic store.
             heartbeat.tick();
             // Test hatch only (`infra::test_panic_after`): `panic_at` is `None`

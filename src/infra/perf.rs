@@ -135,7 +135,7 @@ fn bucket_index(stall: Duration) -> usize {
 
 /// The 1-minute load average, or 0.0 where unavailable. Context for the
 /// stall numbers: a stall histogram is only meaningful next to how
-/// contended the machine was while it accumulated. `pub(crate)`: `watchdog`
+/// contended the machine was while it accumulated. `pub(crate)`: `stallwatch`
 /// wants the same context on a stall report, and a second `getloadavg` call
 /// is not worth a second implementation.
 pub(crate) fn load1() -> f64 {
@@ -149,7 +149,8 @@ pub(crate) fn load1() -> f64 {
     }
 }
 
-/// Size-based rotation, `perf.jsonl` → `perf.jsonl.1` — the same
+/// Size-based rotation, `perf.jsonl` → `perf.jsonl.1` (`<name>.<ext>.1`
+/// generally, so `watchdog.log` → `watchdog.log.1`) — the same
 /// atomic-rename, best-effort shape as `app.rs`'s `rotate_audit_log` (its
 /// doc carries the full reasoning; kept separate because core must not
 /// reach into infra for a 5-line helper, nor the reverse). `pub(crate)`:
@@ -158,7 +159,11 @@ pub(crate) fn load1() -> f64 {
 pub(crate) fn rotate_log(path: &std::path::Path, max: u64) {
     let too_big = std::fs::metadata(path).map(|m| m.len() >= max).unwrap_or(false);
     if too_big {
-        let _ = std::fs::rename(path, path.with_extension("jsonl.1"));
+        let rotated = match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) => path.with_extension(format!("{ext}.1")),
+            None => path.with_extension("1"),
+        };
+        let _ = std::fs::rename(path, rotated);
     }
 }
 
