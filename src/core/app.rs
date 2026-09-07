@@ -4642,13 +4642,10 @@ impl<B: PaneBackend> App<B> {
     /// both ends, exactly like `Alt+m`/`Alt+Shift+m` (`step_tab`); a no-op
     /// below two tabs.
     ///
-    /// Same skeleton as `go_to_tab` — C21 zoom exit, C22 float hide, U11
-    /// bookkeeping, lazy spawn — with the target swapped for `edge_pane`'s
-    /// pick. `go_to_tab` itself is deliberately not called here: it would
-    /// set focus once (to `tab_focus_target`) and this function a second
-    /// time right after, and `set_focus` reports a real focus transition on
-    /// every call that changes the id — a spurious CSI O/I pair to a pane
-    /// that was never truly focused.
+    /// The switch itself is `go_to_tab_landing` with `edge_pane`'s pick as
+    /// the landing, so focus moves exactly once: landing on
+    /// `tab_focus_target` first would report a spurious CSI O/I pair to a
+    /// pane that was never truly focused, and now also expand it (#184).
     ///
     /// `rects` is the active tab's rects, already computed by the caller —
     /// reused here, not recomputed, to check whether `self.focused` is
@@ -4715,13 +4712,7 @@ impl<B: PaneBackend> App<B> {
         // Right enters the destination from its left edge (leftmost pane);
         // Left enters from its right edge (rightmost).
         let Some(target) = edge_pane(&drects, dir == layout::Dir::Left) else { return };
-
-        self.exit_zoom(); // C21: any (real) tab change exits zoom
-        self.hide_float(); // C22 rule 2: the float can't actually be shown here (focus_dir's float_focused() guard already returned above if it were) — kept for parity with every other tab switch
-        self.remember_tab_focus(); // U11 bookkeeping, before active_tab moves
-        self.ws.active_tab = next;
-        self.spawn_active_tab();
-        self.set_focus(target);
+        self.go_to_tab_landing(next, Some(target));
     }
 
     /// C22: the pane a split would actually be taken off — the focused one
@@ -5004,6 +4995,13 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn go_to_tab(&mut self, i: usize) {
+        self.go_to_tab_landing(i, None);
+    }
+
+    /// `landing` is the pane the caller is about to focus in tab `i`, so the
+    /// switch lands there directly: passing through the tab's remembered
+    /// pane first would expand a stack member the user never asked to see.
+    fn go_to_tab_landing(&mut self, i: usize, landing: Option<PaneId>) {
         if i >= self.ws.tabs.len() {
             // C38: `Alt+5` on a two-tab workspace is literally C35's case —
             // "a navigation key that silently does nothing reads as broken"
@@ -5020,6 +5018,7 @@ impl<B: PaneBackend> App<B> {
         // zoom, and the same path hid the float and reset focus to the
         // tab's first pane — a "switch" to nowhere, destroying view state.
         if i == self.ws.active_tab {
+            debug_assert!(landing.is_none(), "a landing on the active tab needs no switch");
             return;
         }
         self.exit_zoom(); // C21: any (real) tab change exits zoom
@@ -5029,8 +5028,10 @@ impl<B: PaneBackend> App<B> {
         self.spawn_active_tab();
         // U11: land on the pane this tab was left on; a first visit (or a
         // remembered pane that has since closed) falls back to its first visible one.
-        let target =
-            self.tab_focus_target(i).or_else(|| self.first_visible()).unwrap_or(self.focused);
+        let target = landing
+            .or_else(|| self.tab_focus_target(i))
+            .or_else(|| self.first_visible())
+            .unwrap_or(self.focused);
         self.set_focus(target);
     }
 
@@ -5442,7 +5443,7 @@ impl<B: PaneBackend> App<B> {
     fn focus_attention_target(&mut self, target: PaneId) {
         if let Some(ti) = self.tab_of(target) {
             if ti != self.ws.active_tab {
-                self.go_to_tab(ti);
+                self.go_to_tab_landing(ti, Some(target));
             }
         }
         if self.is_float(target) {
@@ -13185,6 +13186,80 @@ pub(crate) mod tests {
         }
     }
 
+    /// Snapshot every stack in every tab as (sorted members, expanded pane
+    /// id) — the before/after state `inv_expansion_stable` diffs.
+    fn stack_expansions(app: &App<FakePane>) -> Vec<(Vec<PaneId>, PaneId)> {
+        fn walk(node: &LayoutNode, out: &mut Vec<(Vec<PaneId>, PaneId)>) {
+            match node {
+                LayoutNode::Pane(_) => {}
+                LayoutNode::Stack { children, expanded, .. } => {
+                    let mut members = children.clone();
+                    members.sort_unstable();
+                    out.push((members, children[*expanded]));
+                }
+                LayoutNode::Split { children, .. } => {
+                    for c in children {
+                        walk(c, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for tab in &app.ws.tabs {
+            walk(&tab.layout, &mut out);
+        }
+        out
+    }
+
+    /// A stronger property than `inv_check_focused_expanded`, which is
+    /// vacuous against a bug that resets focus AND expansion together (the
+    /// tree-order fallback this guards against did exactly that on
+    /// startup): a stack's expanded pane must never change unless something
+    /// legitimately moved it. For each post-action stack, find the smallest
+    /// prior stack that is a superset of its members (itself with zero or
+    /// more panes removed); skip if none (a new or grown stack — NewPane
+    /// joined it, a move landed a pane in it, a `StackPane` rung absorbed
+    /// it, a tab was restored) or if the prior expanded pane is gone from
+    /// it (the open member itself was removed; the clamp picks a
+    /// neighbour by design). Otherwise the expanded pane must be unchanged
+    /// — with one exemption: when `deliberate_focus` says this action may
+    /// aim focus at a specific pane (`Action::Focus`, `FocusAlternate`,
+    /// `JumpAttention`, a tab switch restoring U11's memory, a float
+    /// restore), the ONE stack focus landed in is skipped — `inv_check`'s
+    /// focused-is-expanded assertion covers it — and so is the stack holding
+    /// a dismissed float's `prev_focus`, the landing focus passes through on
+    /// its way out. Every other stack, in every tab, must still hold: a
+    /// focus move can only open the pane it lands on.
+    fn inv_expansion_stable(
+        before: &[(Vec<PaneId>, PaneId)],
+        app: &App<FakePane>,
+        deliberate_focus: bool,
+        float_prev: Option<PaneId>,
+        ctx: &str,
+    ) {
+        for (members_after, expanded_after) in stack_expansions(app) {
+            if deliberate_focus && members_after.contains(&app.focused) {
+                continue;
+            }
+            if float_prev.is_some_and(|p| members_after.contains(&p)) {
+                continue;
+            }
+            let prior = before
+                .iter()
+                .filter(|(m, _)| members_after.iter().all(|id| m.contains(id)))
+                .min_by_key(|(m, _)| m.len());
+            let Some((_, expanded_before)) = prior else { continue };
+            if !members_after.contains(expanded_before) {
+                continue;
+            }
+            assert_eq!(
+                *expanded_before, expanded_after,
+                "{ctx}: stack {members_after:?} silently reassigned its expanded pane \
+                 ({expanded_before} -> {expanded_after})"
+            );
+        }
+    }
+
     /// THE invariant: per tab, the set of PaneIds in `layout` == the keys of
     /// `panes`; ids are unique within a tab AND across tabs; the float is in
     /// no tree.
@@ -13334,6 +13409,13 @@ pub(crate) mod tests {
             let mut trail: Vec<String> = Vec::new();
             'step: for step in 0..400 {
                 let would_quit = app.ws.tabs.len() == 1 && app.ws.active_tab().panes.len() == 1;
+                let stacks_before = stack_expansions(&app);
+                let focused_before = app.focused;
+                // Leaving a shown float lands focus on its `prev_focus` first, even
+                // when the action then carries it elsewhere (a tab switch): that
+                // intermediate landing is a real focus move the property must allow.
+                let float_prev_before =
+                    app.float.as_ref().filter(|f| f.shown).map(|f| f.prev_focus);
                 let (name, action) = loop {
                     let pick = rng.below(42);
                     let d = dirs[rng.below(4) as usize];
@@ -13389,7 +13471,20 @@ pub(crate) mod tests {
                             *coverage.entry("CtlClose").or_default() += 1;
                             ops_total += 1;
                             trail.push(format!("{step}:CtlClose({victim})"));
-                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            let ctx = format!(
+                                "seed {seed} after [{}] (focus {focused_before}->{})",
+                                trail.join(","),
+                                app.focused
+                            );
+                            inv_check(&app, &ctx);
+                            // Deliberate: `close_pane_id`'s own U11 fallback, same as ClosePane.
+                            inv_expansion_stable(
+                                &stacks_before,
+                                &app,
+                                true,
+                                float_prev_before,
+                                &ctx,
+                            );
                             continue 'step;
                         }
                         28 => {
@@ -13403,7 +13498,19 @@ pub(crate) mod tests {
                             *coverage.entry("Resize(term)").or_default() += 1;
                             ops_total += 1;
                             trail.push(format!("{step}:Term({w}x{h})"));
-                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            let ctx = format!(
+                                "seed {seed} after [{}] (focus {focused_before}->{})",
+                                trail.join(","),
+                                app.focused
+                            );
+                            inv_check(&app, &ctx);
+                            inv_expansion_stable(
+                                &stacks_before,
+                                &app,
+                                false,
+                                float_prev_before,
+                                &ctx,
+                            );
                             continue 'step;
                         }
                         29 => ("LastTab", Action::LastTab),
@@ -13422,7 +13529,21 @@ pub(crate) mod tests {
                             *coverage.entry("RosterJump").or_default() += 1;
                             ops_total += 1;
                             trail.push(format!("{step}:RosterJump({dest})"));
-                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            let ctx = format!(
+                                "seed {seed} after [{}] (focus {focused_before}->{})",
+                                trail.join(","),
+                                app.focused
+                            );
+                            inv_check(&app, &ctx);
+                            // Deliberate: roster_jump funnels through `focus_attention_target`,
+                            // same as JumpAttention/FocusAlternate/a control-plane Focus.
+                            inv_expansion_stable(
+                                &stacks_before,
+                                &app,
+                                true,
+                                float_prev_before,
+                                &ctx,
+                            );
                             continue 'step;
                         }
                         32 => {
@@ -13440,7 +13561,19 @@ pub(crate) mod tests {
                             *coverage.entry("CtlSpawn").or_default() += 1;
                             ops_total += 1;
                             trail.push(format!("{step}:CtlSpawn"));
-                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            let ctx = format!(
+                                "seed {seed} after [{}] (focus {focused_before}->{})",
+                                trail.join(","),
+                                app.focused
+                            );
+                            inv_check(&app, &ctx);
+                            inv_expansion_stable(
+                                &stacks_before,
+                                &app,
+                                false,
+                                float_prev_before,
+                                &ctx,
+                            );
                             continue 'step;
                         }
                         33 => {
@@ -13461,7 +13594,20 @@ pub(crate) mod tests {
                             *coverage.entry("FeedJump").or_default() += 1;
                             ops_total += 1;
                             trail.push(format!("{step}:FeedJump({dest})"));
-                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            let ctx = format!(
+                                "seed {seed} after [{}] (focus {focused_before}->{})",
+                                trail.join(","),
+                                app.focused
+                            );
+                            inv_check(&app, &ctx);
+                            // Deliberate: the third `focus_attention_target` caller (U25).
+                            inv_expansion_stable(
+                                &stacks_before,
+                                &app,
+                                true,
+                                float_prev_before,
+                                &ctx,
+                            );
                             continue 'step;
                         }
                         34 => {
@@ -13532,7 +13678,19 @@ pub(crate) mod tests {
                             *coverage.entry("CtlVerb").or_default() += 1;
                             ops_total += 1;
                             trail.push(format!("{step}:Ctl({name})"));
-                            inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                            let ctx = format!(
+                                "seed {seed} after [{}] (focus {focused_before}->{})",
+                                trail.join(","),
+                                app.focused
+                            );
+                            inv_check(&app, &ctx);
+                            inv_expansion_stable(
+                                &stacks_before,
+                                &app,
+                                false,
+                                float_prev_before,
+                                &ctx,
+                            );
                             continue 'step;
                         }
                         35 => ("ToggleFloat", Action::ToggleFloat),
@@ -13566,7 +13724,32 @@ pub(crate) mod tests {
                 if app.ws.tabs.iter().any(|t| inv_has_stack(&t.layout)) {
                     stacks_seen += 1;
                 }
-                inv_check(&app, &format!("seed {seed} after [{}]", trail.join(",")));
+                let ctx = format!(
+                    "seed {seed} after [{}] (focus {focused_before}->{})",
+                    trail.join(","),
+                    app.focused
+                );
+                inv_check(&app, &ctx);
+                // Which actions may aim focus at a specific pane, and why
+                // `CycleLayout` is skipped outright, is documented on
+                // `inv_expansion_stable`. Tab switches count: `go_to_tab`
+                // re-targets U11's remembered pane, and `ClosePane` shares that
+                // fallback. Leaving a shown float is a landing too, whatever
+                // action did it (C22 rule 2).
+                let deliberate = matches!(
+                    name,
+                    "Focus"
+                        | "FocusAlternate"
+                        | "JumpAttention"
+                        | "GoToTab"
+                        | "NextTab"
+                        | "PrevTab"
+                        | "LastTab"
+                        | "ClosePane"
+                ) || app.is_float(focused_before);
+                if !matches!(name, "CycleLayout+" | "CycleLayout-") {
+                    inv_expansion_stable(&stacks_before, &app, deliberate, float_prev_before, &ctx);
+                }
                 assert!(!app.quit, "seed {seed}: quit unexpectedly at [{}]", trail.join(","));
             }
         }
@@ -16984,6 +17167,64 @@ pub(crate) mod tests {
                 assert_eq!(*expanded, 2, "the saved workspace must keep the original expansion")
             }
             other => panic!("expected a stack, got {other:?}"),
+        }
+    }
+
+    /// A jump into another tab must land on its target directly. Passing
+    /// through the tab's remembered pane first would expand a stack member
+    /// the user never asked to see (found by the expansion-stability fuzz).
+    #[test]
+    fn jumping_into_another_tab_does_not_open_its_remembered_stack_member() {
+        let spec = || PaneSpec {
+            adapter: "shell".into(),
+            cwd: "/tmp".into(),
+            session: None,
+            title: None,
+            spawned_by: None,
+            note: None,
+            noted_at: None,
+        };
+        let panes0 = HashMap::from([(1u64, spec())]);
+        let panes1 = HashMap::from([(4u64, spec()), (5, spec()), (6, spec()), (7, spec())]);
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![
+                Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes: panes0 },
+                Tab {
+                    name: "other".into(),
+                    layout: LayoutNode::Split {
+                        dir: SplitDir::Vertical,
+                        ratios: vec![0.5, 0.5],
+                        children: vec![
+                            LayoutNode::Stack { children: vec![4, 5, 6], expanded: 0, from: None },
+                            LayoutNode::Pane(7),
+                        ],
+                    },
+                    panes: panes1,
+                },
+            ],
+        };
+        let (mut app, _) = mk_app(ws);
+        app.tab_focus.insert(6); // tab 2 remembers a now-collapsed member
+
+        app.focus_attention_target(7);
+
+        assert_eq!(app.ws.active_tab, 1);
+        assert_eq!(app.focused, 7);
+        assert_eq!(
+            app.alternate,
+            Some(1),
+            "go-back remembers the origin, not the pane passed through"
+        );
+        match &app.ws.tabs[1].layout {
+            LayoutNode::Split { children, .. } => match &children[0] {
+                LayoutNode::Stack { children, expanded, .. } => {
+                    assert_eq!(children[*expanded], 4, "pane 4 was open and must stay open")
+                }
+                other => panic!("expected a stack, got {other:?}"),
+            },
+            other => panic!("expected a split, got {other:?}"),
         }
     }
 
