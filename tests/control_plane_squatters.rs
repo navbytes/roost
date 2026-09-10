@@ -22,11 +22,10 @@ use std::time::{Duration, Instant};
 /// not proof it is bound yet.
 fn wait_for_socket(dir: &std::path::Path) -> std::path::PathBuf {
     let sock = dir.join("roost.sock");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !sock.exists() {
-        assert!(Instant::now() < deadline, "roost never bound its control socket");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        harness::wait_until(Duration::from_secs(10), || sock.exists()),
+        "roost never bound its control socket",
+    );
     sock
 }
 
@@ -70,11 +69,10 @@ fn a_sustained_silent_flood_does_not_lock_out_the_control_plane() {
             std::thread::sleep(Duration::from_millis(2));
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.load(Ordering::SeqCst) {
-        assert!(Instant::now() < deadline, "the flood never got going");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        harness::wait_until(Duration::from_secs(10), || ready.load(Ordering::SeqCst)),
+        "the flood never got going",
+    );
 
     // The real client, invoked the way a user would.
     let started = Instant::now();

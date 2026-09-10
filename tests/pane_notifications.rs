@@ -57,18 +57,6 @@ fn cli(state_dir: &std::path::Path, args: &[&str]) -> String {
     format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
-/// Poll `pred` until it holds or `timeout` passes.
-fn poll(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if pred() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
-
 #[test]
 fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     let cwd = std::env::temp_dir();
@@ -83,7 +71,9 @@ fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     // sent into that window can still be swallowed by the startup keyboard
     // probe (`main.rs`'s `KBD_PROBE_BUDGET`), which is exactly what made
     // this test's `Alt+n` a no-op until it waited for this instead.
-    let up = poll(Duration::from_secs(10), || cli(h.state_dir(), &["list"]).contains("\"pane\""));
+    let up = harness::wait_until(Duration::from_secs(10), || {
+        cli(h.state_dir(), &["list"]).contains("\"pane\"")
+    });
     assert!(up, "roost's control socket never came up");
 
     // Alt+n: a second pane, which takes focus — so pane 1, the one about to
@@ -91,7 +81,7 @@ fn a_pane_osc9_notification_pulls_attention_and_reaches_the_host() {
     // surviving emitter serves; a focused pane's notification is deliberately
     // silent now (you are already there).
     h.write_bytes(b"\x1bn");
-    let split = poll(Duration::from_secs(10), || {
+    let split = harness::wait_until(Duration::from_secs(10), || {
         let list = cli(h.state_dir(), &["list"]);
         list.matches("\"pane\"").count() == 2 && list.contains("\"pane\": 2")
     });

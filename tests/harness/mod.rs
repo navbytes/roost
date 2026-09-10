@@ -663,6 +663,13 @@ pub fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// Wait for the control CLI to answer at all — it comes up a moment after
+/// the first frame, and both `roster_overlay` and `rekeyed_chords` need it
+/// up before trusting `roost list` as ground truth for where focus landed.
+pub fn wait_for_control_cli(has_answered: impl FnMut() -> bool) {
+    assert!(wait_until(Duration::from_secs(10), has_answered), "the control CLI never came up");
+}
+
 /// Whether `pid` still names a **running** process.
 ///
 /// `kill -0` alone is not that question: it succeeds for a zombie, which is

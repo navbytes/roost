@@ -53,11 +53,7 @@ fn the_roster_lists_another_tabs_panes_and_jumps_across_to_one() {
     );
     // ...and until the control socket answers, so the ground-truth probe is
     // trustworthy rather than merely early.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while focused_pane(&sd) == 0 {
-        assert!(std::time::Instant::now() < deadline, "the control CLI never came up");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    harness::wait_for_control_cli(|| focused_pane(&sd) != 0);
     assert_eq!(focused_pane(&sd), 1, "the fixture starts on tab 1's only pane");
 
     // The chord has to actually reach roost before anything is measured: a
