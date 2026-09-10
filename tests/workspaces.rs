@@ -110,6 +110,36 @@ fn wait_for_workspace_socket(root: &std::path::Path, name: &str) {
     }
 }
 
+/// Block until workspace `owner`'s instance actually **holds** the claim on
+/// `(adapter, session)`.
+///
+/// `settle` is not a stand-in for this. It answers "the grid stopped
+/// changing", and roost's terminal setup (`ratatui::init()`, `src/main.rs`)
+/// writes the alt-screen and mode sequences before `run()` builds the `App`
+/// — and `App::new` is where `spawn_pane` takes the D7 claim
+/// (`src/core/app.rs`). So a settled instance can still be a blank alternate
+/// screen with no claim taken (measured on this harness: settle returns
+/// ~200 ms before the claim file appears). A second instance spawned in that
+/// window resolves its own session first and wins the claim, which is not
+/// what any claim scenario means to test.
+///
+/// The claim file's owner line is written only *after* the flock is
+/// granted (`FsClaims::acquire`), so reading `owner` back out of it is the
+/// cross-instance happens-before these scenarios need.
+fn wait_for_claim(root: &std::path::Path, adapter: &str, session: &str, owner: &str) {
+    let path = root.join("claims").join(format!("{adapter}.{session}"));
+    let held = harness::wait_until(WAIT, || {
+        std::fs::read_to_string(&path)
+            .is_ok_and(|s| s.split_once('\t').is_some_and(|(ws, _)| ws == owner))
+    });
+    assert!(
+        held,
+        "workspace '{owner}' never took the claim on {session} ({}: {:?})",
+        path.display(),
+        std::fs::read_to_string(&path).ok()
+    );
+}
+
 fn spawn_named(
     root: &std::path::Path,
     name: &str,
@@ -281,7 +311,9 @@ fn control_verbs_target_the_flagged_workspace_and_name_what_is_running() {
 /// pane's agent itself may or may not be installed on this machine; the
 /// claim verdict is independent of that (the claim is taken before the
 /// launch), and the assertions compare only against the claim placeholder,
-/// never against a live agent pane.
+/// never against a live agent pane. That independence holds *within* one
+/// instance; ordering the two spawns against each other is `wait_for_claim`'s
+/// job, which `settle` cannot do.
 #[test]
 fn a_session_claimed_by_one_workspace_shows_a_placeholder_in_the_other() {
     let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -300,6 +332,10 @@ fn a_session_claimed_by_one_workspace_shows_a_placeholder_in_the_other() {
         return;
     };
     assert!(ha.settle(WAIT), "instance a never settled");
+    // a must be *holding* the claim before b resolves its own session —
+    // otherwise b takes it and launches, and the placeholder below never
+    // comes (see `wait_for_claim`).
+    wait_for_claim(&root, "pi", session, "a");
 
     let Some(mut firstb) = spawn_named(
         &root,
@@ -628,6 +664,10 @@ fn a_sigkilled_instance_releases_its_claim_for_the_next_restore() {
         return;
     };
     assert!(ha.settle(WAIT), "instance a never settled");
+    // There is no "released on crash" to prove unless a held a claim to
+    // release: killing a settled-but-not-yet-claimed instance leaves b
+    // resuming a session nobody ever took (see `wait_for_claim`).
+    wait_for_claim(&root, "pi", session, "a");
 
     let roost_a = ha.pid();
     // SAFETY: `kill(2)` on a pid this test owns, with SIGKILL — no pointers.
