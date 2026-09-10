@@ -65,6 +65,15 @@ pub struct Tab {
     /// tiled tab round-trips with no `view` key so old saves diff cleanly.
     #[serde(default, skip_serializing_if = "TabView::is_tiled")]
     pub view: TabView,
+    /// The pane this tab was focused on, stamped on every save so a quit
+    /// and relaunch land back where the user left off (DESIGN-ui.md C43).
+    /// Same additive-serde pattern as `view`: absent (not `null`) when
+    /// there is no honest answer, so a tab that has never been focused —
+    /// and every `workspace.json` written before this field existed —
+    /// round-trips with no `focus` key at all. `validate_and_repair` drops
+    /// a value naming a pane the tab does not contain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<PaneId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +107,7 @@ impl Workspace {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         }
     }
@@ -178,6 +188,12 @@ impl Workspace {
                     note: None,
                     noted_at: None,
                 });
+            }
+            // A hand-edited or corrupted file can name a `focus` that isn't
+            // in this tab at all (never was, or was closed since); a value
+            // like that must not survive to `App::new`, which trusts it.
+            if tab.focus.is_some_and(|id| !in_layout.contains(&id)) {
+                tab.focus = None;
             }
         }
         // A tab whose layout holds no panes at all draws as a blank body with
@@ -474,6 +490,7 @@ mod tests {
             layout: LayoutNode::Stack { children: Vec::new(), expanded: 0, from: None },
             panes: HashMap::new(),
             view: TabView::Tiled,
+            focus: None,
         });
         ws.active_tab = 1;
         ws.validate_and_repair();
@@ -494,6 +511,7 @@ mod tests {
             layout: LayoutNode::Pane(1),
             panes: HashMap::new(),
             view: TabView::Tiled,
+            focus: None,
         };
         let tiled_json = serde_json::to_string(&tiled).expect("a tab serializes");
         assert!(!tiled_json.contains("\"view\""), "a tiled tab omits the view key: {tiled_json}");
@@ -507,6 +525,68 @@ mod tests {
         let old_json = r#"{"name":"main","layout":{"pane":1},"panes":{}}"#;
         let old: Tab = serde_json::from_str(old_json).expect("an old tab still loads");
         assert_eq!(old.view, TabView::Tiled);
+    }
+
+    /// The persistence contract for C43's `focus` field, mirroring
+    /// `a_tab_view_round_trips_and_older_workspaces_still_load` exactly: a
+    /// tab that has never been focused (the overwhelming common case, and
+    /// every tab a pre-C43 roost ever wrote) serializes with no `focus` key
+    /// at all, a focused tab round-trips, and a `workspace.json` written
+    /// before this field existed still loads — as `None`, not an error.
+    #[test]
+    fn a_tab_focus_round_trips_and_older_workspaces_still_load() {
+        let unfocused = Tab {
+            name: "main".into(),
+            layout: LayoutNode::Pane(1),
+            panes: HashMap::new(),
+            view: TabView::Tiled,
+            focus: None,
+        };
+        let unfocused_json = serde_json::to_string(&unfocused).expect("a tab serializes");
+        assert!(
+            !unfocused_json.contains("\"focus\""),
+            "a never-focused tab omits the focus key: {unfocused_json}",
+        );
+
+        let focused = Tab { focus: Some(1), ..unfocused.clone() };
+        let focused_json = serde_json::to_string(&focused).expect("a focused tab serializes");
+        let reloaded: Tab = serde_json::from_str(&focused_json).expect("and loads back");
+        assert_eq!(reloaded.focus, Some(1));
+
+        // Backward: a tab written before `focus` existed has no key at all.
+        let old_json = r#"{"name":"main","layout":{"pane":1},"panes":{}}"#;
+        let old: Tab = serde_json::from_str(old_json).expect("an old tab still loads");
+        assert_eq!(old.focus, None);
+    }
+
+    /// A hand-edited or corrupted `workspace.json` can name a `focus` that
+    /// isn't in the tab at all — never was, or was closed since. `App::new`
+    /// trusts `Tab.focus` outright, so a value like that must not survive
+    /// past `validate_and_repair`: the boundary where an arbitrary file
+    /// becomes one roost can run.
+    #[test]
+    fn validate_and_repair_clears_a_focus_naming_a_missing_pane() {
+        let mut ws = Workspace::default_in(PathBuf::from("/tmp"));
+        ws.tabs[0].focus = Some(99); // not in this tab's layout at all
+        ws.validate_and_repair();
+        assert_eq!(ws.tabs[0].focus, None, "a focus naming no real pane must not survive repair");
+
+        // A focus naming a pane this tab genuinely holds is left alone.
+        ws.tabs[0].focus = Some(1);
+        ws.validate_and_repair();
+        assert_eq!(ws.tabs[0].focus, Some(1), "a focus naming a real pane survives repair");
+    }
+
+    /// Forward: `Tab` sets no `deny_unknown_fields`, so a key a *newer*
+    /// roost wrote (not just an absent `view`) does not break an older one
+    /// reading the same file — it is ignored, the mechanism the sibling
+    /// test's backward half relies on but never itself exercises.
+    #[test]
+    fn a_tab_json_with_an_unknown_key_still_loads() {
+        let json = r#"{"name":"main","layout":{"pane":1},"panes":{},"totally_unknown":42}"#;
+        let tab: Tab = serde_json::from_str(json).expect("an unknown key is ignored, not fatal");
+        assert_eq!(tab.name, "main");
+        assert_eq!(tab.view, TabView::Tiled);
     }
 
     #[test]

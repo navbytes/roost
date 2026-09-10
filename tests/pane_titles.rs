@@ -36,8 +36,11 @@ fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
         return;
     };
     // Before: the untitled pane's badge carries the `adapter · cwd-tag`
-    // fallback, so "1 shell" is on screen and no task name is.
-    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains("1 shell")).is_none() {
+    // fallback (no pane id — the badge dropped it, C4 amended), so "shell ·
+    // {cwd_tag}" is on screen and no task name is.
+    let cwd_tag = std::path::Path::new(cwd).file_name().and_then(|f| f.to_str()).unwrap_or(cwd);
+    let fallback_badge = format!("shell · {cwd_tag}");
+    if h.wait_for(Duration::from_secs(5), |s| s.contents().contains(&fallback_badge)).is_none() {
         panic!(
             "expected the adapter/cwd fallback badge before any OSC title:\n{}",
             h.screen().contents()
@@ -57,7 +60,7 @@ fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
     h.settle(Duration::from_secs(3));
     let shell_frame = h.screen().contents();
     assert!(
-        shell_frame.contains("1 shell") && !shell_frame.contains("1 TASK-X"),
+        shell_frame.contains(&fallback_badge) && !shell_frame.contains("TASK-X"),
         "a shell pane must keep its adapter/cwd badge despite an OSC title:\n{shell_frame}"
     );
 
@@ -77,9 +80,11 @@ fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
     h.write_bytes(b"sh -c 'sleep 300; :' pi\r");
 
     // Inbound: once promoted, the corner badge adopts the title it had been
-    // ignoring (C4's badge leads with the pane id, so `1 TASK-X` is the
-    // exact rendered token). Generous: promotion waits on a 2 s detect tick.
-    if h.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 TASK-X")).is_none() {
+    // ignoring (no id, C4 amended — the badge is bare `name`, and this pane
+    // has no title/adapter suffix since it's a live OSC title, not a rename,
+    // so `TASK-X` is the exact rendered token). Generous: promotion waits on
+    // a 2 s detect tick.
+    if h.wait_for(Duration::from_secs(15), |s| s.contents().contains("TASK-X")).is_none() {
         panic!(
             "the promoted pane's OSC 2 title never reached its badge:\n{}",
             h.screen().contents()
@@ -87,11 +92,12 @@ fn a_pane_osc_title_names_it_on_the_badge_and_in_the_host_title() {
     }
 
     // Outbound: roost publishes the focused pane's name as the host
-    // terminal's own title, led by the pane id exactly like the badge — a
-    // window title reading only `shell · cwd` cannot say which of a
-    // project's identically-named panes is focused. `wait_for_host_bytes`
-    // rather than a one-shot read: the update is throttled, so it may lag
-    // the badge by a tick.
+    // terminal's own title, led by the pane id — the host title kept its id
+    // (C4's chrome dropped it, the host title did not, it is a separate join
+    // key when several roost windows are open). A window title reading only
+    // `shell · cwd` cannot say which of a project's identically-named panes
+    // is focused. `wait_for_host_bytes` rather than a one-shot read: the
+    // update is throttled, so it may lag the badge by a tick.
     let published = h.wait_for_host_bytes(Duration::from_secs(5), |b| {
         contains(b, "\x1b]2;roost · 1 TASK-X\x07".as_bytes())
     });

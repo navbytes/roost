@@ -666,23 +666,101 @@ pub fn solo_rects(body: Rect, focused: PaneId) -> (u16, PaneRect) {
     (rw, PaneRect { id: focused, rect, collapsed: false })
 }
 
-/// C43: how many of the rail's `n` panes are actually drawn as a row —
-/// `rail_height` includes the header (row 0), so the rest holds panes, one
-/// per row, until they don't fit; the *last* row then gives way to the
-/// `…` overflow marker instead of a pane. Shared by `draw_rail` (what to
-/// draw) and `rail_row_at` (what a click may land on), so the two can
-/// never disagree about which row, if any, is the `…` — a click there
-/// must hit nothing, not whichever pane the marker displaced.
-pub fn rail_visible_rows(rail_height: u16, n: usize) -> usize {
-    let body_rows = rail_height.saturating_sub(1) as usize;
-    if body_rows == 0 {
-        return 0;
+/// C43: which slice of the rail's `n` rows is on screen, and whether an
+/// `…` marker is owed at either end. One pure seam so `draw_rail` (what to
+/// draw) and `rail_row_at` (what a click may land on) can never disagree
+/// about which row, if any, is a marker rather than a pane.
+///
+/// The window follows the shown pane. v1 drew the first rows only and
+/// never moved, so focus stepping past the fold left the rail with **no
+/// `▎` anywhere** while `Alt+↑/↓` went on moving among rows nobody could
+/// see — a stronger failure than "you can't see every row", and one that
+/// contradicts C43's own "shown ≡ focused". A marker costs a row, so
+/// below three body rows there is none: the header's own `N PANES` count
+/// is what says rows are missing, and the row budget goes to panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RailWindow {
+    /// Index into `pane_order()` of the first row drawn.
+    pub top: usize,
+    /// How many pane rows are drawn.
+    pub len: usize,
+    /// Rows exist above `top` — the first body row is an `…`, not a pane.
+    pub more_above: bool,
+    /// Rows exist below `top + len` — the last body row is an `…`.
+    pub more_below: bool,
+}
+
+pub fn rail_window(rail_height: u16, n: usize, shown: usize) -> RailWindow {
+    let none = RailWindow { top: 0, len: 0, more_above: false, more_below: false };
+    // `rail_height` includes the header (row 0); the rest is the budget.
+    let capacity = rail_height.saturating_sub(1) as usize;
+    if capacity == 0 || n == 0 {
+        return none;
     }
-    if n > body_rows {
-        body_rows - 1
-    } else {
-        n
+    if n <= capacity {
+        return RailWindow { top: 0, len: n, more_above: false, more_below: false };
     }
+    let shown = shown.min(n - 1);
+    if capacity < 3 {
+        // Not enough rows to spend one on a marker and still say anything.
+        return RailWindow { top: shown.min(n - capacity), len: capacity, ..none };
+    }
+    // Top-anchored while the shown row is in the head: one `…` below.
+    let head = capacity - 1;
+    if shown < head {
+        return RailWindow { top: 0, len: head, more_above: false, more_below: true };
+    }
+    // Bottom-anchored once it reaches the tail: one `…` above.
+    let tail_top = n - head;
+    if shown >= tail_top {
+        return RailWindow { top: tail_top, len: head, more_above: true, more_below: false };
+    }
+    // In between: an `…` at each end, the shown row kept near the middle.
+    let mid = capacity - 2;
+    let top = shown.saturating_sub(mid / 2).clamp(1, n - mid - 1);
+    RailWindow { top, len: mid, more_above: true, more_below: true }
+}
+
+/// C43 (rail breathing room): the spaced/contiguous/windowed cascade,
+/// wrapped around `rail_window` so `draw_rail` and `mouse::rail_row_at`
+/// read one seam and never compute the row pitch independently — the same
+/// reason `rail_window` itself exists.
+///
+/// Spacing is comfort, not information, so it is the first thing to yield
+/// when rows get scarce — the same call C6's stack header makes (drawn only
+/// when the stack is tall enough to spare the row) and C8's boxed collapsed
+/// rows make (boxed only when there's height to afford it). Three regimes,
+/// tried in order:
+///
+/// 1. **Spaced** — a blank row under the header and one above every pane
+///    row — chosen only when every row still fits: `1 + 2*n <= rail_height`.
+///    Rows land at `rail.y + 2 + 2*i`, so the last is at `rail.y + 2*n`,
+///    which is exactly why that predicate is the fit test. By construction
+///    the spaced case never overflows, so it needs no `…` markers.
+/// 2. **Contiguous** — today's layout, rows at `rail.y + 1 + i` — when
+///    spacing doesn't fit but every row still does.
+/// 3. **Windowed** — `rail_window`'s existing follow-the-shown-row
+///    behaviour, `…` markers included — when rows don't fit contiguously
+///    either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RailLayout {
+    /// Regime 1: every row got a blank line of its own.
+    pub spaced: bool,
+    pub window: RailWindow,
+}
+
+pub fn rail_layout(rail_height: u16, n: usize, shown: usize) -> RailLayout {
+    let fits_spaced = n
+        .checked_mul(2)
+        .and_then(|doubled| doubled.checked_add(1))
+        .is_some_and(|need| need <= rail_height as usize);
+    if fits_spaced {
+        return RailLayout {
+            spaced: true,
+            window: RailWindow { top: 0, len: n, more_above: false, more_below: false },
+        };
+    }
+    RailLayout { spaced: false, window: rail_window(rail_height, n, shown) }
 }
 
 /// A stack's header row (C6) — shown above its members, in the space it
@@ -2121,19 +2199,148 @@ mod tests {
     }
 
     #[test]
-    fn rail_visible_rows_gives_way_to_the_overflow_marker_only_once_needed() {
+    fn rail_window_gives_way_to_the_overflow_marker_only_once_needed() {
         // Header + 5 body rows (height 6): everything fits up to 5 panes.
-        assert_eq!(rail_visible_rows(6, 3), 3, "no overflow, every row is a pane");
-        assert_eq!(rail_visible_rows(6, 5), 5, "exactly full, still no overflow");
-        // 6 panes in 5 body rows: the last row becomes `…`, so only 4 are drawn.
-        assert_eq!(rail_visible_rows(6, 6), 4, "one row spent on the `…` marker");
-        assert_eq!(
-            rail_visible_rows(6, 50),
-            4,
-            "however many are hidden, still just the one marker"
-        );
+        let w = rail_window(6, 3, 0);
+        assert_eq!((w.top, w.len), (0, 3), "no overflow, every row is a pane");
+        assert!(!w.more_above && !w.more_below);
+        let w = rail_window(6, 5, 0);
+        assert_eq!((w.top, w.len), (0, 5), "exactly full, still no overflow");
+        assert!(!w.more_above && !w.more_below);
+        // 6 panes in 5 body rows: the last row becomes `…`, so only 4 draw.
+        let w = rail_window(6, 6, 0);
+        assert_eq!((w.top, w.len), (0, 4), "one row spent on the `…` marker");
+        assert!(!w.more_above && w.more_below);
         // No body rows at all: not even the marker has anywhere to go.
-        assert_eq!(rail_visible_rows(1, 3), 0, "height 1 is the header alone");
-        assert_eq!(rail_visible_rows(0, 3), 0, "degenerate height never panics");
+        assert_eq!(rail_window(1, 3, 0).len, 0, "height 1 is the header alone");
+        assert_eq!(rail_window(0, 3, 0).len, 0, "degenerate height never panics");
+    }
+
+    /// The bug the window exists to kill: with more panes than rows, the
+    /// shown row must always be inside the drawn slice, or the rail shows
+    /// a list with no `▎` on it at all while `Alt+↑/↓` keeps moving focus.
+    #[test]
+    fn rail_window_always_keeps_the_shown_row_on_screen() {
+        for height in 1..=12u16 {
+            for n in 1..=30usize {
+                for shown in 0..n {
+                    let w = rail_window(height, n, shown);
+                    if w.len == 0 {
+                        continue; // height 1: the header alone, nothing drawn
+                    }
+                    assert!(
+                        (w.top..w.top + w.len).contains(&shown),
+                        "height={height} n={n} shown={shown}: window {w:?} loses the marker",
+                    );
+                    assert!(w.top + w.len <= n, "height={height} n={n}: window runs past the rows");
+                    let markers = usize::from(w.more_above) + usize::from(w.more_below);
+                    assert!(
+                        w.len + markers <= (height - 1) as usize,
+                        "height={height} n={n} shown={shown}: {w:?} overruns the rail",
+                    );
+                    // Markers cost a row, so they only exist once there
+                    // are three body rows to spend one of.
+                    let can_mark = (height - 1) >= 3;
+                    assert_eq!(
+                        w.more_above,
+                        w.top > 0 && can_mark,
+                        "height={height} n={n} shown={shown}: {w:?} misreports rows above",
+                    );
+                    assert_eq!(
+                        w.more_below,
+                        w.top + w.len < n && can_mark,
+                        "height={height} n={n} shown={shown}: {w:?} misreports rows below",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Stepping to the last pane of a long tab scrolls the rail to the
+    /// tail — one `…` above, none below, and the last row really drawn.
+    #[test]
+    fn rail_window_anchors_to_the_tail_at_the_last_row() {
+        let w = rail_window(6, 20, 19);
+        assert_eq!((w.top, w.len), (16, 4));
+        assert!(w.more_above && !w.more_below);
+    }
+
+    // ---- C43: rail breathing room (rail_layout) ---------------------------
+
+    /// The cascade's three regimes, picked purely by height against `n`:
+    /// spaced while `1 + 2*n <= rail_height`, contiguous once spacing stops
+    /// fitting but every row still does, windowed once even that doesn't.
+    /// Pinned at the boundary itself and one row below it, since that is
+    /// exactly where the predicate the design leans on bites.
+    #[test]
+    fn rail_layout_picks_the_cascade_regime_by_height_around_the_spacing_boundary() {
+        let n = 4;
+        // Boundary: 1 + 2*4 = 9.
+        let at_boundary = rail_layout(9, n, 0);
+        assert!(at_boundary.spaced, "exactly 1+2n rows: spacing still fits");
+        assert_eq!((at_boundary.window.top, at_boundary.window.len), (0, n));
+        assert!(!at_boundary.window.more_above && !at_boundary.window.more_below);
+
+        let one_below = rail_layout(8, n, 0);
+        assert!(!one_below.spaced, "one row short of 1+2n: spacing no longer fits");
+        // Every row still fits contiguously: capacity = 7 >= n = 4.
+        assert_eq!((one_below.window.top, one_below.window.len), (0, n));
+        assert!(!one_below.window.more_above && !one_below.window.more_below);
+
+        let comfortably_spaced = rail_layout(20, n, 0);
+        assert!(comfortably_spaced.spaced, "well above the boundary: still spaced");
+
+        // Below contiguous fit too: windowed, and a `…` marker gives way.
+        let windowed = rail_layout(4, n, 0); // capacity 3 < n = 4
+        assert!(!windowed.spaced);
+        assert!(windowed.window.len < n, "some rows gave way to a marker");
+    }
+
+    /// A spaced layout, whenever the cascade picks it, always draws every
+    /// row and never owes a `…` marker — the fit predicate guarantees room
+    /// for all of them, so there is nothing left to elide.
+    #[test]
+    fn a_spaced_rail_layout_always_covers_every_row_with_no_markers() {
+        for n in 0..=20usize {
+            for rail_height in (1 + 2 * n as u16)..=60 {
+                let rl = rail_layout(rail_height, n, 0);
+                if rl.spaced {
+                    assert_eq!(rl.window.top, 0, "n={n} rail_height={rail_height}");
+                    assert_eq!(rl.window.len, n, "n={n} rail_height={rail_height}");
+                    assert!(
+                        !rl.window.more_above && !rl.window.more_below,
+                        "n={n} rail_height={rail_height}: spaced with a marker"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Property: whichever regime the cascade picks, the last row it draws
+    /// a pane on never runs past the rail's own last row — spacing must
+    /// never be the thing that causes the overflow it exists to avoid.
+    #[test]
+    fn the_last_drawn_rail_row_never_overflows_the_rail() {
+        for rail_height in 0..=40u16 {
+            for n in 0..=30usize {
+                for shown in 0..n.max(1) {
+                    let rl = rail_layout(rail_height, n, shown);
+                    if rl.window.len == 0 {
+                        continue;
+                    }
+                    // Mirrors `draw_rail`'s own pitch/first_slot arithmetic,
+                    // relative to the rail's top row (row 0 = the header).
+                    let pitch: u16 = if rl.spaced { 2 } else { 1 };
+                    let first_slot: u16 =
+                        if rl.spaced { 2 } else { 1 + u16::from(rl.window.more_above) };
+                    let last_row = first_slot + (rl.window.len as u16 - 1) * pitch;
+                    assert!(
+                        last_row < rail_height,
+                        "rail_height={rail_height} n={n} shown={shown}: {rl:?} \
+                         last row {last_row} overflows",
+                    );
+                }
+            }
+        }
     }
 }

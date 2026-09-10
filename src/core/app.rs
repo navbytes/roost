@@ -844,11 +844,31 @@ impl<B: PaneBackend> App<B> {
             keymap: Keymap::default(),
         };
         app.spawn_active_tab();
+        // C43: seed `tab_focus` from every tab's saved `focus` before the
+        // active tab's own restore below, so switching to another tab after
+        // launch lands on *its* remembered pane too, not its first —
+        // exactly what `remember_tab_focus` builds up during a session,
+        // reconstructed from what `stamp_tab_focus` wrote on the last save.
+        // Membership-checked against that tab's own panes: a hand-edited or
+        // stale id must not seed a lie (`validate_and_repair` already drops
+        // one that names no pane at all, but not one that names a pane in
+        // a *different* tab).
+        for tab in &app.ws.tabs {
+            if let Some(id) = tab.focus {
+                if tab.panes.contains_key(&id) {
+                    app.tab_focus.insert(id);
+                }
+            }
+        }
         // Through `set_focus` like every other focus move, so that method
-        // really is the only writer of `focused` (P10). Nothing is reported
-        // here: the panes were spawned microseconds ago and none has had a
-        // chance to send `?1004h` yet.
-        let first = app.first_visible().unwrap_or(0);
+        // really is the only writer of `focused` (P10) — its
+        // `expand_in_stacks` matters here: a remembered pane can be a
+        // collapsed stack member. Nothing is reported here: the panes were
+        // spawned microseconds ago and none has had a chance to send
+        // `?1004h` yet.
+        let remembered =
+            app.ws.active_tab().focus.filter(|id| app.ws.active_tab().panes.contains_key(id));
+        let first = remembered.or_else(|| app.first_visible()).unwrap_or(0);
         app.set_focus(first);
         // U20: seed the picker's recent-cwd column from the workspace that
         // was just loaded — the directories this fleet already lives in.
@@ -913,6 +933,7 @@ impl<B: PaneBackend> App<B> {
     /// exactly when the user needs to read it. The indicator remains the
     /// standing signal; this is the one that cannot be missed.
     fn save(&mut self) {
+        self.stamp_tab_focus();
         let result = self.store.save(&self.ws);
         let ok = result.is_ok();
         if self.last_save_ok && !ok {
@@ -1365,11 +1386,27 @@ impl<B: PaneBackend> App<B> {
     /// which row carries `▎`.
     pub fn solo_shown(&self) -> PaneId {
         if self.ws.active_tab().panes.contains_key(&self.focused) {
-            self.focused
-        } else {
-            let active = self.ws.active_tab;
-            self.tab_focus_target(active).or_else(|| self.first_visible()).unwrap_or(0)
+            return self.focused;
         }
+        // C22: while the float is shown it owns `self.focused`, but the pane
+        // *behind* it has not changed — `hide_float` restores exactly this.
+        // Membership-checked the same way it is there, since solo (unlike
+        // zoom) survives a tab switch and `prev_focus` can therefore name a
+        // pane in another tab. Skipping it outright, as this used to, let
+        // `Alt+Shift+z` over a solo tab swap the shown pane for the tab's
+        // stale remembered one — the rail's `▎` jumped, and two PTYs got
+        // resized — then snap back on hide (review, 2026-09-10).
+        if let Some(back) = self
+            .float
+            .as_ref()
+            .filter(|f| f.shown)
+            .map(|f| f.prev_focus)
+            .filter(|p| self.ws.active_tab().panes.contains_key(p))
+        {
+            return back;
+        }
+        let active = self.ws.active_tab;
+        self.tab_focus_target(active).or_else(|| self.first_visible()).unwrap_or(0)
     }
 
     /// The active tab's pane that's actually visible with no other
@@ -1851,6 +1888,45 @@ impl<B: PaneBackend> App<B> {
     pub fn display_name(&self, id: PaneId) -> String {
         let Some(spec) = self.find_spec(id) else { return format!("pane {id}") };
         display_name_live(spec, self.live_title(id).as_deref())
+    }
+
+    /// SPEC-ux U2 (reopened): `display_name`'s text, with an ` (N)` ordinal
+    /// suffix when — and only when — another pane in the **same tab** would
+    /// otherwise render byte-identical text (the id no longer breaks the
+    /// tie, having been dropped from every chrome row as a recycled,
+    /// non-durable name). Ties are broken in that tab's own `pane_order()`
+    /// — the same walk the rail steps and the roster ties on — so the first
+    /// pane with a given name stays bare and later ones count up from 2; a
+    /// pane naming no tab (the float) never has anything to collide with,
+    /// so it always stays bare.
+    ///
+    /// A chrome-row concern only — `display_name` itself is untouched on
+    /// purpose. It feeds the C20 feed, notifications, flashes and the host
+    /// terminal title, all of which already carry the real pane id and so
+    /// never needed a name whose shape depends on what else happens to be
+    /// open; suffixing it there would just be text the id already made
+    /// redundant.
+    pub fn chrome_name(&self, id: PaneId) -> String {
+        let name = self.display_name(id);
+        let Some(tab) = self.ws.tabs.iter().find(|t| t.panes.contains_key(&id)) else {
+            return name;
+        };
+        let mut order = Vec::new();
+        layout::pane_order(&tab.layout, &mut order);
+        let mut seen = 0usize;
+        for pid in order {
+            if self.display_name(pid) == name {
+                seen += 1;
+                if pid == id {
+                    break;
+                }
+            }
+        }
+        if seen <= 1 {
+            name
+        } else {
+            format!("{name} ({seen})")
+        }
     }
 
     /// P6: the pane's current OSC 0/2 title, sanitized and bounded — `None`
@@ -4649,9 +4725,8 @@ impl<B: PaneBackend> App<B> {
         // C43: `Left`/`Right` are refused before `apply` ever reaches this
         // function, so `dir` is always `Up`/`Down` here in solo — swap with
         // the rail's previous/next row (`rail_rows`, i.e. `pane_order()`)
-        // rather than a spatial neighbour, clamped silently at the ends
-        // (the rail has no edge chord to point at, unlike the tiled case
-        // just below).
+        // rather than a spatial neighbour, refusing out loud at the ends
+        // with `flash_move_edge`'s own list-shaped Up/Down wording.
         if self.solo() {
             let rows = self.rail_rows();
             let Some(i) = rows.iter().position(|&id| id == self.focused) else { return };
@@ -4660,7 +4735,15 @@ impl<B: PaneBackend> App<B> {
                 layout::Dir::Down => (i + 1 < rows.len()).then_some(i + 1),
                 layout::Dir::Left | layout::Dir::Right => None,
             };
-            let Some(j) = other else { return };
+            let Some(j) = other else {
+                // C38 / "every no-op flashes": the tiled branch just below
+                // says so at its edges, and `flash_move_edge`'s own Up/Down
+                // wording ("nothing above to swap with") is already about a
+                // list, not a geometry — so the rail reuses it rather than
+                // clamping mutely, which read as a dropped keypress.
+                self.flash_move_edge(dir);
+                return;
+            };
             let focused = self.focused;
             let layout = &mut self.ws.active_tab_mut().layout;
             if layout::swap_panes(layout, focused, rows[j]) {
@@ -5131,6 +5214,7 @@ impl<B: PaneBackend> App<B> {
             layout: LayoutNode::Pane(id),
             panes,
             view: TabView::Tiled,
+            focus: None,
         });
         self.ws.active_tab = self.ws.tabs.len() - 1;
         self.spawn_active_tab();
@@ -5160,6 +5244,30 @@ impl<B: PaneBackend> App<B> {
     fn tab_focus_target(&self, i: usize) -> Option<PaneId> {
         let tab = self.ws.tabs.get(i)?;
         tab.panes.keys().find(|id| self.tab_focus.contains(id)).copied()
+    }
+
+    /// C43: write each tab's remembered pane into `Tab.focus` right before
+    /// `save` serializes, so a quit and relaunch land back where the user
+    /// left off — not just the tiled/solo split `Tab.view` already
+    /// persists. The active tab's answer is `solo_shown()`: the same
+    /// membership-and-float resolution the rail's `▎` marker uses, so what
+    /// gets saved is exactly what was on screen, float included (`focus`
+    /// never names the float — it belongs to no tab). Every other tab's
+    /// answer is `tab_focus_target`, the in-memory record `remember_tab_focus`
+    /// keeps current on each switch. Either can come back empty (a tab never
+    /// focused, or whose remembered pane already closed) — `None`, not a
+    /// stale id, is the honest answer then.
+    fn stamp_tab_focus(&mut self) {
+        let active = self.ws.active_tab;
+        for i in 0..self.ws.tabs.len() {
+            let focus = if i == active {
+                let shown = self.solo_shown();
+                self.ws.tabs[i].panes.contains_key(&shown).then_some(shown)
+            } else {
+                self.tab_focus_target(i)
+            };
+            self.ws.tabs[i].focus = focus;
+        }
     }
 
     fn go_to_tab(&mut self, i: usize) {
@@ -5783,14 +5891,20 @@ impl<B: PaneBackend> App<B> {
     /// unconditionally would claim "can't tile" in cases `Alt+Shift+t`
     /// tiles instantly — so it's used only when the tree genuinely isn't
     /// drawable; the milder failure (drawable, but none of the three canned
-    /// shapes clear the floor) gets C25's own pre-solo wording back.
+    /// shapes clear the floor) names the toggle instead — C25's own
+    /// pre-solo wording pointed at `Alt+s`, which solo itself refuses.
     fn cycle_layout(&mut self, forward: bool) {
         let order = self.pane_order();
         if order.len() < 2 {
             self.set_flash("one pane — nothing to arrange");
             return;
         }
-        let focused = self.focused;
+        // Not bare `self.focused`: `apply`'s structural guard deliberately
+        // skips `hide_float` for `CycleLayout` while solo, so this is the
+        // one path that can run with the float still shown — and the float
+        // id is not in `order`, which would build (and measure) a candidate
+        // with one phantom leaf too many, refusing shapes that in fact fit.
+        let focused = if order.contains(&self.focused) { self.focused } else { self.solo_shown() };
         let area = self.body_area();
         let was_solo = self.solo();
         for step in 0..LAYOUT_CYCLE_LEN {
@@ -5831,8 +5945,12 @@ impl<B: PaneBackend> App<B> {
         // start always finds a stop somewhere in the ring; the sole
         // survivor is failing to tile on the way out of solo.
         if layout::every_pane_is_drawable(&self.ws.active_tab().layout, area) {
-            let hint =
-                self.chord_clause(Action::StackPane, |c| format!("; stack a pane with {c} first"));
+            // C38 (the way out must actually *be* a way out): this branch
+            // is reachable only from solo, and C25's own pre-solo clause
+            // named `Alt+s` — which solo refuses, pointing the user at a
+            // dead end. `every_pane_is_drawable` is exactly `toggle_solo`'s
+            // exit guard, so the toggle is the chord that does work here.
+            let hint = self.chord_clause(Action::ToggleSolo, |c| format!(" — {c} tiles this tab"));
             self.set_flash(format!("no room to rearrange{hint}"));
         } else {
             self.set_flash(self.cant_tile_flash());
@@ -12669,6 +12787,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let store = MemStore::default();
@@ -12817,6 +12936,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         }
     }
@@ -12900,6 +13020,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let mut registry = agents::registry();
@@ -12964,6 +13085,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let mut registry = agents::registry();
@@ -14231,6 +14353,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let mut registry = agents::registry();
@@ -14358,6 +14481,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let mut registry = agents::registry();
@@ -14452,6 +14576,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let mut registry = agents::registry();
@@ -14583,7 +14708,13 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
         };
         let mut registry = agents::registry();
         registry.insert("unscoped", Box::new(UnscopedAdapter(root.clone())));
@@ -14679,7 +14810,13 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
         };
 
         let mut registry = agents::registry();
@@ -14774,7 +14911,13 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
         };
 
         let mut registry = agents::registry();
@@ -16045,6 +16188,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let (mut app, store) = mk_app(ws);
@@ -17511,7 +17655,13 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
         };
         let (mut app, _) = mk_app(ws);
         app.focused = 3; // a collapsed member — expanded is currently 0 (pane 1)
@@ -17553,7 +17703,13 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
         };
         let (mut app, store) = mk_app(ws);
 
@@ -17602,6 +17758,7 @@ pub(crate) mod tests {
                     layout: LayoutNode::Pane(1),
                     panes: panes0,
                     view: TabView::Tiled,
+                    focus: None,
                 },
                 Tab {
                     name: "other".into(),
@@ -17615,6 +17772,7 @@ pub(crate) mod tests {
                     },
                     panes: panes1,
                     view: TabView::Tiled,
+                    focus: None,
                 },
             ],
         };
@@ -17673,6 +17831,7 @@ pub(crate) mod tests {
                 layout: LayoutNode::Pane(1),
                 panes: panes0,
                 view: TabView::Tiled,
+                focus: None,
             }],
         };
         let (mut app, _) = mk_app(ws);
@@ -17697,6 +17856,7 @@ pub(crate) mod tests {
             layout: LayoutNode::Stack { children: vec![4, 5, 6], expanded: 2, from: None },
             panes: panes1,
             view: TabView::Tiled,
+            focus: None,
         };
         app.undo.push(Closed::Tab { index: 1, tab: closed_tab });
 
@@ -17735,7 +17895,13 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
         };
         let (mut app, _) = mk_app(ws);
         // Startup (fix 1) already lands here since 2 is the saved `expanded`
@@ -17777,7 +17943,13 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
         };
         let (mut app, _) = mk_app(ws);
         // Startup (fix 1) already lands here since 2 is the saved `expanded`
@@ -17890,8 +18062,20 @@ pub(crate) mod tests {
             version: 1,
             active_tab: 0,
             tabs: vec![
-                Tab { name: "t0".into(), layout: layout0, panes: panes0, view: TabView::Tiled },
-                Tab { name: "t1".into(), layout: layout1, panes: panes1, view: TabView::Tiled },
+                Tab {
+                    name: "t0".into(),
+                    layout: layout0,
+                    panes: panes0,
+                    view: TabView::Tiled,
+                    focus: None,
+                },
+                Tab {
+                    name: "t1".into(),
+                    layout: layout1,
+                    panes: panes1,
+                    view: TabView::Tiled,
+                    focus: None,
+                },
             ],
         }
     }
@@ -18183,6 +18367,7 @@ pub(crate) mod tests {
                     layout: LayoutNode::Pane(1),
                     panes: panes0,
                     view: TabView::Tiled,
+                    focus: None,
                 },
                 Tab {
                     name: "t1".into(),
@@ -18200,6 +18385,7 @@ pub(crate) mod tests {
                     },
                     panes: panes1,
                     view: TabView::Tiled,
+                    focus: None,
                 },
             ],
         };
@@ -18641,6 +18827,41 @@ pub(crate) mod tests {
         assert_eq!(app.focused, remembered, "the memory travelled with the tab");
     }
 
+    /// C43: `Tab.focus` is what makes U11's per-tab memory survive a quit —
+    /// `App::new` is what every launch (and this test's simulated relaunch)
+    /// runs through, so stepping off the first pane, saving, and building a
+    /// fresh `App` from what got saved must land back on the stepped-to
+    /// pane, not `first_visible()`.
+    #[test]
+    fn relaunching_an_app_from_a_saved_workspace_lands_on_the_remembered_pane_not_the_first() {
+        let (mut app, store) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // tab 0: panes 1 | 2, focus 2 — not the first
+        assert_eq!(app.focused, 2);
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(saved.tabs[0].focus, Some(2), "save stamps the tab's remembered pane");
+
+        let (relaunched, _) = mk_app(saved);
+        assert_eq!(
+            relaunched.focused, 2,
+            "a relaunch must land on the remembered pane, not pane 1"
+        );
+    }
+
+    /// A `workspace.json` can carry a `focus` naming a pane that closed (or
+    /// never existed) since it was written — hand-edited, corrupted, or
+    /// from a build with a bug. `validate_and_repair` drops it before
+    /// `App::new` ever sees it, so this end-to-end path must fall back to
+    /// the tab's first pane, exactly like a first visit that never had a
+    /// memory to begin with (contrast `tab_focus_falls_back_to_the_first_
+    /// pane_when_the_memory_is_gone`, which pins the in-session version).
+    #[test]
+    fn a_saved_focus_naming_a_closed_pane_falls_back_cleanly_on_relaunch() {
+        let mut ws = shell_ws();
+        ws.tabs[0].focus = Some(99); // no pane 99 in this tab at all
+        let (app, _) = mk_app(ws);
+        assert_eq!(app.focused, 1, "a stale saved focus falls back to the tab's first pane");
+    }
+
     /// Undo reopens a closed tab with fresh pane ids, so there is nothing
     /// to remember — it must land on the reopened tab's first pane and
     /// leave every other tab's memory intact.
@@ -19018,8 +19239,8 @@ pub(crate) mod tests {
         assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
         assert_eq!(
             app.flash(),
-            Some("no room to rearrange; stack a pane with Alt+s first"),
-            "the tree still draws — this is C25's own pre-solo wording, not toggle_solo's"
+            Some("no room to rearrange — Alt+Shift+t tiles this tab"),
+            "the tree still draws, so it names the toggle (which works here),              not C25's pre-solo Alt+s (which solo itself refuses)"
         );
 
         // Harsher case: enough panes that a tiny body can't draw them all.
@@ -19383,6 +19604,86 @@ pub(crate) mod tests {
         app.find_spec_mut(1).unwrap().title = Some("TASK-8".into());
         app.last_host_title = None;
         assert!(host_contains(&mut app, b"\x1b]2;roost \xc2\xb7 1 TASK-8\x07"));
+    }
+
+    // -- SPEC-ux U2 (reopened): chrome-row collision suffix -----------------
+
+    /// Two panes with nothing else to tell them apart (same adapter, same
+    /// cwd, no title): the first stays bare, the second gets ` (2)` — never
+    /// the other way, and never both suffixed.
+    #[test]
+    fn chrome_name_suffixes_only_the_second_of_two_colliding_panes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1, 2 — both `shell · tmp`
+        assert_eq!(app.chrome_name(1), "shell · tmp", "pane_order()'s first pane stays bare");
+        assert_eq!(app.chrome_name(2), "shell · tmp (2)", "the second gets the ordinal");
+    }
+
+    /// Three-way collision numbers straight through: bare, ` (2)`, ` (3)` —
+    /// not every later pane defaulting to the same suffix.
+    #[test]
+    fn chrome_name_numbers_a_three_way_collision_in_pane_order() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // panes 1, 2, 3 — all `shell · tmp`
+        let order = app.pane_order();
+        assert_eq!(app.chrome_name(order[0]), "shell · tmp");
+        assert_eq!(app.chrome_name(order[1]), "shell · tmp (2)");
+        assert_eq!(app.chrome_name(order[2]), "shell · tmp (3)");
+    }
+
+    /// A name nothing else in the tab shares is never suffixed, even
+    /// alongside a pane pair that does collide.
+    #[test]
+    fn chrome_name_never_suffixes_a_name_with_no_collision() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1, 2 — both `shell · tmp`
+        app.find_spec_mut(2).unwrap().title = Some("worker1".into());
+        assert_eq!(app.chrome_name(1), "shell · tmp", "no other pane shares this name anymore");
+        assert_eq!(app.chrome_name(2), "worker1", "a distinct name, explicit or not, stays bare");
+    }
+
+    /// An explicit `Alt+r` title collides exactly like a fallback name does
+    /// — the rule is about the rendered text, not about how it was derived.
+    #[test]
+    fn chrome_name_suffixes_a_colliding_explicit_title_the_same_way() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.find_spec_mut(1).unwrap().title = Some("worker".into());
+        app.find_spec_mut(2).unwrap().title = Some("worker".into());
+        assert_eq!(app.chrome_name(1), "worker");
+        assert_eq!(app.chrome_name(2), "worker (2)");
+    }
+
+    /// Closing the first of a colliding pair returns the survivor to its
+    /// bare name — the suffix is recomputed fresh, never remembered.
+    #[test]
+    fn chrome_name_returns_the_survivor_to_bare_after_the_first_closes() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane); // panes 1, 2 — both `shell · tmp`
+        assert_eq!(app.chrome_name(2), "shell · tmp (2)");
+        app.focused = 1;
+        app.apply(Action::ClosePane);
+        assert_eq!(
+            app.chrome_name(2),
+            "shell · tmp",
+            "the survivor has nothing left to collide with"
+        );
+    }
+
+    /// The collision scope is one tab: two panes in *different* tabs with
+    /// the same (explicit, so the fixture's own cwd can't matter) name
+    /// never suffix each other, however many there are.
+    #[test]
+    fn chrome_name_never_crosses_a_tab_boundary() {
+        let (mut app, _) = mk_app(shell_ws());
+        let tab0_pane = app.pane_order()[0];
+        app.find_spec_mut(tab0_pane).unwrap().title = Some("worker".into());
+        app.apply(Action::NewTab);
+        let tab1_pane = app.pane_order()[0];
+        app.find_spec_mut(tab1_pane).unwrap().title = Some("worker".into());
+        assert_eq!(app.chrome_name(tab0_pane), "worker", "tab 0's lone pane, unaffected");
+        assert_eq!(app.chrome_name(tab1_pane), "worker", "tab 1's lone pane, unaffected");
     }
 
     /// C4 (amended 2026-09-03): a NAMED workspace's title gains the workspace
@@ -21034,6 +21335,52 @@ pub(crate) mod tests {
         assert_eq!(app.ws.active_tab, 1, "wraps to the other tab, the only one there is");
     }
 
+    /// Review fix, C43: `solo_shown()` used to skip straight past the
+    /// float's own `prev_focus` to the tab's *remembered* pane whenever that
+    /// pane was still a member of the active tab — so showing the scratch
+    /// float over a solo tab could swap which pane was on screen if focus
+    /// had moved since the last tab switch (the only thing that stamps
+    /// `tab_focus`). `prev_focus` is what `toggle_float` actually captured
+    /// off `self.focused` a moment ago and is the one honest answer.
+    #[test]
+    fn solo_shown_prefers_the_floats_prev_focus_over_a_stale_remembered_pane() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        let rows = app.rail_rows();
+        assert_eq!(rows.len(), 3);
+        app.set_focus(rows[0]);
+
+        // A tab switch away and back is the only thing that stamps
+        // `tab_focus` — it lands back on rows[0], the pane the tab was left
+        // on, matching `self.focused` for now.
+        app.apply(Action::NewTab);
+        app.apply(Action::PrevTab);
+        assert_eq!(app.ws.active_tab, 0);
+        assert_eq!(app.focused, rows[0]);
+
+        // Step focus without another tab switch: `tab_focus` still names
+        // rows[0], but the rail has moved on to rows[1].
+        app.apply(Action::Focus(layout::Dir::Down));
+        assert_eq!(app.focused, rows[1]);
+
+        app.apply(Action::ToggleFloat);
+        assert_eq!(
+            app.solo_shown(),
+            rows[1],
+            "the float's prev_focus, not tab_focus's stale rows[0], is what was on screen"
+        );
+        let rects = app.display_rects();
+        assert!(
+            rects.iter().any(|pr| pr.id == rows[1]),
+            "display_rects still carries the pane behind the float: {rects:?}"
+        );
+
+        app.apply(Action::ToggleFloat);
+        assert_eq!(app.solo_shown(), rows[1], "hiding the float snaps back to the same pane");
+    }
+
     /// C33's swap path, reused: `Alt+Shift+↑/↓` reorders the rail exactly
     /// like it reorders the tiled tree, and the reorder persists.
     #[test]
@@ -21053,6 +21400,40 @@ pub(crate) mod tests {
         let mut persisted_order = Vec::new();
         layout::pane_order(&saved.tabs[0].layout, &mut persisted_order);
         assert_eq!(persisted_order, after, "the swap survived the save");
+    }
+
+    /// Review fix, C43: the rail's swap used to clamp silently at either
+    /// end, like `Focus` still does — but a *move* is a structural edit, not
+    /// a look, and C38's rule is every refusal says so. It now reuses
+    /// `flash_move_edge`'s own list-shaped Up/Down wording instead.
+    #[test]
+    fn solo_move_pane_at_the_rail_ends_flashes_instead_of_clamping_silently() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        let rows = app.rail_rows();
+        assert_eq!(rows.len(), 3);
+        let before = format!("{:?}", app.ws.active_tab().layout);
+
+        app.set_focus(rows[0]);
+        app.apply(Action::MovePane(layout::Dir::Up));
+        assert_eq!(
+            format!("{:?}", app.ws.active_tab().layout),
+            before,
+            "nothing above the top row to swap with"
+        );
+        assert_eq!(app.flash(), Some("nothing above to swap with"));
+
+        app.flash = None;
+        app.set_focus(rows[2]);
+        app.apply(Action::MovePane(layout::Dir::Down));
+        assert_eq!(
+            format!("{:?}", app.ws.active_tab().layout),
+            before,
+            "nothing below the bottom row to swap with"
+        );
+        assert_eq!(app.flash(), Some("nothing below to swap with"));
     }
 
     /// Every refused chord — the shape verbs and the cross-tab move pair —

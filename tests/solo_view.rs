@@ -102,3 +102,95 @@ fn alt_shift_t_toggles_solo_steps_the_rail_and_tiles_back_through_a_real_termina
 
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
 }
+
+/// Like `harness::spawn_or_skip`, but for `Harness::try_spawn_at` — the seam
+/// this file's relaunch scenario needs (a caller-owned `ROOST_STATE` root
+/// two spawns share), with the same "skip, don't fail" escape hatch for a
+/// sandboxed runner with no usable PTY.
+fn spawn_at_or_skip(root: &std::path::Path, what: &str) -> Option<harness::Harness> {
+    match harness::Harness::try_spawn_at(root, &[], &[]) {
+        Ok(h) => Some(h),
+        Err(reason) => {
+            eprintln!("SKIP {what}: {reason}");
+            None
+        }
+    }
+}
+
+/// C43's headline claim — "a solo tab comes back solo, with its remembered
+/// focus, on launch" (DESIGN-ui.md, C43 "Persistence and control plane") —
+/// is a round trip through `workspace.json` on disk, at process boundaries
+/// the single-process test above never crosses: it toggles, steps and
+/// tiles back all inside one `roost` run, so it cannot tell "solo state
+/// lives in memory" from "solo state round-trips through the saved file".
+/// This spawns roost once, enters solo, steps the rail off the tab's first
+/// pane, quits cleanly, then relaunches against the very same `ROOST_STATE`
+/// and asserts the tab comes back solo, showing the same (non-first) pane.
+#[test]
+fn a_solo_tab_with_a_stepped_focus_survives_quit_and_relaunch_through_a_real_terminal() {
+    let cwd = std::env::temp_dir();
+    let cwd = cwd.to_str().expect("temp dir is valid utf8");
+    let root = harness::shared_state_dir("solorelaunch");
+    std::fs::write(root.join("workspace.json"), harness::two_panes(cwd))
+        .expect("seed workspace.json");
+
+    let Some(mut h1) = spawn_at_or_skip(&root, "solo relaunch e2e") else {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    };
+    assert!(h1.settle(Duration::from_secs(15)), "roost never drew a first frame");
+    assert!(
+        h1.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 main")).is_some(),
+        "roost never drew its tab bar",
+    );
+    assert_eq!(pane_count(h1.screen()), 2, "the fixture starts as two tiled panes");
+
+    // Enter solo, then step off the tab's first pane — the state a bare
+    // toggle-on can't distinguish from "always shows the first pane".
+    h1.write_bytes(ALT_SHIFT_T);
+    assert!(
+        h1.wait_for(Duration::from_secs(5), |s| s.contents().contains("SOLO · 2 PANES")).is_some(),
+        "ESC T never reached ToggleSolo — the rail header never drew:\n{}",
+        h1.screen().contents(),
+    );
+    let first_marker = marked_row(h1.screen());
+    assert!(first_marker.is_some(), "the focused row must carry the ▎ marker on entry");
+
+    h1.write_bytes(ALT_DOWN);
+    let stepped_marker = h1.wait_for(Duration::from_secs(5), |s| {
+        marked_row(s).is_some() && marked_row(s) != first_marker
+    });
+    assert!(
+        stepped_marker.is_some(),
+        "Alt+↓ never moved the ▎ marker off row {first_marker:?}:\n{}",
+        h1.screen().contents(),
+    );
+    let stepped_marker = marked_row(h1.screen());
+
+    assert!(h1.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");
+
+    // `h1` stays bound (not dropped) until the relaunch has spawned: its
+    // `Drop` removes the shared `ROOST_STATE` root, and the second instance
+    // needs that root's `workspace.json` still there to read (see
+    // `Harness::try_spawn_at`'s own doc comment).
+    let Some(mut h2) = spawn_at_or_skip(&root, "solo relaunch e2e (relaunch)") else {
+        return;
+    };
+    assert!(h2.settle(Duration::from_secs(15)), "the relaunched roost never drew a first frame");
+    assert!(
+        h2.wait_for(Duration::from_secs(15), |s| s.contents().contains("SOLO · 2 PANES")).is_some(),
+        "the relaunched tab did not come back solo:\n{}",
+        h2.screen().contents(),
+    );
+    assert_eq!(
+        marked_row(h2.screen()),
+        stepped_marker,
+        "the relaunched tab must remember the stepped-to pane, not fall back to the first:\n{}",
+        h2.screen().contents(),
+    );
+
+    assert!(
+        h2.quit_and_wait(Duration::from_secs(5)).is_some(),
+        "relaunched roost did not exit cleanly"
+    );
+}

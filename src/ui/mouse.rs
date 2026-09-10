@@ -357,18 +357,43 @@ pub fn picker_row_at(rect: Rect, items: usize, col: u16, row: u16) -> Option<usi
 /// hit nothing. The rail draws no border (§2 background policy), so every
 /// column inside counts, unlike the picker's bordered dialog above. Past
 /// the last row `draw_rail` actually drew a pane on — including the `…`
-/// overflow marker's own row, when there is one — also hits nothing:
-/// `layout::rail_visible_rows` is the one seam both this and `draw_rail`
-/// read, so a click can never land on a pane the marker displaced.
-pub fn rail_row_at(rail: Rect, rows: &[PaneId], col: u16, row: u16) -> Option<PaneId> {
+/// overflow marker's own row, when there is one — also hits nothing. A
+/// spaced rail's blank gap rows are not dead: each belongs to the pane row
+/// it pads, like a list item's padding, so a click there resolves the same
+/// as clicking the row itself. `layout::rail_layout` is the one seam both
+/// this and `draw_rail` read, so a click can never land on a pane a marker
+/// displaced — nor on the wrong pane once the window has scrolled to follow
+/// the shown row, nor disagree about the row pitch.
+pub fn rail_row_at(
+    rail: Rect,
+    rows: &[PaneId],
+    shown: PaneId,
+    col: u16,
+    row: u16,
+) -> Option<PaneId> {
     if col < rail.x || col >= rail.x + rail.width || row >= rail.y + rail.height {
         return None;
     }
-    let i = row.checked_sub(rail.y + 1)? as usize;
-    if i >= crate::core::layout::rail_visible_rows(rail.height, rows.len()) {
+    // 0 = the header row.
+    let slot = row.checked_sub(rail.y)? as usize;
+    let shown_i = rows.iter().position(|&id| id == shown).unwrap_or(0);
+    let rl = crate::core::layout::rail_layout(rail.height, rows.len(), shown_i);
+    let i = if rl.spaced {
+        // Each blank row pads the pane row directly below it, so it belongs
+        // to that row like a list item's padding — only the header (slot 0)
+        // hits nothing. Gap `1 + 2*i` and pane row `2 + 2*i` both floor-divide
+        // to row `i`: `(slot - 1) / 2`.
+        slot.checked_sub(1)? / 2
+    } else {
+        // The `…` markers own the first and/or last body slot when the
+        // window is scrolled; a click on one hits nothing, like the header.
+        let body_slot = slot.checked_sub(1)?;
+        body_slot.checked_sub(usize::from(rl.window.more_above))?
+    };
+    if i >= rl.window.len {
         return None;
     }
-    rows.get(i).copied()
+    rows.get(rl.window.top + i).copied()
 }
 
 /// The tab bar's right-aligned status text (C2): the mode word (U15 — only
@@ -1186,46 +1211,85 @@ mod tests {
     fn rail_row_at_the_header_row_hits_nothing() {
         let rail = Rect::new(0, 1, 20, 10);
         let rows = vec![1u64, 2, 3];
-        assert_eq!(rail_row_at(rail, &rows, 5, 1), None);
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 1), None);
     }
 
-    /// The ordinary case: row `rail.y + 1 + i` is the i-th id, at any
-    /// column inside the rail (no border to dodge, unlike the picker).
+    /// The ordinary (contiguous) case: row `rail.y + 1 + i` is the i-th id,
+    /// at any column inside the rail (no border to dodge, unlike the
+    /// picker). Height 6 keeps this below the spacing threshold
+    /// (`1 + 2*3 = 7 > 6`) so it stays in the contiguous regime — the
+    /// spaced case gets its own test below.
     #[test]
     fn rail_row_at_maps_rows_to_ids_in_order() {
-        let rail = Rect::new(0, 1, 20, 10);
+        let rail = Rect::new(0, 1, 20, 6);
         let rows = vec![7u64, 8, 9];
-        assert_eq!(rail_row_at(rail, &rows, 0, 2), Some(7));
-        assert_eq!(rail_row_at(rail, &rows, 19, 3), Some(8));
-        assert_eq!(rail_row_at(rail, &rows, 10, 4), Some(9));
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 0, 2), Some(7));
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 19, 3), Some(8));
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 10, 4), Some(9));
     }
 
     /// Past the last id, still inside the rail's rect (the fixed-height
     /// tail below a short list) — and everything outside the rect on
-    /// every side: above, below, left, right.
+    /// every side: above, below, left, right. Height 10 for 2 ids puts this
+    /// rail in the spaced regime (`2*2+1 = 5 <= 10`); the last drawn content
+    /// (a gap padding pane 1) is row 4, so the dead tail starts at row 6.
     #[test]
     fn rail_row_at_outside_the_rows_or_the_rect_hits_nothing() {
         let rail = Rect::new(5, 1, 20, 10);
         let rows = vec![1u64, 2];
-        assert_eq!(rail_row_at(rail, &rows, 5, 4), None, "past the last id");
-        assert_eq!(rail_row_at(rail, &rows, 4, 2), None, "left of the rail");
-        assert_eq!(rail_row_at(rail, &rows, 25, 2), None, "right of the rail");
-        assert_eq!(rail_row_at(rail, &rows, 5, 0), None, "above the rail");
-        assert_eq!(rail_row_at(rail, &rows, 5, 11), None, "below the rail");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 6), None, "past the last id");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 4, 2), None, "left of the rail");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 25, 2), None, "right of the rail");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 0), None, "above the rail");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 11), None, "below the rail");
     }
 
     /// design-supervisor finding: a click on the `…` overflow row used to
     /// resolve to whichever pane the marker had displaced — the one row
-    /// `draw_rail` never actually painted an id into. `rail_visible_rows`
-    /// is the seam that keeps this in lockstep with what's drawn.
+    /// `draw_rail` never actually painted an id into. `rail_window` is the
+    /// seam that keeps this in lockstep with what's drawn.
     #[test]
     fn rail_row_at_the_overflow_marker_row_hits_nothing() {
-        // Header (row 1) + 3 body rows (rows 2..4) for 5 ids: only 2 are
-        // drawn as panes (rows 2, 3); row 4 is the `…` marker.
+        // Header (row 1) + 3 body rows (rows 2..4) for 5 ids: with the
+        // shown row at the head, only 2 draw as panes (rows 2, 3); row 4
+        // is the `…` marker.
         let rail = Rect::new(0, 1, 20, 4);
         let rows = vec![10u64, 11, 12, 13, 14];
-        assert_eq!(rail_row_at(rail, &rows, 0, 2), Some(10), "first drawn row");
-        assert_eq!(rail_row_at(rail, &rows, 0, 3), Some(11), "second drawn row");
-        assert_eq!(rail_row_at(rail, &rows, 0, 4), None, "the `…` row itself, not pane 12");
+        assert_eq!(rail_row_at(rail, &rows, 10, 0, 2), Some(10), "first drawn row");
+        assert_eq!(rail_row_at(rail, &rows, 10, 0, 3), Some(11), "second drawn row");
+        assert_eq!(rail_row_at(rail, &rows, 10, 0, 4), None, "the `…` row itself, not pane 12");
+    }
+
+    /// …and once the window has scrolled to follow the shown row, a click
+    /// resolves against the *drawn* slice, not the head of the list. The
+    /// top `…` owns the first body row, so it hits nothing either.
+    #[test]
+    fn rail_row_at_follows_the_window_when_the_rail_has_scrolled() {
+        // Same rail; the shown row is now the last id, so the window is
+        // bottom-anchored: row 2 is the top `…`, rows 3/4 are ids 13/14.
+        let rail = Rect::new(0, 1, 20, 4);
+        let rows = vec![10u64, 11, 12, 13, 14];
+        assert_eq!(rail_row_at(rail, &rows, 14, 0, 2), None, "the top `…` marker");
+        assert_eq!(rail_row_at(rail, &rows, 14, 0, 3), Some(13));
+        assert_eq!(rail_row_at(rail, &rows, 14, 0, 4), Some(14), "the shown row is reachable");
+    }
+
+    /// C43 breathing room: in a spaced rail every pane row sits at
+    /// `rail.y + 2 + 2*i`, with a blank gap row above the first one and
+    /// between every pair. Only the header hits nothing — each gap row
+    /// belongs to the pane row it pads, so a click there resolves to the
+    /// same id as clicking the pane row itself.
+    #[test]
+    fn rail_row_at_a_spaced_rail_resolves_panes_and_their_padding_gaps_to_the_same_id() {
+        // height 10, n=3: 1 + 2*3 = 7 <= 10, so this is the spaced regime.
+        let rail = Rect::new(0, 1, 20, 10);
+        let rows = vec![7u64, 8, 9];
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 1), None, "the header row");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 2), Some(7), "gap padding the first row");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 3), Some(7), "first pane row");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 4), Some(8), "gap padding the second row");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 5), Some(8), "second pane row");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 6), Some(9), "gap padding the third row");
+        assert_eq!(rail_row_at(rail, &rows, rows[0], 5, 7), Some(9), "third pane row");
     }
 }

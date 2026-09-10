@@ -203,12 +203,14 @@ mod tests {
                     layout: LayoutNode::Pane(1),
                     panes: tab1_panes,
                     view: TabView::Tiled,
+                    focus: None,
                 },
                 Tab {
                     name: "two".into(),
                     layout: LayoutNode::Pane(3),
                     panes: tab2_panes,
                     view: TabView::Tiled,
+                    focus: None,
                 },
             ],
         };

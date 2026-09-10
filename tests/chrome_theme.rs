@@ -566,7 +566,13 @@ fn the_roster_status_filter_tags_its_title_in_the_tiers_own_colour() {
     // dimmed backdrop) and fails the NeedsInput tier, dropping its whole
     // group — including the header.
     let frame = screen.contents();
-    assert!(frame.contains("1 shell"), "the matching pane must still be listed:\n{frame}");
+    // No pane id on the row any more — the name (adapter + cwd tag) is what
+    // identifies it now.
+    let cwd_tag = std::path::Path::new(cwd).file_name().and_then(|f| f.to_str()).unwrap_or(cwd);
+    assert!(
+        frame.contains(&format!("shell · {cwd_tag}")),
+        "the matching pane must still be listed:\n{frame}"
+    );
     assert!(!frame.contains("2 SIDE"), "the non-matching tab's group must vanish whole:\n{frame}");
 
     assert!(h.quit_and_wait(Duration::from_secs(5)).is_some(), "roost did not exit cleanly");

@@ -82,21 +82,33 @@ fn the_roster_lists_another_tabs_panes_and_jumps_across_to_one() {
     // NOT active, whose panes have no other resting surface in roost.
     assert!(frame.contains("1 MAIN · 1 PANE"), "tab 1's group header:\n{frame}");
     assert!(frame.contains("2 API · 2 PANES"), "the INACTIVE tab's group header:\n{frame}");
-    // C8's row format for each of the inactive tab's panes: the id leads,
-    // and — the case this whole fixture *is* — a tab restored from disk has
-    // never been spawned, so its rows say "not started" behind the quiet dot
-    // the tab bar itself is drawing on that tab in this very frame. Rows
-    // reading "exited" here would be the roster calling a fleet that has yet
-    // to start a morgue.
-    for id in [2, 3] {
-        let row = frame
-            .lines()
-            .find(|l| l.contains(&format!("{id} shell")))
-            .unwrap_or_else(|| panic!("pane {id} (inactive tab) is listed:\n{frame}"));
-        assert!(row.contains("not started"), "pane {id}'s row has not spawned: {row:?}");
-        assert!(!row.contains("exited"), "pane {id} is not dead: {row:?}");
-        assert!(!row.contains('✕'), "no dead glyph on pane {id}'s row: {row:?}");
+    // C8's row format for each of the inactive tab's panes: no pane id (C4
+    // amended — the name is already on the row), and — the case this whole
+    // fixture *is* — a tab restored from disk has never been spawned, so its
+    // rows say "not started" behind the quiet dot the tab bar itself is
+    // drawing on that tab in this very frame. Rows reading "exited" here
+    // would be the roster calling a fleet that has yet to start a morgue.
+    // Both of tab 2's panes share an identical fallback name (same adapter,
+    // same cwd) — the collision suffix (SPEC-ux U2, reopened) is what makes
+    // them distinguishable by name again: pane 2 (`pane_order()`'s first)
+    // reads bare, pane 3 reads numbered ` (2)`.
+    let tag = std::path::Path::new(cwd).file_name().and_then(|f| f.to_str()).unwrap();
+    let name = format!("shell · {tag}");
+    let lines: Vec<&str> = frame.lines().collect();
+    let header = lines
+        .iter()
+        .position(|l| l.contains("2 API · 2 PANES"))
+        .unwrap_or_else(|| panic!("the INACTIVE tab's group header is listed:\n{frame}"));
+    let pane2 = lines[header + 1];
+    let pane3 = lines[header + 2];
+    for row in [pane2, pane3] {
+        assert!(row.contains(&name), "the inactive tab's pane row: {row:?}");
+        assert!(row.contains("not started"), "the row has not spawned: {row:?}");
+        assert!(!row.contains("exited"), "the row is not dead: {row:?}");
+        assert!(!row.contains('✕'), "no dead glyph on the row: {row:?}");
     }
+    assert!(!pane2.contains(&format!("{name} (2)")), "pane 2 stays bare:\n{pane2}");
+    assert!(pane3.contains(&format!("{name} (2)")), "pane 3 is numbered:\n{pane3}");
     assert!(frame.contains("ROSTER"), "the C9 mode word is on the bar:\n{frame}");
 
     // -- walk to a pane in the other tab and go there -----------------------
