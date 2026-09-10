@@ -1523,7 +1523,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             chords(&[Action::FlipSplit], "flip this split's orientation"),
             chords(
                 &[Action::CycleLayout { forward: true }],
-                "cycle layout: grid / main+stack / all-stack",
+                "cycle layout: grid / main+stack / all-stack / solo",
             ),
             // C37 sits directly under its own unshifted form, which is
             // C28's actual rule (the C33 audit drew the distinction: C28

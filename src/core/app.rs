@@ -367,6 +367,16 @@ const CLICK_TOLERANCE: u16 = 1;
 /// How many closed panes/tabs the undo stack keeps.
 const UNDO_DEPTH: usize = 20;
 
+/// C25/C43: `layout_cycle`'s ring length — grid, main+stack, all-stack, and
+/// (since C43) solo as its fourth stop.
+const LAYOUT_CYCLE_LEN: isize = 4;
+
+/// C43: solo's own position in the `layout_cycle` ring — the last of the
+/// four. `toggle_solo`'s entry arm and `cycle_layout`'s step onto this stop
+/// both set `layout_cycle` to one past it, so whichever chord got you into
+/// solo, the next `Alt+g` goes to grid and `Alt+Shift+g` to all-stack.
+const SOLO_CYCLE_STOP: usize = 3;
+
 /// Cap on concurrently parked `wait` requests. Each parked wait holds a
 /// socket connection slot for up to its whole timeout, and one-shot calls
 /// like status/list share that same pool (`MAX_CONN` in sock.rs) — without a
@@ -504,8 +514,8 @@ pub struct App<B: PaneBackend> {
     /// `display_rects`); the layout tree itself is never touched.
     /// Session-only, never persisted.
     zoomed: bool,
-    /// C25: index of the arrangement Alt+g tries first on the next press
-    /// (grid=0 / main+stack=1 / all-stack=2). Session-only.
+    /// C25: index of the stop Alt+g tries first on the next press
+    /// (grid=0 / main+stack=1 / all-stack=2 / **solo=3, C43**). Session-only.
     layout_cycle: usize,
     /// The workspace this instance runs in (named workspaces): "default" or
     /// the `-w` name. Carried in from the composition root because core is
@@ -4140,13 +4150,17 @@ impl<B: PaneBackend> App<B> {
         // float on its way to doing nothing. Falls through to this
         // function's own tail (`relayout` + `save`), same as every other
         // refusal that changes nothing.
+        //
+        // **[Amended 2026-09-10, C43]** `CycleLayout` left this list: it is
+        // now the fourth stop of its own ring (`cycle_layout`'s own doc
+        // comment carries the fit rule and the two-way interplay), so
+        // `Alt+g`/`Alt+Shift+g` act on a solo tab instead of refusing.
         if self.solo() {
             let refusal = match action {
                 Action::StackPane
                 | Action::ExplodeStack
                 | Action::FlipSplit
-                | Action::Resize { .. }
-                | Action::CycleLayout { .. } => Some(self.solo_shape_refusal()),
+                | Action::Resize { .. } => Some(self.solo_shape_refusal()),
                 Action::MovePane(layout::Dir::Left | layout::Dir::Right) => {
                     Some(self.solo_move_pane_lr_refusal())
                 }
@@ -5389,6 +5403,10 @@ impl<B: PaneBackend> App<B> {
     /// view. A pure view transform — the layout tree is never touched by
     /// entering, leaving, or stepping — so leaving restores the tree
     /// exactly as it was, no matter what stepped or reordered while solo.
+    /// Leaving here never touches `layout_cycle` — unlike stepping off the
+    /// solo stop via `Alt+g`, this restores the tree as it was rather than
+    /// applying one of the three canned shapes, so there is no new position
+    /// in the ring to record.
     fn toggle_solo(&mut self) {
         if self.solo() {
             // The only thing solo can make stale: the terminal may have
@@ -5397,11 +5415,7 @@ impl<B: PaneBackend> App<B> {
             // can't fully draw.
             let area = self.body_area();
             if !layout::every_pane_is_drawable(&self.ws.active_tab().layout, area) {
-                let n = self.ws.active_tab().panes.len();
-                self.set_flash(format!(
-                    "can't tile {n} panes at {}×{} — close some, or widen the terminal",
-                    area.width, area.height
-                ));
+                self.set_flash(self.cant_tile_flash());
                 return;
             }
             self.ws.active_tab_mut().view = TabView::Tiled;
@@ -5409,23 +5423,51 @@ impl<B: PaneBackend> App<B> {
             // already ran on every focus change made while solo, so the
             // tiled tree comes back with the right member already open.
         } else {
-            self.ws.active_tab_mut().view = TabView::Solo;
-            // C22 rule 3's pattern, the same two lines `apply`'s structural
-            // guard runs for the shape verbs: entering solo doesn't touch
-            // the tree, but the float has no place beside a rail-and-one-
-            // pane view, and leaving zoom means the very first frame shows
-            // the rail instead of a full-body pane that would need a
-            // second `Alt+z` to reveal it.
-            self.exit_zoom();
-            self.hide_float();
+            // **[Amended 2026-09-10, C43]** `layout_cycle` is set to the
+            // solo stop's own index + 1 (`enter_solo`'s job when it runs
+            // from inside `cycle_layout`) here too, so the next `Alt+g`
+            // goes to grid and `Alt+Shift+g` to all-stack regardless of
+            // whether solo was entered by this chord or by cycling onto it.
+            self.enter_solo();
+            self.layout_cycle = (SOLO_CYCLE_STOP + 1) % LAYOUT_CYCLE_LEN as usize;
         }
     }
 
+    /// C43/C25: put the active tab into solo view — set `view = Solo` and
+    /// leave `tab.layout` untouched, then the same zoom/float housekeeping
+    /// C22 rule 3 runs for the shape verbs (a rail-and-one-pane view has no
+    /// room for a zoomed pane or a floating scratch shell). Shared by
+    /// `toggle_solo`'s entry arm and `cycle_layout`'s step onto the solo
+    /// stop, so the two ways into solo can never drift apart. Neither
+    /// caller's own `layout_cycle` bookkeeping lives here — the two mean
+    /// different things by "the next index" — so each sets it itself right
+    /// after calling this.
+    fn enter_solo(&mut self) {
+        self.ws.active_tab_mut().view = TabView::Solo;
+        self.exit_zoom();
+        self.hide_float();
+    }
+
+    /// C43: the wording for "can't tile" — `toggle_solo`'s own exit guard,
+    /// and now `cycle_layout`'s dead end stepping *out* of solo when none
+    /// of the three tiled shapes fit either — so there is one message for
+    /// this refusal, however it's reached.
+    fn cant_tile_flash(&self) -> String {
+        let n = self.ws.active_tab().panes.len();
+        let area = self.body_area();
+        format!(
+            "can't tile {n} panes at {}×{} — close some, or widen the terminal",
+            area.width, area.height
+        )
+    }
+
     /// C43: what the shape verbs (`Alt+s`, `Alt+Shift+s`, `Alt+o`, the
-    /// resize keys, `Alt+g`/`Alt+Shift+g`) say when refused in solo view —
-    /// applying them invisibly, to a tree the user cannot see, would be
-    /// exactly the surprise C21 exits zoom to avoid. Names the way out with
-    /// the live chord, C42's ceiling message's own rule.
+    /// resize keys) say when refused in solo view — applying them
+    /// invisibly, to a tree the user cannot see, would be exactly the
+    /// surprise C21 exits zoom to avoid. Names the way out with the live
+    /// chord, C42's ceiling message's own rule.
+    /// **[Amended 2026-09-10, C43]** `Alt+g`/`Alt+Shift+g` left this list —
+    /// `CycleLayout` is no longer refused in solo, see `cycle_layout`.
     fn solo_shape_refusal(&self) -> String {
         match self.chord_label(Action::ToggleSolo) {
             Some(c) => format!("solo view — {c} tiles this tab"),
@@ -5681,19 +5723,36 @@ impl<B: PaneBackend> App<B> {
         self.set_focus(target);
     }
 
-    /// Alt+g: step the active tab through the three canned arrangements,
-    /// skipping ones that don't fit the current body area. No-ops (without
-    /// advancing the cycle counter) when there's nothing to arrange or
-    /// nothing fits.
+    /// Alt+g: step the active tab through the four canned stops, skipping
+    /// ones that don't fit the current body area. No-ops (without advancing
+    /// the cycle counter) when there's nothing to arrange.
     /// **[C37, 2026-08-19]** `forward` is false for `Alt+Shift+g`, which
     /// walks the same cycle backwards.
     ///
     /// `layout_cycle` is the arrangement to try *next going forward*, so
     /// what is showing is `layout_cycle - 1` and stepping back means
-    /// starting two behind it. The `1 - step` below is exactly that:
-    /// candidates `lc+1, lc, lc-1` — the forward order reversed, with the
-    /// same skip-what-doesn't-fit behaviour, so a shape the terminal is too
-    /// small for is passed over in both directions alike.
+    /// starting two behind it. Forward tries `lc, lc+1, lc+2, lc+3`;
+    /// backward tries `lc-2, lc-3, lc-4, lc-1` (`-(step + 2)` below) — the
+    /// same sequence reversed, both ending on the arrangement already
+    /// showing as their last-resort fallback. **[Amended 2026-09-10, C43]**
+    /// C37's own arithmetic read `lc+1, lc, lc-1`, which is this formula's
+    /// answer mod 3 and no longer mod 4 — the ring gained a fourth stop
+    /// (below) and the two forms stopped agreeing.
+    ///
+    /// **[Amended 2026-09-10, C43]** Solo joins the ring as its fourth
+    /// stop, after all-stack: `grid → main+stack → all-stack → solo → grid`
+    /// going forward, so stepping back from grid wraps to solo. Landing on
+    /// the solo stop only sets `tab.view` — `tab.layout` is untouched
+    /// (`enter_solo`, shared with `toggle_solo`'s own entry). Solo always
+    /// fits (one pane on screen needs no floor check), so an unfit tiled
+    /// tab now lands on solo rather than refusing — the old "no room to
+    /// rearrange" flash is unreachable from a tiled start for exactly that
+    /// reason. The one dead end left is stepping *out* of solo (forward to
+    /// grid, backward to all-stack) when none of the three tiled shapes fit
+    /// either: refused with `cant_tile_flash`, `toggle_solo`'s own exit
+    /// wording, so there is one message for "can't tile" however it's
+    /// reached. `n < 2` still refuses unconditionally, before any of this —
+    /// a one-pane tab reaches solo only via `Alt+Shift+t`.
     fn cycle_layout(&mut self, forward: bool) {
         let order = self.pane_order();
         if order.len() < 2 {
@@ -5702,19 +5761,32 @@ impl<B: PaneBackend> App<B> {
         }
         let focused = self.focused;
         let area = self.body_area();
-        for step in 0..3 {
-            let offset = if forward { step } else { 1 - step };
-            let idx = (self.layout_cycle as isize + offset).rem_euclid(3) as usize;
+        let was_solo = self.solo();
+        for step in 0..LAYOUT_CYCLE_LEN {
+            let offset = if forward { step } else { -(step + 2) };
+            let idx = (self.layout_cycle as isize + offset).rem_euclid(LAYOUT_CYCLE_LEN) as usize;
+            if idx == SOLO_CYCLE_STOP {
+                if was_solo {
+                    // Already here, and nothing tiled fit either — say so
+                    // below rather than silently re-landing on solo.
+                    break;
+                }
+                self.enter_solo();
+                self.layout_cycle = (idx + 1) % LAYOUT_CYCLE_LEN as usize;
+                return;
+            }
             let node = arrangement_for(idx, &order, focused);
             if layout::arrangement_fits(&node, area) {
                 self.ws.active_tab_mut().layout = node;
-                self.layout_cycle = (idx + 1) % 3;
+                self.ws.active_tab_mut().view = TabView::Tiled;
+                self.layout_cycle = (idx + 1) % LAYOUT_CYCLE_LEN as usize;
                 return;
             }
         }
-        let hint =
-            self.chord_clause(Action::StackPane, |c| format!("; stack a pane with {c} first"));
-        self.set_flash(format!("no room to rearrange{hint}"));
+        // Only reachable when `was_solo`: solo always fits, so a tiled
+        // start always finds a stop somewhere in the ring; the sole
+        // survivor is failing to tile on the way out of solo.
+        self.set_flash(self.cant_tile_flash());
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -8072,6 +8144,9 @@ pub fn roster_top_clamped(top: usize, len: usize, height: usize) -> usize {
 /// C25: the arrangement at cycle index `idx` (0=grid, 1=main+stack,
 /// 2=all-stack) for pane order `order` with `focused` kept in place — the
 /// pure per-index dispatch `cycle_layout` walks while searching for a fit.
+/// **[C43]** Never called with the ring's fourth index (solo, 3) —
+/// `cycle_layout` handles that stop itself, since solo has no `LayoutNode`
+/// of its own to build.
 fn arrangement_for(idx: usize, order: &[PaneId], focused: PaneId) -> LayoutNode {
     match idx {
         0 => layout::grid_layout(order),
@@ -16049,11 +16124,11 @@ pub(crate) mod tests {
     /// "From inside the ring" is the contract, not a test convenience: a
     /// tab's layout before the first `Alt+g` is whatever splitting left it,
     /// which is **not** one of the three canned arrangements.
-    /// `layout_cycle` is a position in a three-item ring, not an undo
-    /// stack, so stepping back from the first wraps to the last rather than
-    /// restoring a pre-cycle custom layout. Anything else would need the
-    /// cycle to remember arbitrary layouts, which is what `Alt+u` and the
-    /// split chords are for.
+    /// `layout_cycle` is a position in a **[C43: four]**-item ring, not an
+    /// undo stack, so stepping back from the first wraps to the last rather
+    /// than restoring a pre-cycle custom layout. Anything else would need
+    /// the cycle to remember arbitrary layouts, which is what `Alt+u` and
+    /// the split chords are for.
     #[test]
     fn reversing_the_layout_cycle_undoes_a_forward_step() {
         let (mut app, _) = mk_app(shell_ws()); // 100x30 fits all three shapes
@@ -16074,9 +16149,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// Walking backwards reaches all three arrangements and closes the
-    /// ring, so the reverse direction is a full traversal rather than a
-    /// one-step nudge that then sticks.
+    /// Walking backwards reaches all four stops — the three arrangements
+    /// and solo — and closes the ring, so the reverse direction is a full
+    /// traversal rather than a one-step nudge that then sticks.
+    /// **[Amended 2026-09-10, C43]** Was a three-arrangement pin; the ring
+    /// gained solo as its fourth stop, so this now needs one more backward
+    /// press per lap and a state reader that knows about solo (entering it
+    /// leaves the tree, and therefore `arrangement_kind`, untouched).
     #[test]
     fn the_reverse_cycle_visits_every_arrangement() {
         let (mut app, _) = mk_app(shell_ws());
@@ -16084,19 +16163,27 @@ pub(crate) mod tests {
         app.apply(Action::NewPane);
         app.apply(Action::CycleLayout { forward: true }); // enter the ring
 
-        let start = arrangement_kind(&app.ws.tabs[0].layout);
+        fn state(app: &App<FakePane>) -> &'static str {
+            if app.solo() {
+                "solo"
+            } else {
+                arrangement_kind(&app.ws.tabs[0].layout)
+            }
+        }
+
+        let start = state(&app);
         let mut seen = vec![start];
-        for _ in 0..2 {
+        for _ in 0..3 {
             app.apply(Action::CycleLayout { forward: false });
-            seen.push(arrangement_kind(&app.ws.tabs[0].layout));
+            seen.push(state(&app));
         }
         let mut unique = seen.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 3, "three distinct arrangements going back: {seen:?}");
+        assert_eq!(unique.len(), 4, "four distinct stops going back: {seen:?}");
 
         app.apply(Action::CycleLayout { forward: false });
-        assert_eq!(arrangement_kind(&app.ws.tabs[0].layout), start, "and the ring closes");
+        assert_eq!(state(&app), start, "and the ring closes");
     }
 
     /// The skip-what-doesn't-fit rule (C25) applies in reverse too: a shape
@@ -18703,8 +18790,11 @@ pub(crate) mod tests {
 
     // -- C25 canned layout cycle ----------------------------------------------
 
+    /// **[Amended 2026-09-10, C43]** Was a three-stop pin ending "wraps back
+    /// to grid" on the 4th press; solo is now the fourth stop, so the wrap
+    /// moved to the 5th.
     #[test]
-    fn cycle_layout_advances_grid_then_main_stack_then_all_stack_then_wraps() {
+    fn cycle_layout_advances_grid_main_stack_all_stack_solo_then_wraps() {
         let (mut app, _) = mk_app(shell_ws()); // 100x30 — comfortable for all 3 shapes
         app.apply(Action::NewPane);
         app.apply(Action::NewPane); // 3 panes total
@@ -18724,7 +18814,17 @@ pub(crate) mod tests {
         app.apply(Action::CycleLayout { forward: true });
         assert!(matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }));
 
-        app.apply(Action::CycleLayout { forward: true }); // wraps back to grid
+        let all_stack = format!("{:?}", app.ws.tabs[0].layout);
+        app.apply(Action::CycleLayout { forward: true }); // 4th: solo
+        assert!(app.solo(), "the fourth stop is solo");
+        assert_eq!(
+            format!("{:?}", app.ws.tabs[0].layout),
+            all_stack,
+            "solo is a view, not a tree edit — the all-stack tree rides along untouched"
+        );
+
+        app.apply(Action::CycleLayout { forward: true }); // 5th: wraps back to grid
+        assert!(!app.solo());
         assert!(matches!(
             app.ws.tabs[0].layout,
             LayoutNode::Split { dir: SplitDir::Horizontal, .. }
@@ -18755,16 +18855,26 @@ pub(crate) mod tests {
         assert_eq!(app.flash(), Some("one pane — nothing to arrange"));
     }
 
+    /// **[Amended 2026-09-10, C43]** Was `cycle_layout_noop_when_nothing_fits`,
+    /// pinning the old "no room to rearrange" refusal. Solo always fits (one
+    /// pane on screen needs no floor check), so this exact scenario — a
+    /// tiled tab too small for any of the three canned arrangements — now
+    /// lands on solo instead of refusing.
     #[test]
-    fn cycle_layout_noop_when_nothing_fits() {
+    fn cycle_layout_lands_on_solo_when_no_tiled_arrangement_fits() {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         app.apply(Action::NewPane); // 3 panes, organically nested splits
         app.on_resize(Size::new(30, 10), (0, 0)); // body far below the 36x10 floor for any arrangement
         let before = format!("{:?}", app.ws.tabs[0].layout);
         app.apply(Action::CycleLayout { forward: true });
-        assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
-        assert_eq!(app.flash(), Some("no room to rearrange; stack a pane with Alt+s first"));
+        assert!(app.solo(), "nothing tiled fits, so Alt+g lands on solo");
+        assert_eq!(
+            format!("{:?}", app.ws.tabs[0].layout),
+            before,
+            "solo is a view, not a tree edit — the untileable tree is left exactly as it was"
+        );
+        assert!(app.flash().is_none(), "landing on solo succeeds; it doesn't refuse");
     }
 
     #[test]
@@ -18789,6 +18899,84 @@ pub(crate) mod tests {
             LayoutNode::Split { ratios, .. } => assert_eq!(ratios, &vec![0.5, 0.5]), // grid, n=2
             other => panic!("expected the cycled layout to be saved, got {other:?}"),
         }
+    }
+
+    // -- C43: solo joins the layout cycle as its fourth stop --------------------
+
+    /// C37's own wrap rule, re-pointed at solo: the ring's last stop moved,
+    /// so stepping back from the first (grid) now wraps to solo rather than
+    /// all-stack.
+    #[test]
+    fn cycle_layout_backward_from_grid_wraps_to_solo() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::CycleLayout { forward: true }); // enter the ring at grid
+        assert!(!app.solo());
+
+        app.apply(Action::CycleLayout { forward: false });
+        assert!(app.solo(), "stepping back from grid wraps to solo, the ring's new last stop");
+    }
+
+    /// The mirror of the above: stepping back *out* of solo lands on
+    /// all-stack, the stop immediately before it in forward order.
+    #[test]
+    fn cycle_layout_backward_from_solo_lands_on_all_stack() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        assert!(app.solo());
+
+        app.apply(Action::CycleLayout { forward: false });
+        assert!(!app.solo());
+        assert!(
+            matches!(app.ws.tabs[0].layout, LayoutNode::Stack { .. }),
+            "backward from solo lands on all-stack"
+        );
+    }
+
+    /// The one dead end solo still has in `cycle_layout`: stepping out fails
+    /// when none of the three tiled shapes fit either, worded exactly like
+    /// `toggle_solo`'s own exit guard — one message for "can't tile",
+    /// however it's reached — and the tab stays solo rather than landing
+    /// somewhere half-tiled.
+    #[test]
+    fn cycle_layout_in_solo_flashes_cant_tile_when_nothing_fits_and_stays_solo() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        app.on_resize(Size::new(30, 10), (0, 0)); // too small for any of the three tiled shapes
+        let before = format!("{:?}", app.ws.tabs[0].layout);
+
+        app.apply(Action::CycleLayout { forward: true });
+        assert!(app.solo(), "nothing tiled fits; the tab stays solo");
+        assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
+        assert!(
+            app.flash().is_some_and(|m| m.contains("can't tile")),
+            "expected toggle_solo's own exit-guard wording: {:?}",
+            app.flash()
+        );
+    }
+
+    /// However solo was entered — by `Alt+Shift+t` here, by cycling onto it
+    /// elsewhere — the counter lands in the same place: the next `Alt+g`
+    /// goes to grid.
+    #[test]
+    fn toggle_solo_then_cycle_layout_advances_to_grid() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes, organically split — not one of the canned shapes
+        app.apply(Action::ToggleSolo);
+        assert!(app.solo());
+
+        app.apply(Action::CycleLayout { forward: true });
+        assert!(!app.solo());
+        assert!(
+            matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }),
+            "Alt+Shift+t then Alt+g goes to grid regardless of how solo was entered"
+        );
     }
 
     // -- C26 tab-undo pinning ---------------------------------------------------
@@ -20721,6 +20909,9 @@ pub(crate) mod tests {
     /// leaves the tree exactly as it was and names the way out with the
     /// live chord, C42's ceiling message's own rule. Also: a refusal must
     /// not first exit an unrelated zoom on its way to doing nothing.
+    /// **[Amended 2026-09-10, C43]** `CycleLayout` left this list — it is
+    /// now the fourth stop of its own ring rather than a refused shape
+    /// verb, see `cycle_layout`'s own solo tests for its actual behavior.
     #[test]
     fn solo_refuses_the_shape_verbs_and_cross_tab_move_leaving_the_tree_untouched() {
         let (mut app, _) = mk_app(shell_ws());
@@ -20735,7 +20926,6 @@ pub(crate) mod tests {
             Action::ExplodeStack,
             Action::FlipSplit,
             Action::Resize { horizontal: false, grow: true },
-            Action::CycleLayout { forward: true },
         ] {
             app.flash = None;
             app.apply(action);
