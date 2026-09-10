@@ -3063,6 +3063,33 @@ current map should not have to know that.]** Tree ops live in `layout.rs`
   tests: the worked shapes above, order preservation, fit refusal, n=1/n=2
   degenerate forms.
 
+**[Amended 2026-09-10, C43 — solo joins the cycle as a fourth stop.]** Order:
+`grid → main+stack → all-stack → solo → grid`. Landing on the solo stop sets
+only `tab.view = Solo`; `tab.layout` is untouched, the same way `toggle_solo`
+(`Alt+Shift+t`) enters it — `enter_solo` is the one function both call, so
+the two ways in can't drift apart. Stepping *off* solo (forward to grid,
+backward to all-stack) sets `view = Tiled` and applies that arrangement in
+the same step, through the ordinary arrangement code above.
+
+Fit changes with it: solo always fits — one pane on screen needs none of the
+floor checks the other three do — so a tiled tab too small for any of them
+now **lands on solo** rather than flashing `no room to rearrange`, which is
+therefore unreachable from a tiled start. The one dead end left is the
+opposite direction: stepping out of solo when none of the three tiled shapes
+fit either, refused with the exact wording `toggle_solo`'s own exit guard
+uses (`can't tile {n} panes at {w}×{h} — close some, or widen the
+terminal`) — one message for "can't tile", however it's reached. `n < 2`
+still refuses unconditionally, ahead of all of this: a one-pane tab reaches
+solo only via `Alt+Shift+t`.
+
+Counter sync: entering solo — by cycling onto it *or* by `Alt+Shift+t` —
+sets `layout_cycle` to one past the solo stop, so the next `Alt+g` goes to
+grid and `Alt+Shift+g` to all-stack regardless of which chord got you there.
+Leaving via `Alt+Shift+t` does not touch the counter (it restores the tree
+as it was, not one of the three canned shapes, so there is no new ring
+position to record); leaving via `Alt+g`/`Alt+Shift+g` advances it like any
+other step. See C43 for the full model and C37 for the wrap this displaces.
+
 ### C26 — Tab undo: scope statement — [Added 2026-07-22, fleet features]
 
 **Current = already implemented.** Verified in the working tree: the undo
@@ -5308,6 +5335,9 @@ take that at its word.
 **Config.** One new `NAMES` entry, `cycle_layout_back`. `cycle_layout` keeps
 its name and now means the forward direction explicitly.
 
+**[Amended 2026-09-10, C43]** The wrap this contract describes now lands on
+solo, the cycle's new fourth stop — see C25's own dated amendment.
+
 ### C38 — A refusal says so — [Added 2026-08-20, simulation pass]
 
 **The gap.** Eight gestures refuse correctly and wordlessly. Pressing them
@@ -6126,7 +6156,8 @@ is solo-aware:
 | `Alt+←/→` | Cross tabs unconditionally, on the first press — solo has no tiled geometry left for `neighbor` to consult |
 | `Alt+Shift+↑/↓` | Reorder: swap the shown pane with its rail order-neighbour (`layout::swap_panes`), persisted — the same swap `Alt+Shift+hjkl` does in tiled |
 | `Alt+Shift+←/→` | Refused: *"solo view — {Alt+i chord} / {Alt+Shift+i chord} moves a pane between tabs"* |
-| `Alt+s`, `Alt+Shift+s`, `Alt+o`, the resize keys, `Alt+g`/`Alt+Shift+g` | Refused: *"solo view — {toggle chord} tiles this tab"* — shape verbs would act invisibly on a tree the user cannot see |
+| `Alt+s`, `Alt+Shift+s`, `Alt+o`, the resize keys | Refused: *"solo view — {toggle chord} tiles this tab"* — shape verbs would act invisibly on a tree the user cannot see |
+| `Alt+g`/`Alt+Shift+g` | **[Amended 2026-09-10]** Not refused — solo is the cycle's own fourth stop (C25). Tiles the tab into the next/previous canned arrangement that fits; refused only when none of the three tiled shapes fit either, with the same wording the `Alt+Shift+t` row below uses |
 | `Alt+w` | Closes; focus lands on the rail's next row below, else the one above — the tab-strip's own idiom, not U11's remembered-pane fallback |
 | `Alt+z` | Zoom composes on top, unchanged: hides the rail for the full body (`ZOOM · n hidden`); `Alt+z` again brings the rail straight back |
 | `Alt+Shift+t` | Back to tiled — tree byte-identical, focus unchanged. Refused when the tiled tree isn't drawable at the current size: *"can't tile {n} panes at {w}×{h} — close some, or widen the terminal"* |
@@ -6134,6 +6165,18 @@ is solo-aware:
 Membership (`Alt+n`, control-plane spawn, mark/pull, `Alt+i`/`Alt+Shift+i`)
 and everything not listed behave exactly as in tiled — rows simply appear
 or leave with the tree.
+
+**[Amended 2026-09-10] `Alt+g` and solo, both ways.** C25 originally listed
+`CycleLayout` among the shape verbs solo refuses outright; it no longer is
+one. Solo is now the layout cycle's fourth stop, so the two features run
+into each other in both directions: `Alt+g`/`Alt+Shift+g` can *land on*
+solo from a tiled tab too small for any canned arrangement (C25's fit rule
+made solo the one stop that always fits), and can *leave* solo by tiling
+into grid or all-stack, same as `Alt+Shift+t` does but through the cycle
+instead of the toggle. Entering solo either way syncs `layout_cycle` so the
+next `Alt+g` always goes to grid; only `Alt+Shift+t`'s own exit leaves the
+tree as it was rather than applying a canned shape, so only it leaves the
+counter untouched. See C25's dated amendment for the arithmetic.
 
 **Mouse.** A left press on a rail row → `on_click` (focus, therefore
 shown) — the tab strip's and roster's own click-to-focus rule. The header
@@ -6203,7 +6246,7 @@ shows only the C9-curated subsets.
 | 4b | `Alt+Shift+←↓↑→ / hjkl` | **move this pane that way inside the tab (swaps with its neighbour)** | C33 |
 | 5 | `Alt+s / Alt+Shift+s` | **stack this pane (collapse its split; it expands) / explode the stack around it into a split** | C6–C8 |
 | 6 | `Alt+o` | flip split orientation | — |
-| 7 | `Alt+g / Alt+Shift+g` | **cycle layout: grid / main+stack / all-stack, forward / back** | C25/C37 |
+| 7 | `Alt+g / Alt+Shift+g` | **cycle layout: grid / main+stack / all-stack / solo, forward / back** | C25/C37/C43 |
 | 8 | `Alt+z` | **zoom focused pane (view only; Alt+z again to exit)** | C21 |
 | 9 | `Alt+Shift+z` | **floating scratch shell (toggle)** | C22 |
 | 10 | `Alt+a` | **jump to next pane that needs you** | C19 |

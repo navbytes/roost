@@ -313,7 +313,9 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   to switch what's shown; `Alt+Shift+↑/↓` reorders the rail. A pure view
   transform like zoom, and persisted per tab (a solo tab comes back solo).
   `Alt+Shift+t` again tiles it back — refused only if the tiled tree
-  wouldn't fit the current terminal.
+  wouldn't fit the current terminal. It's also the fourth stop of the
+  canned layout cycle below (`Alt+g`/`Alt+Shift+g` reach it too, and
+  stepping off it from either chord keeps both in sync).
 - **Raw pass-through (`Alt+Shift+p`).** Marks the focused pane raw: every
   key except the toggle itself — including every other `Alt` chord —
   forwards straight through as bytes, so an agent CLI with its own Alt
@@ -326,10 +328,13 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   interleave freely (a drag moves the keyboard cursor too); `Esc`/`q` exits
   and clears the selection. Honest scope: visible grid only, same as the
   mouse path — no scrollback paging inside copy mode.
-- **Canned layouts (`Alt+g`).** Cycles the active tab through three built-in
-  arrangements — even grid, main pane + stack, all-stack — skipping any
-  that wouldn't fit the terminal, and always keeping focus and pane order
-  stable. It's a snap-to-arrangement, not undoable via `Alt+u`.
+- **Canned layouts (`Alt+g`).** Cycles the active tab through four stops —
+  even grid, main pane + stack, all-stack, then solo — skipping tiled
+  shapes that wouldn't fit the terminal, and always keeping focus and pane
+  order stable. Solo always fits (it's one pane on screen), so a tab too
+  small for any tiled shape lands there instead of refusing; stepping off
+  it, forward or back, tiles the tab again. It's a snap-to-arrangement, not
+  undoable via `Alt+u`.
 - **Tab undo, the honest scope.** `Alt+u` already reopened panes; it now
   reopens whole tabs the same way — name, layout, and pane specs restored,
   session ids included, so agents resume where they left off. The one limit

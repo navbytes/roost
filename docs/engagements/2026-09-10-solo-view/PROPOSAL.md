@@ -307,6 +307,14 @@ silent (C38).
   are untouched. The chrome fixture for a solo tab therefore has to be added
   by hand — it joins C30's "human-must-remember" list.
 
+**[2026-09-10, superseded at the client's request]** The "No fourth `Alt+g`
+stop" line above no longer holds. Solo is now the layout cycle's fourth
+stop — `grid → main+stack → all-stack → solo → grid` — landed the same day,
+argued as the C25 amendment this section itself said such a change would
+need. See C25's and C43's dated amendments in DESIGN-ui.md for the shape,
+the fit rule (solo always fits, so an unfit tiled tab lands there instead of
+refusing), and the `layout_cycle` counter sync between the two entry paths.
+
 ## 6. Tests — the executable form
 
 Unit (`app.rs` / `layout.rs` / `render.rs` / `mouse.rs`):
