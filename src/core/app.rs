@@ -16,7 +16,7 @@ use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
-use crate::core::workspace::{PaneSpec, Tab, Workspace};
+use crate::core::workspace::{PaneSpec, Tab, TabView, Workspace};
 use crate::ports::{
     ClaimError, ClaimHandle, ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore,
 };
@@ -938,6 +938,13 @@ impl<B: PaneBackend> App<B> {
         self.zoomed
     }
 
+    /// C43: is the active tab in solo view (one pane shown, the rest in a
+    /// rail)? Per-tab and persisted — unrelated to `zoomed`, which is a
+    /// session-only overlay that can sit on top of either view.
+    pub fn solo(&self) -> bool {
+        self.ws.active_tab().view == TabView::Solo
+    }
+
     /// C40: the pane waiting to be pulled, if any — the C9 hint bar's
     /// standing "pull marked pane here" pair is the only thing that makes a
     /// mark visible from the tab you marked it *from*.
@@ -1076,6 +1083,28 @@ impl<B: PaneBackend> App<B> {
                 _ => self.focused,
             };
             v.push(PaneRect { id: target, rect: body, collapsed: false });
+        } else if self.solo() {
+            // Unlike the zoom branch above, `f.prev_focus` is not safe to
+            // trust here: `zoomed` is cleared on every real tab switch
+            // (`new_tab`/`go_to_tab`), but solo is a per-tab, *persisted*
+            // flag that survives one — including the active-tab-shift a
+            // close can cause without going through either (removing the
+            // active tab's last pane shifts a *different* tab into this
+            // index, with no float/zoom cleanup along that path). So
+            // `prev_focus`, recorded for whatever tab was active when the
+            // float went up, can name a pane that is not in the tab solo
+            // is now showing. Resolve the same way `close_pane_id`'s U11
+            // fallback and `hide_float`/`close_float` do: trust
+            // `self.focused` only while it is actually a member of this
+            // tab (the float owns it while shown, which never is), else
+            // fall back to the tab's own remembered focus.
+            let focused = if self.ws.active_tab().panes.contains_key(&self.focused) {
+                self.focused
+            } else {
+                let active = self.ws.active_tab;
+                self.tab_focus_target(active).or_else(|| self.first_visible()).unwrap_or(0)
+            };
+            v.push(layout::solo_rects(body, focused).1);
         } else {
             v.extend(self.rects());
         }
@@ -1300,6 +1329,26 @@ impl<B: PaneBackend> App<B> {
         let mut v = Vec::new();
         layout::pane_order(&self.ws.active_tab().layout, &mut v);
         v
+    }
+
+    /// C43: the rail's rect (the leftmost columns of `body_area()`), when
+    /// one is actually drawn — solo, not zoomed (zoom hides it: the shown
+    /// pane gets the whole body), and wide enough for `rail_width` to give
+    /// out more than 0 columns.
+    pub fn rail_area(&self) -> Option<Rect> {
+        if !self.solo() || self.zoomed {
+            return None;
+        }
+        let body = self.body_area();
+        let rw = layout::rail_width(body.width);
+        (rw > 0).then_some(Rect { x: body.x, y: body.y, width: rw, height: body.height })
+    }
+
+    /// C43: the rail's rows, top to bottom — the active tab's panes in
+    /// `pane_order()` (the same order `Alt+↑/↓` steps and the roster ties
+    /// on).
+    pub fn rail_rows(&self) -> Vec<PaneId> {
+        self.pane_order()
     }
 
     /// The active tab's pane that's actually visible with no other
@@ -2699,6 +2748,21 @@ impl<B: PaneBackend> App<B> {
     /// consistent even when the pane it removes isn't either of those.
     fn close_pane_id(&mut self, id: PaneId) -> bool {
         let Some(ti) = self.tab_of(id) else { return false };
+        // C43: the rail's own landing rule — "next row below, else the one
+        // above" (the tab strip's own idiom for closing the active tab) —
+        // rather than U11's remembered-pane fallback below, which would
+        // otherwise pick whatever pane was last focused, possibly nowhere
+        // near the row that just closed. Captured before removal, against
+        // this tab's *current* order: only meaningful when `id` is actually
+        // in the active tab and that tab is solo, else `None` and the
+        // fallback below is untouched.
+        let solo_next = (self.ws.active_tab == ti && self.ws.tabs[ti].view == TabView::Solo)
+            .then(|| {
+                let rows = self.rail_rows();
+                let i = rows.iter().position(|&p| p == id)?;
+                rows.get(i + 1).or_else(|| i.checked_sub(1).and_then(|j| rows.get(j))).copied()
+            })
+            .flatten();
         // C21: closing the pane you're zoomed on ends the zoomed view —
         // there's nothing left to show full-screen. A control-plane close of
         // some *other* pane leaves an unrelated zoom alone.
@@ -2847,8 +2911,11 @@ impl<B: PaneBackend> App<B> {
         // somewhere they could not see.
         if !self.float_focused() && !self.ws.active_tab().panes.contains_key(&self.focused) {
             let active = self.ws.active_tab;
-            let target =
-                self.tab_focus_target(active).or_else(|| self.first_visible()).unwrap_or(0);
+            let target = solo_next
+                .filter(|p| self.ws.active_tab().panes.contains_key(p))
+                .or_else(|| self.tab_focus_target(active))
+                .or_else(|| self.first_visible())
+                .unwrap_or(0);
             self.set_focus(target);
         }
         true
@@ -4056,6 +4123,31 @@ impl<B: PaneBackend> App<B> {
         if disarmed {
             self.clear_confirm_flash();
         }
+        // C43: solo view refuses the shape verbs and the cross-tab pane-move
+        // pair outright — before the structural guard just below, so a
+        // refused chord never first exits an unrelated zoom or hides the
+        // float on its way to doing nothing. Falls through to this
+        // function's own tail (`relayout` + `save`), same as every other
+        // refusal that changes nothing.
+        if self.solo() {
+            let refusal = match action {
+                Action::StackPane
+                | Action::ExplodeStack
+                | Action::FlipSplit
+                | Action::Resize { .. }
+                | Action::CycleLayout { .. } => Some(self.solo_shape_refusal()),
+                Action::MovePane(layout::Dir::Left | layout::Dir::Right) => {
+                    Some(self.solo_move_pane_lr_refusal())
+                }
+                _ => None,
+            };
+            if let Some(msg) = refusal {
+                self.set_flash(msg);
+                self.relayout();
+                self.save();
+                return;
+            }
+        }
         // C21/C22: a structural layout action must not change the tab
         // invisibly behind a full-screen zoomed pane, nor target the float
         // (which lives outside the layout tree — leaving it focused here is
@@ -4261,6 +4353,7 @@ impl<B: PaneBackend> App<B> {
             Action::ToggleFeed => self.toggle_feed(),
             Action::ToggleFloat => self.toggle_float(),
             Action::ToggleRaw => self.toggle_raw(),
+            Action::ToggleSolo => self.toggle_solo(),
         }
         self.relayout();
         self.save();
@@ -4452,6 +4545,23 @@ impl<B: PaneBackend> App<B> {
             self.hide_float();
             return;
         }
+        // C43: solo has no tiled geometry on screen, so `Up`/`Down` step the
+        // rail's own order instead, and `Left`/`Right` skip the tiled
+        // `neighbor` lookup entirely — consulting it would walk the hidden
+        // tree — and go straight to the cross-tab handoff. Passing
+        // `display_rects()` (solo's own single-pane list) rather than the
+        // tiled `rects()` means its full-width refusal can never trip: there
+        // is nothing else on screen to be narrower, so this always crosses
+        // on the first press, exactly `Alt+←/→`'s ordinary tab-edge behavior.
+        if self.solo() {
+            return match dir {
+                layout::Dir::Up | layout::Dir::Down => self.step_rail_focus(dir),
+                layout::Dir::Left | layout::Dir::Right => {
+                    let rects = self.display_rects();
+                    self.focus_dir_cross_tab(dir, &rects);
+                }
+            };
+        }
         let rects = self.rects();
         if let Some(id) = layout::neighbor(&rects, self.focused, dir) {
             self.set_focus(id);
@@ -4501,6 +4611,28 @@ impl<B: PaneBackend> App<B> {
         // check above has to see a float that is still shown, and `rects()`
         // below has to see the whole tab rather than just the zoomed pane.
         self.exit_zoom();
+        // C43: `Left`/`Right` are refused before `apply` ever reaches this
+        // function, so `dir` is always `Up`/`Down` here in solo — swap with
+        // the rail's previous/next row (`rail_rows`, i.e. `pane_order()`)
+        // rather than a spatial neighbour, clamped silently at the ends
+        // (the rail has no edge chord to point at, unlike the tiled case
+        // just below).
+        if self.solo() {
+            let rows = self.rail_rows();
+            let Some(i) = rows.iter().position(|&id| id == self.focused) else { return };
+            let other = match dir {
+                layout::Dir::Up => i.checked_sub(1),
+                layout::Dir::Down => (i + 1 < rows.len()).then_some(i + 1),
+                layout::Dir::Left | layout::Dir::Right => None,
+            };
+            let Some(j) = other else { return };
+            let focused = self.focused;
+            let layout = &mut self.ws.active_tab_mut().layout;
+            if layout::swap_panes(layout, focused, rows[j]) {
+                layout::expand_in_stacks(layout, focused);
+            }
+            return;
+        }
         let rects = self.rects();
         let Some(target) = layout::neighbor(&rects, self.focused, dir) else {
             self.flash_move_edge(dir);
@@ -4963,6 +5095,7 @@ impl<B: PaneBackend> App<B> {
             name: format!("tab{}", self.ws.tabs.len() + 1),
             layout: LayoutNode::Pane(id),
             panes,
+            view: TabView::Tiled,
         });
         self.ws.active_tab = self.ws.tabs.len() - 1;
         self.spawn_active_tab();
@@ -5239,6 +5372,87 @@ impl<B: PaneBackend> App<B> {
         let focused = self.focused;
         layout::expand_in_stacks(&mut self.ws.active_tab_mut().layout, focused);
         self.zoomed = true;
+    }
+
+    /// C43 (`Alt+Shift+t`): toggle the active tab between tiled and solo
+    /// view. A pure view transform — the layout tree is never touched by
+    /// entering, leaving, or stepping — so leaving restores the tree
+    /// exactly as it was, no matter what stepped or reordered while solo.
+    fn toggle_solo(&mut self) {
+        if self.solo() {
+            // The only thing solo can make stale: the terminal may have
+            // shrunk underneath the hidden tree while it was showing just
+            // one pane. Refuse rather than hand back a tree `compute_rects`
+            // can't fully draw.
+            let area = self.body_area();
+            if !layout::every_pane_is_drawable(&self.ws.active_tab().layout, area) {
+                let n = self.ws.active_tab().panes.len();
+                self.set_flash(format!(
+                    "can't tile {n} panes at {}×{} — close some, or widen the terminal",
+                    area.width, area.height
+                ));
+                return;
+            }
+            self.ws.active_tab_mut().view = TabView::Tiled;
+            // Focus itself is untouched: `set_focus`'s `expand_in_stacks`
+            // already ran on every focus change made while solo, so the
+            // tiled tree comes back with the right member already open.
+        } else {
+            self.ws.active_tab_mut().view = TabView::Solo;
+            // C22 rule 3's pattern, the same two lines `apply`'s structural
+            // guard runs for the shape verbs: entering solo doesn't touch
+            // the tree, but the float has no place beside a rail-and-one-
+            // pane view, and leaving zoom means the very first frame shows
+            // the rail instead of a full-body pane that would need a
+            // second `Alt+z` to reveal it.
+            self.exit_zoom();
+            self.hide_float();
+        }
+    }
+
+    /// C43: what the shape verbs (`Alt+s`, `Alt+Shift+s`, `Alt+o`, the
+    /// resize keys, `Alt+g`/`Alt+Shift+g`) say when refused in solo view —
+    /// applying them invisibly, to a tree the user cannot see, would be
+    /// exactly the surprise C21 exits zoom to avoid. Names the way out with
+    /// the live chord, C42's ceiling message's own rule.
+    fn solo_shape_refusal(&self) -> String {
+        match self.chord_label(Action::ToggleSolo) {
+            Some(c) => format!("solo view — {c} tiles this tab"),
+            None => "solo view — tile this tab first".to_string(),
+        }
+    }
+
+    /// C43: what `MovePane(Left|Right)` says when refused in solo view.
+    /// Unlike the shape verbs this one names two chords (`Alt+i` and its
+    /// shifted sibling), because they're the actual way out — a pane still
+    /// moves between tabs in solo, just not by this key.
+    fn solo_move_pane_lr_refusal(&self) -> String {
+        let fwd = self.chord_label(Action::MovePaneToTab { forward: true });
+        let back = self.chord_label(Action::MovePaneToTab { forward: false });
+        let chords = match (back, fwd) {
+            (Some(b), Some(f)) => format!("{b} / {f}"),
+            (Some(b), None) => b,
+            (None, Some(f)) => f,
+            (None, None) => "move it".to_string(),
+        };
+        format!("solo view — {chords} moves a pane between tabs")
+    }
+
+    /// C43: step the focused pane to the previous/next row of the rail
+    /// (`rail_rows`, i.e. `pane_order()`), clamped silently at the ends —
+    /// the same dead end every other in-tab directional move keeps (C31).
+    /// Shared by `Focus(Up|Down)` in solo and the invariant fuzzer.
+    fn step_rail_focus(&mut self, dir: layout::Dir) {
+        let rows = self.rail_rows();
+        let Some(i) = rows.iter().position(|&id| id == self.focused) else { return };
+        let next = match dir {
+            layout::Dir::Up => i.checked_sub(1),
+            layout::Dir::Down => (i + 1 < rows.len()).then_some(i + 1),
+            layout::Dir::Left | layout::Dir::Right => None,
+        };
+        if let Some(j) = next {
+            self.set_focus(rows[j]);
+        }
     }
 
     /// C19: every pane whose runtime status is `NeedsInput` — the exact
@@ -12314,7 +12528,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         };
         let store = MemStore::default();
         let (tx, _rx) = mpsc::sync_channel(64);
@@ -12457,7 +12676,12 @@ pub(crate) mod tests {
         Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         }
     }
 
@@ -12535,7 +12759,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         };
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
@@ -12594,7 +12823,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         };
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
@@ -13417,7 +13651,7 @@ pub(crate) mod tests {
                 let float_prev_before =
                     app.float.as_ref().filter(|f| f.shown).map(|f| f.prev_focus);
                 let (name, action) = loop {
-                    let pick = rng.below(42);
+                    let pick = rng.below(43);
                     let d = dirs[rng.below(4) as usize];
                     let a = match pick {
                         0..=3 => ("NewPane", Action::NewPane),
@@ -13701,6 +13935,11 @@ pub(crate) mod tests {
                         // move cannot — worth the two picks.
                         38 => ("MarkPane", Action::MarkPane),
                         39 => ("PullPane", Action::PullPane),
+                        // C43: enters/leaves solo, so every pick above (Focus
+                        // and MovePane's Up/Down included) also gets fuzzed
+                        // through the solo-aware dispatch and the rail's
+                        // expand-on-focus path.
+                        42 => ("ToggleSolo", Action::ToggleSolo),
                         _ => ("FocusAlternate", Action::FocusAlternate),
                     };
                     break a;
@@ -13851,7 +14090,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         };
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
@@ -13973,7 +14217,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         };
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
@@ -14062,7 +14311,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         };
         let mut registry = agents::registry();
         registry.insert("detect", Box::new(DetectAdapter));
@@ -14193,7 +14447,7 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes }],
+            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
         };
         let mut registry = agents::registry();
         registry.insert("unscoped", Box::new(UnscopedAdapter(root.clone())));
@@ -14289,7 +14543,7 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes }],
+            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
         };
 
         let mut registry = agents::registry();
@@ -14384,7 +14638,7 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes }],
+            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
         };
 
         let mut registry = agents::registry();
@@ -15650,7 +15904,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         };
         let (mut app, store) = mk_app(ws);
 
@@ -17104,7 +17363,7 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes }],
+            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
         };
         let (mut app, _) = mk_app(ws);
         app.focused = 3; // a collapsed member — expanded is currently 0 (pane 1)
@@ -17146,7 +17405,7 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes }],
+            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
         };
         let (mut app, store) = mk_app(ws);
 
@@ -17190,7 +17449,12 @@ pub(crate) mod tests {
             version: 1,
             active_tab: 0,
             tabs: vec![
-                Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes: panes0 },
+                Tab {
+                    name: "main".into(),
+                    layout: LayoutNode::Pane(1),
+                    panes: panes0,
+                    view: TabView::Tiled,
+                },
                 Tab {
                     name: "other".into(),
                     layout: LayoutNode::Split {
@@ -17202,6 +17466,7 @@ pub(crate) mod tests {
                         ],
                     },
                     panes: panes1,
+                    view: TabView::Tiled,
                 },
             ],
         };
@@ -17255,7 +17520,12 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes: panes0 }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes: panes0,
+                view: TabView::Tiled,
+            }],
         };
         let (mut app, _) = mk_app(ws);
 
@@ -17278,6 +17548,7 @@ pub(crate) mod tests {
             name: "stacked".into(),
             layout: LayoutNode::Stack { children: vec![4, 5, 6], expanded: 2, from: None },
             panes: panes1,
+            view: TabView::Tiled,
         };
         app.undo.push(Closed::Tab { index: 1, tab: closed_tab });
 
@@ -17316,7 +17587,7 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes }],
+            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
         };
         let (mut app, _) = mk_app(ws);
         // Startup (fix 1) already lands here since 2 is the saved `expanded`
@@ -17358,7 +17629,7 @@ pub(crate) mod tests {
         let ws = Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout, panes }],
+            tabs: vec![Tab { name: "main".into(), layout, panes, view: TabView::Tiled }],
         };
         let (mut app, _) = mk_app(ws);
         // Startup (fix 1) already lands here since 2 is the saved `expanded`
@@ -17471,8 +17742,8 @@ pub(crate) mod tests {
             version: 1,
             active_tab: 0,
             tabs: vec![
-                Tab { name: "t0".into(), layout: layout0, panes: panes0 },
-                Tab { name: "t1".into(), layout: layout1, panes: panes1 },
+                Tab { name: "t0".into(), layout: layout0, panes: panes0, view: TabView::Tiled },
+                Tab { name: "t1".into(), layout: layout1, panes: panes1, view: TabView::Tiled },
             ],
         }
     }
@@ -17759,7 +18030,12 @@ pub(crate) mod tests {
             version: 1,
             active_tab: 0,
             tabs: vec![
-                Tab { name: "t0".into(), layout: LayoutNode::Pane(1), panes: panes0 },
+                Tab {
+                    name: "t0".into(),
+                    layout: LayoutNode::Pane(1),
+                    panes: panes0,
+                    view: TabView::Tiled,
+                },
                 Tab {
                     name: "t1".into(),
                     layout: LayoutNode::Split {
@@ -17775,6 +18051,7 @@ pub(crate) mod tests {
                         ],
                     },
                     panes: panes1,
+                    view: TabView::Tiled,
                 },
             ],
         };
@@ -20317,5 +20594,231 @@ pub(crate) mod tests {
             crate::infra::signals::teardown_started(),
             "kill_fleet must announce itself before spending the hangup grace",
         );
+    }
+
+    // -- C43: solo view -------------------------------------------------------
+
+    /// The model claim: solo is a pure view transform. Toggling on and back
+    /// off leaves the layout tree exactly as it was — nothing was ever
+    /// collapsed, so there is nothing for the round trip to fail to restore.
+    #[test]
+    fn toggle_solo_twice_leaves_the_layout_untouched() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        let before = format!("{:?}", app.ws.active_tab().layout);
+        app.apply(Action::ToggleSolo);
+        assert!(app.solo());
+        app.apply(Action::ToggleSolo);
+        assert!(!app.solo());
+        assert_eq!(
+            format!("{:?}", app.ws.active_tab().layout),
+            before,
+            "solo never touches the tree"
+        );
+    }
+
+    #[test]
+    fn display_rects_in_solo_is_one_rect_at_body_minus_rail() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleSolo);
+        let rects = app.display_rects();
+        assert_eq!(rects.len(), 1, "solo shows exactly one pane");
+        assert_eq!(rects[0].id, app.focused);
+        assert!(!rects[0].collapsed);
+        let body = app.body_area();
+        let rw = layout::rail_width(body.width);
+        assert_eq!(
+            rects[0].rect,
+            Rect { x: body.x + rw, y: body.y, width: body.width - rw, height: body.height }
+        );
+    }
+
+    /// Solo is a per-tab flag, not session-wide: tab 0 going solo must not
+    /// leak onto a freshly created tab 1, and switching back must find tab
+    /// 0's own view still standing.
+    #[test]
+    fn solo_is_independent_per_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        assert_eq!(app.ws.active_tab, 0);
+        app.apply(Action::ToggleSolo);
+        assert!(app.solo());
+        app.apply(Action::NewTab);
+        assert!(!app.solo(), "a fresh tab starts tiled regardless of its neighbour");
+        app.apply(Action::PrevTab);
+        assert_eq!(app.ws.active_tab, 0);
+        assert!(app.solo(), "tab 0 kept its own view across the round trip");
+    }
+
+    #[test]
+    fn solo_focus_up_down_steps_the_rail_and_clamps_silently_at_the_ends() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        let rows = app.rail_rows();
+        assert_eq!(rows.len(), 3);
+        app.focused = rows[0];
+        app.apply(Action::Focus(layout::Dir::Up));
+        assert_eq!(app.focused, rows[0], "clamped silently at the top row");
+        assert!(app.flash().is_none(), "C31's dead end is silent, not flashed");
+        app.apply(Action::Focus(layout::Dir::Down));
+        assert_eq!(app.focused, rows[1]);
+        app.apply(Action::Focus(layout::Dir::Down));
+        assert_eq!(app.focused, rows[2]);
+        app.apply(Action::Focus(layout::Dir::Down));
+        assert_eq!(app.focused, rows[2], "clamped silently at the bottom row");
+    }
+
+    /// C43: solo has no tiled geometry left for `Left`/`Right` to walk, so
+    /// they skip straight to the cross-tab handoff — unconditionally, on
+    /// the first press, matching PROPOSAL.md §2.4's "no new rule" table.
+    #[test]
+    fn solo_focus_left_right_crosses_tabs_unconditionally() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        app.apply(Action::PrevTab);
+        assert_eq!(app.ws.active_tab, 0);
+        app.apply(Action::ToggleSolo);
+        app.apply(Action::Focus(layout::Dir::Left));
+        assert_eq!(app.ws.active_tab, 1, "wraps to the other tab, the only one there is");
+    }
+
+    /// C33's swap path, reused: `Alt+Shift+↑/↓` reorders the rail exactly
+    /// like it reorders the tiled tree, and the reorder persists.
+    #[test]
+    fn solo_move_pane_up_down_swaps_the_rail_order_and_persists() {
+        let (mut app, store) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        let before = app.rail_rows();
+        app.focused = before[1];
+        app.apply(Action::MovePane(layout::Dir::Up));
+        let after = app.rail_rows();
+        assert_eq!(app.focused, before[1], "focus follows the pane, id unchanged");
+        assert_eq!(after, vec![before[1], before[0], before[2]]);
+
+        let saved = store.load().unwrap().unwrap();
+        let mut persisted_order = Vec::new();
+        layout::pane_order(&saved.tabs[0].layout, &mut persisted_order);
+        assert_eq!(persisted_order, after, "the swap survived the save");
+    }
+
+    /// Every refused chord — the shape verbs and the cross-tab move pair —
+    /// leaves the tree exactly as it was and names the way out with the
+    /// live chord, C42's ceiling message's own rule. Also: a refusal must
+    /// not first exit an unrelated zoom on its way to doing nothing.
+    #[test]
+    fn solo_refuses_the_shape_verbs_and_cross_tab_move_leaving_the_tree_untouched() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleSolo);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed());
+        let before = format!("{:?}", app.ws.active_tab().layout);
+
+        for action in [
+            Action::StackPane,
+            Action::ExplodeStack,
+            Action::FlipSplit,
+            Action::Resize { horizontal: false, grow: true },
+            Action::CycleLayout { forward: true },
+        ] {
+            app.flash = None;
+            app.apply(action);
+            assert_eq!(
+                format!("{:?}", app.ws.active_tab().layout),
+                before,
+                "{action:?} must not touch the tree"
+            );
+            assert!(
+                app.flash()
+                    .is_some_and(|m| m.contains("solo view") && m.contains("tiles this tab")),
+                "{action:?}: {:?}",
+                app.flash()
+            );
+        }
+        for action in [Action::MovePane(layout::Dir::Left), Action::MovePane(layout::Dir::Right)] {
+            app.flash = None;
+            app.apply(action);
+            assert_eq!(
+                format!("{:?}", app.ws.active_tab().layout),
+                before,
+                "{action:?} must not touch the tree"
+            );
+            assert!(
+                app.flash().is_some_and(
+                    |m| m.contains("solo view") && m.contains("moves a pane between tabs")
+                ),
+                "{action:?}: {:?}",
+                app.flash()
+            );
+        }
+        assert!(app.solo(), "a refusal never silently tiles the tab");
+        assert!(app.zoomed(), "nor does it exit an unrelated zoom on its way to refusing");
+    }
+
+    /// PROPOSAL.md §2.4: closing in solo lands on the tab-strip's own idiom
+    /// — the row below, else the one above — not U11's remembered-pane
+    /// fallback (which could land anywhere).
+    #[test]
+    fn solo_close_lands_on_the_next_row_below_then_the_one_above() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        let rows = app.rail_rows();
+        assert_eq!(rows.len(), 3);
+
+        app.focused = rows[1];
+        app.apply(Action::ClosePane);
+        assert_eq!(app.focused, rows[2], "lands on the row below when there is one");
+
+        app.apply(Action::ClosePane);
+        assert_eq!(app.focused, rows[0], "lands on the row above once nothing is below");
+    }
+
+    /// C21: zoom composes on top of solo — it hides the rail (the shown
+    /// pane gets the whole body) and leaving zoom brings the rail straight
+    /// back, no second `Alt+Shift+t` needed.
+    #[test]
+    fn zoom_hides_the_rail_and_leaving_it_restores_the_rail() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleSolo);
+        assert!(app.rail_area().is_some());
+        app.apply(Action::ToggleZoom);
+        assert!(app.rail_area().is_none(), "zoom takes the whole body");
+        app.apply(Action::ToggleZoom);
+        assert!(app.rail_area().is_some(), "leaving zoom brings the rail back");
+    }
+
+    /// Leaving solo guards on the real tree's drawability at the *current*
+    /// size — the one thing solo could have let go stale by hiding the
+    /// tree while the terminal shrank underneath it.
+    #[test]
+    fn leaving_solo_refuses_when_the_tiled_tree_would_not_be_drawable() {
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..8 {
+            app.apply(Action::NewPane);
+        }
+        app.apply(Action::ToggleSolo);
+        assert!(app.solo());
+        let before = format!("{:?}", app.ws.active_tab().layout);
+        app.on_resize(Size::new(6, 3), (0, 0));
+        assert!(
+            !layout::every_pane_is_drawable(&app.ws.active_tab().layout, app.body_area()),
+            "fixture must actually be undrawable at this size"
+        );
+        app.apply(Action::ToggleSolo);
+        assert!(app.solo(), "the refusal must leave the tab in solo");
+        assert_eq!(
+            format!("{:?}", app.ws.active_tab().layout),
+            before,
+            "a refused tile must not touch the tree either"
+        );
+        assert!(app.flash().is_some_and(|m| m.contains("can't tile")), "{:?}", app.flash());
     }
 }

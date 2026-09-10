@@ -48,11 +48,19 @@ pub fn draw<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>) {
     // C6: header row above each stack tall enough to spare one — a separate
     // walk over the same tree `app.rects()` reads, since the header isn't a
     // `PaneRect` (it belongs to no pane; §5). C21: stack headers are
-    // real-tree chrome, suppressed entirely while zoomed.
-    if !app.zoomed() {
+    // real-tree chrome, suppressed entirely while zoomed. C43: and while
+    // solo — the tree they'd describe isn't on screen either.
+    if !app.zoomed() && !app.solo() {
         for header in layout::stack_headers(&app.ws.active_tab().layout, body) {
             draw_stack_header(f, header);
         }
+    }
+    // C43: the rail — solo's list of the tab's other panes — drawn before
+    // the pane(s) below so its own border (none) never competes with the
+    // shown pane's. `None` while zoomed (zoom takes the whole body) or
+    // below the rail's own width floor.
+    if let Some(rail) = app.rail_area() {
+        draw_rail(f, app, rail, spinner);
     }
     // C21/C22/§5: the zoom-and-float-aware display list — every
     // render/PTY-resize/mouse-hit path shares this one accessor so none of
@@ -153,11 +161,13 @@ fn draw_too_small(f: &mut Frame<'_>, area: Rect) {
 /// that is not an oversight: config.json's grammar is Alt chords only
 /// (`Chord::parse` requires the `alt+` prefix), so those keys cannot be
 /// remapped and cannot go stale. Only what can move is derived.
+#[allow(clippy::too_many_arguments)]
 fn hint_pairs(
     mode: &Mode,
     focused_dead: bool,
     resumable: bool,
     focused_raw: bool,
+    solo: bool,
     help_scrolled: bool,
     marked: bool,
     keymap: &Keymap,
@@ -302,6 +312,26 @@ fn hint_pairs(
         Mode::Normal if focused_raw => {
             alt(&[Action::ToggleRaw], "Alt+Shift+p", "exit raw").into_iter().collect()
         }
+        // C43: solo's own six. `Up`/`Down` step the rail; `Left`/`Right`
+        // cross tabs — solo has no tiled geometry left for them to move
+        // focus around in. The shape verbs (`Alt+s` et al.) are refused in
+        // solo, so this list swaps `stack` for the toggle itself, the way
+        // out back to the tiled hints below.
+        Mode::Normal if solo => {
+            const FOCUS_UD: &[Action] = &[Action::Focus(Dir::Up), Action::Focus(Dir::Down)];
+            const FOCUS_LR: &[Action] = &[Action::Focus(Dir::Left), Action::Focus(Dir::Right)];
+            [
+                alt(&[Action::Help], "Alt+?", "keys"),
+                alt(FOCUS_UD, "Alt+↑↓", "pane"),
+                alt(FOCUS_LR, "Alt+←→", "tab"),
+                alt(&[Action::NewPane], "Alt+n", "new"),
+                alt(&[Action::ClosePane], "Alt+w", "close"),
+                alt(&[Action::ToggleSolo], "Alt+Shift+t", "tile"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        }
         // Pairs drop whole from the right, so `Alt+? keys` leads (the way to
         // everything else once it's dropped) and `Alt+r rename` trails
         // (costs nothing when gone — still findable under Alt+?).
@@ -343,12 +373,15 @@ fn hint_pairs(
 }
 
 /// C9's right-segment uppercase mode word. A real non-Normal mode always
-/// wins; in Normal, `RAW` (C23) beats `ZOOM` (C21) beats `NORMAL` — input
-/// safety (knowing you're raw) trumps view state.
-fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
+/// wins; in Normal, `RAW` (C23) beats `ZOOM` (C21) beats `SOLO` (C43) beats
+/// `NORMAL` — input safety (knowing you're raw) trumps view state, and
+/// zoom (session-only, composes on top) outranks the persisted solo flag
+/// underneath it.
+fn mode_word(mode: &Mode, zoomed: bool, raw: bool, solo: bool) -> &'static str {
     match mode {
         Mode::Normal if raw => "RAW",
         Mode::Normal if zoomed => "ZOOM",
+        Mode::Normal if solo => "SOLO",
         Mode::Normal => "NORMAL",
         Mode::Rename { .. } => "RENAME",
         Mode::PaneEdit { .. } => "EDIT",
@@ -538,6 +571,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) {
         app.focused_dead(),
         resumable,
         focused_raw,
+        app.solo(),
         scrolled,
         app.marked().is_some(),
         app.keymap(),
@@ -560,7 +594,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) {
         app.attention_segment(),
         query,
         position,
-        mode_word(&app.mode, app.zoomed(), focused_raw),
+        mode_word(&app.mode, app.zoomed(), focused_raw, app.solo()),
         input::chord_for(app.keymap(), Action::JumpAttention),
     );
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
@@ -1501,6 +1535,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             chords(&[Action::CycleLayout { forward: false }], "the same cycle, backwards"),
             chords(&[Action::ToggleZoom], "zoom the focused pane (view only)"),
             chords(&[Action::ToggleFloat], "floating scratch shell"),
+            chords(&[Action::ToggleSolo], "solo view: one pane at a time, the rest in a rail"),
         ],
     },
     HelpGroup {
@@ -2166,7 +2201,7 @@ pub fn tab_status_word<B: PaneBackend>(app: &App<B>) -> Option<&'static str> {
     if app.hints_shown() {
         return None; // C9's right segment already says it
     }
-    let word = mode_word(&app.mode, app.zoomed(), app.is_raw(app.focused));
+    let word = mode_word(&app.mode, app.zoomed(), app.is_raw(app.focused), app.solo());
     (word != "NORMAL").then_some(word)
 }
 
@@ -2773,6 +2808,106 @@ fn draw_stack_header(f: &mut Frame<'_>, header: layout::StackHeader) {
     );
 }
 
+/// C43's rail header text (row 0) for the given rail width — the labelled
+/// tier gets `stack_header_text`'s own shape with `STACK` swapped for
+/// `SOLO`, same degrade-by-overflow rule (Paragraph clips visually, never
+/// panics); the glyph tier has no room for the count or the right segment,
+/// so it just says the word, space-padded to fill the row.
+fn rail_header_text(width: u16, n: usize) -> String {
+    if width <= layout::RAIL_GLYPH_COLS {
+        let left = " SOLO";
+        let pad = width.saturating_sub(left.chars().count() as u16);
+        format!("{left}{}", " ".repeat(pad as usize))
+    } else {
+        let left = format!(" SOLO · {n} PANES");
+        let right = "ALT+↑↓ ";
+        let pad = width
+            .saturating_sub(left.chars().count() as u16)
+            .saturating_sub(right.chars().count() as u16);
+        format!("{left}{}{right}", " ".repeat(pad as usize))
+    }
+}
+
+/// C43: one rail row at the glyph tier (`RAIL_GLYPH_COLS` wide) — marker,
+/// status glyph, space, id, padded to fill the row. The labelled tier
+/// reuses `collapsed_row_spans` wholesale instead; there's no room here for
+/// anything past the bare id.
+fn rail_glyph_row_spans(
+    focused: bool,
+    status: Option<AgentStatus>,
+    id: layout::PaneId,
+    spinner: char,
+) -> Vec<Span<'static>> {
+    let (base_glyph, glyph_style, spins) = row_status_style(status);
+    let glyph = if spins { spinner } else { base_glyph };
+    let marker = if focused {
+        Span::styled(theme::MARKER_ACTIVE.to_string(), theme::accent())
+    } else {
+        Span::raw(" ")
+    };
+    let rest = format!(" {id}");
+    let content_w = 2 + mouse::display_width(&rest); // marker + glyph, 1 col each
+    let pad = layout::RAIL_GLYPH_COLS.saturating_sub(content_w);
+    vec![
+        marker,
+        Span::styled(glyph.to_string(), glyph_style),
+        Span::raw(format!("{rest}{}", " ".repeat(pad as usize))),
+    ]
+}
+
+/// C43: the solo-view rail — row 0 the header, then one row per
+/// `rail_rows()` id, top-aligned, recomputed every frame from the
+/// workspace (renames, status flips and closes show up live, same as the
+/// roster). When there are more rows than fit, the *last* rail row draws
+/// `…` instead of that row — v1 never scrolls the rail (deferred, see
+/// DESIGN-ui.md C43 / PROPOSAL.md §2.2).
+fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, spinner: char) {
+    let rows = app.rail_rows();
+    f.render_widget(
+        Paragraph::new(rail_header_text(rail.width, rows.len()))
+            .style(theme::quiet().add_modifier(Modifier::UNDERLINED)),
+        Rect::new(rail.x, rail.y, rail.width, 1),
+    );
+    let body_rows = rail.height.saturating_sub(1);
+    if body_rows == 0 {
+        return; // no room for even one pane row under the header
+    }
+    let overflow = rows.len() as u16 > body_rows;
+    let shown = if overflow { body_rows - 1 } else { body_rows };
+    for (i, &id) in rows.iter().take(shown as usize).enumerate() {
+        let row = Rect::new(rail.x, rail.y + 1 + i as u16, rail.width, 1);
+        let focused = app.focused == id;
+        let status = app.display_status(id).unwrap_or(AgentStatus::Exited);
+        let spans = if rail.width <= layout::RAIL_GLYPH_COLS {
+            rail_glyph_row_spans(focused, Some(status), id, spinner)
+        } else {
+            let spec = app.find_spec(id);
+            let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
+            let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
+            let name = if spec.is_some() { app.display_name(id) } else { "?".into() };
+            let noted = spec.is_some_and(|s| s.note.is_some());
+            let raw = app.is_raw(id);
+            collapsed_row_spans(
+                rail.width,
+                focused,
+                Some(status),
+                id,
+                &name,
+                &adapter,
+                has_title,
+                raw,
+                noted,
+                spinner,
+            )
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
+    }
+    if overflow {
+        let row = Rect::new(rail.x, rail.y + rail.height - 1, rail.width, 1);
+        f.render_widget(Paragraph::new("…").style(theme::quiet()), row);
+    }
+}
+
 /// C4's note segment data (C32): what the badge says about a parked note.
 /// `headline` is the note's first line, `more` marks a body under it (the
 /// `⋮`), `age` is the pre-rendered age tag — `None` when the note has no
@@ -3160,7 +3295,24 @@ mod tests {
             focused_dead,
             resumable,
             focused_raw,
+            false,
             help_scrolled,
+            false,
+            &Keymap::default(),
+        )
+    }
+
+    /// C43: the solo hint list, default keymap — its own tiny wrapper
+    /// rather than growing every one of the 5-arg wrapper's 16 call sites
+    /// for a flag only one test needs.
+    fn hint_pairs_solo() -> Vec<(String, &'static str)> {
+        super::hint_pairs(
+            &Mode::Normal,
+            false,
+            false,
+            false,
+            true,
+            false,
             false,
             &Keymap::default(),
         )
@@ -3834,6 +3986,33 @@ mod tests {
         );
     }
 
+    /// C43: solo's own six, and — PROPOSAL.md §2.6's own budget — still
+    /// inside the 100-column floor beside the right segment's `SOLO` word.
+    #[test]
+    fn hint_pairs_solo_mode_is_the_six_c43_pairs_and_fits_the_floor() {
+        let pairs = hint_pairs_solo();
+        assert_eq!(
+            pairs,
+            p(&[
+                ("Alt+?", "keys"),
+                ("Alt+↑↓", "pane"),
+                ("Alt+←→", "tab"),
+                ("Alt+n", "new"),
+                ("Alt+w", "close"),
+                ("Alt+Shift+t", "tile"),
+            ]),
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        let right_w = super::hint_bar_right_spans(None, None, None, "SOLO", Some("Alt+a".into()))
+            .iter()
+            .map(|s| mouse::display_width(&s.content))
+            .sum::<u16>();
+        assert!(
+            cols + right_w <= 100,
+            "solo hints are {cols} cols + {right_w} of segment; the 100-col floor clips them"
+        );
+    }
+
     /// F1, pinned at the bar itself: every Alt chord on the footer is
     /// resolved from the live keymap, so a config.json remap moves the bar
     /// too — the chord that replaced a default takes the pair over, and the
@@ -3845,7 +4024,8 @@ mod tests {
             "config.json",
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let pairs = super::hint_pairs(&Mode::Normal, false, false, false, false, false, &keymap);
+        let pairs =
+            super::hint_pairs(&Mode::Normal, false, false, false, false, false, false, &keymap);
         assert!(
             !pairs.iter().any(|(k, _)| k.contains("Alt+w")),
             "the displaced default chord is off the bar: {pairs:?}"
@@ -3919,8 +4099,16 @@ mod tests {
         let unmarked = hint_pairs(&Mode::Normal, false, false, false, false);
         assert!(!unmarked.iter().any(|(k, _)| k.contains("Shift+v")), "{unmarked:?}");
 
-        let marked =
-            super::hint_pairs(&Mode::Normal, false, false, false, false, true, &Keymap::default());
+        let marked = super::hint_pairs(
+            &Mode::Normal,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            &Keymap::default(),
+        );
         assert_eq!(marked[0], one("Alt+Shift+v", "pull marked pane"));
         assert_eq!(&marked[1..], &unmarked[..], "and nothing else on the bar moved");
         // It must survive the squeeze that drops everything else, or the
@@ -4042,10 +4230,11 @@ mod tests {
 
     #[test]
     fn mode_word_matches_c9_table() {
-        assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
+        assert_eq!(mode_word(&Mode::Normal, false, false, false), "NORMAL");
         assert_eq!(
             mode_word(
                 &Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab },
+                false,
                 false,
                 false
             ),
@@ -4055,14 +4244,15 @@ mod tests {
             mode_word(
                 &Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
                 false,
+                false,
                 false
             ),
             "PICKER"
         );
-        assert_eq!(mode_word(&Mode::Scroll, false, false), "SCROLL");
-        assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false), "COPY");
+        assert_eq!(mode_word(&Mode::Scroll, false, false, false), "SCROLL");
+        assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false, false), "COPY");
         assert_eq!(
-            mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false),
+            mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false, false),
             "HELP"
         );
     }
@@ -4071,19 +4261,41 @@ mod tests {
     fn mode_word_shows_zoom_pseudo_state_only_in_the_normal_slot() {
         // C21/amended C9: ZOOM shows only when the mode is Normal — every
         // other mode's own word wins regardless of the zoomed flag.
-        assert_eq!(mode_word(&Mode::Normal, true, false), "ZOOM");
-        assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
-        assert_eq!(mode_word(&Mode::Scroll, true, false), "SCROLL");
-        assert_eq!(mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, true, false), "HELP");
+        assert_eq!(mode_word(&Mode::Normal, true, false, false), "ZOOM");
+        assert_eq!(mode_word(&Mode::Normal, false, false, false), "NORMAL");
+        assert_eq!(mode_word(&Mode::Scroll, true, false, false), "SCROLL");
+        assert_eq!(
+            mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, true, false, false),
+            "HELP"
+        );
     }
 
     #[test]
     fn mode_word_raw_beats_zoom_beats_normal_but_never_a_real_mode_word() {
         // C23/amended C9: in the Normal slot, RAW beats ZOOM beats NORMAL —
         // but any real (non-Normal) mode word still wins over both.
-        assert_eq!(mode_word(&Mode::Normal, false, true), "RAW");
-        assert_eq!(mode_word(&Mode::Normal, true, true), "RAW", "raw beats zoom");
-        assert_eq!(mode_word(&Mode::Scroll, true, true), "SCROLL", "a real mode word always wins");
+        assert_eq!(mode_word(&Mode::Normal, false, true, false), "RAW");
+        assert_eq!(mode_word(&Mode::Normal, true, true, false), "RAW", "raw beats zoom");
+        assert_eq!(
+            mode_word(&Mode::Scroll, true, true, false),
+            "SCROLL",
+            "a real mode word always wins"
+        );
+    }
+
+    /// C43: SOLO sits between ZOOM and NORMAL in the Normal slot — it loses
+    /// to a real mode word, loses to ZOOM (session-only, composes on top),
+    /// but beats bare NORMAL, and RAW still outranks everything.
+    #[test]
+    fn mode_word_solo_sits_between_zoom_and_normal() {
+        assert_eq!(mode_word(&Mode::Normal, false, false, true), "SOLO");
+        assert_eq!(mode_word(&Mode::Normal, true, false, true), "ZOOM", "zoom outranks solo");
+        assert_eq!(mode_word(&Mode::Normal, false, true, true), "RAW", "raw outranks solo");
+        assert_eq!(
+            mode_word(&Mode::Scroll, false, false, true),
+            "SCROLL",
+            "a real mode word always wins over solo too"
+        );
     }
 
     #[test]
@@ -4294,13 +4506,13 @@ mod tests {
     #[test]
     fn mode_word_roster_wins_regardless_of_zoom() {
         let mode = Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None };
-        assert_eq!(mode_word(&mode, true, false), "ROSTER");
+        assert_eq!(mode_word(&mode, true, false, false), "ROSTER");
     }
 
     #[test]
     fn mode_word_feed_wins_regardless_of_zoom() {
-        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, false, false), "FEED");
-        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, true, false), "FEED");
+        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, false, false, false), "FEED");
+        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, true, false, false), "FEED");
     }
 
     /// C32: the tab dialog and the combined pane editor lead their hint
@@ -6226,6 +6438,44 @@ row's — widen ADAPTER_COL",
             search.pane = focused;
             app.search = Some(search);
             out.push(("scrollback search hits", snap(&mut app)));
+        }
+
+        // C43: solo view — the rail's header text, the `▎` marker on the
+        // row showing the focused pane, and the shown pane's border
+        // starting right where the rail ends. Self-verifying like the
+        // fixtures above: a regression in any of the three fails loudly
+        // here rather than the §2 gates below silently exercising the
+        // wrong screen.
+        {
+            use crate::core::layout;
+            let mut app = three_panes();
+            app.apply(Action::ToggleSolo);
+            let rw = layout::rail_width(app.body_area().width);
+            let rows = app.rail_rows();
+            let i = rows.iter().position(|&id| id == app.focused).expect("focused is a rail row");
+            let buf = snap(&mut app);
+            let frame: String = (0..30)
+                .map(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(frame.contains("SOLO · 3 PANES"), "the rail header:\n{frame}");
+            let marker_row: String = (0..rw)
+                .filter_map(|x| buf.cell((x, 2 + i as u16)).map(|c| c.symbol().to_string()))
+                .collect();
+            assert!(
+                marker_row.contains(theme::MARKER_ACTIVE),
+                "the focused row ({i}) carries the marker: {marker_row:?}\n{frame}"
+            );
+            assert_eq!(
+                buf.cell((rw, 1)).map(|c| c.symbol().to_string()).as_deref(),
+                Some("┌"),
+                "the shown pane's border starts right where the rail ends (x={rw}):\n{frame}"
+            );
+            out.push(("solo view", buf));
         }
 
         out

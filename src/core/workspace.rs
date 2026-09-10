@@ -38,11 +38,33 @@ pub struct PaneSpec {
     pub noted_at: Option<u64>,
 }
 
+/// A tab's presentation mode: the whole tree tiled at once, or one pane
+/// shown solo with the rest listed in a rail beside it. See DESIGN-ui.md
+/// C43 for the full contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabView {
+    #[default]
+    Tiled,
+    Solo,
+}
+
+impl TabView {
+    pub fn is_tiled(&self) -> bool {
+        matches!(self, TabView::Tiled)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tab {
     pub name: String,
     pub layout: LayoutNode,
     pub panes: HashMap<PaneId, PaneSpec>,
+    /// Tiled (the whole tree at once) or solo (one pane, rest in a rail).
+    /// Absent in old `workspace.json` files, which load as `Tiled`; a
+    /// tiled tab round-trips with no `view` key so old saves diff cleanly.
+    #[serde(default, skip_serializing_if = "TabView::is_tiled")]
+    pub view: TabView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +93,12 @@ impl Workspace {
         Workspace {
             version: 1,
             active_tab: 0,
-            tabs: vec![Tab { name: "main".into(), layout: LayoutNode::Pane(1), panes }],
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout: LayoutNode::Pane(1),
+                panes,
+                view: TabView::Tiled,
+            }],
         }
     }
 
@@ -446,12 +473,40 @@ mod tests {
             name: "tab2".into(),
             layout: LayoutNode::Stack { children: Vec::new(), expanded: 0, from: None },
             panes: HashMap::new(),
+            view: TabView::Tiled,
         });
         ws.active_tab = 1;
         ws.validate_and_repair();
         assert_eq!(ws.tabs.len(), 1);
         assert_eq!(ws.tabs[0].name, "main");
         assert_eq!(ws.active_tab, 0);
+    }
+
+    /// The persistence contract for C43's `view` field: a tiled tab (the
+    /// overwhelming common case) serializes byte-identical to before it
+    /// existed, a solo tab round-trips, and a workspace saved before this
+    /// field existed (no `view` key at all) loads as `Tiled` rather than
+    /// erroring.
+    #[test]
+    fn a_tab_view_round_trips_and_older_workspaces_still_load() {
+        let tiled = Tab {
+            name: "main".into(),
+            layout: LayoutNode::Pane(1),
+            panes: HashMap::new(),
+            view: TabView::Tiled,
+        };
+        let tiled_json = serde_json::to_string(&tiled).expect("a tab serializes");
+        assert!(!tiled_json.contains("\"view\""), "a tiled tab omits the view key: {tiled_json}");
+
+        let solo = Tab { view: TabView::Solo, ..tiled.clone() };
+        let solo_json = serde_json::to_string(&solo).expect("a solo tab serializes");
+        let reloaded: Tab = serde_json::from_str(&solo_json).expect("and loads back");
+        assert_eq!(reloaded.view, TabView::Solo);
+
+        // Backward: a tab written before `view` existed has no key at all.
+        let old_json = r#"{"name":"main","layout":{"pane":1},"panes":{}}"#;
+        let old: Tab = serde_json::from_str(old_json).expect("an old tab still loads");
+        assert_eq!(old.view, TabView::Tiled);
     }
 
     #[test]

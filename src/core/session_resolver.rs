@@ -67,7 +67,7 @@ mod tests {
     use super::*;
     use crate::agents::CommandSpec;
     use crate::core::layout::LayoutNode;
-    use crate::core::workspace::{PaneSpec, Tab};
+    use crate::core::workspace::{PaneSpec, Tab, TabView};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -198,8 +198,18 @@ mod tests {
             version: 1,
             active_tab: 0,
             tabs: vec![
-                Tab { name: "one".into(), layout: LayoutNode::Pane(1), panes: tab1_panes },
-                Tab { name: "two".into(), layout: LayoutNode::Pane(3), panes: tab2_panes },
+                Tab {
+                    name: "one".into(),
+                    layout: LayoutNode::Pane(1),
+                    panes: tab1_panes,
+                    view: TabView::Tiled,
+                },
+                Tab {
+                    name: "two".into(),
+                    layout: LayoutNode::Pane(3),
+                    panes: tab2_panes,
+                    view: TabView::Tiled,
+                },
             ],
         };
         let claimed = claimed_sessions(&ws);

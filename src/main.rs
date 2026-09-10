@@ -982,6 +982,28 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
+    // C43: the solo-view rail — a left press on a row focuses that pane
+    // (`on_click`, the tab strip's and roster's own click-to-focus rule);
+    // every other event inside the rail (wheel included) is consumed and
+    // does nothing — v1 never scrolls the rail and there is no cursor for
+    // a wheel to move (unlike the roster). Checked ahead of the seam/pane
+    // paths below so a rail click can't fall through to whatever pane sits
+    // behind it in the display list.
+    if let Some(rail) = app.rail_area() {
+        let inside = me.column >= rail.x
+            && me.column < rail.x + rail.width
+            && me.row >= rail.y
+            && me.row < rail.y + rail.height;
+        if inside {
+            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some(id) = mouse::rail_row_at(rail, &app.rail_rows(), me.column, me.row) {
+                    app.on_click(id);
+                }
+            }
+            return;
+        }
+    }
+
     // U21: a left press on the seam between two panes drags that border
     // instead of focusing. Checked ahead of the pane paths below because a
     // pane's rect *includes* its border (C3), so hit-testing would happily

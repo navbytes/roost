@@ -638,6 +638,34 @@ pub struct PaneRect {
     pub collapsed: bool,
 }
 
+/// C43: rail row width at the labelled tier — long enough for a status
+/// glyph, a marker, and a few id digits at the glyph tier's floor.
+pub const RAIL_GLYPH_COLS: u16 = 6;
+
+/// C43: how wide the solo-view rail is at `body_width` columns. Three
+/// tiers: nothing below 40 (there's no room to spare), a fixed
+/// `RAIL_GLYPH_COLS` from 40 up (glyph + marker only), and a fifth of the
+/// body — clamped to `[20, 32]` — from 100 up, wide enough for labelled
+/// rows.
+pub fn rail_width(body_width: u16) -> u16 {
+    if body_width >= 100 {
+        (body_width / 5).clamp(20, 32)
+    } else if body_width >= 40 {
+        RAIL_GLYPH_COLS
+    } else {
+        0
+    }
+}
+
+/// C43: the rail width and the solo-shown pane's rect for a `body` area —
+/// the rail along the left edge, the focused pane taking the rest. Never
+/// collapsed: a solo pane is always the one thing on screen.
+pub fn solo_rects(body: Rect, focused: PaneId) -> (u16, PaneRect) {
+    let rw = rail_width(body.width);
+    let rect = Rect { x: body.x + rw, y: body.y, width: body.width - rw, height: body.height };
+    (rw, PaneRect { id: focused, rect, collapsed: false })
+}
+
 /// A stack's header row (C6) — shown above its members, in the space it
 /// borrows from them, when `stack_header_shown` says there's room. Not a
 /// `PaneRect`: it belongs to no pane (clicks/wheel events over it hit
@@ -2044,5 +2072,32 @@ mod tests {
         // here) has to clear the floor.
         let node = all_stack_layout(&[1, 2, 3, 4, 5], 1);
         assert!(arrangement_fits(&node, Rect::new(0, 0, 40, 20)));
+    }
+
+    #[test]
+    fn rail_width_steps_through_its_three_tiers() {
+        assert_eq!(rail_width(39), 0, "below 40: no room to spare");
+        assert_eq!(rail_width(40), RAIL_GLYPH_COLS);
+        assert_eq!(rail_width(99), RAIL_GLYPH_COLS);
+        assert_eq!(rail_width(100), 20, "100/5 = 20, the floor of the clamp");
+        assert_eq!(rail_width(160), 32, "160/5 = 32, the ceiling of the clamp");
+        assert_eq!(rail_width(200), 32, "200/5 = 40, clamped down to 32");
+    }
+
+    #[test]
+    fn solo_rects_pane_keeps_at_least_80_columns_from_100_up() {
+        for w in 100..=240u16 {
+            let (rw, pr) = solo_rects(Rect::new(0, 0, w, 40), 1);
+            assert_eq!(rw + pr.rect.width, w, "rail + pane account for the whole width");
+            assert!(pr.rect.width >= 80, "at {w} cols the pane rect is only {}", pr.rect.width);
+        }
+    }
+
+    #[test]
+    fn solo_rects_pane_sits_right_of_the_rail() {
+        let (rw, pr) = solo_rects(Rect::new(2, 3, 120, 30), 7);
+        assert_eq!(pr.id, 7);
+        assert!(!pr.collapsed);
+        assert_eq!(pr.rect, Rect { x: 2 + rw, y: 3, width: 120 - rw, height: 30 });
     }
 }

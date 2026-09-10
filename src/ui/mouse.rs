@@ -350,6 +350,20 @@ pub fn picker_row_at(rect: Rect, items: usize, col: u16, row: u16) -> Option<usi
     (i < items && i < (rect.height - 2) as usize).then_some(i)
 }
 
+/// C43: which rail row (if any) sits at (col, row), given the rail's drawn
+/// rect and `App::rail_rows()`'s ids in the same top-to-bottom order.
+/// Row 0 of the rail is the header — it belongs to no pane, the same rule
+/// a stack's own header row follows — so it and anything outside `rail`
+/// hit nothing. The rail draws no border (§2 background policy), so every
+/// column inside counts, unlike the picker's bordered dialog above.
+pub fn rail_row_at(rail: Rect, rows: &[PaneId], col: u16, row: u16) -> Option<PaneId> {
+    if col < rail.x || col >= rail.x + rail.width || row >= rail.y + rail.height {
+        return None;
+    }
+    let i = row.checked_sub(rail.y + 1)? as usize;
+    rows.get(i).copied()
+}
+
 /// The tab bar's right-aligned status text (C2): the mode word (U15 — only
 /// when the hint bar isn't carrying it), the focused pane's cwd (already
 /// `~`-abbreviated by the caller, `App::focused_cwd`) and the save
@@ -1156,5 +1170,40 @@ mod tests {
         // Same width, healthy save: the area is dropped whole instead —
         // nothing here is worth taking a tab's columns for.
         assert_eq!(status_fit(Some("ZOOM"), Some("~/work"), true, &names, bar - 4), None);
+    }
+
+    /// C43: the rail's header row (row 0) belongs to no pane — same rule a
+    /// stack's own header follows — so a click there hits nothing even
+    /// though it is well inside the rail's rect.
+    #[test]
+    fn rail_row_at_the_header_row_hits_nothing() {
+        let rail = Rect::new(0, 1, 20, 10);
+        let rows = vec![1u64, 2, 3];
+        assert_eq!(rail_row_at(rail, &rows, 5, 1), None);
+    }
+
+    /// The ordinary case: row `rail.y + 1 + i` is the i-th id, at any
+    /// column inside the rail (no border to dodge, unlike the picker).
+    #[test]
+    fn rail_row_at_maps_rows_to_ids_in_order() {
+        let rail = Rect::new(0, 1, 20, 10);
+        let rows = vec![7u64, 8, 9];
+        assert_eq!(rail_row_at(rail, &rows, 0, 2), Some(7));
+        assert_eq!(rail_row_at(rail, &rows, 19, 3), Some(8));
+        assert_eq!(rail_row_at(rail, &rows, 10, 4), Some(9));
+    }
+
+    /// Past the last id, still inside the rail's rect (the fixed-height
+    /// tail below a short list) — and everything outside the rect on
+    /// every side: above, below, left, right.
+    #[test]
+    fn rail_row_at_outside_the_rows_or_the_rect_hits_nothing() {
+        let rail = Rect::new(5, 1, 20, 10);
+        let rows = vec![1u64, 2];
+        assert_eq!(rail_row_at(rail, &rows, 5, 4), None, "past the last id");
+        assert_eq!(rail_row_at(rail, &rows, 4, 2), None, "left of the rail");
+        assert_eq!(rail_row_at(rail, &rows, 25, 2), None, "right of the rail");
+        assert_eq!(rail_row_at(rail, &rows, 5, 0), None, "above the rail");
+        assert_eq!(rail_row_at(rail, &rows, 5, 11), None, "below the rail");
     }
 }
