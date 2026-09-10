@@ -60,6 +60,23 @@ shown in the badge, collapsed rows, and feed entries.
 notifications and pane-referencing flashes carry the display name, and the
 corner badge and collapsed rows lead with the pane id (C4/C8/C20 amended
 2026-07-27).
+**[Amended 2026-09-10, review pass — the id leaves the badge and collapsed
+rows.]** The last clause above is no longer true. `Workspace::next_pane_id`
+recycles (`max(live ids) + 1`), so the id names an allocation slot, not the
+pane, and on a row that already shows the pane's name it was redundant.
+`App::chrome_name(id)` now disambiguates instead: bare on the first pane
+with a given name in its tab, ` (2)`, ` (3)` … on the rest — scoped to one
+tab because the badge, a collapsed stack row, and a roster group each show
+one tab's panes at a time. The badge (C4) and collapsed rows (C8, and the
+roster, C27, which reuses the same row) render `chrome_name`, not the id;
+U2's original problem — panes indistinguishable on fleet surfaces — is
+still fixed, just by the ordinal instead of the id. The id has not left the
+TUI: it still leads C20's feed (`{id} {name}`, unchanged), the host
+terminal's title (`roost · {id} {focused pane}`, unchanged), and the solo
+rail's glyph tier (C43, 40–99 cols, where no name fits) — and it remains
+`roost send`/`roost list`/`roost status`'s own key. `App::display_name`
+(feed, notifications, flashes, host title) is untouched; only the chrome
+rows that already carry a name dropped the id.
 **Extended (SPEC-parity P6, same branch):** the chain is now explicit Alt+r
 title → the pane's **live OSC 0/2 title** → `adapter · cwd-tag`, resolved by
 `App::display_name` so every surface listed above inherits it; the live title
@@ -613,7 +630,14 @@ C12 modal on C20's own geometry. It lists every pane grouped by tab in C19's
 ring order (the float last), tab headers in C6's underlined-label idiom and
 pane rows in **C8's collapsed-row format verbatim** — the same
 `collapsed_row_spans`, `display_name`, `state_word` and C5 glyph table every
-other fleet surface uses, so no new glyph and no new vocabulary. The opening
+other fleet surface uses, so no new glyph and no new vocabulary.
+**[Amended 2026-09-10, review pass]** Two words above are dated: the tab
+headers now draw C6's `─` rule (`section_header_text`), not the
+`Modifier::UNDERLINED` idiom; and the pane rows read `chrome_name`, not bare
+`display_name` — C4/C8's 2026-09-10 amendment drops the id from the shared
+row, so `chrome_name`'s ` (2)`/` (3)` ordinals are what keeps two
+identically-named panes in one tab's group apart, same-tab scope matching
+this list's own per-tab grouping. The opening
 cursor is the pane `Alt+a` would jump to (both read one `attention_next`), so
 `Alt+Shift+a` `Enter` **is** `Alt+a` — the roster is a superset of the chord
 users know, not a competitor. Arrows/PgUp/PgDn move (headers are skipped;

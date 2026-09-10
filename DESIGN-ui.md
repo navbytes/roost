@@ -257,10 +257,12 @@ red). Modifiers permitted, and what each is load-bearing for:
   now, not only a mechanism.
 - `REVERSED` — the three attention surfaces (C10/C11/C16), copy selection
   (C17), copy cursor (C24), search hits (C17 amendment).
-- `UNDERLINED` — the stack header rule (C6), the copy cursor inside a
-  selection and the current search hit (C24/C17), and the pane editor's
-  name row (C32, amended 2026-08-15 — the field's own rule, padded edge
-  to edge so it doubles as the name/note separator).
+- `UNDERLINED` — the copy cursor inside a selection and the current search
+  hit (C24/C17), and the pane editor's name row (C32, amended 2026-08-15 —
+  the field's own rule, padded edge to edge so it doubles as the name/note
+  separator). **[Amended 2026-09-10, review pass]** No longer the stack
+  header rule: C6 (and C15/C27/C43's group headers with it) traded the
+  modifier for a literal `─` rule — see C6's own amendment.
 
 Program output keeps whatever attributes it sent.
 
@@ -822,6 +824,35 @@ the placement moved, and with it:
   coloured: the glyph carries status and `raw`/`↑N` carry view state, and
   flattening them to the border colour would delete the signal.
 
+**[Amended 2026-09-10, review pass — the id leaves the badge.]** The
+2026-07-27 U2 amendment above (`:705`, `:710`) made the id lead every fleet
+row; this reopens that call for the badge/border title (and C8 below).
+`Workspace::next_pane_id` is `max(live ids) + 1` — recycled, not monotonic —
+so the number names an allocation slot, not the pane, and on a row that
+already shows the pane's name the id is noise. `badge_text` (`render.rs`) now
+composes `"{name} · {adapter}"` (custom title) or `"{name}"` (untitled — same
+no-dup rule as before), dropping the leading `{id} ` outright; the
+`"{id} {name} · {adapter}"` composition at `:833` and the "same U2 id-first
+rule" it cites are both superseded — `identity_title_is_two_toned_and_reads_exactly_as_the_badge_did`
+now pins `" claude "` with no id, and `badge_no_dup_rule_pins_c4` is the
+current no-dup equality. Collisions — two panes in one tab rendering the same
+name — are caught not by the id but by `App::chrome_name(id)`, a second
+helper layered over `display_name`: bare on the first pane with a given name
+in that tab's `pane_order()`, ` (2)`, ` (3)` … on the rest, scoped to one tab
+because that is the widest any single rail/roster/collapsed-stack view
+spans. The id has not left the TUI: it still leads C20's feed (`{id}
+{name}`, unchanged), the host terminal title (`roost · {id} {focused pane}`,
+unchanged — untitled panes in one project can share `shell · cwd-tag`, and
+the title has no second mark to disambiguate them), and the solo rail's
+glyph tier (C43, 40–99 cols, where no name fits) — and it is `roost
+list`/`roost status`'s own key regardless of chrome. `:713`'s "the one
+helper every fleet surface … derives pane identity from" is also superseded:
+it is now two helpers with a stated split — `display_name` (feed,
+notifications, flashes, host title — surfaces that already carry the id and
+so never needed collision suffixing) and `chrome_name` (badge, collapsed
+rows, roster — surfaces where the id is gone and a name collision would
+otherwise be silent).
+
 ### C5 — Status glyph system + spinner
 
 **Current:** glyphs from `status.rs:34–42`; colors `render.rs:282–290`
@@ -1025,6 +1056,30 @@ member gets **3 rows** (C8's bordered box: border + row + border):
   C33 swaps) is rect-driven. The C25 fit predicate keeps exempting collapsed
   rects whatever their height.
 
+**[Amended 2026-09-10, review pass]** The `Modifier::UNDERLINED` fill above
+is retired. Underline draws *under* the glyphs, hard against the baseline
+with no leading, so it collided with descenders and with the `·` separator
+and read as cramped; terminals also disagree about its weight and its
+colour. The header row is now a `─` rule running edge to edge with a gap
+punched in it for each label — the shape of a pane's own top border
+(`┌ title ─────┐`) minus the corners, the same move C3/C4 made on
+2026-08-21 when the identity badge went onto the border. On a solo tab's
+first body row (C43) the rail header's rule and the shown pane's top border
+now share a row and align, which the underline could never do (it sat a
+pixel row lower than the `─` beside it). **[Amended 2026-09-10, review
+pass — corrected.]** "Line up into one continuous rule" overstated it: the
+rail header draws in `theme::quiet()`, while the shown pane's top border —
+always focused, since C43's own "shown ≡ focused" means a solo tab's body
+pane is never drawn unfocused — draws in `accent()`. Two different tokens,
+so the pair reads as two aligned rules with a colour change at the seam,
+not one unbroken line. One shared function, `section_header_text(width,
+left, right)`
+(`render.rs`), now draws this row for all four surfaces that used to carry
+the underline independently — C6's own header, C43's rail header, C27's
+roster group rows and C15's help-overlay group heads — so the four can no
+longer drift from each other. The right label sheds whole, exactly as
+before, when the rule between the two would fall narrower than one column.
+
 ### C7 — Expanded-member edge marker
 
 **Current:** the expanded stack member renders as an ordinary bordered pane
@@ -1139,6 +1194,9 @@ area affords the rows (C6's boxed-geometry amendment: the member's rect is
 - The row itself is unchanged: the same `collapsed_row_spans` output —
   marker, glyph, id + name, right segment, same styles, same width-shedding
   order — rendered on the box's single inner row at `width − 2`.
+  **[Amended 2026-09-10, review pass]** `id +` is dated — see this
+  section's own 2026-09-10 id-removal amendment below; the row this box
+  wraps lost the id the same day the box's own text otherwise stayed put.
 - A collapsed rect below 3 rows (the C6 fallback regime, or a clamped last
   member) renders the 1-row bar exactly as before. The roster (C27) and
   feed reuse of the row format are untouched — the box is stack chrome,
@@ -1146,6 +1204,32 @@ area affords the rows (C6's boxed-geometry amendment: the member's rect is
 - Click-to-expand covers the whole box, borders included (the rect grew;
   the hit test is rect-driven); `route_mouse` still forwards nothing for a
   collapsed member.
+
+**[Amended 2026-09-10, review pass — a one-column floor on the shed.]**
+"When the row is too narrow, the right segment drops first" above didn't
+say *how* narrow: an exact fit (`left_w + right_w == width`) rendered the
+two segments with no gap between them at all — seen live as ` shell ·
+tmpworking` at a 24-column C43 rail (120 columns; the leading `1 ` id in the
+original 2026-09-10 example above is dropped here only, to stay truthful
+after the id removal directly below — the gap bug itself, the merged `tmp`
++ `working`, is untouched). `collapsed_row_spans`
+now requires `SEGMENT_GAP_COLS = 1` blank column between the segments, so
+an exact fit sheds the right segment one column earlier instead of running
+the two together. Same constant, same reasoning, on C43's own rail header —
+its own shedding now runs through `section_header_text`'s `RULE_MIN_COLS`,
+not this `SEGMENT_GAP_COLS`; see that section's cross-reference.
+
+**[Amended 2026-09-10, review pass — the id leaves the row.]** SPEC-ux U2's
+id-first row (above, `:1120`, `:1122`) is reopened, same reasoning as C4's
+badge: `Workspace::next_pane_id` recycles, so it isn't a durable name, and
+this row already carries the pane's name. `collapsed_row_spans` now emits
+`marker(1) + glyph(1) + " " + name + fill + "{adapter} · {word}" + " "` —
+no id segment. A name collision within the row's own tab (two panes reading
+identical text) is disambiguated by `App::chrome_name`, not the id — see
+C4's amendment for the full split between it and `display_name`. The id
+still lives in C43's rail glyph tier (`rail_glyph_row_spans`, a separate
+function, id-only, unchanged — no name fits at that width) and in C20's
+feed.
 
 ### C9 — Hint bar
 
@@ -1205,6 +1289,14 @@ Gray, no bar bg, no right segment. Normal-mode list has 10 pairs (`:84–95`).
   `RAW` when the focused pane is raw (C23), `ZOOM` when zoomed (C21).
   Precedence: a real non-Normal mode word always wins; else `RAW` beats
   `ZOOM` beats `NORMAL` (input safety trumps view state).
+- **[Amended 2026-09-10, C43 — a third pseudo-state word.]** `SOLO` joins
+  `RAW`/`ZOOM` in the Normal slot when the active tab is in solo view;
+  precedence becomes `RAW > ZOOM > SOLO > NORMAL` (input safety, then view
+  state, then the base mode). The Normal-mode pair list is no longer one
+  fixed seven, either: solo swaps the tiled shape-verb pairs for its own
+  six (`Alt+? keys · Alt+Shift+t tile · Alt+↑↓ pane · Alt+←→ tab · Alt+n
+  new · Alt+w close`, C43) — "exactly these seven" above describes *tiled*
+  Normal; solo Normal has its own count and content.
 - **[Amended 2026-07-27, SPEC-ux U6 — pair order is the yield order]:** the
   seven Normal-mode pairs are unchanged in content but re-ordered to
   `Alt+? keys` · `Alt+n new` · `Alt+↵ launch` · `Alt+s stack` ·
@@ -1950,7 +2042,11 @@ So the cap goes, and with it the merges:
   blanks would be six rows of a table that already scrolls at the floor.
   Grouping is also what makes an unmerged list readable — 26 undifferentiated
   chord rows is a worse artifact than 20 merged ones; 26 in seven named
-  blocks is a better one than either.
+  blocks is a better one than either. **[Amended 2026-09-10, review pass]**
+  "Underlined" is dated: the heading now wears C6's `─` rule
+  (`section_header_text`), not a `Modifier::UNDERLINED` fill — the rule
+  still *is* the separator between groups, drawn rather than implied by an
+  attribute. See C6's own amendment for why.
 - **The fewest columns that fit** (`help_layout`). One column while the list
   fits the body's height — the calm form, and the only form at the 80-col
   floor. A second column only when one would overflow *and* the terminal is
@@ -2822,7 +2918,11 @@ can never see them.
     titled: `"{id} {name} · {adapter} · raw {glyph}"`, untitled:
     `"{id} {name} · raw {glyph}"` — the `raw` token fg `ACCENT_DIM` (the
     "roost stepped back" color family, C11/C16). [Id prefix per C4's U2
-    amendment, 2026-07-27.]
+    amendment, 2026-07-27.] **[Amended 2026-09-10, review pass]** The id
+    prefix is gone with C4's own removal of it: titled reads `"{name} ·
+    {adapter} · raw {glyph}"`, untitled `"{name} · raw {glyph}"` — `name`
+    here is `App::chrome_name`, not `display_name`, so a same-name collision
+    in the raw pane's own tab still gets its ` (2)` ordinal.
   - Collapsed stack row (C8): right segment gains the prefix →
     `"raw · {word}"`.
   - Hint bar while a raw pane is focused and mode is Normal: mode word
@@ -3075,12 +3175,25 @@ Fit changes with it: solo always fits — one pane on screen needs none of the
 floor checks the other three do — so a tiled tab too small for any of them
 now **lands on solo** rather than flashing `no room to rearrange`, which is
 therefore unreachable from a tiled start. The one dead end left is the
-opposite direction: stepping out of solo when none of the three tiled shapes
-fit either, refused with the exact wording `toggle_solo`'s own exit guard
-uses (`can't tile {n} panes at {w}×{h} — close some, or widen the
-terminal`) — one message for "can't tile", however it's reached. `n < 2`
-still refuses unconditionally, ahead of all of this: a one-pane tab reaches
-solo only via `Alt+Shift+t`.
+opposite direction: stepping out of solo when none of the three tiled
+shapes fit either. `n < 2` still refuses unconditionally, ahead of all of
+this: a one-pane tab reaches solo only via `Alt+Shift+t`.
+
+**[Amended 2026-09-10, review pass]** The paragraph above used to end there
+with one wording for that dead end; it never was one. `cycle_layout`'s own
+fit test (`arrangement_fits`, the same per-pane comfort floor the other
+three stops use) is stricter than `toggle_solo`'s exit guard
+(`every_pane_is_drawable` — every pane gets *some* rect, not one clearing
+the floor), so the dead end has two cases. The milder, more common one is a
+tree that's drawable but clears none of the three canned shapes' floor;
+borrowing `toggle_solo`'s `can't tile` wording there would claim a dead end
+`Alt+Shift+t` doesn't actually hit, and C25's own pre-solo wording named
+`Alt+s` — which solo refuses, a dead end pointing at a dead end. It
+now flashes, pointed at the chord that does work: `"no room to
+rearrange — {Alt+Shift+t chord} tiles this tab"`. Only when the tree
+genuinely isn't drawable (`every_pane_is_drawable` false too) does it fall
+through to `toggle_solo`'s own `can't tile {n} panes at {w}×{h} — close
+some, or widen the terminal`.
 
 Counter sync: entering solo — by cycling onto it *or* by `Alt+Shift+t` —
 sets `layout_cycle` to one past the solo stop, so the next `Alt+g` goes to
@@ -3246,14 +3359,24 @@ you.**
     panes are being shown), `quiet()`, `Modifier::UNDERLINED` across every
     cell of the row (the label is padded to the row width so the rule runs
     edge to edge, exactly as `stack_header_text` does it). A header is a
-    label, never a destination.
+    label, never a destination. **[Amended 2026-09-10, review pass]** The
+    underline is gone with C6's own: the row is now drawn by the shared
+    `section_header_text` as a `─` rule with a gap punched in for the
+    label, not a modifier under padded text. See C6's own amendment.
   - **Pane rows reuse C8's collapsed-row format verbatim** — marker + glyph +
     id + name + `{adapter} · {state word}` — by calling the very same
     `collapsed_row_spans`, one column narrower. `display_name_live` /
     `App::display_name`, `state_word`, `collapsed_name_style` and the C5
     glyph table are all shared, so a pane reads identically here, in a
     collapsed stack row, and on its badge. **No new glyphs**: §2's inventory
-    holds.
+    holds. **[Amended 2026-09-10, review pass]** The `id +` above is stale:
+    C8's own 2026-09-10 amendment drops the id from `collapsed_row_spans`
+    (the recycled-id reasoning there applies verbatim here, since this row
+    calls that same function) — the format is marker + glyph + name +
+    `{adapter} · {state word}`, with `App::chrome_name` (not the id)
+    disambiguating same-name panes within a tab's group. Roster group rows
+    already scope by tab, so `chrome_name`'s own per-tab collision scope
+    matches this list's own grouping with no extra plumbing.
   - **A pane that has never been spawned reads "not started", never
     "exited".** [Amended 2026-07-28, supervisor D1] The roster is the only
     surface that lists panes outside the active tab, and `spawn_active_tab`
@@ -3387,10 +3510,15 @@ you.**
 **Scope: jump is the only action in v1.** No close, no send, no broadcast,
 no rename. Rationale, recorded so a later change is a deliberate decision
 rather than a drift: those would turn a navigator into a control panel,
-duplicate keys the panes already answer to, and `roost send <id>` (with the
-id the roster puts in front of you) already covers scripted dispatch —
-the CLI is also where the fat-finger-unsafe verbs deliberately live (§7's
-"no TUI broadcast key"). Adding an action here means re-arguing that split.
+duplicate keys the panes already answer to, and `roost send <id>` already
+covers scripted dispatch — the CLI is also where the fat-finger-unsafe verbs
+deliberately live (§7's "no TUI broadcast key"). Adding an action here means
+re-arguing that split. **[Amended 2026-09-10, review pass]** "The id the
+roster puts in front of you" is dated — C27's pane rows dropped the id with
+C8's (they share `collapsed_row_spans`). The id is still one of the three
+fields type-ahead matches (below), so `roost send <id>` stays reachable by
+typing it, just not printed on the row; the feed, host title and C43's
+glyph-tier rail are where a row still shows it plainly.
 
 **Unit tests (the executable form of this contract):** ring-order opening
 cursor and the `Alt+a` equivalence · row grouping incl. the float's own group
@@ -3401,8 +3529,9 @@ tab bar's own `Unknown` glyph rather than `exited`
 Backspace widening and header collapse · `Enter` through the shared helper
 across tabs · stale-cursor flash · entry-chord and `Esc` toggling closed ·
 window follow/clamp · mouse row-click jump, header-click no-op, outside-click
-dismiss, wheel-moves-cursor · the drawn overlay (headers underlined, C8 rows,
-both marks, live query). Plus the PTY e2e `tests/roster_overlay.rs`: the
+dismiss, wheel-moves-cursor · the drawn overlay (headers ruled — C6's `─`
+idiom, amended 2026-09-10, was underlined — C8 rows, both marks, live
+query). Plus the PTY e2e `tests/roster_overlay.rs`: the
 roster lists a **non-active** tab's panes and jumps across to one, with
 `roost list` as ground truth — that cross-tab case is the whole point of the
 feature, so it gets a real terminal.
@@ -4372,7 +4501,7 @@ Every px-only construct in the mockup, and its cell-level fate:
 | ~18px horizontal tab padding (`:628`) | ~1 gutter cell per separator (C2, amended 2026-07-23) — the translatable half of the mockup's tab padding. |
 | letterspacing (0.02–0.11em) | **dropped** — no letterspacing in a cell grid; spacing out characters by hand is a gimmick that breaks widths. |
 | tab strip `border-bottom` / hint bar `border-top` (1px rules) | **dropped** — no spare rows. [Amended 2026-07-27] the `TAB_STRIP`/`BAR` bg steps that used to carry the separation are gone too (§2 background policy): the bars are set off by the ink weight of what is on them, and the panes' own top/bottom borders are the rules that survive. |
-| stack header `border-bottom` (`:659`) | `Modifier::UNDERLINED` across the header row (C6) — the one place a rule translates to an attribute instead of a row. |
+| stack header `border-bottom` (`:659`) | a literal `─` rule, edge to edge with a gap punched in for each label (C6's `section_header_text`, shared with C15/C27/C43). [Amended 2026-09-10, review pass] Was `Modifier::UNDERLINED` across the header row — "the one place a rule translates to an attribute instead of a row" is no longer true anywhere in chrome; see C6's own amendment for why. |
 | `tui-pulse` opacity animation (1 → 0.28) | [Amended 2026-08-07, C5] a ten-frame braille spinner cycling in the glyph's own steady colour (`accent()`), not an opacity or colour flip — an opacity dip has no theme-safe cell equivalent, and a two-colour flip (the 2026-07-27 ANSI 9 ↔ ANSI 1 answer this row used to give) reads as "wants attention" rather than "busy"; a shape change carries "busy" without touching colour at all. |
 | `tui-blink` block cursor (`:673`) | out of scope — the real cursor belongs to the inner program; roost already positions the hardware cursor (`render.rs:355–362`). |
 | emulator chrome row (traffic lights, `:617–624`) | out of scope — OS terminal window chrome. |
@@ -6139,13 +6268,86 @@ sheds first when both don't fit (C8's right-to-left rule) — the labelled
 tier's own floor (20 cols) is already too narrow for `" SOLO · N PANES"`
 (15) plus `"ALT+↑↓ "` (7) at once, so a header that showed both
 unconditionally would mangle into `PANESALT+↑` rather than degrade
-cleanly. Rows below are `pane_order()`, recomputed every frame like the
-roster — renames, status flips and closes show up live. `layout::rail_width`,
-`layout::solo_rects` and `layout::rail_visible_rows` (how many rows are
-drawn before the `…` overflow marker takes the last slot) are pure and
-unit-tested; `App::rail_area`/`App::rail_rows`/`App::solo_shown` (the pane
-actually shown — not bare `self.focused`, which the float owns while
-shown) are the seam render, mouse and PTY-resize all read.
+cleanly. **[Amended 2026-09-10, review pass]** That shedding carries the
+same one-column floor C8 gained (`SEGMENT_GAP_COLS`, its own amendment): an
+exact fit still ran the two segments together with no gap at all (`
+SOLO · 6 PANESALT+↑↓` at a 22-column rail, seen live at 110 columns), so
+the right segment now sheds one column earlier instead. Rows below are
+`pane_order()`, recomputed every frame like the roster — renames, status
+flips and closes show up live. `layout::rail_width`, `layout::solo_rects`
+and `layout::rail_window` (below) are pure and unit-tested;
+`App::rail_area`/`App::rail_rows`/`App::solo_shown` (the pane actually
+shown — not bare `self.focused`, which the float owns while shown) are the
+seam render, mouse and PTY-resize all read.
+
+**[Amended 2026-09-10, review pass — the id leaves the labelled tier.]** The
+labelled tier's row above (`▎ marker · glyph · id · name · fill · adapter ·
+word`) is C8's own row, reused verbatim through `collapsed_row_spans` — so
+C8's 2026-09-10 id removal applies here too: `id ·` is gone, and
+`App::chrome_name` (not the id) breaks a same-name tie within this tab's
+`pane_order()`. **The glyph tier keeps its id** (`rail_glyph_row_spans`, a
+separate function): at 40–99 cols no name fits beside the marker and glyph,
+and the id is this tier's one piece of text — deliberately the id-first
+surface `roost send <id>` stays discoverable from.
+
+**[Amended 2026-09-10, review pass]** "C6's underline" above is dated: the
+header row is now C6's `─` rule (`section_header_text`, shared across
+C6/C15/C27/C43 — see C6's own amendment for the rationale), not a
+`Modifier::UNDERLINED` fill. The shedding threshold moved with the shape:
+the fixed cost beside the rule is `"SOLO · N PANES"` (14 cols, trimmed)
+plus `"ALT+↑↓"` (6) plus the rule's own six punctuation columns and
+one-column floor, 27 — one column short of that (including an exact
+26-column fit) still sheds the right segment whole, not the old 20-vs-22
+arithmetic. The glyph tier's header changed shape too: below
+`RAIL_GLYPH_COLS` there is no room for a label beside a rule at all, so
+`rail_header_text` special-cases it — the word sits centred *in* the rule
+instead of beside it, `─SOLO─`, the one place this contract's header does
+not go through `section_header_text` unmodified.
+
+**[Amended 2026-09-10, review pass — the rail windows instead of freezing
+at row 0.]** `layout::rail_window(rail_height, n, shown)` returns the drawn
+slice (`top`, `len`) plus `more_above`/`more_below`; the window follows the
+shown row so the `▎` marker is never off screen, and an `…` is drawn at
+whichever end still has rows behind it — never a bottom marker standing in
+for rows that are above, the old draw's own failure. A marker costs a row,
+so below three body rows there are no markers at all and the row budget
+goes to panes instead; the header's `N PANES` count is what says rows are
+missing there. Reason for the change: with the old first-N-rows draw,
+stepping focus past the fold left the rail with no `▎` anywhere while
+`Alt+↑/↓` kept moving among rows nobody could see — contradicting this
+contract's own "shown ≡ focused" line above. Wheel-over-rail is still
+ignored and drag-to-reorder is still deferred (below); only the frozen
+window is gone.
+
+**[Amended 2026-09-10, review pass — breathing room.]** The rail's rows now
+pick one of three regimes by height, through `layout::rail_layout(rail_height,
+n, shown)`, which wraps `rail_window` above rather than replacing it:
+**spaced** — a blank row under the header and one above every pane row, rows
+landing at `rail.y + 2 + 2*i` (the last at `rail.y + 2*n`, which is exactly
+why `1 + 2*n <= rail_height` is the fit test) — when every row still fits
+that way; **contiguous** — the layout described above, rows at
+`rail.y + 1 + i` — when spacing doesn't fit but every row still does;
+**windowed** — `rail_window`'s own behaviour above, `…` markers included —
+when rows don't fit contiguously either. By construction the spaced regime
+never overflows, so it draws no `…` markers. Spacing is comfort, not
+information, so it is the first thing to give up when rows get scarce — the
+same call C6's stack header makes (drawn only when the stack is tall enough
+to spare the row) and C8's boxed collapsed rows make (boxed only when there
+is height for the box); a rail that spaced itself unconditionally would push
+panes off screen to buy air, which inverts that priority. The pitch is a
+property of the rail, not of the tier — the labelled tier and the glyph tier
+space alike, since a tier decides a row's *content*, not its spacing.
+`rail_layout` is the single seam `draw_rail` and `mouse::rail_row_at` both
+read, so drawing and hit-testing cannot disagree about the pitch.
+**[Amended 2026-09-10, review pass — a gap row is not dead.]** The claim
+above — a blank gap row hits nothing, like the header — is reversed: in a
+list, a row's padding belongs to the row, and a spaced rail that left half
+its clickable area dead read as broken. Each gap now resolves to the pane
+row it pads: the gap at `rail.y + 1 + 2*i` and the pane row at `rail.y + 2 +
+2*i` both floor-divide to row `i` (`(slot − 1) / 2`, `slot = row − rail.y`),
+so a click on either lands the same focus change. In the spaced regime only
+the header (`slot == 0`) hits nothing now; the contiguous and windowed
+regimes are unchanged — they have no gap rows to reinterpret.
 
 **Keys inside a solo tab.** Every chord keeps its `Action`; only dispatch
 is solo-aware:
@@ -6154,10 +6356,10 @@ is solo-aware:
 |---|---|
 | `Alt+↑/↓` | Step the rail (`pane_order()`), clamped silently at the ends — C31's dead end, not a refusal |
 | `Alt+←/→` | Cross tabs unconditionally, on the first press — solo has no tiled geometry left for `neighbor` to consult |
-| `Alt+Shift+↑/↓` | Reorder: swap the shown pane with its rail order-neighbour (`layout::swap_panes`), persisted — the same swap `Alt+Shift+hjkl` does in tiled |
+| `Alt+Shift+↑/↓` | Reorder: swap the shown pane with its rail order-neighbour (`layout::swap_panes`), persisted — the same swap `Alt+Shift+hjkl` does in tiled. **[Amended 2026-09-10, review pass]** Refused with a flash at either end of the rail (*"nothing above/below to swap with"*, C38) — unlike `Alt+↑/↓` above, which clamps silently there |
 | `Alt+Shift+←/→` | Refused: *"solo view — {Alt+i chord} / {Alt+Shift+i chord} moves a pane between tabs"* |
 | `Alt+s`, `Alt+Shift+s`, `Alt+o`, the resize keys | Refused: *"solo view — {toggle chord} tiles this tab"* — shape verbs would act invisibly on a tree the user cannot see |
-| `Alt+g`/`Alt+Shift+g` | **[Amended 2026-09-10]** Not refused — solo is the cycle's own fourth stop (C25). Tiles the tab into the next/previous canned arrangement that fits; refused only when none of the three tiled shapes fit either, with the same wording the `Alt+Shift+t` row below uses |
+| `Alt+g`/`Alt+Shift+g` | **[Amended 2026-09-10]** Not refused — solo is the cycle's own fourth stop (C25). Tiles the tab into the next/previous canned arrangement that fits; refused only when none of the three tiled shapes fit either. **[Amended 2026-09-10, review pass]** Two wordings, not one, matched to how badly the tree doesn't fit: *"no room to rearrange — {Alt+Shift+t chord} tiles this tab"* when the tree is drawable but clears none of the three canned shapes' floor, else the `Alt+Shift+t` row's own `can't tile {n} panes at {w}×{h}` wording when it genuinely isn't drawable — see C25's dated amendment |
 | `Alt+w` | Closes; focus lands on the rail's next row below, else the one above — the tab-strip's own idiom, not U11's remembered-pane fallback |
 | `Alt+z` | Zoom composes on top, unchanged: hides the rail for the full body (`ZOOM · n hidden`); `Alt+z` again brings the rail straight back |
 | `Alt+Shift+t` | Back to tiled — tree byte-identical, focus unchanged. Refused when the tiled tree isn't drawable at the current size: *"can't tile {n} panes at {w}×{h} — close some, or widen the terminal"* |
@@ -6181,37 +6383,88 @@ counter untouched. See C25's dated amendment for the arithmetic.
 **Mouse.** A left press on a rail row → `on_click` (focus, therefore
 shown) — the tab strip's and roster's own click-to-focus rule. The header
 row and the `…` overflow marker belong to no pane; a click there hits
-nothing. Wheel over the rail is consumed and does nothing (v1 never
-scrolls the rail — deferred list, below).
+nothing. Wheel over the rail is consumed and does nothing (there is no
+separate scroll position for it to move — the window tracks the shown row;
+deferred list, below).
 
 **Chrome.** `SOLO` takes C9's word slot, precedence `RAW > ZOOM > SOLO >
-NORMAL`; `tab_status_word` (U15) mirrors it. The Normal+solo hint bar
-swaps the tiled shape-verb pairs for the rail's own six: `Alt+? keys ·
-Alt+↑↓ pane · Alt+←→ tab · Alt+n new · Alt+w close · Alt+Shift+t tile` —
-inside the 100-column floor beside the right segment. Help overlay: one
-row in the LAYOUT group, beside `Alt+z`/`Alt+Shift+z`. The shown pane's
-border is ordinary C3/C4 chrome (focused `accent()`, the C4 identity
-badge) — no `SOLO` marking on it; the border's title slot stays zoom's.
+NORMAL` (C9's own amendment records the slot); `tab_status_word` (U15)
+mirrors it. The Normal+solo hint bar swaps the tiled shape-verb pairs for
+the rail's own six: `Alt+? keys · Alt+Shift+t tile · Alt+↑↓ pane ·
+Alt+←→ tab · Alt+n new · Alt+w close` — inside the 100-column floor beside
+the right segment; C40's `Alt+Shift+v pull marked pane` pair leads ahead of
+all six while a mark is pending, the same standing-pull rule the tiled bar
+carries. **[Amended 2026-09-10, review pass]** `tile` moved from
+last to second, and the pull pair now shows in solo at all: pairs drop
+whole from the right, and at the glyph tier (40–99 cols) the rail draws no
+words at all, so a trailing `tile` was the first pair to go exactly where
+it named the only way out of a *persisted* view; the pull pair had been
+dropped from solo outright, though `PullPane` itself still worked there.
+Help overlay: one row in the LAYOUT group, beside `Alt+z`/`Alt+Shift+z`.
+The shown pane's border is ordinary C3/C4 chrome (focused `accent()`, the
+C4 identity badge) — no `SOLO` marking on it; the border's title slot
+stays zoom's.
 
 **Persistence and control plane.** Saved on toggle and on reorder like any
 other mutation (`apply`'s own tail); a solo tab comes back solo, with its
 remembered focus, on launch. `roost list` / `roost status` are unchanged;
 no control-plane verb toggles the view, same as zoom.
 
-**Deferred (v1) — say so rather than pretend otherwise.** Rail overflow
-scrolling: v1 draws `…` on the last rail row when rows don't fit, and
-never scrolls to reveal the rest. Wheel over the rail is ignored outright,
-not routed to a scroll that doesn't exist yet. `Alt+n` in solo keeps
-today's `split_fit` comfort-floor refusal rather than a solo-aware one — it
-reads the *tiled* rect and may refuse where the screen looks empty; that
-is a known, accepted rough edge, not an oversight. Drag-to-reorder is
-skipped (`Alt+Shift+↑/↓` already covers the move).
+**[Amended 2026-09-10, review pass — the "remembered focus" half made
+honest.]** The paragraph above named the claim before there was a field
+behind it: `Tab` carried `view` but nothing recorded which pane was
+focused, so `App::new` always landed a reopened tab (solo or tiled) on
+`first_visible()` — a relaunch could show a *different* pane than the one
+left on. `Tab.focus: Option<PaneId>` fixes this, for tiled tabs as much as
+solo ones; C43 is where it is documented because the failing case that
+found it was solo, not because the field is solo-specific.
+`#[serde(default, skip_serializing_if = "Option::is_none")]` — the exact
+pattern `view` uses above — so a tab that has never been focused, and every
+`workspace.json` a pre-this-field roost ever wrote, round-trips with no
+`focus` key at all. Stamped in `App::save`, immediately before
+`self.store.save`: the active tab's value is `solo_shown()` (the same
+membership-and-float resolution the rail's `▎` marker reads, so what's
+saved is what was on screen, float included — `focus` never names the
+float, which belongs to no tab), and every other tab's value is
+`tab_focus_target`, U11's in-memory per-tab record. Either can come back
+with no honest answer — a tab never visited, or whose remembered pane has
+since closed — and `focus` is cleared to `None` then, not left stale.
+Restored in `App::new`: the active tab's `focus` is trusted only when it
+names a pane the tab actually contains, else the fallback is today's
+`first_visible()` unchanged; every tab's saved `focus` also reseeds
+`tab_focus` so a switch to another tab after launch lands on *its*
+remembered pane too, not its first. Landed through `set_focus`, the single
+writer, same as every other focus move — its `expand_in_stacks` is what
+lets a remembered pane that's a collapsed stack member come back expanded
+rather than hidden. `validate_and_repair` drops a `focus` naming a pane the
+tab does not contain, the same boundary that already repairs a hand-edited
+or corrupted layout ↔ panes mismatch — a value like that must not reach
+`App::new`, which trusts it outright.
+
+**Deferred (v1) — say so rather than pretend otherwise.** **[Amended
+2026-09-10, review pass]** Rail overflow no longer defers scrolling: the
+first-N-rows draw described here at launch is gone, replaced by the
+windowing `layout::rail_window` above. What's still deferred: wheel over
+the rail is ignored outright, not routed to a scroll — there is no
+separate scroll position to route it to; the window already tracks the
+shown row. `Alt+n` in solo keeps today's `split_fit` comfort-floor refusal
+rather than a solo-aware one — it reads the *tiled* rect and may refuse
+where the screen looks empty; that is a known, accepted rough edge, not an
+oversight. Drag-to-reorder is skipped (`Alt+Shift+↑/↓` already covers the
+move).
 
 **Tests.** Model round trip:
 `a_tab_view_round_trips_and_older_workspaces_still_load` (`workspace.rs`).
 Geometry: `rail_width_steps_through_its_three_tiers`,
 `solo_rects_pane_keeps_at_least_80_columns_from_100_up`,
-`solo_rects_pane_sits_right_of_the_rail` (`layout.rs`). Dispatch (`app.rs`):
+`solo_rects_pane_sits_right_of_the_rail` (`layout.rs`). **[Amended
+2026-09-10, review pass]** Breathing room:
+`rail_layout_picks_the_cascade_regime_by_height_around_the_spacing_boundary`,
+`a_spaced_rail_layout_always_covers_every_row_with_no_markers`,
+`the_last_drawn_rail_row_never_overflows_the_rail` (`layout.rs`),
+`rail_row_at_a_spaced_rail_resolves_panes_and_treats_gaps_like_the_header`
+(`mouse.rs`), `a_spaced_rail_draws_rows_two_apart_with_a_blank_row_between`
+(`render.rs`). Dispatch (`app.rs`):
 `toggle_solo_twice_leaves_the_layout_untouched`, `solo_is_independent_per_tab`,
 `solo_focus_up_down_steps_the_rail_and_clamps_silently_at_the_ends`,
 `solo_focus_left_right_crosses_tabs_unconditionally`,
@@ -6228,6 +6481,17 @@ the pane border starting at the rail's width),
 (`mouse.rs`): `rail_row_at_maps_rows_to_ids_in_order` and its header/bounds
 siblings. Real terminal (`tests/solo_view.rs`):
 `alt_shift_t_toggles_solo_steps_the_rail_and_tiles_back_through_a_real_terminal`.
+**[Amended 2026-09-10, review pass]** `Tab.focus`, the remembered-focus
+half above: model round trip and repair, `workspace.rs`'s
+`a_tab_focus_round_trips_and_older_workspaces_still_load` and
+`validate_and_repair_clears_a_focus_naming_a_missing_pane`; restore on
+launch, `app.rs`'s
+`relaunching_an_app_from_a_saved_workspace_lands_on_the_remembered_pane_not_the_first`
+and `a_saved_focus_naming_a_closed_pane_falls_back_cleanly_on_relaunch`;
+end to end through a real terminal, `tests/solo_view.rs`'s
+`a_solo_tab_with_a_stepped_focus_survives_quit_and_relaunch_through_a_real_terminal`
+— steps the rail off its first row, quits, relaunches, and checks the `▎`
+comes back on the same row rather than snapping to the first.
 
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
@@ -6305,8 +6569,9 @@ shift-pair idiom row 5's `s`/`Shift+s` and row 8/9's `z`/`Shift+z` already
 carry, paired here with row 13's `Alt+t` (new tab); the unshifted free pool
 (§8's own dated notes above) is untouched. Two existing surfaces gain a
 solo-aware form rather than a third: C9's hint bar shows its own six-pair
-Normal+solo list in place of the tiled one (`Alt+? keys · Alt+↑↓ pane ·
-Alt+←→ tab · Alt+n new · Alt+w close · Alt+Shift+t tile`), and C21's zoom
+Normal+solo list in place of the tiled one (`Alt+? keys · Alt+Shift+t
+tile · Alt+↑↓ pane · Alt+←→ tab · Alt+n new · Alt+w close` — order per
+C43's 2026-09-10 review-pass amendment), and C21's zoom
 sits on top unchanged — row 8's `Alt+z` hides the rail for the full body,
 `Alt+z` again brings it back, no new interplay for either contract to
 teach. See C43 for the rail, the per-tab persisted view flag, and the
