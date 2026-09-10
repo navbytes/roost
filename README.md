@@ -267,7 +267,7 @@ row.
 
 ## Fleet features
 
-Ten keyboard-first additions for running more agents at once, plus one
+Eleven keyboard-first additions for running more agents at once, plus one
 CLI-only escape hatch — all Alt-only, same layer as everything above.
 
 - **Jump to attention (`Alt+a`).** Jumps to the next pane whose status is
@@ -308,6 +308,12 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   real. Honest scope: it's session-only, never written to `workspace.json`,
   and gone at quit like any other unsaved state — there's no persistent
   fourth pane type here, just an ephemeral one.
+- **Solo view (`Alt+Shift+t`).** One pane at a time, full width, with the
+  rest of the tab listed in a rail beside it — click a row, or `Alt+↑/↓`,
+  to switch what's shown; `Alt+Shift+↑/↓` reorders the rail. A pure view
+  transform like zoom, and persisted per tab (a solo tab comes back solo).
+  `Alt+Shift+t` again tiles it back — refused only if the tiled tree
+  wouldn't fit the current terminal.
 - **Raw pass-through (`Alt+Shift+p`).** Marks the focused pane raw: every
   key except the toggle itself — including every other `Alt` chord —
   forwards straight through as bytes, so an agent CLI with its own Alt

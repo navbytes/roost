@@ -36,6 +36,7 @@ these defaults.
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
 | `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
 | `Alt+z` / `Alt+Shift+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) / toggle the floating scratch shell — the two view toggles, on one physical key |
+| `Alt+Shift+t` | solo view: one pane at a time, the rest listed in a rail beside it (`Alt+Shift+t` again tiles the tab back) |
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
 | `Alt+;` | go back to the pane you came from — toggles, and follows across tabs (tmux's `prefix ;`) |
 | `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |

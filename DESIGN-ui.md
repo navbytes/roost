@@ -6073,6 +6073,110 @@ it at a real PTY and watches the header count up. The round trip is
 `a_stack_with_nothing_to_remember_explodes_to_the_even_horizontal_fallback`
 for all three ways to reach the fallback.
 
+### C43 — Solo view (`Alt+Shift+t`) — [Added 2026-09-10]
+
+One pane at a time, full attention, with the rest of the tab still one
+glance away — a second view a tab can be in alongside tiled, not a new
+`Mode`. Full rationale, the alternatives weighed, and the chord derivation
+live in `docs/engagements/2026-09-10-solo-view/PROPOSAL.md` §2–3; this
+entry is the condensed contract.
+
+**Model.** `Tab.view: TabView { Tiled, Solo }`, per-tab and persisted —
+`#[serde(default, skip_serializing_if = "TabView::is_tiled")]`, the exact
+additive pattern C42's `StackOrigin.from` used: a tiled tab (the common
+case) writes byte-identical JSON to before this field existed, a solo tab
+round-trips, an older `workspace.json` loads `Tiled`. Solo is a pure view
+transform — the layout tree is never touched by entering, leaving, or
+stepping; `rects()` (the real tree) still drives focus math and
+`spawn_child`'s split direction, unchanged. `display_rects()` in a solo tab
+yields `[float?, focused @ body-minus-rail]`; leaving solo shows the tree
+exactly as it was — the free round trip C42's ladder cannot offer, because
+nothing was ever collapsed. Shown ≡ focused: there is no second cursor, so
+every existing way of moving focus changes what's shown, through
+`set_focus` (the single writer, `expand_in_stacks` and all).
+
+**Geometry — the rail.** The rail is the leftmost columns of `body_area()`,
+full body height, no divider column (the shown pane's own left border is
+the rule, §2 background policy). Two tiers by body width: **labelled**
+(≥ 100 cols, `clamp(width/5, 20, 32)` columns, a full C8 row per pane —
+`▎` marker · glyph · id · name · fill · `adapter · word`) and **glyph**
+(40–99 cols, `RAIL_GLYPH_COLS = 6` columns, marker + glyph + id); below 40,
+no rail — the pane takes the body. Row 0 is the header (`" SOLO · N
+PANES"` labelled / `" SOLO"` glyph, C6's underline, belongs to no pane);
+rows below are `pane_order()`, recomputed every frame like the roster —
+renames, status flips and closes show up live. `layout::rail_width` and
+`layout::solo_rects` are pure and unit-tested; `App::rail_area`/
+`App::rail_rows` are the seam render, mouse and PTY-resize all read.
+
+**Keys inside a solo tab.** Every chord keeps its `Action`; only dispatch
+is solo-aware:
+
+| Chord | In solo |
+|---|---|
+| `Alt+↑/↓` | Step the rail (`pane_order()`), clamped silently at the ends — C31's dead end, not a refusal |
+| `Alt+←/→` | Cross tabs unconditionally, on the first press — solo has no tiled geometry left for `neighbor` to consult |
+| `Alt+Shift+↑/↓` | Reorder: swap the shown pane with its rail order-neighbour (`layout::swap_panes`), persisted — the same swap `Alt+Shift+hjkl` does in tiled |
+| `Alt+Shift+←/→` | Refused: *"solo view — {Alt+i chord} / {Alt+Shift+i chord} moves a pane between tabs"* |
+| `Alt+s`, `Alt+Shift+s`, `Alt+o`, the resize keys, `Alt+g`/`Alt+Shift+g` | Refused: *"solo view — {toggle chord} tiles this tab"* — shape verbs would act invisibly on a tree the user cannot see |
+| `Alt+w` | Closes; focus lands on the rail's next row below, else the one above — the tab-strip's own idiom, not U11's remembered-pane fallback |
+| `Alt+z` | Zoom composes on top, unchanged: hides the rail for the full body (`ZOOM · n hidden`); `Alt+z` again brings the rail straight back |
+| `Alt+Shift+t` | Back to tiled — tree byte-identical, focus unchanged. Refused when the tiled tree isn't drawable at the current size: *"can't tile {n} panes at {w}×{h} — close some, or widen the terminal"* |
+
+Membership (`Alt+n`, control-plane spawn, mark/pull, `Alt+i`/`Alt+Shift+i`)
+and everything not listed behave exactly as in tiled — rows simply appear
+or leave with the tree.
+
+**Mouse.** A left press on a rail row → `on_click` (focus, therefore
+shown) — the tab strip's and roster's own click-to-focus rule. The header
+row and the `…` overflow marker belong to no pane; a click there hits
+nothing. Wheel over the rail is consumed and does nothing (v1 never
+scrolls the rail — deferred list, below).
+
+**Chrome.** `SOLO` takes C9's word slot, precedence `RAW > ZOOM > SOLO >
+NORMAL`; `tab_status_word` (U15) mirrors it. The Normal+solo hint bar
+swaps the tiled shape-verb pairs for the rail's own six: `Alt+? keys ·
+Alt+↑↓ pane · Alt+←→ tab · Alt+n new · Alt+w close · Alt+Shift+t tile` —
+inside the 100-column floor beside the right segment. Help overlay: one
+row in the LAYOUT group, beside `Alt+z`/`Alt+Shift+z`. The shown pane's
+border is ordinary C3/C4 chrome (focused `accent()`, the C4 identity
+badge) — no `SOLO` marking on it; the border's title slot stays zoom's.
+
+**Persistence and control plane.** Saved on toggle and on reorder like any
+other mutation (`apply`'s own tail); a solo tab comes back solo, with its
+remembered focus, on launch. `roost list` / `roost status` are unchanged;
+no control-plane verb toggles the view, same as zoom.
+
+**Deferred (v1) — say so rather than pretend otherwise.** Rail overflow
+scrolling: v1 draws `…` on the last rail row when rows don't fit, and
+never scrolls to reveal the rest. Wheel over the rail is ignored outright,
+not routed to a scroll that doesn't exist yet. `Alt+n` in solo keeps
+today's `split_fit` comfort-floor refusal rather than a solo-aware one — it
+reads the *tiled* rect and may refuse where the screen looks empty; that
+is a known, accepted rough edge, not an oversight. Drag-to-reorder is
+skipped (`Alt+Shift+↑/↓` already covers the move).
+
+**Tests.** Model round trip:
+`a_tab_view_round_trips_and_older_workspaces_still_load` (`workspace.rs`).
+Geometry: `rail_width_steps_through_its_three_tiers`,
+`solo_rects_pane_keeps_at_least_80_columns_from_100_up`,
+`solo_rects_pane_sits_right_of_the_rail` (`layout.rs`). Dispatch (`app.rs`):
+`toggle_solo_twice_leaves_the_layout_untouched`, `solo_is_independent_per_tab`,
+`solo_focus_up_down_steps_the_rail_and_clamps_silently_at_the_ends`,
+`solo_focus_left_right_crosses_tabs_unconditionally`,
+`solo_move_pane_up_down_swaps_the_rail_order_and_persists`,
+`solo_refuses_the_shape_verbs_and_cross_tab_move_leaving_the_tree_untouched`,
+`solo_close_lands_on_the_next_row_below_then_the_one_above`,
+`zoom_hides_the_rail_and_leaving_it_restores_the_rail`,
+`leaving_solo_refuses_when_the_tiled_tree_would_not_be_drawable`; the
+invariant fuzzer's pool includes `ToggleSolo`. Chrome (`render.rs`): the
+`chrome_buffers()` "solo view" fixture (header text, the focused row's `▎`,
+the pane border starting at the rail's width),
+`mode_word_solo_sits_between_zoom_and_normal`,
+`hint_pairs_solo_mode_is_the_six_c43_pairs_and_fits_the_floor`. Mouse
+(`mouse.rs`): `rail_row_at_maps_rows_to_ids_in_order` and its header/bounds
+siblings. Real terminal (`tests/solo_view.rs`):
+`alt_shift_t_toggles_solo_steps_the_rail_and_tiles_back_through_a_real_terminal`.
+
 ## 8. Key table — [Added 2026-07-22, fleet features]
 
 The one canonical list. The help overlay (C15) renders every chord here —
@@ -6141,6 +6245,20 @@ use on macOS, where the unshifted arm was claiming the event first and row
 20 silently did row 19's job.
 | 21 | `Alt+q` | quit (workspace saved; sessions live) | — |
 | 22 | `Alt+'` | **broadcast: type once, send to every pane (`Tab` picks who)** | C36 |
+| 23 | `Alt+Shift+t` | solo view: one pane at a time, the rest listed beside it | C43 |
+
+[Amended 2026-09-10, C43 — solo view. Row 23 adds `Alt+Shift+t`, spending a
+shifted sibling of an already-bound unshifted chord — the same-letter
+shift-pair idiom row 5's `s`/`Shift+s` and row 8/9's `z`/`Shift+z` already
+carry, paired here with row 13's `Alt+t` (new tab); the unshifted free pool
+(§8's own dated notes above) is untouched. Two existing surfaces gain a
+solo-aware form rather than a third: C9's hint bar shows its own six-pair
+Normal+solo list in place of the tiled one (`Alt+? keys · Alt+↑↓ pane ·
+Alt+←→ tab · Alt+n new · Alt+w close · Alt+Shift+t tile`), and C21's zoom
+sits on top unchanged — row 8's `Alt+z` hides the rail for the full body,
+`Alt+z` again brings it back, no new interplay for either contract to
+teach. See C43 for the rail, the per-tab persisted view flag, and the
+refusal wording.]
 
 [Amended 2026-09-03, the Alt+f re-key. Row 9 moves from `Alt+f` to
 `Alt+Shift+z`, paired with row 8's `Alt+z` as the same-letter shift-pair
