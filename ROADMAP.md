@@ -312,6 +312,30 @@ Left:
   arithmetic computed live):
   https://claude.ai/code/artifact/b048130b-8f0a-4b47-a3c6-afca00888491
 
+- **[proposed] Solo view — one pane at a time, the tab's panes listed
+  beside it.** Researched 2026-09-10 at the client's request; not built.
+  A per-tab, **persisted** view (`Tab.view: Tiled | Solo`, additive
+  serde) that is a pure view transform like C21's zoom — the tree is never
+  touched, so leaving it restores the tiled layout byte for byte — plus a
+  left rail of C8 rows (marker · glyph · id · name · state word) in
+  `pane_order`, headed `SOLO · n PANES` in C6's idiom. `Alt+↑↓` step the
+  rail, `Alt+←→` cross tabs on the first press (C31 falls out unchanged),
+  `Alt+Shift+↑↓` reorder, shape verbs refuse and name the way out, zoom
+  composes on top by hiding the rail. Two tiers: labelled
+  `clamp(width/5, 20, 32)` columns from 100 wide, a 6-column glyph column
+  down to 40. The 2026-07-28 tribunal's 80-column arithmetic does not
+  apply — there is one pane on screen, so no split to fit — and this is
+  **not** the parked fleet rail below: that one is workspace-wide and
+  always on; this one lists the *current tab* and exists only while the
+  tab is solo. Proposed chord `Alt+Shift+t` (the `t`/`Shift+t` pair:
+  `Alt+t` adds a tab to the strip, `Alt+Shift+t` gives this tab a strip of
+  its own); `Alt+Shift+o` is rejected on the record (`ESC O` is the SS3
+  introducer). Full proposal, rejected alternatives and the test list:
+  `docs/engagements/2026-09-10-solo-view/PROPOSAL.md`. Cell-accurate
+  mockups at 80/110/160 columns, with the tier arithmetic computed live and
+  the same tab rendered as an all-stack for comparison:
+  https://claude.ai/code/artifact/fde4524e-d158-40b2-ac86-618e10f63a7e
+
 - **[choice] Dead-pane `Enter` retry.** Relaunching a dead pane re-runs the same
   resume command even if it just failed permanently; could distinguish transient
   vs permanent failure. Rare now that pi/claude ids are reliable.
