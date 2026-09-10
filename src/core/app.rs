@@ -4197,6 +4197,16 @@ impl<B: PaneBackend> App<B> {
         // design audit, which probed the row instead of reading it. Zoom is
         // still left, from inside `move_pane_dir` — under zoom `rects()`
         // yields only the zoomed pane, so `neighbor` must run after.
+        //
+        // **[Amended 2026-09-10, C43 review]** `CycleLayout` is skipped here
+        // when the tab is already solo: unlike the other structural verbs it
+        // can now refuse (nothing tiled fits, or `n < 2`) *inside* solo, and
+        // a refusal must touch nothing — not even an unrelated zoom or the
+        // float. `cycle_layout` itself runs this pair right before it
+        // actually commits to a tiled arrangement, so a press that succeeds
+        // still exits zoom first; one that lands on solo already gets it
+        // for free from `enter_solo`. A tiled tab's `CycleLayout` is
+        // unaffected — this only narrows the already-solo case.
         if matches!(
             action,
             Action::NewPane
@@ -4204,8 +4214,8 @@ impl<B: PaneBackend> App<B> {
                 | Action::ExplodeStack
                 | Action::FlipSplit
                 | Action::Resize { .. }
-                | Action::CycleLayout { .. }
-        ) {
+        ) || (matches!(action, Action::CycleLayout { .. }) && !self.solo())
+        {
             self.exit_zoom();
             self.hide_float();
         }
@@ -5743,16 +5753,37 @@ impl<B: PaneBackend> App<B> {
     /// stop, after all-stack: `grid → main+stack → all-stack → solo → grid`
     /// going forward, so stepping back from grid wraps to solo. Landing on
     /// the solo stop only sets `tab.view` — `tab.layout` is untouched
-    /// (`enter_solo`, shared with `toggle_solo`'s own entry). Solo always
-    /// fits (one pane on screen needs no floor check), so an unfit tiled
-    /// tab now lands on solo rather than refusing — the old "no room to
-    /// rearrange" flash is unreachable from a tiled start for exactly that
-    /// reason. The one dead end left is stepping *out* of solo (forward to
-    /// grid, backward to all-stack) when none of the three tiled shapes fit
-    /// either: refused with `cant_tile_flash`, `toggle_solo`'s own exit
-    /// wording, so there is one message for "can't tile" however it's
-    /// reached. `n < 2` still refuses unconditionally, before any of this —
-    /// a one-pane tab reaches solo only via `Alt+Shift+t`.
+    /// (`enter_solo`, shared with `toggle_solo`'s own entry, which also
+    /// takes care of leaving zoom and hiding the float on that arm). Solo
+    /// always fits (one pane on screen needs no floor check), so an unfit
+    /// tiled tab now lands on solo rather than refusing. Stepping *out* of
+    /// solo (forward to grid, backward to all-stack) leaves zoom and hides
+    /// the float itself, right here, rather than relying on `apply`'s
+    /// structural guard — that guard now skips `CycleLayout` while solo
+    /// precisely so a *refusal* touches neither (below). `n < 2` still
+    /// refuses unconditionally, before any of this — a one-pane tab reaches
+    /// solo only via `Alt+Shift+t`.
+    ///
+    /// **[Amended 2026-09-10, review]** `layout_cycle` is one counter
+    /// shared by every tab, while `view` is per-tab, so a press here can
+    /// meet the solo index purely by coincidence — solo'd on tab A at
+    /// `lc=0`, three presses on tab B leave `lc=3`, and back on A the very
+    /// first candidate (`idx=3`) is the ring's solo slot again. That is not
+    /// "nothing tiled fits"; it means try the next candidate, so this arm
+    /// `continue`s rather than aborting the search — the solo-entry arm
+    /// just above still only ever fires when `!was_solo`, so it can never
+    /// silently re-land on solo, and the dead end below still only fires
+    /// once every candidate, including this one, has been ruled out.
+    ///
+    /// The dead end itself now has two wordings, not one: this loop's fit
+    /// test is `arrangement_fits`, the same strict per-pane floor the other
+    /// three stops use, but `toggle_solo`'s own exit guard is the more
+    /// lenient `every_pane_is_drawable` (every pane gets *some* rect, not
+    /// one meeting the comfort floor). Borrowing `cant_tile_flash`
+    /// unconditionally would claim "can't tile" in cases `Alt+Shift+t`
+    /// tiles instantly — so it's used only when the tree genuinely isn't
+    /// drawable; the milder failure (drawable, but none of the three canned
+    /// shapes clear the floor) gets C25's own pre-solo wording back.
     fn cycle_layout(&mut self, forward: bool) {
         let order = self.pane_order();
         if order.len() < 2 {
@@ -5767,9 +5798,10 @@ impl<B: PaneBackend> App<B> {
             let idx = (self.layout_cycle as isize + offset).rem_euclid(LAYOUT_CYCLE_LEN) as usize;
             if idx == SOLO_CYCLE_STOP {
                 if was_solo {
-                    // Already here, and nothing tiled fit either — say so
-                    // below rather than silently re-landing on solo.
-                    break;
+                    // Already here (or the shared counter just happens to
+                    // land here from another tab's cycling) — not a fit,
+                    // not a refusal on its own; try the next candidate.
+                    continue;
                 }
                 self.enter_solo();
                 self.layout_cycle = (idx + 1) % LAYOUT_CYCLE_LEN as usize;
@@ -5777,6 +5809,18 @@ impl<B: PaneBackend> App<B> {
             }
             let node = arrangement_for(idx, &order, focused);
             if layout::arrangement_fits(&node, area) {
+                // Stepping out of solo tiles the tab — leave zoom and hide
+                // the float ourselves (`apply`'s guard skipped both while
+                // solo, see its own dated amendment) so a refusal above
+                // never touches either. `hide_float` can move `self.focused`
+                // (back to `prev_focus`, off the float it was borrowing) —
+                // `arrangement_for` cares which real pane is focused, so the
+                // node built against the pre-hide value must be rebuilt
+                // against the corrected one rather than committed stale.
+                self.exit_zoom();
+                self.hide_float();
+                let focused = self.focused;
+                let node = arrangement_for(idx, &order, focused);
                 self.ws.active_tab_mut().layout = node;
                 self.ws.active_tab_mut().view = TabView::Tiled;
                 self.layout_cycle = (idx + 1) % LAYOUT_CYCLE_LEN as usize;
@@ -5786,7 +5830,13 @@ impl<B: PaneBackend> App<B> {
         // Only reachable when `was_solo`: solo always fits, so a tiled
         // start always finds a stop somewhere in the ring; the sole
         // survivor is failing to tile on the way out of solo.
-        self.set_flash(self.cant_tile_flash());
+        if layout::every_pane_is_drawable(&self.ws.active_tab().layout, area) {
+            let hint =
+                self.chord_clause(Action::StackPane, |c| format!("; stack a pane with {c} first"));
+            self.set_flash(format!("no room to rearrange{hint}"));
+        } else {
+            self.set_flash(self.cant_tile_flash());
+        }
     }
 
     /// Alt+e: open the C20 activity feed at the live tail, or close it if
@@ -18943,11 +18993,46 @@ pub(crate) mod tests {
     /// somewhere half-tiled.
     #[test]
     fn cycle_layout_in_solo_flashes_cant_tile_when_nothing_fits_and_stays_solo() {
+        // Two ways "nothing tiled fits" can happen, worded differently
+        // (review, 2026-09-10): the tree can still be perfectly drawable —
+        // just none of the three *canned* shapes clear the comfort floor —
+        // or it can be genuinely undrawable, the harsher failure
+        // `toggle_solo`'s own exit guard refuses. Borrowing that guard's
+        // wording for the milder case would claim "can't tile" where
+        // `Alt+Shift+t` would in fact tile instantly.
+
+        // Milder case: 3 panes, a small but still-drawable body.
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         app.apply(Action::NewPane); // 3 panes
         app.apply(Action::ToggleSolo);
         app.on_resize(Size::new(30, 10), (0, 0)); // too small for any of the three tiled shapes
+        assert!(
+            layout::every_pane_is_drawable(&app.ws.tabs[0].layout, app.body_area()),
+            "fixture must actually still draw at this size"
+        );
+        let before = format!("{:?}", app.ws.tabs[0].layout);
+
+        app.apply(Action::CycleLayout { forward: true });
+        assert!(app.solo(), "nothing tiled fits; the tab stays solo");
+        assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
+        assert_eq!(
+            app.flash(),
+            Some("no room to rearrange; stack a pane with Alt+s first"),
+            "the tree still draws — this is C25's own pre-solo wording, not toggle_solo's"
+        );
+
+        // Harsher case: enough panes that a tiny body can't draw them all.
+        let (mut app, _) = mk_app(shell_ws());
+        for _ in 0..8 {
+            app.apply(Action::NewPane); // 9 panes
+        }
+        app.apply(Action::ToggleSolo);
+        app.on_resize(Size::new(6, 3), (0, 0));
+        assert!(
+            !layout::every_pane_is_drawable(&app.ws.tabs[0].layout, app.body_area()),
+            "fixture must actually be undrawable at this size"
+        );
         let before = format!("{:?}", app.ws.tabs[0].layout);
 
         app.apply(Action::CycleLayout { forward: true });
@@ -18955,7 +19040,7 @@ pub(crate) mod tests {
         assert_eq!(format!("{:?}", app.ws.tabs[0].layout), before, "layout must be untouched");
         assert!(
             app.flash().is_some_and(|m| m.contains("can't tile")),
-            "expected toggle_solo's own exit-guard wording: {:?}",
+            "the tree itself can't draw — expected toggle_solo's own exit-guard wording: {:?}",
             app.flash()
         );
     }
@@ -18977,6 +19062,71 @@ pub(crate) mod tests {
             matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }),
             "Alt+Shift+t then Alt+g goes to grid regardless of how solo was entered"
         );
+    }
+
+    /// **[Added 2026-09-10, review]** `layout_cycle` is one counter shared
+    /// across every tab; `view` (solo or tiled) is per-tab. Cycling on tab 1
+    /// can walk the shared counter onto the solo index by pure coincidence
+    /// while tab 0 sits there solo — that must read as "try the next
+    /// candidate", not "nothing fits", or a roomy tab 0 gets a false
+    /// refusal the moment focus returns to it.
+    #[test]
+    fn cycle_layout_a_coincidental_counter_collision_from_another_tab_still_finds_a_fit() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // tab 0: 3 panes
+        app.apply(Action::ToggleSolo);
+        assert!(app.solo(), "setup: tab 0 is solo");
+
+        app.apply(Action::NewTab); // tab 1, now active
+        app.apply(Action::NewPane); // tab 1: 2 panes
+        for _ in 0..3 {
+            // Advances the *shared* layout_cycle to exactly the solo index
+            // — tab 1 was never solo, so each of these three tiles it.
+            app.apply(Action::CycleLayout { forward: true });
+        }
+        assert!(!app.solo(), "setup: tab 1 was never solo");
+
+        app.apply(Action::PrevTab);
+        assert!(app.solo(), "tab 0 kept its own view across the round trip");
+
+        app.apply(Action::CycleLayout { forward: true });
+        assert!(!app.solo(), "the coincidental counter collision must not abort the search");
+        assert!(
+            matches!(app.ws.tabs[0].layout, LayoutNode::Split { dir: SplitDir::Horizontal, .. }),
+            "tab 0 tiles into grid, the candidate right past the coincidental solo index"
+        );
+    }
+
+    /// **[Added 2026-09-10, review]** `CycleLayout` can now refuse *inside*
+    /// solo (nothing tiled fits), and a refusal must touch nothing —
+    /// `apply`'s C21 structural guard skips leaving zoom/hiding the float
+    /// for `CycleLayout` while solo for exactly this reason; the exit
+    /// happens instead, unconditionally, right where `cycle_layout` commits
+    /// to an actual tiled arrangement — a spot a refusal never reaches.
+    #[test]
+    fn cycle_layout_refusal_in_solo_leaves_zoom_and_float_untouched() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // 3 panes
+        app.apply(Action::ToggleSolo);
+        app.apply(Action::ToggleZoom);
+        assert!(app.zoomed(), "setup: zoomed while solo");
+        app.apply(Action::ToggleFloat);
+        assert!(app.float.as_ref().is_some_and(|f| f.shown), "setup: float shown too");
+        assert!(app.zoomed(), "setup: showing the float must not itself exit zoom");
+
+        app.on_resize(Size::new(30, 10), (0, 0)); // too small for any of the three tiled shapes
+        app.apply(Action::CycleLayout { forward: true });
+
+        assert!(app.solo(), "the refusal must leave the tab in solo");
+        assert!(app.zoomed(), "a refused Alt+g must not exit an unrelated zoom");
+        assert!(
+            app.float.as_ref().is_some_and(|f| f.shown),
+            "nor hide an unrelated float: {:?}",
+            app.float.as_ref().map(|f| f.shown)
+        );
+        assert!(app.flash().is_some(), "the refusal must still say something");
     }
 
     // -- C26 tab-undo pinning ---------------------------------------------------
