@@ -48,11 +48,19 @@ pub fn draw<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>) {
     // C6: header row above each stack tall enough to spare one — a separate
     // walk over the same tree `app.rects()` reads, since the header isn't a
     // `PaneRect` (it belongs to no pane; §5). C21: stack headers are
-    // real-tree chrome, suppressed entirely while zoomed.
-    if !app.zoomed() {
+    // real-tree chrome, suppressed entirely while zoomed. C43: and while
+    // solo — the tree they'd describe isn't on screen either.
+    if !app.zoomed() && !app.solo() {
         for header in layout::stack_headers(&app.ws.active_tab().layout, body) {
             draw_stack_header(f, header);
         }
+    }
+    // C43: the rail — solo's list of the tab's other panes — drawn before
+    // the pane(s) below so its own border (none) never competes with the
+    // shown pane's. `None` while zoomed (zoom takes the whole body) or
+    // below the rail's own width floor.
+    if let Some(rail) = app.rail_area() {
+        draw_rail(f, app, rail, spinner);
     }
     // C21/C22/§5: the zoom-and-float-aware display list — every
     // render/PTY-resize/mouse-hit path shares this one accessor so none of
@@ -153,11 +161,13 @@ fn draw_too_small(f: &mut Frame<'_>, area: Rect) {
 /// that is not an oversight: config.json's grammar is Alt chords only
 /// (`Chord::parse` requires the `alt+` prefix), so those keys cannot be
 /// remapped and cannot go stale. Only what can move is derived.
+#[allow(clippy::too_many_arguments)]
 fn hint_pairs(
     mode: &Mode,
     focused_dead: bool,
     resumable: bool,
     focused_raw: bool,
+    solo: bool,
     help_scrolled: bool,
     marked: bool,
     keymap: &Keymap,
@@ -302,6 +312,44 @@ fn hint_pairs(
         Mode::Normal if focused_raw => {
             alt(&[Action::ToggleRaw], "Alt+Shift+p", "exit raw").into_iter().collect()
         }
+        // C43: solo's own six. `Up`/`Down` step the rail; `Left`/`Right`
+        // cross tabs — solo has no tiled geometry left for them to move
+        // focus around in. The shape verbs (`Alt+s` et al.) are refused in
+        // solo, so this list swaps `stack` for the toggle itself, the way
+        // out back to the tiled hints below.
+        Mode::Normal if solo => {
+            const FOCUS_UD: &[Action] = &[Action::Focus(Dir::Up), Action::Focus(Dir::Down)];
+            const FOCUS_LR: &[Action] = &[Action::Focus(Dir::Left), Action::Focus(Dir::Right)];
+            // C40's standing pull pair, leading, exactly as the tiled arm
+            // below carries it: `PullPane` is not among the verbs solo
+            // refuses, so dropping the pair only made a working gesture
+            // invisible — and a mark's pane is usually in another tab,
+            // which is the whole reason the pair exists.
+            let pull = if marked {
+                alt(&[Action::PullPane], "Alt+Shift+v", "pull marked pane")
+            } else {
+                None
+            };
+            [
+                pull,
+                alt(&[Action::Help], "Alt+?", "keys"),
+                // Second, not last: pairs drop whole from the right, and at
+                // the glyph tier (40-99 cols) the rail draws no words at
+                // all — so trailing `tile` was the first pair to go exactly
+                // where it is the only thing on screen naming the way out
+                // of a *persisted* view. C23's raw bar makes the same call
+                // for the same reason: the exit outranks everything but
+                // `Alt+? keys`.
+                alt(&[Action::ToggleSolo], "Alt+Shift+t", "tile"),
+                alt(FOCUS_UD, "Alt+↑↓", "pane"),
+                alt(FOCUS_LR, "Alt+←→", "tab"),
+                alt(&[Action::NewPane], "Alt+n", "new"),
+                alt(&[Action::ClosePane], "Alt+w", "close"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        }
         // Pairs drop whole from the right, so `Alt+? keys` leads (the way to
         // everything else once it's dropped) and `Alt+r rename` trails
         // (costs nothing when gone — still findable under Alt+?).
@@ -343,12 +391,15 @@ fn hint_pairs(
 }
 
 /// C9's right-segment uppercase mode word. A real non-Normal mode always
-/// wins; in Normal, `RAW` (C23) beats `ZOOM` (C21) beats `NORMAL` — input
-/// safety (knowing you're raw) trumps view state.
-fn mode_word(mode: &Mode, zoomed: bool, raw: bool) -> &'static str {
+/// wins; in Normal, `RAW` (C23) beats `ZOOM` (C21) beats `SOLO` (C43) beats
+/// `NORMAL` — input safety (knowing you're raw) trumps view state, and
+/// zoom (session-only, composes on top) outranks the persisted solo flag
+/// underneath it.
+fn mode_word(mode: &Mode, zoomed: bool, raw: bool, solo: bool) -> &'static str {
     match mode {
         Mode::Normal if raw => "RAW",
         Mode::Normal if zoomed => "ZOOM",
+        Mode::Normal if solo => "SOLO",
         Mode::Normal => "NORMAL",
         Mode::Rename { .. } => "RENAME",
         Mode::PaneEdit { .. } => "EDIT",
@@ -538,6 +589,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) {
         app.focused_dead(),
         resumable,
         focused_raw,
+        app.solo(),
         scrolled,
         app.marked().is_some(),
         app.keymap(),
@@ -560,7 +612,7 @@ fn draw_hint_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) {
         app.attention_segment(),
         query,
         position,
-        mode_word(&app.mode, app.zoomed(), focused_raw),
+        mode_word(&app.mode, app.zoomed(), focused_raw, app.solo()),
         input::chord_for(app.keymap(), Action::JumpAttention),
     );
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
@@ -1208,11 +1260,10 @@ fn draw_help_columns(
             .take(layout.height as usize)
             .map(|(row, line)| match line {
                 HelpLine::Head(title) => {
-                    let pad =
-                        (width as usize).saturating_sub(mouse::display_width(title) as usize + 1);
+                    // C15's group heads, same idiom, same one function.
                     Line::from(Span::styled(
-                        format!(" {title}{}", " ".repeat(pad)),
-                        theme::quiet().add_modifier(Modifier::UNDERLINED),
+                        section_header_text(width, title, None),
+                        theme::quiet(),
                     ))
                 }
                 // [C41] The cursor spends the key column's leading space
@@ -1396,7 +1447,9 @@ struct HelpGroup {
 /// *inside* roost; this one is the odd surface out — the reference block for
 /// `roost send`/`read`/`status`/`spawn`/`wait`, the control CLI an outside
 /// actor (an LLM, a script, another pane) drives the fleet with, keyed on
-/// the pane id every badge shows (U2). Rows are the verbs a caller reaches
+/// the pane id the activity feed shows (U2, amended: chrome surfaces that
+/// already show the pane's name dropped the id as redundant, but C20's feed
+/// still carries it as the join key). Rows are the verbs a caller reaches
 /// for, not a man page: the CLI's own `--help` covers `list`/`fork`/`close`
 /// and every flag. It sorts last for the same reason `READING THE SCREEN`
 /// does — it teaches the product rather than a binding.
@@ -1489,7 +1542,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             chords(&[Action::FlipSplit], "flip this split's orientation"),
             chords(
                 &[Action::CycleLayout { forward: true }],
-                "cycle layout: grid / main+stack / all-stack",
+                "cycle layout: grid / main+stack / all-stack / solo",
             ),
             // C37 sits directly under its own unshifted form, which is
             // C28's actual rule (the C33 audit drew the distinction: C28
@@ -1501,6 +1554,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             chords(&[Action::CycleLayout { forward: false }], "the same cycle, backwards"),
             chords(&[Action::ToggleZoom], "zoom the focused pane (view only)"),
             chords(&[Action::ToggleFloat], "floating scratch shell"),
+            chords(&[Action::ToggleSolo], "solo view: one pane at a time, the rest in a rail"),
         ],
     },
     HelpGroup {
@@ -1606,7 +1660,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "CONTROL CLI",
         rows: &[
-            reference("<id>", "same id shown on each pane's badge"),
+            reference("<id>", "same id shown in the feed"),
             reference("roost send <id> \"text\"", "type into that pane (--enter submits)"),
             reference("roost read <id>", "print its current screen"),
             reference("roost status", "list every pane and its status"),
@@ -1997,9 +2051,9 @@ fn draw_roster_rows<B: PaneBackend>(
 
 /// C27: one roster row's spans.
 ///
-/// A group header is C6's idiom — an uppercase label, `quiet()`, every cell
-/// of the row underlined (the text is padded to the full width so the rule
-/// runs edge to edge, exactly as `stack_header_text` does it).
+/// A group header is C6's idiom — an uppercase label, `quiet()`, drawn as a
+/// `─` rule beside it (`section_header_text`), the same as `stack_header_text`
+/// and `rail_header_text`.
 ///
 /// A pane row is `marker + C8's collapsed row`. The leading column is the
 /// cursor (`❯`, the picker/feed idiom) and the C8 row keeps its own `▎` for
@@ -2015,11 +2069,9 @@ fn roster_row_spans<B: PaneBackend>(
 ) -> Vec<Span<'static>> {
     match row {
         RosterRow::Group { label } => {
-            let pad = (width as usize).saturating_sub(mouse::display_width(label) as usize);
-            vec![Span::styled(
-                format!("{label}{}", " ".repeat(pad)),
-                theme::quiet().add_modifier(Modifier::UNDERLINED),
-            )]
+            // C27's group header wears the same rule idiom as C6/C43's, via
+            // the one function — it had the same cramped underline.
+            vec![Span::styled(section_header_text(width, label, None), theme::quiet())]
         }
         RosterRow::Pane { id } => {
             let id = *id;
@@ -2033,7 +2085,7 @@ fn roster_row_spans<B: PaneBackend>(
             let status = app.display_status(id);
             let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
             let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
-            let name = if spec.is_some() { app.display_name(id) } else { "?".into() };
+            let name = if spec.is_some() { app.chrome_name(id) } else { "?".into() };
             let marker = if id == cursor {
                 Span::styled(theme::PICKER_SELECTED.to_string(), theme::accent())
             } else {
@@ -2044,7 +2096,6 @@ fn roster_row_spans<B: PaneBackend>(
                 width.saturating_sub(1),
                 app.focused == id,
                 status,
-                id,
                 &name,
                 &adapter,
                 has_title,
@@ -2166,7 +2217,7 @@ pub fn tab_status_word<B: PaneBackend>(app: &App<B>) -> Option<&'static str> {
     if app.hints_shown() {
         return None; // C9's right segment already says it
     }
-    let word = mode_word(&app.mode, app.zoomed(), app.is_raw(app.focused));
+    let word = mode_word(&app.mode, app.zoomed(), app.is_raw(app.focused), app.solo());
     (word != "NORMAL").then_some(word)
 }
 
@@ -2374,17 +2425,20 @@ fn collapsed_name_style(status: Option<AgentStatus>, focused: bool) -> Style {
     }
 }
 
-/// C4 (amended, U2): the badge leads with the pane id — the join key for
-/// `roost send <id>`, which previously appeared nowhere in the TUI. No-dup
+/// C4 (amended, U2): the badge is the pane's display name, not its id — the
+/// id is recycled by `Workspace::next_pane_id` (max live id + 1), not
+/// monotonic, so it names an allocation slot, not the pane; where the name
+/// is already shown, the id is noise. The id still lives elsewhere as the
+/// join key for `roost send <id>` (C20's feed, the rail's glyph tier). No-dup
 /// rule: an untitled pane's display `name` (`display_name_live`) already
 /// embeds the adapter — so appending `· {adapter}` again would duplicate it
 /// ("pi · repo · pi"). Only a custom title needs the adapter spelled out
 /// separately.
-fn badge_text(id: layout::PaneId, name: &str, adapter: &str, has_title: bool) -> String {
+fn badge_text(name: &str, adapter: &str, has_title: bool) -> String {
     if has_title {
-        format!("{id} {name} · {adapter}")
+        format!("{name} · {adapter}")
     } else {
-        format!("{id} {name}")
+        name.to_string()
     }
 }
 
@@ -2473,14 +2527,13 @@ fn draw_pane<B: PaneBackend>(
         let status = app.display_status(pr.id).unwrap_or(AgentStatus::Exited);
         let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
         let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
-        // U2 (amended, P6): the shared display name — explicit title, else
-        // the pane's live OSC 0/2 title, else `adapter · cwd-tag`. One
-        // helper for every fleet surface, `App::display_name`, so the badge
-        // can never drift from what the feed/notifications/host title call
-        // the same pane. Untitled panes on the same adapter are otherwise
-        // indistinguishable at a glance; a pane publishing a live task line
-        // now says what it's doing.
-        let name = if spec.is_some() { app.display_name(pr.id) } else { "?".into() };
+        // U2 (amended, P6) + U2 reopened: `App::chrome_name` — `display_name`
+        // with an ` (N)` collision suffix added only when another pane in
+        // this tab would otherwise render the identical text. One helper
+        // for the badge, the collapsed row and the rail row alike, so a
+        // pane's own border can never disagree with its row about which
+        // suffix (if any) it carries.
+        let name = if spec.is_some() { app.chrome_name(pr.id) } else { "?".into() };
         // C32: the badge's note segment — headline + age on the focused
         // pane, a bare `¶` elsewhere; `¶⋮` marks a body under the
         // headline. Built here because only draw_pane knows focus.
@@ -2525,7 +2578,6 @@ fn draw_pane<B: PaneBackend>(
             row.width,
             focused,
             Some(status),
-            pr.id,
             &name,
             &adapter,
             has_title,
@@ -2573,7 +2625,7 @@ fn draw_pane<B: PaneBackend>(
     let glyph = badge_glyph(spins, app.scroll_offset(pr.id), spinner, base_glyph);
     if let Some(spans) = identity_title(
         top_budget,
-        &badge_text(pr.id, &name, &adapter, has_title),
+        &badge_text(&name, &adapter, has_title),
         raw,
         app.scroll_offset(pr.id),
         glyph,
@@ -2671,15 +2723,25 @@ fn dead_bar_text(resumable: bool, close_chord: Option<&str>) -> String {
 }
 
 /// C8: one collapsed stack row's spans for the given width — marker, status
-/// glyph, pane id, and name on the left; the right-aligned dim
+/// glyph, and name on the left; the right-aligned dim
 /// "adapter · word" segment when there's room. The right segment drops first
-/// when narrow; if even the left side overflows, the id+name (last in
+/// when narrow; if even the left side overflows, the name (last in
 /// `left`) is what visibly clips. Pure so the width-shedding order is
 /// unit-testable.
 ///
-/// The left side carries the pane id ahead of the name — the
-/// `roost send <id>` join key, same placement as the corner badge (C4).
+/// The left side carries just the name, no pane id — the id is recycled
+/// (`Workspace::next_pane_id`), not a durable identifier, and would be
+/// noise next to the name it already shows. The join key for
+/// `roost send <id>` still surfaces elsewhere (C20's feed, the rail's
+/// glyph tier).
 ///
+/// The minimum blank columns between a row's left segment and its
+/// right-aligned one (C8) — and between the two halves of a rail header
+/// (C43). Zero would let an exact fit run the two together
+/// (`tmpworking`, ` SOLO · 6 PANESALT+↑↓`); the right segment sheds whole
+/// one column earlier instead, which is already the shedding rule.
+const SEGMENT_GAP_COLS: u16 = 1;
+
 /// No-dup rule (C8, mirrors C4's `badge_text`): an untitled pane's `name` is
 /// the shared `display_name_live` fallback, which already embeds the adapter —
 /// so the right segment drops the `{adapter} · ` prefix and shows just the
@@ -2701,7 +2763,6 @@ fn collapsed_row_spans(
     width: u16,
     focused: bool,
     status: Option<AgentStatus>,
-    id: layout::PaneId,
     name: &str,
     adapter: &str,
     has_title: bool,
@@ -2721,7 +2782,7 @@ fn collapsed_row_spans(
     let left: Vec<(String, Style)> = vec![
         marker,
         (glyph.to_string(), glyph_style),
-        (format!(" {id} {name}"), collapsed_name_style(status, focused)),
+        (format!(" {name}"), collapsed_name_style(status, focused)),
     ];
     let left_w: u16 = left.iter().map(|(t, _)| mouse::display_width(t)).sum();
     let right = if has_title {
@@ -2735,7 +2796,12 @@ fn collapsed_row_spans(
     let marker_w: u16 = if noted { 2 } else { 0 }; // "¶ "
     let right_w = mouse::display_width(&right) + marker_w;
 
-    if width >= left_w + right_w {
+    // At least one blank column between the two segments: `width >=
+    // left_w + right_w` alone lets an exact fit render `tmpworking` with
+    // no gap at all (seen live at a 24-column C43 rail), which reads as
+    // one mangled word rather than two segments. The right segment sheds
+    // whole instead — C8's own right-to-left rule, one column earlier.
+    if width >= left_w + right_w + SEGMENT_GAP_COLS {
         let pad = width - left_w - right_w;
         let mut spans: Vec<Span<'_>> = left.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
         spans.push(Span::raw(" ".repeat(pad as usize)));
@@ -2753,24 +2819,193 @@ fn collapsed_row_spans(
 /// left, "ALT+↑↓ " right-aligned, filled with spaces between. Pure so the
 /// content and right-alignment are unit-testable without a `Frame`.
 fn stack_header_text(width: u16, n: usize) -> String {
-    let left = format!(" STACK · {n} PANES");
-    let right = "ALT+↑↓ ";
-    let pad = width
-        .saturating_sub(left.chars().count() as u16)
-        .saturating_sub(right.chars().count() as u16);
-    format!("{left}{}{right}", " ".repeat(pad as usize))
+    section_header_text(width, &format!("STACK · {n} PANES"), Some("ALT+↑↓"))
 }
 
-/// C6: a stack's header row. Every cell (text and fill alike) carries
-/// `Modifier::UNDERLINED` — the cell translation of the mockup's 1px bottom
-/// rule — via the paragraph-level style, the same edge-to-edge-fill trick
-/// `draw_tab_bar` uses. No bg (background policy, §2).
+/// The least a rule can be and still read as a rule rather than debris.
+const RULE_MIN_COLS: u16 = 1;
+
+/// C6/C15/C27/C43: a section header row — a `─` rule running edge to edge
+/// with a gap punched in it for each label.
+///
+/// **[2026-09-10]** The rule replaces the edge-to-edge
+/// `Modifier::UNDERLINED` these four rows carried until now. Underline
+/// draws *under* the glyphs, hard against the baseline with no leading, so
+/// it collided with descenders and with the `·` separator and read as
+/// cramped; terminals also disagree about its weight and its colour. The
+/// shape is a pane's own top border (`┌ title ─────┐`) minus the corners —
+/// the same move C3/C4 made on 2026-08-21 when the identity badge went onto
+/// the border — and on a solo tab's first body row the rail header's rule
+/// and the shown pane's top border now line up into one continuous rule
+/// across the body, which the underline could never do (it sat a pixel row
+/// lower than the `─` beside it).
+///
+/// This function owns every blank column in the row: labels are passed bare
+/// and trimmed here, so no caller can decorate its own label and drift.
+/// The right label sheds whole when the rule between the two would be
+/// narrower than `RULE_MIN_COLS` — the right-to-left rule these rows
+/// already followed, at a threshold the rule itself now sets.
+fn section_header_text(width: u16, left: &str, right: Option<&str>) -> String {
+    let left = left.trim();
+    let left_w = mouse::display_width(left);
+    if let Some(right) = right {
+        let right = right.trim();
+        let right_w = mouse::display_width(right);
+        // ─ ␣ left ␣ rule ␣ right ␣ ─  → six fixed columns beside the rule.
+        let fixed = left_w + right_w + 6;
+        if fixed + RULE_MIN_COLS <= width {
+            let rule = width - fixed;
+            return format!("─ {left} {} {right} ─", "─".repeat(rule as usize));
+        }
+    }
+    // Left alone: one leading rule cell, then the rule runs to the far edge.
+    // Narrower than the label itself still degrades by overflow (Paragraph
+    // clips visually), never by panicking.
+    let rule = width.saturating_sub(left_w + 3);
+    format!("─ {left} {}", "─".repeat(rule as usize))
+}
+
+/// C6: a stack's header row. The division is drawn as a `─` rule beside the
+/// label (`section_header_text`), not as `Modifier::UNDERLINED` under it —
+/// see that function for why it changed. No bg (background policy, §2).
 fn draw_stack_header(f: &mut Frame<'_>, header: layout::StackHeader) {
     f.render_widget(
-        Paragraph::new(stack_header_text(header.rect.width, header.n))
-            .style(theme::quiet().add_modifier(Modifier::UNDERLINED)),
+        Paragraph::new(stack_header_text(header.rect.width, header.n)).style(theme::quiet()),
         header.rect,
     );
+}
+
+/// C43's rail header text (row 0) for the given rail width — the labelled
+/// tier gets `stack_header_text`'s own shape with `STACK` swapped for
+/// `SOLO`, but **not** its unconditional right segment: at the labelled
+/// tier's own floor (20 cols) `" SOLO · N PANES"` plus `"ALT+↑↓ "` already
+/// overflows, so the right segment sheds first (C8's right-to-left rule,
+/// `collapsed_row_spans`'s own tactic) rather than the header mangling
+/// into `PANESALT+↑`. Left alone still degrades by overflow (Paragraph
+/// clips visually, never panics) below its own width. The glyph tier has
+/// no room for the count or the right segment either, so it just says the
+/// word, space-padded to fill the row.
+fn rail_header_text(width: u16, n: usize) -> String {
+    if width <= layout::RAIL_GLYPH_COLS {
+        // The one place the rule idiom degenerates: six columns leave a
+        // single cell beside `SOLO`, and a one-cell rule reads as debris
+        // rather than a division — while dropping it entirely would leave
+        // this header with no separation from the rows at all. So the word
+        // sits *centred in* the rule here instead of beside it. Same ink,
+        // same glyph, the only shape that still divides at this width.
+        let word = "SOLO";
+        let spare = width.saturating_sub(mouse::display_width(word));
+        let lead = spare / 2;
+        return format!(
+            "{}{word}{}",
+            "─".repeat(lead as usize),
+            "─".repeat((spare - lead) as usize),
+        );
+    }
+    section_header_text(width, &format!("SOLO · {n} PANES"), Some("ALT+↑↓"))
+}
+
+/// C43: one rail row at the glyph tier (`RAIL_GLYPH_COLS` wide) — marker,
+/// status glyph, space, id, padded to fill the row. The labelled tier
+/// reuses `collapsed_row_spans` wholesale instead; there's no room here for
+/// anything past the bare id.
+fn rail_glyph_row_spans(
+    focused: bool,
+    status: Option<AgentStatus>,
+    id: layout::PaneId,
+    spinner: char,
+) -> Vec<Span<'static>> {
+    let (base_glyph, glyph_style, spins) = row_status_style(status);
+    let glyph = if spins { spinner } else { base_glyph };
+    let marker = if focused {
+        Span::styled(theme::MARKER_ACTIVE.to_string(), theme::accent())
+    } else {
+        Span::raw(" ")
+    };
+    let rest = format!(" {id}");
+    let content_w = 2 + mouse::display_width(&rest); // marker + glyph, 1 col each
+    let pad = layout::RAIL_GLYPH_COLS.saturating_sub(content_w);
+    vec![
+        marker,
+        Span::styled(glyph.to_string(), glyph_style),
+        // C8's own ink/quiet ramp, same as the labelled tier's name column
+        // (`collapsed_row_spans`) — the bare id is this tier's only text,
+        // so it carries the same style that column would.
+        Span::styled(
+            format!("{rest}{}", " ".repeat(pad as usize)),
+            collapsed_name_style(status, focused),
+        ),
+    ]
+}
+
+/// C43: the solo-view rail — row 0 the header, then one row per
+/// `rail_rows()` id, top-aligned, recomputed every frame from the
+/// workspace (renames, status flips and closes show up live, same as the
+/// roster). Rows get a blank line of breathing room above them when every
+/// one still fits with the spacing; below that they close up contiguous;
+/// below that the window follows the shown row and an `…` marks whichever
+/// end still has rows behind it (`layout::rail_layout`, which wraps
+/// `rail_window` for the last two regimes) — so the `▎` marker is never off
+/// screen.
+fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, spinner: char) {
+    let rows = app.rail_rows();
+    // Not `app.focused` directly: while the float is shown it owns that,
+    // and `solo_shown` is the one accessor `display_rects` also reads, so
+    // the row `▎` marks always agrees with the pane actually on screen.
+    let shown = app.solo_shown();
+    f.render_widget(
+        Paragraph::new(rail_header_text(rail.width, rows.len())).style(theme::quiet()),
+        Rect::new(rail.x, rail.y, rail.width, 1),
+    );
+    if rail.height < 2 {
+        return; // no room for even one pane row under the header
+    }
+    // Shared with `mouse::rail_row_at` so drawing and hit-testing can never
+    // disagree about which row, if any, is a gap, an `…` overflow marker,
+    // or a pane — nor about where the window sits once it has scrolled to
+    // follow the shown row, nor about the row pitch (1 vs 2) either.
+    let shown_i = rows.iter().position(|&id| id == shown).unwrap_or(0);
+    let rl = layout::rail_layout(rail.height, rows.len(), shown_i);
+    let w = rl.window;
+    let pitch: u16 = if rl.spaced { 2 } else { 1 };
+    let first_slot = if rl.spaced { rail.y + 2 } else { rail.y + 1 + u16::from(w.more_above) };
+    for (i, &id) in rows.iter().skip(w.top).take(w.len).enumerate() {
+        let row = Rect::new(rail.x, first_slot + i as u16 * pitch, rail.width, 1);
+        let focused = shown == id;
+        let status = app.display_status(id).unwrap_or(AgentStatus::Exited);
+        let spans = if rail.width <= layout::RAIL_GLYPH_COLS {
+            rail_glyph_row_spans(focused, Some(status), id, spinner)
+        } else {
+            let spec = app.find_spec(id);
+            let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
+            let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
+            let name = if spec.is_some() { app.chrome_name(id) } else { "?".into() };
+            let noted = spec.is_some_and(|s| s.note.is_some());
+            let raw = app.is_raw(id);
+            collapsed_row_spans(
+                rail.width,
+                focused,
+                Some(status),
+                &name,
+                &adapter,
+                has_title,
+                raw,
+                noted,
+                spinner,
+            )
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
+    }
+    // An `…` at whichever end still has rows behind it — never a bottom
+    // marker standing in for rows that are actually above.
+    if w.more_above {
+        let row = Rect::new(rail.x, rail.y + 1, rail.width, 1);
+        f.render_widget(Paragraph::new(" …").style(theme::quiet()), row);
+    }
+    if w.more_below {
+        let row = Rect::new(rail.x, rail.y + rail.height - 1, rail.width, 1);
+        f.render_widget(Paragraph::new(" …").style(theme::quiet()), row);
+    }
 }
 
 /// C4's note segment data (C32): what the badge says about a parked note.
@@ -2801,8 +3036,10 @@ fn age_word(noted_at: u64, now: u64) -> String {
     }
 }
 
-/// C3/C4 (amended 2026-08-21): the pane's **identity title** — the left half
-/// of the top border, `" {id} {name} · {adapter} [raw] [↑N] {glyph} "`.
+/// C3/C4 (amended 2026-08-21; id dropped 2026-09-10): the pane's **identity
+/// title** — the left half of the top border, `" {name} · {adapter} [raw]
+/// [↑N] {glyph} "`. No pane id: it is recycled (`Workspace::next_pane_id`),
+/// not durable, and would be noise next to the name already there.
 ///
 /// Formerly the corner badge, drawn over the pane's own first content row.
 /// That row is the pane's most valuable one — a prompt, the first line of a
@@ -3138,8 +3375,8 @@ mod tests {
         age_word, badge_text, blit_screen, cell_in_selection, centered_near, collapsed_name_style,
         collapsed_row_spans, dialog_rect, feed_entry_spans, feed_window, help_content_width,
         help_layout, help_lines, hint_bar_right_spans, identity_title, mode_word, note_title,
-        push_tab_spans, should_place_cursor, stack_header_text, state_word, BadgeNote, HelpKey,
-        HelpLine, HELP_GROUPS,
+        push_tab_spans, section_header_text, should_place_cursor, stack_header_text, state_word,
+        BadgeNote, HelpKey, HelpLine, HELP_GROUPS,
     };
     use crate::ui::input::{self, Action, Keymap};
     use crate::App;
@@ -3160,10 +3397,33 @@ mod tests {
             focused_dead,
             resumable,
             focused_raw,
+            false,
             help_scrolled,
             false,
             &Keymap::default(),
         )
+    }
+
+    /// C43: the solo hint list, default keymap — its own tiny wrapper
+    /// rather than growing every one of the 5-arg wrapper's 16 call sites
+    /// for a flag only one test needs.
+    fn hint_pairs_solo() -> Vec<(String, &'static str)> {
+        super::hint_pairs(
+            &Mode::Normal,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &Keymap::default(),
+        )
+    }
+
+    /// C43, marked: `hint_pairs_solo`'s own sibling, flipping only the
+    /// `marked` flag a single test needs.
+    fn hint_pairs_solo_marked() -> Vec<(String, &'static str)> {
+        super::hint_pairs(&Mode::Normal, false, false, false, true, false, true, &Keymap::default())
     }
 
     /// Build an expected pair list. Keys are owned since F1 (they are
@@ -3208,11 +3468,11 @@ mod tests {
 
     #[test]
     fn badge_no_dup_rule_pins_c4() {
-        // U2: every badge leads with the pane id (the `roost send <id>` key).
+        // The badge is the pane's display name, not its (recycled) id.
         // Untitled fallback name already embeds the adapter — don't repeat it.
-        assert_eq!(badge_text(3, "pi · myrepo", "pi", false), "3 pi · myrepo");
+        assert_eq!(badge_text("pi · myrepo", "pi", false), "pi · myrepo");
         // A custom title doesn't embed the adapter — spell it out.
-        assert_eq!(badge_text(7, "worker1", "claude", true), "7 worker1 · claude");
+        assert_eq!(badge_text("worker1", "claude", true), "worker1 · claude");
     }
 
     fn ident(budget: u16, text: &str) -> String {
@@ -3452,7 +3712,6 @@ mod tests {
             40,
             false,
             Some(AgentStatus::Idle),
-            2,
             "api",
             "shell",
             false,
@@ -3467,7 +3726,6 @@ mod tests {
             8,
             false,
             Some(AgentStatus::Idle),
-            2,
             "api",
             "shell",
             false,
@@ -3679,7 +3937,6 @@ mod tests {
             40,
             false,
             Some(AgentStatus::Working),
-            2,
             "pi",
             "pi",
             true,
@@ -3701,7 +3958,6 @@ mod tests {
             40,
             false,
             Some(AgentStatus::Waiting),
-            2,
             "shell",
             "shell",
             false,
@@ -3717,14 +3973,13 @@ mod tests {
     #[test]
     fn collapsed_row_drops_right_segment_before_clipping_name() {
         let name = "a-fairly-long-pane-name";
-        // Exactly enough room for "marker + glyph + ' ' + id + ' ' + name",
-        // nothing more (U2: the id rides with the name on the left).
-        let left_w = 5 + name.chars().count() as u16;
+        // Exactly enough room for "marker + glyph + ' ' + name", nothing
+        // more — no id on the left since the id change (2026-09-10).
+        let left_w = 3 + name.chars().count() as u16;
         let spans = collapsed_row_spans(
             left_w,
             false,
             Some(AgentStatus::Idle),
-            2,
             name,
             "shell",
             true,
@@ -3733,7 +3988,7 @@ mod tests {
             theme::GLYPH_WORKING,
         );
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, format!(" · 2 {name}"));
+        assert_eq!(text, format!(" · {name}"));
         assert!(!text.contains("shell"));
     }
 
@@ -3743,7 +3998,6 @@ mod tests {
             4,
             false,
             Some(AgentStatus::Waiting),
-            2,
             "a-very-long-pane-name",
             "shell",
             false,
@@ -3762,7 +4016,6 @@ mod tests {
             40,
             true,
             Some(AgentStatus::Working),
-            2,
             "pi",
             "pi",
             true,
@@ -3780,7 +4033,6 @@ mod tests {
             60,
             false,
             Some(AgentStatus::Working),
-            2,
             "pi",
             "pi",
             true,
@@ -3795,7 +4047,6 @@ mod tests {
             60,
             false,
             Some(AgentStatus::Waiting),
-            2,
             "shell",
             "shell",
             false,
@@ -3807,13 +4058,110 @@ mod tests {
         assert!(text.ends_with("raw · your turn "), "{text}");
     }
 
+    /// **[Amended 2026-09-10]** was `..._is_uppercase_and_right_aligned`,
+    /// pinned to the old edge-to-edge fill. `section_header_text`'s rule
+    /// idiom replaces the fill: the row still measures exactly `width` and
+    /// the content is still uppercase, but the label leads with `"─ "` and
+    /// trails into the rule rather than starting flush and padding with
+    /// spaces.
     #[test]
-    fn stack_header_text_is_uppercase_and_right_aligned() {
+    fn stack_header_text_is_uppercase_and_wears_the_rule_idiom() {
         let text = stack_header_text(30, 3);
         assert_eq!(text.chars().count(), 30);
-        assert!(text.starts_with(" STACK · 3 PANES"));
-        assert!(text.ends_with("ALT+↑↓ "));
+        assert!(text.starts_with("─ STACK · 3 PANES "));
+        assert!(text.ends_with(" ALT+↑↓ ─"));
         assert_eq!(text, text.to_uppercase());
+    }
+
+    /// **[Amended 2026-09-10]** the rail header's own fixed cost changed
+    /// with the rule idiom: `"SOLO · N PANES"` (14, trimmed) plus
+    /// `"ALT+↑↓"` (6) plus six punctuation columns (`"─ ", " ", " ", " ─"`
+    /// around the rule) plus `RULE_MIN_COLS` (1) is 27 — one column short
+    /// of that still sheds the right segment whole (C8's right-to-left
+    /// rule), never mangling into `PANESALT+↑`.
+    #[test]
+    fn rail_header_text_sheds_the_right_segment_before_it_would_overflow() {
+        let text = super::rail_header_text(20, 3);
+        assert_eq!(text, "─ SOLO · 3 PANES ───", "narrow: left label and rule only");
+        assert!(!text.contains("ALT"), "no partial ALT+↑ debris at a width that can't fit it");
+
+        // An *exact* fit is still a shed: a zero-width rule between the two
+        // labels would run them together, which the rule's own
+        // `RULE_MIN_COLS` floor forbids.
+        let text = super::rail_header_text(26, 3);
+        assert_eq!(text, "─ SOLO · 3 PANES ─────────", "an exact fit still sheds — no zero rule");
+        assert!(!text.contains("ALT"), "no run-together header at the shedding boundary");
+
+        let text = super::rail_header_text(27, 3);
+        assert_eq!(text, "─ SOLO · 3 PANES ─ ALT+↑↓ ─", "one rule column is the least that reads");
+        assert!(text.ends_with("ALT+↑↓ ─"), "wide enough now, so it keeps the right segment");
+    }
+
+    /// C6/C15/C27/C43's shared rule idiom, both labels, roomy width: a `─`
+    /// rule runs from edge to edge with a one-space gap punched in for each
+    /// label, and the row is exactly `width` columns.
+    #[test]
+    fn section_header_text_draws_both_labels_at_a_roomy_width() {
+        let text = section_header_text(30, "stack · 3 panes", Some("alt+up"));
+        assert_eq!(text.chars().count(), 30);
+        assert_eq!(text, "─ stack · 3 panes ─── alt+up ─");
+    }
+
+    /// The right label sheds whole, not clipped, the moment the rule between
+    /// the two labels would fall below `RULE_MIN_COLS` — C8's own
+    /// right-to-left rule applied to the rule itself.
+    #[test]
+    fn section_header_text_sheds_the_right_label_at_a_tight_width() {
+        let text = section_header_text(20, "STACK · 3 PANES", Some("ALT+↑↓"));
+        assert_eq!(text, "─ STACK · 3 PANES ──");
+        assert!(!text.contains("ALT"), "the right label sheds whole rather than clipping in");
+    }
+
+    /// No right label at all: the same leading `"─ "` and a trailing rule,
+    /// the shape the roster's group rows and the help overlay's group heads
+    /// use — the row still measures exactly `width`.
+    #[test]
+    fn section_header_text_draws_the_left_label_alone() {
+        let text = section_header_text(20, " 1 MAIN · 2 PANES", None);
+        assert_eq!(text.chars().count(), 20);
+        assert_eq!(text, "─ 1 MAIN · 2 PANES ─");
+    }
+
+    /// The row is exactly `width` display columns whenever it fits — both
+    /// the both-label and the left-only shape — across a spread of widths,
+    /// not just one example.
+    #[test]
+    fn section_header_text_row_is_always_exactly_width_columns_when_it_fits() {
+        for width in [20u16, 21, 27, 30, 40, 80] {
+            let text = section_header_text(width, "STACK · 3 PANES", Some("ALT+↑↓"));
+            assert_eq!(mouse::display_width(&text), width, "width {width}: {text:?}");
+        }
+        for width in [20u16, 21, 40] {
+            let text = section_header_text(width, "1 MAIN · 2 PANES", None);
+            assert_eq!(mouse::display_width(&text), width, "width {width}: {text:?}");
+        }
+    }
+
+    /// A width narrower than the label itself degrades by overflowing the
+    /// string (`Paragraph` clips visually) rather than panicking — true with
+    /// or without a right label to shed first.
+    #[test]
+    fn section_header_text_does_not_panic_when_width_is_smaller_than_the_label() {
+        let text = section_header_text(3, "STACK", None);
+        assert!(text.contains("STACK"));
+        let text = section_header_text(3, "STACK", Some("X"));
+        assert!(text.contains("STACK"));
+        assert!(!text.contains('X'), "the right label sheds long before the left overflows");
+    }
+
+    /// C43's one exception: at the rail's glyph tier (`RAIL_GLYPH_COLS`,
+    /// six columns) there is no room for a label beside a rule, so the word
+    /// sits centred *in* the rule instead — `"─SOLO─"`, not
+    /// `section_header_text`'s own shape.
+    #[test]
+    fn rail_header_text_centres_the_word_in_the_rule_at_the_glyph_tier() {
+        let text = super::rail_header_text(6, 3);
+        assert_eq!(text, "─SOLO─");
     }
 
     #[test]
@@ -3834,6 +4182,68 @@ mod tests {
         );
     }
 
+    /// C43: solo's own six, and — PROPOSAL.md §2.6's own budget — still
+    /// inside the 100-column floor beside the right segment's `SOLO` word.
+    #[test]
+    fn hint_pairs_solo_mode_is_the_six_c43_pairs_and_fits_the_floor() {
+        let pairs = hint_pairs_solo();
+        assert_eq!(
+            pairs,
+            p(&[
+                ("Alt+?", "keys"),
+                ("Alt+Shift+t", "tile"),
+                ("Alt+↑↓", "pane"),
+                ("Alt+←→", "tab"),
+                ("Alt+n", "new"),
+                ("Alt+w", "close"),
+            ]),
+        );
+        let cols: u16 = pairs.iter().map(|(k, l)| super::hint_pair_cols(k, l)).sum();
+        let right_w = super::hint_bar_right_spans(None, None, None, "SOLO", Some("Alt+a".into()))
+            .iter()
+            .map(|s| mouse::display_width(&s.content))
+            .sum::<u16>();
+        assert!(
+            cols + right_w <= 100,
+            "solo hints are {cols} cols + {right_w} of segment; the 100-col floor clips them"
+        );
+    }
+
+    /// C43: the way *out* of a persisted view must survive the squeeze.
+    /// At the glyph tier (40-99 body cols) the rail draws no words at all,
+    /// so the hint bar is the only thing on screen naming `Alt+Shift+t` —
+    /// and a trailing `tile` pair was the first to drop there. Pinned at
+    /// the 80-column floor, where it used to be gone.
+    #[test]
+    fn hint_pairs_solo_keeps_the_tile_pair_at_the_eighty_column_floor() {
+        let pairs = hint_pairs_solo();
+        let right_w = super::hint_bar_right_spans(None, None, None, "SOLO", Some("Alt+a".into()))
+            .iter()
+            .map(|s| mouse::display_width(&s.content))
+            .sum::<u16>();
+        for width in 60..=100u16 {
+            let shown = super::fit_hint_pairs(&pairs, right_w, width);
+            assert!(
+                pairs[..shown].iter().any(|(k, _)| k.contains("Shift+t")),
+                "at {width} cols the solo bar sheds its own way out: {:?}",
+                &pairs[..shown],
+            );
+        }
+    }
+
+    /// Review fix, C43: the solo hint arm used to drop the pull pair
+    /// outright when a pane was marked — the shape-verb refusal accidentally
+    /// swallowed C40's standing `Alt+Shift+v`, even though `PullPane` still
+    /// works in solo. It now leads the solo bar exactly as it leads the
+    /// tiled one, mirrored from `the_pull_pair_leads_the_bar_only_while_a_pane_is_marked`.
+    #[test]
+    fn hint_pairs_solo_mode_leads_with_the_pull_pair_while_a_pane_is_marked() {
+        let unmarked = hint_pairs_solo();
+        let marked = hint_pairs_solo_marked();
+        assert_eq!(marked[0], one("Alt+Shift+v", "pull marked pane"));
+        assert_eq!(&marked[1..], &unmarked[..], "and nothing else on the solo bar moved");
+    }
+
     /// F1, pinned at the bar itself: every Alt chord on the footer is
     /// resolved from the live keymap, so a config.json remap moves the bar
     /// too — the chord that replaced a default takes the pair over, and the
@@ -3845,7 +4255,8 @@ mod tests {
             "config.json",
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let pairs = super::hint_pairs(&Mode::Normal, false, false, false, false, false, &keymap);
+        let pairs =
+            super::hint_pairs(&Mode::Normal, false, false, false, false, false, false, &keymap);
         assert!(
             !pairs.iter().any(|(k, _)| k.contains("Alt+w")),
             "the displaced default chord is off the bar: {pairs:?}"
@@ -3919,8 +4330,16 @@ mod tests {
         let unmarked = hint_pairs(&Mode::Normal, false, false, false, false);
         assert!(!unmarked.iter().any(|(k, _)| k.contains("Shift+v")), "{unmarked:?}");
 
-        let marked =
-            super::hint_pairs(&Mode::Normal, false, false, false, false, true, &Keymap::default());
+        let marked = super::hint_pairs(
+            &Mode::Normal,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            &Keymap::default(),
+        );
         assert_eq!(marked[0], one("Alt+Shift+v", "pull marked pane"));
         assert_eq!(&marked[1..], &unmarked[..], "and nothing else on the bar moved");
         // It must survive the squeeze that drops everything else, or the
@@ -4042,10 +4461,11 @@ mod tests {
 
     #[test]
     fn mode_word_matches_c9_table() {
-        assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
+        assert_eq!(mode_word(&Mode::Normal, false, false, false), "NORMAL");
         assert_eq!(
             mode_word(
                 &Mode::Rename { buffer: String::new(), cursor: 0, target: RenameTarget::Tab },
+                false,
                 false,
                 false
             ),
@@ -4055,14 +4475,15 @@ mod tests {
             mode_word(
                 &Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false },
                 false,
+                false,
                 false
             ),
             "PICKER"
         );
-        assert_eq!(mode_word(&Mode::Scroll, false, false), "SCROLL");
-        assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false), "COPY");
+        assert_eq!(mode_word(&Mode::Scroll, false, false, false), "SCROLL");
+        assert_eq!(mode_word(&Mode::Copy { cursor: (0, 0) }, false, false, false), "COPY");
         assert_eq!(
-            mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false),
+            mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, false, false, false),
             "HELP"
         );
     }
@@ -4071,19 +4492,41 @@ mod tests {
     fn mode_word_shows_zoom_pseudo_state_only_in_the_normal_slot() {
         // C21/amended C9: ZOOM shows only when the mode is Normal — every
         // other mode's own word wins regardless of the zoomed flag.
-        assert_eq!(mode_word(&Mode::Normal, true, false), "ZOOM");
-        assert_eq!(mode_word(&Mode::Normal, false, false), "NORMAL");
-        assert_eq!(mode_word(&Mode::Scroll, true, false), "SCROLL");
-        assert_eq!(mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, true, false), "HELP");
+        assert_eq!(mode_word(&Mode::Normal, true, false, false), "ZOOM");
+        assert_eq!(mode_word(&Mode::Normal, false, false, false), "NORMAL");
+        assert_eq!(mode_word(&Mode::Scroll, true, false, false), "SCROLL");
+        assert_eq!(
+            mode_word(&Mode::Help { top: 0, filter: None, cursor: 0 }, true, false, false),
+            "HELP"
+        );
     }
 
     #[test]
     fn mode_word_raw_beats_zoom_beats_normal_but_never_a_real_mode_word() {
         // C23/amended C9: in the Normal slot, RAW beats ZOOM beats NORMAL —
         // but any real (non-Normal) mode word still wins over both.
-        assert_eq!(mode_word(&Mode::Normal, false, true), "RAW");
-        assert_eq!(mode_word(&Mode::Normal, true, true), "RAW", "raw beats zoom");
-        assert_eq!(mode_word(&Mode::Scroll, true, true), "SCROLL", "a real mode word always wins");
+        assert_eq!(mode_word(&Mode::Normal, false, true, false), "RAW");
+        assert_eq!(mode_word(&Mode::Normal, true, true, false), "RAW", "raw beats zoom");
+        assert_eq!(
+            mode_word(&Mode::Scroll, true, true, false),
+            "SCROLL",
+            "a real mode word always wins"
+        );
+    }
+
+    /// C43: SOLO sits between ZOOM and NORMAL in the Normal slot — it loses
+    /// to a real mode word, loses to ZOOM (session-only, composes on top),
+    /// but beats bare NORMAL, and RAW still outranks everything.
+    #[test]
+    fn mode_word_solo_sits_between_zoom_and_normal() {
+        assert_eq!(mode_word(&Mode::Normal, false, false, true), "SOLO");
+        assert_eq!(mode_word(&Mode::Normal, true, false, true), "ZOOM", "zoom outranks solo");
+        assert_eq!(mode_word(&Mode::Normal, false, true, true), "RAW", "raw outranks solo");
+        assert_eq!(
+            mode_word(&Mode::Scroll, false, false, true),
+            "SCROLL",
+            "a real mode word always wins over solo too"
+        );
     }
 
     #[test]
@@ -4294,13 +4737,13 @@ mod tests {
     #[test]
     fn mode_word_roster_wins_regardless_of_zoom() {
         let mode = Mode::Roster { cursor: 1, filter: String::new(), top: 0, status_filter: None };
-        assert_eq!(mode_word(&mode, true, false), "ROSTER");
+        assert_eq!(mode_word(&mode, true, false, false), "ROSTER");
     }
 
     #[test]
     fn mode_word_feed_wins_regardless_of_zoom() {
-        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, false, false), "FEED");
-        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, true, false), "FEED");
+        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, false, false, false), "FEED");
+        assert_eq!(mode_word(&Mode::Feed { offset: 0 }, true, false, false), "FEED");
     }
 
     /// C32: the tab dialog and the combined pane editor lead their hint
@@ -4465,7 +4908,6 @@ mod tests {
             0,
             true,
             Some(AgentStatus::Working),
-            2,
             "pi",
             "pi",
             true,
@@ -4572,12 +5014,13 @@ mod tests {
     fn stack_header_text_does_not_panic_when_width_is_smaller_than_content() {
         // The header is gated on the stack area's *height* (C6), not its
         // width, so a tall-but-narrow stack can still ask for a header
-        // narrower than " STACK · N PANES" + "ALT+↑↓ ". Must degrade by
+        // narrower than "STACK · N PANES" plus "ALT+↑↓". Must degrade by
         // overflowing the string (Paragraph clips visually, same as the hint
-        // bar), not panic.
+        // bar), not panic — and the right segment sheds long before that,
+        // so it never even reaches the overflow.
         let text = stack_header_text(4, 3);
         assert!(text.contains("STACK · 3 PANES"));
-        assert!(text.ends_with("ALT+↑↓ "));
+        assert!(!text.contains("ALT"), "the right segment sheds rather than mangling in");
     }
 
     // -- C20 activity feed ---------------------------------------------------
@@ -5693,7 +6136,7 @@ row's — widen ADAPTER_COL",
         // caller passes.
         assert!(text.contains("<id>"), "the pane-id join must be spelled out:\n{text}");
         assert!(
-            text.to_lowercase().contains("badge") || text.to_lowercase().contains("tab"),
+            text.to_lowercase().contains("feed") || text.to_lowercase().contains("tab"),
             "the join must point back at where the id is shown on screen:\n{text}",
         );
     }
@@ -6228,7 +6671,163 @@ row's — widen ADAPTER_COL",
             out.push(("scrollback search hits", snap(&mut app)));
         }
 
+        // C43: solo view — the rail's header text, the `▎` marker on the
+        // row showing the focused pane, and the shown pane's border
+        // starting right where the rail ends. Self-verifying like the
+        // fixtures above: a regression in any of the three fails loudly
+        // here rather than the §2 gates below silently exercising the
+        // wrong screen.
+        {
+            use crate::core::layout;
+            let mut app = three_panes();
+            app.apply(Action::ToggleSolo);
+            let rw = layout::rail_width(app.body_area().width);
+            let rows = app.rail_rows();
+            let i = rows.iter().position(|&id| id == app.focused).expect("focused is a rail row");
+            let buf = snap(&mut app);
+            let frame: String = (0..30)
+                .map(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The exact row, not just a substring: at this fixture's own
+            // width (100 cols -> rw=20) `" SOLO · 3 PANES"` (15) plus
+            // `"ALT+↑↓ "` (7) already overflows 20, so a `.contains` check
+            // alone would still pass on the mangled `PANESALT+↑` this once
+            // rendered — the right segment must have shed instead.
+            let header_row: String =
+                (0..rw).filter_map(|x| buf.cell((x, 1)).map(|c| c.symbol().to_string())).collect();
+            assert_eq!(
+                header_row,
+                super::rail_header_text(rw, 3),
+                "the header row exactly matches the pure fn at this width:\n{frame}"
+            );
+            assert!(
+                !header_row.contains("ALT"),
+                "no room for the right segment here: {header_row:?}"
+            );
+            // C43 breathing room: at this fixture's rail height (28 body
+            // rows for 3 panes) the spaced regime engages, so the marker's
+            // absolute row is `rail.y + 2 + 2*i`, not the old `2 + i`.
+            // Derived from the same `rail_layout` seam `draw_rail` reads,
+            // rather than re-deriving the pitch by hand.
+            let rail = app.rail_area().expect("solo view carries a rail");
+            let rl = layout::rail_layout(rail.height, rows.len(), i);
+            assert!(rl.spaced, "this fixture's height is exactly the case breathing room targets");
+            let marker_y = rail.y + 2 + 2 * i as u16;
+            let marker_row: String = (0..rw)
+                .filter_map(|x| buf.cell((x, marker_y)).map(|c| c.symbol().to_string()))
+                .collect();
+            assert!(
+                marker_row.contains(theme::MARKER_ACTIVE),
+                "the focused row ({i}) carries the marker: {marker_row:?}\n{frame}"
+            );
+            assert_eq!(
+                buf.cell((rw, 1)).map(|c| c.symbol().to_string()).as_deref(),
+                Some("┌"),
+                "the shown pane's border starts right where the rail ends (x={rw}):\n{frame}"
+            );
+            out.push(("solo view", buf));
+        }
+
         out
+    }
+
+    /// SPEC-ux U2 (reopened): a pane's own border badge and its row in the
+    /// C43 rail read the identical (collision-suffixed) name — both derive
+    /// from `App::chrome_name`, so the two surfaces can never disagree about
+    /// which text names the pane solo is showing.
+    #[test]
+    fn solo_rail_row_and_the_shown_panes_border_badge_agree_on_a_collision_suffix() {
+        use crate::core::layout;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes, all `shell · tmp`, focus = pane 3
+        app.apply(Action::ToggleSolo);
+
+        let shown = app.solo_shown();
+        let want = app.chrome_name(shown);
+        assert!(
+            want.contains(" ("),
+            "the fixture's own point is that the shown pane collides: {want:?}"
+        );
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+
+        let rw = layout::rail_width(app.body_area().width);
+        let rows = app.rail_rows();
+        let i = rows.iter().position(|&id| id == shown).expect("the shown pane is a rail row");
+        // Header on row 1; at this size (28 body rows for 3 panes) the
+        // spaced regime engages, so rows start at row 3 with a pitch of 2 —
+        // same geometry the C43 solo-view fixture above pins at this size.
+        let rail_row: String = (0..rw)
+            .filter_map(|x| buf.cell((x, 1 + 2 + 2 * i as u16)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(rail_row.contains(&want), "the rail row carries the suffixed name: {rail_row:?}");
+
+        let border_row: String =
+            (rw..100).filter_map(|x| buf.cell((x, 1)).map(|c| c.symbol().to_string())).collect();
+        assert!(
+            border_row.contains(&want),
+            "the shown pane's own border badge carries the same suffixed name: {border_row:?}"
+        );
+    }
+
+    /// C43 breathing room: at a height where the spacing predicate holds
+    /// (`1 + 2*n <= rail_height`), the rail's pane rows land at
+    /// `rail.y + 2 + 2*i`, with a genuinely blank row between each — nothing
+    /// painted into the gap, not merely "no marker there".
+    #[test]
+    fn a_spaced_rail_draws_rows_two_apart_with_a_blank_row_between() {
+        use crate::core::layout;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane); // three panes: n=3, rail height 28 -> 1+2*3=7<=28
+        app.apply(Action::ToggleSolo);
+
+        let rw = layout::rail_width(app.body_area().width);
+        let rail = app.rail_area().expect("solo view carries a rail");
+        let rl = layout::rail_layout(rail.height, app.rail_rows().len(), 0);
+        assert!(rl.spaced, "this fixture's own point is that its height spaces");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+
+        for i in 0..3u16 {
+            let pane_row_y = rail.y + 2 + 2 * i;
+            let gap_row_y = pane_row_y - 1;
+            let pane_row: String = (0..rw)
+                .filter_map(|x| buf.cell((x, pane_row_y)).map(|c| c.symbol().to_string()))
+                .collect();
+            assert!(
+                !pane_row.trim().is_empty(),
+                "row {pane_row_y} (pane {i}) is unexpectedly blank"
+            );
+            let gap: String = (0..rw)
+                .filter_map(|x| buf.cell((x, gap_row_y)).map(|c| c.symbol().to_string()))
+                .collect();
+            assert_eq!(
+                gap.trim(),
+                "",
+                "row {gap_row_y} (the gap above pane row {i}) is not blank: {gap:?}"
+            );
+        }
     }
 
     /// Both the flash and the alt-warning can want the hint bar at once;
@@ -6688,13 +7287,15 @@ row's — widen ADAPTER_COL",
         // [Amended 2026-08-21] Identity shares this border now (C3/C4), and
         // yields to zoom rather than the other way round — but only the
         // columns zoom actually took. At 14 the two still coexist, so the
-        // join key survives on the left while `ZOOM` holds the right.
-        assert!(border.contains('3'), "identity keeps its end of the border: {border:?}");
+        // name survives (clipped) on the left while `ZOOM` holds the right.
+        // The pane's display name is "shell · tmp" (mk_app's default cwd);
+        // at this budget it clips to its first three columns.
+        assert!(border.contains("she"), "identity keeps its end of the border: {border:?}");
         // ...and the pane's own first content row, which the badge used to
         // occupy, is the pane's again.
         let content_row: String =
             (0..14).filter_map(|x| buf.cell((x, 2)).map(|c| c.symbol().to_string())).collect();
-        assert!(!content_row.contains('3'), "no chrome left on the content row: {content_row:?}");
+        assert!(!content_row.contains("she"), "no chrome left on the content row: {content_row:?}");
     }
 
     /// C21/C22 (amended 2026-08-11): "keeps zoom" + the float draws above
@@ -6799,7 +7400,8 @@ row's — widen ADAPTER_COL",
 
     /// C27, end to end through the real `draw()`: the roster groups panes
     /// under underlined tab headers, spells each pane row in C8's collapsed
-    /// format (id + name + `{adapter} · {state word}`), marks the cursor with
+    /// format (name + `{adapter} · {state word}`, no pane id — the id is
+    /// noise next to a name already on the row), marks the cursor with
     /// the picker's `❯`, lists a pane from a tab that is **not** active, and
     /// puts the live type-ahead query in the frame title.
     #[test]
@@ -6833,7 +7435,7 @@ row's — widen ADAPTER_COL",
         assert!(frame.contains("2 TAB2 · 1 PANE"), "tab 2's group header:\n{frame}");
         // C8's row format, for a pane in the *inactive* tab — the whole point
         // of the feature. `shell · /tmp` untitled ⇒ the state word alone.
-        assert!(frame.contains("1 shell · tmp"), "an inactive tab's pane row:\n{frame}");
+        assert!(frame.contains("shell · tmp"), "an inactive tab's pane row:\n{frame}");
         assert!(frame.contains("idle") || frame.contains("your turn"), "a state word:\n{frame}");
         assert!(frame.contains(theme::PICKER_SELECTED), "the cursor marker:\n{frame}");
         assert!(frame.contains("ROSTER"), "the C9 mode word:\n{frame}");
@@ -6928,7 +7530,7 @@ row's — widen ADAPTER_COL",
         // by design: item 4 scopes out C2/C5's tab aggregate) glyph lives
         // above it and would otherwise collide with a whole-frame search.
         let lines = drawn_lines(&mut app);
-        let badge_row = lines.iter().find(|l| l.contains("1 shell")).expect("the badge row");
+        let badge_row = lines.iter().find(|l| l.contains("shell · tmp")).expect("the badge row");
         assert!(
             badge_row.contains(theme::GLYPH_IDLE),
             "the corner badge's glyph reads idle:\n{badge_row}"
@@ -6943,7 +7545,7 @@ row's — widen ADAPTER_COL",
     }
 
     /// C15 (amended), end to end through the real `draw()`: the keymap
-    /// draws its groups as underlined headings, spells each chord in the
+    /// draws its groups as `─`-rule headings, spells each chord in the
     /// key column, and — on a body too short for the whole table — says so
     /// in its own title rather than silently ending mid-list.
     #[test]
@@ -6972,8 +7574,9 @@ row's — widen ADAPTER_COL",
         assert!(frame.contains("Esc closes"), "the way out is in the title:\n{frame}");
         assert!(frame.contains("type to filter"), "…and the typing rule:\n{frame}");
 
-        // The heading wears C6's rule across its own column, exactly as the
-        // roster's group rows do — not just uppercase text.
+        // The heading wears C6's `─` rule ahead of its own column, exactly
+        // as the roster's group rows do — not just uppercase text, and not
+        // an underline any more (2026-09-10).
         let (hy, hx) = (0..30)
             .flat_map(|y| (0..100).map(move |x| (y, x)))
             .find(|&(y, x)| {
@@ -6985,9 +7588,15 @@ row's — widen ADAPTER_COL",
             })
             .expect("the PANES heading is on screen");
         assert!(
-            buf.cell((hx, hy)).unwrap().modifier.contains(Modifier::UNDERLINED),
-            "the heading is underlined (C6's idiom)",
+            !buf.cell((hx, hy)).unwrap().modifier.contains(Modifier::UNDERLINED),
+            "the rule idiom replaces the underline, not adds to it",
         );
+        assert_eq!(
+            buf.cell((hx - 2, hy)).unwrap().symbol(),
+            "─",
+            "a rule cell runs immediately ahead of the label"
+        );
+        assert_eq!(buf.cell((hx - 1, hy)).unwrap().symbol(), " ", "one gap column beside it");
 
         // A 30-row terminal cannot hold the whole table, so the title has to
         // own up to it — the alternative is a list that just stops.
@@ -7086,21 +7695,25 @@ row's — widen ADAPTER_COL",
         assert!(row.contains(tab_glyph), "row {row:?} wears the tab's own glyph {tab_glyph:?}");
     }
 
-    /// C27 borrows C6's header idiom: the group row is underlined edge to
-    /// edge (text *and* the fill after it), so it reads as a rule rather than
-    /// as another pane.
+    /// **[Amended 2026-09-10]** was `..._are_underlined_across_the_whole_row`
+    /// — C27 borrows C6's header idiom, which is now `section_header_text`'s
+    /// `─` rule rather than an underline: the row still spans the whole
+    /// width and is still styled `theme::quiet()`, but the rule is drawn as
+    /// literal `─` cells, not a modifier under the text.
     #[test]
-    fn roster_group_headers_are_underlined_across_the_whole_row() {
+    fn roster_group_headers_draw_a_rule_across_the_whole_row() {
         let row = RosterRow::Group { label: " 1 MAIN · 2 PANES".to_string() };
         let mut app = mk_app(ratatui::layout::Size::new(100, 30));
         app.apply(crate::ui::input::Action::ToggleRoster);
         let spans = super::roster_row_spans(&app, &row, 40, 1, theme::GLYPH_WORKING);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(mouse::display_width(&text), 40, "the label is padded to the row width");
+        assert_eq!(mouse::display_width(&text), 40, "the rule fills the row to its width");
+        assert_eq!(text, "─ 1 MAIN · 2 PANES ─────────────────────");
         for s in &spans {
+            assert_eq!(s.style, theme::quiet(), "the whole row wears C6's quiet style");
             assert!(
-                s.style.add_modifier.contains(Modifier::UNDERLINED),
-                "every cell of the header carries the rule: {s:?}"
+                !s.style.add_modifier.contains(Modifier::UNDERLINED),
+                "the rule idiom replaces the underline, not adds to it: {s:?}"
             );
         }
     }
@@ -7135,7 +7748,6 @@ row's — widen ADAPTER_COL",
             49,
             false,
             Some(AgentStatus::Idle),
-            other,
             &app.display_name(other),
             "shell",
             false,

@@ -111,6 +111,11 @@ pub enum Action {
     /// Toggle the focused pane's raw (hard pass-through) membership,
     /// Alt+Shift+p — also the chord that exits raw (C23).
     ToggleRaw,
+    /// C43: toggle the active tab between tiled and solo view (one pane at
+    /// a time, the rest listed in a rail beside it), `Alt+Shift+t`. The
+    /// same-letter shift-pair idiom as `Alt+t`/`Alt+Shift+t`'s siblings:
+    /// `Alt+t` adds a tab; this gives the tab a rail of its own.
+    ToggleSolo,
 }
 
 #[derive(Debug, PartialEq)]
@@ -202,7 +207,12 @@ fn default_chord_action(code: KeyCode, shift: bool) -> Option<Action> {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('n') => Some(Action::NewPane),
         KeyCode::Char('w') => Some(Action::ClosePane),
-        KeyCode::Char('t') => Some(Action::NewTab),
+        // C43: the same same-letter shift-pair idiom as `s`/`S`, `z`/`Z`
+        // above — Alt+t adds a tab, Alt+Shift+t gives this tab a rail of
+        // its own. Alt+'T' tolerates the uppercase-delivery quirk those
+        // pairs already carry.
+        KeyCode::Char('t') => Some(if shift { Action::ToggleSolo } else { Action::NewTab }),
+        KeyCode::Char('T') => Some(Action::ToggleSolo),
         KeyCode::Char('s') => Some(if shift { Action::ExplodeStack } else { Action::StackPane }),
         KeyCode::Char('S') => Some(Action::ExplodeStack),
         KeyCode::Char('o') => Some(Action::FlipSplit), // orientation
@@ -952,6 +962,7 @@ const NAMES: &[(&str, Action)] = &[
     ("toggle_feed", Action::ToggleFeed),
     ("toggle_float", Action::ToggleFloat),
     ("toggle_raw", Action::ToggleRaw),
+    ("toggle_solo", Action::ToggleSolo),
 ];
 
 /// An action's config.json name — the reverse of `action_by_name`, and the
@@ -2343,6 +2354,10 @@ mod tests {
         "Alt+Shift+p",
         // C40's standing pull pair, same shape as the seven above.
         "Alt+Shift+v",
+        // C43's solo hint list, same shape again.
+        "Alt+↑↓",
+        "Alt+←→",
+        "Alt+Shift+t",
         // C15 `HelpKey::Family` shorthands, which give way to enumeration
         // the moment any member moves.
         "Alt+←↓↑→ / hjkl",

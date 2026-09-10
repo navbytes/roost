@@ -982,6 +982,44 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
+    // C43: the solo-view rail — a left press on a row focuses that pane
+    // (`on_click`, the tab strip's and roster's own click-to-focus rule);
+    // every other event inside the rail (wheel included) is consumed and
+    // does nothing — the rail's window already tracks the shown row, so
+    // there is no separate scroll position for a wheel to move (and no
+    // cursor either, unlike the roster). Checked ahead of the seam/pane
+    // paths below so a rail click can't fall through to whatever pane sits
+    // behind it in the display list.
+    if let Some(rail) = app.rail_area() {
+        let inside = me.column >= rail.x
+            && me.column < rail.x + rail.width
+            && me.row >= rail.y
+            && me.row < rail.y + rail.height;
+        // At the glyph tier the float's centered rect can overlap the
+        // 6-column rail, and the float draws on top of it (C22 stacking
+        // order) — so a point the float actually covers must reach it via
+        // the ordinary hit-test below, not be swallowed here first.
+        // `display_rects()` is the one seam both paths read, float always
+        // first when shown, so this can't disagree with what's on screen.
+        let over_float = mouse::hit_test(&app.display_rects(), me.column, me.row)
+            .is_some_and(|pr| app.is_float(pr.id));
+        if inside && !over_float {
+            // Selection-freeze design audit D1, same as copy mode/modal
+            // above: a drag that started on a pane and overshot into the
+            // rail on release must not leave the P20 latch set with no one
+            // left to release it.
+            app.release_mouse_gesture();
+            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some(id) =
+                    mouse::rail_row_at(rail, &app.rail_rows(), app.solo_shown(), me.column, me.row)
+                {
+                    app.on_click(id);
+                }
+            }
+            return;
+        }
+    }
+
     // U21: a left press on the seam between two panes drags that border
     // instead of focusing. Checked ahead of the pane paths below because a
     // pane's rect *includes* its border (C3), so hit-testing would happily

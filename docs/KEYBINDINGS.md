@@ -34,8 +34,9 @@ these defaults.
 | `Alt+Shift+arrow` / `Alt+Shift+hjkl` | move the focused pane that way within the tab — swaps it with its neighbour, reorders inside a stack |
 | `Alt+s` / `Alt+Shift+s` | stack: collapse the surrounding split into a stack, focused pane expanded — **press again to absorb the next split out**, up to the whole tab / explode the stack back into the split it came from |
 | `Alt+o` | flip the focused split's orientation (vertical ⇄ horizontal) |
-| `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack (skips shapes that don't fit) |
+| `Alt+g` / `Alt+Shift+g` | cycle layout forward / back: even grid → main pane + stack → all-stack → solo (skips tiled shapes that don't fit; solo always fits, so an unfit tab lands there instead of refusing) |
 | `Alt+z` / `Alt+Shift+z` | zoom the focused pane to fill the screen — view only, layout stays put (`Alt+z` again, a tab switch, or any layout edit exits) / toggle the floating scratch shell — the two view toggles, on one physical key |
+| `Alt+Shift+t` | solo view: one pane at a time, the rest listed in a rail beside it (`Alt+Shift+t` again tiles the tab back). `Alt+g` reaches the same view — it's the cycle's fourth stop — and stepping off it from either chord keeps the counter in sync |
 | `Alt+a` | jump to the next pane that needs input, across tabs, wrapping (zsh accept-and-hold collision — same remedy) |
 | `Alt+;` | go back to the pane you came from — toggles, and follows across tabs (tmux's `prefix ;`) |
 | `Alt+Shift+a` | fleet roster — every pane, grouped by tab, opening on the one `Alt+a` would jump to |
