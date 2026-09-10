@@ -16,7 +16,7 @@
 #[allow(dead_code)]
 mod harness;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[test]
 fn a_panic_in_the_event_loop_does_not_orphan_the_fleet() {
@@ -78,14 +78,10 @@ fn a_panic_in_the_event_loop_does_not_orphan_the_fleet() {
     let mut lingering: Vec<u32> = before.iter().copied().chain([bg]).collect();
     lingering.sort_unstable();
     lingering.dedup();
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    loop {
+    harness::wait_until(Duration::from_millis(1500), || {
         lingering.retain(|&p| harness::is_alive(p));
-        if lingering.is_empty() || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        lingering.is_empty()
+    });
     assert!(
         lingering.is_empty(),
         "a panic orphaned {lingering:?} (the backgrounded job was {bg}, panes {before:?})"
@@ -154,13 +150,9 @@ fn a_panic_on_a_background_thread_leaves_the_terminal_alone() {
     let before = harness::descendant_pids(roost);
     assert!(h.quit_and_wait(Duration::from_secs(10)).is_some(), "roost did not exit cleanly");
     let mut lingering = before;
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    loop {
+    harness::wait_until(Duration::from_millis(1500), || {
         lingering.retain(|&p| harness::is_alive(p));
-        if lingering.is_empty() || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        lingering.is_empty()
+    });
     assert!(lingering.is_empty(), "panes survived the quit: {lingering:?}");
 }

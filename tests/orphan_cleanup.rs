@@ -15,20 +15,17 @@
 #[allow(dead_code)]
 mod harness;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Wait for every pid in `pids` to be gone, up to `grace`. Returns whatever
 /// is still live at the end.
 fn survivors(pids: &[u32], grace: Duration) -> Vec<u32> {
-    let deadline = Instant::now() + grace;
     let mut left: Vec<u32> = pids.to_vec();
-    loop {
+    harness::wait_until(grace, || {
         left.retain(|&p| harness::is_alive(p));
-        if left.is_empty() || Instant::now() >= deadline {
-            return left;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        left.is_empty()
+    });
+    left
 }
 
 #[test]

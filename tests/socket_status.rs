@@ -23,19 +23,15 @@ use std::time::{Duration, Instant};
 
 /// Poll for a file to exist non-empty, returning its trimmed contents.
 fn wait_for_file(path: &std::path::Path, timeout: Duration) -> Option<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            let s = s.trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let mut contents = None;
+    harness::wait_until(timeout, || {
+        contents = std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        contents.is_some()
+    });
+    contents
 }
 
 /// `roost status 1` against the harness instance, via the real client CLI
@@ -85,14 +81,11 @@ fn socket_exited_on_a_live_pane_is_advisory_not_death() {
     // (recent shell output ⇒ working, else waiting) — never "exited". This
     // round-trips through the same event loop that consumed the status line,
     // so it also serves as the "message was processed" barrier.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        let s = cli_status(h.state_dir());
-        if s.contains("\"status\"") || Instant::now() >= deadline {
-            break s;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let mut status = String::new();
+    harness::wait_until(Duration::from_secs(5), || {
+        status = cli_status(h.state_dir());
+        status.contains("\"status\"")
+    });
     assert!(!status.contains("exited"), "socket 'exited' killed a live pane: {status}");
 
     // No dead-pane error bar on screen...
@@ -145,14 +138,11 @@ fn output_does_not_promote_a_resting_report_while_the_link_is_live_but_does_once
 
     // Round-trip through the event loop (same barrier as the test above) so
     // the link-up + status have definitely both landed before we look.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        let s = cli_status(h.state_dir());
-        if s.contains("\"waiting\"") || Instant::now() >= deadline {
-            break s;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let mut status = String::new();
+    harness::wait_until(Duration::from_secs(5), || {
+        status = cli_status(h.state_dir());
+        status.contains("\"waiting\"")
+    });
     assert!(status.contains("\"waiting\""), "setup: extension report never took: {status}");
 
     // Byte noise while the link is live: composer echo from typing. Must
@@ -175,14 +165,11 @@ fn output_does_not_promote_a_resting_report_while_the_link_is_live_but_does_once
     // output — with the link down, this is the fallback D1 preserves.
     std::thread::sleep(Duration::from_millis(500));
     h.write_bytes(b"echo fallback_restored\r");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        let s = cli_status(h.state_dir());
-        if s.contains("\"working\"") || Instant::now() >= deadline {
-            break s;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let mut status = String::new();
+    harness::wait_until(Duration::from_secs(5), || {
+        status = cli_status(h.state_dir());
+        status.contains("\"working\"")
+    });
     assert!(
         status.contains("\"working\""),
         "output must promote a resting report once the link is down: {status}"

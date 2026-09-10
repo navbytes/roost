@@ -23,7 +23,7 @@ mod harness;
 
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Wait up to `budget` for every pid in `pids` to stop being alive
 /// (`harness::is_alive`, zombie-aware — see its own doc comment for why a
@@ -33,15 +33,12 @@ use std::time::{Duration, Instant};
 /// since these are two different tests files' throwaway spin-wait, not a
 /// piece of the harness proper.
 fn survivors(pids: &[u32], budget: Duration) -> Vec<u32> {
-    let deadline = Instant::now() + budget;
     let mut left: Vec<u32> = pids.to_vec();
-    loop {
+    harness::wait_until(budget, || {
         left.retain(|&p| harness::is_alive(p));
-        if left.is_empty() || Instant::now() >= deadline {
-            return left;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        left.is_empty()
+    });
+    left
 }
 
 #[test]

@@ -15,22 +15,16 @@
 #[allow(dead_code)]
 mod harness;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Poll for a file to exist non-empty, returning its contents.
 fn wait_for_file(path: &std::path::Path, timeout: Duration) -> Option<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if !s.trim().is_empty() {
-                return Some(s);
-            }
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let mut contents = None;
+    harness::wait_until(timeout, || {
+        contents = std::fs::read_to_string(path).ok().filter(|s| !s.trim().is_empty());
+        contents.is_some()
+    });
+    contents
 }
 
 /// The value of `key` in an `env(1)` dump, matched on whole lines so
