@@ -44,14 +44,11 @@ fn status_hook_subcommand_reports_over_the_real_socket() {
     let bin = env!("CARGO_BIN_EXE_roost");
     h.write_bytes(format!("{bin} __status needs_input\r").as_bytes());
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        let s = cli_status(h.state_dir());
-        if s.contains("needs_input") || Instant::now() >= deadline {
-            break s;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let mut status = String::new();
+    harness::wait_until(Duration::from_secs(5), || {
+        status = cli_status(h.state_dir());
+        status.contains("needs_input")
+    });
     assert!(status.contains("needs_input"), "status hook never landed: {status}");
 
     let _ = h.quit_and_wait(Duration::from_secs(5));

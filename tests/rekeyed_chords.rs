@@ -81,11 +81,7 @@ fn focused_pane(state_dir: &std::path::Path) -> Option<u64> {
 /// the first frame, and every scenario here reads it.
 fn wait_for_control(h: &mut harness::Harness) -> std::path::PathBuf {
     let sd = h.state_dir().to_path_buf();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while focused_pane(&sd).is_none() {
-        assert!(std::time::Instant::now() < deadline, "the control CLI never came up");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    harness::wait_for_control_cli(|| focused_pane(&sd).is_some());
     sd
 }
 

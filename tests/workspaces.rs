@@ -103,11 +103,10 @@ fn dump_tree(root: &std::path::Path) -> String {
 /// not a verdict (this failed exactly that way under parallel load).
 fn wait_for_workspace_socket(root: &std::path::Path, name: &str) {
     let dir = root.join("workspaces").join(name);
-    let deadline = Instant::now() + WAIT;
-    while !(dir.join("roost.sock").exists() && dir.join("control.token").exists()) {
-        assert!(Instant::now() < deadline, "the workspace socket/token never appeared at {dir:?}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let up = harness::wait_until(WAIT, || {
+        dir.join("roost.sock").exists() && dir.join("control.token").exists()
+    });
+    assert!(up, "the workspace socket/token never appeared at {dir:?}");
 }
 
 /// Block until workspace `owner`'s instance actually **holds** the claim on
