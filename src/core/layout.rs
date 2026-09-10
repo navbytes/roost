@@ -638,8 +638,8 @@ pub struct PaneRect {
     pub collapsed: bool,
 }
 
-/// C43: rail row width at the labelled tier — long enough for a status
-/// glyph, a marker, and a few id digits at the glyph tier's floor.
+/// C43: rail row width at the glyph tier — long enough for a marker, a
+/// status glyph, and a few id digits.
 pub const RAIL_GLYPH_COLS: u16 = 6;
 
 /// C43: how wide the solo-view rail is at `body_width` columns. Three
@@ -664,6 +664,25 @@ pub fn solo_rects(body: Rect, focused: PaneId) -> (u16, PaneRect) {
     let rw = rail_width(body.width);
     let rect = Rect { x: body.x + rw, y: body.y, width: body.width - rw, height: body.height };
     (rw, PaneRect { id: focused, rect, collapsed: false })
+}
+
+/// C43: how many of the rail's `n` panes are actually drawn as a row —
+/// `rail_height` includes the header (row 0), so the rest holds panes, one
+/// per row, until they don't fit; the *last* row then gives way to the
+/// `…` overflow marker instead of a pane. Shared by `draw_rail` (what to
+/// draw) and `rail_row_at` (what a click may land on), so the two can
+/// never disagree about which row, if any, is the `…` — a click there
+/// must hit nothing, not whichever pane the marker displaced.
+pub fn rail_visible_rows(rail_height: u16, n: usize) -> usize {
+    let body_rows = rail_height.saturating_sub(1) as usize;
+    if body_rows == 0 {
+        return 0;
+    }
+    if n > body_rows {
+        body_rows - 1
+    } else {
+        n
+    }
 }
 
 /// A stack's header row (C6) — shown above its members, in the space it
@@ -2099,5 +2118,22 @@ mod tests {
         assert_eq!(pr.id, 7);
         assert!(!pr.collapsed);
         assert_eq!(pr.rect, Rect { x: 2 + rw, y: 3, width: 120 - rw, height: 30 });
+    }
+
+    #[test]
+    fn rail_visible_rows_gives_way_to_the_overflow_marker_only_once_needed() {
+        // Header + 5 body rows (height 6): everything fits up to 5 panes.
+        assert_eq!(rail_visible_rows(6, 3), 3, "no overflow, every row is a pane");
+        assert_eq!(rail_visible_rows(6, 5), 5, "exactly full, still no overflow");
+        // 6 panes in 5 body rows: the last row becomes `…`, so only 4 are drawn.
+        assert_eq!(rail_visible_rows(6, 6), 4, "one row spent on the `…` marker");
+        assert_eq!(
+            rail_visible_rows(6, 50),
+            4,
+            "however many are hidden, still just the one marker"
+        );
+        // No body rows at all: not even the marker has anywhere to go.
+        assert_eq!(rail_visible_rows(1, 3), 0, "height 1 is the header alone");
+        assert_eq!(rail_visible_rows(0, 3), 0, "degenerate height never panics");
     }
 }

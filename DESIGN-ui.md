@@ -6100,13 +6100,22 @@ full body height, no divider column (the shown pane's own left border is
 the rule, §2 background policy). Two tiers by body width: **labelled**
 (≥ 100 cols, `clamp(width/5, 20, 32)` columns, a full C8 row per pane —
 `▎` marker · glyph · id · name · fill · `adapter · word`) and **glyph**
-(40–99 cols, `RAIL_GLYPH_COLS = 6` columns, marker + glyph + id); below 40,
-no rail — the pane takes the body. Row 0 is the header (`" SOLO · N
-PANES"` labelled / `" SOLO"` glyph, C6's underline, belongs to no pane);
-rows below are `pane_order()`, recomputed every frame like the roster —
-renames, status flips and closes show up live. `layout::rail_width` and
-`layout::solo_rects` are pure and unit-tested; `App::rail_area`/
-`App::rail_rows` are the seam render, mouse and PTY-resize all read.
+(40–99 cols, `RAIL_GLYPH_COLS = 6` columns, marker + glyph + id in C8's
+own ink/quiet ramp — the bare id is this tier's only text); below 40, no
+rail — the pane takes the body. Row 0 is the header (`" SOLO · N PANES"`
+left / `"ALT+↑↓ "` right-aligned at the labelled tier, C6's underline,
+belongs to no pane; `" SOLO"` alone at the glyph tier). The right segment
+sheds first when both don't fit (C8's right-to-left rule) — the labelled
+tier's own floor (20 cols) is already too narrow for `" SOLO · N PANES"`
+(15) plus `"ALT+↑↓ "` (7) at once, so a header that showed both
+unconditionally would mangle into `PANESALT+↑` rather than degrade
+cleanly. Rows below are `pane_order()`, recomputed every frame like the
+roster — renames, status flips and closes show up live. `layout::rail_width`,
+`layout::solo_rects` and `layout::rail_visible_rows` (how many rows are
+drawn before the `…` overflow marker takes the last slot) are pure and
+unit-tested; `App::rail_area`/`App::rail_rows`/`App::solo_shown` (the pane
+actually shown — not bare `self.focused`, which the float owns while
+shown) are the seam render, mouse and PTY-resize all read.
 
 **Keys inside a solo tab.** Every chord keeps its `Action`; only dispatch
 is solo-aware:

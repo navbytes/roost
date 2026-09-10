@@ -355,12 +355,19 @@ pub fn picker_row_at(rect: Rect, items: usize, col: u16, row: u16) -> Option<usi
 /// Row 0 of the rail is the header — it belongs to no pane, the same rule
 /// a stack's own header row follows — so it and anything outside `rail`
 /// hit nothing. The rail draws no border (§2 background policy), so every
-/// column inside counts, unlike the picker's bordered dialog above.
+/// column inside counts, unlike the picker's bordered dialog above. Past
+/// the last row `draw_rail` actually drew a pane on — including the `…`
+/// overflow marker's own row, when there is one — also hits nothing:
+/// `layout::rail_visible_rows` is the one seam both this and `draw_rail`
+/// read, so a click can never land on a pane the marker displaced.
 pub fn rail_row_at(rail: Rect, rows: &[PaneId], col: u16, row: u16) -> Option<PaneId> {
     if col < rail.x || col >= rail.x + rail.width || row >= rail.y + rail.height {
         return None;
     }
     let i = row.checked_sub(rail.y + 1)? as usize;
+    if i >= crate::core::layout::rail_visible_rows(rail.height, rows.len()) {
+        return None;
+    }
     rows.get(i).copied()
 }
 
@@ -1205,5 +1212,20 @@ mod tests {
         assert_eq!(rail_row_at(rail, &rows, 25, 2), None, "right of the rail");
         assert_eq!(rail_row_at(rail, &rows, 5, 0), None, "above the rail");
         assert_eq!(rail_row_at(rail, &rows, 5, 11), None, "below the rail");
+    }
+
+    /// design-supervisor finding: a click on the `…` overflow row used to
+    /// resolve to whichever pane the marker had displaced — the one row
+    /// `draw_rail` never actually painted an id into. `rail_visible_rows`
+    /// is the seam that keeps this in lockstep with what's drawn.
+    #[test]
+    fn rail_row_at_the_overflow_marker_row_hits_nothing() {
+        // Header (row 1) + 3 body rows (rows 2..4) for 5 ids: only 2 are
+        // drawn as panes (rows 2, 3); row 4 is the `…` marker.
+        let rail = Rect::new(0, 1, 20, 4);
+        let rows = vec![10u64, 11, 12, 13, 14];
+        assert_eq!(rail_row_at(rail, &rows, 0, 2), Some(10), "first drawn row");
+        assert_eq!(rail_row_at(rail, &rows, 0, 3), Some(11), "second drawn row");
+        assert_eq!(rail_row_at(rail, &rows, 0, 4), None, "the `…` row itself, not pane 12");
     }
 }

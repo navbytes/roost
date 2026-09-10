@@ -1093,18 +1093,10 @@ impl<B: PaneBackend> App<B> {
             // index, with no float/zoom cleanup along that path). So
             // `prev_focus`, recorded for whatever tab was active when the
             // float went up, can name a pane that is not in the tab solo
-            // is now showing. Resolve the same way `close_pane_id`'s U11
-            // fallback and `hide_float`/`close_float` do: trust
-            // `self.focused` only while it is actually a member of this
-            // tab (the float owns it while shown, which never is), else
-            // fall back to the tab's own remembered focus.
-            let focused = if self.ws.active_tab().panes.contains_key(&self.focused) {
-                self.focused
-            } else {
-                let active = self.ws.active_tab;
-                self.tab_focus_target(active).or_else(|| self.first_visible()).unwrap_or(0)
-            };
-            v.push(layout::solo_rects(body, focused).1);
+            // is now showing. `solo_shown` resolves it the same way
+            // `close_pane_id`'s U11 fallback and `hide_float`/`close_float`
+            // do instead.
+            v.push(layout::solo_rects(body, self.solo_shown()).1);
         } else {
             v.extend(self.rects());
         }
@@ -1349,6 +1341,25 @@ impl<B: PaneBackend> App<B> {
     /// on).
     pub fn rail_rows(&self) -> Vec<PaneId> {
         self.pane_order()
+    }
+
+    /// C43: the pane solo actually shows — `self.focused` while it's
+    /// really a member of the active tab, else the tab's own remembered
+    /// focus. The float owns `self.focused` while shown, which never
+    /// satisfies that, and — unlike `zoomed`, cleared on every real tab
+    /// switch — solo is a persisted per-tab flag that can survive one (see
+    /// `display_rects`'s solo branch for the full reasoning), so
+    /// `self.focused` alone isn't safe to trust here the way it is
+    /// elsewhere. The one accessor `display_rects` and `draw_rail`'s
+    /// focused-row marker both read, so the two can never disagree about
+    /// which row carries `▎`.
+    pub fn solo_shown(&self) -> PaneId {
+        if self.ws.active_tab().panes.contains_key(&self.focused) {
+            self.focused
+        } else {
+            let active = self.ws.active_tab;
+            self.tab_focus_target(active).or_else(|| self.first_visible()).unwrap_or(0)
+        }
     }
 
     /// The active tab's pane that's actually visible with no other
@@ -20659,7 +20670,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleSolo);
         let rows = app.rail_rows();
         assert_eq!(rows.len(), 3);
-        app.focused = rows[0];
+        app.set_focus(rows[0]);
         app.apply(Action::Focus(layout::Dir::Up));
         assert_eq!(app.focused, rows[0], "clamped silently at the top row");
         assert!(app.flash().is_none(), "C31's dead end is silent, not flashed");
@@ -20694,7 +20705,7 @@ pub(crate) mod tests {
         app.apply(Action::NewPane); // 3 panes
         app.apply(Action::ToggleSolo);
         let before = app.rail_rows();
-        app.focused = before[1];
+        app.set_focus(before[1]);
         app.apply(Action::MovePane(layout::Dir::Up));
         let after = app.rail_rows();
         assert_eq!(app.focused, before[1], "focus follows the pane, id unchanged");
@@ -20772,7 +20783,7 @@ pub(crate) mod tests {
         let rows = app.rail_rows();
         assert_eq!(rows.len(), 3);
 
-        app.focused = rows[1];
+        app.set_focus(rows[1]);
         app.apply(Action::ClosePane);
         assert_eq!(app.focused, rows[2], "lands on the row below when there is one");
 

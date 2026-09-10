@@ -2810,21 +2810,35 @@ fn draw_stack_header(f: &mut Frame<'_>, header: layout::StackHeader) {
 
 /// C43's rail header text (row 0) for the given rail width — the labelled
 /// tier gets `stack_header_text`'s own shape with `STACK` swapped for
-/// `SOLO`, same degrade-by-overflow rule (Paragraph clips visually, never
-/// panics); the glyph tier has no room for the count or the right segment,
-/// so it just says the word, space-padded to fill the row.
+/// `SOLO`, but **not** its unconditional right segment: at the labelled
+/// tier's own floor (20 cols) `" SOLO · N PANES"` plus `"ALT+↑↓ "` already
+/// overflows, so the right segment sheds first (C8's right-to-left rule,
+/// `collapsed_row_spans`'s own tactic) rather than the header mangling
+/// into `PANESALT+↑`. Left alone still degrades by overflow (Paragraph
+/// clips visually, never panics) below its own width. The glyph tier has
+/// no room for the count or the right segment either, so it just says the
+/// word, space-padded to fill the row.
 fn rail_header_text(width: u16, n: usize) -> String {
     if width <= layout::RAIL_GLYPH_COLS {
         let left = " SOLO";
         let pad = width.saturating_sub(left.chars().count() as u16);
-        format!("{left}{}", " ".repeat(pad as usize))
-    } else {
-        let left = format!(" SOLO · {n} PANES");
-        let right = "ALT+↑↓ ";
-        let pad = width
-            .saturating_sub(left.chars().count() as u16)
-            .saturating_sub(right.chars().count() as u16);
+        return format!("{left}{}", " ".repeat(pad as usize));
+    }
+    let left = format!(" SOLO · {n} PANES");
+    let right = "ALT+↑↓ ";
+    let left_w = left.chars().count() as u16;
+    let right_w = right.chars().count() as u16;
+    if left_w + right_w <= width {
+        let pad = width - left_w - right_w;
         format!("{left}{}{right}", " ".repeat(pad as usize))
+    } else {
+        // C8's right-to-left shedding rule: the right segment goes first,
+        // same as `collapsed_row_spans`'s right segment dropping before the
+        // left side ever clips. Left alone still degrades by overflow
+        // (Paragraph clips visually) rather than panicking, same as
+        // `stack_header_text`.
+        let pad = width.saturating_sub(left_w);
+        format!("{left}{}", " ".repeat(pad as usize))
     }
 }
 
@@ -2851,7 +2865,13 @@ fn rail_glyph_row_spans(
     vec![
         marker,
         Span::styled(glyph.to_string(), glyph_style),
-        Span::raw(format!("{rest}{}", " ".repeat(pad as usize))),
+        // C8's own ink/quiet ramp, same as the labelled tier's name column
+        // (`collapsed_row_spans`) — the bare id is this tier's only text,
+        // so it carries the same style that column would.
+        Span::styled(
+            format!("{rest}{}", " ".repeat(pad as usize)),
+            collapsed_name_style(status, focused),
+        ),
     ]
 }
 
@@ -2863,20 +2883,24 @@ fn rail_glyph_row_spans(
 /// DESIGN-ui.md C43 / PROPOSAL.md §2.2).
 fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, spinner: char) {
     let rows = app.rail_rows();
+    // Not `app.focused` directly: while the float is shown it owns that,
+    // and `solo_shown` is the one accessor `display_rects` also reads, so
+    // the row `▎` marks always agrees with the pane actually on screen.
+    let shown = app.solo_shown();
     f.render_widget(
         Paragraph::new(rail_header_text(rail.width, rows.len()))
             .style(theme::quiet().add_modifier(Modifier::UNDERLINED)),
         Rect::new(rail.x, rail.y, rail.width, 1),
     );
-    let body_rows = rail.height.saturating_sub(1);
-    if body_rows == 0 {
+    if rail.height < 2 {
         return; // no room for even one pane row under the header
     }
-    let overflow = rows.len() as u16 > body_rows;
-    let shown = if overflow { body_rows - 1 } else { body_rows };
-    for (i, &id) in rows.iter().take(shown as usize).enumerate() {
+    // Shared with `mouse::rail_row_at` so drawing and hit-testing can never
+    // disagree about which row, if any, is the `…` overflow marker.
+    let visible = layout::rail_visible_rows(rail.height, rows.len());
+    for (i, &id) in rows.iter().take(visible).enumerate() {
         let row = Rect::new(rail.x, rail.y + 1 + i as u16, rail.width, 1);
-        let focused = app.focused == id;
+        let focused = shown == id;
         let status = app.display_status(id).unwrap_or(AgentStatus::Exited);
         let spans = if rail.width <= layout::RAIL_GLYPH_COLS {
             rail_glyph_row_spans(focused, Some(status), id, spinner)
@@ -2902,7 +2926,7 @@ fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, sp
         };
         f.render_widget(Paragraph::new(Line::from(spans)), row);
     }
-    if overflow {
+    if rows.len() > visible {
         let row = Rect::new(rail.x, rail.y + rail.height - 1, rail.width, 1);
         f.render_widget(Paragraph::new("…").style(theme::quiet()), row);
     }
@@ -3966,6 +3990,23 @@ mod tests {
         assert!(text.starts_with(" STACK · 3 PANES"));
         assert!(text.ends_with("ALT+↑↓ "));
         assert_eq!(text, text.to_uppercase());
+    }
+
+    /// C43/design-supervisor: the labelled tier's own floor (20 cols, the
+    /// `chrome_buffers()` "solo view" fixture's own width at a 100-col
+    /// body) is too narrow for `" SOLO · N PANES"` (15) plus `"ALT+↑↓ "`
+    /// (7) at once — 22 > 20. The right segment must shed first (C8's
+    /// right-to-left rule), not concatenate into a mangled
+    /// `PANESALT+↑`. A width past the combined need keeps both.
+    #[test]
+    fn rail_header_text_sheds_the_right_segment_before_it_would_overflow() {
+        let text = super::rail_header_text(20, 3);
+        assert_eq!(text, " SOLO · 3 PANES     ", "the right segment sheds whole, not clipped");
+        assert!(!text.contains("ALT"), "no partial ALT+↑ debris at a width that can't fit it");
+
+        let text = super::rail_header_text(22, 3);
+        assert_eq!(text, " SOLO · 3 PANESALT+↑↓ ", "exactly enough room, no fill");
+        assert!(text.ends_with("ALT+↑↓ "), "wide enough now, so it keeps the right segment");
     }
 
     #[test]
@@ -6462,7 +6503,22 @@ row's — widen ADAPTER_COL",
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(frame.contains("SOLO · 3 PANES"), "the rail header:\n{frame}");
+            // The exact row, not just a substring: at this fixture's own
+            // width (100 cols -> rw=20) `" SOLO · 3 PANES"` (15) plus
+            // `"ALT+↑↓ "` (7) already overflows 20, so a `.contains` check
+            // alone would still pass on the mangled `PANESALT+↑` this once
+            // rendered — the right segment must have shed instead.
+            let header_row: String =
+                (0..rw).filter_map(|x| buf.cell((x, 1)).map(|c| c.symbol().to_string())).collect();
+            assert_eq!(
+                header_row,
+                super::rail_header_text(rw, 3),
+                "the header row exactly matches the pure fn at this width:\n{frame}"
+            );
+            assert!(
+                !header_row.contains("ALT"),
+                "no room for the right segment here: {header_row:?}"
+            );
             let marker_row: String = (0..rw)
                 .filter_map(|x| buf.cell((x, 2 + i as u16)).map(|c| c.symbol().to_string()))
                 .collect();

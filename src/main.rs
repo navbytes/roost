@@ -994,7 +994,20 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
             && me.column < rail.x + rail.width
             && me.row >= rail.y
             && me.row < rail.y + rail.height;
-        if inside {
+        // At the glyph tier the float's centered rect can overlap the
+        // 6-column rail, and the float draws on top of it (C22 stacking
+        // order) — so a point the float actually covers must reach it via
+        // the ordinary hit-test below, not be swallowed here first.
+        // `display_rects()` is the one seam both paths read, float always
+        // first when shown, so this can't disagree with what's on screen.
+        let over_float = mouse::hit_test(&app.display_rects(), me.column, me.row)
+            .is_some_and(|pr| app.is_float(pr.id));
+        if inside && !over_float {
+            // Selection-freeze design audit D1, same as copy mode/modal
+            // above: a drag that started on a pane and overshot into the
+            // rail on release must not leave the P20 latch set with no one
+            // left to release it.
+            app.release_mouse_gesture();
             if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
                 if let Some(id) = mouse::rail_row_at(rail, &app.rail_rows(), me.column, me.row) {
                     app.on_click(id);
