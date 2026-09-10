@@ -640,6 +640,29 @@ pub fn descendant_pids(pid: u32) -> Vec<u32> {
     all
 }
 
+/// `Harness::wait_for` for facts that are not on a screen: poll `pred` to a
+/// deadline, `true` the moment it holds, `false` on timeout.
+///
+/// The off-screen twin matters because `settle` answers "the grid stopped
+/// changing", which a roost that has not started drawing yet also satisfies
+/// — `ratatui::init()` writes the alt-screen and mode sequences before
+/// `run()` builds the `App`, so the bytes gate is already open while the
+/// grid is legitimately blank. A scenario that needs roost to have reached
+/// some *side effect* (a socket bound, a session claim taken) has to wait
+/// for that side effect itself; `settle` is not a proxy for it.
+pub fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    loop {
+        if pred() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
 /// Whether `pid` still names a **running** process.
 ///
 /// `kill -0` alone is not that question: it succeeds for a zombie, which is
