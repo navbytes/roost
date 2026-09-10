@@ -16,7 +16,7 @@ mod harness;
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -426,11 +426,10 @@ fn the_default_workspace_writes_the_same_files_in_the_same_places() {
     assert!(h.settle(WAIT), "initial frame never settled");
 
     let state = h.state_dir();
-    let deadline = Instant::now() + WAIT;
-    while !state.join("roost.sock").exists() {
-        assert!(Instant::now() < deadline, "the default socket never appeared");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        harness::wait_until(WAIT, || state.join("roost.sock").exists()),
+        "the default socket never appeared"
+    );
     assert!(state.join("workspace.json").exists(), "state stays in the root");
     assert!(
         !state.join("workspaces").exists(),
@@ -671,11 +670,10 @@ fn a_sigkilled_instance_releases_its_claim_for_the_next_restore() {
     let roost_a = ha.pid();
     // SAFETY: `kill(2)` on a pid this test owns, with SIGKILL — no pointers.
     unsafe { libc::kill(roost_a as libc::pid_t, libc::SIGKILL) };
-    let deadline = Instant::now() + WAIT;
-    while harness::is_alive(roost_a) {
-        assert!(Instant::now() < deadline, "the SIGKILLed instance never died");
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    assert!(
+        harness::wait_until(WAIT, || !harness::is_alive(roost_a)),
+        "the SIGKILLed instance never died"
+    );
 
     let Some(mut hb) = spawn_named(
         &root,

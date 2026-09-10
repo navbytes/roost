@@ -70,18 +70,14 @@ fn pane_is_live(state_dir: &std::path::Path, pane: &str) -> bool {
 }
 
 fn wait_until_reachable(state_dir: &std::path::Path, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
+    let mut last = None;
+    let reachable = harness::wait_until(timeout, || {
         let o = cli_in(state_dir, &["list"]);
-        if o.status.success() {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "roost's control socket never became reachable: {o:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        let ok = o.status.success();
+        last = Some(o);
+        ok
+    });
+    assert!(reachable, "roost's control socket never became reachable: {:?}", last.unwrap());
 }
 
 /// QA repro: `roost --version` used to fall through to launching the TUI —

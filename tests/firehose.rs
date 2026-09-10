@@ -181,14 +181,10 @@ fn firehose_latency_starvation_and_clean_exit() {
     // leader (see `harness::descendant_pids` doc comment), so "no live pid
     // from the pre-quit set" is exactly "process-group absence" for all of
     // them.
-    let deadline = Instant::now() + Duration::from_millis(800);
     let mut lingering: Vec<u32> = before.clone();
-    loop {
+    harness::wait_until(Duration::from_millis(800), || {
         lingering.retain(|&pid| harness::is_alive(pid));
-        if lingering.is_empty() || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        lingering.is_empty()
+    });
     assert!(lingering.is_empty(), "orphaned process(es) survived Alt+q: {lingering:?}");
 }

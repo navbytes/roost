@@ -52,11 +52,7 @@ fn alt_i_carries_the_focused_pane_into_the_next_tab_without_restarting_it() {
         h.wait_for(Duration::from_secs(15), |s| s.contents().contains("1 main")).is_some(),
         "roost never drew its tab bar",
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while pane_tab(&sd, 1).is_none() {
-        assert!(std::time::Instant::now() < deadline, "the control CLI never came up");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    harness::wait_for_control_cli(|| pane_tab(&sd, 1).is_some());
     assert_eq!(pane_tab(&sd, 1), Some((0, true)), "the fixture starts on tab 1's only pane");
 
     // Mark the running shell so "the same process" is provable after the
