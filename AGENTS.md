@@ -1,6 +1,6 @@
 # roost — orientation
 
-roost: a session-native terminal multiplexer for AI agent CLIs (pi, Claude
+roost: a session-native terminal multiplexer for AI agent CLIs (pi, Codex
 Code, shell), in Rust + ratatui. No daemon — workspace resurrection rides on
 each adapter's own session ids.
 
