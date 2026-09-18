@@ -9,7 +9,7 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, ...). 
 - [DONE] #legacy_cedf Legacy issue: v0.1.21 everywhere: stack focus fix shipped, expansion-stability fuzz property, release request (#185) -> v0.1.21 everywhere: stack focus fix shipped, expansion-stability fuzz property, release request (#185) (fixed)
 
 ## Decisions
-- No decisions logged yet.
+- Refactor: Refactor code structure for improved readability and maintainability [.gitignore]
 
 ## Notes
 - archive named-workspaces; sync its three capability specs to main
