@@ -278,12 +278,16 @@ impl StateStore for FsStore {
         let salvage = |why: &str| -> (Option<Workspace>, Option<String>) {
             let bak = self.path.with_extension(format!("json.corrupt-{}", std::process::id()));
             let moved = fs::rename(&self.path, &bak).is_ok();
-            let where_ = if moved {
-                format!("saved as {}", bak.display())
-            } else {
-                "could not be saved aside".to_string()
+            // The salvage name leads, and the reason trails: a flash is one
+            // row wide and the tail is what gets cut, so the half the user
+            // can act on must not be the half that goes. The bare file name,
+            // not the path — the directory is the one they just launched in.
+            let where_ = match (moved, bak.file_name()) {
+                (true, Some(name)) => format!("saved as {}", name.to_string_lossy()),
+                (true, None) => format!("saved as {}", bak.display()),
+                (false, _) => "could not be saved aside".to_string(),
             };
-            (None, Some(format!("workspace.json {why} — {where_}, starting fresh")))
+            (None, Some(format!("workspace.json {where_}, starting fresh — {why}")))
         };
         match serde_json::from_str::<Workspace>(&raw) {
             Ok(ws) if ws.version > SCHEMA_VERSION => {
