@@ -1282,7 +1282,7 @@ fn draw_help_columns(
                 // `HELP_COL_FLOOR`. The glyph is C14's picker marker and
                 // C27's roster marker, the same "↵ acts on this row" idiom
                 // in its third overlay, so nothing new is being taught.
-                HelpLine::Row(k, d, _) => {
+                HelpLine::Row(k, d, runs) => {
                     let prefix = help_key_prefix(k);
                     let marked = at == Some((i, row));
                     let key = if marked {
@@ -1296,9 +1296,19 @@ fn draw_help_columns(
                     // whose whole job is being readable when you are lost.
                     // `elide_key` already does this for the key column.
                     let room = width.saturating_sub(mouse::display_width(&key));
+                    // In the palette the cursor skips rows `↵` cannot run, so
+                    // those rows' keys step down to the quiet red and the row
+                    // under `❯` lifts to ink — the picker's and roster's own
+                    // selected-row rung — so what `↓` will land on is legible.
+                    let key_style = if cursor.is_some() && runs.is_none() {
+                        theme::accent_quiet()
+                    } else {
+                        theme::accent()
+                    };
+                    let desc_style = if marked { theme::ink() } else { theme::quiet() };
                     Line::from(vec![
-                        Span::styled(key, theme::accent()),
-                        Span::styled(elide_to(d, room), theme::quiet()),
+                        Span::styled(key, key_style),
+                        Span::styled(elide_to(d, room), desc_style),
                     ])
                 }
             })
@@ -5868,6 +5878,43 @@ mod tests {
     /// reader needs. Nothing widened the dialog because nothing could;
     /// the query had to give instead. Found by the C39 design audit, which
     /// also found why no test saw it (the floor gate above was vacuous).
+    /// [C41] In the palette, what `↓` can land on reads differently from
+    /// what it skips: read-only rows' keys drop to the quiet red, and the
+    /// row under `❯` lifts its description to ink.
+    #[test]
+    fn the_palette_marks_runnable_rows_and_lifts_the_selected_one() {
+        use crate::core::app::Mode;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(120, 40));
+        app.apply(Action::Help);
+        app.mode = Mode::Help { top: 0, filter: Some(String::new()), cursor: 0 };
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row = |y: u16| -> String {
+            (0..120).filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string())).collect()
+        };
+        let find = |needle: &str| (0..40u16).find(|&y| row(y).contains(needle)).expect(needle);
+        let dim_at = |y: u16, x: u16| buf.cell((x, y)).unwrap().modifier.contains(Modifier::DIM);
+        let key_x = |y: u16| row(y).chars().position(|c| c == 'A').unwrap() as u16;
+
+        // A direction family is read-only; a single chord runs.
+        let family = find("move focus");
+        assert!(dim_at(family, key_x(family)), "a read-only row's key is the quiet red");
+        let runs = find("new shell pane");
+        assert!(!dim_at(runs, key_x(runs)), "a runnable row's key keeps the full red");
+
+        let marked = find(&theme::PICKER_SELECTED.to_string());
+        let text = row(marked);
+        let last = text.trim_end_matches(|c: char| !c.is_alphabetic()).chars().count() - 1;
+        assert!(!dim_at(marked, last as u16), "the selected row's description is ink: {text:?}");
+    }
+
     #[test]
     fn a_query_wider_than_the_terminal_elides_and_keeps_the_way_out() {
         let floor = Rect::new(0, 0, 80, 24);
