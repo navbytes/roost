@@ -274,7 +274,10 @@ pi-tui's own default loader frames, verbatim) · `◆` U+25C6 · `○` U+25CB ·
 U+00B7 · `✕` U+2715 · `▎` U+258E (active-tab / focused-row marker) ·
 `│` U+2502 (tab separator) · `▏` U+258F
 (rename cursor, existing) · `❯` U+276F (picker selection) · `✓` U+2713
-(saved) · `…` U+2026 (tab overflow). All are single-width — including every
+(saved) · `…` U+2026 (the clip marker — tab overflow, and [Amended 2026-09-18, clip marker] any chrome
+text cut short: `theme::OVERFLOW` in `quiet()` where a run of spans is cut
+(`clip_spans`), or in the cut text's own style where one string is
+(`elide_to` — so a flash's `…` is reversed with it)). All are single-width — including every
 spinner frame, so the swap costs no badge-column or tab-strip width anywhere.
 The double-width `🪶` is removed with the brand block (C2), eliminating the
 wide-glyph offset hazard in mouse math.
@@ -817,7 +820,9 @@ the placement moved, and with it:
   name deleted the status glyph — the one element reporting whether the
   agent is alive. The tail is now fixed and the *name* absorbs the
   shortfall, down to nothing; a title that cannot fit even ` {glyph} `
-  disappears whole rather than clipping the glyph in half.
+  disappears whole rather than clipping the glyph in half. [Amended 2026-09-18, clip marker] A
+  name that is cut ends in `…` (`elide_to`), so it never passes for a
+  name that simply ends there.
 - **Styling does *not* follow C21's "match the border you sit on".** That
   rule is right for `ZOOM · {n} hidden`, which is one undifferentiated
   statement about the pane. This title has structure C5 requires be
@@ -1150,7 +1155,8 @@ focused = Black on status-color bg, unfocused = status-color fg.
   see SPEC-GAP-1.
 - Focused row additionally paints bg `RULE` across the full row width;
   unfocused rows have no bg.
-- When the row is too narrow, the right segment drops first (name clips last).
+- When the row is too narrow, the right segment drops first (name clips last,
+  `…`-marked — [Amended 2026-09-18, clip marker], via `clip_spans`).
 - Click-to-expand behavior unchanged.
 - [Amended 2026-07-22, fleet features] A raw pane's right segment carries the
   `raw · ` prefix per C23.
@@ -1489,6 +1495,10 @@ generic notices — "copied", extension updates — so it gets the neutral
 elevated treatment, not a reserved color; ok-green is banned from chrome.)
 Timing/precedence unchanged.
 
+**[Amended 2026-09-18, clip marker]:** a flash wider than its row is cut and `…`-marked inside its
+padding. The corrupt-workspace flash leads with the salvage file name and
+trails the reason, so the actionable half is the half that survives.
+
 **[Amended 2026-07-27, SPEC-ux U14]:** Styling and timing are untouched, but
 the *copy* flash's wording is now contracted — it was the one flash that
 could lie, firing at extraction time while `clipboard::copy` discarded both
@@ -1719,7 +1729,9 @@ modals; derived from its rules):**
 - Backdrop: `Modifier::DIM` on every body cell outside the dialog —
   mechanism unchanged (`:126–141`).
 - Anchoring: `centered_near(anchor, body, w, h)` unchanged, including its
-  tests (`:507–527`).
+  tests (`:507–527`). [Amended 2026-09-18, clip marker] Except the two fleet overlays (C20, C27),
+  which pass the body as their own anchor: they are about every pane, not
+  the focused one.
 - [Amended 2026-07-22, fleet features] The feed overlay (C20) is a fourth
   C12 modal. Modals are the **topmost** chrome layer — above the float pane
   (C22) and the zoomed view (C21); stacking order is contracted in C22.
@@ -1925,7 +1937,9 @@ together:
 fg `MUTED` — same key/label system as the hint bar. Content unchanged.
 Width fits the widest content line (key column + longest description),
 clamped to screen bounds; anchoring via `centered_near` unchanged — no
-mid-word clipping of its own content. [Amended 2026-07-22, ux finding #1;
+mid-word clipping of its own content. [Amended 2026-09-18, clip marker] Below the width that fits
+every description, a description is cut mid-word after all, `…`-marked —
+the `Paragraph` used to clip it with no marker, which is worse. [Amended 2026-07-22, ux finding #1;
 the fixed 52-col width predates the restyle and clipped descriptions.]
 
 **[Amended 2026-07-22, fleet features]:** "content unchanged" is superseded —
@@ -2500,11 +2514,13 @@ extension events (`app.rs:1081`) or is polled from `StatusTracker`
 
   Session-detection events are deliberately excluded (noise, not action).
 - **Geometry:** centered on `body_area()`;
-  `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`; C12 frame
+  `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)` — the cap;
+  [Amended 2026-09-18, clip marker] the drawn height comes down to the content (`App::overlay_size`,
+  shared with C27); C12 frame
   (Plain `ACCENT` border, title `" activity "`, `Clear` interior, DIM
   backdrop). At the 80×24 floor: 72×16, fits.
-- **Entry rows**, newest at the bottom, one row per entry (no wrap; the
-  paragraph clips long lines at the overlay width):
+- **Entry rows**, newest at the bottom, one row per entry (no wrap; a
+  long line is cut at the overlay width and `…`-marked, [Amended 2026-09-18, clip marker]):
   `" HH:MM:SS  {text}"` — timestamp (local wall clock) fg `DIM`, text fg
   `MUTED`. Exception: a `status` line whose new state is NeedsInput renders
   its text fg `FG` prefixed with `◆ ` fg `ACCENT` — the one red in the feed,
@@ -3295,11 +3311,16 @@ you.**
   introducer, so it carries none of N3's DCS ambiguity.)
 - **Surface: a C12 modal** (`Mode::Roster`), drawn through the existing frame
   + `draw_mode_overlay` path — the same machinery the feed, picker and help
-  use, so the backdrop, border, anchoring and U8 mouse rules all apply
-  unchanged. It is the **fifth** C12 modal (C12's U8 amendment lists four).
-- **Geometry:** the roster calls `feed_overlay_size` directly —
-  `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`, anchored by
-  `centered_near` like every other modal. Deliberately one function, not a
+  use, so the backdrop, border and U8 mouse rules all apply unchanged
+  (anchoring: the body, as C20 — see Geometry). It is the **fifth** C12 modal (C12's U8 amendment lists four).
+- **Geometry:** the roster shares C20's `App::overlay_size` ([Amended 2026-09-18, clip marker]; it
+  used to call `feed_overlay_size` directly, which is now the cap) —
+  `w = min(72, body.width − 4)`, `h = min(16, body.height − 4)`, centred on
+  the body like C20 (not on the focused pane: the roster is fleet-wide, and a
+  pane anchor pushed it off-centre at 80 columns). [Amended 2026-09-18, clip marker] `App::overlay_size`
+  brings the height down to the larger of the *unfiltered* fleet (panes plus
+  one header per group) and the feed, so a small fleet is not framed in empty
+  rows, and a filter or a toggle still never resizes it. Deliberately one function, not a
   copy: the two overlays answer the fleet's two questions and must not
   resize under a user toggling between them, and the 80×24 floor is then
   proven once for both.
@@ -5075,8 +5096,9 @@ pinning test had only ever exercised the default keymap: a default-only
 assertion about a quantity that had just stopped being constant.)
 
 So a resolved key column is **elided** to fit: cut at a `" / "` boundary with
-a trailing `…`, never mid-chord. **The key yields and the description never
-does** — a reader who sees two of eight chords still learns what the row is
+a trailing `…`, never mid-chord. **The key yields first and the description
+last** ([Amended 2026-09-18, clip marker] — it used to read "never", but a column narrower than the
+longest description clipped it anyway, unmarked; it is now `…`-marked) — a reader who sees two of eight chords still learns what the row is
 for and can widen the terminal for the rest, while a clipped description
 teaches nothing at any width. Pinned by
 `one_help_column_fits_the_floor_under_a_remap_too`, which sweeps the configs
