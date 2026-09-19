@@ -1400,8 +1400,21 @@ impl<B: PaneBackend> App<B> {
                 let name = if spec.is_some() { self.chrome_name(id) } else { "?".into() };
                 let noted = spec.is_some_and(|s| s.note.is_some());
                 let raw = self.is_raw(id);
-                let status = self.display_status(id).unwrap_or(AgentStatus::Exited);
-                collapsed_row_min_cols(&name, adapter, has_title, raw, noted, Some(status))
+                // Sized for the widest state word, never the current one: a
+                // status flip must not resize the shown pane and reflow the
+                // agent inside it.
+                [
+                    None,
+                    Some(AgentStatus::Working),
+                    Some(AgentStatus::NeedsInput),
+                    Some(AgentStatus::Waiting),
+                    Some(AgentStatus::Idle),
+                    Some(AgentStatus::Exited),
+                ]
+                .into_iter()
+                .map(|st| collapsed_row_min_cols(&name, adapter, has_title, raw, noted, st))
+                .max()
+                .unwrap_or(0)
             })
             .fold(header, u16::max)
     }
