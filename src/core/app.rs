@@ -1764,7 +1764,7 @@ impl<B: PaneBackend> App<B> {
         for (id, o) in observations {
             let Some(spec) = self.find_spec_mut(id) else { continue };
             if let Some(cwd) = o.cwd {
-                if spec.cwd != cwd && !same_dir(&spec.cwd, &cwd) {
+                if spec.cwd != cwd {
                     spec.cwd = cwd.clone();
                     visited.push(cwd);
                     dirty = true;
@@ -4425,18 +4425,8 @@ impl<B: PaneBackend> App<B> {
                 // previous visit, and the cwd column parked on its most
                 // recent entry (which is the pane you are splitting off, so
                 // the zero-keystroke launch matches the pre-U20 behavior).
-                // …and opened on the first adapter that is actually
-                // installed. Row 0 is `pi`, so a machine without it met a
-                // picker whose zero-keystroke launch was `pi not found` —
-                // the cursor parked on the one row that cannot run. Falls
-                // back to 0 when nothing is installed, which is the honest
-                // answer: every row says `not found` and none is better.
-                let selection = crate::agents::picker_ids()
-                    .into_iter()
-                    .position(|id| adapter_installed(id, &self.registry))
-                    .unwrap_or(0);
                 self.mode =
-                    Mode::Picker { selection, filter: String::new(), cwd: 0, on_cwd: false };
+                    Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false };
             }
             Action::ScrollMode => {
                 // U9: entering Scroll mode after wheeling continues from the
@@ -5982,24 +5972,7 @@ impl<B: PaneBackend> App<B> {
     /// (shared) overlay height, at least one row/entry. The single source
     /// for both keyboards' PgUp/PgDn and the feed's wheel notch.
     fn overlay_page(&self) -> usize {
-        (self.overlay_size().1 / 2).max(1) as usize
-    }
-
-    /// C20/C27: what the two fleet overlays actually draw at —
-    /// `feed_overlay_size`'s cap brought down to the rows there are to show.
-    /// A one-pane fleet used to get two rows of content inside a sixteen-row
-    /// frame, and a filter matching nothing left `no pane matches` floating
-    /// in the middle of an empty box; the keymap overlay has shrunk to its
-    /// filtered content since C39 and these two never did.
-    ///
-    /// Height is the *larger* of the two overlays' needs, which is what
-    /// keeps the property the shared size existed for: toggling roster↔feed
-    /// still never resizes the frame.
-    pub fn overlay_size(&self) -> (u16, u16) {
-        let (w, cap) = feed_overlay_size(self.body_area());
-        let content = self.roster_rows().len().max(self.feed.len()).max(1);
-        // The two border rows the content sits between.
-        (w, (content as u16).saturating_add(2).min(cap))
+        (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize
     }
 
     // ---- C27: the fleet roster ------------------------------------------
@@ -6147,7 +6120,7 @@ impl<B: PaneBackend> App<B> {
 
     /// How many rows the overlay can show at once (its inner height).
     fn roster_view_rows(&self) -> usize {
-        self.overlay_size().1.saturating_sub(2) as usize
+        feed_overlay_size(self.body_area()).1.saturating_sub(2) as usize
     }
 
     /// C15: the keymap's paging step — half its visible height, at least one
@@ -8463,22 +8436,6 @@ fn alt_hint_line(term_program: Option<&str>) -> &'static str {
             " Alt keys aren't reaching roost? Turn on your terminal's Option/Alt-as-Meta setting (send Esc+) "
         }
     }
-}
-
-/// Do these two paths name the same directory? Spelling differs from
-/// identity wherever a symlink does: the kernel reports a pane's cwd fully
-/// resolved (`/private/var/…` on macOS), while `workspace.json` holds
-/// whatever the user or the spawning pane wrote (`/var/…`). Taking the
-/// observation as a `cd` rewrote the spec on the first tick, and the tab
-/// bar's path visibly changed spelling and width moments after launch.
-///
-/// Only consulted when the two strings already differ, so the two
-/// `canonicalize` calls cost nothing in the steady state. A path that
-/// cannot be resolved (deleted under the pane) compares as itself, which
-/// leaves the plain `!=` answer standing.
-fn same_dir(a: &Path, b: &Path) -> bool {
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    real(a) == real(b)
 }
 
 /// Pure decision behind `App::focused_cwd`: abbreviate a `$HOME`-rooted path
@@ -11913,9 +11870,6 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::QuickLaunch);
         assert!(matches!(app.mode, Mode::Picker { .. }));
-        // From row 0, not from wherever this machine's $PATH puts the
-        // opening cursor — this test is about the move, not the default.
-        pin_picker_to_row_0(&mut app);
         // pick item 1 ("claude")
         app.handle_mode_key(KeyEvent::from(KeyCode::Down));
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
@@ -12631,30 +12585,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The picker opens on the first *installed* adapter, which depends on
-    /// the machine's `$PATH`. Tests about movement want a fixed start.
-    fn pin_picker_to_row_0<B: PaneBackend>(app: &mut App<B>) {
-        if let Mode::Picker { selection, .. } = &mut app.mode {
-            *selection = 0;
-        }
-    }
-
-    /// The picker's cursor opens on a row that can actually run: row 0 is
-    /// `pi`, whose substituted launch program never resolves in this suite,
-    /// so an opening cursor of 0 would be the one row `↵` cannot launch.
-    #[test]
-    fn the_picker_opens_on_an_adapter_that_is_actually_installed() {
-        let (mut app, _) = mk_app(shell_ws());
-        app.apply(Action::QuickLaunch);
-        let Mode::Picker { selection, .. } = &app.mode else { panic!("picker") };
-        let rows = app.picker_filtered();
-        assert!(
-            !rows[*selection].contains(PICKER_MISSING_SUFFIX),
-            "opened on {:?}, which cannot launch",
-            rows[*selection],
-        );
-    }
-
     /// U20: `↑`/`↓` steer whichever column has the keyboard, and `←`/`→`
     /// hand it over. Without this the second column would be unreachable.
     #[test]
@@ -12664,7 +12594,6 @@ pub(crate) mod tests {
         app.note_cwd(PathBuf::from("/a"));
         app.note_cwd(PathBuf::from("/b")); // → [/b, /a, /tmp]
         app.apply(Action::QuickLaunch);
-        pin_picker_to_row_0(&mut app);
         press(&mut app, KeyCode::Down);
         let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
         assert_eq!((*selection, *cwd, *on_cwd), (1, 0, false), "↓ moves the adapter column");

@@ -126,10 +126,8 @@ pub const RENAME_CURSOR: char = '▏'; // U+258F
 pub const PICKER_SELECTED: char = '❯'; // U+276F
 /// Save-indicator "saved" glyph.
 pub const SAVED: char = '✓'; // U+2713
-/// The clip marker: any chrome text cut short wears it, so a cut never
-/// passes for a name that simply ends there. The tab strip's own, spent
-/// on pane titles, badges and collapsed rows too since 2026-09-18.
-pub const OVERFLOW: char = '…'; // U+2026
+/// Tab-bar overflow clip marker.
+pub const TAB_OVERFLOW: char = '…'; // U+2026
 /// Scrollback marker (U3): leads the badge's `↑N` token and the scroll
 /// hint's `↑N/M` position whenever a pane's view is frozen in history.
 pub const SCROLLED: char = '↑'; // U+2191
