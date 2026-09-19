@@ -10,7 +10,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
-    feed_overlay_size, App, FeedEntry, Mode, RenameTarget, RosterRow, Search, Selection, TabSummary,
+    App, FeedEntry, Mode, RenameTarget, RosterRow, Search, Selection, TabSummary,
 };
 use crate::core::control::Actor;
 use crate::core::layout::{self, Dir, PaneRect};
@@ -537,7 +537,11 @@ fn fit_hint_pairs<K: AsRef<str>>(hints: &[(K, &'static str)], right_w: u16, widt
 fn draw_flash<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect) -> bool {
     let Some(msg) = app.flash() else { return false };
     f.render_widget(Clear, area);
-    f.render_widget(Paragraph::new(format!(" {msg} ")).style(theme::attention()), area);
+    // A flash that outgrows its row used to be clipped by the `Paragraph`
+    // with nothing to show for it — and the salvage path in the corrupt
+    // workspace flash is exactly the kind of tail that got eaten.
+    let text = format!(" {} ", elide_to(msg, area.width.saturating_sub(2)));
+    f.render_widget(Paragraph::new(text).style(theme::attention()), area);
     true
 }
 
@@ -1192,6 +1196,12 @@ fn help_title(
 /// Cut `text` to `room` columns, marking the cut with `…` when it bites.
 /// Room for nothing at all yields nothing at all — an ellipsis alone says
 /// less than the count and exit hint it would be stealing space from.
+///
+/// The one place chrome cuts a *word*: an unmarked cut reads as a short
+/// name, so `a-very-long-pane-name` clipped to a border looked like a pane
+/// genuinely called `a-very-long-pane-na`. `…` is already the sanctioned
+/// overflow glyph (§2 inventory, the tab strip's own); `clip_spans` spends
+/// it for the same reason on a run of styled spans.
 fn elide_to(text: &str, room: u16) -> String {
     if mouse::display_width(text) <= room {
         return text.to_string();
@@ -1199,9 +1209,7 @@ fn elide_to(text: &str, room: u16) -> String {
     if room == 0 {
         return String::new();
     }
-    let keep = room.saturating_sub(1) as usize;
-    let cut: String = text.chars().take(keep).collect();
-    format!("{cut}…")
+    format!("{}…", take_width(text, room - 1))
 }
 
 /// [F9] Does this row survive the type-ahead query? Case-insensitive over
@@ -1282,9 +1290,15 @@ fn draw_help_columns(
                     } else {
                         prefix
                     };
+                    // The description is the half that overruns a narrow
+                    // column, and the `Paragraph` used to clip it mid-word
+                    // with nothing to show for it — on the one surface
+                    // whose whole job is being readable when you are lost.
+                    // `elide_key` already does this for the key column.
+                    let room = width.saturating_sub(mouse::display_width(&key));
                     Line::from(vec![
                         Span::styled(key, theme::accent()),
-                        Span::styled(d.to_string(), theme::quiet()),
+                        Span::styled(elide_to(d, room), theme::quiet()),
                     ])
                 }
             })
@@ -1699,7 +1713,15 @@ pub fn modal_rect<B: PaneBackend>(app: &App<B>) -> Option<Rect> {
         .find(|pr| pr.id == app.focused)
         .map(|pr| pr.rect)
         .unwrap_or(body);
-    dialog_rect(&app.mode, body, anchor, picker_rows(app), app.picker_cwds(), app.keymap())
+    dialog_rect(
+        &app.mode,
+        body,
+        anchor,
+        picker_rows(app),
+        app.picker_cwds(),
+        app.keymap(),
+        app.overlay_size(),
+    )
 }
 
 /// How many rows `dialog_rect` should size the picker's adapter column to —
@@ -1734,6 +1756,7 @@ fn dialog_rect(
     rows: usize,
     cwds: &[std::path::PathBuf],
     keymap: &Keymap,
+    overlay: (u16, u16),
 ) -> Option<Rect> {
     match mode {
         // Copy mode has no centered overlay — the cursor/selection are
@@ -1771,16 +1794,19 @@ fn dialog_rect(
             let (w, h) = help_layout(body, keymap, filter.as_deref()).size;
             Some(centered_near(anchor, body, w, h))
         }
-        Mode::Feed { .. } => {
-            let (w, h) = feed_overlay_size(body);
-            Some(centered_near(anchor, body, w, h))
-        }
-        // C27: deliberately the feed's own geometry — the two overlays
+        // C20/C27: deliberately one geometry for both — the two overlays
         // answer the fleet's two questions and should not resize under a
-        // user toggling between them.
-        Mode::Roster { .. } => {
-            let (w, h) = feed_overlay_size(body);
-            Some(centered_near(anchor, body, w, h))
+        // user toggling between them (`App::overlay_size`, which is also
+        // what stops a small fleet rattling around a fixed frame).
+        //
+        // Centred on the *body*, not on the focused pane: these two are
+        // about the whole fleet, and anchoring them to one pane pushed a
+        // 71-column frame off-centre in an 80-column terminal, leaving a
+        // strip of the panes behind showing past its edge that read as a
+        // rendering fault rather than as a backdrop.
+        Mode::Feed { .. } | Mode::Roster { .. } => {
+            let (w, h) = overlay;
+            Some(centered_near(body, body, w, h))
         }
     }
 }
@@ -1795,9 +1821,15 @@ fn draw_mode_overlay<B: PaneBackend>(
     anchor: Rect,
     spinner: char,
 ) {
-    let Some(rect) =
-        dialog_rect(&app.mode, body, anchor, picker_rows(app), app.picker_cwds(), app.keymap())
-    else {
+    let Some(rect) = dialog_rect(
+        &app.mode,
+        body,
+        anchor,
+        picker_rows(app),
+        app.picker_cwds(),
+        app.keymap(),
+        app.overlay_size(),
+    ) else {
         return;
     };
     match &app.mode {
@@ -2135,6 +2167,7 @@ fn draw_feed_entries(f: &mut Frame<'_>, feed: &VecDeque<FeedEntry>, offset: usiz
                 &e.text,
                 e.needs_input,
                 i == selected,
+                inner.width,
             ))
         })
         .collect();
@@ -2162,24 +2195,26 @@ fn feed_window(len: usize, offset: usize, rows: usize) -> std::ops::Range<usize>
 /// The row's leading column is a selection marker: `❯` `accent` on the entry
 /// Enter would act on, a space on every other row — same idiom as the
 /// picker (C14).
+/// A row wider than the overlay is `…`-marked rather than clipped by the
+/// `Paragraph` — a feed line is mostly free text and the tail is where the
+/// detail lives, so a silent cut is the one that costs something.
 fn feed_entry_spans(
     hhmmss: &str,
     text: &str,
     needs_input: bool,
     selected: bool,
+    width: u16,
 ) -> Vec<Span<'static>> {
     let marker = if selected { theme::PICKER_SELECTED } else { ' ' };
-    let mut spans = vec![
-        Span::styled(marker.to_string(), theme::accent()),
-        Span::styled(format!("{hhmmss}  "), theme::quiet()),
-    ];
+    let mut parts =
+        vec![(marker.to_string(), theme::accent()), (format!("{hhmmss}  "), theme::quiet())];
     if needs_input {
-        spans.push(Span::styled(format!("{} ", theme::GLYPH_NEEDS_INPUT), theme::accent()));
-        spans.push(Span::styled(text.to_string(), theme::ink()));
+        parts.push((format!("{} ", theme::GLYPH_NEEDS_INPUT), theme::accent()));
+        parts.push((text.to_string(), theme::ink()));
     } else {
-        spans.push(Span::styled(text.to_string(), theme::quiet()));
+        parts.push((text.to_string(), theme::quiet()));
     }
-    spans
+    clip_spans(&parts, width)
 }
 
 /// Local wall-clock `HH:MM:SS` for a feed entry's timestamp (C20). Uses libc
@@ -2239,7 +2274,7 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect, spi
     // marker, now at whichever end is hiding tabs). It occupies column 0,
     // which is why `TabStrip::x0` exists.
     if strip.left_marker {
-        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), theme::quiet()));
+        spans.push(Span::styled(theme::OVERFLOW.to_string(), theme::quiet()));
         used += strip.x0;
     }
     // Left to right, one 9-part span group per tab (marker/label/glyph/count/
@@ -2262,7 +2297,7 @@ fn draw_tab_bar<B: PaneBackend>(f: &mut Frame<'_>, app: &App<B>, area: Rect, spi
     // ...and a trailing `…` when tabs remain past the right edge and a
     // spare column is left to show it in (overflow, C2).
     if strip.right_marker {
-        spans.push(Span::styled(theme::TAB_OVERFLOW.to_string(), theme::quiet()));
+        spans.push(Span::styled(theme::OVERFLOW.to_string(), theme::quiet()));
         used += 1;
     }
 
@@ -2450,8 +2485,18 @@ fn badge_text(name: &str, adapter: &str, has_title: bool) -> String {
 /// chars (D1): a wide glyph (CJK, emoji) in a renamed pane/tab counts as the
 /// two columns it actually draws, and a clip point never splits one in half.
 fn clip_spans(parts: &[(String, Style)], budget: u16) -> Vec<Span<'static>> {
-    let mut spans = Vec::with_capacity(parts.len());
-    let mut left = budget;
+    let total: u16 = parts.iter().map(|(t, _)| mouse::display_width(t)).sum();
+    if total <= budget {
+        return parts.iter().map(|(t, s)| Span::styled(t.clone(), *s)).collect();
+    }
+    if budget == 0 {
+        return Vec::new();
+    }
+    // Something has to go, so the last column buys the `…` that says so
+    // (see `elide_to`) — in `quiet()`, the overflow marker's own style
+    // wherever else chrome spends it.
+    let mut spans = Vec::with_capacity(parts.len() + 1);
+    let mut left = budget - 1;
     for (text, style) in parts {
         if left == 0 {
             break;
@@ -2465,6 +2510,7 @@ fn clip_spans(parts: &[(String, Style)], budget: u16) -> Vec<Span<'static>> {
             left = 0;
         }
     }
+    spans.push(Span::styled(theme::OVERFLOW.to_string(), theme::quiet()));
     spans
 }
 
@@ -3088,9 +3134,9 @@ fn identity_title(
     if fixed > budget || text.trim().is_empty() {
         return None;
     }
-    // Whatever the tail leaves is the name's. `take_width` keeps the clip
-    // off a wide glyph's second half (D1).
-    let name = take_width(text, budget - fixed);
+    // Whatever the tail leaves is the name's, `…`-marked when it bites —
+    // `elide_to` keeps the clip off a wide glyph's second half (D1).
+    let name = elide_to(text, budget - fixed);
     let mut parts: Vec<(String, Style)> = Vec::with_capacity(tail.len() + 1);
     if name.is_empty() {
         // Clipped to nothing: the glyph still reports, and a stray separator
@@ -3534,7 +3580,9 @@ mod tests {
                 assert!(ch != '\u{fffd}', "{text:?}");
             }
         }
-        assert_eq!(ident(8, "日本語"), format!(" 日本 {} ", theme::GLYPH_WORKING));
+        // The cut is marked, and `…` is one column — so the budget buys
+        // one wide glyph plus the marker, not two wide glyphs unannounced.
+        assert_eq!(ident(8, "日本語"), format!(" 日… {} ", theme::GLYPH_WORKING));
     }
 
     /// P7: every way the pane can be "not showing a cursor" suppresses
@@ -3748,9 +3796,9 @@ mod tests {
             col: 0,
             pane: 1,
         };
-        let one = dialog_rect(&mk(1), body, body, 0, &[], &Keymap::default()).unwrap();
+        let one = dialog_rect(&mk(1), body, body, 0, &[], &Keymap::default(), (0, 0)).unwrap();
         assert_eq!((one.width, one.height), (44, 4), "name row + one note line");
-        let five = dialog_rect(&mk(5), body, body, 0, &[], &Keymap::default()).unwrap();
+        let five = dialog_rect(&mk(5), body, body, 0, &[], &Keymap::default(), (0, 0)).unwrap();
         assert_eq!(five.height, 8);
     }
 
@@ -5057,7 +5105,7 @@ mod tests {
     /// column-aligned, which is what actually separates it from the text.
     #[test]
     fn feed_entry_spans_default_styling_is_quiet_throughout() {
-        let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false, false);
+        let spans = feed_entry_spans("12:34:56", "spawned shell (shell)", false, false, 80);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, " 12:34:56  spawned shell (shell)");
         assert_eq!(spans[1].style, theme::quiet());
@@ -5069,8 +5117,8 @@ mod tests {
     /// width and every column after it are unchanged.
     #[test]
     fn feed_entry_spans_mark_the_selected_row_without_shifting_a_column() {
-        let plain = feed_entry_spans("12:34:56", "spawned shell", false, false);
-        let picked = feed_entry_spans("12:34:56", "spawned shell", false, true);
+        let plain = feed_entry_spans("12:34:56", "spawned shell", false, false, 80);
+        let picked = feed_entry_spans("12:34:56", "spawned shell", false, true, 80);
         let text =
             |v: &[super::Span<'_>]| -> String { v.iter().map(|s| s.content.as_ref()).collect() };
         assert_eq!(text(&picked), format!("{}12:34:56  spawned shell", theme::PICKER_SELECTED));
@@ -5083,7 +5131,7 @@ mod tests {
 
     #[test]
     fn feed_entry_spans_needs_input_line_gets_the_accent_diamond_and_ink_text() {
-        let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true, false);
+        let spans = feed_entry_spans("12:34:56", "pi: waiting → needs you", true, false, 80);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             text,
@@ -7289,8 +7337,8 @@ row's — widen ADAPTER_COL",
         // columns zoom actually took. At 14 the two still coexist, so the
         // name survives (clipped) on the left while `ZOOM` holds the right.
         // The pane's display name is "shell · tmp" (mk_app's default cwd);
-        // at this budget it clips to its first three columns.
-        assert!(border.contains("she"), "identity keeps its end of the border: {border:?}");
+        // at this budget it clips to two columns plus the `…` that says so.
+        assert!(border.contains("sh…"), "identity keeps its end of the border: {border:?}");
         // ...and the pane's own first content row, which the badge used to
         // occupy, is the pane's again.
         let content_row: String =

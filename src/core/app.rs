@@ -4425,8 +4425,18 @@ impl<B: PaneBackend> App<B> {
                 // previous visit, and the cwd column parked on its most
                 // recent entry (which is the pane you are splitting off, so
                 // the zero-keystroke launch matches the pre-U20 behavior).
+                // …and opened on the first adapter that is actually
+                // installed. Row 0 is `pi`, so a machine without it met a
+                // picker whose zero-keystroke launch was `pi not found` —
+                // the cursor parked on the one row that cannot run. Falls
+                // back to 0 when nothing is installed, which is the honest
+                // answer: every row says `not found` and none is better.
+                let selection = crate::agents::picker_ids()
+                    .into_iter()
+                    .position(|id| adapter_installed(id, &self.registry))
+                    .unwrap_or(0);
                 self.mode =
-                    Mode::Picker { selection: 0, filter: String::new(), cwd: 0, on_cwd: false };
+                    Mode::Picker { selection, filter: String::new(), cwd: 0, on_cwd: false };
             }
             Action::ScrollMode => {
                 // U9: entering Scroll mode after wheeling continues from the
@@ -5972,7 +5982,31 @@ impl<B: PaneBackend> App<B> {
     /// (shared) overlay height, at least one row/entry. The single source
     /// for both keyboards' PgUp/PgDn and the feed's wheel notch.
     fn overlay_page(&self) -> usize {
-        (feed_overlay_size(self.body_area()).1 / 2).max(1) as usize
+        (self.overlay_size().1 / 2).max(1) as usize
+    }
+
+    /// C20/C27: what the two fleet overlays actually draw at —
+    /// `feed_overlay_size`'s cap brought down to the rows there are to show,
+    /// so a one-pane fleet no longer sits in a sixteen-row frame.
+    ///
+    /// Sized from the *unfiltered* fleet (every pane plus one header per
+    /// tab) and the feed, whichever is larger: a filter must not shrink the
+    /// frame per keystroke, and toggling roster↔feed must not resize it.
+    /// Outside those two modes nothing draws it, so it skips the count —
+    /// `modal_rect` and the frame loop call this unconditionally, the cost
+    /// `picker_rows` documents.
+    pub fn overlay_size(&self) -> (u16, u16) {
+        let (w, cap) = feed_overlay_size(self.body_area());
+        if !matches!(self.mode, Mode::Roster { .. } | Mode::Feed { .. }) {
+            return (w, cap);
+        }
+        let tabs: usize =
+            self.ws.tabs.iter().filter(|t| !t.panes.is_empty()).map(|t| t.panes.len() + 1).sum();
+        // The float rides last under a header of its own (C22/C27).
+        let fleet = tabs + if self.float.is_some() { 2 } else { 0 };
+        let content = fleet.max(self.feed.len()).max(1);
+        // The two border rows the content sits between.
+        (w, (content as u16).saturating_add(2).min(cap))
     }
 
     // ---- C27: the fleet roster ------------------------------------------
@@ -6120,7 +6154,7 @@ impl<B: PaneBackend> App<B> {
 
     /// How many rows the overlay can show at once (its inner height).
     fn roster_view_rows(&self) -> usize {
-        feed_overlay_size(self.body_area()).1.saturating_sub(2) as usize
+        self.overlay_size().1.saturating_sub(2) as usize
     }
 
     /// C15: the keymap's paging step — half its visible height, at least one
@@ -11870,6 +11904,9 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::QuickLaunch);
         assert!(matches!(app.mode, Mode::Picker { .. }));
+        // From row 0, not from wherever this machine's $PATH puts the
+        // opening cursor — this test is about the move, not the default.
+        pin_picker_to_row_0(&mut app);
         // pick item 1 ("claude")
         app.handle_mode_key(KeyEvent::from(KeyCode::Down));
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
@@ -12585,6 +12622,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// The picker opens on the first *installed* adapter, which depends on
+    /// the machine's `$PATH`. Tests about movement want a fixed start.
+    fn pin_picker_to_row_0<B: PaneBackend>(app: &mut App<B>) {
+        if let Mode::Picker { selection, .. } = &mut app.mode {
+            *selection = 0;
+        }
+    }
+
+    /// The picker's cursor opens on a row that can actually run: row 0 is
+    /// `pi`, whose substituted launch program never resolves in this suite,
+    /// so an opening cursor of 0 would be the one row `↵` cannot launch.
+    #[test]
+    fn the_picker_opens_on_an_adapter_that_is_actually_installed() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::QuickLaunch);
+        let Mode::Picker { selection, .. } = &app.mode else { panic!("picker") };
+        let rows = app.picker_filtered();
+        assert!(
+            !rows[*selection].contains(PICKER_MISSING_SUFFIX),
+            "opened on {:?}, which cannot launch",
+            rows[*selection],
+        );
+    }
+
     /// U20: `↑`/`↓` steer whichever column has the keyboard, and `←`/`→`
     /// hand it over. Without this the second column would be unreachable.
     #[test]
@@ -12594,6 +12655,7 @@ pub(crate) mod tests {
         app.note_cwd(PathBuf::from("/a"));
         app.note_cwd(PathBuf::from("/b")); // → [/b, /a, /tmp]
         app.apply(Action::QuickLaunch);
+        pin_picker_to_row_0(&mut app);
         press(&mut app, KeyCode::Down);
         let Mode::Picker { selection, cwd, on_cwd, .. } = &app.mode else { panic!("picker") };
         assert_eq!((*selection, *cwd, *on_cwd), (1, 0, false), "↓ moves the adapter column");
@@ -15767,6 +15829,25 @@ pub(crate) mod tests {
         // The opening cursor is the ring's own pick (C27's contract) — the
         // real ◆, never the resting agent or a shell.
         assert_eq!(roster_cursor(&app), tab0[1]);
+    }
+
+    /// The fleet overlays fit their unfiltered content, and a filter never
+    /// resizes them — typing into the roster must not jiggle its frame.
+    #[test]
+    fn the_roster_frame_fits_the_fleet_and_holds_still_under_a_filter() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        app.apply(Action::ToggleRoster);
+        let (_, h) = app.overlay_size();
+        assert!(h as usize >= app.roster_rows().len() + 2, "every row fits: {h}");
+        assert!(h < feed_overlay_size(app.body_area()).1, "and no taller than the fleet");
+        for c in "zzz".chars() {
+            app.handle_mode_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(
+                c,
+            )));
+        }
+        assert!(app.roster_rows().is_empty(), "the filter matched nothing");
+        assert_eq!(app.overlay_size().1, h, "…and the frame did not move");
     }
 
     /// C22's float is not a tab, so it rides last under its own header —
