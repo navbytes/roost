@@ -21333,9 +21333,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// And the end of that path: the yielded chord really does quit. A
-    /// quiet fleet quits on the first press (U1), so one `apply` is the
-    /// whole story — the busy-fleet confirm has its own tests.
     /// §7's open item, resolved: a text dialog holding typing the user has
     /// not committed refuses a stray Alt chord (and says why) instead of
     /// dropping the text — every editor, and quitting still quits.
@@ -21366,6 +21363,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// And the end of that path: the yielded chord really does quit. A
+    /// quiet fleet quits on the first press (U1), so one `apply` is the
+    /// whole story — the busy-fleet confirm has its own tests.
     #[test]
     fn alt_q_quits_from_every_mode() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

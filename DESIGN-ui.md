@@ -163,11 +163,11 @@ should be read against C5's spinner amendment, not looked up as an accessor.
 
 | Token | ratatui expression | Where used in chrome |
 |---|---|---|
-| `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text, the `¶` note marker and the focused badge's note headline (C32) |
+| `ink()` | `Color::Reset` | primary ink: active tab label, waiting glyph ○, modal titles/body/input, the live search query, picker selections, working/needs-input collapsed-row names, **every** focused collapsed row, the tab bar's mode word, the feed's needs-input text, the `¶` note marker and the focused badge's note headline (C32), the palette's selected row's description (C41, amended 2026-09-20) |
 | `quiet()` | `Color::Reset` + `Modifier::DIM` | the one secondary rung: inactive tab labels, corner-badge text, hint labels, picker unselected rows, help descriptions, idle glyph ·, tab-bar cwd + saved word, stack header, collapsed-row right segment and unfocused waiting/idle/exited names, feed timestamps and text, hint-bar mode word, overflow `…`, the note age tag (C32) |
 | `rule()` | `Color::DarkGray` (ANSI 8) | **structure only**: unfocused pane borders (except a boxed collapsed member's, which is stack chrome — C8, amended 2026-09-01), tab separators `│`. Never text (see the legibility principle). |
 | `accent()` | `Color::Red` (ANSI 1) | the one red: focused pane border, active-tab marker `▎`, hint keys, ◆ needs-input, the Working spinner (C5, amended 2026-08-07 — one steady red, no second phase), modal borders, "◆ N needs you", "save failed", spawn-error line, `❯` picker/feed markers |
-| `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, collapsed-member box border (C8, amended 2026-09-01), `raw` badge token (C23), `↑N` badge token (U3) |
+| `accent_quiet()` | `Color::Red` + `Modifier::DIM` | ✕ exited glyph, collapsed-member box border (C8, amended 2026-09-01), `raw` badge token (C23), `↑N` badge token (U3), a read-only row's key in the open palette (C41, amended 2026-09-20) |
 | `attention()` | `Modifier::REVERSED`, no colour | the **neutral** attention surface: the transient flash (C10) |
 | `attention_problem()` | `Color::Red` + `Modifier::REVERSED` | the **problem** bars: alt-warning (C11), dead-pane action bar (C16) |
 | `ok` / `warn` / `info` | — not defined in theme | **no chrome role.** Program-output palette in the mockup only. Must not appear in `src/ui/`. |
@@ -5927,6 +5927,16 @@ this verb belongs anyway: C28 and C33's rule is that a shifted chord carries
 the *pane* where its unshifted sibling carries *you*.
 
 ### C41 — The keymap overlay runs what it teaches (`Alt+?` `/` … `↵`) — [Added 2026-08-28]
+
+**[Amended 2026-09-20, UX review — runnable rows read as runnable.]** Every
+key column used to be `accent()` whether `↵` could run the row or not, and
+`❯` sat in that same red, so `↓` visibly skipped a third of the drawn rows
+with nothing to say why. While the palette is open (the filter is `Some`),
+a row with no action draws its key in `accent_quiet()`; runnable keys keep
+`accent()`; and the row under `❯` lifts its description to `ink()` — the
+C14 picker's and C27 roster's own selected-row rung. The unfiltered poster
+is unchanged: it runs nothing, so it marks nothing. No new token, glyph or
+width. Pinned by `the_palette_marks_runnable_rows_and_lifts_the_selected_one`.
 
 **No new chord, no new overlay, no second list.** C15's keymap already draws
 every binding grouped and labelled; F9 already gave it a `/` type-ahead over
