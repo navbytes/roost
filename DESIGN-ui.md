@@ -6327,6 +6327,32 @@ and `layout::rail_window` (below) are pure and unit-tested;
 shown — not bare `self.focused`, which the float owns while shown) are the
 seam render, mouse and PTY-resize all read.
 
+**[Amended 2026-09-20, rail fits its content.]** The labelled tier's width
+formula above is superseded: `clamp(width/5, 20, 32)` was the rail's width
+regardless of what its rows needed, and with short pane names it spent
+columns on nothing — two short-named panes could leave 24 of 120 columns
+mostly blank. The tier's width is now `content_cols.clamp(20, clamp(width/5,
+20, 32))` (`layout::rail_width`), where `content_cols`
+(`App::rail_content_cols`) is the widest row the rail's own content
+actually needs — a full C8 row (marker, glyph, name, `SEGMENT_GAP_COLS`, the
+right-aligned `adapter · word`) maxed against the header's own minimum
+(`SOLO · N PANES` alone, `rail_header_min_cols`). The old clamp is now only
+the ceiling, never the fixed width, so the rail never gets wider than
+before, only narrower; the 20-column floor is unchanged. `rail_content_cols`
+reads only name/adapter/title/raw/note/status — none of which depend on
+*which* row is focused or on the spinner's current frame — so `Alt+↑/↓` and
+the spinner tick never move this number; it changes only when a pane's own
+content does.
+
+`RAIL_GLYPH_COLS` also changed, from 6 to 12, and with it the glyph tier's
+row: "the bare id is this tier's only text" (the geometry paragraph above)
+is superseded — a bare id doesn't answer "which pane is that" in the one view
+where every other pane is off screen, so `rail_glyph_row_spans` now draws
+marker · glyph · id · space · name, the name cut with `elide_to` (marked
+with `…`) to whatever room the wider tier leaves. The id still leads and is
+never elided away — it stays `roost send <id>`'s join key, the same reason
+C8's 2026-09-10 amendment kept it here after dropping it everywhere else.
+
 **[Amended 2026-09-10, review pass — the id leaves the labelled tier.]** The
 labelled tier's row above (`▎ marker · glyph · id · name · fill · adapter ·
 word`) is C8's own row, reused verbatim through `collapsed_row_spans` — so

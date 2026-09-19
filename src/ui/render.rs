@@ -2814,6 +2814,52 @@ const SEGMENT_GAP_COLS: u16 = 1;
 /// C4 marker's exact meaning here (presence of a parked note, never its
 /// text: collapsed rows and the roster stay reveal-on-visit surfaces).
 /// It rides the right segment, so narrow rows shed it with the segment.
+/// C43 (rail sizing) / C8: the left segment's width, and the right
+/// segment's text and width, for a collapsed row's `name`/`adapter`/etc —
+/// the one seam `collapsed_row_spans` (draws them) and `collapsed_row_min_cols`
+/// (sizes the labelled-tier rail to them) both read, so a row's drawn
+/// footprint and the rail's sizing footprint can never drift apart.
+fn collapsed_row_segments(
+    name: &str,
+    adapter: &str,
+    has_title: bool,
+    raw: bool,
+    noted: bool,
+    status: Option<AgentStatus>,
+) -> (u16, String, u16) {
+    // marker + glyph (1 col each — every marker/status glyph in the theme
+    // is single-width) + a leading space + the name.
+    let left_w = 3 + mouse::display_width(name);
+    let right = if has_title {
+        format!("{adapter} · {} ", row_word(status))
+    } else {
+        format!("{} ", row_word(status))
+    };
+    let right = if raw { format!("raw · {right}") } else { right };
+    // C32: the note marker leads the right segment, its own `ink()` span so
+    // it stays findable in a column of quiet state words.
+    let marker_w: u16 = if noted { 2 } else { 0 }; // "¶ "
+    let right_w = mouse::display_width(&right) + marker_w;
+    (left_w, right, right_w)
+}
+
+/// C43 (rail sizing): the minimum columns a labelled-tier row needs to
+/// render without truncation — `collapsed_row_spans`'s own render
+/// threshold (`left_w + right_w + SEGMENT_GAP_COLS`), read off the shared
+/// `collapsed_row_segments` so the two can never disagree about what a row
+/// needs. `App::rail_content_cols` maxes this over every rail row.
+pub(crate) fn collapsed_row_min_cols(
+    name: &str,
+    adapter: &str,
+    has_title: bool,
+    raw: bool,
+    noted: bool,
+    status: Option<AgentStatus>,
+) -> u16 {
+    let (left_w, _, right_w) = collapsed_row_segments(name, adapter, has_title, raw, noted, status);
+    left_w + right_w + SEGMENT_GAP_COLS
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collapsed_row_spans(
     width: u16,
@@ -2840,17 +2886,8 @@ fn collapsed_row_spans(
         (glyph.to_string(), glyph_style),
         (format!(" {name}"), collapsed_name_style(status, focused)),
     ];
-    let left_w: u16 = left.iter().map(|(t, _)| mouse::display_width(t)).sum();
-    let right = if has_title {
-        format!("{adapter} · {} ", row_word(status))
-    } else {
-        format!("{} ", row_word(status))
-    };
-    let right = if raw { format!("raw · {right}") } else { right };
-    // C32: the note marker leads the right segment, its own `ink()` span so
-    // it stays findable in a column of quiet state words.
-    let marker_w: u16 = if noted { 2 } else { 0 }; // "¶ "
-    let right_w = mouse::display_width(&right) + marker_w;
+    let (left_w, right, right_w) =
+        collapsed_row_segments(name, adapter, has_title, raw, noted, status);
 
     // At least one blank column between the two segments: `width >=
     // left_w + right_w` alone lets an exact fit render `tmpworking` with
@@ -2943,12 +2980,12 @@ fn draw_stack_header(f: &mut Frame<'_>, header: layout::StackHeader) {
 /// word, space-padded to fill the row.
 fn rail_header_text(width: u16, n: usize) -> String {
     if width <= layout::RAIL_GLYPH_COLS {
-        // The one place the rule idiom degenerates: six columns leave a
-        // single cell beside `SOLO`, and a one-cell rule reads as debris
-        // rather than a division — while dropping it entirely would leave
-        // this header with no separation from the rows at all. So the word
-        // sits *centred in* the rule here instead of beside it. Same ink,
-        // same glyph, the only shape that still divides at this width.
+        // The one place the rule idiom degenerates: at the glyph tier's few
+        // columns beside `SOLO`, a rule that thin reads as debris rather
+        // than a division — while dropping it entirely would leave this
+        // header with no separation from the rows at all. So the word sits
+        // *centred in* the rule here instead of beside it. Same ink, same
+        // glyph, the only shape that still divides at this width.
         let word = "SOLO";
         let spare = width.saturating_sub(mouse::display_width(word));
         let lead = spare / 2;
@@ -2961,14 +2998,26 @@ fn rail_header_text(width: u16, n: usize) -> String {
     section_header_text(width, &format!("SOLO · {n} PANES"), Some("ALT+↑↓"))
 }
 
-/// C43: one rail row at the glyph tier (`RAIL_GLYPH_COLS` wide) — marker,
-/// status glyph, space, id, padded to fill the row. The labelled tier
-/// reuses `collapsed_row_spans` wholesale instead; there's no room here for
-/// anything past the bare id.
+/// C43 (rail sizing): the labelled-tier header's own minimum — `rail_header_text`
+/// with no right segment and a zero-length rule, the same floor
+/// `section_header_text`'s own left-alone branch renders at. `App::rail_content_cols`
+/// maxes this against every row's `collapsed_row_min_cols`.
+pub(crate) fn rail_header_min_cols(n: usize) -> u16 {
+    mouse::display_width(&format!("SOLO · {n} PANES")) + 3
+}
+
+/// C43 (amended 2026-09-20, rail fits its content): one rail row at the
+/// glyph tier (`RAIL_GLYPH_COLS` wide) — marker, status glyph, id, a space,
+/// then the pane's display name, cut with `elide_to` to whatever room is
+/// left. The id alone used to be this tier's only text (`roost send <id>`'s
+/// join key, still kept first for that reason), but in the one view where
+/// every other pane is off screen a bare id doesn't answer "which pane is
+/// that" — so the name now rides beside it, truncated rather than dropped.
 fn rail_glyph_row_spans(
     focused: bool,
     status: Option<AgentStatus>,
     id: layout::PaneId,
+    name: &str,
     spinner: char,
 ) -> Vec<Span<'static>> {
     let (base_glyph, glyph_style, spins) = row_status_style(status);
@@ -2978,17 +3027,17 @@ fn rail_glyph_row_spans(
     } else {
         Span::raw(" ")
     };
-    let rest = format!(" {id}");
-    let content_w = 2 + mouse::display_width(&rest); // marker + glyph, 1 col each
-    let pad = layout::RAIL_GLYPH_COLS.saturating_sub(content_w);
+    let room = layout::RAIL_GLYPH_COLS.saturating_sub(2); // marker + glyph, 1 col each
+    let text = elide_to(&format!(" {id} {name}"), room);
+    let pad = room.saturating_sub(mouse::display_width(&text));
     vec![
         marker,
         Span::styled(glyph.to_string(), glyph_style),
         // C8's own ink/quiet ramp, same as the labelled tier's name column
-        // (`collapsed_row_spans`) — the bare id is this tier's only text,
-        // so it carries the same style that column would.
+        // (`collapsed_row_spans`) — the id-and-name text is this tier's
+        // only content, so it carries the same style that column would.
         Span::styled(
-            format!("{rest}{}", " ".repeat(pad as usize)),
+            format!("{text}{}", " ".repeat(pad as usize)),
             collapsed_name_style(status, focused),
         ),
     ]
@@ -3029,13 +3078,13 @@ fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, sp
         let row = Rect::new(rail.x, first_slot + i as u16 * pitch, rail.width, 1);
         let focused = shown == id;
         let status = app.display_status(id).unwrap_or(AgentStatus::Exited);
+        let spec = app.find_spec(id);
+        let name = if spec.is_some() { app.chrome_name(id) } else { "?".into() };
         let spans = if rail.width <= layout::RAIL_GLYPH_COLS {
-            rail_glyph_row_spans(focused, Some(status), id, spinner)
+            rail_glyph_row_spans(focused, Some(status), id, &name, spinner)
         } else {
-            let spec = app.find_spec(id);
             let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
             let adapter = spec.map(|s| s.adapter.clone()).unwrap_or_else(|| "?".into());
-            let name = if spec.is_some() { app.chrome_name(id) } else { "?".into() };
             let noted = spec.is_some_and(|s| s.note.is_some());
             let raw = app.is_raw(id);
             collapsed_row_spans(
@@ -4976,6 +5025,47 @@ mod tests {
         assert!(spans.is_empty());
     }
 
+    /// C43 (amended 2026-09-20, rail fits its content): the glyph tier's
+    /// headline change — a bare id no longer answers "which pane is that"
+    /// in the one view where every other pane is off screen, so the name
+    /// rides beside it. A short id + name fits `RAIL_GLYPH_COLS` (12) whole.
+    #[test]
+    fn rail_glyph_row_spans_carries_the_id_and_the_name() {
+        let spans = super::rail_glyph_row_spans(
+            true,
+            Some(AgentStatus::Working),
+            3,
+            "claude",
+            theme::GLYPH_WORKING,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(mouse::display_width(&text), crate::core::layout::RAIL_GLYPH_COLS);
+        assert!(text.contains('3'), "the id stays — it's the `roost send <id>` join key: {text:?}");
+        assert!(text.contains("claude"), "the name answers 'which pane is that': {text:?}");
+    }
+
+    /// A name too long for the glyph tier's few spare columns is cut, not
+    /// dropped whole — `elide_to`'s own contract, marked with `…` so the
+    /// truncation reads as a cut rather than a short name.
+    #[test]
+    fn rail_glyph_row_spans_elides_a_name_that_does_not_fit() {
+        let spans = super::rail_glyph_row_spans(
+            false,
+            Some(AgentStatus::Idle),
+            42,
+            "a-very-long-agent-session-name",
+            theme::GLYPH_WORKING,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(mouse::display_width(&text), crate::core::layout::RAIL_GLYPH_COLS);
+        assert!(text.contains('…'), "the cut is marked, not silent: {text:?}");
+        assert!(text.contains("42"), "the id still leads the cut text: {text:?}");
+        assert!(
+            !text.contains("a-very-long-agent-session-name"),
+            "the full name does not fit and must not sneak through: {text:?}"
+        );
+    }
+
     /// C8 (amended 2026-09-01): where the C6 geometry grants a collapsed
     /// member its 3 rows, the row draws inside an `accent_quiet()` bordered
     /// box — a collapsed pane reads as a pane, not as a rule between its
@@ -6776,7 +6866,7 @@ row's — widen ADAPTER_COL",
             use crate::core::layout;
             let mut app = three_panes();
             app.apply(Action::ToggleSolo);
-            let rw = layout::rail_width(app.body_area().width);
+            let rw = app.rail_area().expect("solo view carries a rail").width;
             let rows = app.rail_rows();
             let i = rows.iter().position(|&id| id == app.focused).expect("focused is a rail row");
             let buf = snap(&mut app);
@@ -6837,7 +6927,6 @@ row's — widen ADAPTER_COL",
     /// which text names the pane solo is showing.
     #[test]
     fn solo_rail_row_and_the_shown_panes_border_badge_agree_on_a_collision_suffix() {
-        use crate::core::layout;
         use crate::ui::input::Action;
         use ratatui::backend::TestBackend;
         use ratatui::layout::Size;
@@ -6859,7 +6948,7 @@ row's — widen ADAPTER_COL",
         term.draw(|f| super::draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
 
-        let rw = layout::rail_width(app.body_area().width);
+        let rw = app.rail_area().expect("solo view carries a rail").width;
         let rows = app.rail_rows();
         let i = rows.iter().position(|&id| id == shown).expect("the shown pane is a rail row");
         // Header on row 1; at this size (28 body rows for 3 panes) the
@@ -6876,6 +6965,29 @@ row's — widen ADAPTER_COL",
             border_row.contains(&want),
             "the shown pane's own border badge carries the same suffixed name: {border_row:?}"
         );
+    }
+
+    /// C43 (2026-09-20, rail fits its content): the headline claim end to
+    /// end — two short-named panes (the fixture's default `shell · tmp`) at
+    /// a wide body no longer pay for the old fixed `clamp(body_width/5, 20,
+    /// 32)`; the rail shrinks to what its own rows need, and never past
+    /// that old ceiling nor under the labelled tier's own 20-column floor.
+    #[test]
+    fn labelled_rail_shrinks_to_content_and_never_exceeds_the_old_clamp() {
+        use crate::ui::input::Action;
+        use ratatui::layout::Size;
+
+        let mut app = mk_app(Size::new(200, 30));
+        app.apply(Action::NewPane); // two panes, both the fixture's default name
+        app.apply(Action::ToggleSolo);
+
+        let rw = app.rail_area().expect("solo view carries a rail").width;
+        let old_ceiling = (app.body_area().width / 5).clamp(20, 32);
+        assert!(
+            rw < old_ceiling,
+            "two short names should shrink well under the old {old_ceiling}-col ceiling: {rw}"
+        );
+        assert!(rw >= 20, "never narrower than the labelled tier's own floor: {rw}");
     }
 
     /// C43 breathing room: at a height where the spacing predicate holds
@@ -6895,8 +7007,8 @@ row's — widen ADAPTER_COL",
         app.apply(Action::NewPane); // three panes: n=3, rail height 28 -> 1+2*3=7<=28
         app.apply(Action::ToggleSolo);
 
-        let rw = layout::rail_width(app.body_area().width);
         let rail = app.rail_area().expect("solo view carries a rail");
+        let rw = rail.width;
         let rl = layout::rail_layout(rail.height, app.rail_rows().len(), 0);
         assert!(rl.spaced, "this fixture's own point is that its height spaces");
 

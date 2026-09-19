@@ -21,7 +21,7 @@ use crate::ports::{
     ClaimError, ClaimHandle, ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore,
 };
 use crate::ui::input::{Action, Keymap};
-use crate::ui::render::state_word;
+use crate::ui::render::{collapsed_row_min_cols, rail_header_min_cols, state_word};
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -1127,7 +1127,7 @@ impl<B: PaneBackend> App<B> {
             // is now showing. `solo_shown` resolves it the same way
             // `close_pane_id`'s U11 fallback and `hide_float`/`close_float`
             // do instead.
-            v.push(layout::solo_rects(body, self.solo_shown()).1);
+            v.push(layout::solo_rects(body, self.solo_shown(), self.rail_content_cols()).1);
         } else {
             v.extend(self.rects());
         }
@@ -1363,7 +1363,7 @@ impl<B: PaneBackend> App<B> {
             return None;
         }
         let body = self.body_area();
-        let rw = layout::rail_width(body.width);
+        let rw = layout::rail_width(body.width, self.rail_content_cols());
         (rw > 0).then_some(Rect { x: body.x, y: body.y, width: rw, height: body.height })
     }
 
@@ -1372,6 +1372,38 @@ impl<B: PaneBackend> App<B> {
     /// on).
     pub fn rail_rows(&self) -> Vec<PaneId> {
         self.pane_order()
+    }
+
+    /// C43 (amended 2026-09-20, rail fits its content): the widest column
+    /// count the labelled-tier rail's rows actually need — the max of every
+    /// row's `collapsed_row_min_cols` (marker, glyph, name, the gap, and
+    /// `adapter · word`, exactly as `draw_rail` would draw that row) and
+    /// the header's own `rail_header_min_cols`. `rail_width` clamps to
+    /// this, so two short-named panes no longer spend a fifth of the body
+    /// on blank space.
+    ///
+    /// Every input here (name, adapter, has-title, raw, noted, status) is
+    /// independent of *which* row is focused and of the spinner's current
+    /// frame — a status's glyph substitutes for the spinner but never
+    /// changes the row's width — so recomputing this on every call, rather
+    /// than caching it, still leaves the number untouched by `Alt+↑/↓` or
+    /// by the spinner tick; it only moves when a name, pane, or status
+    /// actually changes.
+    fn rail_content_cols(&self) -> u16 {
+        let rows = self.rail_rows();
+        let header = rail_header_min_cols(rows.len());
+        rows.into_iter()
+            .map(|id| {
+                let spec = self.find_spec(id);
+                let has_title = spec.and_then(|s| s.title.as_ref()).is_some();
+                let adapter = spec.map(|s| s.adapter.as_str()).unwrap_or("?");
+                let name = if spec.is_some() { self.chrome_name(id) } else { "?".into() };
+                let noted = spec.is_some_and(|s| s.note.is_some());
+                let raw = self.is_raw(id);
+                let status = self.display_status(id).unwrap_or(AgentStatus::Exited);
+                collapsed_row_min_cols(&name, adapter, has_title, raw, noted, Some(status))
+            })
+            .fold(header, u16::max)
     }
 
     /// C43: the pane solo actually shows — `self.focused` while it's
@@ -21432,7 +21464,7 @@ pub(crate) mod tests {
         assert_eq!(rects[0].id, app.focused);
         assert!(!rects[0].collapsed);
         let body = app.body_area();
-        let rw = layout::rail_width(body.width);
+        let rw = app.rail_area().expect("solo view carries a rail").width;
         assert_eq!(
             rects[0].rect,
             Rect { x: body.x + rw, y: body.y, width: body.width - rw, height: body.height }

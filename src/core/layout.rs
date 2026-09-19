@@ -639,17 +639,24 @@ pub struct PaneRect {
 }
 
 /// C43: rail row width at the glyph tier — long enough for a marker, a
-/// status glyph, and a few id digits.
-pub const RAIL_GLYPH_COLS: u16 = 6;
+/// status glyph, the pane id, and a sliver of its name (**[Amended
+/// 2026-09-20, rail fits its content]** — was 6, id-only, before the name
+/// was added; see `rail_glyph_row_spans`).
+pub const RAIL_GLYPH_COLS: u16 = 12;
 
 /// C43: how wide the solo-view rail is at `body_width` columns. Three
 /// tiers: nothing below 40 (there's no room to spare), a fixed
-/// `RAIL_GLYPH_COLS` from 40 up (glyph + marker only), and a fifth of the
-/// body — clamped to `[20, 32]` — from 100 up, wide enough for labelled
-/// rows.
-pub fn rail_width(body_width: u16) -> u16 {
+/// `RAIL_GLYPH_COLS` from 40 up (glyph + marker only), and — from 100 up —
+/// **[Amended 2026-09-20, rail fits its content]** `content_cols` (the
+/// widest row the rail actually needs — see `App::rail_content_cols`)
+/// clamped to `[20, (body_width / 5).clamp(20, 32)]`. The clamp's ceiling is
+/// exactly the old fixed width, so the rail only ever gets narrower than it
+/// used to, never wider; its floor keeps a labelled row legible even for
+/// two panes named `a` and `b`.
+pub fn rail_width(body_width: u16, content_cols: u16) -> u16 {
     if body_width >= 100 {
-        (body_width / 5).clamp(20, 32)
+        let ceiling = (body_width / 5).clamp(20, 32);
+        content_cols.clamp(20, ceiling)
     } else if body_width >= 40 {
         RAIL_GLYPH_COLS
     } else {
@@ -659,9 +666,10 @@ pub fn rail_width(body_width: u16) -> u16 {
 
 /// C43: the rail width and the solo-shown pane's rect for a `body` area —
 /// the rail along the left edge, the focused pane taking the rest. Never
-/// collapsed: a solo pane is always the one thing on screen.
-pub fn solo_rects(body: Rect, focused: PaneId) -> (u16, PaneRect) {
-    let rw = rail_width(body.width);
+/// collapsed: a solo pane is always the one thing on screen. `content_cols`
+/// is `rail_width`'s own labelled-tier input — see `App::rail_content_cols`.
+pub fn solo_rects(body: Rect, focused: PaneId, content_cols: u16) -> (u16, PaneRect) {
+    let rw = rail_width(body.width, content_cols);
     let rect = Rect { x: body.x + rw, y: body.y, width: body.width - rw, height: body.height };
     (rw, PaneRect { id: focused, rect, collapsed: false })
 }
@@ -2173,18 +2181,37 @@ mod tests {
 
     #[test]
     fn rail_width_steps_through_its_three_tiers() {
-        assert_eq!(rail_width(39), 0, "below 40: no room to spare");
-        assert_eq!(rail_width(40), RAIL_GLYPH_COLS);
-        assert_eq!(rail_width(99), RAIL_GLYPH_COLS);
-        assert_eq!(rail_width(100), 20, "100/5 = 20, the floor of the clamp");
-        assert_eq!(rail_width(160), 32, "160/5 = 32, the ceiling of the clamp");
-        assert_eq!(rail_width(200), 32, "200/5 = 40, clamped down to 32");
+        assert_eq!(rail_width(39, 0), 0, "below 40: no room to spare");
+        assert_eq!(rail_width(40, 0), RAIL_GLYPH_COLS);
+        assert_eq!(rail_width(99, 0), RAIL_GLYPH_COLS);
+        assert_eq!(
+            rail_width(100, 0),
+            20,
+            "100/5 = 20, the floor of the clamp, even with no content"
+        );
+        // A generous `content_cols` (999) pins the labelled tier at its old
+        // fixed ceiling, so these two still read exactly as before.
+        assert_eq!(rail_width(160, 999), 32, "160/5 = 32, the ceiling of the clamp");
+        assert_eq!(rail_width(200, 999), 32, "200/5 = 40, clamped down to 32");
+    }
+
+    /// **[2026-09-20]** the labelled tier's headline change: it shrinks to
+    /// whatever the rail's rows actually need, never past the old
+    /// `clamp(body_width/5, 20, 32)` ceiling, and never below the 20-column
+    /// floor either.
+    #[test]
+    fn rail_width_shrinks_to_content_but_never_past_the_old_clamp() {
+        assert_eq!(rail_width(120, 12), 20, "content narrower than the floor clamps up to it");
+        assert_eq!(rail_width(120, 22), 22, "content between the floor and the old ceiling wins");
+        assert_eq!(rail_width(120, 99), 24, "120/5 = 24: content past it clamps back down");
     }
 
     #[test]
     fn solo_rects_pane_keeps_at_least_80_columns_from_100_up() {
         for w in 100..=240u16 {
-            let (rw, pr) = solo_rects(Rect::new(0, 0, w, 40), 1);
+            // 999 pins the rail at the old clamp's ceiling — this test's own
+            // point is the pane's floor, not the rail's new content-fit.
+            let (rw, pr) = solo_rects(Rect::new(0, 0, w, 40), 1, 999);
             assert_eq!(rw + pr.rect.width, w, "rail + pane account for the whole width");
             assert!(pr.rect.width >= 80, "at {w} cols the pane rect is only {}", pr.rect.width);
         }
@@ -2192,7 +2219,7 @@ mod tests {
 
     #[test]
     fn solo_rects_pane_sits_right_of_the_rail() {
-        let (rw, pr) = solo_rects(Rect::new(2, 3, 120, 30), 7);
+        let (rw, pr) = solo_rects(Rect::new(2, 3, 120, 30), 7, 999);
         assert_eq!(pr.id, 7);
         assert!(!pr.collapsed);
         assert_eq!(pr.rect, Rect { x: 2 + rw, y: 3, width: 120 - rw, height: 30 });
