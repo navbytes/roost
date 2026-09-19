@@ -996,7 +996,7 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
             && me.row >= rail.y
             && me.row < rail.y + rail.height;
         // At the glyph tier the float's centered rect can overlap the
-        // 6-column rail, and the float draws on top of it (C22 stacking
+        // narrow rail, and the float draws on top of it (C22 stacking
         // order) — so a point the float actually covers must reach it via
         // the ordinary hit-test below, not be swallowed here first.
         // `display_rects()` is the one seam both paths read, float always

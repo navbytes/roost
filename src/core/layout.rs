@@ -639,14 +639,21 @@ pub struct PaneRect {
 }
 
 /// C43: rail row width at the glyph tier — long enough for a marker, a
-/// status glyph, and a few id digits.
-pub const RAIL_GLYPH_COLS: u16 = 6;
+/// status glyph, the pane id, and a sliver of its name (**[Amended
+/// 2026-09-20, glyph tier names the pane]** — was 6, id-only, before the
+/// name was added; see `rail_glyph_row_spans`).
+pub const RAIL_GLYPH_COLS: u16 = 12;
 
 /// C43: how wide the solo-view rail is at `body_width` columns. Three
 /// tiers: nothing below 40 (there's no room to spare), a fixed
-/// `RAIL_GLYPH_COLS` from 40 up (glyph + marker only), and a fifth of the
+/// `RAIL_GLYPH_COLS` from 40 up (marker, glyph, id and a clipped name), and a fifth of the
 /// body — clamped to `[20, 32]` — from 100 up, wide enough for labelled
-/// rows.
+/// rows. **[Tried 2026-09-20, reverted]** Sizing the labelled tier to its
+/// content (the widest row actually needed) was tried and reverted: for an
+/// untitled agent pane the name is the live OSC title, which Claude Code
+/// rewrites constantly, so a content-fit width jittered and reflowed the
+/// agent's own PTY on every title change. Fixed and unconditional is a
+/// deliberate tradeoff of column efficiency for a stable PTY size.
 pub fn rail_width(body_width: u16) -> u16 {
     if body_width >= 100 {
         (body_width / 5).clamp(20, 32)

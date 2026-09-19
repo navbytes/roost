@@ -21432,7 +21432,7 @@ pub(crate) mod tests {
         assert_eq!(rects[0].id, app.focused);
         assert!(!rects[0].collapsed);
         let body = app.body_area();
-        let rw = layout::rail_width(body.width);
+        let rw = app.rail_area().expect("solo view carries a rail").width;
         assert_eq!(
             rects[0].rect,
             Rect { x: body.x + rw, y: body.y, width: body.width - rw, height: body.height }
