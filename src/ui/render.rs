@@ -5870,14 +5870,6 @@ mod tests {
     /// [F9] ...and a query longer than the terminal cannot push the title
     /// past the floor either — the query elides, the exit hint survives.
     ///
-    /// `help_layout` floors the dialog on the title's width, but that only
-    /// answers *content narrower than the title*. A body narrower than the
-    /// title is the other half, and the `.min(body.width)` re-admitted it:
-    /// at the floor a 46-character query clamped and `modal_frame`
-    /// truncated the tail — losing "Esc clears", the one thing a filtering
-    /// reader needs. Nothing widened the dialog because nothing could;
-    /// the query had to give instead. Found by the C39 design audit, which
-    /// also found why no test saw it (the floor gate above was vacuous).
     /// [C41] In the palette, what `↓` can land on reads differently from
     /// what it skips: read-only rows' keys drop to the quiet red, and the
     /// row under `❯` lifts its description to ink.
@@ -5915,6 +5907,14 @@ mod tests {
         assert!(!dim_at(marked, last as u16), "the selected row's description is ink: {text:?}");
     }
 
+    /// `help_layout` floors the dialog on the title's width, but that only
+    /// answers *content narrower than the title*. A body narrower than the
+    /// title is the other half, and the `.min(body.width)` re-admitted it:
+    /// at the floor a 46-character query clamped and `modal_frame`
+    /// truncated the tail — losing "Esc clears", the one thing a filtering
+    /// reader needs. Nothing widened the dialog because nothing could;
+    /// the query had to give instead. Found by the C39 design audit, which
+    /// also found why no test saw it (the floor gate above was vacuous).
     #[test]
     fn a_query_wider_than_the_terminal_elides_and_keeps_the_way_out() {
         let floor = Rect::new(0, 0, 80, 24);
