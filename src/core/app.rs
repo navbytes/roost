@@ -3738,7 +3738,8 @@ impl<B: PaneBackend> App<B> {
     /// The refusal flash for an open text dialog holding uncommitted typing,
     /// or `None` when nothing typed would be lost by leaving. Compared
     /// against what opening the dialog would prefill, so a dialog opened and
-    /// left untouched still closes on any chord, exactly as before.
+    /// left untouched still closes on any chord, exactly as before. Reads the
+    /// spec live: assumes nothing else renames this tab/pane while it is open.
     fn text_dialog_unsaved(&self) -> Option<&'static str> {
         let dirty = match &self.mode {
             Mode::Rename { buffer, target: RenameTarget::Tab, .. } => {

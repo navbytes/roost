@@ -1790,7 +1790,8 @@ every non-feed/roster modal.
 
 **[Amended 2026-08-20]** U8 above contracts what a modal owns of the
 **mouse**. The keys are not C12's to answer: an Alt chord leaves every mode,
-modal or not, and that rule is **C24b**'s — amended the same day with the
+modal or not (save a text dialog holding unsaved typing — §7, resolved
+2026-09-19), and that rule is **C24b**'s — amended the same day with the
 two chords a mode may keep and the gates that pin them. C12 adds nothing to
 it; a modal is a mode, and holds keys exactly as weakly as one.
 
