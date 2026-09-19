@@ -371,6 +371,31 @@ Left:
   checks the state too. The two fixes are independent, and each was verified
   against the other disabled.
 
+- **[gap] Text dialogs are unlabelled boxes.** The pane editor (`Alt+r`) and the
+  tab rename open as empty frames: no placeholder, no name/note divider visible
+  without underline support, and their whole key model lives on the hint bar,
+  which `Alt+/` hides. C39/C41 put the help overlay's ↵/Esc in its *title* so
+  they survive that; C13/C32 titles carry no keys. The pane editor also never
+  names the pane it edits (the broadcast composer names its targets). Found by
+  the 2026-09-19 popup review; not taken because it's a C13/C32 contract change.
+- **[gap] No direct-select in the solo rail.** `Alt+↑↓` steps only, so nine panes
+  means eight presses; the picker, tabs and roster all have 1..9 or cursor+↵.
+  C43's deferred list doesn't mention it. Needs a chord decision.
+- **[gap] Keymap counts are off.** The `keys — 36/52` title counts section
+  headings as keys (`render.rs` `help_title` + `help_lines`), and a filter
+  matching one command reads "2 shown". A zero-match filter leaves a 2-row frame
+  that says only "0 shown", where the roster says `no pane matches`.
+- **[choice] Fleet overlays grow while open.** Since #191 the roster/feed frame is
+  sized to max(fleet, feed) and grows as panes or feed entries arrive (a filter
+  or toggle still never resizes it). C20/C27 accept this as worded; revisit only
+  if it reads as jitter in practice.
+- **[you] Auto-committed tooling in the public repo.** `2ecf292`/`9c63c47`/
+  `3fce3a1` (pushed by an outside auto-committer, not a PR) added `.agents/`,
+  `.codex/`, `.projectmem/` (incl. a 3.7k-line `viz.html`) and `AGENTS.md`; they
+  shipped in the v0.1.23 source archive. Also, `.projectmem/summary.md` is
+  committed but regenerated on every projectmem event, so the tree is never
+  clean. Decide: keep, gitignore, or remove.
+
 ## Internal quality — refactors
 
 Pure restructures, no behavior change; do only if roost keeps growing, and each
@@ -424,6 +449,13 @@ as its own isolated, well-reviewed change (they touch roost's trickiest code).
   unchanged (the same 4 pre-existing warnings, none in the new code).
   `agents/pi.rs`'s narrowed-then-full-scan-fallback detection was left
   untouched, as was every other adapter.
+
+- **[health] `tests/firehose.rs` depends on the checkout path.** It fails
+  deterministically (echo of `g` not visible within 250ms) from any checkout
+  whose directory name is long: the shell prompt prints the cwd basename and the
+  typed text wraps inside pane B's ~58 columns. A worktree path produced a false
+  "pre-existing failure" report on 2026-09-20. Fix: pin a short `PS1` (or cwd)
+  for the harness's panes.
 
 ## Performance — deferred
 
