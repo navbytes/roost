@@ -849,7 +849,8 @@ spans. The id has not left the TUI: it still leads C20's feed (`{id}
 {name}`, unchanged), the host terminal title (`roost · {id} {focused pane}`,
 unchanged — untitled panes in one project can share `shell · cwd-tag`, and
 the title has no second mark to disambiguate them), and the solo rail's
-glyph tier (C43, 40–99 cols, where no name fits) — and it is `roost
+glyph tier (C43, 40–99 cols — **[Amended 2026-09-20]** id-first now, not
+id-only; the name rides beside it, elided) — and it is `roost
 list`/`roost status`'s own key regardless of chrome. `:713`'s "the one
 helper every fleet surface … derives pane identity from" is also superseded:
 it is now two helpers with a stated split — `display_name` (feed,
@@ -1234,8 +1235,8 @@ no id segment. A name collision within the row's own tab (two panes reading
 identical text) is disambiguated by `App::chrome_name`, not the id — see
 C4's amendment for the full split between it and `display_name`. The id
 still lives in C43's rail glyph tier (`rail_glyph_row_spans`, a separate
-function, id-only, unchanged — no name fits at that width) and in C20's
-feed.
+function — **[Amended 2026-09-20]** id-first, not id-only: the name now
+rides beside it, elided to fit) and in C20's feed.
 
 ### C9 — Hint bar
 
@@ -6327,31 +6328,16 @@ and `layout::rail_window` (below) are pure and unit-tested;
 shown — not bare `self.focused`, which the float owns while shown) are the
 seam render, mouse and PTY-resize all read.
 
-**[Amended 2026-09-20, rail fits its content.]** The labelled tier's width
-formula above is superseded: `clamp(width/5, 20, 32)` was the rail's width
-regardless of what its rows needed, and with short pane names it spent
-columns on nothing — two short-named panes could leave 24 of 120 columns
-mostly blank. The tier's width is now `content_cols.clamp(20, clamp(width/5,
-20, 32))` (`layout::rail_width`), where `content_cols`
-(`App::rail_content_cols`) is the widest row the rail's own content
-actually needs — a full C8 row (marker, glyph, name, `SEGMENT_GAP_COLS`, the
-right-aligned `adapter · word`) maxed against the header's own minimum
-(`SOLO · N PANES` alone, `rail_header_min_cols`). The old clamp is now only
-the ceiling, never the fixed width, so the rail never gets wider than
-before, only narrower; the 20-column floor is unchanged. `rail_content_cols`
-reads only name/adapter/title/raw/note/status — none of which depend on
-*which* row is focused or on the spinner's current frame — so `Alt+↑/↓` and
-the spinner tick never move this number; it changes only when a pane's own
-content does.
-
-`RAIL_GLYPH_COLS` also changed, from 6 to 12, and with it the glyph tier's
-row: "the bare id is this tier's only text" (the geometry paragraph above)
-is superseded — a bare id doesn't answer "which pane is that" in the one view
-where every other pane is off screen, so `rail_glyph_row_spans` now draws
-marker · glyph · id · space · name, the name cut with `elide_to` (marked
-with `…`) to whatever room the wider tier leaves. The id still leads and is
-never elided away — it stays `roost send <id>`'s join key, the same reason
-C8's 2026-09-10 amendment kept it here after dropping it everywhere else.
+**[Amended 2026-09-20, glyph tier names the pane.]** `RAIL_GLYPH_COLS`
+widened from 6 to 12. "The bare id is this tier's only text" (the geometry
+paragraph above) is superseded — a bare id doesn't answer "which pane is
+that" in the one view where every other pane is off screen, so
+`rail_glyph_row_spans` now draws marker · glyph · id · space · name, the
+name cut with `elide_to` (marked with `…`) to whatever room the wider tier
+leaves. The id still leads and is never elided away — it stays
+`roost send <id>`'s join key, the same reason the 2026-09-10 amendment below
+kept it here after dropping it from the labelled tier. The labelled tier's
+width and row shape are unchanged from the geometry paragraph above.
 
 **[Amended 2026-09-10, review pass — the id leaves the labelled tier.]** The
 labelled tier's row above (`▎ marker · glyph · id · name · fill · adapter ·
@@ -6359,9 +6345,10 @@ word`) is C8's own row, reused verbatim through `collapsed_row_spans` — so
 C8's 2026-09-10 id removal applies here too: `id ·` is gone, and
 `App::chrome_name` (not the id) breaks a same-name tie within this tab's
 `pane_order()`. **The glyph tier keeps its id** (`rail_glyph_row_spans`, a
-separate function): at 40–99 cols no name fits beside the marker and glyph,
-and the id is this tier's one piece of text — deliberately the id-first
-surface `roost send <id>` stays discoverable from.
+separate function) — deliberately the id-first surface `roost send <id>`
+stays discoverable from. **[Amended 2026-09-20]** "No name fits beside the
+marker and glyph" is dated: the tier widened to 12 columns and now draws the
+name too, elided; see that amendment above for the current row shape.
 
 **[Amended 2026-09-10, review pass]** "C6's underline" above is dated: the
 header row is now C6's `─` rule (`section_header_text`, shared across
@@ -6371,11 +6358,13 @@ the fixed cost beside the rule is `"SOLO · N PANES"` (14 cols, trimmed)
 plus `"ALT+↑↓"` (6) plus the rule's own six punctuation columns and
 one-column floor, 27 — one column short of that (including an exact
 26-column fit) still sheds the right segment whole, not the old 20-vs-22
-arithmetic. The glyph tier's header changed shape too: below
-`RAIL_GLYPH_COLS` there is no room for a label beside a rule at all, so
-`rail_header_text` special-cases it — the word sits centred *in* the rule
-instead of beside it, `─SOLO─`, the one place this contract's header does
-not go through `section_header_text` unmodified.
+arithmetic. **[Amended 2026-09-20]** The glyph tier's header no longer has a
+bespoke shape either: at the tier's current 12 columns, `section_header_text`'s
+ordinary left-alone shape (`─ SOLO ─────`, no count, the label the geometry
+paragraph's glyph-tier note describes) reads cleanly on its own, so
+`rail_header_text` no longer special-cases it — every width now goes through
+`section_header_text` unmodified, just with a shorter label below the
+labelled tier's floor.
 
 **[Amended 2026-09-10, review pass — the rail windows instead of freezing
 at row 0.]** `layout::rail_window(rail_height, n, shown)` returns the drawn
@@ -6469,8 +6458,11 @@ the right segment; C40's `Alt+Shift+v pull marked pane` pair leads ahead of
 all six while a mark is pending, the same standing-pull rule the tiled bar
 carries. **[Amended 2026-09-10, review pass]** `tile` moved from
 last to second, and the pull pair now shows in solo at all: pairs drop
-whole from the right, and at the glyph tier (40–99 cols) the rail draws no
-words at all, so a trailing `tile` was the first pair to go exactly where
+whole from the right, and at the glyph tier (40–99 cols) the hint bar itself
+has no room for chord words at all (**[Amended 2026-09-20]** the rail's own
+rows are a separate surface and unaffected — they draw id + name at this
+tier, see the geometry paragraph above), so a trailing `tile` was the first
+pair to go exactly where
 it named the only way out of a *persisted* view; the pull pair had been
 dropped from solo outright, though `PullPane` itself still worked there.
 Help overlay: one row in the LAYOUT group, beside `Alt+z`/`Alt+Shift+z`.
