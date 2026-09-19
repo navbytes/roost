@@ -3091,7 +3091,8 @@ keep, which is two:
 
 Everything else drops to `Mode::Normal` and dispatches globally, so `Alt+q`
 quits, `Alt+n` opens a pane and `Alt+1` switches tabs from inside any dialog
-— **out of any mode**, which is narrower than "from anywhere" and
+(**[Amended 2026-09-19]** except a text dialog holding unsaved typing, which
+refuses every chord but its own and `Alt+q` — §7, resolved) — **out of any mode**, which is narrower than "from anywhere" and
 deliberately so: C23's raw pass-through (a raw pane in Normal mode) claims
 every Alt chord but its own toggle, and a C11 terminal that never sends ALT
 at all has no chord to route.
@@ -4856,8 +4857,21 @@ which is what the mutation check breaks.
 Found by a simulation agent reviewing C36 adversarially — it could not
 defeat the guard, and found this instead.
 
-### Open: an Alt chord discards an editor's unsaved buffer
-**[Added 2026-08-20, C24b amendment audit]**
+### ~~Open~~: an Alt chord discards an editor's unsaved buffer
+**[Added 2026-08-20, C24b amendment audit]** **[Resolved 2026-09-19 —
+refuse, don't discard]** A text dialog (C13 rename, C32 pane editor, C36
+composer) holding typing that differs from what it opened with refuses any
+Alt chord except its own entry chord (C24b's deliberate toggle-off) and
+`Alt+q` (quitting is the defensible discard, below), and flashes the way
+out: `unsaved edit — ↵ saves · Esc discards`, or `unsent message — ↵ sends
+· Esc discards` for the composer — C38's "a refusal says so". A dialog
+opened and left untouched still closes on any chord exactly as before, so
+C24b's sweeps run against untouched dialogs and still pass. None of the
+three shapes below: no confirm dialog, no remembered buffer, and `Alt+1`
+no longer throws text away. `App::text_dialog_unsaved`, pinned by
+`a_dirty_text_dialog_refuses_a_stray_alt_chord_but_not_quit`.
+
+The original record follows.
 
 Found while contracting C24b's escape hatch, and deliberately **not** fixed
 there — the amendment documented and gated existing behaviour; this is a
