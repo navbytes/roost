@@ -646,7 +646,7 @@ pub const RAIL_GLYPH_COLS: u16 = 12;
 
 /// C43: how wide the solo-view rail is at `body_width` columns. Three
 /// tiers: nothing below 40 (there's no room to spare), a fixed
-/// `RAIL_GLYPH_COLS` from 40 up (glyph + marker only), and a fifth of the
+/// `RAIL_GLYPH_COLS` from 40 up (marker, glyph, id and a clipped name), and a fifth of the
 /// body — clamped to `[20, 32]` — from 100 up, wide enough for labelled
 /// rows. **[Tried 2026-09-20, reverted]** Sizing the labelled tier to its
 /// content (the widest row actually needed) was tried and reverted: for an
