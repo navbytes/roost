@@ -1765,7 +1765,7 @@ impl<B: PaneBackend> App<B> {
             let Some(spec) = self.find_spec_mut(id) else { continue };
             if let Some(cwd) = o.cwd {
                 if spec.cwd != cwd {
-                    // Keep kernel-resolved: adapters encode it verbatim into session dirs (6fa8dea).
+                    // Keep kernel-resolved: adapters encode it verbatim into session dirs, 6fa8dea
                     spec.cwd = cwd.clone();
                     visited.push(cwd);
                     dirty = true;
