@@ -3735,6 +3735,30 @@ impl<B: PaneBackend> App<B> {
         self.pending_copy.take().map(|(text, _)| text)
     }
 
+    /// The refusal flash for an open text dialog holding uncommitted typing,
+    /// or `None` when nothing typed would be lost by leaving. Compared
+    /// against what opening the dialog would prefill, so a dialog opened and
+    /// left untouched still closes on any chord, exactly as before. Reads the
+    /// spec live: assumes nothing else renames this tab/pane while it is open.
+    fn text_dialog_unsaved(&self) -> Option<&'static str> {
+        let dirty = match &self.mode {
+            Mode::Rename { buffer, target: RenameTarget::Tab, .. } => {
+                *buffer != self.ws.active_tab().name
+            }
+            Mode::PaneEdit { name, lines, pane, .. } => self.find_spec(*pane).is_some_and(|spec| {
+                *name != spec.title.clone().unwrap_or_default()
+                    || lines.join("\n").trim_end() != spec.note.as_deref().unwrap_or("").trim_end()
+            }),
+            Mode::Broadcast { lines, .. } => lines.iter().any(|l| !l.is_empty()),
+            _ => false,
+        };
+        match (&self.mode, dirty) {
+            (_, false) => None,
+            (Mode::Broadcast { .. }, true) => Some("unsent message — ↵ sends · Esc discards"),
+            _ => Some("unsaved edit — ↵ saves · Esc discards"),
+        }
+    }
+
     /// Set a transient hint-bar message (e.g. a startup notice).
     pub fn set_flash(&mut self, msg: impl Into<String>) {
         self.flash = Some((msg.into(), Instant::now(), FLASH_WINDOW));
@@ -6655,6 +6679,20 @@ impl<B: PaneBackend> App<B> {
             // Alt+c handoff keeps it — a search *is* how you find the text
             // you are about to select, so throwing the hits away at the
             // handoff would break the flow the search exists to serve.
+            // Any other Alt chord used to drop the dialog and run its global
+            // binding, throwing uncommitted typing away with no prompt and no
+            // undo (DESIGN-ui.md §7's open item, resolved). A dirty dialog
+            // refuses instead and says the way out.
+            // Alt+q stays the one exit that never asks (U1 guards it
+            // already; §7 named quitting the defensible discard).
+            let quitting = matches!(
+                crate::ui::input::translate_with(key, &self.keymap),
+                crate::ui::input::InputResult::Action(Action::Quit)
+            );
+            if let Some(msg) = self.text_dialog_unsaved().filter(|_| !quitting) {
+                self.set_flash(msg);
+                return true;
+            }
             let looking_back = matches!(self.mode, Mode::Scroll | Mode::Search { .. });
             let scroll_to_copy = looking_back && key.code == KeyCode::Char('c');
             if looking_back && !scroll_to_copy {
@@ -21089,11 +21127,16 @@ pub(crate) mod tests {
     fn every_mode() -> Vec<(&'static str, Mode)> {
         let modes = vec![
             ("Normal", Mode::Normal),
-            ("Rename", Mode::Rename { buffer: "x".into(), cursor: 1, target: RenameTarget::Tab }),
+            // Untouched dialogs: `shell_ws`'s tab is "main" and its pane has
+            // no title. A dirty one refuses chords, pinned on its own below.
+            (
+                "Rename",
+                Mode::Rename { buffer: "main".into(), cursor: 4, target: RenameTarget::Tab },
+            ),
             (
                 "PaneEdit",
                 Mode::PaneEdit {
-                    name: "x".into(),
+                    name: String::new(),
                     lines: vec![String::new()],
                     row: 0,
                     col: 0,
@@ -21293,6 +21336,36 @@ pub(crate) mod tests {
     /// And the end of that path: the yielded chord really does quit. A
     /// quiet fleet quits on the first press (U1), so one `apply` is the
     /// whole story — the busy-fleet confirm has its own tests.
+    /// §7's open item, resolved: a text dialog holding typing the user has
+    /// not committed refuses a stray Alt chord (and says why) instead of
+    /// dropping the text — every editor, and quitting still quits.
+    #[test]
+    fn a_dirty_text_dialog_refuses_a_stray_alt_chord_but_not_quit() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        for open in [Action::EditPane, Action::RenameTab, Action::ToggleBroadcast] {
+            let (mut app, _) = mk_app(shell_ws());
+            app.apply(open);
+            app.handle_mode_key(KeyEvent::from(KeyCode::Char('z')));
+            let before = std::mem::discriminant(&app.mode);
+            let panes = app.runtimes.len();
+            assert!(app.handle_mode_key(alt('n')), "{open:?}: Alt+n was not held back");
+            assert_eq!(std::mem::discriminant(&app.mode), before, "{open:?}: still open");
+            assert!(app.text_dialog_unsaved().is_some(), "{open:?}: the typing survived");
+            assert_eq!(app.runtimes.len(), panes, "{open:?}: and no pane was spawned");
+            assert!(app.flash().is_some_and(|f| f.contains("Esc discards")), "{open:?}");
+            // Quit is the exception, as it is everywhere.
+            if !app.handle_mode_key(alt('q')) {
+                if let crate::ui::input::InputResult::Action(a) =
+                    crate::ui::input::translate_with(alt('q'), app.keymap())
+                {
+                    app.apply(a);
+                }
+            }
+            assert!(app.quit, "{open:?}: Alt+q still quits");
+        }
+    }
+
     #[test]
     fn alt_q_quits_from_every_mode() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
