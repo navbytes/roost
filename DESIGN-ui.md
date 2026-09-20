@@ -1831,6 +1831,21 @@ alone (heading ` rename tab `, hint list leading `type tab name`).
 `RenameTarget` keeps its enum shape with `Tab` as the sole variant, so the
 mode doesn't churn twice if a third single-line target ever appears.
 
+**[Amended 2026-09-20 — the caret window, and a heading that names the
+tab.]** A field never hides its own caret is the rule from here on;
+`rename_field` clipping past ~42 columns with the caret still riding
+whatever fell off the edge — "accepted" by C32's original text below — is
+reversed. `rename_field` now takes the field's width and returns a
+**window** of the buffer that always contains the caret: it holds still
+until the caret would leave it, then shifts the minimum needed to bring it
+back, measured in display columns (a CJK or emoji buffer scrolls at the
+same visual point an ASCII one does) and never splitting a wide character
+across the edge. The heading also grows the tab's number — ` rename tab
+{n} ` — the one handle for "which tab" that stays put while the buffer
+beside it changes on every keystroke; C32 and C36, amended the same date,
+give the multi-line fields the same no-hidden-caret guarantee by soft-wrap
+instead, since a scrolling window and a field that grows downward don't mix.
+
 ### C14 — Picker (quick-launch)
 
 **Current:** `render.rs:169–193` — Double/Cyan; selected row Black on Yellow.
@@ -4514,6 +4529,27 @@ display, reveal-on-visit, U8 modal rules, the cap, paste, cancel semantics
 `hint_pairs_rename_word_differs_tab_vs_pane_editor` (render); the
 `pane editor` chrome fixture replaces `note dialog`.
 
+**[Amended 2026-09-20 — the caret is never hidden.]** "A line wider than
+the field clips at the field's right edge, caret included — C13's own field
+behavior, accepted" (above) is reversed: a hidden caret was never an
+acceptable cost of a bounded dialog, it was the bug this amendment exists
+to fix. The name row keeps C13's horizontal window (its own 2026-09-20
+amendment) unchanged; note rows **soft-wrap** instead — a logical line that
+outgrows the field flows onto extra visual rows, breaking at whitespace and
+hard-breaking a single word wider than the field, rather than clipping.
+Height changes to match: "`lines + 3`, growing to `NOTE_MAX_LINES`" (above)
+now counts **visual** rows, not logical ones, still capped at
+`NOTE_MAX_LINES` — and past the cap the dialog scrolls vertically to keep
+the caret's row in view instead of growing past the body. This is a
+render-side cap on rendered rows, separate from the input-side cap on
+*logical* lines (`NOTE_MAX_LINES` itself, and the "a split is swallowed
+whole" clause above) — wrapping can multiply one without touching the
+other, which is why the same number bounds two different things. The
+heading also names the pane: ` edit pane {id} `, the pane's stable id
+rather than the name field being typed beside it (echoing the very buffer
+being edited would be redundant, and would shift on every keystroke),
+elided with `…` past the frame's 44 columns.
+
 ---
 
 ## 4. Pixel-idea translations (explicit)
@@ -5446,6 +5482,19 @@ highest-severity finding of this contract's design audit, and the reason
 behaviour each one implements.
 
 **Config.** One new `NAMES` entry, `toggle_broadcast`.
+
+**[Amended 2026-09-20 — wraps and scrolls instead of clipping.]** "The
+dialog is `lines + 2` rows tall and never scrolls" (above) is superseded on
+the height side only: `lines` now means the message's **visual** rows
+(soft-wrapped by C32's 2026-09-20 rule, so a line wider than the field
+flows instead of clipping), still capped at `BROADCAST_MAX_LINES`, and past
+the cap the dialog scrolls vertically to keep the caret's row in view
+rather than growing past the body. The **logical** line cap
+(`BROADCAST_MAX_LINES` itself, and "the break is refused rather than
+partially applied" at it) is unchanged — this is a render-side bound on
+rendered rows layered on top of it, not a replacement for it. The
+horizontal side needed no change: a broadcast message was always
+multi-line-field territory, never C13's single-line window.
 
 ### C37 — Reverse the layout cycle (`Alt+Shift+g`) — [Added 2026-08-19, comparative UX review F10]
 
