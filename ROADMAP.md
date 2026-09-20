@@ -401,12 +401,6 @@ Left:
   sized to max(fleet, feed) and grows as panes or feed entries arrive (a filter
   or toggle still never resizes it). C20/C27 accept this as worded; revisit only
   if it reads as jitter in practice.
-- **[you] Auto-committed tooling in the public repo.** `2ecf292`/`9c63c47`/
-  `3fce3a1` (pushed by an outside auto-committer, not a PR) added `.agents/`,
-  `.codex/`, `.projectmem/` (incl. a 3.7k-line `viz.html`) and `AGENTS.md`; they
-  shipped in the v0.1.23 source archive. Also, `.projectmem/summary.md` is
-  committed but regenerated on every projectmem event, so the tree is never
-  clean. Decide: keep, gitignore, or remove.
 
 ## Internal quality — refactors
 

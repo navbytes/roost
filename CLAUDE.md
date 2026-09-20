@@ -72,6 +72,19 @@ each adapter's own session ids.
   of `vX.Y.Z everywhere: …` (v0.1.13, commit cb4747c). Nothing downstream
   breaks — the release keys off Cargo.toml — but the log stops being
   readable by release.
+- **Agent tooling is generated, not tracked** (2026-09-20): `.agents/` was a
+  byte-identical mirror of `.claude/skills/`, and `.projectmem/`'s
+  `summary.md`, `issues/` and `viz.html` are rebuilt from `events.jsonl` —
+  which was already ignored, so the repo tracked outputs whose input it did
+  not keep. That is why the tree was never clean: every projectmem event
+  rewrote a tracked file. All of them are gitignored now; the hand-authored
+  half of projectmem (`config.toml`, `AI_INSTRUCTIONS.md`, `PROJECT_MAP.md`,
+  `plan.md`) stays tracked, because a fresh clone needs it to work the way the
+  section below says this project works. `AGENTS.md` is a pointer to this
+  file, never a copy — the copy it replaced had drifted to calling the product
+  "Codex Code". And `.gitattributes` marks every agent-tooling path
+  `export-ignore`, so the source archives GitHub attaches to a release stop
+  carrying 424 KiB of memory store and four assistants' config.
 - **`main` is protected** (2026-08-21): PRs required, both CI matrix jobs
   must be green, no force-push, no branch deletion, zero required
   approvals so a solo maintainer can self-merge. Admins are exempt, and
