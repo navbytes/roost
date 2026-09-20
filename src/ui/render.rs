@@ -10,7 +10,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
-    App, FeedEntry, Mode, RenameTarget, RosterRow, Search, Selection, TabSummary, NOTE_MAX_LINES,
+    App, FeedEntry, Mode, RenameTarget, RosterRow, Search, Selection, TabSummary,
+    BROADCAST_MAX_LINES, NOTE_MAX_LINES,
 };
 use crate::core::control::Actor;
 use crate::core::layout::{self, Dir, PaneRect};
@@ -747,6 +748,12 @@ fn rename_field(buffer: &str, cursor: usize, width: u16) -> Vec<Span<'static>> {
         .min(caret_col); // never excludes the caret's own column
     let start_idx = chars.partition_point(|&(s, _, _)| s < start_col);
     let end_bound = start_col + width;
+    // A `width` narrower than the caret's own char (e.g. `width == 1` with a
+    // 2-column CJK/emoji char under the caret) excludes that char here —
+    // the fallback below still draws a caret, just a bare reversed space
+    // rather than the hidden character. Never a panic, but a real field is
+    // always ≥ a handful of columns, so this is a narrower-than-any-glyph
+    // corner rather than something that comes up in practice.
     let end_idx =
         chars[start_idx..].iter().take_while(|&&(s, _, w)| s + w <= end_bound).count() + start_idx;
 
@@ -1963,6 +1970,18 @@ fn picker_rows<B: PaneBackend>(app: &App<B>) -> usize {
 /// terminal is wide enough that `centered_near` doesn't have to shrink it).
 const TEXT_DIALOG_WIDTH: u16 = 44;
 
+/// The wrap width `dialog_rect`'s row count and `draw_mode_overlay`'s
+/// actual render must agree on: `centered_near` clamps the dialog to
+/// `body.width` on a terminal narrower than `TEXT_DIALOG_WIDTH`, and
+/// `inner.width` (what rendering wraps against) shrinks with it. Deriving
+/// this from the bare constant instead of `body` booked rows for a wider
+/// frame than the one that actually got drawn, so a wrapped note could
+/// come up a row short and scroll when a correctly-sized box wouldn't
+/// have had to.
+fn text_field_width(body: Rect) -> u16 {
+    TEXT_DIALOG_WIDTH.min(body.width).saturating_sub(2)
+}
+
 /// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
 /// [U20] The picker's size now depends on app state (the type-ahead filter's
 /// row count and the recent-cwd column), so it takes those as `rows`/`cwds`
@@ -1994,8 +2013,8 @@ fn dialog_rect(
         // *logical* lines (`app::NOTE_MAX_LINES`) is unchanged and separate
         // — this bound is on rendered rows, which wrapping can multiply.
         Mode::PaneEdit { lines, .. } => {
-            let note_rows: usize =
-                lines.iter().map(|l| wrap_line(l, TEXT_DIALOG_WIDTH - 2).len()).sum();
+            let field_width = text_field_width(body);
+            let note_rows: usize = lines.iter().map(|l| wrap_line(l, field_width).len()).sum();
             Some(centered_near(
                 anchor,
                 body,
@@ -2007,15 +2026,18 @@ fn dialog_rect(
         // message row, same wrap-and-cap-and-scroll shape as the pane
         // editor. Still not wider than C13 — a broadcast is read at the
         // moment of sending and the eye should be on the title's target
-        // count, not sweeping a wide field.
+        // count, not sweeping a wide field. Capped at `BROADCAST_MAX_LINES`
+        // (not `NOTE_MAX_LINES`) so the render cap keeps naming the same
+        // constant DESIGN-ui.md's C36 cites, even though the two are
+        // aliased to the same value today.
         Mode::Broadcast { lines, .. } => {
-            let msg_rows: usize =
-                lines.iter().map(|l| wrap_line(l, TEXT_DIALOG_WIDTH - 2).len()).sum();
+            let field_width = text_field_width(body);
+            let msg_rows: usize = lines.iter().map(|l| wrap_line(l, field_width).len()).sum();
             Some(centered_near(
                 anchor,
                 body,
                 TEXT_DIALOG_WIDTH,
-                msg_rows.min(NOTE_MAX_LINES) as u16 + 2,
+                msg_rows.min(BROADCAST_MAX_LINES) as u16 + 2,
             ))
         }
         Mode::Picker { .. } => {
@@ -4092,6 +4114,40 @@ mod tests {
         assert_eq!((one.width, one.height), (44, 4), "name row + one note line");
         let five = dialog_rect(&mk(5), body, body, 0, &[], &Keymap::default(), (0, 0)).unwrap();
         assert_eq!(five.height, 8);
+    }
+
+    /// [Added 2026-09-20, review fix] `dialog_rect` must wrap at the width
+    /// `centered_near` actually clamps the dialog to, not the bare
+    /// `TEXT_DIALOG_WIDTH` — on a terminal narrower than 44 cols the real
+    /// field is narrower too, and booking rows against the wider assumption
+    /// leaves the box a row short (so `visual_window` scrolls immediately
+    /// on a dialog that should have had room to grow instead). Body width
+    /// 40 ⇒ dialog 40 ⇒ field 38: a 40-char word doesn't fit in one row at
+    /// 38 (it would at the wrong assumed 42), so it must book two.
+    #[test]
+    fn dialog_rect_wraps_at_the_actual_clamped_width_on_a_narrow_terminal() {
+        let body = Rect::new(0, 0, 40, 30);
+        let mode = Mode::PaneEdit {
+            name: String::new(),
+            lines: vec!["x".repeat(40)],
+            row: 0,
+            col: 0,
+            pane: 1,
+        };
+        let rect = dialog_rect(&mode, body, body, 0, &[], &Keymap::default(), (0, 0)).unwrap();
+        assert_eq!(rect.width, 40, "clamped to the narrow body, same as centered_near");
+        assert_eq!(rect.height, 5, "name row + two wrapped note rows + frame, not one row short");
+    }
+
+    /// [Added 2026-09-20, review fix] `text_field_width`'s own clamp, in
+    /// isolation from `dialog_rect`: wide enough terminal ⇒ the standard
+    /// 42-column field; narrower ⇒ shrinks with the body, same as
+    /// `centered_near`'s own `width.min(bounds.width)`.
+    #[test]
+    fn text_field_width_matches_centered_nears_own_clamp() {
+        assert_eq!(super::text_field_width(Rect::new(0, 0, 100, 30)), 42);
+        assert_eq!(super::text_field_width(Rect::new(0, 0, 40, 30)), 38);
+        assert_eq!(super::text_field_width(Rect::new(0, 0, 1, 30)), 0, "never underflows");
     }
 
     #[test]

@@ -8342,7 +8342,7 @@ fn roster_rank(status: Option<AgentStatus>) -> u8 {
 /// C36: the composer's line ceiling — the dialog grows a row per break and
 /// never scrolls, so this is what keeps it inside the body. Matches C32's
 /// note cap in spirit and in number.
-const BROADCAST_MAX_LINES: usize = NOTE_MAX_LINES;
+pub const BROADCAST_MAX_LINES: usize = NOTE_MAX_LINES;
 
 const ROSTER_STATUS_CYCLE: [Option<AgentStatus>; 6] = [
     None,

@@ -1836,15 +1836,23 @@ tab.]** A field never hides its own caret is the rule from here on;
 `rename_field` clipping past ~42 columns with the caret still riding
 whatever fell off the edge — "accepted" by C32's original text below — is
 reversed. `rename_field` now takes the field's width and returns a
-**window** of the buffer that always contains the caret: it holds still
-until the caret would leave it, then shifts the minimum needed to bring it
-back, measured in display columns (a CJK or emoji buffer scrolls at the
-same visual point an ASCII one does) and never splitting a wide character
-across the edge. The heading also grows the tab's number — ` rename tab
-{n} ` — the one handle for "which tab" that stays put while the buffer
-beside it changes on every keystroke; C32 and C36, amended the same date,
-give the multi-line fields the same no-hidden-caret guarantee by soft-wrap
-instead, since a scrolling window and a field that grows downward don't mix.
+**window** of the buffer that always contains the caret: while the buffer
+fits the field the window is left-anchored at the start; once it doesn't,
+the window is anchored so the caret rides the field's trailing edge instead
+— the caret is always in view, never hidden, but `rename_field` is pure and
+recomputes from `cursor` alone with no remembered scroll position, so once
+scrolled the field shifts one column per ←/→ rather than holding still
+until the caret would actually leave it. Measured in display columns (a
+CJK or emoji buffer scrolls at the same visual point an ASCII one does) and
+never splitting a wide character across the edge. The heading also grows
+the tab's number — ` rename tab {n} ` — the one handle for "which tab" that
+stays put while the buffer beside it changes on every keystroke; C32 and
+C36, amended the same date, give the multi-line fields the same
+no-hidden-caret guarantee by soft-wrap instead, since a scrolling window
+and a field that grows downward don't mix. (The held-window version — the
+field staying put until the caret would actually leave it, which needs an
+origin carried in the mode rather than recomputed — is ROADMAP.md's
+`rename_field` entry, deferred as polish beyond the reported bug.)
 
 ### C14 — Picker (quick-launch)
 
@@ -4548,7 +4556,8 @@ other, which is why the same number bounds two different things. The
 heading also names the pane: ` edit pane {id} `, the pane's stable id
 rather than the name field being typed beside it (echoing the very buffer
 being edited would be redundant, and would shift on every keystroke),
-elided with `…` past the frame's 44 columns.
+elided with `…` past the 42 columns available inside the frame's border
+(the 44-column frame, minus the 2 border columns the title sits inside of).
 
 ---
 
