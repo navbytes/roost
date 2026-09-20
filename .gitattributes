@@ -1,0 +1,11 @@
+# Keep agent tooling out of the source archives GitHub attaches to a release.
+# It is for working *on* roost, not for building it, and a 424 KiB memory
+# store plus four assistants' config in a tarball named `roost-x.y.z` is
+# noise at best and stale advice at worst. Cloning still gets all of it.
+.claude/ export-ignore
+.codex/ export-ignore
+.opencode/ export-ignore
+.projectmem/ export-ignore
+docs/engagements/ export-ignore
+AGENTS.md export-ignore
+.gitattributes export-ignore
