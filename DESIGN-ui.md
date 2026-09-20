@@ -1958,6 +1958,11 @@ add a 21st.
 explain-itself surface, and it explained only the chords. It now ends with
 **three reference rows**, after `Alt+q` and in this order:
 
+*[Amended 2026-09-20: two of the three are reference rows in the strict
+sense the counter now uses (`HelpKey::Reference`, not counted as keys);
+`Alt+click / o` is a chord spelled by hand, as the note below already
+said, and counts.]*
+
 | key column | description |
 |---|---|
 | `status` | `⠋ working ◆ needs you ○ waiting · idle ✕ exited` |
@@ -5713,6 +5718,23 @@ scroll-mode search. All four rows stay inside C9's 100-column budget, and
 `the_help_hint_row_narrows_only_once_the_keymap_actually_scrolls` measures
 every one of them rather than the two it used to.
 
+**[Amended 2026-09-20] The counter counts chords, and the frame keeps a row
+for an empty one.** `26/36` above named no unit, and the two readings
+disagreed: the table draws group headings between its rows, and the glyph
+legend rows (`status`, `mouse`) and the `CONTROL CLI` block spell things
+nobody presses. The number is a
+promise about the *keymap*, so it counts what a reader can press —
+`HelpKey::Chords`, `Family`, and the hand-spelled bare keys — and excludes
+both the headings and `HelpKey::Reference` rows; `N shown` under a query is
+the same unit, so one matching command reads `1 shown`, not the row plus its
+heading. Scrolling still moves *rows*, headings included, because rows are
+what a window scrolls: `↑↓ more` is a statement about fit, not a second
+counter, so one `↓` may advance the count by 0, 1 or 2. And a query matching
+nothing now keeps one content row for `no key matches`, the centred
+`quiet()` line C27's roster and the feed already draw — the title's `0 shown`
+was true but left this overlay answering an empty result differently from its
+two siblings.
+
 **All four wordings come from one function** (`help_title`), because the
 dialog's **width is floored by the title's** — see below — and a second
 spelling would let the floor guard a string the frame does not draw. §4/§5
@@ -5969,8 +5991,12 @@ rows that resist are precisely the ones nobody would drive this way:
   and a palette that performs one step and then closes is strictly worse
   than the chord it would be standing in for. **The ambiguity and the
   uselessness coincide**, which is why one rule covers both.
-- `Text` rows bind nothing — the `CONTROL CLI` block, the glyph legend, the
-  dead-pane keys `main.rs` claims. Nothing to run.
+- `Text` and `Reference` rows have no single action to run. **[Amended
+  2026-09-20]** They were one variant until the counter needed to tell them
+  apart: `Reference` documents (`status`, `mouse`, the `CONTROL CLI` block)
+  and is not counted as a key, while `Text` spells keys that are real but
+  are not `Action` chords — the dead-pane keys `main.rs` claims, and
+  `Alt+click / o`. Neither is runnable; only one is pressable.
 
 What survives is what a palette is *for*: the rare, one-shot, hard-to-
 remember verbs — flip split, cycle layout, mark/pull, toggle

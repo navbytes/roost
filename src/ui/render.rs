@@ -927,7 +927,7 @@ fn help_key_text(key: &HelpKey, desc: &str, bindings: &[(String, Action)]) -> Op
         // Authored text of known width — the control-CLI block and the
         // legends. Not elided: it names no chord this function resolved, so
         // there is no " / " here that is safe to cut.
-        HelpKey::Text(s) => Some((*s).to_string()),
+        HelpKey::Text(s) | HelpKey::Reference(s) => Some((*s).to_string()),
         HelpKey::Chords(actions) => join_chords(actions, bindings).map(|k| elide_key(k, desc)),
         HelpKey::Family(spelling, actions) => {
             let live = join_chords(actions, bindings)?;
@@ -970,7 +970,31 @@ fn help_content_width(lines: &[HelpLine]) -> u16 {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum HelpLine {
     Head(&'static str),
-    Row(String, &'static str, Option<Action>),
+    Row(String, &'static str, RowKind),
+}
+
+/// [C41/C39] What a drawn row *is*, which three separate questions read:
+/// whether `↵` can run it, whether the cursor may land on it, and whether
+/// the title's counter claims it as a key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowKind {
+    /// One verb with one outcome — the palette's runnable row.
+    Command(Action),
+    /// A key or gesture the reader can press, but not one action to run: a
+    /// direction family, a multi-chord row, the dead-pane bare keys.
+    Key,
+    /// Scenery. The glyph legend and the `CONTROL CLI` block spell things
+    /// nobody presses, so the counter does not call them keys.
+    Reference,
+}
+
+impl RowKind {
+    fn action(self) -> Option<Action> {
+        match self {
+            RowKind::Command(a) => Some(a),
+            RowKind::Key | RowKind::Reference => None,
+        }
+    }
 }
 
 /// [C41] The action `↵` runs on a row, or `None` when the row is not a
@@ -987,17 +1011,21 @@ enum HelpLine {
 ///   wrong feature: those are the chords you press five times in a row, and
 ///   a palette that runs one step and then closes is strictly worse than
 ///   the chord it is standing in for.
-/// - `Text(_)` binds nothing at all — the control-CLI reference block, the
-///   glyph legend, the dead-pane keys `main.rs` claims. Nothing to run.
+/// - `Text(_)` spells keys that are real but are not `Action` chords — the
+///   dead-pane keys `main.rs` claims, `Alt+click / o` — and `Reference(_)`
+///   binds nothing at all: the two legend rows and the control-CLI block.
+///   Neither has one action to run; only the first is pressable, which is
+///   the distinction `RowKind` keeps for the title's counter.
 ///
 /// So what stays runnable is exactly the set a palette is for: the rare,
 /// one-shot, hard-to-remember verbs (flip split, cycle layout, mark/pull a
 /// pane, toggle raw/float/zoom/feed/roster, undo, rename). The rows that
 /// resist execution are the ones nobody would drive this way anyway.
-fn help_row_action(key: &HelpKey) -> Option<Action> {
+fn help_row_kind(key: &HelpKey) -> RowKind {
     match key {
-        HelpKey::Chords([only]) => Some(*only),
-        HelpKey::Chords(_) | HelpKey::Family(..) | HelpKey::Text(_) => None,
+        HelpKey::Chords([only]) => RowKind::Command(*only),
+        HelpKey::Chords(_) | HelpKey::Family(..) | HelpKey::Text(_) => RowKind::Key,
+        HelpKey::Reference(_) => RowKind::Reference,
     }
 }
 
@@ -1013,7 +1041,7 @@ pub fn help_actions(keymap: &Keymap, filter: &str) -> Vec<Action> {
     help_lines(keymap, filter)
         .into_iter()
         .filter_map(|l| match l {
-            HelpLine::Row(_, _, action) => action,
+            HelpLine::Row(_, _, kind) => kind.action(),
             HelpLine::Head(_) => None,
         })
         .collect()
@@ -1033,7 +1061,7 @@ fn help_lines(keymap: &Keymap, filter: &str) -> Vec<HelpLine> {
             .iter()
             .filter_map(|r| {
                 help_key_text(&r.key, r.desc, &bindings)
-                    .map(|k| HelpLine::Row(k, r.desc, help_row_action(&r.key)))
+                    .map(|k| HelpLine::Row(k, r.desc, help_row_kind(&r.key)))
             })
             .filter(|l| help_row_matches(l, filter))
             .collect();
@@ -1054,7 +1082,7 @@ fn help_lines(keymap: &Keymap, filter: &str) -> Vec<HelpLine> {
 /// nobody presses it, so counting lines overstates the keymap by one per
 /// group and a two-column split reports whichever column is taller.
 fn help_key_count(lines: &[HelpLine]) -> usize {
-    lines.iter().filter(|l| matches!(l, HelpLine::Row(..))).count()
+    lines.iter().filter(|l| matches!(l, HelpLine::Row(_, _, k) if *k != RowKind::Reference)).count()
 }
 
 /// C15: how the keymap lays out in `body` — how many columns, how the lines
@@ -1118,7 +1146,12 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
         vec![a.to_vec(), b.to_vec()]
     };
     let tallest = columns.iter().map(|c| c.len()).max().unwrap_or(0) as u16;
-    let height = tallest.min(avail_h);
+    // [Amended 2026-09-20] A query that matches nothing keeps one content
+    // row, for `no key matches` to be said in. The title already said `0
+    // shown`, but the roster and the feed both answer an empty result with a
+    // line in the body, and three overlays answering the same question three
+    // ways is the drift C27's rule exists against.
+    let height = tallest.max(1).min(avail_h);
     // +1 so a row that spends the full content width still has a column of
     // air before the right border (the key column already opens with one).
     let w = content * columns.len() as u16
@@ -1134,7 +1167,8 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
     // and the frame together.
     let tallest_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
     let keys: usize = columns.iter().map(|c| help_key_count(c)).sum();
-    let runnable = columns.iter().flatten().any(|l| matches!(l, HelpLine::Row(_, _, Some(_))));
+    let runnable =
+        columns.iter().flatten().any(|l| matches!(l, HelpLine::Row(_, _, RowKind::Command(_))));
     let title = help_title(
         filter,
         keys,
@@ -1267,6 +1301,12 @@ fn draw_help_columns(
     inner: Rect,
 ) {
     let content = layout.content;
+    // C14's rule, in the roster's own words and its own `quiet()` middle
+    // row: an empty result is the answer, not the absence of one.
+    if layout.columns.iter().all(|c| c.is_empty()) {
+        draw_empty_state(f, inner, "no key matches");
+        return;
+    }
     let at = cursor.and_then(|c| help_cursor_pos(layout, c));
     for (i, column) in layout.columns.iter().enumerate() {
         let x = inner.x + i as u16 * (content + HELP_GUTTER);
@@ -1313,7 +1353,7 @@ fn draw_help_columns(
                     // those rows' keys step down to the quiet red and the row
                     // under `❯` lifts to ink — the picker's and roster's own
                     // selected-row rung — so what `↓` will land on is legible.
-                    let key_style = if cursor.is_some() && runs.is_none() {
+                    let key_style = if cursor.is_some() && runs.action().is_none() {
                         theme::accent_quiet()
                     } else {
                         theme::accent()
@@ -1341,7 +1381,7 @@ fn help_cursor_pos(layout: &HelpLayout, cursor: usize) -> Option<(usize, usize)>
     let mut seen = 0;
     for (i, column) in layout.columns.iter().enumerate() {
         for (row, line) in column.iter().enumerate() {
-            if matches!(line, HelpLine::Row(_, _, Some(_))) {
+            if matches!(line, HelpLine::Row(_, _, RowKind::Command(_))) {
                 if seen == cursor {
                     return Some((i, row));
                 }
@@ -1434,8 +1474,11 @@ enum HelpKey {
     /// instead, because `Alt+←↓↑→ / hjkl` would otherwise be exactly the
     /// stale spelling F1 exists to abolish, merely a wider one.
     Family(&'static str, &'static [Action]),
-    /// Binds nothing: a legend line or a control-CLI reference row.
+    /// A hand-written spelling of keys that are real but are not `Action`
+    /// chords: the dead-pane bare keys, the mouse gestures.
     Text(&'static str),
+    /// Binds nothing: a legend line or a control-CLI reference row.
+    Reference(&'static str),
 }
 
 struct HelpRow {
@@ -1449,8 +1492,13 @@ const fn chords(actions: &'static [Action], desc: &'static str) -> HelpRow {
 const fn family(spelling: &'static str, actions: &'static [Action], desc: &'static str) -> HelpRow {
     HelpRow { key: HelpKey::Family(spelling, actions), desc }
 }
-const fn reference(key: &'static str, desc: &'static str) -> HelpRow {
+/// A row whose keys are real but spelled by hand — no `Action` behind them.
+const fn bare(key: &'static str, desc: &'static str) -> HelpRow {
     HelpRow { key: HelpKey::Text(key), desc }
+}
+/// A row that documents rather than binds (`RowKind::Reference`).
+const fn reference(key: &'static str, desc: &'static str) -> HelpRow {
+    HelpRow { key: HelpKey::Reference(key), desc }
 }
 
 /// C15: one titled block of the keymap.
@@ -1691,7 +1739,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             // own stated rule ("Alt+click gets its own row because it is a
             // chord"), applied to the mouse verb that is now also one.
             reference("mouse", "wheel scrolls · click focuses · drag/2x/3x/shift selects"),
-            reference("Alt+click / o", "open the URL under the pointer / copy cursor"),
+            bare("Alt+click / o", "open the URL under the pointer / copy cursor"),
         ],
     },
     HelpGroup {
@@ -3447,7 +3495,7 @@ mod tests {
         collapsed_row_spans, dialog_rect, feed_entry_spans, feed_window, help_content_width,
         help_layout, help_lines, hint_bar_right_spans, identity_title, mode_word, note_title,
         push_tab_spans, section_header_text, should_place_cursor, stack_header_text, state_word,
-        BadgeNote, HelpKey, HelpLine, HELP_GROUPS,
+        BadgeNote, HelpKey, HelpLine, RowKind, HELP_GROUPS,
     };
     use crate::ui::input::{self, Action, Keymap};
     use crate::App;
@@ -5246,7 +5294,7 @@ mod tests {
             .flat_map(|g| g.rows.iter())
             .flat_map(|r| match &r.key {
                 HelpKey::Chords(a) | HelpKey::Family(_, a) => *a,
-                HelpKey::Text(_) => &[],
+                HelpKey::Text(_) | HelpKey::Reference(_) => &[],
             })
             .copied()
             .collect();
@@ -5819,22 +5867,24 @@ mod tests {
         );
     }
 
-    /// [C39] A query that matches nothing still draws a frame that says so
-    /// — C14's rule ("an empty result still needs a frame to say so"), and
-    /// the bug this branch already fixed for the roster and the feed, where
-    /// a zero-height dialog left the chord looking unbound.
+    /// [C39, amended 2026-09-20] A query that matches nothing draws a frame
+    /// that says so — C14's rule ("an empty result still needs a frame to say
+    /// so"), and the bug this branch already fixed for the roster and the
+    /// feed, where a zero-height dialog left the chord looking unbound.
     ///
-    /// It works here for a reason worth pinning rather than relying on: the
-    /// width floor is the *title's*, and the title is never empty, so an
-    /// empty table still has a frame wide enough to read. The design audit
-    /// found the behaviour correct and the guard missing.
+    /// Two things say it. The width floor is the *title's*, and the title is
+    /// never empty, so the frame is always wide enough to read `0 shown`. And
+    /// since 2026-09-20 the body keeps one row for `no key matches`, the same
+    /// centred `quiet()` line the roster and the feed draw — the title alone
+    /// left this overlay answering an empty result differently from its two
+    /// siblings, which is the drift C27's rule exists against.
     #[test]
     fn a_query_matching_nothing_still_draws_a_frame_that_says_so() {
         let body = Rect::new(0, 0, 120, 40);
         let km = Keymap::default();
         let layout = help_layout(body, &km, Some("zzzzz-no-such-thing"));
         assert_eq!(layout.columns.iter().map(|c| c.len()).max().unwrap_or(0), 0, "nothing matched");
-        assert_eq!(layout.size.1, 2, "two border rows — a frame, not a void");
+        assert_eq!(layout.size.1, 3, "two border rows and one to say it in");
         let title =
             super::help_title(Some("zzzzz-no-such-thing"), 0, 0, false, false, body.width - 2);
         assert!(title.contains("0 shown"), "and it says the result is empty: {title:?}");
@@ -5867,9 +5917,21 @@ mod tests {
         assert!(layout.keys > tallest, "both columns count: {} vs {tallest}", layout.keys);
         assert_eq!(
             layout.keys,
-            help_lines(&km, "").iter().filter(|l| matches!(l, HelpLine::Row(..))).count(),
+            help_lines(&km, "")
+                .iter()
+                .filter(|l| matches!(l, HelpLine::Row(_, _, k) if *k != RowKind::Reference))
+                .count(),
             "every chord the table holds, counted once",
         );
+
+        // …and the scenery is not among them. `roost read <id>` is a row of
+        // the table and a line a reader can read, but it is not a key, so a
+        // title that called it one would be counting the wrong thing twice.
+        assert!(
+            help_lines(&km, "roost read").iter().any(|l| matches!(l, HelpLine::Row(..))),
+            "the CONTROL CLI block is in the table",
+        );
+        assert_eq!(help_layout(body, &km, Some("roost read")).keys, 0, "…but it binds nothing");
 
         // And under a query: one match is "1 shown", not two-with-its-heading.
         let one = help_layout(body, &km, Some("reopen"));
@@ -5910,8 +5972,11 @@ mod tests {
         for q in ["this keymap", "hint bar", "toggle the hint", "quit", "zoom"] {
             let layout = help_layout(body, &km, Some(q));
             let rows = layout.columns.iter().map(|c| c.len()).max().unwrap_or(0);
-            let runnable =
-                layout.columns.iter().flatten().any(|l| matches!(l, HelpLine::Row(_, _, Some(_))));
+            let runnable = layout
+                .columns
+                .iter()
+                .flatten()
+                .any(|l| matches!(l, HelpLine::Row(_, _, RowKind::Command(_))));
             let title = super::help_title(
                 Some(q),
                 rows,
