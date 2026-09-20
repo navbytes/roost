@@ -1049,11 +1049,21 @@ fn help_lines(keymap: &Keymap, filter: &str) -> Vec<HelpLine> {
     out
 }
 
+/// C15/C39: how many of `lines` are chords — what the title's counter means
+/// when it says "keys". A group heading takes a row and scrolls like one, but
+/// nobody presses it, so counting lines overstates the keymap by one per
+/// group and a two-column split reports whichever column is taller.
+fn help_key_count(lines: &[HelpLine]) -> usize {
+    lines.iter().filter(|l| matches!(l, HelpLine::Row(..))).count()
+}
+
 /// C15: how the keymap lays out in `body` — how many columns, how the lines
 /// divide between them, and the dialog those choices need.
 struct HelpLayout {
     /// One `Vec<HelpLine>` per column, left to right.
     columns: Vec<Vec<HelpLine>>,
+    /// Chords across every column — the title's `total` (`help_key_count`).
+    keys: usize,
     /// Rows of content each column shows at once (the shorter of "what it
     /// holds" and "what fits"); the scroll step and the `top` clamp use it.
     height: u16,
@@ -1123,11 +1133,12 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
     // Found by driving it in a PTY; no unit test was looking at the title
     // and the frame together.
     let tallest_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    let keys: usize = columns.iter().map(|c| help_key_count(c)).sum();
     let runnable = columns.iter().flatten().any(|l| matches!(l, HelpLine::Row(_, _, Some(_))));
     let title = help_title(
         filter,
-        tallest_rows,
-        tallest_rows,
+        keys,
+        keys,
         tallest_rows > height as usize,
         runnable,
         body.width.saturating_sub(2),
@@ -1139,7 +1150,7 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
                                                     // `size.0` is the tautology C15's own 2026-08-20 amendment named — and
                                                     // that this field exists is the second time it had to be named.
     let asked = w.max(title_w);
-    HelpLayout { columns, height, size: (asked.min(body.width), height + 2), content, asked }
+    HelpLayout { columns, keys, height, size: (asked.min(body.width), height + 2), content, asked }
 }
 
 /// [F9] C39's four title wordings, in one place — because the dialog's
@@ -1147,9 +1158,11 @@ fn help_layout(body: Rect, keymap: &Keymap, filter: Option<&str>) -> HelpLayout 
 /// title would let the floor guard a string the frame does not draw. That
 /// is §4/§5 lockstep applied to a modal's own heading.
 ///
-/// `shown` is the last visible row's index (the scrolled counter's left
-/// half); pass `total` for the worst case when the caller does not know
-/// `top` yet — the count only ever gets narrower, never wider.
+/// `shown` and `total` are **chords**, not rows: a reader counting what the
+/// overlay taught them counts keys, and the headings between them are the
+/// table's own scenery (`help_key_count`). `shown` is how many the scroll
+/// window has reached; pass `total` for the worst case when the caller does
+/// not know `top` yet — the count only ever gets narrower, never wider.
 ///
 /// `avail` is the widest the title may be. **The query is what gives**, and
 /// it is elided rather than truncated by the frame: everything after it —
@@ -1991,10 +2004,17 @@ fn draw_mode_overlay<B: PaneBackend>(
             // any key — marking a row there would advertise an `↵` that the
             // "any key closes it" contract still owns.
             let cursor = filter.as_ref().map(|_| *cursor);
+            // Keys, not lines: `visible`/`total` are the scroll geometry —
+            // rows, headings included — and they stay that, because that is
+            // what the `↑↓` clause is about. The counter is a promise about
+            // the *keymap*, so it counts chords, and "reached" spans every
+            // column: both scroll together, so the reader has seen each
+            // column's rows down to the same line.
+            let through = top + visible;
             let heading = help_title(
                 filter.as_deref(),
-                (top + visible).min(total),
-                total,
+                layout.columns.iter().map(|c| help_key_count(&c[..through.min(c.len())])).sum(),
+                layout.keys,
                 total > visible,
                 help_cursor_pos(&layout, cursor.unwrap_or(0)).is_some(),
                 body.width.saturating_sub(2),
@@ -5826,6 +5846,39 @@ mod tests {
         );
     }
 
+    /// [C39] The counter counts *chords*. Headings share the line `Vec` and
+    /// scroll like rows, and the un-filtered table splits across two columns
+    /// — count lines and it overstates the keymap by one per group; count one
+    /// column's and it reports half a table. Both were true of `keys — 36/52`,
+    /// and a reader can check this number by eye, which is the whole reason
+    /// the title carries it.
+    #[test]
+    fn the_title_counts_chords_not_lines() {
+        // Wide enough for two columns of C15's widest row, short enough that
+        // one column does not fit — the split is the case that made `36/52`
+        // report half a table.
+        let body = Rect::new(0, 0, 200, 20);
+        let km = Keymap::default();
+        let layout = help_layout(body, &km, None);
+        assert_eq!(layout.columns.len(), 2, "the fixture is the two-column case");
+        let lines: usize = layout.columns.iter().map(|c| c.len()).sum();
+        let tallest = layout.columns.iter().map(|c| c.len()).max().unwrap_or(0);
+        assert!(layout.keys < lines, "headings are not keys: {} of {lines}", layout.keys);
+        assert!(layout.keys > tallest, "both columns count: {} vs {tallest}", layout.keys);
+        assert_eq!(
+            layout.keys,
+            help_lines(&km, "").iter().filter(|l| matches!(l, HelpLine::Row(..))).count(),
+            "every chord the table holds, counted once",
+        );
+
+        // And under a query: one match is "1 shown", not two-with-its-heading.
+        let one = help_layout(body, &km, Some("reopen"));
+        assert_eq!(help_lines(&km, "reopen").len(), 2, "one row under one heading");
+        assert_eq!(one.keys, 1, "the heading is not a key");
+        let title = super::help_title(Some("reopen"), one.keys, one.keys, false, false, 198);
+        assert!(title.contains("1 shown"), "{title:?}");
+    }
+
     /// [F9] The dialog is sized for the *filtered* table — C14's picker rule
     /// applied to the surface that borrowed its type-ahead. A query cutting
     /// 36 rows to 3 must not leave a 36-row frame around them.
@@ -7752,7 +7805,12 @@ row's — widen ADAPTER_COL",
         // own up to it — the alternative is a list that just stops.
         let (visible, total) = super::help_scroll_extent(app.body_area(), app.keymap(), None);
         assert!(visible < total, "the fixture is genuinely scrolled");
-        assert!(frame.contains(&format!("/{total}")), "the title counts the rows:\n{frame}");
+        // …in chords. `total` is rows, which is what the scroll window is
+        // measured in; the count the title carries is the keymap's own size,
+        // and the group headings between the rows are not keys.
+        let keys = super::help_layout(app.body_area(), app.keymap(), None).keys;
+        assert!(keys < total, "the headings are rows this count must not claim");
+        assert!(frame.contains(&format!("/{keys}")), "the title counts the keys:\n{frame}");
         assert!(frame.contains("↑↓ more"), "…and names the keys that reach them:\n{frame}");
     }
 
