@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::core::app::{
     App, FeedEntry, Mode, RenameTarget, RosterRow, Search, Selection, TabSummary,
+    BROADCAST_MAX_LINES, NOTE_MAX_LINES,
 };
 use crate::core::control::Actor;
 use crate::core::layout::{self, Dir, PaneRect};
@@ -692,10 +693,10 @@ fn picker_row_body(i: usize, item: &str) -> String {
     }
 }
 
-/// C13 (U16, amended 2026-08-27): the rename field's rendered spans — the
-/// caret **on** the character at the insertion point (`theme::attention()`,
-/// the reversal every terminal's own block cursor is), not a glyph inserted
-/// before it.
+/// C13 (U16, amended 2026-08-27, 2026-09-20): the rename field's rendered
+/// spans — the caret **on** the character at the insertion point
+/// (`theme::attention()`, the reversal every terminal's own block cursor
+/// is), not a glyph inserted before it.
 ///
 /// It was an inserted `▏` until a live report: moving the point left pushed
 /// every character after it one column right, so editing the middle of a
@@ -707,21 +708,168 @@ fn picker_row_body(i: usize, item: &str) -> String {
 ///
 /// `cursor` is a char index and is clamped, so a stale value (a resize
 /// between keystrokes, a paste that shortened the buffer) renders the caret
-/// at the end instead of panicking on a bad slice. Pure so the caret's
-/// placement has a unit-test seam.
-fn rename_field(buffer: &str, cursor: usize) -> Vec<Span<'static>> {
-    let at = cursor.min(buffer.chars().count());
-    let byte = buffer.char_indices().nth(at).map_or(buffer.len(), |(b, _)| b);
-    let mut spans = vec![Span::raw(buffer[..byte].to_string())];
-    let mut tail = buffer[byte..].chars();
-    match tail.next() {
-        Some(c) => {
+/// at the end instead of panicking on a bad slice.
+///
+/// **[Amended 2026-09-20]** `width` bounds the field, and the return value
+/// is a **window** of `buffer` rather than the whole thing: past ~42
+/// columns the old unbounded version clipped at the frame's right edge,
+/// caret included, so typing a long name went blind past that point. The
+/// window sits still until the caret would leave it, then shifts the
+/// minimum needed to bring it back — measured in display columns
+/// (`mouse::display_width`/`char::width`, not `.len()`/`.chars().count()`,
+/// so a CJK or emoji buffer scrolls at the same visual point a plain-ASCII
+/// one does), and never splits a wide character across the edge: a char
+/// whose start would land before the window boundary is excluded whole,
+/// not half-drawn. Pure, so both the caret's placement and the window's
+/// edges keep their unit-test seam.
+fn rename_field(buffer: &str, cursor: usize, width: u16) -> Vec<Span<'static>> {
+    let width = width.max(1);
+    let mut col = 0u16;
+    let chars: Vec<(u16, char, u16)> = buffer
+        .chars()
+        .map(|c| {
+            let w = c.width().unwrap_or(0) as u16;
+            let start = col;
+            col += w;
+            (start, c, w)
+        })
+        .collect();
+    let at = cursor.min(chars.len());
+    // The caret's own column + width: either the char under it, or — at
+    // the end of the buffer — the virtual trailing space, one column wide.
+    let (caret_col, caret_w) = chars.get(at).map_or((col, 1), |&(s, _, w)| (s, w));
+
+    let raw_start = caret_col.saturating_add(caret_w).saturating_sub(width);
+    let start_col = chars
+        .iter()
+        .map(|&(s, _, _)| s)
+        .find(|&s| s >= raw_start)
+        .unwrap_or(caret_col)
+        .min(caret_col); // never excludes the caret's own column
+    let start_idx = chars.partition_point(|&(s, _, _)| s < start_col);
+    let end_bound = start_col + width;
+    // A `width` narrower than the caret's own char (e.g. `width == 1` with a
+    // 2-column CJK/emoji char under the caret) excludes that char here —
+    // the fallback below still draws a caret, just a bare reversed space
+    // rather than the hidden character. Never a panic, but a real field is
+    // always ≥ a handful of columns, so this is a narrower-than-any-glyph
+    // corner rather than something that comes up in practice.
+    let end_idx =
+        chars[start_idx..].iter().take_while(|&&(s, _, w)| s + w <= end_bound).count() + start_idx;
+
+    let head_end = at.min(end_idx);
+    let head: String = chars[start_idx..head_end].iter().map(|&(_, c, _)| c).collect();
+    let mut spans = vec![Span::raw(head)];
+    if at < end_idx {
+        if let Some(&(_, c, _)) = chars.get(at) {
             spans.push(Span::styled(c.to_string(), theme::attention()));
-            spans.push(Span::raw(tail.as_str().to_string()));
+            let tail: String = chars[at + 1..end_idx].iter().map(|&(_, c, _)| c).collect();
+            spans.push(Span::raw(tail));
+            return spans;
         }
-        None => spans.push(Span::styled(" ", theme::attention())),
     }
+    spans.push(Span::styled(" ", theme::attention()));
     spans
+}
+
+/// C32/C36 (2026-09-20): `line` broken into the visual rows it occupies at
+/// `width` display columns, each paired with the char index into `line`
+/// where that row's content starts — `rename_field`'s wrap-side
+/// counterpart, for the two fields (pane note, broadcast message) that can
+/// flow onto more rows instead of scrolling sideways. A run of whitespace
+/// is the break point and is dropped there, so a row never opens or closes
+/// on a space; a single word wider than `width` has no whitespace left to
+/// break at, so it hard-breaks mid-word rather than overflowing. The start
+/// index is what lets a caller (`wrap_cursor`) map a cursor column onto the
+/// row it lands on without re-running the break decisions. Pure, and
+/// always returns at least one row (an empty `line` wraps to one empty
+/// row), matching how an unwrapped field always drew at least its own
+/// blank line.
+fn wrap_line(line: &str, width: u16) -> Vec<(String, usize)> {
+    let width = width.max(1);
+    let chars: Vec<char> = line.chars().collect();
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_start = 0usize;
+    let mut row_w = 0u16;
+    let mut pending_ws: Option<String> = None;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let is_ws = chars[i].is_whitespace();
+        let start = i;
+        while i < chars.len() && chars[i].is_whitespace() == is_ws {
+            i += 1;
+        }
+        let token: String = chars[start..i].iter().collect();
+        if is_ws {
+            // Held rather than appended immediately: whether it survives
+            // depends on whether the *next* word also fits this row.
+            pending_ws = Some(token);
+            continue;
+        }
+        let token_w = mouse::display_width(&token);
+        let sep_w = pending_ws.as_deref().map(mouse::display_width).unwrap_or(0);
+        if row.is_empty() {
+            row_start = start; // leading whitespace never opens a row
+        } else if row_w + sep_w + token_w > width {
+            rows.push((std::mem::take(&mut row), row_start));
+            row_start = start;
+            row_w = 0;
+        } else if let Some(sep) = pending_ws.take() {
+            row.push_str(&sep);
+            row_w += sep_w;
+        }
+        pending_ws = None;
+        if token_w <= width {
+            row.push_str(&token);
+            row_w += token_w;
+        } else {
+            // Hard-break: a lone word wider than the field, one char at a
+            // time — the only place a row can end without a word boundary.
+            for (j, ch) in token.chars().enumerate() {
+                let w = ch.width().unwrap_or(0) as u16;
+                if !row.is_empty() && row_w + w > width {
+                    rows.push((std::mem::take(&mut row), row_start));
+                    row_start = start + j;
+                    row_w = 0;
+                }
+                row.push(ch);
+                row_w += w;
+            }
+        }
+    }
+    rows.push((row, row_start));
+    rows
+}
+
+/// Maps `col` (a char index into the line `rows` was wrapped from) onto the
+/// visual `(row, col)` it lands on — `wrap_line`'s cursor-side counterpart.
+/// A column that fell on whitespace `wrap_line` dropped (between one row's
+/// content and the next) lands at the end of the row it trails, which is
+/// where the caret visually sits until the next keystroke pushes it onto a
+/// word. Pure.
+fn wrap_cursor(rows: &[(String, usize)], col: usize) -> (usize, usize) {
+    for (i, (text, start)) in rows.iter().enumerate() {
+        let next_start = rows.get(i + 1).map_or(usize::MAX, |(_, s)| *s);
+        if col < next_start {
+            return (i, col.saturating_sub(*start).min(text.chars().count()));
+        }
+    }
+    let last = rows.len().saturating_sub(1);
+    (last, rows.last().map_or(0, |(t, _)| t.chars().count()))
+}
+
+/// C32/C36 (2026-09-20): which of `total` visual rows are on screen when
+/// only `cap` fit — the dialog's vertical counterpart to `rename_field`'s
+/// horizontal window, same shape: stays put until `caret_row` would fall
+/// outside it, then shifts the minimum needed to bring it back. Pure.
+fn visual_window(caret_row: usize, total: usize, cap: usize) -> std::ops::Range<usize> {
+    let cap = cap.max(1);
+    if total <= cap {
+        return 0..total;
+    }
+    let start = caret_row.saturating_sub(cap - 1).min(total - cap);
+    start..start + cap
 }
 
 /// The rendered width of a span run, in display columns (D1) — what a
@@ -1814,6 +1962,26 @@ fn picker_rows<B: PaneBackend>(app: &App<B>) -> usize {
     }
 }
 
+/// C13/C32/C36: the one field width the tab-rename, pane-editor and
+/// broadcast dialogs all share — `dialog_rect`'s three `centered_near`
+/// calls below, and the width `wrap_line` measures note/broadcast lines
+/// against before `modal_frame` exists to hand back its actual `inner`
+/// (which is this minus the 2-column border, in the common case where the
+/// terminal is wide enough that `centered_near` doesn't have to shrink it).
+const TEXT_DIALOG_WIDTH: u16 = 44;
+
+/// The wrap width `dialog_rect`'s row count and `draw_mode_overlay`'s
+/// actual render must agree on: `centered_near` clamps the dialog to
+/// `body.width` on a terminal narrower than `TEXT_DIALOG_WIDTH`, and
+/// `inner.width` (what rendering wraps against) shrinks with it. Deriving
+/// this from the bare constant instead of `body` booked rows for a wider
+/// frame than the one that actually got drawn, so a wrapped note could
+/// come up a row short and scroll when a correctly-sized box wouldn't
+/// have had to.
+fn text_field_width(body: Rect) -> u16 {
+    TEXT_DIALOG_WIDTH.min(body.width).saturating_sub(2)
+}
+
 /// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
 /// [U20] The picker's size now depends on app state (the type-ahead filter's
 /// row count and the recent-cwd column), so it takes those as `rows`/`cwds`
@@ -1835,19 +2003,42 @@ fn dialog_rect(
         // in the hint bar's right segment, so the pane it is searching
         // stays fully visible while the query narrows.
         Mode::Normal | Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. } => None,
-        Mode::Rename { .. } => Some(centered_near(anchor, body, 44, 3)),
-        // C32 (combined): Rename's width; one row for the name plus one
-        // per note line — the dialog grows a row per Shift+↵ (to
-        // NOTE_MAX_LINES) instead of scrolling.
+        Mode::Rename { .. } => Some(centered_near(anchor, body, TEXT_DIALOG_WIDTH, 3)),
+        // C32 (combined, amended 2026-09-20): Rename's width; one row for
+        // the name plus one per **visual** note row (soft-wrapped, so a
+        // long line grows rows instead of clipping) — capped at
+        // NOTE_MAX_LINES so a wrapped note can't push the dialog past the
+        // body; a vertical scroll (`visual_window`, in `draw_mode_overlay`)
+        // keeps the caret's row in view past the cap. The input-side cap on
+        // *logical* lines (`app::NOTE_MAX_LINES`) is unchanged and separate
+        // — this bound is on rendered rows, which wrapping can multiply.
         Mode::PaneEdit { lines, .. } => {
-            Some(centered_near(anchor, body, 44, lines.len() as u16 + 3))
+            let field_width = text_field_width(body);
+            let note_rows: usize = lines.iter().map(|l| wrap_line(l, field_width).len()).sum();
+            Some(centered_near(
+                anchor,
+                body,
+                TEXT_DIALOG_WIDTH,
+                note_rows.min(NOTE_MAX_LINES) as u16 + 3,
+            ))
         }
-        // C36: C13's width, one row per message line. Wider than the pane
-        // editor would be tempting, but a broadcast is read at the moment
-        // of sending and the eye should be on the title's target count,
-        // not sweeping a wide field.
+        // C36 (amended 2026-09-20): C13's width, one row per **visual**
+        // message row, same wrap-and-cap-and-scroll shape as the pane
+        // editor. Still not wider than C13 — a broadcast is read at the
+        // moment of sending and the eye should be on the title's target
+        // count, not sweeping a wide field. Capped at `BROADCAST_MAX_LINES`
+        // (not `NOTE_MAX_LINES`) so the render cap keeps naming the same
+        // constant DESIGN-ui.md's C36 cites, even though the two are
+        // aliased to the same value today.
         Mode::Broadcast { lines, .. } => {
-            Some(centered_near(anchor, body, 44, lines.len() as u16 + 2))
+            let field_width = text_field_width(body);
+            let msg_rows: usize = lines.iter().map(|l| wrap_line(l, field_width).len()).sum();
+            Some(centered_near(
+                anchor,
+                body,
+                TEXT_DIALOG_WIDTH,
+                msg_rows.min(BROADCAST_MAX_LINES) as u16 + 2,
+            ))
         }
         Mode::Picker { .. } => {
             // U20: as tall as the longer of the two columns (a filter can
@@ -1908,9 +2099,17 @@ fn draw_mode_overlay<B: PaneBackend>(
         Mode::Rename { buffer, cursor, target } => {
             // Tab is the one target left (C32 absorbed pane renames).
             let RenameTarget::Tab = target;
-            let inner = modal_frame(f, body, rect, Line::from(" rename tab ").style(theme::ink()));
+            // The 1-based tab number, not the name being typed — a stable
+            // handle that doesn't shift on every keystroke of the buffer
+            // this dialog is editing (`mouse::tab_label`'s own numbering).
+            let title = elide_to(
+                &format!(" rename tab {} ", app.ws.active_tab + 1),
+                rect.width.saturating_sub(2),
+            );
+            let inner = modal_frame(f, body, rect, Line::from(title).style(theme::ink()));
             f.render_widget(
-                Paragraph::new(Line::from(rename_field(buffer, *cursor))).style(theme::ink()),
+                Paragraph::new(Line::from(rename_field(buffer, *cursor, inner.width)))
+                    .style(theme::ink()),
                 inner,
             );
         }
@@ -1922,25 +2121,59 @@ fn draw_mode_overlay<B: PaneBackend>(
         // C6's header idiom, zero rows spent — and stays visible even
         // with an empty name. Everything `ink()`: it is all input, and
         // quiet input can't be proofread (C13's own rule).
-        Mode::PaneEdit { name, lines, row, col, .. } => {
-            let inner = modal_frame(f, body, rect, Line::from(" edit pane ").style(theme::ink()));
-            let mut name_spans =
-                if *row == 0 { rename_field(name, *col) } else { vec![Span::raw(name.clone())] };
+        Mode::PaneEdit { name, lines, row, col, pane } => {
+            // The pane's stable id, not the name being typed — the name is
+            // the thing this dialog edits, so echoing it in the title would
+            // be redundant and shift on every keystroke.
+            let title = elide_to(&format!(" edit pane {pane} "), rect.width.saturating_sub(2));
+            let inner = modal_frame(f, body, rect, Line::from(title).style(theme::ink()));
+            let mut name_spans = if *row == 0 {
+                rename_field(name, *col, inner.width)
+            } else {
+                vec![Span::raw(name.clone())]
+            };
             let pad = inner.width.saturating_sub(spans_width(&name_spans));
             // The fill keeps the underline running edge to edge (C6's
             // header idiom); the row's style carries it, so the caret's
             // reversal patches on top of it rather than replacing it.
             name_spans.push(Span::raw(" ".repeat(pad as usize)));
-            let mut rendered: Vec<Line<'_>> =
-                vec![Line::from(name_spans).style(theme::ink().add_modifier(Modifier::UNDERLINED))];
-            rendered.extend(lines.iter().enumerate().map(|(i, l)| {
-                if i + 1 == *row {
-                    Line::from(rename_field(l, *col))
-                } else {
-                    Line::from(l.clone())
+            let name_line =
+                Line::from(name_spans).style(theme::ink().add_modifier(Modifier::UNDERLINED));
+
+            // Soft-wrap every note line at the field width (C32, amended
+            // 2026-09-20): a line too long to fit flows onto extra visual
+            // rows instead of clipping. `row`/`col` index the *logical*
+            // line and its char column; `wrap_cursor` maps that onto the
+            // visual row/col the caret actually rides.
+            let wrapped: Vec<Vec<(String, usize)>> =
+                lines.iter().map(|l| wrap_line(l, inner.width)).collect();
+            // `active` is (logical note line, visual row/col within it),
+            // computed once so the loop below and the vertical caret row
+            // agree on the same visual position rather than re-deriving it.
+            let active = (*row > 0).then(|| (*row - 1, wrap_cursor(&wrapped[*row - 1], *col)));
+            let mut note_lines: Vec<Line<'_>> = Vec::new();
+            for (li, rows) in wrapped.iter().enumerate() {
+                let caret = active.filter(|&(ar, _)| ar == li).map(|(_, vrc)| vrc);
+                for (vi, (text, _)) in rows.iter().enumerate() {
+                    note_lines.push(match caret {
+                        Some((vr, vc)) if vr == vi => {
+                            Line::from(rename_field(text, vc, inner.width))
+                        }
+                        _ => Line::from(text.clone()),
+                    });
                 }
-            }));
-            f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
+            }
+            let caret_row = match active {
+                None => 0,
+                Some((ar, (vr, _))) => {
+                    let before: usize = wrapped[..ar].iter().map(|r| r.len()).sum();
+                    1 + before + vr
+                }
+            };
+            let mut rendered = vec![name_line];
+            rendered.extend(note_lines);
+            let window = visual_window(caret_row, rendered.len(), inner.height as usize);
+            f.render_widget(Paragraph::new(rendered[window].to_vec()).style(theme::ink()), inner);
         }
         // C36: the composer. The title carries the **live target count**,
         // and that count is the contract's safety affordance — a visible
@@ -1971,18 +2204,26 @@ fn draw_mode_overlay<B: PaneBackend>(
                 title.push(Span::styled(format!("{glyph} "), style));
             }
             let inner = modal_frame(f, body, rect, Line::from(title));
-            let rendered: Vec<Line<'_>> = lines
-                .iter()
-                .enumerate()
-                .map(|(i, l)| {
-                    if i == *row {
-                        Line::from(rename_field(l, *col))
+            // Soft-wrap every message line (C36, amended 2026-09-20): same
+            // wrap-and-scroll shape as the pane editor's note, minus the
+            // name row this composer has none of.
+            let wrapped: Vec<Vec<(String, usize)>> =
+                lines.iter().map(|l| wrap_line(l, inner.width)).collect();
+            let (caret_vr, caret_vc) = wrap_cursor(&wrapped[*row], *col);
+            let caret_row: usize =
+                wrapped[..*row].iter().map(|r| r.len()).sum::<usize>() + caret_vr;
+            let mut rendered: Vec<Line<'_>> = Vec::new();
+            for (li, rows) in wrapped.iter().enumerate() {
+                for (vi, (text, _)) in rows.iter().enumerate() {
+                    rendered.push(if li == *row && vi == caret_vr {
+                        Line::from(rename_field(text, caret_vc, inner.width))
                     } else {
-                        Line::from(l.clone())
-                    }
-                })
-                .collect();
-            f.render_widget(Paragraph::new(rendered).style(theme::ink()), inner);
+                        Line::from(text.clone())
+                    });
+                }
+            }
+            let window = visual_window(caret_row, rendered.len(), inner.height as usize);
+            f.render_widget(Paragraph::new(rendered[window].to_vec()).style(theme::ink()), inner);
         }
         Mode::Picker { selection, filter, cwd, on_cwd } => {
             let items = app.picker_filtered();
@@ -3875,6 +4116,40 @@ mod tests {
         assert_eq!(five.height, 8);
     }
 
+    /// [Added 2026-09-20, review fix] `dialog_rect` must wrap at the width
+    /// `centered_near` actually clamps the dialog to, not the bare
+    /// `TEXT_DIALOG_WIDTH` — on a terminal narrower than 44 cols the real
+    /// field is narrower too, and booking rows against the wider assumption
+    /// leaves the box a row short (so `visual_window` scrolls immediately
+    /// on a dialog that should have had room to grow instead). Body width
+    /// 40 ⇒ dialog 40 ⇒ field 38: a 40-char word doesn't fit in one row at
+    /// 38 (it would at the wrong assumed 42), so it must book two.
+    #[test]
+    fn dialog_rect_wraps_at_the_actual_clamped_width_on_a_narrow_terminal() {
+        let body = Rect::new(0, 0, 40, 30);
+        let mode = Mode::PaneEdit {
+            name: String::new(),
+            lines: vec!["x".repeat(40)],
+            row: 0,
+            col: 0,
+            pane: 1,
+        };
+        let rect = dialog_rect(&mode, body, body, 0, &[], &Keymap::default(), (0, 0)).unwrap();
+        assert_eq!(rect.width, 40, "clamped to the narrow body, same as centered_near");
+        assert_eq!(rect.height, 5, "name row + two wrapped note rows + frame, not one row short");
+    }
+
+    /// [Added 2026-09-20, review fix] `text_field_width`'s own clamp, in
+    /// isolation from `dialog_rect`: wide enough terminal ⇒ the standard
+    /// 42-column field; narrower ⇒ shrinks with the body, same as
+    /// `centered_near`'s own `width.min(bounds.width)`.
+    #[test]
+    fn text_field_width_matches_centered_nears_own_clamp() {
+        assert_eq!(super::text_field_width(Rect::new(0, 0, 100, 30)), 42);
+        assert_eq!(super::text_field_width(Rect::new(0, 0, 40, 30)), 38);
+        assert_eq!(super::text_field_width(Rect::new(0, 0, 1, 30)), 0, "never underflows");
+    }
+
     #[test]
     fn badge_glyph_yields_to_the_steady_frame_while_the_view_is_frozen() {
         // N1: an animating glyph means "alive right now" — a scrolled pane's
@@ -5705,12 +5980,15 @@ mod tests {
     /// U16: the caret sits AT the insertion point, not always at the end —
     /// the visible half of the cursor motion. Out-of-range values clamp to
     /// the end rather than panicking on a bad slice, and the field slices on
-    /// char boundaries so a multi-byte name survives.
+    /// char boundaries so a multi-byte name survives. `width` is generous
+    /// here (44, C13's own field width) so the window never engages —
+    /// that's `rename_field_windows_the_buffer_to_keep_the_caret_visible`'s
+    /// job below.
     #[test]
     fn rename_field_puts_the_caret_at_the_insertion_point() {
         // (text before the caret, the character under it, text after it).
         let parts = |b: &str, c: usize| {
-            let spans = super::rename_field(b, c);
+            let spans = super::rename_field(b, c, 44);
             let at = spans.iter().position(|s| s.style == theme::attention()).expect("a caret");
             assert_eq!(at, 1, "the caret always follows exactly one head span");
             let text = |s: Option<&ratatui::text::Span<'_>>| {
@@ -5736,13 +6014,127 @@ mod tests {
     #[test]
     fn moving_the_caret_never_moves_the_text_around_it() {
         let widths: Vec<u16> =
-            (0..=4).map(|c| super::spans_width(&super::rename_field("abcd", c))).collect();
+            (0..=4).map(|c| super::spans_width(&super::rename_field("abcd", c, 44))).collect();
         assert_eq!(widths, vec![4, 4, 4, 4, 5], "only the end-of-buffer caret adds a column");
         for cursor in 0..=4 {
-            let spans = super::rename_field("abcd", cursor);
+            let spans = super::rename_field("abcd", cursor, 44);
             let flat: String = spans.iter().map(|s| s.content.to_string()).collect();
             assert_eq!(flat.trim_end(), "abcd", "cursor {cursor} rewrote the text");
         }
+    }
+
+    /// [Added 2026-09-20] The caret window: past ~42 columns the old
+    /// unbounded field clipped at the right edge, caret included, so typing
+    /// a long name went blind. A width-4 field over a 10-char buffer proves
+    /// the window follows the caret at the start, middle, and end without
+    /// ever excluding it.
+    #[test]
+    fn rename_field_windows_the_buffer_to_keep_the_caret_visible() {
+        let flat = |b: &str, c: usize, w: u16| -> String {
+            super::rename_field(b, c, w).iter().map(|s| s.content.to_string()).collect()
+        };
+        let has_caret = |b: &str, c: usize, w: u16| {
+            super::rename_field(b, c, w).iter().any(|s| s.style == theme::attention())
+        };
+        let buffer = "0123456789";
+        for c in [0usize, 5, 10] {
+            assert!(has_caret(buffer, c, 4), "cursor {c} lost its caret to the window");
+            assert!(
+                super::spans_width(&super::rename_field(buffer, c, 4)) <= 4,
+                "cursor {c} overflowed the 4-column field"
+            );
+        }
+        // At the start the window is left-anchored — no scroll needed yet.
+        assert!(flat(buffer, 0, 4).starts_with('0'), "left-anchored at the buffer's start");
+        // Scrolled right to keep a middle caret in view.
+        let mid = flat(buffer, 5, 4);
+        assert!(mid.contains('5'), "the window must contain the caret's own character: {mid:?}");
+        // At the end the window trails off the last real character to make
+        // room for the trailing caret space.
+        let end = flat(buffer, 10, 4);
+        assert!(end.ends_with(' '), "end-of-buffer caret is a trailing reversed space: {end:?}");
+    }
+
+    /// [Added 2026-09-20] Width is measured in display columns
+    /// (`mouse::display_width`), not chars — a CJK/emoji buffer must scroll
+    /// at the same *visual* point an ASCII one does, and the window must
+    /// never split a wide glyph across its edge.
+    #[test]
+    fn rename_field_window_measures_display_columns_not_chars() {
+        // "文" is 1 char / 2 columns; five of them are 5 chars / 10 columns.
+        let buffer = "文文文文文";
+        let spans = super::rename_field(buffer, 4, 4);
+        assert_eq!(super::spans_width(&spans), 4, "a 4-column window never exceeds 4 columns");
+        let flat: String = spans.iter().map(|s| s.content.to_string()).collect();
+        // A 4-column window can hold exactly two full-width chars — never a
+        // half-drawn third one.
+        assert!(
+            flat.chars().filter(|&c| c == '文').count() <= 2,
+            "no wide char split across the window edge: {flat:?}"
+        );
+        // An emoji (also 2 columns) at the very end still gets its caret.
+        let emoji = "ab🎉";
+        assert!(super::rename_field(emoji, 3, 3).iter().any(|s| s.style == theme::attention()));
+    }
+
+    /// [Added 2026-09-20] C32/C36's soft wrap: a whitespace run is the
+    /// break point and is dropped there, so wrapped rows read as plain
+    /// prose rather than carrying a stray leading/trailing space.
+    #[test]
+    fn wrap_line_breaks_at_whitespace_and_drops_the_separator() {
+        let rows: Vec<String> =
+            super::wrap_line("hello world", 8).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(rows, vec!["hello", "world"]);
+        // Fits whole ⇒ one row, byte-for-byte the original line.
+        assert_eq!(
+            super::wrap_line("hello world", 11).into_iter().map(|(t, _)| t).collect::<Vec<_>>(),
+            vec!["hello world"]
+        );
+        // An empty line still occupies one (empty) visual row.
+        assert_eq!(super::wrap_line("", 8), vec![(String::new(), 0)]);
+    }
+
+    /// [Added 2026-09-20] A single word wider than the field has no
+    /// whitespace left to break at, so it hard-breaks mid-word instead of
+    /// overflowing the row.
+    #[test]
+    fn wrap_line_hard_breaks_a_word_wider_than_the_field() {
+        let rows: Vec<String> =
+            super::wrap_line("supercalifragilistic", 6).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(rows, vec!["superc", "alifra", "gilist", "ic"]);
+        for row in &rows {
+            assert!(super::mouse::display_width(row) <= 6, "{row:?} overflowed the field");
+        }
+    }
+
+    /// [Added 2026-09-20] `wrap_cursor` maps a logical char column onto the
+    /// visual row/col it lands on — the caret's answer to which of the
+    /// wrapped rows it actually rides, including a column that fell on the
+    /// whitespace `wrap_line` dropped between two rows.
+    #[test]
+    fn wrap_cursor_maps_the_logical_column_onto_its_visual_row() {
+        let rows = super::wrap_line("hello world", 8);
+        assert_eq!(rows, vec![("hello".to_string(), 0), ("world".to_string(), 6)]);
+        assert_eq!(super::wrap_cursor(&rows, 0), (0, 0), "start of the line");
+        assert_eq!(super::wrap_cursor(&rows, 3), (0, 3), "mid-word, first row");
+        // Index 5 is the dropped space itself — attributed to the end of
+        // the row it trails, which is where the caret visually sits.
+        assert_eq!(super::wrap_cursor(&rows, 5), (0, 5));
+        assert_eq!(super::wrap_cursor(&rows, 6), (1, 0), "start of the second row");
+        assert_eq!(super::wrap_cursor(&rows, 11), (1, 5), "end of the line");
+    }
+
+    /// [Added 2026-09-20] The dialog's vertical window: same shape as the
+    /// horizontal one, and must keep the caret's row on screen once
+    /// wrapping pushes the total past the cap.
+    #[test]
+    fn visual_window_keeps_the_caret_row_in_view_past_the_cap() {
+        assert_eq!(super::visual_window(0, 5, 8), 0..5, "under the cap ⇒ show everything");
+        assert_eq!(super::visual_window(0, 20, 8), 0..8, "caret at the top ⇒ left alone");
+        assert_eq!(super::visual_window(19, 20, 8), 12..20, "caret at the bottom ⇒ follows it");
+        let mid = super::visual_window(10, 20, 8);
+        assert!(mid.contains(&10), "a mid-document caret must stay inside its own window");
+        assert_eq!(mid.len(), 8);
     }
 
     /// C14 (U20): the cwd column shows the last two path components, so a

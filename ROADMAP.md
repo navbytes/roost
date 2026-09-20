@@ -378,6 +378,19 @@ Left:
   they survive that; C13/C32 titles carry no keys. The pane editor also never
   names the pane it edits (the broadcast composer names its targets). Found by
   the 2026-09-19 popup review; not taken because it's a C13/C32 contract change.
+  **[Amended 2026-09-20]** The pane-editor-never-names-the-pane clause is
+  fixed (titles now carry the tab index / pane id, DESIGN-ui.md C13/C32); the
+  rest of this gap — no key hints in the title, no divider without underline
+  support — stands.
+- **[choice] `rename_field`'s caret window is right-anchored, not held-still
+  (2026-09-20).** The same-date fix (DESIGN-ui.md C13) guarantees the caret is
+  never hidden past ~42 columns, but the window recomputes from `cursor`
+  alone — pure, no render-time state — so once scrolled it pins the caret to
+  the field's trailing edge and shifts one column per ←/→ instead of holding
+  still until the caret would actually leave it, the way a held window origin
+  would. That needs an origin carried in `Mode::Rename`/`PaneEdit`/`Broadcast`
+  rather than derived fresh each frame, which is state a caret-hidden bug fix
+  didn't need to add. Flagged by that fix's own review round. Size S/M.
 - **[gap] No direct-select in the solo rail.** `Alt+↑↓` steps only, so nine panes
   means eight presses; the picker, tabs and roster all have 1..9 or cursor+↵.
   C43's deferred list doesn't mention it. Needs a chord decision.
