@@ -450,13 +450,6 @@ as its own isolated, well-reviewed change (they touch roost's trickiest code).
   `agents/pi.rs`'s narrowed-then-full-scan-fallback detection was left
   untouched, as was every other adapter.
 
-- **[health] `tests/firehose.rs` depends on the checkout path.** It fails
-  deterministically (echo of `g` not visible within 250ms) from any checkout
-  whose directory name is long: the shell prompt prints the cwd basename and the
-  typed text wraps inside pane B's ~58 columns. A worktree path produced a false
-  "pre-existing failure" report on 2026-09-20. Fix: pin a short `PS1` (or cwd)
-  for the harness's panes.
-
 ## Performance — deferred
 
 - **[perf] Scope pi `session_state` to the cwd.** It walks the *entire* pi

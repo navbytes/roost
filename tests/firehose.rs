@@ -91,18 +91,21 @@ fn firehose_latency_starvation_and_clean_exit() {
     // (`src/ui/input.rs`: Alt+l / Alt+Right both map to Focus(Dir::Right)).
     h.write_bytes(b"\x1bl");
 
-    // No PS1 wrangling either, for the same reason. The echo assertion below
-    // accumulates 20 characters on the pane's **first content row**, and this
-    // gate used to have to set a two-column prompt in-band because macOS's
-    // login shell starts with `\h:\W \u\$ ` — 30 columns of hostname and
-    // username — which left 12 before the badge overwrote the echo, failing
-    // at keystroke ~12 on every Mac while passing on Linux's `$ `. With the
-    // badge off that row, the default prompt and twenty characters fit side
-    // by side and the shell can be whatever the host makes it.
+    // Pin pane B's prompt to two columns. The echo assertion below accumulates
+    // 20 characters on one ~58-column row, and a login shell's default prompt
+    // is as wide as the host's hostname, user and cwd *basename* make it:
+    // macOS starts at `\h:\W \u\$ `, so a checkout whose directory name is
+    // long wraps the run onto a second row, where `half()`'s newline-joined
+    // text no longer contains it — this gate failed at keystroke 4 from a
+    // 45-character worktree name while passing from `roost`. That is a
+    // property of the checkout path, not of roost, and it has already been
+    // mistaken for a real regression once (2026-09-20).
     //
-    // Verified as the reason rather than assumed: with the pre-amendment
-    // renderer and these two workarounds removed, this gate fails at
-    // keystroke 6.
+    // In-band because it cannot be inherited: shell panes are login shells
+    // (P18) and macOS's /etc/bashrc assigns PS1 unconditionally, so an
+    // exported one loses — see `harness::spawn`. Assertion 2's 3.5s window
+    // below doubles as the wait for the new prompt to land.
+    h.write_bytes(b"PS1='$ '\r");
 
     // --- Assertion 2 (checked first so its ~3.5s duration overlaps the
     // sustained-spew window assertion 1 also needs, keeping total wall time
