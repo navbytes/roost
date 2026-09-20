@@ -381,22 +381,6 @@ Left:
 - **[gap] No direct-select in the solo rail.** `Alt+↑↓` steps only, so nine panes
   means eight presses; the picker, tabs and roster all have 1..9 or cursor+↵.
   C43's deferred list doesn't mention it. Needs a chord decision.
-- **[choice] What the keymap counter counts.** The title now counts the table's
-  *rows* rather than its lines, but 8 rows bind nothing — the glyph legend and
-  the `CONTROL CLI` block (`render.rs` `HELP_GROUPS`) — so `keys — n/44` is 44
-  entries of which 36 are pressable. Narrowing cannot key off `HelpKey::Text`:
-  the dead-pane `↵ / f / y` row is `Text` and is a real key. And DESIGN-ui.md's
-  own illustration (C28/C39, `keys — 26/36`) names no unit and matches neither
-  reading, so the spec has to say what it means before the code can follow.
-  Second, smaller seam: headings still occupy the scroll window, so `↓` moves
-  the counter by 0, 1 or 2. Found by the 2026-09-20 design audit.
-- **[choice] A zero-match keymap filter is a 2-row frame saying "0 shown"**,
-  where the roster draws `no pane matches` inside its own. C14's rule ("an empty
-  result still needs a frame to say so") is satisfied by the title, and
-  `a_query_matching_nothing_still_draws_a_frame_that_says_so` pins that reading
-  on purpose — so this is a consistency question about the two surfaces, not a
-  bug in either. Found by the 2026-09-19 popup review; the counting half of that
-  entry is fixed (the title counts chords now, not rows).
 - **[choice] Fleet overlays grow while open.** Since #191 the roster/feed frame is
   sized to max(fleet, feed) and grows as panes or feed entries arrive (a filter
   or toggle still never resizes it). C20/C27 accept this as worded; revisit only
