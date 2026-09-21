@@ -8125,6 +8125,71 @@ row's — widen ADAPTER_COL",
         assert!(frame.contains("note investigate timeout"), "the note field is labelled:\n{frame}");
     }
 
+    /// [Added 2026-09-21, review fix] A note past the field width wraps
+    /// (C32): only the first visual row of a logical line gets the `note `
+    /// label, the rest are indented `PANE_EDIT_LABEL_WIDTH` blank columns so
+    /// the text lines up under it. `dialog_rect`'s booked height must match
+    /// what `draw_mode_overlay` actually paints, or the box comes up a row
+    /// short/long relative to its own border.
+    #[test]
+    fn pane_edit_note_continuation_row_is_blank_indented_and_matches_dialog_rect_height() {
+        use crate::core::app::Mode;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::{Rect, Size};
+        use ratatui::Terminal;
+
+        let body = Rect::new(0, 0, 100, 30);
+        let field_width = super::pane_edit_field_width(body);
+        assert_eq!(field_width, 37, "the width this test's wrap math assumes");
+        // One word wider than the field: a deterministic hard-break at
+        // exactly `field_width` chars, so the split point isn't at the
+        // mercy of word-boundary wrapping.
+        let tail = 13;
+        let note = "x".repeat(field_width as usize + tail);
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.mode =
+            Mode::PaneEdit { name: "api".into(), lines: vec![note], row: 0, col: 0, pane: 1 };
+
+        let rect = dialog_rect(&app.mode, body, body, 0, &[], &Keymap::default(), (0, 0)).unwrap();
+        assert_eq!(rect.height, 5, "name row + two wrapped note rows + top/bottom border");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            (0..100).filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string())).collect()
+        };
+        let cols = |y: u16, x0: u16, n: u16| -> String {
+            (x0..x0 + n).filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string())).collect()
+        };
+
+        // Border consumes row 0; row 1 is the name field; the wrapped note
+        // is rows 2 and 3 — exactly what `rect.height` booked, no more.
+        let inner_x = rect.x + 1;
+        let first_note_row = rect.y + 2;
+        let continuation_row = rect.y + 3;
+        assert!(
+            row_text(first_note_row)
+                .contains(&format!("note {}", "x".repeat(field_width as usize))),
+            "the first visual row carries the label and fills the field: {}",
+            row_text(first_note_row)
+        );
+        assert_eq!(
+            cols(continuation_row, inner_x, super::PANE_EDIT_LABEL_WIDTH),
+            " ".repeat(super::PANE_EDIT_LABEL_WIDTH as usize),
+            "the continuation row is blank-indented, not re-labelled"
+        );
+        assert_eq!(
+            cols(continuation_row, inner_x + super::PANE_EDIT_LABEL_WIDTH, tail as u16),
+            "x".repeat(tail),
+            "the continuation row picks up right where the hard-break left off"
+        );
+        // Bottom border, not a fourth content row — the dialog drew exactly
+        // the rows `dialog_rect` booked.
+        assert!(row_text(rect.y + rect.height - 1).contains('└'), "bottom border closes the box");
+    }
+
     #[test]
     fn picker_zero_adapter_matches_keeps_the_cwd_column_actionable() {
         use crate::core::app::Mode;

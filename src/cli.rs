@@ -551,18 +551,18 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
     match verb {
         "list" => {
             reject_unknown_flags(verb, rest, &[])?;
-            require_positionals(verb, rest, 0, 0)?;
+            require_positionals(verb, rest, 0, 0, None)?;
         }
         "status" => {
             reject_unknown_flags(verb, rest, &[])?;
-            let pos = require_positionals(verb, rest, 0, 1)?;
+            let pos = require_positionals(verb, rest, 0, 1, None)?;
             if let Some(p) = pos.first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
         }
         "spawn" => {
             reject_unknown_flags(verb, rest, &["--cwd", "--input"])?;
-            let pos = require_positionals(verb, rest, 1, 1)?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("an ADAPTER"))?;
             let adapter = &pos[0];
             m.insert("adapter".into(), adapter.as_str().into());
             if let Some(cwd) = flag_value(rest, "--cwd")? {
@@ -574,7 +574,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "fork" => {
             reject_unknown_flags(verb, rest, &[])?;
-            let pos = require_positionals(verb, rest, 0, 1)?;
+            let pos = require_positionals(verb, rest, 0, 1, None)?;
             if let Some(p) = pos.first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
@@ -604,7 +604,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "read" => {
             reject_unknown_flags(verb, rest, &["--tail", "--full"])?;
-            let pos = require_positionals(verb, rest, 1, 1)?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
             if has_flag(rest, "--tail") && has_flag(rest, "--full") {
@@ -622,14 +622,14 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "close" => {
             reject_unknown_flags(verb, rest, &["--force"])?;
-            let pos = require_positionals(verb, rest, 1, 1)?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
             m.insert("force".into(), has_flag(rest, "--force").into());
         }
         "focus" => {
             reject_unknown_flags(verb, rest, &[])?;
-            let pos = require_positionals(verb, rest, 1, 1)?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
         }
@@ -665,15 +665,23 @@ fn parse_pane(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| format!("not a pane id: {s}"))
 }
 
+/// `metavar` restores the pre-generic wording ("spawn needs an ADAPTER",
+/// "read needs a PANE") for verbs whose one required positional has a name
+/// worth saying — `None` falls back to the count-based message, which is
+/// all a `min: 0` verb (no required positional to name) ever hits.
 fn require_positionals(
     verb: &str,
     args: &[String],
     min: usize,
     max: usize,
+    metavar: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let pos = positional(args);
     if pos.len() < min {
-        return Err(format!("{verb} needs {min} positional argument(s)"));
+        return Err(match metavar {
+            Some(m) => format!("{verb} needs {m}"),
+            None => format!("{verb} needs {min} positional argument(s)"),
+        });
     }
     if pos.len() > max {
         return Err(format!("{verb} takes at most {max} positional argument(s)"));
@@ -688,6 +696,16 @@ fn require_positionals(
 /// mistaken for an option before this point.
 fn end_of_options(args: &[String]) -> usize {
     args.iter().position(|a| a == "--").unwrap_or(args.len())
+}
+
+/// True when `flag`'s value slot is filled by another option name rather
+/// than a real value (`--cwd --tail`) — shared by `reject_unknown_flags` and
+/// `flag_value` so the collision rule can't drift between the two call
+/// sites. `--input` is exempt: its value is free-form prompt text, so even a
+/// recognized option name is a legal literal value for it.
+fn value_collides_with_flag(flag: &str, candidate: &str) -> bool {
+    !FREE_TEXT_VALUE_OPTIONS.contains(&flag)
+        && (VALUE_TAKING_OPTIONS.contains(&candidate) || BOOLEAN_OPTIONS.contains(&candidate))
 }
 
 /// Every `--flag` in `args` ahead of `--` must be in `allowed`, or this is a
@@ -715,22 +733,18 @@ fn reject_unknown_flags(verb: &str, args: &[String], allowed: &[&str]) -> Result
             let opts = if allowed.is_empty() { "(none)".to_string() } else { allowed.join("|") };
             return Err(format!("{verb}: unknown flag {a} (valid: {opts})"));
         }
-        if allowed.contains(&a.as_str()) && VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
+        let value_taking_allowed =
+            allowed.contains(&a.as_str()) && VALUE_TAKING_OPTIONS.contains(&a.as_str());
+        if value_taking_allowed {
             if i + 1 >= end {
                 return Err(format!("{a} needs a value"));
             }
             let next = args[i + 1].as_str();
-            if !FREE_TEXT_VALUE_OPTIONS.contains(&a.as_str())
-                && (VALUE_TAKING_OPTIONS.contains(&next) || BOOLEAN_OPTIONS.contains(&next))
-            {
+            if value_collides_with_flag(a, next) {
                 return Err(format!("{a} needs a value before {next}"));
             }
         }
-        i += if allowed.contains(&a.as_str()) && VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
-            2
-        } else {
-            1
-        };
+        i += if value_taking_allowed { 2 } else { 1 };
     }
     Ok(())
 }
@@ -786,10 +800,7 @@ fn flag_value(args: &[String], flag: &str) -> Result<Option<String>, String> {
     let Some(i) = args[..end].iter().position(|a| a == flag) else { return Ok(None) };
     if i + 1 >= end {
         Err(format!("{flag} needs a value"))
-    } else if !FREE_TEXT_VALUE_OPTIONS.contains(&flag)
-        && (VALUE_TAKING_OPTIONS.contains(&args[i + 1].as_str())
-            || BOOLEAN_OPTIONS.contains(&args[i + 1].as_str()))
-    {
+    } else if value_collides_with_flag(flag, &args[i + 1]) {
         Err(format!("{flag} needs a value before {}", args[i + 1]))
     } else {
         Ok(Some(args[i + 1].clone()))
@@ -1335,6 +1346,50 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The invariant `reject_unknown_flags`/`flag_value`/`has_flag` all lean
+    /// on: no flag is in both `VALUE_TAKING_OPTIONS` and `BOOLEAN_OPTIONS`
+    /// (a flag can't both eat the next token and not), and every option any
+    /// verb actually accepts (mirrored here from `build_request`'s `match`)
+    /// is classified into exactly one of the two — an option added to a
+    /// verb's `allowed` list and left off both would fall through
+    /// unclassified rather than erroring loudly.
+    #[test]
+    fn value_taking_and_boolean_options_partition_every_verbs_allowed_flags() {
+        let overlap: Vec<&&str> = super::VALUE_TAKING_OPTIONS
+            .iter()
+            .filter(|f| super::BOOLEAN_OPTIONS.contains(f))
+            .collect();
+        assert!(overlap.is_empty(), "a flag can't be both value-taking and boolean: {overlap:?}");
+
+        let per_verb_allowed: &[(&str, &[&str])] = &[
+            ("list", &[]),
+            ("status", &[]),
+            ("spawn", &["--cwd", "--input"]),
+            ("fork", &[]),
+            ("send", &["--all", "--enter"]),
+            ("read", &["--tail", "--full"]),
+            ("close", &["--force"]),
+            ("focus", &[]),
+            ("wait", &["--until", "--timeout"]),
+        ];
+        assert_eq!(
+            per_verb_allowed.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            super::VERBS.to_vec(),
+            "keep this table in sync with build_request's match arms"
+        );
+        for (verb, allowed) in per_verb_allowed {
+            for flag in *allowed {
+                let value_taking = super::VALUE_TAKING_OPTIONS.contains(flag);
+                let boolean = super::BOOLEAN_OPTIONS.contains(flag);
+                assert!(
+                    value_taking ^ boolean,
+                    "{verb}'s {flag} must classify into exactly one of \
+                     VALUE_TAKING_OPTIONS/BOOLEAN_OPTIONS"
+                );
+            }
+        }
+    }
+
     /// The pre-pass must find the workspace flag in every position for
     /// every verb — before the verb, after it, in either `-w` spelling —
     /// and hand back argv with the verb still first.
@@ -1569,6 +1624,26 @@ mod tests {
             let err = build_request(&owned, "T".into()).unwrap_err();
             assert!(err.contains("not both"), "{args:?}: {err}");
         }
+    }
+
+    /// [Added 2026-09-21] `reject_unknown_flags` skips a value-taking
+    /// allowed flag's own value token (`i += 2`), so a `-`-prefixed value —
+    /// which used to be misread as a stray unknown flag before that skip
+    /// existed — reaches the flag's own parsing untouched, whatever that
+    /// makes of it.
+    #[test]
+    fn a_dash_prefixed_value_after_cwd_or_timeout_is_taken_as_the_value_not_an_unknown_flag() {
+        match parse(&["spawn", "claude", "--cwd", "-weird-dir"]).method {
+            Method::Spawn { cwd, .. } => assert_eq!(cwd.as_deref(), Some("-weird-dir")),
+            _ => panic!(),
+        }
+        // --timeout still parses its value as a number, so a dash-prefixed
+        // one fails there — the point is *which* error: never "unknown flag".
+        let owned: Vec<String> =
+            ["wait", "3", "--timeout", "-5"].iter().map(|s| s.to_string()).collect();
+        let err = build_request(&owned, "T".into()).unwrap_err();
+        assert!(err.contains("needs a number"), "{err}");
+        assert!(!err.contains("unknown flag"), "{err}");
     }
 
     #[test]

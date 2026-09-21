@@ -32,7 +32,7 @@ All six bounded findings were fixed. Structured CLI values reject option-name co
 
 - `cargo +1.96.1 fmt --check` — passed.
 - `cargo +1.96.1 clippy --all-targets -- -D warnings` — passed.
-- `env -u NO_COLOR TERM=xterm-256color COLORTERM=truecolor cargo test` — 1,276 passed, 0 failed.
+- `env -u NO_COLOR TERM=xterm-256color COLORTERM=truecolor cargo test` — 1,286 passed, 0 failed.
 - Independent code review — approved after pinning recognized option names as valid free-form `--input` text.
 - TUI design-supervisor audit — aligned with C12/C13/C14/C32 after the contract amendments in `DESIGN-ui.md`.
 

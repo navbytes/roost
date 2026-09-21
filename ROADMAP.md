@@ -394,14 +394,15 @@ Left:
 - **[gap] No direct-select in the solo rail.** `Alt+↑↓` steps only, so nine panes
   means eight presses; the picker, tabs and roster all have 1..9 or cursor+↵.
   C43's deferred list doesn't mention it. Needs a chord decision.
-- **[choice] The picker has no "nothing matched" line.** C14's own rule got its
+- **[done] The picker has no "nothing matched" line.** C14's own rule got its
   row in C27's roster, the feed, and (2026-09-20) the keymap, all through the
   same `draw_empty_state`. The picker floors its frame to one row
-  (`render.rs` `dialog_rect`, `Mode::Picker`) but draws nothing in it: a filter
-  matching no adapter leaves the adapter column blank beside a populated cwd
+  (`render.rs` `dialog_rect`, `Mode::Picker`) but drew nothing in it: a filter
+  matching no adapter left the adapter column blank beside a populated cwd
   column. Its two-column body is the reason it was skipped — "no adapter
   matches" belongs to one column, not to the dialog. Noticed by the 2026-09-20
-  design audit.
+  design audit; fixed by the owner-audit pass — the picker now shows `no agent
+  matches` in the adapter column.
 - **[choice] Fleet overlays grow while open.** Since #191 the roster/feed frame is
   sized to max(fleet, feed) and grows as panes or feed entries arrive (a filter
   or toggle still never resizes it). C20/C27 accept this as worded; revisit only
