@@ -7,3 +7,5 @@ for `AGENTS.md` should follow this pointer and read that file.
 This used to be a machine translation of CLAUDE.md. It had already drifted —
 it renamed the product "Codex Code" — and a second copy of a living document
 drifts by construction. One orientation, one place.
+
+For change and release authorization, follow [.github/RELEASE-POLICY.md](.github/RELEASE-POLICY.md).

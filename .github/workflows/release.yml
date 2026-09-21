@@ -21,6 +21,15 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-publisher
+  cancel-in-progress: false
 
 jobs:
   # Dispatch-only gate, and the reason it exists is a real incident.
@@ -48,15 +57,33 @@ jobs:
   # is checked in `build` instead) and the job still succeeds.
   preflight:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - name: Require an authorized release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo 'Manual releases must run from main'; exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --paginate --slurp > "$RUNNER_TEMP/release-prs.json"
+          jq -e --arg sha "$GITHUB_SHA" --arg repo "$GITHUB_REPOSITORY" 'add | any(.[]; .merged_at != null and .merge_commit_sha == $sha and .base.ref == "main" and .head.repo.full_name == $repo and (.head.ref | startswith("release/")))' "$RUNNER_TEMP/release-prs.json"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Require a merged release commit
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
       - name: Refuse to re-release a version that is already tagged
-        if: github.event_name == 'workflow_dispatch'
+        if: github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
           version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
-          if git ls-remote --exit-code origin "refs/tags/v${version}" >/dev/null 2>&1; then
+          if git rev-parse "v${version}" >/dev/null 2>&1 && [ "$(git rev-list -n 1 "v${version}")" != "$GITHUB_SHA" ]; then
             echo "::error title=v${version} is already released::Cargo.toml at this commit says ${version}, and v${version} is already tagged. Continuing would overwrite that release's published artifacts with binaries built from this commit. Merge the version-bump PR first, then dispatch again (or just touch .github/release-request and let release-request.yml do it)."
             exit 1
           fi
@@ -79,8 +106,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Cheap guard against shipping a binary whose --version-equivalent
       # (the crate version baked into the tarball name) doesn't match what
@@ -118,8 +146,9 @@ jobs:
           tar czf "${pkg}.tar.gz" "$pkg"
           shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
+          retention-days: 7
           name: dist-${{ matrix.target }}
           path: |
             roost-*.tar.gz
@@ -129,6 +158,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     env:
@@ -140,9 +170,9 @@ jobs:
     steps:
       # Checkout first — it wipes the workspace, and the sync step below
       # needs scripts/ from the repo.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           pattern: dist-*
@@ -169,11 +199,12 @@ jobs:
       # No artifact signing yet.
       # TODO: sign release artifacts (e.g. cosign or minisign) once a
       # signing key is provisioned.
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           # Explicit on both paths; on a dispatch run this is what creates
           # the tag (at this run's commit) rather than expecting one.
           tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS.txt

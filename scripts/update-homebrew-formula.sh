@@ -96,18 +96,33 @@ git clone --depth 1 \
   "$workdir/tap"
 
 tap="$workdir/tap"
+branch="release/roost-${version}"
+remote_branch="$(git -C "$tap" ls-remote --heads origin "refs/heads/$branch")"
+if [ -n "$remote_branch" ]; then
+  git -C "$tap" fetch origin "refs/heads/$branch"
+  git -C "$tap" checkout -B "$branch" FETCH_HEAD
+fi
 mkdir -p "$tap/Formula"
 render > "$tap/Formula/roost.rb"
 
 cd "$tap"
 git add -A
-if git diff --cached --quiet; then
-  echo "Tap already up to date for ${version}; nothing to push."
+if ! git diff --cached --quiet; then
+  git config user.name "github-actions[bot]"
+  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+  git commit -m "roost ${version}"
+  git push origin "HEAD:refs/heads/$branch"
+elif [ -z "$remote_branch" ]; then
+  echo "Tap already up to date for ${version}."
   exit 0
 fi
-
-git config user.name "github-actions[bot]"
-git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git commit -m "roost ${version}"
-git push
-echo "Pushed tap update for roost ${version}."
+export GH_TOKEN="$HOMEBREW_TAP_TOKEN"
+open_prs="$(gh pr list --repo navbytes/homebrew-tap --head "$branch" --state open --json number --jq length)"
+if [ "$open_prs" = 0 ]; then
+  merged_prs="$(gh pr list --repo navbytes/homebrew-tap --head "$branch" --state merged --json number --jq length)"
+  if [ "$merged_prs" = 0 ]; then
+    gh pr create --repo navbytes/homebrew-tap --base main --head "$branch" \
+      --title "roost ${version}" --body "Update the tap to the published roost ${version} release."
+  fi
+fi
+echo "Tap PR ready for roost ${version}."
