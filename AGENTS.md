@@ -38,16 +38,20 @@ each adapter's own session ids.
   then touch `.github/release-request` and merge: the request workflow
   dispatches Release, which builds four targets, **creates the `v*` tag
   itself** from Cargo.toml's version, publishes with SHA256SUMS.txt, and
-  syncs the Homebrew tap. **The tap sync works on its own now** — the
-  `HOMEBREW_TAP_TOKEN` secret got configured sometime after 2026-08-21:
-  on v0.1.15 (2026-09-01) the workflow itself pushed `roost 0.1.15` to
-  navbytes/homebrew-tap one second after publishing, verified
-  byte-identical to a hand-render. So do NOT hand-sync by default; the
-  hand-sync era (every release v0.1.5→v0.1.12; v0.1.8/v0.1.9 missed and
-  the tap quietly served 0.1.8 until tap PRs #3–#5 caught it up) is
-  history. After a release, confirm the tap's `Formula/roost.rb` hit the
-  new version; only if the sync step skipped or failed, fall back to
-  rendering with
+  opens a Homebrew tap PR. **The tap update is a PR, not a push** (since
+  #203): the workflow pushes `release/roost-X.Y.Z` to navbytes/homebrew-tap
+  and opens a PR that a human reviews and merges — until it merges, `brew`
+  keeps serving the previous version. `HOMEBREW_TAP_TOKEN` needs both
+  Contents and Pull requests write on the tap: on v0.1.24 (2026-09-21) it
+  lacked the latter, the branch pushed but PR creation 403'd and failed the
+  run after the release had already published; a hand-opened tap PR (#9)
+  from the pushed branch finished it, and the token was fixed. Do NOT
+  hand-render by default; the hand-sync era (every release v0.1.5→v0.1.12;
+  v0.1.8/v0.1.9 missed and the tap quietly served 0.1.8 until tap PRs #3–#5
+  caught it up) is history. After a release, confirm the tap PR merged and
+  `Formula/roost.rb` on the tap's `main` hit the new version; if the branch
+  pushed but no PR opened, open one from that branch; only if no branch
+  exists, fall back to rendering with
   `RENDER_ONLY=1 RELEASE_TAG=vX.Y.Z scripts/update-homebrew-formula.sh`
   (SUMS_FILE pointed at the release's SHA256SUMS.txt) and PR the result
   to navbytes/homebrew-tap. Built this way (v0.1.7,
