@@ -1969,6 +1969,7 @@ fn picker_rows<B: PaneBackend>(app: &App<B>) -> usize {
 /// (which is this minus the 2-column border, in the common case where the
 /// terminal is wide enough that `centered_near` doesn't have to shrink it).
 const TEXT_DIALOG_WIDTH: u16 = 44;
+const PANE_EDIT_LABEL_WIDTH: u16 = 5;
 
 /// The wrap width `dialog_rect`'s row count and `draw_mode_overlay`'s
 /// actual render must agree on: `centered_near` clamps the dialog to
@@ -1980,6 +1981,10 @@ const TEXT_DIALOG_WIDTH: u16 = 44;
 /// have had to.
 fn text_field_width(body: Rect) -> u16 {
     TEXT_DIALOG_WIDTH.min(body.width).saturating_sub(2)
+}
+
+fn pane_edit_field_width(body: Rect) -> u16 {
+    text_field_width(body).saturating_sub(PANE_EDIT_LABEL_WIDTH)
 }
 
 /// The pure half of `modal_rect`: mode + geometry in, dialog rect out.
@@ -2013,7 +2018,7 @@ fn dialog_rect(
         // *logical* lines (`app::NOTE_MAX_LINES`) is unchanged and separate
         // — this bound is on rendered rows, which wrapping can multiply.
         Mode::PaneEdit { lines, .. } => {
-            let field_width = text_field_width(body);
+            let field_width = pane_edit_field_width(body);
             let note_rows: usize = lines.iter().map(|l| wrap_line(l, field_width).len()).sum();
             Some(centered_near(
                 anchor,
@@ -2103,7 +2108,7 @@ fn draw_mode_overlay<B: PaneBackend>(
             // handle that doesn't shift on every keystroke of the buffer
             // this dialog is editing (`mouse::tab_label`'s own numbering).
             let title = elide_to(
-                &format!(" rename tab {} ", app.ws.active_tab + 1),
+                &format!(" rename tab {} · ↵ save · Esc cancel ", app.ws.active_tab + 1),
                 rect.width.saturating_sub(2),
             );
             let inner = modal_frame(f, body, rect, Line::from(title).style(theme::ink()));
@@ -2125,13 +2130,19 @@ fn draw_mode_overlay<B: PaneBackend>(
             // The pane's stable id, not the name being typed — the name is
             // the thing this dialog edits, so echoing it in the title would
             // be redundant and shift on every keystroke.
-            let title = elide_to(&format!(" edit pane {pane} "), rect.width.saturating_sub(2));
+            let title = elide_to(
+                &format!(" edit pane {pane} · ↵ save · Esc cancel "),
+                rect.width.saturating_sub(2),
+            );
             let inner = modal_frame(f, body, rect, Line::from(title).style(theme::ink()));
-            let mut name_spans = if *row == 0 {
-                rename_field(name, *col, inner.width)
+            let field_width = inner.width.saturating_sub(PANE_EDIT_LABEL_WIDTH);
+            let mut name_spans = vec![Span::styled("name ", theme::ink())];
+            let mut name_value = if *row == 0 {
+                rename_field(name, *col, field_width)
             } else {
                 vec![Span::raw(name.clone())]
             };
+            name_spans.append(&mut name_value);
             let pad = inner.width.saturating_sub(spans_width(&name_spans));
             // The fill keeps the underline running edge to edge (C6's
             // header idiom); the row's style carries it, so the caret's
@@ -2146,7 +2157,7 @@ fn draw_mode_overlay<B: PaneBackend>(
             // line and its char column; `wrap_cursor` maps that onto the
             // visual row/col the caret actually rides.
             let wrapped: Vec<Vec<(String, usize)>> =
-                lines.iter().map(|l| wrap_line(l, inner.width)).collect();
+                lines.iter().map(|l| wrap_line(l, field_width)).collect();
             // `active` is (logical note line, visual row/col within it),
             // computed once so the loop below and the vertical caret row
             // agree on the same visual position rather than re-deriving it.
@@ -2155,12 +2166,17 @@ fn draw_mode_overlay<B: PaneBackend>(
             for (li, rows) in wrapped.iter().enumerate() {
                 let caret = active.filter(|&(ar, _)| ar == li).map(|(_, vrc)| vrc);
                 for (vi, (text, _)) in rows.iter().enumerate() {
-                    note_lines.push(match caret {
-                        Some((vr, vc)) if vr == vi => {
-                            Line::from(rename_field(text, vc, inner.width))
-                        }
-                        _ => Line::from(text.clone()),
-                    });
+                    let mut spans = vec![if vi == 0 {
+                        Span::styled("note ", theme::ink())
+                    } else {
+                        Span::raw(" ".repeat(PANE_EDIT_LABEL_WIDTH as usize))
+                    }];
+                    let mut value = match caret {
+                        Some((vr, vc)) if vr == vi => rename_field(text, vc, field_width),
+                        _ => vec![Span::raw(text.clone())],
+                    };
+                    spans.append(&mut value);
+                    note_lines.push(Line::from(spans));
                 }
             }
             let caret_row = match active {
@@ -2244,7 +2260,7 @@ fn draw_mode_overlay<B: PaneBackend>(
             // `ink` without the marker, so what will actually be launched
             // is readable from either side.
             let adapter_col = ADAPTER_COL as usize;
-            let rows = items.len().max(cwds.len());
+            let rows = items.len().max(cwds.len()).max(1);
             let lines: Vec<Line<'_>> = (0..rows)
                 .map(|i| {
                     let mut spans: Vec<Span<'_>> = Vec::with_capacity(3);
@@ -2256,6 +2272,15 @@ fn draw_mode_overlay<B: PaneBackend>(
                             let (marker, style) = row_marks(i == *selection, !*on_cwd);
                             spans.push(marker);
                             spans.push(Span::styled(format!("{text}{}", " ".repeat(pad)), style));
+                        }
+                        None if items.is_empty() && i == 0 => {
+                            let text = "no agent matches";
+                            let pad =
+                                adapter_col.saturating_sub(mouse::display_width(text) as usize);
+                            spans.push(Span::styled(
+                                format!("{text}{}", " ".repeat(pad)),
+                                theme::quiet(),
+                            ));
                         }
                         None => spans.push(Span::raw(" ".repeat(adapter_col))),
                     }
@@ -8056,6 +8081,142 @@ row's — widen ADAPTER_COL",
         assert!(!drawn.contains("opencode"), "including the other `p` match:\n{drawn}");
         assert!(!drawn.contains(" 2 "), "no second row survives the filter:\n{drawn}");
         assert!(matches!(app.mode, Mode::Picker { .. }));
+    }
+
+    #[test]
+    fn text_modals_keep_field_labels_and_commit_guidance_inside_the_frame() {
+        use crate::core::app::{Mode, RenameTarget};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        let draw = |app: &mut App<crate::ports::fakes::FakePane>| -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        app.mode = Mode::Rename { buffer: "work".into(), cursor: 4, target: RenameTarget::Tab };
+        let frame = draw(&mut app);
+        assert!(frame.contains("↵ save · Esc cancel"), "rename owns its exit guidance:\n{frame}");
+
+        app.mode = Mode::PaneEdit {
+            name: "api".into(),
+            lines: vec!["investigate timeout".into()],
+            row: 1,
+            col: 19,
+            pane: 1,
+        };
+        let frame = draw(&mut app);
+        assert!(
+            frame.contains("↵ save · Esc cancel"),
+            "pane edit owns its exit guidance:\n{frame}"
+        );
+        assert!(frame.contains("name api"), "the name field is labelled:\n{frame}");
+        assert!(frame.contains("note investigate timeout"), "the note field is labelled:\n{frame}");
+    }
+
+    /// [Added 2026-09-21, review fix] A note past the field width wraps
+    /// (C32): only the first visual row of a logical line gets the `note `
+    /// label, the rest are indented `PANE_EDIT_LABEL_WIDTH` blank columns so
+    /// the text lines up under it. `dialog_rect`'s booked height must match
+    /// what `draw_mode_overlay` actually paints, or the box comes up a row
+    /// short/long relative to its own border.
+    #[test]
+    fn pane_edit_note_continuation_row_is_blank_indented_and_matches_dialog_rect_height() {
+        use crate::core::app::Mode;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::{Rect, Size};
+        use ratatui::Terminal;
+
+        let body = Rect::new(0, 0, 100, 30);
+        let field_width = super::pane_edit_field_width(body);
+        assert_eq!(field_width, 37, "the width this test's wrap math assumes");
+        // One word wider than the field: a deterministic hard-break at
+        // exactly `field_width` chars, so the split point isn't at the
+        // mercy of word-boundary wrapping.
+        let tail = 13;
+        let note = "x".repeat(field_width as usize + tail);
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.mode =
+            Mode::PaneEdit { name: "api".into(), lines: vec![note], row: 0, col: 0, pane: 1 };
+
+        let rect = dialog_rect(&app.mode, body, body, 0, &[], &Keymap::default(), (0, 0)).unwrap();
+        assert_eq!(rect.height, 5, "name row + two wrapped note rows + top/bottom border");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            (0..100).filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string())).collect()
+        };
+        let cols = |y: u16, x0: u16, n: u16| -> String {
+            (x0..x0 + n).filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string())).collect()
+        };
+
+        // Border consumes row 0; row 1 is the name field; the wrapped note
+        // is rows 2 and 3 — exactly what `rect.height` booked, no more.
+        let inner_x = rect.x + 1;
+        let first_note_row = rect.y + 2;
+        let continuation_row = rect.y + 3;
+        assert!(
+            row_text(first_note_row)
+                .contains(&format!("note {}", "x".repeat(field_width as usize))),
+            "the first visual row carries the label and fills the field: {}",
+            row_text(first_note_row)
+        );
+        assert_eq!(
+            cols(continuation_row, inner_x, super::PANE_EDIT_LABEL_WIDTH),
+            " ".repeat(super::PANE_EDIT_LABEL_WIDTH as usize),
+            "the continuation row is blank-indented, not re-labelled"
+        );
+        assert_eq!(
+            cols(continuation_row, inner_x + super::PANE_EDIT_LABEL_WIDTH, tail as u16),
+            "x".repeat(tail),
+            "the continuation row picks up right where the hard-break left off"
+        );
+        // Bottom border, not a fourth content row — the dialog drew exactly
+        // the rows `dialog_rect` booked.
+        assert!(row_text(rect.y + rect.height - 1).contains('└'), "bottom border closes the box");
+    }
+
+    #[test]
+    fn picker_zero_adapter_matches_keeps_the_cwd_column_actionable() {
+        use crate::core::app::Mode;
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::QuickLaunch);
+        if let Mode::Picker { filter, on_cwd, .. } = &mut app.mode {
+            *filter = "no-such-agent".into();
+            *on_cwd = true;
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = (0..30)
+            .map(|y| {
+                (0..100)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let row = rows.iter().find(|row| row.contains("no agent matches")).expect("empty result");
+        assert!(row.contains("/tmp"), "the cwd column stays visible: {row}");
+        assert!(row.contains(theme::PICKER_SELECTED), "cwd selection stays marked: {row}");
     }
 
     /// C27, end to end through the real `draw()`: the roster groups panes

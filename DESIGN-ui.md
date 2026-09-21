@@ -1854,6 +1854,11 @@ field staying put until the caret would actually leave it, which needs an
 origin carried in the mode rather than recomputed — is ROADMAP.md's
 `rename_field` entry, deferred as polish beyond the reported bug.)
 
+**[Amended 2026-09-21 — commit guidance belongs to the modal.]** The heading
+is ` rename tab {n} · ↵ save · Esc cancel `. The compact commit and cancel
+keys remain visible when the global hint bar is hidden; on a narrow frame the
+existing `elide_to` rule clips the heading rather than widening the dialog.
+
 ### C14 — Picker (quick-launch)
 
 **Current:** `render.rs:169–193` — Double/Cyan; selected row Black on Yellow.
@@ -1863,6 +1868,11 @@ origin carried in the mode rather than recomputed — is ROADMAP.md's
 - unselected: `"  {item}"` fg `MUTED`.
 (The `❯`-prefix selection idiom is lifted from the mockup's approval-prompt
 markup, lines ~669–671.) Size and behavior unchanged.
+
+**[Amended 2026-09-21 — zero adapter matches.]** A filtered adapter column
+with no results says `no agent matches` in `MUTED`. The cwd column remains
+drawn and selectable; the message is not a row and has no marker or click
+target. The dialog still reserves one content row when both columns are empty.
 
 **[Amended 2026-07-27, SPEC-ux U8]** Clicking a row selects **and** launches
 it in one press — the picker is a launcher, so "select, then confirm" would
@@ -4498,6 +4508,15 @@ display, reveal-on-visit, U8 modal rules, the cap, paste, cancel semantics
   frame (`lines + 3`), growing to `NOTE_MAX_LINES`. The point opens at
   the **end of the name row** — Alt+r's rename muscle memory is preserved
   keystroke for keystroke.
+
+**[Amended 2026-09-21 — fields and exits remain named without the hint
+bar.]** The frame heading is
+` edit pane {id} · ↵ save · Esc cancel `. Row 0 begins with the `ink()` label
+`name ` and every logical note line begins with the `ink()` label `note `;
+wrapped continuation rows reserve the same five columns. The labels inherit
+the row contract (the name label is underlined with row 0; note labels are
+plain `ink()`). The 44-column frame is unchanged, so field wrapping/windowing
+uses the remaining 37 content columns. Narrow headings still use `elide_to`.
 - **The seam**: `↑↓` and `←→` cross between name and note freely (`←→`
   flow across row ends); **edits never cross** — Backspace at the note's
   top-left and Delete at the name's end are walls, so a typo can never

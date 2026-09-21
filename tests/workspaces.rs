@@ -533,6 +533,22 @@ fn a_new_workspace_name_is_created_implicitly() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn ws_mv_rejects_an_invalid_source_before_touching_the_filesystem() {
+    let root = harness::shared_state_dir("mv-traversal");
+    let claims = root.join("claims");
+    std::fs::create_dir_all(&claims).expect("create sibling claims directory");
+    std::fs::write(claims.join("keep.txt"), "sentinel").expect("seed sentinel");
+
+    let o = cli(&root, &["ws", "mv", "../claims", "stolen"]);
+    assert_eq!(o.status.code(), Some(2), "invalid OLD is a usage error: {}", err(&o));
+    assert!(err(&o).contains("invalid workspace name"), "{}", err(&o));
+    assert_eq!(std::fs::read_to_string(claims.join("keep.txt")).unwrap(), "sentinel");
+    assert!(!root.join("workspaces/stolen").exists(), "the sibling directory was moved");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// spec `workspaces` "Root override composes" and "Isolation and storage":
 /// `ROOST_STATE` names the root a named workspace's files live under, and
 /// the default workspace's own files stay exactly where they always have —

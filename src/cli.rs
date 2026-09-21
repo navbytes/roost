@@ -45,6 +45,10 @@ const VERBS: &[&str] =
 /// (which must not mistake one for a positional), so the two can't drift
 /// apart by editing one and not the other.
 const VALUE_TAKING_OPTIONS: &[&str] = &["--cwd", "--input", "--tail", "--until", "--timeout"];
+const BOOLEAN_OPTIONS: &[&str] = &["--all", "--enter", "--full", "--force"];
+/// `--input` is prompt text, so even a recognized option name can be its
+/// literal value; typed options reject those collisions as missing values.
+const FREE_TEXT_VALUE_OPTIONS: &[&str] = &["--input"];
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
 /// code. Otherwise return None so `main` launches the TUI. Only a genuinely
@@ -547,17 +551,19 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
     match verb {
         "list" => {
             reject_unknown_flags(verb, rest, &[])?;
+            require_positionals(verb, rest, 0, 0, None)?;
         }
         "status" => {
             reject_unknown_flags(verb, rest, &[])?;
-            if let Some(p) = positional(rest).first() {
+            let pos = require_positionals(verb, rest, 0, 1, None)?;
+            if let Some(p) = pos.first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
         }
         "spawn" => {
             reject_unknown_flags(verb, rest, &["--cwd", "--input"])?;
-            let pos = positional(rest);
-            let adapter = pos.first().ok_or("spawn needs an ADAPTER")?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("an ADAPTER"))?;
+            let adapter = &pos[0];
             m.insert("adapter".into(), adapter.as_str().into());
             if let Some(cwd) = flag_value(rest, "--cwd")? {
                 m.insert("cwd".into(), cwd.into());
@@ -568,7 +574,8 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "fork" => {
             reject_unknown_flags(verb, rest, &[])?;
-            if let Some(p) = positional(rest).first() {
+            let pos = require_positionals(verb, rest, 0, 1, None)?;
+            if let Some(p) = pos.first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
         }
@@ -597,9 +604,12 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "read" => {
             reject_unknown_flags(verb, rest, &["--tail", "--full"])?;
-            let pos = positional(rest);
-            let pane = pos.first().ok_or("read needs a PANE")?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
+            let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
+            if has_flag(rest, "--tail") && has_flag(rest, "--full") {
+                return Err("read takes either --tail N or --full, not both".into());
+            }
             let mode = if let Some(n) = flag_value(rest, "--tail")? {
                 let n: usize = n.parse().map_err(|_| "--tail needs a number")?;
                 serde_json::json!({ "tail": n })
@@ -612,15 +622,15 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "close" => {
             reject_unknown_flags(verb, rest, &["--force"])?;
-            let pos = positional(rest);
-            let pane = pos.first().ok_or("close needs a PANE")?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
+            let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
             m.insert("force".into(), has_flag(rest, "--force").into());
         }
         "focus" => {
             reject_unknown_flags(verb, rest, &[])?;
-            let pos = positional(rest);
-            let pane = pos.first().ok_or("focus needs a PANE")?;
+            let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
+            let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
         }
         "wait" => {
@@ -655,6 +665,30 @@ fn parse_pane(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| format!("not a pane id: {s}"))
 }
 
+/// `metavar` restores the pre-generic wording ("spawn needs an ADAPTER",
+/// "read needs a PANE") for verbs whose one required positional has a name
+/// worth saying — `None` falls back to the count-based message, which is
+/// all a `min: 0` verb (no required positional to name) ever hits.
+fn require_positionals(
+    verb: &str,
+    args: &[String],
+    min: usize,
+    max: usize,
+    metavar: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let pos = positional(args);
+    if pos.len() < min {
+        return Err(match metavar {
+            Some(m) => format!("{verb} needs {m}"),
+            None => format!("{verb} needs {min} positional argument(s)"),
+        });
+    }
+    if pos.len() > max {
+        return Err(format!("{verb} takes at most {max} positional argument(s)"));
+    }
+    Ok(pos)
+}
+
 /// Index of the first literal `--` in `args`, or `args.len()` if there is
 /// none — the end-of-options boundary every flag-parsing helper below
 /// shares. Nothing at or past it is ever read as a flag, so text that
@@ -662,6 +696,16 @@ fn parse_pane(s: &str) -> Result<u64, String> {
 /// mistaken for an option before this point.
 fn end_of_options(args: &[String]) -> usize {
     args.iter().position(|a| a == "--").unwrap_or(args.len())
+}
+
+/// True when `flag`'s value slot is filled by another option name rather
+/// than a real value (`--cwd --tail`) — shared by `reject_unknown_flags` and
+/// `flag_value` so the collision rule can't drift between the two call
+/// sites. `--input` is exempt: its value is free-form prompt text, so even a
+/// recognized option name is a legal literal value for it.
+fn value_collides_with_flag(flag: &str, candidate: &str) -> bool {
+    !FREE_TEXT_VALUE_OPTIONS.contains(&flag)
+        && (VALUE_TAKING_OPTIONS.contains(&candidate) || BOOLEAN_OPTIONS.contains(&candidate))
 }
 
 /// Every `--flag` in `args` ahead of `--` must be in `allowed`, or this is a
@@ -680,12 +724,27 @@ fn end_of_options(args: &[String]) -> usize {
 /// first positional). `send`'s positionals ARE free text — a message may
 /// itself start with `-` — so there only a recognised `--flag` counts.
 fn reject_unknown_flags(verb: &str, args: &[String], allowed: &[&str]) -> Result<(), String> {
-    for a in &args[..end_of_options(args)] {
+    let end = end_of_options(args);
+    let mut i = 0;
+    while i < end {
+        let a = &args[i];
         let flag_shaped = if verb == "send" { a.starts_with("--") } else { a.starts_with('-') };
         if flag_shaped && !allowed.contains(&a.as_str()) {
             let opts = if allowed.is_empty() { "(none)".to_string() } else { allowed.join("|") };
             return Err(format!("{verb}: unknown flag {a} (valid: {opts})"));
         }
+        let value_taking_allowed =
+            allowed.contains(&a.as_str()) && VALUE_TAKING_OPTIONS.contains(&a.as_str());
+        if value_taking_allowed {
+            if i + 1 >= end {
+                return Err(format!("{a} needs a value"));
+            }
+            let next = args[i + 1].as_str();
+            if value_collides_with_flag(a, next) {
+                return Err(format!("{a} needs a value before {next}"));
+            }
+        }
+        i += if value_taking_allowed { 2 } else { 1 };
     }
     Ok(())
 }
@@ -734,14 +793,17 @@ fn positional(args: &[String]) -> Vec<String> {
 /// cwd, all replying ok. `--tail $N` with an unset shell variable is exactly
 /// how a script hits this. Same silent-wrong-answer class `reject_unknown_flags`
 /// already closed for unknown flags; a known flag with a missing value gets
-/// the same treatment.
+/// the same treatment. `--input` is deliberately exempt from option-name
+/// collisions because its value is free-form prompt text.
 fn flag_value(args: &[String], flag: &str) -> Result<Option<String>, String> {
     let end = end_of_options(args);
     let Some(i) = args[..end].iter().position(|a| a == flag) else { return Ok(None) };
-    if i + 1 < end {
-        Ok(Some(args[i + 1].clone()))
-    } else {
+    if i + 1 >= end {
         Err(format!("{flag} needs a value"))
+    } else if value_collides_with_flag(flag, &args[i + 1]) {
+        Err(format!("{flag} needs a value before {}", args[i + 1]))
+    } else {
+        Ok(Some(args[i + 1].clone()))
     }
 }
 
@@ -1196,6 +1258,10 @@ fn ws_rm(name: &str) -> i32 {
 /// refusals (1). The rename is one `fs::rename` inside `workspaces/`, same
 /// filesystem, atomic where the platform allows it to be.
 fn ws_mv(old: &str, new: &str) -> i32 {
+    if let Err(e) = check_workspace_name(old) {
+        eprintln!("roost ws mv: {e}\n\n{WS_HELP}");
+        return 2;
+    }
     if let Err(e) = check_creatable_name(new) {
         eprintln!("roost ws mv: {e}\n\n{WS_HELP}");
         return 2;
@@ -1278,6 +1344,50 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The invariant `reject_unknown_flags`/`flag_value`/`has_flag` all lean
+    /// on: no flag is in both `VALUE_TAKING_OPTIONS` and `BOOLEAN_OPTIONS`
+    /// (a flag can't both eat the next token and not), and every option any
+    /// verb actually accepts (mirrored here from `build_request`'s `match`)
+    /// is classified into exactly one of the two — an option added to a
+    /// verb's `allowed` list and left off both would fall through
+    /// unclassified rather than erroring loudly.
+    #[test]
+    fn value_taking_and_boolean_options_partition_every_verbs_allowed_flags() {
+        let overlap: Vec<&&str> = super::VALUE_TAKING_OPTIONS
+            .iter()
+            .filter(|f| super::BOOLEAN_OPTIONS.contains(f))
+            .collect();
+        assert!(overlap.is_empty(), "a flag can't be both value-taking and boolean: {overlap:?}");
+
+        let per_verb_allowed: &[(&str, &[&str])] = &[
+            ("list", &[]),
+            ("status", &[]),
+            ("spawn", &["--cwd", "--input"]),
+            ("fork", &[]),
+            ("send", &["--all", "--enter"]),
+            ("read", &["--tail", "--full"]),
+            ("close", &["--force"]),
+            ("focus", &[]),
+            ("wait", &["--until", "--timeout"]),
+        ];
+        assert_eq!(
+            per_verb_allowed.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            super::VERBS.to_vec(),
+            "keep this table in sync with build_request's match arms"
+        );
+        for (verb, allowed) in per_verb_allowed {
+            for flag in *allowed {
+                let value_taking = super::VALUE_TAKING_OPTIONS.contains(flag);
+                let boolean = super::BOOLEAN_OPTIONS.contains(flag);
+                assert!(
+                    value_taking ^ boolean,
+                    "{verb}'s {flag} must classify into exactly one of \
+                     VALUE_TAKING_OPTIONS/BOOLEAN_OPTIONS"
+                );
+            }
+        }
     }
 
     /// The pre-pass must find the workspace flag in every position for
@@ -1484,6 +1594,83 @@ mod tests {
         }
         match parse(&["focus", "5"]).method {
             Method::Focus { pane } => assert_eq!(pane, 5),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cli_fixed_arity_verbs_reject_surplus_positionals() {
+        for args in [
+            &["list", "extra"][..],
+            &["status", "3", "4"],
+            &["spawn", "pi", "extra"],
+            &["fork", "3", "4"],
+            &["read", "3", "4"],
+            &["close", "3", "4", "--force"],
+            &["focus", "3", "4"],
+        ] {
+            let owned = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert!(build_request(&owned, "T".into()).is_err(), "accepted {args:?}");
+        }
+        assert!(build_request(&argv(&["send", "3", "free", "text"]), "T".into()).is_ok());
+    }
+
+    #[test]
+    fn cli_read_rejects_tail_and_full_in_either_order() {
+        for args in
+            [&["read", "3", "--tail", "10", "--full"][..], &["read", "3", "--full", "--tail", "10"]]
+        {
+            let owned = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let err = build_request(&owned, "T".into()).unwrap_err();
+            assert!(err.contains("not both"), "{args:?}: {err}");
+        }
+    }
+
+    /// [Added 2026-09-21] `reject_unknown_flags` skips a value-taking
+    /// allowed flag's own value token (`i += 2`), so a `-`-prefixed value —
+    /// which used to be misread as a stray unknown flag before that skip
+    /// existed — reaches the flag's own parsing untouched, whatever that
+    /// makes of it.
+    #[test]
+    fn a_dash_prefixed_value_after_cwd_or_timeout_is_taken_as_the_value_not_an_unknown_flag() {
+        match parse(&["spawn", "claude", "--cwd", "-weird-dir"]).method {
+            Method::Spawn { cwd, .. } => assert_eq!(cwd.as_deref(), Some("-weird-dir")),
+            _ => panic!(),
+        }
+        // --timeout still parses its value as a number, so a dash-prefixed
+        // one fails there — the point is *which* error: never "unknown flag".
+        let owned: Vec<String> =
+            ["wait", "3", "--timeout", "-5"].iter().map(|s| s.to_string()).collect();
+        let err = build_request(&owned, "T".into()).unwrap_err();
+        assert!(err.contains("needs a number"), "{err}");
+        assert!(!err.contains("unknown flag"), "{err}");
+    }
+
+    #[test]
+    fn cli_value_option_rejects_another_recognized_option_as_its_value() {
+        for args in [
+            &["spawn", "pi", "--cwd", "--input", "hello"][..],
+            &["wait", "3", "--timeout", "--until", "waiting"],
+        ] {
+            let owned = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let err = build_request(&owned, "T".into()).unwrap_err();
+            assert!(err.contains("needs a value"), "{args:?}: {err}");
+        }
+
+        match parse(&["spawn", "pi", "--input", "--literal-text"]).method {
+            Method::Spawn { initial_input, .. } => {
+                assert_eq!(initial_input.as_deref(), Some("--literal-text"));
+            }
+            _ => panic!(),
+        }
+        match parse(&["spawn", "pi", "--input", "--full"]).method {
+            Method::Spawn { initial_input, .. } => {
+                assert_eq!(initial_input.as_deref(), Some("--full"))
+            }
+            _ => panic!(),
+        }
+        match parse(&["send", "3", "--", "--full"]).method {
+            Method::Send { text, .. } => assert_eq!(text, "--full"),
             _ => panic!(),
         }
     }

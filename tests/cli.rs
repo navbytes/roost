@@ -139,6 +139,21 @@ fn every_verb_help_is_its_own_text() {
     assert_ne!(help, bare, "spawn --help must not be byte-identical to bare spawn's error");
 }
 
+/// A missing required positional names it — a generic "needs 1 positional
+/// argument(s)" regressed this once (`require_positionals`'s `metavar`).
+#[test]
+fn missing_positional_error_names_the_metavar() {
+    assert!(
+        err(&roost(&["spawn"])).contains("spawn needs an ADAPTER"),
+        "{:?}",
+        err(&roost(&["spawn"]))
+    );
+    for verb in ["read", "close", "focus"] {
+        let e = err(&roost(&[verb]));
+        assert!(e.contains(&format!("{verb} needs a PANE")), "{verb}: {e:?}");
+    }
+}
+
 /// Fix 4, the sharpest QA repro, reproduced exactly: with a REAL, reachable
 /// instance (so there's something to execute), `list --help` / `status
 /// --help` / `fork --help` used to silently run the real verb and return
