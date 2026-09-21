@@ -9,7 +9,7 @@ runs cancel. Do not bypass required checks.
 Update Cargo.toml, the roost entry in Cargo.lock, and documented version examples. Change `.github/release-request` in the same PR. Its merge calls the publisher with the exact merged commit.
 
 Use a local authenticated `gh` session, directly or through an LLM, to create a
-branch, make the version and release-note changes, and open a draft PR with
+branch named `release/<version>`, make the version and release-note changes, and open a draft PR with
 `gh pr create --draft`. Mark it ready with `gh pr ready` when preparation is
 complete. Wait for required checks before merging.
 
@@ -22,7 +22,7 @@ The local gh path needs no new secrets. A future Prepare release Action must
 have permission to create PRs; token-created PRs need a human ready event (or
 a separately authorized token) to trigger normal PR CI. No such token is assumed.
 
-Routine dependency updates are grouped weekly per ecosystem. Security updates
+Routine dependency updates share one weekly multi-ecosystem group. Security updates
 remain eligible immediately and are not held for the routine weekly batch.
 
 Tap publishing tokens need both Contents and Pull requests write permission on

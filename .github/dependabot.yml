@@ -1,20 +1,18 @@
 version: 2
 updates:
-  - package-ecosystem: github-actions
-    directory: "/"
+- package-ecosystem: github-actions
+  directory: /
+  open-pull-requests-limit: 1
+  patterns:
+  - '*'
+  multi-ecosystem-group: routine
+- package-ecosystem: cargo
+  directory: /
+  open-pull-requests-limit: 1
+  patterns:
+  - '*'
+  multi-ecosystem-group: routine
+multi-ecosystem-groups:
+  routine:
     schedule:
       interval: weekly
-    groups:
-      routine:
-        applies-to: version-updates
-        patterns: ["*"]
-    open-pull-requests-limit: 1
-  - package-ecosystem: cargo
-    directory: "/"
-    schedule:
-      interval: weekly
-    groups:
-      routine:
-        applies-to: version-updates
-        patterns: ["*"]
-    open-pull-requests-limit: 1

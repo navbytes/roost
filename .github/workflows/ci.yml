@@ -34,12 +34,10 @@ jobs:
             echo 'code=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' > "$RUNNER_TEMP/changed-files"
-          if grep -qvE '\.(md|txt)$|^LICENSE$' "$RUNNER_TEMP/changed-files"; then
-            echo 'code=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'code=false' >> "$GITHUB_OUTPUT"
-          fi
+          total=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .changed_files)
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" > "$RUNNER_TEMP/changed-files.json"
+          code=$(jq --argjson total "$total" 'add | if length == 0 or length != $total then true else any(.[]; ([.filename, (.previous_filename // .filename)] | any(.[]; test("^(docs/.*\\.md|[^/]+\\.md|LICENSE)$") | not))) end' "$RUNNER_TEMP/changed-files.json")
+          echo "code=$code" >> "$GITHUB_OUTPUT"
 
   # Formatting and lints are properties of the source, not of the platform,
   # so they run once here rather than twice inside the OS matrix below. Cheap
@@ -124,3 +122,20 @@ jobs:
       - run: cargo test --no-fail-fast --verbose -- --show-output
         env:
           ROOST_TEST_ECHO_BUDGET_MS: ${{ matrix.os == 'macos-latest' && '1000' || '' }}
+
+  result:
+    name: ${{ github.workflow }} result
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    needs: [changes, lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          assert results['changes']['result'] == 'success', 'Change detection did not succeed'
+          assert all(job['result'] in ('success', 'skipped') for job in results.values()), results
+          PYTHON
