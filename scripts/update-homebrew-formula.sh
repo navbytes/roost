@@ -109,5 +109,11 @@ fi
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 git commit -m "roost ${version}"
-git push
+branch="release/roost-${version}"
+git push origin "HEAD:refs/heads/$branch"
+export GH_TOKEN="$HOMEBREW_TAP_TOKEN"
+if ! gh pr view "$branch" --repo navbytes/homebrew-tap >/dev/null 2>&1; then
+  gh pr create --repo navbytes/homebrew-tap --base main --head "$branch" \
+    --title "roost ${version}" --body "Update the tap to the published roost ${version} release."
+fi
 echo "Pushed tap update for roost ${version}."
