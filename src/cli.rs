@@ -45,6 +45,10 @@ const VERBS: &[&str] =
 /// (which must not mistake one for a positional), so the two can't drift
 /// apart by editing one and not the other.
 const VALUE_TAKING_OPTIONS: &[&str] = &["--cwd", "--input", "--tail", "--until", "--timeout"];
+const BOOLEAN_OPTIONS: &[&str] = &["--all", "--enter", "--full", "--force"];
+/// `--input` is prompt text, so even a recognized option name can be its
+/// literal value; typed options reject those collisions as missing values.
+const FREE_TEXT_VALUE_OPTIONS: &[&str] = &["--input"];
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
 /// code. Otherwise return None so `main` launches the TUI. Only a genuinely
@@ -547,17 +551,19 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
     match verb {
         "list" => {
             reject_unknown_flags(verb, rest, &[])?;
+            require_positionals(verb, rest, 0, 0)?;
         }
         "status" => {
             reject_unknown_flags(verb, rest, &[])?;
-            if let Some(p) = positional(rest).first() {
+            let pos = require_positionals(verb, rest, 0, 1)?;
+            if let Some(p) = pos.first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
         }
         "spawn" => {
             reject_unknown_flags(verb, rest, &["--cwd", "--input"])?;
-            let pos = positional(rest);
-            let adapter = pos.first().ok_or("spawn needs an ADAPTER")?;
+            let pos = require_positionals(verb, rest, 1, 1)?;
+            let adapter = &pos[0];
             m.insert("adapter".into(), adapter.as_str().into());
             if let Some(cwd) = flag_value(rest, "--cwd")? {
                 m.insert("cwd".into(), cwd.into());
@@ -568,7 +574,8 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "fork" => {
             reject_unknown_flags(verb, rest, &[])?;
-            if let Some(p) = positional(rest).first() {
+            let pos = require_positionals(verb, rest, 0, 1)?;
+            if let Some(p) = pos.first() {
                 m.insert("pane".into(), parse_pane(p)?.into());
             }
         }
@@ -597,9 +604,12 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "read" => {
             reject_unknown_flags(verb, rest, &["--tail", "--full"])?;
-            let pos = positional(rest);
-            let pane = pos.first().ok_or("read needs a PANE")?;
+            let pos = require_positionals(verb, rest, 1, 1)?;
+            let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
+            if has_flag(rest, "--tail") && has_flag(rest, "--full") {
+                return Err("read takes either --tail N or --full, not both".into());
+            }
             let mode = if let Some(n) = flag_value(rest, "--tail")? {
                 let n: usize = n.parse().map_err(|_| "--tail needs a number")?;
                 serde_json::json!({ "tail": n })
@@ -612,15 +622,15 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
         }
         "close" => {
             reject_unknown_flags(verb, rest, &["--force"])?;
-            let pos = positional(rest);
-            let pane = pos.first().ok_or("close needs a PANE")?;
+            let pos = require_positionals(verb, rest, 1, 1)?;
+            let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
             m.insert("force".into(), has_flag(rest, "--force").into());
         }
         "focus" => {
             reject_unknown_flags(verb, rest, &[])?;
-            let pos = positional(rest);
-            let pane = pos.first().ok_or("focus needs a PANE")?;
+            let pos = require_positionals(verb, rest, 1, 1)?;
+            let pane = &pos[0];
             m.insert("pane".into(), parse_pane(pane)?.into());
         }
         "wait" => {
@@ -655,6 +665,22 @@ fn parse_pane(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| format!("not a pane id: {s}"))
 }
 
+fn require_positionals(
+    verb: &str,
+    args: &[String],
+    min: usize,
+    max: usize,
+) -> Result<Vec<String>, String> {
+    let pos = positional(args);
+    if pos.len() < min {
+        return Err(format!("{verb} needs {min} positional argument(s)"));
+    }
+    if pos.len() > max {
+        return Err(format!("{verb} takes at most {max} positional argument(s)"));
+    }
+    Ok(pos)
+}
+
 /// Index of the first literal `--` in `args`, or `args.len()` if there is
 /// none — the end-of-options boundary every flag-parsing helper below
 /// shares. Nothing at or past it is ever read as a flag, so text that
@@ -680,12 +706,31 @@ fn end_of_options(args: &[String]) -> usize {
 /// first positional). `send`'s positionals ARE free text — a message may
 /// itself start with `-` — so there only a recognised `--flag` counts.
 fn reject_unknown_flags(verb: &str, args: &[String], allowed: &[&str]) -> Result<(), String> {
-    for a in &args[..end_of_options(args)] {
+    let end = end_of_options(args);
+    let mut i = 0;
+    while i < end {
+        let a = &args[i];
         let flag_shaped = if verb == "send" { a.starts_with("--") } else { a.starts_with('-') };
         if flag_shaped && !allowed.contains(&a.as_str()) {
             let opts = if allowed.is_empty() { "(none)".to_string() } else { allowed.join("|") };
             return Err(format!("{verb}: unknown flag {a} (valid: {opts})"));
         }
+        if allowed.contains(&a.as_str()) && VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
+            if i + 1 >= end {
+                return Err(format!("{a} needs a value"));
+            }
+            let next = args[i + 1].as_str();
+            if !FREE_TEXT_VALUE_OPTIONS.contains(&a.as_str())
+                && (VALUE_TAKING_OPTIONS.contains(&next) || BOOLEAN_OPTIONS.contains(&next))
+            {
+                return Err(format!("{a} needs a value before {next}"));
+            }
+        }
+        i += if allowed.contains(&a.as_str()) && VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
+            2
+        } else {
+            1
+        };
     }
     Ok(())
 }
@@ -734,14 +779,20 @@ fn positional(args: &[String]) -> Vec<String> {
 /// cwd, all replying ok. `--tail $N` with an unset shell variable is exactly
 /// how a script hits this. Same silent-wrong-answer class `reject_unknown_flags`
 /// already closed for unknown flags; a known flag with a missing value gets
-/// the same treatment.
+/// the same treatment. `--input` is deliberately exempt from option-name
+/// collisions because its value is free-form prompt text.
 fn flag_value(args: &[String], flag: &str) -> Result<Option<String>, String> {
     let end = end_of_options(args);
     let Some(i) = args[..end].iter().position(|a| a == flag) else { return Ok(None) };
-    if i + 1 < end {
-        Ok(Some(args[i + 1].clone()))
-    } else {
+    if i + 1 >= end {
         Err(format!("{flag} needs a value"))
+    } else if !FREE_TEXT_VALUE_OPTIONS.contains(&flag)
+        && (VALUE_TAKING_OPTIONS.contains(&args[i + 1].as_str())
+            || BOOLEAN_OPTIONS.contains(&args[i + 1].as_str()))
+    {
+        Err(format!("{flag} needs a value before {}", args[i + 1]))
+    } else {
+        Ok(Some(args[i + 1].clone()))
     }
 }
 
@@ -1196,6 +1247,10 @@ fn ws_rm(name: &str) -> i32 {
 /// refusals (1). The rename is one `fs::rename` inside `workspaces/`, same
 /// filesystem, atomic where the platform allows it to be.
 fn ws_mv(old: &str, new: &str) -> i32 {
+    if let Err(e) = check_workspace_name(old) {
+        eprintln!("roost ws mv: {e}\n\n{WS_HELP}");
+        return 2;
+    }
     if let Err(e) = check_creatable_name(new) {
         eprintln!("roost ws mv: {e}\n\n{WS_HELP}");
         return 2;
@@ -1484,6 +1539,63 @@ mod tests {
         }
         match parse(&["focus", "5"]).method {
             Method::Focus { pane } => assert_eq!(pane, 5),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cli_fixed_arity_verbs_reject_surplus_positionals() {
+        for args in [
+            &["list", "extra"][..],
+            &["status", "3", "4"],
+            &["spawn", "pi", "extra"],
+            &["fork", "3", "4"],
+            &["read", "3", "4"],
+            &["close", "3", "4", "--force"],
+            &["focus", "3", "4"],
+        ] {
+            let owned = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert!(build_request(&owned, "T".into()).is_err(), "accepted {args:?}");
+        }
+        assert!(build_request(&argv(&["send", "3", "free", "text"]), "T".into()).is_ok());
+    }
+
+    #[test]
+    fn cli_read_rejects_tail_and_full_in_either_order() {
+        for args in
+            [&["read", "3", "--tail", "10", "--full"][..], &["read", "3", "--full", "--tail", "10"]]
+        {
+            let owned = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let err = build_request(&owned, "T".into()).unwrap_err();
+            assert!(err.contains("not both"), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn cli_value_option_rejects_another_recognized_option_as_its_value() {
+        for args in [
+            &["spawn", "pi", "--cwd", "--input", "hello"][..],
+            &["wait", "3", "--timeout", "--until", "waiting"],
+        ] {
+            let owned = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let err = build_request(&owned, "T".into()).unwrap_err();
+            assert!(err.contains("needs a value"), "{args:?}: {err}");
+        }
+
+        match parse(&["spawn", "pi", "--input", "--literal-text"]).method {
+            Method::Spawn { initial_input, .. } => {
+                assert_eq!(initial_input.as_deref(), Some("--literal-text"));
+            }
+            _ => panic!(),
+        }
+        match parse(&["spawn", "pi", "--input", "--full"]).method {
+            Method::Spawn { initial_input, .. } => {
+                assert_eq!(initial_input.as_deref(), Some("--full"))
+            }
+            _ => panic!(),
+        }
+        match parse(&["send", "3", "--", "--full"]).method {
+            Method::Send { text, .. } => assert_eq!(text, "--full"),
             _ => panic!(),
         }
     }
