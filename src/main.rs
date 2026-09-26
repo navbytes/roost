@@ -556,10 +556,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     }
     // Same idea for opencode: drop roost's session-reporting plugin into
     // ~/.config/opencode/plugin/. No-op when opencode isn't set up or
-    // ROOST_NO_EXT_INSTALL is set — see infra::extension module docs.
-    if let Some(msg) = infra::extension::ensure_opencode_plugin() {
-        app.set_flash(msg);
-    }
+    // ROOST_NO_EXT_INSTALL is set — see infra::extension module docs. On a
+    // thread because picking the 1.x or 2.x plugin runs `opencode --version`.
+    let mut opencode_install = Some(std::thread::spawn(infra::extension::ensure_opencode_plugin));
 
     // Write the fleet control token where an external `roost <verb>` client can
     // read it (0600, owner-only, next to the socket). Never placed in a pane's
@@ -600,6 +599,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             // infra::stallwatch: prove this iteration was reached, before
             // anything in it has a chance to block. One atomic store.
             heartbeat.tick();
+            if opencode_install.as_ref().is_some_and(|h| h.is_finished()) {
+                if let Some(msg) = opencode_install.take().and_then(|h| h.join().ok()).flatten() {
+                    app.set_flash(msg);
+                    dirty = true;
+                }
+            }
             // Test hatch only (`infra::test_panic_after`): `panic_at` is `None`
             // on every real run, so this is one `Option` compare per frame.
             if panic_at.is_some_and(|deadline| Instant::now() >= deadline) {
