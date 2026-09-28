@@ -39,8 +39,8 @@
 //!   `plugin/` subdir *is* part of the install: opencode auto-globs that dir,
 //!   so there is no existing file to merge into. The config dir itself still
 //!   must exist — a user who never ran opencode has no `~/.config/opencode`,
-//!   and we never create that. opencode 2.x (by `opencode --version`) gets
-//!   a `plugins/roost/` directory instead — see `install_opencode_v2_plugin`.
+//!   and we never create that. OpenCode 1.18.29+ also gets a V2 terminal
+//!   plugin in `plugins/roost/`; unknown versions leave existing files alone.
 
 use std::path::{Path, PathBuf};
 
@@ -139,24 +139,52 @@ pub fn ensure_opencode_plugin() -> Option<String> {
     if !config_dir.is_dir() {
         return None;
     }
-    // An unknown version keeps the 1.x install roost always did.
-    if opencode_major().is_some_and(|m| m >= 2) {
-        install_opencode_v2_plugin(&config_dir)
-    } else {
-        install_opencode_plugin(&config_dir)
+    install_opencode_for_version(&config_dir, opencode_version())
+}
+
+fn install_opencode_for_version(
+    config_dir: &Path,
+    version: Option<(u32, u32, u32)>,
+) -> Option<String> {
+    match version? {
+        version if version >= (1, 18, 29) => install_opencode_v2_plugin(config_dir),
+        _ => install_opencode_plugin(config_dir),
     }
 }
 
-/// Major version of the `opencode` on PATH — the one roost launches. ~300ms,
-/// so `ensure_opencode_plugin` runs off the main thread.
-fn opencode_major() -> Option<u32> {
+fn opencode_version() -> Option<(u32, u32, u32)> {
     let out = std::process::Command::new("opencode").arg("--version").output().ok()?;
-    parse_major(&String::from_utf8_lossy(&out.stdout))
+    if !out.status.success() {
+        return None;
+    }
+    parse_opencode_version(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn parse_major(version: &str) -> Option<u32> {
-    let v = version.trim().trim_start_matches('v');
-    v[..v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len())].parse().ok()
+fn parse_opencode_version(version: &str) -> Option<(u32, u32, u32)> {
+    let version = version.trim().strip_prefix('v').unwrap_or(version.trim());
+    let valid_suffix = |suffix: &str| {
+        suffix.split('.').all(|part| {
+            !part.is_empty() && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+    };
+    let (version, build) = version.split_once('+').map_or((version, None), |(v, b)| (v, Some(b)));
+    let (version, prerelease) =
+        version.split_once('-').map_or((version, None), |(v, p)| (v, Some(p)));
+    if build.is_some_and(|s| !valid_suffix(s)) || prerelease.is_some_and(|s| !valid_suffix(s)) {
+        return None;
+    }
+    let mut parts = version.split('.');
+    let result =
+        (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+    // Object entrypoints are only confirmed from the stable compatibility boundary.
+    (parts.next().is_none() && !(result == (1, 18, 29) && prerelease.is_some())).then_some(result)
+}
+
+fn modern_opencode_plugin() -> String {
+    BUNDLED_OPENCODE.replace("export const RoostPlugin:", "const RoostPlugin:").replace(
+        "export default RoostPlugin;",
+        "export default { id: \"roost-session-report\", server: RoostPlugin, setup() {} };",
+    )
 }
 
 const BUNDLED_OPENCODE_V2: [(&str, &str); 2] = [
@@ -167,10 +195,11 @@ const BUNDLED_OPENCODE_V2: [(&str, &str); 2] = [
 /// opencode 2.x: v2 refuses 1.x plugin modules, and its shared server can't
 /// see pane env, so the plugin is a `plugins/roost/` directory whose TUI half
 /// does the reporting (see `extensions/opencode-v2/`). The 1.x file is
-/// removed — left in place it fails v2's plugin load on every start.
+/// wrapped for modern V1 and V2 so either version can share the config.
 fn install_opencode_v2_plugin(config_dir: &Path) -> Option<String> {
     let plugin_dir = config_dir.join("plugin");
-    let removed_v1 = std::fs::remove_file(plugin_dir.join("opencode-plugin.ts")).is_ok();
+    let modern = modern_opencode_plugin();
+    let updated_v1 = install_opencode_plugin_body(config_dir, &modern).is_some();
     let dir = config_dir.join("plugins").join("roost");
     let mut changed = false;
     for (name, body) in BUNDLED_OPENCODE_V2 {
@@ -191,8 +220,10 @@ fn install_opencode_v2_plugin(config_dir: &Path) -> Option<String> {
         }
     }
     let _ = std::fs::remove_dir(legacy_dir);
-    (changed || removed_v1)
-        .then(|| "installed the roost opencode 2 plugin (~/.config/opencode/plugins/roost/)".into())
+    (changed || updated_v1).then(|| {
+        "installed the roost opencode compatibility plugins (~/.config/opencode/plugins/roost/)"
+            .into()
+    })
 }
 
 /// The real work of `ensure_opencode_plugin`, split out (like
@@ -200,17 +231,21 @@ fn install_opencode_v2_plugin(config_dir: &Path) -> Option<String> {
 /// `config_dir` is opencode's config directory (the one containing
 /// `opencode.json`), not the `plugin/` subdir itself.
 fn install_opencode_plugin(config_dir: &Path) -> Option<String> {
+    install_opencode_plugin_body(config_dir, BUNDLED_OPENCODE)
+}
+
+fn install_opencode_plugin_body(config_dir: &Path, body: &str) -> Option<String> {
     let plugin_dir = config_dir.join("plugin");
     let target = plugin_dir.join("opencode-plugin.ts");
 
     let existing = std::fs::read_to_string(&target).ok();
-    if existing.as_deref() == Some(BUNDLED_OPENCODE) {
+    if existing.as_deref() == Some(body) {
         return None; // already current
     }
     let updating = existing.is_some();
 
     std::fs::create_dir_all(&plugin_dir).ok()?;
-    write_atomic(&target, BUNDLED_OPENCODE)?;
+    write_atomic(&target, body)?;
 
     Some(if updating {
         "updated the roost opencode plugin to match this build".into()
@@ -987,11 +1022,26 @@ mod tests {
     }
 
     #[test]
-    fn opencode_version_major_parses() {
-        assert_eq!(parse_major("1.18.32\n"), Some(1));
-        assert_eq!(parse_major("v2.0.18"), Some(2));
-        assert_eq!(parse_major("10.1"), Some(10));
-        assert_eq!(parse_major(""), None);
+    fn opencode_version_parses() {
+        assert_eq!(parse_opencode_version("1.18.32\n"), Some((1, 18, 32)));
+        assert_eq!(parse_opencode_version("v2.0.18"), Some((2, 0, 18)));
+        assert_eq!(parse_opencode_version("v2.0.18-beta.1+build-42"), Some((2, 0, 18)));
+        assert_eq!(parse_opencode_version("1.18.29+build.7"), Some((1, 18, 29)));
+        assert_eq!(parse_opencode_version("1.18.32-beta"), Some((1, 18, 32)));
+        for value in [
+            "",
+            "10.1",
+            "2.0.18.1",
+            "error 2.0.18",
+            "1.18.29-beta",
+            "2.0.18-",
+            "2.0.18+",
+            "2.0.18-beta..1",
+            "2.0.18+bad!",
+            "2.0.18+a+b",
+        ] {
+            assert_eq!(parse_opencode_version(value), None);
+        }
     }
 
     #[test]
@@ -999,9 +1049,12 @@ mod tests {
         let dir = scratch_dir("opencode-v2");
         install_opencode_plugin(&dir).expect("v1 installs");
         let msg = install_opencode_v2_plugin(&dir).expect("v2 installs");
-        assert!(msg.contains("opencode 2"), "{msg}");
+        assert!(msg.contains("compatibility"), "{msg}");
         let plugin = dir.join("plugin");
-        assert!(!plugin.join("opencode-plugin.ts").exists(), "v1 file breaks v2 plugin load");
+        assert_eq!(
+            std::fs::read_to_string(plugin.join("opencode-plugin.ts")).unwrap(),
+            modern_opencode_plugin()
+        );
         for (name, body) in BUNDLED_OPENCODE_V2 {
             assert_eq!(
                 std::fs::read_to_string(dir.join("plugins").join("roost").join(name)).unwrap(),
@@ -1044,6 +1097,34 @@ mod tests {
         assert_eq!(std::fs::read_to_string(legacy.join("notes.txt")).unwrap(), "user notes");
         assert!(!legacy.join("tui.ts").exists());
         assert!(install_opencode_v2_plugin(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn opencode_modern_versions_share_one_stable_install() {
+        let dir = scratch_dir("opencode-coexistence");
+        assert!(install_opencode_for_version(&dir, Some((2, 0, 18))).is_some());
+        assert!(install_opencode_for_version(&dir, Some((1, 18, 29))).is_none());
+        assert!(install_opencode_for_version(&dir, Some((1, 18, 32))).is_none());
+        assert!(install_opencode_for_version(&dir, Some((2, 0, 18))).is_none());
+        let body = std::fs::read_to_string(dir.join("plugin/opencode-plugin.ts")).unwrap();
+        assert_eq!(body.matches("export ").count(), 1);
+        assert!(body.contains("server: RoostPlugin, setup() {}"));
+        assert!(install_opencode_for_version(&dir, None).is_none());
+        assert_eq!(std::fs::read_to_string(dir.join("plugin/opencode-plugin.ts")).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_unknown_version_leaves_config_alone_and_old_v1_keeps_legacy_export() {
+        let dir = scratch_dir("opencode-old-version");
+        assert!(install_opencode_for_version(&dir, None).is_none());
+        assert!(!dir.join("plugin").exists());
+        install_opencode_for_version(&dir, Some((1, 18, 28))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("plugin/opencode-plugin.ts")).unwrap(),
+            BUNDLED_OPENCODE
+        );
+        assert!(!dir.join("plugins").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
