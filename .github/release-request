@@ -1,1 +1,2 @@
 v0.1.26
+Retry publication through the required release branch after PR #211.
