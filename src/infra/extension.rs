@@ -40,7 +40,7 @@
 //!   so there is no existing file to merge into. The config dir itself still
 //!   must exist — a user who never ran opencode has no `~/.config/opencode`,
 //!   and we never create that. opencode 2.x (by `opencode --version`) gets
-//!   a `plugin/roost/` directory instead — see `install_opencode_v2_plugin`.
+//!   a `plugins/roost/` directory instead — see `install_opencode_v2_plugin`.
 
 use std::path::{Path, PathBuf};
 
@@ -165,13 +165,13 @@ const BUNDLED_OPENCODE_V2: [(&str, &str); 2] = [
 ];
 
 /// opencode 2.x: v2 refuses 1.x plugin modules, and its shared server can't
-/// see pane env, so the plugin is a `plugin/roost/` directory whose TUI half
+/// see pane env, so the plugin is a `plugins/roost/` directory whose TUI half
 /// does the reporting (see `extensions/opencode-v2/`). The 1.x file is
 /// removed — left in place it fails v2's plugin load on every start.
 fn install_opencode_v2_plugin(config_dir: &Path) -> Option<String> {
     let plugin_dir = config_dir.join("plugin");
     let removed_v1 = std::fs::remove_file(plugin_dir.join("opencode-plugin.ts")).is_ok();
-    let dir = plugin_dir.join("roost");
+    let dir = config_dir.join("plugins").join("roost");
     let mut changed = false;
     for (name, body) in BUNDLED_OPENCODE_V2 {
         let target = dir.join(name);
@@ -182,8 +182,17 @@ fn install_opencode_v2_plugin(config_dir: &Path) -> Option<String> {
         write_atomic(&target, body)?;
         changed = true;
     }
+    // Only remove unchanged generated files from the old server-only discovery path.
+    let legacy_dir = plugin_dir.join("roost");
+    for (name, body) in BUNDLED_OPENCODE_V2 {
+        let target = legacy_dir.join(name);
+        if std::fs::read_to_string(&target).ok().as_deref() == Some(body) {
+            changed |= std::fs::remove_file(target).is_ok();
+        }
+    }
+    let _ = std::fs::remove_dir(legacy_dir);
     (changed || removed_v1)
-        .then(|| "installed the roost opencode 2 plugin (~/.config/opencode/plugin/roost/)".into())
+        .then(|| "installed the roost opencode 2 plugin (~/.config/opencode/plugins/roost/)".into())
 }
 
 /// The real work of `ensure_opencode_plugin`, split out (like
@@ -994,9 +1003,47 @@ mod tests {
         let plugin = dir.join("plugin");
         assert!(!plugin.join("opencode-plugin.ts").exists(), "v1 file breaks v2 plugin load");
         for (name, body) in BUNDLED_OPENCODE_V2 {
-            assert_eq!(std::fs::read_to_string(plugin.join("roost").join(name)).unwrap(), body);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("plugins").join("roost").join(name)).unwrap(),
+                body
+            );
         }
         assert!(install_opencode_v2_plugin(&dir).is_none(), "second run must be silent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn opencode_v2_migrates_the_singular_plugin_directory() {
+        let dir = scratch_dir("opencode-v2-migrate");
+        let legacy = dir.join("plugin").join("roost");
+        std::fs::create_dir_all(&legacy).unwrap();
+        for (name, body) in BUNDLED_OPENCODE_V2 {
+            std::fs::write(legacy.join(name), body).unwrap();
+        }
+        install_opencode_v2_plugin(&dir).expect("legacy install migrates");
+        assert!(!legacy.exists(), "old server plugin must not be loaded twice");
+        for (name, body) in BUNDLED_OPENCODE_V2 {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("plugins").join("roost").join(name)).unwrap(),
+                body
+            );
+        }
+        assert!(install_opencode_v2_plugin(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_v2_migration_preserves_unowned_files() {
+        let dir = scratch_dir("opencode-v2-preserve");
+        let legacy = dir.join("plugin").join("roost");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("server.ts"), "customized plugin").unwrap();
+        std::fs::write(legacy.join("notes.txt"), "user notes").unwrap();
+        std::fs::write(legacy.join("tui.ts"), BUNDLED_OPENCODE_V2[1].1).unwrap();
+        install_opencode_v2_plugin(&dir).expect("new path installs");
+        assert_eq!(std::fs::read_to_string(legacy.join("server.ts")).unwrap(), "customized plugin");
+        assert_eq!(std::fs::read_to_string(legacy.join("notes.txt")).unwrap(), "user notes");
+        assert!(!legacy.join("tui.ts").exists());
+        assert!(install_opencode_v2_plugin(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
