@@ -2782,7 +2782,9 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   for the full reasoning.
 - **One float slot, app-wide** (not per tab): `Option<Float>` holding
   `{ id, spec, shown, prev_focus }`. The scratch's roadmap cousin (a floating
-  *picker*) is explicitly out of scope.
+  *picker*) is explicitly out of scope. **[Amended 2026-09-29]** A second,
+  separate overlay now exists: the control-plane popup, contracted in C22a
+  below; it never occupies this slot.
 - **Lifecycle:** first toggle spawns a `shell` adapter pane in the focused
   pane's cwd (else the process cwd), spec title preset `"scratch"`, shown and
   focused. Later toggles hide/show; the process stays alive while hidden.
@@ -2881,6 +2883,42 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   formula incl. refusal floor; focus rules 1–3; hit-test ordering;
   `the_float_interior_hides_the_tiled_panes_beneath_it`,
   `clear_opaque_keeps_the_left_border_when_a_wide_glyph_abuts_it`.
+
+**C22a — The popup (`roost spawn ADAPTER --float`) — [Added 2026-09-29].**
+An ephemeral, control-plane-opened cousin of the scratch float, like tmux
+`display-popup -E`. It is **not** the scratch float: that stays the human's
+private pane and every control verb keeps refusing it.
+- **Chrome/geometry:** identical to C22 — same `float_rect`, same refusal
+  when the body does not fit (`no room for a popup`), same opaque `Clear`
+  and border/badge (ink · paper · one red, no fixed RGB, no fill beyond the
+  float's own). `--title NAME` is its pane title.
+- **Stacking:** topmost, above the scratch float and the zoomed view, below
+  modals. Opening it hides a shown scratch float first (process kept).
+- **Command:** on the `shell` adapter, `--input CMD` launches `$SHELL [-l] -c
+  CMD` (the shell adapter's own login-flag rule) rather than typing into a
+  prompt, so the popup closes when CMD exits, like tmux `display-popup -E`.
+  Other adapters keep typed `--input`.
+- **Not listed:** absent from `list`, the roster, the Alt+a attention ring,
+  `needs_input_count` and `send --all` — it is always focused, so it is never
+  something to be summoned to, and a broadcast must not type into it.
+- **Focus:** shown ⇒ focused, immediately, and interactive — keys, wheel and
+  clicks inside its rect reach its program exactly as for the float (roost's
+  own Alt chords still apply unless the pane is raw, C23).
+- **Dismissal = close:** everything that hides the scratch float (C22 rules
+  2/3: the toggle chord, Alt+arrows, Alt+a, any tab change, structural
+  actions, a click outside its rect) **kills** the popup instead, and focus
+  returns to `prev_focus` (first visible pane if it is gone). Alt+w closes it
+  with no confirm or undo entry. There is no hidden popup.
+- **Exit = close:** when its process exits, with any status, it closes and
+  focus returns the same way. A launch that fails synchronously is closed at
+  once and reported in the spawn reply's `error`.
+- **One at a time:** a second `--float` spawn fails with `a popup is already
+  open`; the first is never killed silently.
+- **Not persisted, never resurrected;** its id comes from `alloc_pane_id`.
+- **Control plane:** `spawned_by` is the caller, so its owner (and Fleet) may
+  `send`/`read`/`status`/`wait`/`close` it; `fork` of it makes an ordinary
+  sibling. A control split/tab spawn while it is open leaves it
+  open; `focus` of another pane, or `spawn --focus`, dismisses it.
 
 **[Amended 2026-09-03 — the Alt+f re-key.]** `Action::ToggleFloat` moves off
 `Alt+f` onto `Alt+Shift+z`; `Alt+f` is now deliberately unbound. **Why now:**

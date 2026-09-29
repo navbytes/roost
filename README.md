@@ -474,6 +474,8 @@ same binary in client mode:
 ```sh
 roost list                                   # panes: id, adapter, cwd, status, …
 roost spawn pi --cwd ~/api --input "run the tests, report pass/fail"
+roost spawn shell --tab --title build         # ...in a new tab (the human's tab and focus are left alone)
+roost spawn shell --float --input lazygit     # ...as a focused popup running lazygit; it closes when lazygit exits (--focus: move focus to any spawn)
 roost read 5                                  # a pane's current screen (default)
 roost read 5 --tail 20                        # its last N lines (--full for the whole scrollback)
 roost send 5 hello world --enter              # type into a pane (+ Enter)

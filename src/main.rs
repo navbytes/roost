@@ -1007,7 +1007,7 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         // `display_rects()` is the one seam both paths read, float always
         // first when shown, so this can't disagree with what's on screen.
         let over_float = mouse::hit_test(&app.display_rects(), me.column, me.row)
-            .is_some_and(|pr| app.is_float(pr.id));
+            .is_some_and(|pr| app.is_overlay(pr.id));
         if inside && !over_float {
             // Selection-freeze design audit D1, same as copy mode/modal
             // above: a drag that started on a pane and overshot into the

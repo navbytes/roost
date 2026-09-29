@@ -49,6 +49,23 @@ fn shell_spec(shell: &str, cwd: &Path) -> CommandSpec {
     }
 }
 
+/// `$SHELL [-l] -c COMMAND`: runs one command and exits with it, so a pane
+/// built on this closes when the command does (the `--float --input` popup).
+pub fn command_spec(cwd: &Path, command: &str) -> CommandSpec {
+    shell_command(&user_shell(), cwd, command)
+}
+
+fn shell_command(shell: &str, cwd: &Path, command: &str) -> CommandSpec {
+    // csh/tcsh refuse `-l` alongside any other flag, so they run the command non-login.
+    let base = shell.rsplit('/').next().unwrap_or(shell);
+    let spec = if matches!(base, "csh" | "tcsh") {
+        CommandSpec::new(shell, cwd)
+    } else {
+        shell_spec(shell, cwd)
+    };
+    spec.arg("-c").arg(command)
+}
+
 impl AgentAdapter for ShellAdapter {
     fn id(&self) -> &'static str {
         "shell"
@@ -70,8 +87,16 @@ impl AgentAdapter for ShellAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_spec, LOGIN_FLAG_SHELLS};
+    use super::{shell_command, shell_spec, LOGIN_FLAG_SHELLS};
     use std::path::Path;
+
+    #[test]
+    fn a_shell_command_runs_via_dash_c_keeping_the_login_flag() {
+        let spec = shell_command("/bin/zsh", Path::new("/tmp"), "lazygit");
+        assert_eq!(spec.args, ["-l", "-c", "lazygit"]);
+        assert_eq!(shell_command("/opt/weird/sh2", Path::new("/tmp"), "ls").args, ["-c", "ls"]);
+        assert_eq!(shell_command("/bin/tcsh", Path::new("/tmp"), "ls").args, ["-c", "ls"]);
+    }
 
     #[test]
     fn known_shells_are_spawned_as_login_shells() {

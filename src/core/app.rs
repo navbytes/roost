@@ -11,7 +11,9 @@ use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::agents::Registry;
-use crate::core::control::{Actor, Method, ReadMode, Reply, Request, TokenTable, UNAUTHORIZED_MSG};
+use crate::core::control::{
+    Actor, Method, ReadMode, Reply, Request, SpawnPlace, TokenTable, UNAUTHORIZED_MSG,
+};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::session_resolver;
@@ -681,6 +683,14 @@ pub struct App<B: PaneBackend> {
     /// C22: the one app-wide floating scratch pane slot, spawned on first
     /// Alt+Shift+z (Alt+f before the 2026-09-03 re-key). `None` until then.
     float: Option<Float>,
+    /// The ephemeral `spawn --float` popup: same rect and chrome as `float`
+    /// but it is always shown (and focused), dies with its process or on
+    /// any dismissal, and is never persisted. Reuses `Float`; `shown` is
+    /// always true here. Never open together with a *shown* scratch float.
+    popup: Option<Float>,
+    /// Set only while `ctl_spawn_child` moves focus around a control
+    /// split-spawn, so that transient focus move does not dismiss the popup.
+    popup_pinned: bool,
     /// C23: panes currently in raw (hard pass-through) mode, by id.
     /// Per-pane, session-only — never persisted.
     raw: HashSet<PaneId>,
@@ -830,6 +840,8 @@ impl<B: PaneBackend> App<B> {
             visited_waiting: HashSet::new(),
             feed: VecDeque::new(),
             float: None,
+            popup: None,
+            popup_pinned: false,
             raw: HashSet::new(),
             tab_focus: HashSet::new(),
             pending_yank: None,
@@ -1100,19 +1112,14 @@ impl<B: PaneBackend> App<B> {
     pub fn display_rects(&self) -> Vec<PaneRect> {
         let body = self.body_area();
         let mut v = Vec::new();
-        if let Some(f) = &self.float {
-            if f.shown {
-                v.push(PaneRect { id: f.id, rect: Self::float_rect(body), collapsed: false });
-            }
+        if let Some(f) = self.popup.iter().chain(self.float.iter().filter(|f| f.shown)).next() {
+            v.push(PaneRect { id: f.id, rect: Self::float_rect(body), collapsed: false });
         }
         if self.zoomed {
             // C21 "keeps zoom" + C22 rule 1: while the float is shown, focus
             // belongs to it, not the zoomed pane — the real zoom target is
             // whatever was focused right before the float appeared.
-            let target = match &self.float {
-                Some(f) if f.shown => f.prev_focus,
-                _ => self.focused,
-            };
+            let target = self.overlay_prev().unwrap_or(self.focused);
             v.push(PaneRect { id: target, rect: body, collapsed: false });
         } else if self.solo() {
             // Unlike the zoom branch above, `f.prev_focus` is not safe to
@@ -1162,10 +1169,7 @@ impl<B: PaneBackend> App<B> {
         // are not in a live tab, and both must be counted or the id gets
         // handed out twice.
         let base = self.ws.next_pane_id();
-        let base = match &self.float {
-            Some(f) => base.max(f.id + 1),
-            None => base,
-        };
+        let base = self.float.iter().chain(&self.popup).fold(base, |b, f| b.max(f.id + 1));
         // The undo stack. A parked `Closed::Tab` is re-inserted **verbatim,
         // with its original pane ids** (`undo_close`), and `spawn_active_tab`
         // then builds runtimes for them — so if one of those ids has since
@@ -1210,11 +1214,36 @@ impl<B: PaneBackend> App<B> {
         self.is_float(id).then(|| format!("cannot {verb} the scratch pane"))
     }
 
-    /// Is the float currently the focused pane? Equivalent to "is it
-    /// shown" (rule 1: shown ⇒ focused) — checking focus directly is
-    /// simpler and doesn't also require reading `shown`.
+    /// Is `id` the `spawn --float` popup's pane?
+    pub fn is_popup(&self, id: PaneId) -> bool {
+        self.popup.as_ref().is_some_and(|f| f.id == id)
+    }
+
+    /// The scratch float or the popup — what chrome and hit-testing treat as
+    /// the one pane painted over the rest. Control refusals use `is_float`.
+    pub fn is_overlay(&self, id: PaneId) -> bool {
+        self.is_float(id) || self.is_popup(id)
+    }
+
+    /// Where focus returns when the shown overlay goes away, `None` when no
+    /// overlay is up.
+    fn overlay_prev(&self) -> Option<PaneId> {
+        self.popup.iter().chain(self.float.iter().filter(|f| f.shown)).next().map(|f| f.prev_focus)
+    }
+
+    fn overlay_noun(&self) -> &'static str {
+        if self.popup.is_some() {
+            "popup"
+        } else {
+            "scratch pane"
+        }
+    }
+
+    /// Is an overlay (scratch float or popup) currently the focused pane?
+    /// Equivalent to "is it shown" (rule 1: shown ⇒ focused) — checking
+    /// focus directly is simpler and doesn't also require reading `shown`.
     fn float_focused(&self) -> bool {
-        self.is_float(self.focused)
+        self.is_overlay(self.focused)
     }
 
     /// C23: does `id` currently have raw pass-through enabled? Read by the
@@ -1396,12 +1425,8 @@ impl<B: PaneBackend> App<B> {
         // `Alt+Shift+z` over a solo tab swap the shown pane for the tab's
         // stale remembered one — the rail's `▎` jumped, and two PTYs got
         // resized — then snap back on hide (review, 2026-09-10).
-        if let Some(back) = self
-            .float
-            .as_ref()
-            .filter(|f| f.shown)
-            .map(|f| f.prev_focus)
-            .filter(|p| self.ws.active_tab().panes.contains_key(p))
+        if let Some(back) =
+            self.overlay_prev().filter(|p| self.ws.active_tab().panes.contains_key(p))
         {
             return back;
         }
@@ -1429,6 +1454,12 @@ impl<B: PaneBackend> App<B> {
     }
 
     fn spawn_pane(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect) {
+        self.spawn_pane_with(id, spec, rect, None);
+    }
+
+    /// `command`: run this one command instead of an interactive shell (only
+    /// ever set for a `shell` pane).
+    fn spawn_pane_with(&mut self, id: PaneId, spec: &PaneSpec, rect: Rect, command: Option<&str>) {
         // Validate a stored session id via SessionResolver (design doc
         // §6.1): only launch fresh + clear it when the session is
         // *definitively* gone. All adapter queries happen here, in their own
@@ -1460,6 +1491,9 @@ impl<B: PaneBackend> App<B> {
         }
         let adapter = self.registry.get(spec.adapter.as_str());
         let mut cmd = match (&resolution.session, adapter) {
+            (_, Some(_)) if command.is_some() => {
+                crate::agents::shell::command_spec(&spec.cwd, command.unwrap_or_default())
+            }
             (Some(s), Some(a)) => a.resume(&spec.cwd, s),
             (None, Some(a)) => a.launch(&spec.cwd),
             // Unreachable in practice (the same lookup just succeeded in the
@@ -1959,10 +1993,8 @@ impl<B: PaneBackend> App<B> {
     /// them), but each then adds its own is-float refusal (M1) — the float
     /// is the human's private scratch shell, never a control-plane target.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
-        if let Some(f) = &self.float {
-            if f.id == id {
-                return Some(&f.spec);
-            }
+        if let Some(f) = self.float.iter().chain(&self.popup).find(|f| f.id == id) {
+            return Some(&f.spec);
         }
         self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
     }
@@ -1977,10 +2009,8 @@ impl<B: PaneBackend> App<B> {
 
     /// C22: mirrors `find_spec` — the float's spec is mutable too (rename).
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
-        if let Some(f) = &mut self.float {
-            if f.id == id {
-                return Some(&mut f.spec);
-            }
+        if let Some(f) = self.float.iter_mut().chain(&mut self.popup).find(|f| f.id == id) {
+            return Some(&mut f.spec);
         }
         self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
     }
@@ -2045,7 +2075,12 @@ impl<B: PaneBackend> App<B> {
     /// at a time and collapses multiple needs-input panes to a single flag),
     /// so a pane in a background tab still counts.
     pub fn needs_input_count(&self) -> usize {
-        self.runtimes.values().filter(|rt| rt.status() == AgentStatus::NeedsInput).count()
+        // Not the popup: it is always focused, so it is never in the attention
+        // ring this count must equal.
+        self.runtimes
+            .iter()
+            .filter(|(&id, rt)| rt.status() == AgentStatus::NeedsInput && !self.is_popup(id))
+            .count()
     }
 
     /// Whether the focused pane negotiated the kitty keyboard protocol, so the
@@ -2137,7 +2172,7 @@ impl<B: PaneBackend> App<B> {
     /// away). One predicate rather than two, so the two ends cannot disagree
     /// about what "exists" means.
     fn pane_exists(&self, id: PaneId) -> bool {
-        self.tab_of(id).is_some() || self.float.as_ref().is_some_and(|f| f.id == id)
+        self.tab_of(id).is_some() || self.is_overlay(id)
     }
 
     fn tab_of(&self, id: PaneId) -> Option<usize> {
@@ -2218,8 +2253,8 @@ impl<B: PaneBackend> App<B> {
         match method {
             Method::List => self.ctl_list(actor),
             Method::Status { pane } => self.ctl_status(actor, pane),
-            Method::Spawn { adapter, cwd, initial_input } => {
-                self.ctl_spawn(actor, &adapter, cwd, initial_input)
+            Method::Spawn { adapter, cwd, initial_input, place } => {
+                self.ctl_spawn(actor, &adapter, cwd, initial_input, place)
             }
             Method::Fork { pane } => self.ctl_fork(actor, pane),
             Method::Send { pane, text, submit } => self.ctl_send(actor, pane, &text, submit),
@@ -2533,9 +2568,22 @@ impl<B: PaneBackend> App<B> {
         adapter: &str,
         cwd: Option<String>,
         initial_input: Option<String>,
+        mut place: SpawnPlace,
     ) -> Reply {
         if !self.registry.contains_key(adapter) {
             return Reply::err(format!("unknown adapter: {adapter}"));
+        }
+        if place.float && place.tab {
+            return Reply::err("--float and --tab cannot be combined");
+        }
+        if place.title.is_some() && !(place.float || place.tab) {
+            return Reply::err("--title needs --tab or --float");
+        }
+        if let Some(t) = &mut place.title {
+            *t = t.trim().to_string();
+            if t.is_empty() {
+                return Reply::err("--title must not be empty");
+            }
         }
         // QA-2: an explicit --cwd is the one path a caller can name a
         // directory roost has never seen — validate it before anything is
@@ -2551,7 +2599,116 @@ impl<B: PaneBackend> App<B> {
             }
             None => None,
         };
-        self.ctl_spawn_child(actor, adapter, cwd, initial_input, "spawn")
+        if place.float {
+            return self.ctl_spawn_popup(actor, adapter, cwd, initial_input, place.title);
+        }
+        if place.tab {
+            return self.ctl_spawn_tab(actor, adapter, cwd, initial_input, place);
+        }
+        self.ctl_spawn_child(actor, adapter, cwd, initial_input, place.focus, "spawn")
+    }
+
+    /// The owner recorded as `spawned_by` for a pane `actor` creates.
+    fn spawn_owner(actor: Actor) -> Option<PaneId> {
+        match actor {
+            Actor::Fleet | Actor::Local => None,
+            Actor::Pane(a) => Some(a),
+        }
+    }
+
+    /// Working directory for a spawn with no `--cwd`: the focused pane's.
+    fn default_spawn_cwd(&self) -> PathBuf {
+        self.find_spec(self.focused)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    }
+
+    /// Shared tail of every control spawn that made pane `id`: buffer the
+    /// initial input, honor an explicit `--focus`, relayout, persist, reply.
+    fn finish_spawn(&mut self, id: PaneId, initial_input: Option<String>, focus: bool) -> Reply {
+        if let Some(text) = initial_input {
+            let mut bytes = text.into_bytes();
+            bytes.push(b'\r');
+            // Don't write yet: the agent's stdin reader may not be up this
+            // instant after spawn, silently dropping the bytes. Buffer and
+            // flush on the pane's first output (see on_pty_output) — the
+            // minimal reliable "it's alive and reading" signal.
+            self.pending_input.insert(id, bytes);
+        }
+        if focus {
+            self.focus_attention_target(id);
+        }
+        self.relayout();
+        self.save();
+        self.spawn_reply(id)
+    }
+
+    /// `spawn --tab`: the pane becomes the sole pane of a new tab appended
+    /// at the end. Like a split spawn it leaves the human's tab and focus
+    /// alone (§5.2) unless `--focus` — so it does not go through `new_tab`,
+    /// which switches to the tab it makes.
+    fn ctl_spawn_tab(
+        &mut self,
+        actor: Actor,
+        adapter: &str,
+        cwd: Option<PathBuf>,
+        initial_input: Option<String>,
+        place: SpawnPlace,
+    ) -> Reply {
+        let cwd = cwd.unwrap_or_else(|| self.default_spawn_cwd());
+        let id = self.add_tab(adapter, cwd, place.title, Self::spawn_owner(actor));
+        if let Some(spec) = self.find_spec(id).cloned() {
+            self.spawn_pane(id, &spec, self.body_area());
+        }
+        self.finish_spawn(id, initial_input, place.focus)
+    }
+
+    /// `spawn --float`: open the popup over the current view and focus it.
+    /// Refuses a second popup and a body too small for the float geometry.
+    fn ctl_spawn_popup(
+        &mut self,
+        actor: Actor,
+        adapter: &str,
+        cwd: Option<PathBuf>,
+        initial_input: Option<String>,
+        title: Option<String>,
+    ) -> Reply {
+        if self.popup.is_some() {
+            return Reply::err("a popup is already open");
+        }
+        if !Self::float_fits(self.body_area()) {
+            return Reply::err("no room for a popup");
+        }
+        // Topmost: the scratch float steps aside (its process keeps running).
+        // Hidden before `prev_focus` is read so that is the pane underneath.
+        self.hide_float();
+        self.reset_pane_modes();
+        let spec = PaneSpec {
+            adapter: adapter.into(),
+            cwd: cwd.unwrap_or_else(|| self.default_spawn_cwd()),
+            session: None,
+            title,
+            spawned_by: Self::spawn_owner(actor),
+            note: None,
+            noted_at: None,
+        };
+        let id = self.alloc_pane_id();
+        self.popup = Some(Float { id, spec: spec.clone(), shown: true, prev_focus: self.focused });
+        self.set_focus(id);
+        // Like tmux `display-popup -E CMD`: a shell popup with input runs it
+        // as the command, so the popup closes when the command does; other
+        // adapters have no such mode and get the input typed.
+        let as_command = adapter == "shell";
+        let command = initial_input.as_deref().filter(|_| as_command);
+        self.spawn_pane_with(id, &spec, Self::float_rect(self.body_area()), command);
+        let reply = self.spawn_reply(id);
+        // A launch that failed synchronously never emits an exit event, so
+        // nothing else would ever close the popup.
+        if self.dead.contains_key(&id) {
+            self.close_popup();
+            return reply;
+        }
+        self.finish_spawn(id, initial_input.filter(|_| !as_command), false)
     }
 
     /// Shared tail of `ctl_spawn`/`ctl_fork`: resolve `actor`'s owner id,
@@ -2570,12 +2727,10 @@ impl<B: PaneBackend> App<B> {
         adapter: &str,
         cwd: Option<PathBuf>,
         initial_input: Option<String>,
+        focus: bool,
         verb: &str,
     ) -> Reply {
-        let owner = match actor {
-            Actor::Fleet | Actor::Local => None,
-            Actor::Pane(a) => Some(a),
-        };
+        let owner = Self::spawn_owner(actor);
         // A control spawn must leave the human's view exactly as it found
         // it — including the float. `spawn_child` focuses the pane it
         // creates, and C22 rule 1 (enforced in `set_focus`) takes the float
@@ -2585,7 +2740,11 @@ impl<B: PaneBackend> App<B> {
         // tree as a pane with no spec. Save and restore both halves.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
         let float_shown = self.float.as_ref().is_some_and(|f| f.shown);
+        // A popup is the same story: pin it so the transient focus move
+        // below does not read as a dismissal.
+        self.popup_pinned = true;
         let id = self.spawn_child(adapter, cwd, owner);
+        self.popup_pinned = false;
         if let Some(f) = &mut self.float {
             f.shown = float_shown;
         }
@@ -2604,18 +2763,7 @@ impl<B: PaneBackend> App<B> {
                 self.chord_clause(Action::StackPane, |c| format!("; stack a pane with {c} first"));
             return Reply::err(format!("{verb} refused: not enough room to split{hint}"));
         };
-        if let Some(text) = initial_input {
-            let mut bytes = text.into_bytes();
-            bytes.push(b'\r');
-            // Don't write yet: the agent's stdin reader may not be up this
-            // instant after spawn, silently dropping the bytes. Buffer and
-            // flush on the pane's first output (see on_pty_output) — the
-            // minimal reliable "it's alive and reading" signal.
-            self.pending_input.insert(id, bytes);
-        }
-        self.relayout();
-        self.save();
-        self.spawn_reply(id)
+        self.finish_spawn(id, initial_input, focus)
     }
 
     /// P0-2: the `{"pane": id}` reply `ctl_spawn`/`ctl_fork` both end on,
@@ -2654,7 +2802,7 @@ impl<B: PaneBackend> App<B> {
         // Same adapter + cwd. Session-branching (a true fork of the agent's
         // conversation) lands with the bidirectional pi extension; for now this
         // opens a fresh sibling in the same context.
-        self.ctl_spawn_child(actor, &spec.adapter, Some(spec.cwd), None, "fork")
+        self.ctl_spawn_child(actor, &spec.adapter, Some(spec.cwd), None, false, "fork")
     }
 
     fn ctl_send(&mut self, actor: Actor, pane: PaneId, text: &str, submit: bool) -> Reply {
@@ -2716,7 +2864,7 @@ impl<B: PaneBackend> App<B> {
             .iter()
             .filter(|(&id, rt)| {
                 rt.status() != AgentStatus::Exited
-                    && !self.is_float(id)
+                    && !self.is_overlay(id)
                     && self.may_target(actor, id)
                     && status.is_none_or(|want| self.display_status(id) == Some(want))
             })
@@ -2801,6 +2949,12 @@ impl<B: PaneBackend> App<B> {
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
         }
+        // The popup is not in any tab: closing it just dismisses it.
+        if self.is_popup(pane) {
+            self.close_popup();
+            self.relayout();
+            return Reply::ok(serde_json::json!({ "closed": pane }));
+        }
         // The API must never quit roost by closing its last pane.
         if self.ws.tabs.len() == 1 && self.ws.active_tab().panes.len() == 1 {
             return Reply::err("cannot close the last pane via the control interface");
@@ -2871,10 +3025,7 @@ impl<B: PaneBackend> App<B> {
         // pane actually being shown full-screen left `zoomed` set pointing
         // at a pane that no longer exists. `display_rects` resolves the real
         // target the same way; this must agree with it.
-        let zoom_target = match &self.float {
-            Some(f) if f.shown => f.prev_focus,
-            _ => self.focused,
-        };
+        let zoom_target = self.overlay_prev().unwrap_or(self.focused);
         if self.zoomed && id == zoom_target {
             self.exit_zoom();
         }
@@ -3183,6 +3334,11 @@ impl<B: PaneBackend> App<B> {
     /// recovery hint is only visible inside its own borders, so it otherwise
     /// gets no pull toward it (regression: same fix as `on_status`).
     pub fn on_pty_exit(&mut self, id: PaneId) -> Option<String> {
+        // A popup lives exactly as long as its process, whatever the status.
+        if self.is_popup(id) {
+            self.close_popup();
+            return None;
+        }
         if let Some(rt) = self.runtimes.get_mut(&id) {
             rt.on_exit();
         }
@@ -4490,7 +4646,8 @@ impl<B: PaneBackend> App<B> {
                 // floating full-focus surface) — refuse rather than hide it
                 // and zoom whatever's behind it.
                 if self.float_focused() {
-                    self.set_flash("can't zoom the float");
+                    let what = if self.popup.is_some() { "popup" } else { "float" };
+                    self.set_flash(format!("can't zoom the {what}"));
                 } else {
                     self.toggle_zoom();
                 }
@@ -4607,6 +4764,12 @@ impl<B: PaneBackend> App<B> {
     /// would undo exactly what U9 fixed.
     fn set_focus(&mut self, id: PaneId) {
         let old = self.focused;
+        // Focus leaving the popup is a dismissal (it closes); its `prev_focus`
+        // is moot here since the caller already chose where focus goes.
+        // Before the trail below so a dead popup never becomes "go back".
+        if old != id && self.is_popup(old) && !self.popup_pinned {
+            self.drop_popup();
+        }
         // C35: the trail "go back" follows. Recorded here rather than at each
         // call site precisely because this is the one chokepoint — the
         // comment below already says every focus move funnels through it, and
@@ -4750,7 +4913,7 @@ impl<B: PaneBackend> App<B> {
         // simulation agent comparing the two, which is the comparison that
         // makes the inconsistency visible.
         if self.float_focused() {
-            self.set_flash("the scratch pane sits outside the layout");
+            self.set_flash(format!("the {} sits outside the layout", self.overlay_noun()));
             return;
         }
         // C21, from here rather than `apply`'s structural guard: the float
@@ -5122,6 +5285,10 @@ impl<B: PaneBackend> App<B> {
         // C22 rule 4: Alt+w on the float kills it for real, no confirm
         // guard (scratch is not precious — the whole point of the confirm
         // guard below is protecting work the float explicitly isn't).
+        if self.is_popup(self.focused) {
+            self.close_popup();
+            return;
+        }
         if self.float_focused() {
             self.close_float();
             return;
@@ -5229,31 +5396,44 @@ impl<B: PaneBackend> App<B> {
         self.exit_zoom(); // C21: any tab change exits zoom
         self.hide_float(); // C22 rule 2: "any tab change" hides the float too
         self.remember_tab_focus(); // U11: Alt+t leaves a tab like any switch
-        let id = self.alloc_pane_id();
         let cwd = std::env::current_dir().unwrap_or_default();
+        let id = self.add_tab("shell", cwd, None, None);
+        self.ws.active_tab = self.ws.tabs.len() - 1;
+        self.spawn_active_tab();
+        self.set_focus(id);
+    }
+
+    /// Append a tab holding one not-yet-spawned pane and return its id,
+    /// touching neither the active tab nor focus. `name` defaults to `tab{n}`.
+    fn add_tab(
+        &mut self,
+        adapter: &str,
+        cwd: PathBuf,
+        name: Option<String>,
+        spawned_by: Option<PaneId>,
+    ) -> PaneId {
+        let id = self.alloc_pane_id();
         let mut panes = HashMap::new();
         panes.insert(
             id,
             PaneSpec {
-                adapter: "shell".into(),
+                adapter: adapter.into(),
                 cwd,
                 session: None,
                 title: None,
-                spawned_by: None,
+                spawned_by,
                 note: None,
                 noted_at: None,
             },
         );
         self.ws.tabs.push(Tab {
-            name: format!("tab{}", self.ws.tabs.len() + 1),
+            name: name.unwrap_or_else(|| format!("tab{}", self.ws.tabs.len() + 1)),
             layout: LayoutNode::Pane(id),
             panes,
             view: TabView::Tiled,
             focus: None,
         });
-        self.ws.active_tab = self.ws.tabs.len() - 1;
-        self.spawn_active_tab();
-        self.set_focus(id);
+        id
     }
 
     /// U11: snapshot where focus sits in the tab we're about to leave, so
@@ -5373,7 +5553,7 @@ impl<B: PaneBackend> App<B> {
     /// nowhere to send anything.
     fn move_pane_to_tab(&mut self, delta: isize) {
         if self.float_focused() {
-            self.set_flash("the scratch pane belongs to no tab");
+            self.set_flash(format!("the {} belongs to no tab", self.overlay_noun()));
             return;
         }
         let n = self.ws.tabs.len();
@@ -5480,7 +5660,7 @@ impl<B: PaneBackend> App<B> {
     /// tab to pull it out of.
     fn mark_pane(&mut self) {
         if self.float_focused() {
-            self.set_flash("the scratch pane belongs to no tab");
+            self.set_flash(format!("the {} belongs to no tab", self.overlay_noun()));
             return;
         }
         let id = self.focused;
@@ -5861,6 +6041,9 @@ impl<B: PaneBackend> App<B> {
     /// collapsed stack, same as any other focus move. C22: a jump landing on
     /// the float shows it (recording where focus came from as `prev_focus`).
     fn focus_attention_target(&mut self, target: PaneId) {
+        if target != self.focused {
+            self.reset_pane_modes();
+        }
         if let Some(ti) = self.tab_of(target) {
             if ti != self.ws.active_tab {
                 self.go_to_tab_landing(ti, Some(target));
@@ -6542,44 +6725,70 @@ impl<B: PaneBackend> App<B> {
     /// action that must not leave it focused, and a mouse click landing
     /// outside its rect. A no-op when the float isn't currently shown.
     fn hide_float(&mut self) {
+        // The popup has no hidden state: every dismissal closes it.
+        if self.popup.is_some() {
+            self.close_popup();
+            return;
+        }
         let Some(f) = &mut self.float else { return };
         if !f.shown {
             return;
         }
         f.shown = false;
         let back = f.prev_focus;
-        let target = if self.ws.active_tab().panes.contains_key(&back) {
+        let target = self.focus_after_overlay(back);
+        self.set_focus(target);
+    }
+
+    /// Where focus lands when an overlay closes: `back` if it is still in
+    /// the active tab, else whatever is on screen now — prev_focus may have
+    /// been closed via the control plane while the overlay was up (the same
+    /// recovery `close_pane_id` uses).
+    fn focus_after_overlay(&self, back: PaneId) -> PaneId {
+        if self.ws.active_tab().panes.contains_key(&back) {
             back
         } else {
-            // prev_focus may have been closed via the control plane while
-            // the float was up — fall back to whatever's on screen now,
-            // same recovery `close_pane_id` uses.
             self.first_visible().unwrap_or(0)
-        };
-        self.set_focus(target);
+        }
+    }
+
+    /// Kill an overlay pane's process and forget every per-pane record.
+    fn forget_overlay_pane(&mut self, id: PaneId) {
+        if let Some(mut rt) = self.runtimes.remove(&id) {
+            rt.kill();
+        }
+        self.tokens.remove_pane_token(id);
+        self.ext_link_counts.remove(&id); // [F1]
+        self.dead.remove(&id);
+        self.pending_input.remove(&id);
+        self.raw.remove(&id);
+        // D7: a float promoted to an agent claims a session like any other
+        // pane (`claim_session`) — drop it here too, or a closed scratch
+        // float keeps holding it for every other running instance forever.
+        self.pane_claims.remove(&id);
+    }
+
+    /// Kill the popup without touching focus; returns where focus was.
+    fn drop_popup(&mut self) -> Option<PaneId> {
+        let p = self.popup.take()?;
+        self.forget_overlay_pane(p.id);
+        Some(p.prev_focus)
+    }
+
+    /// Close the popup and hand focus back to what it covered.
+    fn close_popup(&mut self) {
+        if let Some(back) = self.drop_popup() {
+            let target = self.focus_after_overlay(back);
+            self.set_focus(target);
+        }
     }
 
     /// C22 rule 4: Alt+w on the float kills it for real and clears the slot
     /// — unlike hiding, no undo entry (scratch is not precious).
     fn close_float(&mut self) {
         let Some(f) = self.float.take() else { return };
-        if let Some(mut rt) = self.runtimes.remove(&f.id) {
-            rt.kill();
-        }
-        self.tokens.remove_pane_token(f.id);
-        self.ext_link_counts.remove(&f.id); // [F1]
-        self.dead.remove(&f.id);
-        self.pending_input.remove(&f.id);
-        self.raw.remove(&f.id);
-        // D7: a float promoted to an agent claims a session like any other
-        // pane (`claim_session`) — drop it here too, or a closed scratch
-        // float keeps holding it for every other running instance forever.
-        self.pane_claims.remove(&f.id);
-        let target = if self.ws.active_tab().panes.contains_key(&f.prev_focus) {
-            f.prev_focus
-        } else {
-            self.first_visible().unwrap_or(0)
-        };
+        self.forget_overlay_pane(f.id);
+        let target = self.focus_after_overlay(f.prev_focus);
         self.set_focus(target);
         self.set_flash("scratch closed");
     }
@@ -7659,6 +7868,16 @@ impl<B: PaneBackend> App<B> {
     /// cancel would have cleaned up. `Esc`'s arms in `handle_mode_key`
     /// mirror this; `esc_and_the_entry_chord_leave_identical_state` pins
     /// them together.
+    /// A focus move the human did not make (control `focus`, `spawn --focus`
+    /// or `--float`, an attention jump) must not carry Scroll/Copy/Search
+    /// state — all about the old pane — over to the new one.
+    fn reset_pane_modes(&mut self) {
+        if matches!(self.mode, Mode::Scroll | Mode::Copy { .. } | Mode::Search { .. }) {
+            self.exit_mode();
+        }
+        self.selection = None;
+    }
+
     fn exit_mode(&mut self) {
         match self.mode {
             // Snap the view back to the live tail, same as Esc/q.
@@ -9889,7 +10108,12 @@ pub(crate) mod tests {
         // spawn
         let v = ok(app.handle_control(Request {
             token: ct.clone(),
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }));
         let p = v["pane"].as_u64().unwrap();
         assert_eq!(app.runtimes.len(), 2);
@@ -9974,6 +10198,7 @@ pub(crate) mod tests {
                 adapter: "always-fails".into(),
                 cwd: None,
                 initial_input: None,
+                place: Default::default(),
             },
         }));
         let id = spawned["pane"].as_u64().unwrap();
@@ -10047,6 +10272,7 @@ pub(crate) mod tests {
                 adapter: "shell".into(),
                 cwd: Some(missing.to_string_lossy().into_owned()),
                 initial_input: None,
+                place: Default::default(),
             },
         });
 
@@ -10070,6 +10296,7 @@ pub(crate) mod tests {
                 adapter: "shell".into(),
                 cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
                 initial_input: None,
+                place: Default::default(),
             },
         });
         let Reply::Ok { ok } = reply else { panic!("a real cwd must not be refused") };
@@ -10117,7 +10344,12 @@ pub(crate) mod tests {
         // Pane 1 spawns a child → child.spawned_by == 1.
         let child = match app.handle_control(Request {
             token: "tok1".into(),
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -10134,7 +10366,12 @@ pub(crate) mod tests {
         // A pane spawned by the *fleet* is not in pane 1's subtree.
         let other = match app.handle_control(Request {
             token: ct,
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -10187,7 +10424,12 @@ pub(crate) mod tests {
         // Pane 1 spawns a child → the child is in its subtree.
         let child = match app.handle_control(Request {
             token: "tok1".into(),
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -10195,7 +10437,12 @@ pub(crate) mod tests {
         // The fleet spawns a sibling, outside pane 1's subtree.
         let other = match app.handle_control(Request {
             token: ct,
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -10324,7 +10571,12 @@ pub(crate) mod tests {
 
         let spawned = match app.handle_control(Request {
             token: ct.clone(),
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -10399,6 +10651,7 @@ pub(crate) mod tests {
                     adapter: "evil\nFORGED fleet spawn -> ok pane=1".into(),
                     cwd: None,
                     initial_input: None,
+                    place: Default::default(),
                 },
             },
             rtx2,
@@ -10719,7 +10972,12 @@ pub(crate) mod tests {
         // Pane 1 spawns its own child (pane 2, in its subtree) and waits on it.
         let child = match app.handle_control(Request {
             token: "tok1".into(),
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -10749,7 +11007,12 @@ pub(crate) mod tests {
         });
         let recycled = match app.handle_control(Request {
             token: ct,
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -13665,6 +13928,7 @@ pub(crate) mod tests {
                 adapter: "shell".into(),
                 cwd: None,
                 initial_input: None,
+                place: Default::default(),
             },
         });
 
@@ -14149,6 +14413,7 @@ pub(crate) mod tests {
                                     adapter: "shell".into(),
                                     cwd: None,
                                     initial_input: None,
+                                    place: Default::default(),
                                 },
                             });
                             *coverage.entry("CtlSpawn").or_default() += 1;
@@ -15135,6 +15400,7 @@ pub(crate) mod tests {
                 adapter: "shell".into(),
                 cwd: None,
                 initial_input: Some("hello".into()),
+                place: Default::default(),
             },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
@@ -15165,6 +15431,7 @@ pub(crate) mod tests {
                 adapter: "shell".into(),
                 cwd: None,
                 initial_input: Some("hello".into()),
+                place: Default::default(),
             },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
@@ -19069,6 +19336,220 @@ pub(crate) mod tests {
         assert_eq!(app.ws.active_tab, 0, "a cross-tab focus must switch to the pane's tab");
     }
 
+    /// `spawn` placement flags: drive the control plane and hand back the
+    /// reply's JSON (or the error text).
+    fn spawn_placed(
+        app: &mut App<FakePane>,
+        place: crate::core::control::SpawnPlace,
+    ) -> Result<serde_json::Value, String> {
+        use crate::core::control::{Method, Reply, Request};
+        let token = app.control_token().to_string();
+        let method =
+            Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None, place };
+        match app.handle_control(Request { token, method }) {
+            Reply::Ok { ok } => Ok(ok),
+            Reply::Err { err } => Err(err),
+        }
+    }
+
+    fn place(tab: bool, focus: bool, float: bool) -> crate::core::control::SpawnPlace {
+        crate::core::control::SpawnPlace { tab, focus, float, title: None }
+    }
+
+    #[test]
+    fn spawn_tab_makes_a_new_tab_without_moving_the_human() {
+        let (mut app, _) = mk_app(shell_ws());
+        let focused = app.focused;
+        let id =
+            spawn_placed(&mut app, place(true, false, false)).unwrap()["pane"].as_u64().unwrap();
+        assert_eq!(app.ws.tabs.len(), 2);
+        assert_eq!(app.ws.tabs[1].name, "tab2");
+        assert!(app.ws.tabs[1].panes.contains_key(&id));
+        assert!(app.runtimes.contains_key(&id), "spawned, not lazily deferred");
+        assert_eq!((app.ws.active_tab, app.focused), (0, focused), "human's view untouched");
+    }
+
+    #[test]
+    fn spawn_tab_title_names_the_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        let mut p = place(true, false, false);
+        p.title = Some("ci".into());
+        spawn_placed(&mut app, p).unwrap();
+        assert_eq!(app.ws.tabs[1].name, "ci");
+    }
+
+    #[test]
+    fn spawn_tab_focus_switches_to_the_new_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id =
+            spawn_placed(&mut app, place(true, true, false)).unwrap()["pane"].as_u64().unwrap();
+        assert_eq!((app.ws.active_tab, app.focused), (1, id));
+    }
+
+    #[test]
+    fn spawn_focus_moves_focus_to_the_split() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id =
+            spawn_placed(&mut app, place(false, true, false)).unwrap()["pane"].as_u64().unwrap();
+        assert_eq!(app.focused, id);
+        assert_eq!(app.ws.tabs.len(), 1);
+    }
+
+    #[test]
+    fn spawn_title_needs_tab_or_float_and_float_excludes_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        let mut p = place(false, false, false);
+        p.title = Some("x".into());
+        assert_eq!(spawn_placed(&mut app, p).unwrap_err(), "--title needs --tab or --float");
+        assert!(spawn_placed(&mut app, place(true, false, true)).is_err());
+        assert_eq!(app.ws.tabs.len(), 1, "a refused spawn creates nothing");
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn spawn_float_opens_a_focused_popup_outside_the_workspace() {
+        let (mut app, _) = mk_app(shell_ws());
+        let below = app.focused;
+        let id =
+            spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
+        assert_eq!(app.focused, id);
+        assert!(app.is_popup(id) && !app.is_float(id));
+        assert!(app.runtimes.contains_key(&id));
+        assert_eq!(app.display_rects()[0].id, id, "topmost");
+        assert!(app.ws.tabs.iter().all(|t| !t.panes.contains_key(&id)), "never persisted");
+        assert_eq!(app.popup.as_ref().unwrap().prev_focus, below);
+    }
+
+    #[test]
+    fn a_second_popup_is_refused_and_the_first_survives() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id =
+            spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
+        let err = spawn_placed(&mut app, place(false, false, true)).unwrap_err();
+        assert_eq!(err, "a popup is already open");
+        assert!(app.is_popup(id) && app.runtimes.contains_key(&id));
+    }
+
+    #[test]
+    fn popup_exit_closes_it_and_restores_focus() {
+        let (mut app, _) = mk_app(shell_ws());
+        let below = app.focused;
+        let id =
+            spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
+        app.on_pty_exit(id);
+        assert!(app.popup.is_none() && !app.runtimes.contains_key(&id));
+        assert_eq!(app.focused, below);
+    }
+
+    #[test]
+    fn dismissing_the_popup_kills_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        let below = app.focused;
+        let id =
+            spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
+        app.apply(Action::ToggleFloat);
+        assert!(app.popup.is_none() && !app.runtimes.contains_key(&id));
+        assert_eq!(app.focused, below);
+        // Any tab change dismisses it too.
+        spawn_placed(&mut app, place(false, false, true)).unwrap();
+        app.apply(Action::NewTab);
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn a_control_split_spawn_does_not_dismiss_the_popup() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id =
+            spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
+        spawn_placed(&mut app, place(false, false, false)).unwrap();
+        assert!(app.is_popup(id));
+        assert_eq!(app.focused, id);
+    }
+
+    #[test]
+    fn popup_hides_the_scratch_float_which_stays_refused_while_the_popup_is_controllable() {
+        use crate::core::control::{Method, Reply, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::ToggleFloat);
+        let scratch = app.focused;
+        let popup =
+            spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
+        assert!(!app.float.as_ref().unwrap().shown, "scratch steps aside");
+        assert_eq!(app.display_rects()[0].id, popup);
+        let token = app.control_token().to_string();
+        let close = |app: &mut App<FakePane>, pane| {
+            app.handle_control(Request {
+                token: token.clone(),
+                method: Method::Close { pane, force: false },
+            })
+        };
+        match close(&mut app, scratch) {
+            Reply::Err { err } => assert_eq!(err, "cannot close the scratch pane"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(matches!(close(&mut app, popup), Reply::Ok { .. }));
+        assert!(app.popup.is_none() && app.float.is_some());
+    }
+
+    #[test]
+    fn a_shell_popup_with_input_runs_it_as_the_command_instead_of_typing_it() {
+        use crate::core::control::{Method, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let token = app.control_token().to_string();
+        let method = Method::Spawn {
+            adapter: "shell".into(),
+            cwd: None,
+            initial_input: Some("lazygit".into()),
+            place: place(false, false, true),
+        };
+        app.handle_control(Request { token, method });
+        let id = app.popup.as_ref().unwrap().id;
+        assert_eq!(app.runtimes[&id].cmd.args.last().map(String::as_str), Some("lazygit"));
+        assert!(app.runtimes[&id].cmd.args.contains(&"-c".to_string()));
+        assert!(!app.pending_input.contains_key(&id), "not typed into a prompt");
+    }
+
+    #[test]
+    fn popup_exit_after_its_prev_focus_pane_was_closed_falls_back_to_first_visible() {
+        use crate::core::control::{Method, Request};
+        let (mut app, _) = mk_app(shell_ws());
+        let first = app.focused;
+        app.apply(Action::NewPane);
+        let covered = app.focused;
+        let popup =
+            spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
+        let token = app.control_token().to_string();
+        app.handle_control(Request { token, method: Method::Close { pane: covered, force: true } });
+        assert_eq!(app.focused, popup, "closing a pane under the popup leaves focus on it");
+        app.on_pty_exit(popup);
+        assert_eq!(app.focused, first);
+    }
+
+    #[test]
+    fn a_click_outside_the_popup_closes_it() {
+        let (mut app, _) = mk_app(shell_ws());
+        let below = app.focused;
+        spawn_placed(&mut app, place(false, false, true)).unwrap();
+        app.on_click(below);
+        assert!(app.popup.is_none());
+        assert_eq!(app.focused, below);
+    }
+
+    #[test]
+    fn a_control_focus_move_drops_scroll_mode_and_selection() {
+        let (mut app, _) = mk_app(shell_ws());
+        let first = app.focused;
+        app.apply(Action::NewPane);
+        app.mode = Mode::Scroll;
+        app.selection =
+            Some(Selection { pane: app.focused, anchor: (0, 0), cursor: (0, 1), dragging: false });
+        spawn_placed(&mut app, place(false, true, false)).unwrap();
+        assert!(matches!(app.mode, Mode::Normal) && app.selection.is_none());
+        app.mode = Mode::Scroll;
+        app.focus_attention_target(first);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
     #[test]
     fn ctl_focus_of_a_missing_pane_is_an_error() {
         use crate::core::control::{Method, Reply, Request};
@@ -19112,7 +19593,12 @@ pub(crate) mod tests {
         // The fleet spawns a pane outside pane 1's subtree.
         let other = match app.handle_control(Request {
             token: ct,
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         }) {
             Reply::Ok { ok } => ok["pane"].as_u64().unwrap(),
             Reply::Err { err } => panic!("{err}"),
@@ -20103,7 +20589,12 @@ pub(crate) mod tests {
         app.handle_control_msg(
             Request {
                 token: ct,
-                method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+                method: Method::Spawn {
+                    adapter: "shell".into(),
+                    cwd: None,
+                    initial_input: None,
+                    place: Default::default(),
+                },
             },
             tx,
         );
@@ -20531,7 +21022,12 @@ pub(crate) mod tests {
         let ct = app.control_token().to_string();
         let reply = app.handle_control(Request {
             token: ct,
-            method: Method::Spawn { adapter: "shell".into(), cwd: None, initial_input: None },
+            method: Method::Spawn {
+                adapter: "shell".into(),
+                cwd: None,
+                initial_input: None,
+                place: Default::default(),
+            },
         });
         assert!(matches!(reply, Reply::Ok { .. }));
         let order = app.pane_order();
