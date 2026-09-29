@@ -828,6 +828,22 @@ struct ConnGuard<'a> {
     slot: Arc<AtomicBool>,
 }
 
+/// Promoted: this connection identified itself, so it earns the generous
+/// timeout (audit finding C1) and is no longer evictable — the whole point of
+/// the pre-auth pool: work in flight, and parked `wait`s especially, must never
+/// be displaced to make room for a stranger. Idempotent — a later request on an
+/// already-promoted connection must not re-touch the socket option every time.
+fn promote(promoted: &mut bool, guard: &mut ConnGuard<'_>, stream: &UnixStream) {
+    if *promoted {
+        return;
+    }
+    *promoted = true;
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    if let Some(seq) = guard.pending_seq.take() {
+        guard.limits.forget_pending(seq);
+    }
+}
+
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
         if let Some(seq) = self.pending_seq.take() {
@@ -1309,23 +1325,7 @@ fn spawn_accept_loop(
                                 }
                                 guard.principal = Some(req.token.clone());
                             }
-                            // Promoted: this connection identified itself, so
-                            // it earns the generous timeout (audit finding
-                            // C1). Idempotent — a second/third request on an
-                            // already-promoted connection must not re-touch
-                            // the socket option every time.
-                            if !promoted {
-                                promoted = true;
-                                let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
-                                // Identified: no longer evictable. This is
-                                // the whole point of the pre-auth pool —
-                                // work in flight, and parked `wait`s
-                                // especially, must never be displaced to
-                                // make room for a stranger.
-                                if let Some(seq) = guard.pending_seq.take() {
-                                    limits.forget_pending(seq);
-                                }
-                            }
+                            promote(&mut promoted, &mut guard, reader.get_ref());
                             let principal = guard.principal.clone().expect("just set above");
                             // Reconnect-surviving rate limit: a command this
                             // connection is otherwise allowed to make can
@@ -1453,10 +1453,7 @@ fn spawn_accept_loop(
                             // connection must not un-promote it, and the
                             // close-on-cap-at-first-pane path already `break`s
                             // before reaching here.
-                            if !promoted {
-                                promoted = true;
-                                let _ = reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
-                            }
+                            promote(&mut promoted, &mut guard, reader.get_ref());
                             if tx.send(ev).is_err() {
                                 break;
                             }
@@ -2598,6 +2595,35 @@ mod tests {
             reply.get("ok").is_some(),
             "a status-only connection must survive an idle gap past READ_TIMEOUT: {reply}"
         );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A promoted status-only connection (the pi extension's shape) must leave
+    /// `pending`: otherwise `evict_oldest_pending` can displace it.
+    #[test]
+    fn a_status_only_connection_is_no_longer_pending_once_promoted() {
+        let (path, listener) = scratch_listener("status-promotion-unpends");
+        let (tx, rx) = capturing_app();
+        let limits = spawn_accept_loop(listener, tx, seeded_reader(&[(1, "t")]));
+        let mut c = connect(&path);
+        poll_until(|| limits.pending_len() == 1, "connection never registered as pending");
+
+        c.get_mut()
+            .write_all(
+                b"{\"pane\":\"1\",\"token\":\"t\",\"event\":\"status\",\"status\":\"working\"}\n",
+            )
+            .unwrap();
+        // `Status` is forwarded only after the promotion step, so seeing it
+        // means promotion has already run.
+        loop {
+            if let AppEvent::Status(1, ..) =
+                rx.recv_timeout(Duration::from_secs(2)).expect("status never forwarded")
+            {
+                break;
+            }
+        }
+        assert_eq!(limits.pending_len(), 0, "a promoted status-only connection stayed evictable");
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
