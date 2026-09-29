@@ -14,4 +14,5 @@ Repo-wide read-only audit; no Critical findings, no secrets, no reimplemented st
 - [ ] Test sleeps: `thread::sleep` as the wait in `tests/harness/mod.rs` (301, 353, 357, 385, 412, 432, 462, 662) and ~a dozen test files (socket_status, firehose, panic_shutdown, terminal_hangup, orphan_after_exit, …). Real regression guards, but flaky on loaded CI; `tests/cli.rs:74` already has a `wait_until` pattern to reuse.
 
 ### Considered, not flagged
+`status_mapping_matches_c5_table` / `tab_summary_mapping_matches_c5_table` in `src/ui/theme.rs` look tautological but are the only guard on the C5 glyph/colour table (swapping NeedsInput `accent()`→`ink()` passes every other test) — keep;
 `"disable"` action literal in `src/ui/input.rs` (only one production use; the rest are tests/docs, so a const buys nothing); custom `wrap_line`/`wrap_cursor`/`centered_near` in `src/ui/render.rs` (ratatui `Paragraph` has no word-wrap); hand-rolled CLI parser (deliberate, helpers already extracted).
