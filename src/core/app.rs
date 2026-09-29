@@ -3503,7 +3503,7 @@ impl<B: PaneBackend> App<B> {
         // insertion, ahead of whatever tail it split off.
         if let Mode::PaneEdit { name, lines, row, col, .. } = &mut self.mode {
             if *row == 0 {
-                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                let clean = strip_control(text, false);
                 let at = (*col).min(name.chars().count());
                 let byte = byte_at(name, at);
                 name.insert_str(byte, &clean);
@@ -3511,7 +3511,7 @@ impl<B: PaneBackend> App<B> {
                 return;
             }
             let clean = text.replace("\r\n", "\n").replace('\r', "\n");
-            let clean: String = clean.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            let clean = strip_control(&clean, true);
             let mut nrow = (*row - 1).min(lines.len().saturating_sub(1));
             let at = byte_at(&lines[nrow], (*col).min(lines[nrow].chars().count()));
             let tail = lines[nrow][at..].to_string();
@@ -3541,7 +3541,7 @@ impl<B: PaneBackend> App<B> {
             // the point after what it inserted — a paste that always
             // appended would be the one edit in the dialog that ignored the
             // cursor.
-            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+            let clean = strip_control(text, false);
             let at = (*cursor).min(buffer.chars().count());
             let byte = byte_at(buffer, at);
             buffer.insert_str(byte, &clean);
@@ -8438,6 +8438,10 @@ pub fn display_name_live(spec: &PaneSpec, live: Option<&str>) -> String {
     format!("{}{cwd_tag}", spec.adapter)
 }
 
+fn strip_control(s: &str, keep_newline: bool) -> String {
+    s.chars().filter(|&c| !c.is_control() || (keep_newline && c == '\n')).collect()
+}
+
 /// P6: a pane's OSC title is untrusted text bound for roost's chrome (and,
 /// for the focused pane, for a sequence roost writes to its own terminal).
 /// Drop control characters, collapse surrounding whitespace, and bound the
@@ -10621,7 +10625,7 @@ pub(crate) mod tests {
             tx,
             Size::new(100, 30),
             (0, 0),
-            Some(dir.join("roost.sock")),
+            Some(dir.join(crate::infra::sock::SOCKET_FILE)),
             TokenTable::new().unwrap(),
             "default".into(),
             Box::new(crate::ports::fakes::MemClaims::default()),
@@ -10718,7 +10722,7 @@ pub(crate) mod tests {
             tx,
             Size::new(100, 30),
             (0, 0),
-            Some(dir.join("roost.sock")),
+            Some(dir.join(crate::infra::sock::SOCKET_FILE)),
             TokenTable::new().unwrap(),
             "default".into(),
             Box::new(crate::ports::fakes::MemClaims::default()),
@@ -20163,6 +20167,14 @@ pub(crate) mod tests {
         // ...and demoting back to a shell drops the adoption again.
         spec.adapter = "shell".into();
         assert_eq!(display_name_live(&spec, Some("TASK-9 tests")), "shell · rqa-work");
+    }
+
+    #[test]
+    fn strip_control_drops_controls_and_optionally_keeps_newline() {
+        let s = "a\tb\x1bc\nd";
+        assert_eq!(strip_control(s, false), "abcd");
+        assert_eq!(strip_control(s, true), "abc\nd");
+        assert_eq!(strip_control("plain 日本", false), "plain 日本");
     }
 
     /// P6: an OSC title is untrusted text headed for roost's chrome and for

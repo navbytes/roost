@@ -34,7 +34,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::workspace::Workspace;
 use crate::infra::sock::{socket_path, OVERSIZE_LINE_MSG};
-use crate::infra::store::{check_creatable_name, check_workspace_name, FsStore, DEFAULT_WORKSPACE};
+use crate::infra::store::{
+    check_creatable_name, check_workspace_name, FsStore, DEFAULT_WORKSPACE, WORKSPACE_FILE,
+    WORKSPACE_LOCK,
+};
 
 const VERBS: &[&str] =
     &["list", "status", "spawn", "fork", "send", "read", "close", "focus", "wait"];
@@ -559,7 +562,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             reject_unknown_flags(verb, rest, &[])?;
             let pos = require_positionals(verb, rest, 0, 1, None)?;
             if let Some(p) = pos.first() {
-                m.insert("pane".into(), parse_pane(p)?.into());
+                insert_pane(&mut m, p)?;
             }
         }
         "spawn" => {
@@ -590,7 +593,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             reject_unknown_flags(verb, rest, &[])?;
             let pos = require_positionals(verb, rest, 0, 1, None)?;
             if let Some(p) = pos.first() {
-                m.insert("pane".into(), parse_pane(p)?.into());
+                insert_pane(&mut m, p)?;
             }
         }
         "send" => {
@@ -610,7 +613,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
                 m.insert("submit".into(), has_flag(rest, "--enter").into());
             } else {
                 let pane = pos.first().ok_or("send needs a PANE")?;
-                m.insert("pane".into(), parse_pane(pane)?.into());
+                insert_pane(&mut m, pane)?;
                 let text = pos[1..].join(" ");
                 m.insert("text".into(), text.into());
                 m.insert("submit".into(), has_flag(rest, "--enter").into());
@@ -620,7 +623,7 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             reject_unknown_flags(verb, rest, &["--tail", "--full"])?;
             let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
-            m.insert("pane".into(), parse_pane(pane)?.into());
+            insert_pane(&mut m, pane)?;
             if has_flag(rest, "--tail") && has_flag(rest, "--full") {
                 return Err("read takes either --tail N or --full, not both".into());
             }
@@ -638,14 +641,14 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             reject_unknown_flags(verb, rest, &["--force"])?;
             let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
-            m.insert("pane".into(), parse_pane(pane)?.into());
+            insert_pane(&mut m, pane)?;
             m.insert("force".into(), has_flag(rest, "--force").into());
         }
         "focus" => {
             reject_unknown_flags(verb, rest, &[])?;
             let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
-            m.insert("pane".into(), parse_pane(pane)?.into());
+            insert_pane(&mut m, pane)?;
         }
         "wait" => {
             reject_unknown_flags(verb, rest, &["--until", "--timeout"])?;
@@ -677,6 +680,11 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
 
 fn parse_pane(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| format!("not a pane id: {s}"))
+}
+
+fn insert_pane(m: &mut serde_json::Map<String, serde_json::Value>, s: &str) -> Result<(), String> {
+    m.insert("pane".into(), parse_pane(s)?.into());
+    Ok(())
 }
 
 /// `metavar` restores the pre-generic wording ("spawn needs an ADAPTER",
@@ -1119,7 +1127,7 @@ struct WsRow {
 fn ws_row(name: &str) -> WsRow {
     let dir = FsStore::workspace_dir(name);
     let running = FsStore::instance_running(&dir);
-    let path = dir.join("workspace.json");
+    let path = dir.join(WORKSPACE_FILE);
     // Missing or unparseable state shows zeros, never an error: a workspace
     // that has never been saved (or was hand-mangled) is still a workspace
     // someone may be running, and the listing must not die on it. Same
@@ -1211,7 +1219,7 @@ enum LockExclusiveError {
 /// but a failed *open* is a different problem (permissions, a read-only
 /// mount) that must not be misreported as one, see `LockExclusiveError`.
 fn lock_workspace_exclusive(dir: &Path) -> Result<std::fs::File, LockExclusiveError> {
-    let path = dir.join("workspace.lock");
+    let path = dir.join(WORKSPACE_LOCK);
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1818,7 +1826,7 @@ mod tests {
         let missing = Path::new("/roost-test-nonexistent-parent-dir/workspace");
         match lock_workspace_exclusive(missing) {
             Err(LockExclusiveError::Open(path, _)) => {
-                assert_eq!(path, missing.join("workspace.lock"))
+                assert_eq!(path, missing.join(crate::infra::store::WORKSPACE_LOCK))
             }
             Ok(_) => panic!("expected an open failure under a nonexistent parent directory"),
             Err(LockExclusiveError::Running) => panic!("an open failure must not read as Running"),

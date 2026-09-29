@@ -25,6 +25,8 @@ use crate::ports::StateStore;
 /// for `ws rm`/`ws mv`/creation paths: the default cannot be renamed or
 /// deleted, only lived in.
 pub const DEFAULT_WORKSPACE: &str = "default";
+pub const WORKSPACE_FILE: &str = "workspace.json";
+pub const WORKSPACE_LOCK: &str = "workspace.lock";
 
 /// The workspace this process runs in, resolved once at startup by
 /// `FsStore::init_workspace` and never touched again. Unset (unit tests,
@@ -111,7 +113,7 @@ impl FsStore {
     /// instances), else the XDG state dir — now the workspace-aware
     /// directory, since workspace.json is per-workspace state.
     pub fn default_path() -> PathBuf {
-        Self::state_dir().join("workspace.json")
+        Self::state_dir().join(WORKSPACE_FILE)
     }
 
     pub fn new(path: PathBuf) -> Self {
@@ -133,7 +135,7 @@ impl FsStore {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(dir.join("workspace.lock"))
+            .open(dir.join(WORKSPACE_LOCK))
         else {
             return false;
         };
@@ -506,7 +508,7 @@ mod tests {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(dir.join("workspace.lock"))
+            .open(dir.join(WORKSPACE_LOCK))
             .unwrap();
         holder.try_lock().unwrap();
         assert!(FsStore::instance_running(&dir), "a held lock reads as running");
