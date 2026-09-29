@@ -68,7 +68,7 @@ fn shell_command(shell: &str, cwd: &Path, command: &str) -> CommandSpec {
 
 impl AgentAdapter for ShellAdapter {
     fn id(&self) -> &'static str {
-        "shell"
+        super::SHELL
     }
 
     fn launch(&self, cwd: &Path) -> CommandSpec {
