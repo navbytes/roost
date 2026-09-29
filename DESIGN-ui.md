@@ -2822,6 +2822,12 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   whenever shown (it is focused whenever shown — next bullet), corner badge
   through the normal titled path → `scratch · shell {glyph}`. No new glyphs,
   no special border.
+- **[Amended 2026-09-29 — the float is opaque.]** `draw_pane` `Clear`s the
+  float's rect before its border and grid (§2 / C12's "Clear then default
+  bg", no fill): a cell the program leaves at default shows the terminal's
+  own paper, never the pane beneath. It had been see-through: `blit_screen`
+  patches styles and writes only the grid's cells. A wide glyph straddling
+  the float's left edge is blanked so the border reaches the terminal.
 - **Focus & input rules (the whole contract in four lines):**
   1. Shown ⇒ focused. All keys route to it normally; scroll, copy, and
      rename modes target it like any pane.
@@ -2872,7 +2878,9 @@ allocated by scanning the tabs (`workspace.rs:57–65`).
   (`find_spec` learns the float so badges/rename/respawn work); control
   `close` of the float is refused with `cannot close the scratch pane`.
 - Unit tests: spawn-once/hide/show lifecycle; id-allocation guard; geometry
-  formula incl. refusal floor; focus rules 1–3; hit-test ordering.
+  formula incl. refusal floor; focus rules 1–3; hit-test ordering;
+  `the_float_interior_hides_the_tiled_panes_beneath_it`,
+  `clear_opaque_keeps_the_left_border_when_a_wide_glyph_abuts_it`.
 
 **[Amended 2026-09-03 — the Alt+f re-key.]** `Action::ToggleFloat` moves off
 `Alt+f` onto `Alt+Shift+z`; `Alt+f` is now deliberately unbound. **Why now:**
