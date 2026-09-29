@@ -10,6 +10,3 @@ Repo-wide read-only audit; no Critical findings, no secrets, no reimplemented st
 Test `thread::sleep`s in `tests/harness/mod.rs`: 5–40 ms poll intervals inside loops that already have deadlines, not bare waits; CI on main was 28/30 green (failures were release-request runs). Revisit only if tests flake.
 `status_mapping_matches_c5_table` / `tab_summary_mapping_matches_c5_table` in `src/ui/theme.rs` look tautological but are the only guard on the C5 glyph/colour table (swapping NeedsInput `accent()`→`ink()` passes every other test) — keep;
 `"disable"` action literal in `src/ui/input.rs` (only one production use; the rest are tests/docs, so a const buys nothing); custom `wrap_line`/`wrap_cursor`/`centered_near` in `src/ui/render.rs` (ratatui `Paragraph` has no word-wrap); hand-rolled CLI parser (deliberate, helpers already extracted).
-
-### Open, not ours to close
-`~/.codex/worktrees/roost-opencode-plugin` (branch `fix/opencode-v2-capability`) holds unmerged work: detect the OpenCode v2 plugin API by capability instead of `opencode --version` (`src/infra/extension.rs`, `extensions/opencode-v2/*`). Decide: finish as a PR or discard.
