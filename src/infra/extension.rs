@@ -39,8 +39,8 @@
 //!   `plugin/` subdir *is* part of the install: opencode auto-globs that dir,
 //!   so there is no existing file to merge into. The config dir itself still
 //!   must exist — a user who never ran opencode has no `~/.config/opencode`,
-//!   and we never create that. OpenCode 1.3.4+ also gets a V2 terminal
-//!   plugin in `plugins/roost/`; unknown versions leave existing files alone.
+//!   and we never create that. Anything but a known pre-1.3.4 opencode
+//!   also gets the V2 terminal plugin in `plugins/roost/`.
 
 use std::path::{Path, PathBuf};
 
@@ -146,10 +146,11 @@ fn install_opencode_for_version(
     config_dir: &Path,
     version: Option<(u32, u32, u32)>,
 ) -> Option<String> {
-    match version? {
-        // 1.3.4 is where v1 learned object default exports (`readV1Plugin`).
-        version if version >= (1, 3, 4) => install_opencode_v2_plugin(config_dir),
-        _ => install_opencode_plugin(config_dir),
+    // 1.3.4 is where v1 learned object default exports (`readV1Plugin`); an
+    // unknown version gets the form that loads on both v1 and v2.
+    match version {
+        Some(version) if version < (1, 3, 4) => install_opencode_plugin(config_dir),
+        _ => install_opencode_v2_plugin(config_dir),
     }
 }
 
@@ -1093,10 +1094,16 @@ mod tests {
     }
 
     #[test]
-    fn opencode_unknown_version_leaves_config_alone_and_old_v1_keeps_legacy_export() {
+    fn opencode_unknown_version_gets_compatible_install_and_old_v1_keeps_legacy_export() {
+        let dir = scratch_dir("opencode-unknown-version");
+        assert!(install_opencode_for_version(&dir, None).is_some());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("plugin/opencode-plugin.ts")).unwrap(),
+            modern_opencode_plugin()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
         let dir = scratch_dir("opencode-old-version");
-        assert!(install_opencode_for_version(&dir, None).is_none());
-        assert!(!dir.join("plugin").exists());
         install_opencode_for_version(&dir, Some((1, 3, 3))).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("plugin/opencode-plugin.ts")).unwrap(),

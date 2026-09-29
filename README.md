@@ -460,8 +460,8 @@ truecolor included. Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 
 OpenCode 1.3.4+ and 2.x share compatible reporting plugins. Older 1.x
 versions retain their legacy plugin and should not share an OpenCode config
-directory with 2.x. If the version probe fails, roost leaves existing plugins
-untouched.
+directory with 2.x. If the version probe fails, roost installs the compatible
+plugins.
 
 New adapters implement the `AgentAdapter` trait in `src/agents/` (eight
 methods, most with defaults).
