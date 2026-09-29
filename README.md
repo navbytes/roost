@@ -458,10 +458,10 @@ truecolor included. Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 | `gemini` | `gemini` | `gemini --resume <uuid>` | per-project history under `~/.gemini/tmp/<slug>/chats/`, slug read from `~/.gemini/projects.json`; session id extracted from file's first JSONL record |
 | `opencode` | `opencode` | `opencode --session <id>` | global SQLite database at `$XDG_DATA_HOME/opencode/opencode.db` (no filesystem detection — resume only by stored id) |
 
-OpenCode 1.18.29+ and 2.x share compatible reporting plugins. Older 1.x
+OpenCode 1.3.4+ and 2.x share compatible reporting plugins. Older 1.x
 versions retain their legacy plugin and should not share an OpenCode config
-directory with 2.x. If the version probe fails or reports a 1.18.29 prerelease, roost leaves
-existing plugins untouched.
+directory with 2.x. If the version probe fails, roost leaves existing plugins
+untouched.
 
 New adapters implement the `AgentAdapter` trait in `src/agents/` (eight
 methods, most with defaults).

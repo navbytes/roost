@@ -39,7 +39,7 @@
 //!   `plugin/` subdir *is* part of the install: opencode auto-globs that dir,
 //!   so there is no existing file to merge into. The config dir itself still
 //!   must exist — a user who never ran opencode has no `~/.config/opencode`,
-//!   and we never create that. OpenCode 1.18.29+ also gets a V2 terminal
+//!   and we never create that. OpenCode 1.3.4+ also gets a V2 terminal
 //!   plugin in `plugins/roost/`; unknown versions leave existing files alone.
 
 use std::path::{Path, PathBuf};
@@ -147,7 +147,8 @@ fn install_opencode_for_version(
     version: Option<(u32, u32, u32)>,
 ) -> Option<String> {
     match version? {
-        version if version >= (1, 18, 29) => install_opencode_v2_plugin(config_dir),
+        // 1.3.4 is where v1 learned object default exports (`readV1Plugin`).
+        version if version >= (1, 3, 4) => install_opencode_v2_plugin(config_dir),
         _ => install_opencode_plugin(config_dir),
     }
 }
@@ -161,23 +162,11 @@ fn opencode_version() -> Option<(u32, u32, u32)> {
 }
 
 fn parse_opencode_version(version: &str) -> Option<(u32, u32, u32)> {
-    let version = version.trim().strip_prefix('v').unwrap_or(version.trim());
-    let valid_suffix = |suffix: &str| {
-        suffix.split('.').all(|part| {
-            !part.is_empty() && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        })
-    };
-    let (version, build) = version.split_once('+').map_or((version, None), |(v, b)| (v, Some(b)));
-    let (version, prerelease) =
-        version.split_once('-').map_or((version, None), |(v, p)| (v, Some(p)));
-    if build.is_some_and(|s| !valid_suffix(s)) || prerelease.is_some_and(|s| !valid_suffix(s)) {
-        return None;
-    }
-    let mut parts = version.split('.');
-    let result =
-        (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-    // Object entrypoints are only confirmed from the stable compatibility boundary.
-    (parts.next().is_none() && !(result == (1, 18, 29) && prerelease.is_some())).then_some(result)
+    let version = version.trim();
+    let core = version.strip_prefix('v').unwrap_or(version).split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(str::parse);
+    let version = (parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?);
+    parts.next().is_none().then_some(version)
 }
 
 fn modern_opencode_plugin() -> String {
@@ -1026,20 +1015,8 @@ mod tests {
         assert_eq!(parse_opencode_version("1.18.32\n"), Some((1, 18, 32)));
         assert_eq!(parse_opencode_version("v2.0.18"), Some((2, 0, 18)));
         assert_eq!(parse_opencode_version("v2.0.18-beta.1+build-42"), Some((2, 0, 18)));
-        assert_eq!(parse_opencode_version("1.18.29+build.7"), Some((1, 18, 29)));
-        assert_eq!(parse_opencode_version("1.18.32-beta"), Some((1, 18, 32)));
-        for value in [
-            "",
-            "10.1",
-            "2.0.18.1",
-            "error 2.0.18",
-            "1.18.29-beta",
-            "2.0.18-",
-            "2.0.18+",
-            "2.0.18-beta..1",
-            "2.0.18+bad!",
-            "2.0.18+a+b",
-        ] {
+        assert_eq!(parse_opencode_version("1.3.4+build.7"), Some((1, 3, 4)));
+        for value in ["", "10.1", "2.0.18.1", "error 2.0.18", "local"] {
             assert_eq!(parse_opencode_version(value), None);
         }
     }
@@ -1103,7 +1080,7 @@ mod tests {
     fn opencode_modern_versions_share_one_stable_install() {
         let dir = scratch_dir("opencode-coexistence");
         assert!(install_opencode_for_version(&dir, Some((2, 0, 18))).is_some());
-        assert!(install_opencode_for_version(&dir, Some((1, 18, 29))).is_none());
+        assert!(install_opencode_for_version(&dir, Some((1, 3, 4))).is_none());
         assert!(install_opencode_for_version(&dir, Some((1, 18, 32))).is_none());
         assert!(install_opencode_for_version(&dir, Some((2, 0, 18))).is_none());
         let body = std::fs::read_to_string(dir.join("plugin/opencode-plugin.ts")).unwrap();
@@ -1119,7 +1096,7 @@ mod tests {
         let dir = scratch_dir("opencode-old-version");
         assert!(install_opencode_for_version(&dir, None).is_none());
         assert!(!dir.join("plugin").exists());
-        install_opencode_for_version(&dir, Some((1, 18, 28))).unwrap();
+        install_opencode_for_version(&dir, Some((1, 3, 3))).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("plugin/opencode-plugin.ts")).unwrap(),
             BUNDLED_OPENCODE
