@@ -38,7 +38,7 @@
 # whose input is not in the repo. That is also why the tree was never clean:
 # every projectmem event rewrote a tracked file. The hand-authored half of
 # projectmem (`config.toml`, `AI_INSTRUCTIONS.md`, `PROJECT_MAP.md`,
-# `plan.md`) stays tracked — a fresh clone needs it to work the way CLAUDE.md
+# `plan.md`) stays tracked — a fresh clone needs it to work the way AGENTS.md
 # says this project works.
 /.agents/
 .projectmem/summary.md

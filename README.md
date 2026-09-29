@@ -8,7 +8,7 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, codex,
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-0.1.26-informational.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.1.27-informational.svg)](Cargo.toml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
 <img src="docs/roost-hero.png" alt="Screenshot of roost running in iTerm2: a single focused shell pane in ~/workspace, showing the ink-and-paper chrome — accent-red focused border, tab bar with save status, a top-right corner badge, and the bottom hint bar." width="800">
@@ -88,8 +88,8 @@ Or build from source, if you'd rather (needs a Rust toolchain):
 mise use -g "cargo:https://github.com/navbytes/roost@branch:main"
 ```
 
-Pin a version by appending it, e.g. `github:navbytes/roost@0.1.26`, or swap
-`@branch:main` for `@tag:v0.1.26` on the cargo backend. Drop `-g` to pin roost
+Pin a version by appending it, e.g. `github:navbytes/roost@0.1.27`, or swap
+`@branch:main` for `@tag:v0.1.27` on the cargo backend. Drop `-g` to pin roost
 per-project in that directory's `mise.toml` instead of globally.
 
 ### A separate workspace is one environment variable
@@ -457,6 +457,11 @@ truecolor included. Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 | `codex` | `codex` | `codex resume <SESSION_ID>` | newest `*.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` (date-bucketed, not cwd-bucketed — detection cannot be scoped to a working directory) |
 | `gemini` | `gemini` | `gemini --resume <uuid>` | per-project history under `~/.gemini/tmp/<slug>/chats/`, slug read from `~/.gemini/projects.json`; session id extracted from file's first JSONL record |
 | `opencode` | `opencode` | `opencode --session <id>` | global SQLite database at `$XDG_DATA_HOME/opencode/opencode.db` (no filesystem detection — resume only by stored id) |
+
+OpenCode 1.3.4+ and 2.x share compatible reporting plugins. Older 1.x
+versions retain their legacy plugin and should not share an OpenCode config
+directory with 2.x. If the version probe fails, roost installs the compatible
+plugins.
 
 New adapters implement the `AgentAdapter` trait in `src/agents/` (eight
 methods, most with defaults).
