@@ -85,7 +85,7 @@ pub fn resolve_config() -> Resolved {
 /// actually selected in this process; for the default workspace itself the
 /// two are the same path, so this changes nothing there.
 fn resolve_default() -> Resolved {
-    if let Some(dir) = std::env::var_os("ROOST_STATE") {
+    if let Some(dir) = std::env::var_os(crate::infra::ENV_STATE) {
         let path = PathBuf::from(dir).join(FILE);
         let exists = path.is_file();
         return Resolved { path, exists, shadowed: None };

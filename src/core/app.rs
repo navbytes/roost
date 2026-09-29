@@ -1506,13 +1506,13 @@ impl<B: PaneBackend> App<B> {
         // ROOST_SOCK/ROOST_TOKEN below, which need a live control socket to
         // mean anything): a pane spawned with no control plane must still
         // see it, so the variable never reads as unset-inside-roost.
-        cmd.env.push(("ROOST_WORKSPACE".into(), self.workspace.clone()));
+        cmd.env.push((crate::infra::ENV_WORKSPACE.into(), self.workspace.clone()));
         if let Some(sock) = &self.sock_path {
-            cmd.env.push(("ROOST_SOCK".into(), sock.to_string_lossy().into_owned()));
+            cmd.env.push((crate::infra::ENV_SOCK.into(), sock.to_string_lossy().into_owned()));
             // Fresh per-spawn token: the pane authenticates its socket messages
             // with it, and no other pane knows it. Reissued on every (re)spawn.
             let token = crate::core::control::gen_token();
-            cmd.env.push(("ROOST_TOKEN".into(), token.clone()));
+            cmd.env.push((crate::infra::ENV_TOKEN.into(), token.clone()));
             self.tokens.set_pane_token(id, token);
             // [F1 residual] A respawn's old connections (if any survive the
             // kill) can only ever carry the OLD token from here on, so

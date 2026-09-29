@@ -46,7 +46,7 @@ impl FsStore {
     /// redirects both together: an isolated fleet's config stays isolated
     /// with it.
     pub fn root_dir() -> PathBuf {
-        if let Some(dir) = std::env::var_os("ROOST_STATE") {
+        if let Some(dir) = std::env::var_os(crate::infra::ENV_STATE) {
             return PathBuf::from(dir);
         }
         dirs::state_dir()

@@ -17,6 +17,7 @@ use crate::core::status::{AgentStatus, StatusTracker};
 use crate::core::workspace::PaneId;
 use crate::infra::inspect;
 use crate::infra::queries::QueryResponder;
+use crate::infra::{ENV_CONTROL_TOKEN, ENV_PANE, ENV_SOCK, ENV_TOKEN};
 use crate::ports::{MouseProto, Observation, PaneBackend, PaneEffects};
 
 const SCROLLBACK_LINES: usize = 5000;
@@ -351,7 +352,7 @@ fn scrub_host_identity(cmd: &mut CommandBuilder) {
 ///
 /// Keep that split honest when `resolve_token` changes: anything that becomes
 /// a *carried* credential belongs in this list.
-const CONTROL_ENV_VARS: &[&str] = &["ROOST_SOCK", "ROOST_CONTROL_TOKEN", "ROOST_TOKEN"];
+const CONTROL_ENV_VARS: &[&str] = &[ENV_SOCK, ENV_CONTROL_TOKEN, ENV_TOKEN];
 
 /// L3: drop roost's own control-plane credentials from the base env a pane
 /// child would otherwise inherit. Kept separate from `scrub_host_identity`
@@ -802,7 +803,7 @@ impl PaneBackend for PtyPane {
         cmd.env("TERM", "xterm-256color");
         // Pane identity for the status socket (roost.ts pi extension /
         // Claude Code hooks) — design doc §6.1.
-        cmd.env("ROOST_PANE", id.to_string());
+        cmd.env(ENV_PANE, id.to_string());
         // L3: a `CommandBuilder` otherwise inherits *this* process's own
         // environment. Two ways that bites: if roost's own control listener
         // never bound (main.rs's listener setup is `.ok()`), `spec.env`

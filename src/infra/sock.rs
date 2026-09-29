@@ -248,7 +248,7 @@ pub fn socket_path() -> PathBuf {
     if FsStore::workspace_name() != DEFAULT_WORKSPACE {
         return FsStore::state_dir().join("roost.sock");
     }
-    if let Some(dir) = std::env::var_os("ROOST_STATE") {
+    if let Some(dir) = std::env::var_os(crate::infra::ENV_STATE) {
         return PathBuf::from(dir).join("roost.sock");
     }
     std::env::var_os("XDG_RUNTIME_DIR")

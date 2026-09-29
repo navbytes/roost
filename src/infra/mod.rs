@@ -54,6 +54,13 @@ pub(crate) fn test_panic_thread_after() -> Option<std::time::Duration> {
     raw.parse().ok().map(std::time::Duration::from_millis)
 }
 
+pub const ENV_SOCK: &str = "ROOST_SOCK";
+pub const ENV_TOKEN: &str = "ROOST_TOKEN";
+pub const ENV_CONTROL_TOKEN: &str = "ROOST_CONTROL_TOKEN";
+pub const ENV_PANE: &str = "ROOST_PANE";
+pub const ENV_WORKSPACE: &str = "ROOST_WORKSPACE";
+pub const ENV_STATE: &str = "ROOST_STATE";
+
 pub mod claims;
 pub mod clipboard;
 pub mod config;
@@ -69,3 +76,18 @@ pub mod signals;
 pub mod sock;
 pub mod stallwatch;
 pub mod store;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_consts_match_wire_names() {
+        assert_eq!(ENV_SOCK, "ROOST_SOCK");
+        assert_eq!(ENV_TOKEN, "ROOST_TOKEN");
+        assert_eq!(ENV_CONTROL_TOKEN, "ROOST_CONTROL_TOKEN");
+        assert_eq!(ENV_PANE, "ROOST_PANE");
+        assert_eq!(ENV_WORKSPACE, "ROOST_WORKSPACE");
+        assert_eq!(ENV_STATE, "ROOST_STATE");
+    }
+}

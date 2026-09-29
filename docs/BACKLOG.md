@@ -7,7 +7,6 @@ Deferred work and accepted limitations. Newest first within a section.
 Repo-wide read-only audit; no Critical findings, no secrets, no reimplemented std/dep logic. Line refs are as of `d4f9bf9` (v0.1.28). Scouts read code and grepped but did not run `cargo test`.
 
 ### Warning
-- [ ] **Centralize `ROOST_*` env var names.** Literal counts: `ROOST_SOCK` 9, `ROOST_TOKEN` 8, `ROOST_PANE`/`ROOST_WORKSPACE`/`ROOST_STATE` 4 each, `ROOST_CONTROL_TOKEN` 2, across `src/cli.rs`, `src/main.rs`, `src/core/app.rs`, `src/infra/`. `src/infra/pty.rs:354` `CONTROL_ENV_VARS` covers only three. A typo silently makes a different variable. Fix: one `pub const` per name in `src/infra/mod.rs`.
 - [ ] **`insert_pane` helper in `build_request`.** `src/cli.rs:562,593,613,623,641,648` repeat `m.insert("pane".into(), parse_pane(..)?.into())`.
 - [ ] **Collapse `mk_app_with_claims*` test fixtures.** `src/core/app.rs:13222–13275`: three near-identical helpers differing only in the registry argument (~15 lines).
 
