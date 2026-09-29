@@ -87,12 +87,12 @@ each adapter's own session ids.
   rewrote a tracked file. All of them are gitignored now; the hand-authored
   half of projectmem (`config.toml`, `AI_INSTRUCTIONS.md`, `PROJECT_MAP.md`,
   `plan.md`) stays tracked, because a fresh clone needs it to work the way the
-  section below says this project works. `AGENTS.md` is a pointer to this
-  file, never a copy — the copy it replaced had drifted to calling the product
-  "Codex Code". And `.gitattributes` marks every agent-tooling path
+  section below says this project works. This file is `AGENTS.md`; `CLAUDE.md`
+  is a symlink to it, never a copy — an old copy had drifted to calling the
+  product "Codex Code". And `.gitattributes` marks every agent-tooling path
   `export-ignore`, so the source archives GitHub attaches to a release stop
   carrying 424 KiB of memory store and four assistants' config.
-- **`main` is protected** (2026-08-21): PRs required, both CI matrix jobs
+- **`main` is protected** (2026-08-21): PRs required, the `CI result` check
   must be green, no force-push, no branch deletion, zero required
   approvals so a solo maintainer can self-merge. Admins are exempt, and
   agent sessions run as the repo admin — so the gate is a guardrail, not a
