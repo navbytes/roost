@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::agents::Registry;
+use crate::agents::{self, Registry};
 use crate::core::control::{
     Actor, Method, ReadMode, Reply, Request, SpawnPlace, TokenTable, UNAUTHORIZED_MSG,
 };
@@ -1547,7 +1547,7 @@ impl<B: PaneBackend> App<B> {
                 // D5: the title-status channel is live only while an agent
                 // runs here — on at birth for agent panes, and kept current
                 // by `observe_panes` for shells that launch one by hand.
-                rt.set_title_signal(spec.adapter != "shell");
+                rt.set_title_signal(spec.adapter != agents::SHELL);
                 self.runtimes.insert(id, rt);
                 self.dead.remove(&id);
                 // Owe this pane a session id? Watch for one (socket reports
@@ -1770,7 +1770,7 @@ impl<B: PaneBackend> App<B> {
     /// untouched (so a momentarily-unreadable pane is never clobbered).
     fn observe_panes(&mut self) {
         let known: Vec<String> =
-            self.registry.keys().filter(|k| **k != "shell").map(|k| k.to_string()).collect();
+            self.registry.keys().filter(|k| **k != agents::SHELL).map(|k| k.to_string()).collect();
         if known.is_empty() {
             return;
         }
@@ -1807,16 +1807,16 @@ impl<B: PaneBackend> App<B> {
             }
             // Reflect the running agent: promote a shell that's now running pi
             // to the pi adapter; demote back to shell when the agent exits.
-            let want = o.agent.unwrap_or_else(|| "shell".to_string());
+            let want = o.agent.unwrap_or_else(|| agents::SHELL.to_string());
             // Not gated on a *transition*: a pane sitting at a shell prompt
             // for an hour must keep moving this bound forward, or the
             // window it eventually gets on promotion would reach back to
             // whenever it last changed state.
-            if want == "shell" {
+            if want == agents::SHELL {
                 still_shell.push(id);
             }
             if spec.adapter != want {
-                let demoting = want == "shell";
+                let demoting = want == agents::SHELL;
                 spec.adapter = want;
                 // Keep spec.session even when demoting to shell. A single missed
                 // observation (a transient argv miss, a subprocess reparent, the
@@ -2698,7 +2698,7 @@ impl<B: PaneBackend> App<B> {
         // Like tmux `display-popup -E CMD`: a shell popup with input runs it
         // as the command, so the popup closes when the command does; other
         // adapters have no such mode and get the input typed.
-        let as_command = adapter == "shell";
+        let as_command = adapter == agents::SHELL;
         let command = initial_input.as_deref().filter(|_| as_command);
         self.spawn_pane_with(id, &spec, Self::float_rect(self.body_area()), command);
         let reply = self.spawn_reply(id);
@@ -3375,7 +3375,7 @@ impl<B: PaneBackend> App<B> {
     /// that is already gone means a report for a dead pane, which nothing
     /// below should claim for.
     fn adapter_of_session_report(&self, id: PaneId) -> &str {
-        self.find_spec(id).map(|s| s.adapter.as_str()).unwrap_or("shell")
+        self.find_spec(id).map(|s| s.adapter.as_str()).unwrap_or(agents::SHELL)
     }
 
     /// The pane's status-socket connection went up or down (D2) — see
@@ -4479,7 +4479,7 @@ impl<B: PaneBackend> App<B> {
         match action {
             Action::Quit => self.quit_guarded(),
             Action::NewPane => {
-                if self.spawn_child("shell", None, None).is_none() {
+                if self.spawn_child(agents::SHELL, None, None).is_none() {
                     self.flash_no_room();
                 }
             }
@@ -5278,7 +5278,7 @@ impl<B: PaneBackend> App<B> {
     /// Is pane `id` a plain shell rather than an agent? The `shell` adapter
     /// is the one roost ships that has no turns to be mid-way through.
     fn is_shell(&self, id: PaneId) -> bool {
-        self.find_spec(id).is_some_and(|s| s.adapter == "shell")
+        self.find_spec(id).is_some_and(|s| s.adapter == agents::SHELL)
     }
 
     fn close_pane(&mut self) {
@@ -5397,7 +5397,7 @@ impl<B: PaneBackend> App<B> {
         self.hide_float(); // C22 rule 2: "any tab change" hides the float too
         self.remember_tab_focus(); // U11: Alt+t leaves a tab like any switch
         let cwd = std::env::current_dir().unwrap_or_default();
-        let id = self.add_tab("shell", cwd, None, None);
+        let id = self.add_tab(agents::SHELL, cwd, None, None);
         self.ws.active_tab = self.ws.tabs.len() - 1;
         self.spawn_active_tab();
         self.set_focus(id);
@@ -6702,7 +6702,7 @@ impl<B: PaneBackend> App<B> {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let prev_focus = self.focused;
         let spec = PaneSpec {
-            adapter: "shell".into(),
+            adapter: agents::SHELL.into(),
             cwd,
             session: None,
             title: Some("scratch".into()),
@@ -8424,7 +8424,7 @@ pub fn display_name_live(spec: &PaneSpec, live: Option<&str>) -> String {
     if let Some(title) = &spec.title {
         return title.clone();
     }
-    if spec.adapter != "shell" {
+    if spec.adapter != agents::SHELL {
         if let Some(live) = live.filter(|t| !t.is_empty()) {
             return live.to_string();
         }
@@ -13228,20 +13228,7 @@ pub(crate) mod tests {
         workspace: &str,
         claims: crate::ports::fakes::MemClaims,
     ) -> App<FakePane> {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        App::<FakePane>::new(
-            ws,
-            agents::registry(),
-            Box::new(MemStore::default()),
-            tx,
-            Size::new(100, 30),
-            (0, 0),
-            None,
-            TokenTable::new().unwrap(),
-            workspace.into(),
-            Box::new(claims),
-        )
-        .unwrap()
+        mk_app_with_claims_full(ws, agents::registry(), workspace, claims)
     }
 
     /// `mk_app_with_claims` for tests that need a non-default registry —

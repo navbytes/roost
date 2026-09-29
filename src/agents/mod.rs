@@ -250,6 +250,9 @@ pub fn session_file_state<A: AgentAdapter + ?Sized>(
     }
 }
 
+/// Registry key and `id()` of the generic shell adapter.
+pub const SHELL: &str = "shell";
+
 pub type Registry = HashMap<&'static str, Box<dyn AgentAdapter>>;
 
 /// The single source of truth for which adapters exist, in user-facing display
