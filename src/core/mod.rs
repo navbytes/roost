@@ -4,8 +4,11 @@
 
 pub mod app;
 pub mod control;
+pub mod detect;
 pub mod event;
 pub mod layout;
+pub mod overlay;
 pub mod session_resolver;
 pub mod status;
+pub mod textfield;
 pub mod workspace;

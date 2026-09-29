@@ -890,6 +890,29 @@ fn visual_window(caret_row: usize, total: usize, cap: usize) -> std::ops::Range<
     start..start + cap
 }
 
+/// A dialog's logical lines soft-wrapped once at one width: `dialog_rect`
+/// sizes by `rows()` and `draw_mode_overlay` draws and places the caret from
+/// the same value, so the two cannot wrap at different widths.
+struct Wrapped(Vec<Vec<(String, usize)>>);
+
+impl Wrapped {
+    fn new(lines: &[String], width: u16) -> Self {
+        Self(lines.iter().map(|l| wrap_line(l, width)).collect())
+    }
+
+    fn rows(&self) -> usize {
+        self.0.iter().map(Vec::len).sum()
+    }
+
+    /// The caret at char `col` of logical `line`: (visual row within that
+    /// line, visual col, visual row counted from the first line).
+    fn caret(&self, line: usize, col: usize) -> (usize, usize, usize) {
+        let (vr, vc) = wrap_cursor(&self.0[line], col);
+        let before: usize = self.0[..line].iter().map(Vec::len).sum();
+        (vr, vc, before + vr)
+    }
+}
+
 /// The rendered width of a span run, in display columns (D1) — what a
 /// caller has to pad against once a field is spans rather than one string.
 fn spans_width(spans: &[Span<'_>]) -> u16 {
@@ -2037,7 +2060,7 @@ fn dialog_rect(
         // — this bound is on rendered rows, which wrapping can multiply.
         Mode::PaneEdit { lines, .. } => {
             let field_width = pane_edit_field_width(body);
-            let note_rows: usize = lines.iter().map(|l| wrap_line(l, field_width).len()).sum();
+            let note_rows = Wrapped::new(lines, field_width).rows();
             Some(centered_near(
                 anchor,
                 body,
@@ -2055,7 +2078,7 @@ fn dialog_rect(
         // aliased to the same value today.
         Mode::Broadcast { lines, .. } => {
             let field_width = text_field_width(body);
-            let msg_rows: usize = lines.iter().map(|l| wrap_line(l, field_width).len()).sum();
+            let msg_rows = Wrapped::new(lines, field_width).rows();
             Some(centered_near(
                 anchor,
                 body,
@@ -2153,7 +2176,7 @@ fn draw_mode_overlay<B: PaneBackend>(
                 rect.width.saturating_sub(2),
             );
             let inner = modal_frame(f, body, rect, Line::from(title).style(theme::ink()));
-            let field_width = inner.width.saturating_sub(PANE_EDIT_LABEL_WIDTH);
+            let field_width = pane_edit_field_width(body);
             let mut name_spans = vec![Span::styled("name ", theme::ink())];
             let mut name_value = if *row == 0 {
                 rename_field(name, *col, field_width)
@@ -2174,15 +2197,14 @@ fn draw_mode_overlay<B: PaneBackend>(
             // rows instead of clipping. `row`/`col` index the *logical*
             // line and its char column; `wrap_cursor` maps that onto the
             // visual row/col the caret actually rides.
-            let wrapped: Vec<Vec<(String, usize)>> =
-                lines.iter().map(|l| wrap_line(l, field_width)).collect();
+            let wrapped = Wrapped::new(lines, field_width);
             // `active` is (logical note line, visual row/col within it),
             // computed once so the loop below and the vertical caret row
             // agree on the same visual position rather than re-deriving it.
-            let active = (*row > 0).then(|| (*row - 1, wrap_cursor(&wrapped[*row - 1], *col)));
+            let active = (*row > 0).then(|| (*row - 1, wrapped.caret(*row - 1, *col)));
             let mut note_lines: Vec<Line<'_>> = Vec::new();
-            for (li, rows) in wrapped.iter().enumerate() {
-                let caret = active.filter(|&(ar, _)| ar == li).map(|(_, vrc)| vrc);
+            for (li, rows) in wrapped.0.iter().enumerate() {
+                let caret = active.filter(|&(ar, _)| ar == li).map(|(_, c)| c);
                 for (vi, (text, _)) in rows.iter().enumerate() {
                     let mut spans = vec![if vi == 0 {
                         Span::styled("note ", theme::ink())
@@ -2190,20 +2212,14 @@ fn draw_mode_overlay<B: PaneBackend>(
                         Span::raw(" ".repeat(PANE_EDIT_LABEL_WIDTH as usize))
                     }];
                     let mut value = match caret {
-                        Some((vr, vc)) if vr == vi => rename_field(text, vc, field_width),
+                        Some((vr, vc, _)) if vr == vi => rename_field(text, vc, field_width),
                         _ => vec![Span::raw(text.clone())],
                     };
                     spans.append(&mut value);
                     note_lines.push(Line::from(spans));
                 }
             }
-            let caret_row = match active {
-                None => 0,
-                Some((ar, (vr, _))) => {
-                    let before: usize = wrapped[..ar].iter().map(|r| r.len()).sum();
-                    1 + before + vr
-                }
-            };
+            let caret_row = active.map_or(0, |(_, (_, _, abs))| 1 + abs);
             let mut rendered = vec![name_line];
             rendered.extend(note_lines);
             let window = visual_window(caret_row, rendered.len(), inner.height as usize);
@@ -2241,16 +2257,14 @@ fn draw_mode_overlay<B: PaneBackend>(
             // Soft-wrap every message line (C36, amended 2026-09-20): same
             // wrap-and-scroll shape as the pane editor's note, minus the
             // name row this composer has none of.
-            let wrapped: Vec<Vec<(String, usize)>> =
-                lines.iter().map(|l| wrap_line(l, inner.width)).collect();
-            let (caret_vr, caret_vc) = wrap_cursor(&wrapped[*row], *col);
-            let caret_row: usize =
-                wrapped[..*row].iter().map(|r| r.len()).sum::<usize>() + caret_vr;
+            let field_width = text_field_width(body);
+            let wrapped = Wrapped::new(lines, field_width);
+            let (caret_vr, caret_vc, caret_row) = wrapped.caret(*row, *col);
             let mut rendered: Vec<Line<'_>> = Vec::new();
-            for (li, rows) in wrapped.iter().enumerate() {
+            for (li, rows) in wrapped.0.iter().enumerate() {
                 for (vi, (text, _)) in rows.iter().enumerate() {
                     rendered.push(if li == *row && vi == caret_vr {
-                        Line::from(rename_field(text, caret_vc, inner.width))
+                        Line::from(rename_field(text, caret_vc, field_width))
                     } else {
                         Line::from(text.clone())
                     });

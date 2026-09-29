@@ -14,46 +14,19 @@ use crate::agents::{self, Registry};
 use crate::core::control::{
     Actor, Method, ReadMode, Reply, Request, SpawnPlace, TokenTable, UNAUTHORIZED_MSG,
 };
+use crate::core::detect::{Found, SessionDetector};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
+use crate::core::overlay::Overlays;
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
+use crate::core::textfield::Field;
 use crate::core::workspace::{PaneSpec, Tab, TabView, Workspace};
-use crate::ports::{
-    ClaimError, ClaimHandle, ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore,
-};
+use crate::ports::{ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore};
 use crate::ui::input::{Action, Keymap};
 use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Slack subtracted from a promoted pane's "last seen as a shell" bound.
-///
-/// `observe_panes` reads the process tree on a `DETECT_INTERVAL` tick, so
-/// its view can lag the truth by up to one tick: an agent that started at T
-/// may still be observed as a shell a moment later, and its session file —
-/// written at T — would then fall just outside a strict bound and never be
-/// found. A few seconds of slack absorbs that while still excluding
-/// everything a previous run left behind, which is the whole point.
-const PROMOTION_GRACE: Duration = Duration::from_secs(10);
-
-/// How long the filesystem fallback keeps looking for a pane's session file
-/// before giving up.
-///
-/// `pending_detect` was previously only cleared on success or when the pane
-/// vanished, so a pane whose agent never wrote a file roost could attribute
-/// stayed pending for the life of the process — and since no adapter
-/// overrides `detect_session`, each tick meant a full recursive walk of the
-/// whole session root (`~/.pi/agent/sessions`: every project, all history)
-/// stat-ing every file, twice a minute, forever.
-///
-/// A minute is far longer than any agent takes to create its session file,
-/// so giving up costs nothing real — and when it is wrong the failure is
-/// the safe one: the pane simply starts fresh next launch instead of
-/// resuming. The exact channel (the agent-side extension, design doc §6.1)
-/// does not go through `pending_detect` at all and keeps working after
-/// this expires.
-const DETECT_GIVE_UP: Duration = Duration::from_secs(60);
 
 /// F1: how long the "Alt keys aren't reaching roost" hint stays up after its
 /// most recent evidence (`App::alt_swallow_at`) — not since launch.
@@ -433,20 +406,6 @@ struct Waiter {
     deadline: Instant,
 }
 
-/// C22: the app-wide floating scratch pane. Lives outside every tab's
-/// layout tree — its runtime sits in the same `App::runtimes` map as any
-/// other pane, but `spec` here (not `Tab::panes`) is its source of truth,
-/// and it is never written to `workspace.json` (session-only by design).
-#[derive(Debug)]
-struct Float {
-    id: PaneId,
-    spec: PaneSpec,
-    shown: bool,
-    /// Whatever was focused right before the float last became shown —
-    /// where focus returns when it hides (C22 rules 2/3).
-    prev_focus: PaneId,
-}
-
 /// C22: below this body size the geometry formula (`App::float_rect`) has
 /// no room to place a sane rect — the toggle refuses instead.
 const MIN_FLOAT_BODY_COLS: u16 = 40;
@@ -525,13 +484,8 @@ pub struct App<B: PaneBackend> {
     /// the host title (C4's workspace segment), the `status` reply and
     /// desktop notifications (D8: identity is title, env and status only).
     workspace: String,
-    /// Cross-instance session claims (D7): the port every acquire/release
-    /// goes through, plus this instance's open handles keyed by pane.
-    /// `pane_claims` carries the claimed session id beside each handle so a
-    /// respawn can tell "same session, keep the handle" from "new session,
-    /// re-claim" without asking the port twice.
-    claims: Box<dyn SessionClaims>,
-    pane_claims: HashMap<PaneId, (String, ClaimHandle)>,
+    /// Session detection state and cross-instance claims (D7).
+    detect: SessionDetector,
     store: Box<dyn StateStore>,
     /// Whether the most recent workspace save succeeded — the tab bar's
     /// right status area (C2) shows "saved ✓" while this is true and
@@ -544,24 +498,6 @@ pub struct App<B: PaneBackend> {
     /// by the terminal; (0, 0) when the host doesn't report pixels. Panes get
     /// a proportional share (`pane_pixels`) at spawn and on every resize.
     host_pixels: (u16, u16),
-    /// Freshly launched agent panes we still owe a session id.
-    pending_detect: HashMap<PaneId, SystemTime>,
-    /// When each pane was last observed running **no** agent — a plain
-    /// shell. The lower bound for a *promoted* pane's session detection.
-    ///
-    /// A pane promoted by the user typing `pi` at a shell prompt cannot own
-    /// a session file older than the last moment it was still a shell, so
-    /// this is the honest window. It used to be `SystemTime::UNIX_EPOCH` —
-    /// no bound at all — which let the scan claim the newest *unclaimed*
-    /// file in the project whenever it was written, i.e. a conversation
-    /// from days ago. See `PROMOTION_GRACE`.
-    last_shell_seen: HashMap<PaneId, SystemTime>,
-    /// Panes for which a detection candidate has already been skipped and
-    /// reported this conflict (D7: another running instance claims it).
-    /// Latched so the feed gets exactly one line per pane, not one every
-    /// tick for as long as the other workspace keeps the session — cleared
-    /// when the pane adopts a session or closes.
-    detect_conflict_latched: HashSet<PaneId>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
     /// `$HOME`, resolved once at startup — `focused_cwd()`'s `~`-abbreviation
@@ -680,17 +616,10 @@ pub struct App<B: PaneBackend> {
     /// capacity `FEED_CAP`, oldest evicted first. Session-only — never
     /// persisted.
     feed: VecDeque<FeedEntry>,
-    /// C22: the one app-wide floating scratch pane slot, spawned on first
-    /// Alt+Shift+z (Alt+f before the 2026-09-03 re-key). `None` until then.
-    float: Option<Float>,
-    /// The ephemeral `spawn --float` popup: same rect and chrome as `float`
-    /// but it is always shown (and focused), dies with its process or on
-    /// any dismissal, and is never persisted. Reuses `Float`; `shown` is
-    /// always true here. Never open together with a *shown* scratch float.
-    popup: Option<Float>,
-    /// Set only while `ctl_spawn_child` moves focus around a control
-    /// split-spawn, so that transient focus move does not dismiss the popup.
-    popup_pinned: bool,
+    /// C22/C22a: the scratch float (first Alt+Shift+z) and the `spawn
+    /// --float` popup. Their specs live here, not in `Tab::panes`; never
+    /// persisted.
+    overlays: Overlays,
     /// C23: panes currently in raw (hard pass-through) mode, by id.
     /// Per-pane, session-only — never persisted.
     raw: HashSet<PaneId>,
@@ -812,9 +741,6 @@ impl<B: PaneBackend> App<B> {
             tx,
             term_size,
             host_pixels,
-            pending_detect: HashMap::new(),
-            last_shell_seen: HashMap::new(),
-            detect_conflict_latched: HashSet::new(),
             last_detect: Instant::now(),
             sock_path,
             home: dirs::home_dir(),
@@ -831,17 +757,14 @@ impl<B: PaneBackend> App<B> {
             tokens,
             ext_link_counts: HashMap::new(),
             workspace,
-            claims,
-            pane_claims: HashMap::new(),
+            detect: SessionDetector::new(claims),
             waiters: Vec::new(),
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
             needy_msgs: HashMap::new(),
             visited_waiting: HashSet::new(),
             feed: VecDeque::new(),
-            float: None,
-            popup: None,
-            popup_pinned: false,
+            overlays: Overlays::default(),
             raw: HashSet::new(),
             tab_focus: HashSet::new(),
             pending_yank: None,
@@ -1112,14 +1035,14 @@ impl<B: PaneBackend> App<B> {
     pub fn display_rects(&self) -> Vec<PaneRect> {
         let body = self.body_area();
         let mut v = Vec::new();
-        if let Some(f) = self.popup.iter().chain(self.float.iter().filter(|f| f.shown)).next() {
-            v.push(PaneRect { id: f.id, rect: Self::float_rect(body), collapsed: false });
+        if let Some(id) = self.overlays.top_id() {
+            v.push(PaneRect { id, rect: Self::float_rect(body), collapsed: false });
         }
         if self.zoomed {
             // C21 "keeps zoom" + C22 rule 1: while the float is shown, focus
             // belongs to it, not the zoomed pane — the real zoom target is
             // whatever was focused right before the float appeared.
-            let target = self.overlay_prev().unwrap_or(self.focused);
+            let target = self.overlays.prev().unwrap_or(self.focused);
             v.push(PaneRect { id: target, rect: body, collapsed: false });
         } else if self.solo() {
             // Unlike the zoom branch above, `f.prev_focus` is not safe to
@@ -1169,7 +1092,7 @@ impl<B: PaneBackend> App<B> {
         // are not in a live tab, and both must be counted or the id gets
         // handed out twice.
         let base = self.ws.next_pane_id();
-        let base = self.float.iter().chain(&self.popup).fold(base, |b, f| b.max(f.id + 1));
+        let base = self.overlays.next_id(base);
         // The undo stack. A parked `Closed::Tab` is re-inserted **verbatim,
         // with its original pane ids** (`undo_close`), and `spawn_active_tab`
         // then builds runtimes for them — so if one of those ids has since
@@ -1194,49 +1117,13 @@ impl<B: PaneBackend> App<B> {
 
     /// Is `id` the float's pane?
     pub fn is_float(&self, id: PaneId) -> bool {
-        self.float.as_ref().is_some_and(|f| f.id == id)
-    }
-
-    /// C22/M1: the one guard every control-plane verb that resolves a
-    /// specific pane id shares — the float is the human's private
-    /// interactive scratch shell, never a control-plane target, for
-    /// *any* verb, not just the ones an earlier pass happened to touch
-    /// (close/send/read only — status/wait/fork still reached it: a
-    /// same-uid pane reading `control.token` off disk *is* Fleet, and
-    /// `spawn_float`'s `spawned_by: None` puts the float outside every
-    /// subtree, so Fleet was never the only actor that needed refusing).
-    /// `verb` slots into "cannot {verb} the scratch pane" — ctl_close's own
-    /// wording — so every caller reads naturally without each inventing
-    /// its own phrasing. Callers check this before authz: an actor doesn't
-    /// get told "forbidden" for a pane it could never legitimately reach
-    /// anyway, it gets told the truth, unconditionally.
-    fn float_refusal(&self, id: PaneId, verb: &str) -> Option<String> {
-        self.is_float(id).then(|| format!("cannot {verb} the scratch pane"))
-    }
-
-    /// Is `id` the `spawn --float` popup's pane?
-    pub fn is_popup(&self, id: PaneId) -> bool {
-        self.popup.as_ref().is_some_and(|f| f.id == id)
+        self.overlays.is_float(id)
     }
 
     /// The scratch float or the popup — what chrome and hit-testing treat as
     /// the one pane painted over the rest. Control refusals use `is_float`.
     pub fn is_overlay(&self, id: PaneId) -> bool {
-        self.is_float(id) || self.is_popup(id)
-    }
-
-    /// Where focus returns when the shown overlay goes away, `None` when no
-    /// overlay is up.
-    fn overlay_prev(&self) -> Option<PaneId> {
-        self.popup.iter().chain(self.float.iter().filter(|f| f.shown)).next().map(|f| f.prev_focus)
-    }
-
-    fn overlay_noun(&self) -> &'static str {
-        if self.popup.is_some() {
-            "popup"
-        } else {
-            "scratch pane"
-        }
+        self.overlays.is_overlay(id)
     }
 
     /// Is an overlay (scratch float or popup) currently the focused pane?
@@ -1426,7 +1313,7 @@ impl<B: PaneBackend> App<B> {
         // stale remembered one — the rail's `▎` jumped, and two PTYs got
         // resized — then snap back on hide (review, 2026-09-10).
         if let Some(back) =
-            self.overlay_prev().filter(|p| self.ws.active_tab().panes.contains_key(p))
+            self.overlays.prev().filter(|p| self.ws.active_tab().panes.contains_key(p))
         {
             return back;
         }
@@ -1532,7 +1419,7 @@ impl<B: PaneBackend> App<B> {
             // claim that outlives the session it was taken for is exactly
             // the leak D7 exists to prevent, and nothing below re-claims for
             // this pane (no session survived `resolve` to claim instead).
-            self.pane_claims.remove(&id);
+            self.detect.release(id);
             // Persist the correction so the dead id isn't retried next launch.
             if let Some(s) = self.find_spec_mut(id) {
                 s.session = None;
@@ -1553,7 +1440,7 @@ impl<B: PaneBackend> App<B> {
                 // Owe this pane a session id? Watch for one (socket reports
                 // it exactly; the filesystem scan in tick() is the fallback).
                 if resolution.wants_detect {
-                    self.pending_detect.insert(id, SystemTime::now());
+                    self.detect.queue(id, SystemTime::now());
                 }
                 // C20: spawn owns the pane's "birth" line — diff_statuses
                 // deliberately stays silent on a pane's first observation.
@@ -1593,108 +1480,27 @@ impl<B: PaneBackend> App<B> {
         // Persist what each pane is actually running (live cwd, typed agent).
         self.observe_panes();
         // C20: one status-transition feed line per pane per tick, diffed
-        // against each pane's last-known status. Placed before the
-        // `pending_detect` early-return below so it always runs, whether or
-        // not any pane is mid-session-detection.
+        // against each pane's last-known status.
         self.diff_statuses();
-        if self.pending_detect.is_empty() {
-            return;
-        }
-        let mut pending: Vec<(PaneId, SystemTime)> =
-            self.pending_detect.iter().map(|(k, v)| (*k, *v)).collect();
-        // Newest spawn first: two panes launched into the same cwd share one
-        // session root, and `detect_session` just grabs the newest unclaimed
-        // file in its window. Processing oldest-first let an earlier pane's
-        // wider window see (and steal) a later pane's not-yet-claimed file,
-        // starving that pane of a session id forever (HashMap iteration order
-        // made this non-deterministic). Claiming newest-spawned-first mirrors
-        // file-creation order, so each pane gets its own file.
-        pending.sort_by_key(|(_, since)| std::cmp::Reverse(*since));
-        // Drop anything past the give-up horizon before scanning for it.
-        // Checked against the pane's own `since` rather than a separate
-        // clock so the window means the same thing here as it does in the
-        // scan: how long we have been looking for *this* pane's file.
-        let now = SystemTime::now();
-        self.pending_detect.retain(|_, since| {
-            now.duration_since(*since).map(|age| age < DETECT_GIVE_UP).unwrap_or(true)
-        });
-        pending.retain(|(id, _)| self.pending_detect.contains_key(id));
-        for (id, since) in pending.clone() {
-            let Some((spec, adapter)) = self
-                .find_spec(id)
-                .and_then(|s| self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a)))
-            else {
-                self.pending_detect.remove(&id);
-                continue;
-            };
-            // Two panes in *different projects* whose adapter gives them the
-            // same session root cannot be told apart by this scan at all:
-            // the root carries no cwd signal (codex buckets rollouts by
-            // date, `~/.codex/sessions` for every project), so the only
-            // thing separating the candidates is mtime order, which says
-            // nothing about whose they are. Decline rather than guess.
-            //
-            // **A wrong session is far worse than no session.** Losing a
-            // resume pointer costs the user a `--continue`; attaching a
-            // pane to another project's conversation corrupts work in it.
-            // Declining leaves the pane pending, so the exact channel (the
-            // agent-side extension) can still report it, and the scan
-            // retries the moment the ambiguity clears.
-            //
-            // Same-cwd concurrency is *not* ambiguous in this sense and is
-            // deliberately still allowed: both panes really are in that
-            // project, and the newest-first ordering above mirrors file
-            // creation order so each takes its own.
-            let root = adapter.session_root(&spec.cwd);
-            let ambiguous = root.is_some()
-                && pending.iter().any(|(other, _)| {
-                    *other != id
-                        && self.find_spec(*other).is_some_and(|o| {
-                            o.adapter == spec.adapter
-                                && o.cwd != spec.cwd
-                                && self
-                                    .registry
-                                    .get(o.adapter.as_str())
-                                    .and_then(|a| a.session_root(&o.cwd))
-                                    == root
-                        })
-                });
-            if ambiguous {
-                continue;
-            }
-            // Session ids already owned by other panes — never re-assign one
-            // (concurrent same-cwd launches otherwise cross-wire onto it).
-            // D7 widens the set with ids other running instances hold claims
-            // on, so detection keeps scanning past anything another workspace
-            // is already driving instead of adopting it.
-            let mut taken = session_resolver::claimed_sessions(&self.ws);
-            taken.extend(self.claims.claimed(&spec.adapter));
-            if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
-                // Claim before adopting (D7): between the snapshot above and
-                // now another instance may have taken it — then keep scanning
-                // on the next tick rather than adopting a claimed session.
-                // Unlike the restore conflict above (once per spawn),
-                // detection retries every tick — latched so a held candidate
-                // gets exactly one feed line per pane, not one every tick
-                // for as long as the other workspace keeps running.
-                match self.claim_session(id, &spec.adapter, &session) {
-                    Ok(()) => {
-                        self.detect_conflict_latched.remove(&id);
-                        self.set_session(id, session);
+        let (ws, overlays) = (&self.ws, &self.overlays);
+        let found =
+            self.detect.poll(SystemTime::now(), &self.registry, ws, |id| spec_in(ws, overlays, id));
+        for f in found {
+            match f {
+                Found::Adopted { id, session, unavailable } => {
+                    if let Some(e) = unavailable {
+                        self.claim_unavailable(id, &e);
                     }
-                    Err(owner) => {
-                        if self.detect_conflict_latched.insert(id) {
-                            self.push_feed(
-                                format!(
-                                    "{}: session {session} is held by {owner} — still scanning",
-                                    self.feed_label(id)
-                                ),
-                                false,
-                                Some(id),
-                            );
-                        }
-                    }
+                    self.set_session(id, session);
                 }
+                Found::Held { id, session, owner } => self.push_feed(
+                    format!(
+                        "{}: session {session} is held by {owner} — still scanning",
+                        self.feed_label(id)
+                    ),
+                    false,
+                    Some(id),
+                ),
             }
         }
     }
@@ -1782,8 +1588,8 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
-        // Panes observed running no agent this tick — `last_shell_seen`
-        // (collected here and written after the loop, since `find_spec_mut`
+        // Panes observed running no agent this tick, for the detector
+        // (collected here, applied after the loop, since `find_spec_mut`
         // holds `self`).
         let mut still_shell: Vec<PaneId> = Vec::new();
         // D5: adapter flips collected here and pushed into the runtimes'
@@ -1808,10 +1614,6 @@ impl<B: PaneBackend> App<B> {
             // Reflect the running agent: promote a shell that's now running pi
             // to the pi adapter; demote back to shell when the agent exits.
             let want = o.agent.unwrap_or_else(|| agents::SHELL.to_string());
-            // Not gated on a *transition*: a pane sitting at a shell prompt
-            // for an hour must keep moving this bound forward, or the
-            // window it eventually gets on promotion would reach back to
-            // whenever it last changed state.
             if want == agents::SHELL {
                 still_shell.push(id);
             }
@@ -1840,41 +1642,7 @@ impl<B: PaneBackend> App<B> {
                 rt.set_title_signal(enabled);
             }
         }
-        let now = SystemTime::now();
-        for id in still_shell {
-            self.last_shell_seen.insert(id, now);
-        }
-        // A newly-recognized agent needs its already-created session file
-        // located — it was written moments before roost noticed, so `now()`
-        // would miss it. The bound is **the last tick this pane was still a
-        // shell**, minus `PROMOTION_GRACE` for observation lag.
-        //
-        // This used to be `SystemTime::UNIX_EPOCH`, on the reasoning that a
-        // wide window "plus the taken-set finds it without cross-wiring".
-        // The taken-set does not carry that weight: `claimed_sessions` only
-        // knows ids stored on *live* panes, so a conversation from a closed
-        // pane or an earlier run is unclaimed and therefore eligible. With
-        // no lower bound the scan took the newest such file whenever it was
-        // written, `set_session` committed it, and the pane was dropped from
-        // `pending_detect` — so the mistake was permanent, and the next
-        // relaunch resumed a conversation from days ago. Reported as "it
-        // loads the wrong session"; pinned by
-        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`.
-        for id in promoted {
-            let floor = self
-                .last_shell_seen
-                .get(&id)
-                .copied()
-                .unwrap_or(now)
-                .checked_sub(PROMOTION_GRACE)
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            // `max`, not `or_insert`: the window may only ever **tighten**.
-            // A pane that promotes, finds nothing (so stays pending),
-            // demotes when the agent exits, then promotes again hours later
-            // would otherwise keep its first floor — by then old enough to
-            // reach conversations from earlier in the same session.
-            self.pending_detect.entry(id).and_modify(|f| *f = (*f).max(floor)).or_insert(floor);
-        }
+        self.detect.observe(still_shell, promoted, SystemTime::now());
         for cwd in visited {
             self.note_cwd(cwd);
         }
@@ -1993,10 +1761,7 @@ impl<B: PaneBackend> App<B> {
     /// them), but each then adds its own is-float refusal (M1) — the float
     /// is the human's private scratch shell, never a control-plane target.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
-        if let Some(f) = self.float.iter().chain(&self.popup).find(|f| f.id == id) {
-            return Some(&f.spec);
-        }
-        self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
+        spec_in(&self.ws, &self.overlays, id)
     }
 
     /// The focused pane's working directory, `$HOME` abbreviated to `~`,
@@ -2009,8 +1774,8 @@ impl<B: PaneBackend> App<B> {
 
     /// C22: mirrors `find_spec` — the float's spec is mutable too (rename).
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
-        if let Some(f) = self.float.iter_mut().chain(&mut self.popup).find(|f| f.id == id) {
-            return Some(&mut f.spec);
+        if let Some(spec) = self.overlays.spec_mut(id) {
+            return Some(spec);
         }
         self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
     }
@@ -2079,7 +1844,9 @@ impl<B: PaneBackend> App<B> {
         // ring this count must equal.
         self.runtimes
             .iter()
-            .filter(|(&id, rt)| rt.status() == AgentStatus::NeedsInput && !self.is_popup(id))
+            .filter(|(&id, rt)| {
+                rt.status() == AgentStatus::NeedsInput && !self.overlays.is_popup(id)
+            })
             .count()
     }
 
@@ -2385,7 +2152,7 @@ impl<B: PaneBackend> App<B> {
             // M1: `wait <float> --until idle` would be a typing oracle on
             // the human's private scratch shell — same refusal as every
             // other verb that resolves a specific pane id.
-            if let Some(msg) = self.float_refusal(p, "wait on") {
+            if let Some(msg) = self.overlays.refusal(p, "wait on") {
                 let _ = reply.send(Reply::err(msg.clone()));
                 return Err(msg);
             }
@@ -2541,7 +2308,7 @@ impl<B: PaneBackend> App<B> {
                 // `ctl_list` is the only thing that iterates — but a
                 // specific id resolves it via `find_spec` same as any
                 // other verb, so it needs the same explicit refusal.
-                if let Some(msg) = self.float_refusal(p, "get the status of") {
+                if let Some(msg) = self.overlays.refusal(p, "get the status of") {
                     return Reply::err(msg);
                 }
                 if !self.may_target(actor, p) {
@@ -2673,7 +2440,7 @@ impl<B: PaneBackend> App<B> {
         initial_input: Option<String>,
         title: Option<String>,
     ) -> Reply {
-        if self.popup.is_some() {
+        if self.overlays.popup_id().is_some() {
             return Reply::err("a popup is already open");
         }
         if !Self::float_fits(self.body_area()) {
@@ -2693,7 +2460,7 @@ impl<B: PaneBackend> App<B> {
             noted_at: None,
         };
         let id = self.alloc_pane_id();
-        self.popup = Some(Float { id, spec: spec.clone(), shown: true, prev_focus: self.focused });
+        self.overlays.open_popup(id, spec.clone(), self.focused);
         self.set_focus(id);
         // Like tmux `display-popup -E CMD`: a shell popup with input runs it
         // as the command, so the popup closes when the command does; other
@@ -2739,15 +2506,11 @@ impl<B: PaneBackend> App<B> {
         // have, and one `cycle_layout` then planted into the tab's layout
         // tree as a pane with no spec. Save and restore both halves.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
-        let float_shown = self.float.as_ref().is_some_and(|f| f.shown);
-        // A popup is the same story: pin it so the transient focus move
+        // A popup is the same story: pinned, so the transient focus move
         // below does not read as a dismissal.
-        self.popup_pinned = true;
+        let float_shown = self.overlays.pin();
         let id = self.spawn_child(adapter, cwd, owner);
-        self.popup_pinned = false;
-        if let Some(f) = &mut self.float {
-            f.shown = float_shown;
-        }
+        self.overlays.unpin(float_shown);
         // Restore the tab before focus: `set_focus`'s centralized expand
         // walks whichever tab is active *at the time it runs*, so restoring
         // `active_tab` first is what guarantees it lands on the human's tab.
@@ -2790,7 +2553,7 @@ impl<B: PaneBackend> App<B> {
         // M1: forking the float would clone its spec into a brand-new real
         // pane (and surface its cwd in `list`) — refused before authz, same
         // as every other verb that resolves a specific pane id.
-        if let Some(msg) = self.float_refusal(target, "fork") {
+        if let Some(msg) = self.overlays.refusal(target, "fork") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, target) {
@@ -2809,7 +2572,7 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "send to") {
+        if let Some(msg) = self.overlays.refusal(pane, "send to") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
@@ -2909,7 +2672,7 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "read") {
+        if let Some(msg) = self.overlays.refusal(pane, "read") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
@@ -2943,14 +2706,14 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "close") {
+        if let Some(msg) = self.overlays.refusal(pane, "close") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
         }
         // The popup is not in any tab: closing it just dismisses it.
-        if self.is_popup(pane) {
+        if self.overlays.is_popup(pane) {
             self.close_popup();
             self.relayout();
             return Reply::ok(serde_json::json!({ "closed": pane }));
@@ -2981,7 +2744,7 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "focus") {
+        if let Some(msg) = self.overlays.refusal(pane, "focus") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
@@ -3025,7 +2788,7 @@ impl<B: PaneBackend> App<B> {
         // pane actually being shown full-screen left `zoomed` set pointing
         // at a pane that no longer exists. `display_rects` resolves the real
         // target the same way; this must agree with it.
-        let zoom_target = self.overlay_prev().unwrap_or(self.focused);
+        let zoom_target = self.overlays.prev().unwrap_or(self.focused);
         if self.zoomed && id == zoom_target {
             self.exit_zoom();
         }
@@ -3066,41 +2829,9 @@ impl<B: PaneBackend> App<B> {
         self.last_status.remove(&id);
         self.needy_msgs.remove(&id);
         self.visited_waiting.remove(&id);
-        // And once more, for the two session-detection maps — the last
-        // `PaneId`-keyed state in `App` that close was not pruning, and the
-        // one where inheriting a dead pane's entry is not cosmetic.
-        //
-        // `last_shell_seen` is the floor `observe_panes` gives a promoted
-        // pane's session scan ("the last tick this pane was still a
-        // shell"). A pane that sat at a prompt for two hours leaves a
-        // two-hour-old stamp behind; a later pane taking that id and
-        // promoting before its own first shell observation — which is the
-        // normal case for a pane spawned with initial input, since it is
-        // running the agent within milliseconds — inherits it and scans two
-        // hours back. That is exactly the window
-        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`
-        // exists to close, reopened through the recycled id: the scan takes
-        // the newest unclaimed file in that window, `set_session` commits
-        // it permanently, and the next relaunch resumes a stranger's
-        // conversation.
-        //
-        // `pending_detect` is the same hazard one step later: a pane closed
-        // mid-detection leaves its window keyed on the id, and `tick` only
-        // discards it if the id resolves to no spec at all — so an id
-        // recycled within the tick keeps hunting on the dead pane's clock,
-        // and can overwrite a session the new pane was resuming with an
-        // unrelated one.
-        self.last_shell_seen.remove(&id);
-        self.pending_detect.remove(&id);
-        // Same recycled-id reason once more: an inherited latch would
-        // silently swallow the new pane's own first conflict notification.
-        self.detect_conflict_latched.remove(&id);
-        // D7: drop the pane's session claim, releasing it for every other
-        // running instance. Pane ids are recycled, so an unremoved entry is
-        // not just a leak — a later pane with this id would inherit the
-        // claim (and, worse, its release-on-drop would later free a claim
-        // the new pane never took).
-        self.pane_claims.remove(&id);
+        // D7/C23: session detection state and the pane's session claim —
+        // see `SessionDetector::forget_pane` for why recycled ids matter.
+        self.detect.forget_pane(id);
         // C40: and the pull mark, for the same recycled-id reason — a mark
         // left pointing at a closed pane would be pulled by whichever pane
         // inherited the number next.
@@ -3173,42 +2904,22 @@ impl<B: PaneBackend> App<B> {
     fn set_session(&mut self, id: PaneId, session: String) {
         if let Some(spec) = self.find_spec_mut(id) {
             spec.session = Some(session);
-            self.pending_detect.remove(&id);
+            self.detect.unqueue(id);
             self.save();
         }
     }
 
-    /// D7: claim `(adapter, session)` for pane `id` across all running
-    /// instances, keeping one handle per pane in `pane_claims`. The bookkeeping
-    /// is deliberately here, not in the port: a pane respawn re-runs the
-    /// restore path, and re-acquiring while still holding the same claim is
-    /// refused by the lock itself — so the *app* releases before re-acquiring,
-    /// which is also what makes the single-instance case never self-block.
-    ///
-    /// - Same pane, same session: keep the existing handle (idempotent).
-    /// - Same pane, new session: drop the old handle, take the new claim.
-    /// - `Failed` (claims dir unreadable etc.): proceed **unclaimed** — claims
-    ///   are advisory best-effort (see `ports::ClaimError`), and a broken
-    ///   claims dir must not brick every restore.
-    /// - `Held`: refused; the caller owns the user-visible degradation.
+    /// D7: `SessionDetector::claim`, with the advisory-failure note put on
+    /// the feed so it is not fully silent.
     fn claim_session(&mut self, id: PaneId, adapter: &str, session: &str) -> Result<(), String> {
-        if self.pane_claims.get(&id).is_some_and(|(s, _)| s == session) {
-            return Ok(());
+        if let Some(e) = self.detect.claim(id, adapter, session)? {
+            self.claim_unavailable(id, &e);
         }
-        self.pane_claims.remove(&id);
-        match self.claims.acquire(adapter, session) {
-            Ok(handle) => {
-                self.pane_claims.insert(id, (session.to_string(), handle));
-                Ok(())
-            }
-            Err(ClaimError::Held(desc)) => Err(desc),
-            Err(ClaimError::Failed(e)) => {
-                // Advisory port failed, not held: proceed without a claim.
-                // The feed line keeps the failure from being fully silent.
-                self.push_feed(format!("session claim unavailable: {e}"), false, Some(id));
-                Ok(())
-            }
-        }
+        Ok(())
+    }
+
+    fn claim_unavailable(&mut self, id: PaneId, err: &str) {
+        self.push_feed(format!("session claim unavailable: {err}"), false, Some(id));
     }
 
     // -- event handling ----------------------------------------------------
@@ -3335,7 +3046,7 @@ impl<B: PaneBackend> App<B> {
     /// gets no pull toward it (regression: same fix as `on_status`).
     pub fn on_pty_exit(&mut self, id: PaneId) -> Option<String> {
         // A popup lives exactly as long as its process, whatever the status.
-        if self.is_popup(id) {
+        if self.overlays.is_popup(id) {
             self.close_popup();
             return None;
         }
@@ -3502,50 +3213,13 @@ impl<B: PaneBackend> App<B> {
         // still read as the text you pasted. The point lands after the
         // insertion, ahead of whatever tail it split off.
         if let Mode::PaneEdit { name, lines, row, col, .. } = &mut self.mode {
-            if *row == 0 {
-                let clean = strip_control(text, false);
-                let at = (*col).min(name.chars().count());
-                let byte = byte_at(name, at);
-                name.insert_str(byte, &clean);
-                *col = at + clean.chars().count();
-                return;
-            }
-            let clean = text.replace("\r\n", "\n").replace('\r', "\n");
-            let clean = strip_control(&clean, true);
-            let mut nrow = (*row - 1).min(lines.len().saturating_sub(1));
-            let at = byte_at(&lines[nrow], (*col).min(lines[nrow].chars().count()));
-            let tail = lines[nrow][at..].to_string();
-            lines[nrow].truncate(at);
-            let mut parts = clean.split('\n');
-            if let Some(first) = parts.next() {
-                lines[nrow].push_str(first);
-            }
-            for part in parts {
-                if lines.len() < NOTE_MAX_LINES {
-                    nrow += 1;
-                    lines.insert(nrow, part.to_string());
-                } else {
-                    if !lines[nrow].is_empty() && !part.is_empty() {
-                        lines[nrow].push(' ');
-                    }
-                    lines[nrow].push_str(part);
-                }
-            }
-            *col = lines[nrow].chars().count();
-            lines[nrow].push_str(&tail);
-            *row = nrow + 1;
+            Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).paste(text);
             return;
         }
         if let Mode::Rename { buffer, cursor, .. } = &mut self.mode {
-            // U16: a paste lands at the point, like typing does, and leaves
-            // the point after what it inserted — a paste that always
-            // appended would be the one edit in the dialog that ignored the
-            // cursor.
-            let clean = strip_control(text, false);
-            let at = (*cursor).min(buffer.chars().count());
-            let byte = byte_at(buffer, at);
-            buffer.insert_str(byte, &clean);
-            *cursor = at + clean.chars().count();
+            // U16: a paste lands at the point, like typing does.
+            let (mut none, mut row) = (Vec::new(), 0);
+            Field::new(Some(buffer), &mut none, &mut row, cursor, 0).paste(text);
             return;
         }
         if self.modal_active() {
@@ -4362,7 +4036,7 @@ impl<B: PaneBackend> App<B> {
             // otherwise a pane that gives up on a dead session keeps the
             // claim held, blocking every other workspace from ever
             // resuming it even though this pane no longer represents it.
-            self.pane_claims.remove(&id);
+            self.detect.release(id);
             if let Some(spec) = self.find_spec_mut(id) {
                 spec.session = None;
             }
@@ -4646,7 +4320,7 @@ impl<B: PaneBackend> App<B> {
                 // floating full-focus surface) — refuse rather than hide it
                 // and zoom whatever's behind it.
                 if self.float_focused() {
-                    let what = if self.popup.is_some() { "popup" } else { "float" };
+                    let what = if self.overlays.popup_id().is_some() { "popup" } else { "float" };
                     self.set_flash(format!("can't zoom the {what}"));
                 } else {
                     self.toggle_zoom();
@@ -4764,11 +4438,12 @@ impl<B: PaneBackend> App<B> {
     /// would undo exactly what U9 fixed.
     fn set_focus(&mut self, id: PaneId) {
         let old = self.focused;
-        // Focus leaving the popup is a dismissal (it closes); its `prev_focus`
-        // is moot here since the caller already chose where focus goes.
-        // Before the trail below so a dead popup never becomes "go back".
-        if old != id && self.is_popup(old) && !self.popup_pinned {
-            self.drop_popup();
+        // C22 rule 1, enforced in this single writer rather than at each door
+        // (per-site copies missed C35's "go back"): leaving the popup closes
+        // it, leaving a shown float hides it — the caller already chose where
+        // focus goes. Before the trail below so a dead popup is never "go back".
+        if let Some(popup) = self.overlays.focus_moved(old, id) {
+            self.forget_overlay_pane(popup);
         }
         // C35: the trail "go back" follows. Recorded here rather than at each
         // call site precisely because this is the one chokepoint — the
@@ -4777,20 +4452,6 @@ impl<B: PaneBackend> App<B> {
         // feature that moves focus.
         if old != id && self.pane_exists(old) {
             self.alternate = Some(old);
-        }
-        // C22 rule 1: a shown float IS the focused pane, so focus landing on
-        // anything else means the float is no longer up. Enforced here, in
-        // the single writer of `self.focused`, rather than at each door: the
-        // rule was previously re-applied per call site, and the ones that
-        // forgot (C35's Alt+`` `` "go back" among them) left the float drawn
-        // over the body with the user's keystrokes going to a tiled pane
-        // underneath it. `shown` is cleared directly rather than through
-        // `hide_float`, which would re-route focus the caller has already
-        // decided.
-        if old != id && self.float_focused() && !self.is_float(id) {
-            if let Some(f) = &mut self.float {
-                f.shown = false;
-            }
         }
         self.focused = id;
         // A focused-but-collapsed stack member is invisible to the user;
@@ -4913,7 +4574,7 @@ impl<B: PaneBackend> App<B> {
         // simulation agent comparing the two, which is the comparison that
         // makes the inconsistency visible.
         if self.float_focused() {
-            self.set_flash(format!("the {} sits outside the layout", self.overlay_noun()));
+            self.set_flash(format!("the {} sits outside the layout", self.overlays.noun()));
             return;
         }
         // C21, from here rather than `apply`'s structural guard: the float
@@ -5285,7 +4946,7 @@ impl<B: PaneBackend> App<B> {
         // C22 rule 4: Alt+w on the float kills it for real, no confirm
         // guard (scratch is not precious — the whole point of the confirm
         // guard below is protecting work the float explicitly isn't).
-        if self.is_popup(self.focused) {
+        if self.overlays.is_popup(self.focused) {
             self.close_popup();
             return;
         }
@@ -5553,7 +5214,7 @@ impl<B: PaneBackend> App<B> {
     /// nowhere to send anything.
     fn move_pane_to_tab(&mut self, delta: isize) {
         if self.float_focused() {
-            self.set_flash(format!("the {} belongs to no tab", self.overlay_noun()));
+            self.set_flash(format!("the {} belongs to no tab", self.overlays.noun()));
             return;
         }
         let n = self.ws.tabs.len();
@@ -5660,7 +5321,7 @@ impl<B: PaneBackend> App<B> {
     /// tab to pull it out of.
     fn mark_pane(&mut self) {
         if self.float_focused() {
-            self.set_flash(format!("the {} belongs to no tab", self.overlay_noun()));
+            self.set_flash(format!("the {} belongs to no tab", self.overlays.noun()));
             return;
         }
         let id = self.focused;
@@ -5910,9 +5571,9 @@ impl<B: PaneBackend> App<B> {
             layout::pane_order(&tab.layout, &mut order);
             ring.extend(order.into_iter().filter(|&id| self.display_status(id) == Some(status)));
         }
-        if let Some(f) = &self.float {
-            if self.display_status(f.id) == Some(status) {
-                ring.push(f.id);
+        if let Some(id) = self.overlays.float_id() {
+            if self.display_status(id) == Some(status) {
+                ring.push(id);
             }
         }
         ring
@@ -6050,11 +5711,7 @@ impl<B: PaneBackend> App<B> {
             }
         }
         if self.is_float(target) {
-            let from = self.focused;
-            if let Some(f) = &mut self.float {
-                f.shown = true;
-                f.prev_focus = from;
-            }
+            self.overlays.show_float(self.focused);
         }
         self.set_focus(target);
     }
@@ -6211,7 +5868,7 @@ impl<B: PaneBackend> App<B> {
         let tabs: usize =
             self.ws.tabs.iter().filter(|t| !t.panes.is_empty()).map(|t| t.panes.len() + 1).sum();
         // The float rides last under a header of its own (C22/C27).
-        let fleet = tabs + if self.float.is_some() { 2 } else { 0 };
+        let fleet = tabs + if self.overlays.float_id().is_some() { 2 } else { 0 };
         let content = fleet.max(self.feed.len()).max(1);
         // The two border rows the content sits between.
         (w, (content as u16).saturating_add(2).min(cap))
@@ -6309,11 +5966,9 @@ impl<B: PaneBackend> App<B> {
             rows.push(RosterRow::Group { label: roster_group_label(i, name, panes.len()) });
             rows.extend(panes.into_iter().map(|id| RosterRow::Pane { id }));
         }
-        if let Some(f) = &self.float {
-            if shows(f.id) {
-                rows.push(RosterRow::Group { label: roster_float_label() });
-                rows.push(RosterRow::Pane { id: f.id });
-            }
+        if let Some(id) = self.overlays.float_id().filter(|&id| shows(id)) {
+            rows.push(RosterRow::Group { label: roster_float_label() });
+            rows.push(RosterRow::Pane { id });
         }
         rows
     }
@@ -6679,16 +6334,7 @@ impl<B: PaneBackend> App<B> {
             self.set_flash("no room for float");
             return;
         }
-        // The float's id comes out of the borrow before `set_focus` runs:
-        // that call needs all of `self` (the report it may send goes to the
-        // runtimes map), which `&mut self.float` would still be holding.
-        let prev = self.focused;
-        let show = self.float.as_mut().map(|f| {
-            f.shown = true;
-            f.prev_focus = prev;
-            f.id
-        });
-        match show {
+        match self.overlays.show_float(self.focused) {
             Some(id) => self.set_focus(id),
             None => self.spawn_float(),
         }
@@ -6710,7 +6356,7 @@ impl<B: PaneBackend> App<B> {
             note: None,
             noted_at: None,
         };
-        self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
+        self.overlays.open_float(id, spec.clone(), prev_focus);
         self.set_focus(id);
         // display_rects, not rects: the float isn't in the tiled tree, so
         // only the zoom-aware/float-aware display list knows its rect.
@@ -6726,16 +6372,11 @@ impl<B: PaneBackend> App<B> {
     /// outside its rect. A no-op when the float isn't currently shown.
     fn hide_float(&mut self) {
         // The popup has no hidden state: every dismissal closes it.
-        if self.popup.is_some() {
+        if self.overlays.popup_id().is_some() {
             self.close_popup();
             return;
         }
-        let Some(f) = &mut self.float else { return };
-        if !f.shown {
-            return;
-        }
-        f.shown = false;
-        let back = f.prev_focus;
+        let Some(back) = self.overlays.hide_float() else { return };
         let target = self.focus_after_overlay(back);
         self.set_focus(target);
     }
@@ -6765,14 +6406,14 @@ impl<B: PaneBackend> App<B> {
         // D7: a float promoted to an agent claims a session like any other
         // pane (`claim_session`) — drop it here too, or a closed scratch
         // float keeps holding it for every other running instance forever.
-        self.pane_claims.remove(&id);
+        self.detect.release(id);
     }
 
     /// Kill the popup without touching focus; returns where focus was.
     fn drop_popup(&mut self) -> Option<PaneId> {
-        let p = self.popup.take()?;
-        self.forget_overlay_pane(p.id);
-        Some(p.prev_focus)
+        let (id, prev_focus) = self.overlays.take_popup()?;
+        self.forget_overlay_pane(id);
+        Some(prev_focus)
     }
 
     /// Close the popup and hand focus back to what it covered.
@@ -6786,9 +6427,9 @@ impl<B: PaneBackend> App<B> {
     /// C22 rule 4: Alt+w on the float kills it for real and clears the slot
     /// — unlike hiding, no undo entry (scratch is not precious).
     fn close_float(&mut self) {
-        let Some(f) = self.float.take() else { return };
-        self.forget_overlay_pane(f.id);
-        let target = self.focus_after_overlay(f.prev_focus);
+        let Some((id, prev_focus)) = self.overlays.take_float() else { return };
+        self.forget_overlay_pane(id);
+        let target = self.focus_after_overlay(prev_focus);
         self.set_focus(target);
         self.set_flash("scratch closed");
     }
@@ -6839,8 +6480,8 @@ impl<B: PaneBackend> App<B> {
             // bindings below, Alt+r's own toggle-off included.
             if key.code == KeyCode::Enter {
                 match &mut self.mode {
-                    Mode::PaneEdit { lines, row, col, .. } => {
-                        pane_edit_break(lines, row, col);
+                    Mode::PaneEdit { name, lines, row, col, .. } => {
+                        Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).brk();
                         return true;
                     }
                     // C36: the composer needs the same carve-out. On
@@ -6851,7 +6492,7 @@ impl<B: PaneBackend> App<B> {
                     // design audit; C36's "keys are C32's, exactly" was an
                     // overclaim until now.
                     Mode::Broadcast { lines, row, col, .. } => {
-                        broadcast_break(lines, row, col);
+                        Field::new(None, lines, row, col, BROADCAST_MAX_LINES).brk();
                         return true;
                     }
                     _ => {}
@@ -6968,64 +6609,7 @@ impl<B: PaneBackend> App<B> {
             Mode::Normal => false,
             Mode::Rename { buffer, cursor, target } => {
                 let target = *target;
-                // U16: only Ctrl+W/Ctrl+U are real edits here — the two
-                // every line editor on the platform binds — every *other*
-                // modified char is discarded: a chord roost doesn't
-                // implement must never leave its letter behind in a name.
-                // Every edit is relative to `cursor`, the point, which is
-                // what makes Ctrl+W's readline name ("word behind point")
-                // honest.
-                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
-                let len = buffer.chars().count();
-                *cursor = (*cursor).min(len);
                 match key.code {
-                    // Ctrl+U — readline's unix-line-discard: kill from the
-                    // point back to the start, keeping the tail. (It cleared
-                    // the whole buffer before, which was the same thing when
-                    // the point was always the end.)
-                    KeyCode::Char('u') if ctrl => {
-                        *buffer = buffer[byte_at(buffer, *cursor)..].to_string();
-                        *cursor = 0;
-                    }
-                    // Ctrl+W — readline's unix-word-rubout, over the text
-                    // behind the point only; whatever follows it survives.
-                    KeyCode::Char('w') if ctrl => {
-                        let at = byte_at(buffer, *cursor);
-                        let head = erase_word(&buffer[..at]);
-                        *cursor = head.chars().count();
-                        *buffer = head + &buffer[at..];
-                    }
-                    // Shift is how an uppercase letter arrives (kitty CSI-u
-                    // spells `A` as Shift+`a`), so it is the one modifier a
-                    // plain insert may carry.
-                    KeyCode::Char(c)
-                        if key
-                            .modifiers
-                            .difference(crossterm::event::KeyModifiers::SHIFT)
-                            .is_empty() =>
-                    {
-                        buffer.insert(byte_at(buffer, *cursor), c);
-                        *cursor += 1;
-                    }
-                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
-                    // Backspace eats the char *behind* the point, Delete the
-                    // one under it — the split every text field makes, and
-                    // impossible to offer before there was a point.
-                    KeyCode::Backspace => {
-                        if *cursor > 0 {
-                            *cursor -= 1;
-                            buffer.remove(byte_at(buffer, *cursor));
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if *cursor < len {
-                            buffer.remove(byte_at(buffer, *cursor));
-                        }
-                    }
-                    KeyCode::Left => *cursor = cursor.saturating_sub(1),
-                    KeyCode::Right => *cursor = (*cursor + 1).min(len),
-                    KeyCode::Home => *cursor = 0,
-                    KeyCode::End => *cursor = len,
                     KeyCode::Enter => {
                         let text = buffer.trim().to_string();
                         // Tab is the one Rename target left (C32 absorbed
@@ -7039,25 +6623,26 @@ impl<B: PaneBackend> App<B> {
                         self.mode = Mode::Normal;
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
-                    _ => {}
+                    _ => {
+                        // U16: a single-line `Field` — no lines, so the
+                        // vertical keys and line joins are no-ops here.
+                        let (mut none, mut row) = (Vec::new(), 0);
+                        Field::new(Some(buffer), &mut none, &mut row, cursor, 0).edit(key);
+                    }
                 }
                 true
             }
             Mode::Broadcast { lines, row, col, status_filter } => {
                 // C36: C32's editing vocabulary over a plain line buffer —
-                // no name row, so `row` indexes `lines` directly and the
-                // seam rules PaneEdit needs don't apply. Enter *sends*
-                // (Shift/Ctrl+Enter breaks a line, C32's convention), Tab
-                // cycles the target filter, Esc walks away having sent
-                // nothing.
+                // no name row, so the seam rules PaneEdit needs don't apply.
+                // Enter *sends* (Shift/Ctrl+Enter breaks a line, C32's
+                // convention), Tab cycles the target filter, Esc walks away
+                // having sent nothing.
                 let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
-                *row = (*row).min(lines.len().saturating_sub(1));
-                let len = lines[*row].chars().count();
-                *col = (*col).min(len);
                 match key.code {
                     KeyCode::Enter if shift || ctrl => {
-                        broadcast_break(lines, row, col);
+                        Field::new(None, lines, row, col, BROADCAST_MAX_LINES).brk();
                     }
                     KeyCode::Enter => {
                         let text = lines.join("\n").trim().to_string();
@@ -7075,113 +6660,24 @@ impl<B: PaneBackend> App<B> {
                         // `step_status_filter`. The roster keeps it.
                         *status_filter = step_status_filter(*status_filter, back, true);
                     }
-                    KeyCode::Char('u') if ctrl => {
-                        let cur = &mut lines[*row];
-                        *cur = cur[byte_at(cur, *col)..].to_string();
-                        *col = 0;
-                    }
-                    KeyCode::Char('w') if ctrl => {
-                        let cur = &mut lines[*row];
-                        let at = byte_at(cur, *col);
-                        let head = erase_word(&cur[..at]);
-                        *col = head.chars().count();
-                        *cur = head + &cur[at..];
-                    }
-                    KeyCode::Char(c)
-                        if key
-                            .modifiers
-                            .difference(crossterm::event::KeyModifiers::SHIFT)
-                            .is_empty() =>
-                    {
-                        let cur = &mut lines[*row];
-                        let at = byte_at(cur, *col);
-                        cur.insert(at, c);
-                        *col += 1;
-                    }
-                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
-                    KeyCode::Backspace => {
-                        if *col > 0 {
-                            *col -= 1;
-                            let cur = &mut lines[*row];
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row > 0 {
-                            let cur = lines.remove(*row);
-                            *row -= 1;
-                            *col = lines[*row].chars().count();
-                            lines[*row].push_str(&cur);
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if *col < len {
-                            let cur = &mut lines[*row];
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row + 1 < lines.len() {
-                            let next = lines.remove(*row + 1);
-                            lines[*row].push_str(&next);
-                        }
-                    }
-                    KeyCode::Left => {
-                        if *col > 0 {
-                            *col -= 1;
-                        } else if *row > 0 {
-                            *row -= 1;
-                            *col = lines[*row].chars().count();
-                        }
-                    }
-                    KeyCode::Right => {
-                        if *col < len {
-                            *col += 1;
-                        } else if *row + 1 < lines.len() {
-                            *row += 1;
-                            *col = 0;
-                        }
-                    }
-                    KeyCode::Up => {
-                        if *row > 0 {
-                            *row -= 1;
-                            *col = (*col).min(lines[*row].chars().count());
-                        }
-                    }
-                    KeyCode::Down => {
-                        if *row + 1 < lines.len() {
-                            *row += 1;
-                            *col = (*col).min(lines[*row].chars().count());
-                        }
-                    }
-                    KeyCode::Home => *col = 0,
-                    KeyCode::End => *col = len,
                     KeyCode::Esc => self.mode = Mode::Normal,
-                    _ => {}
+                    _ => Field::new(None, lines, row, col, BROADCAST_MAX_LINES).edit(key),
                 }
                 true
             }
             Mode::PaneEdit { name, lines, row, col, pane } => {
-                // C32 (combined): Rename's editing vocabulary on the
-                // current row — Ctrl+U/W, insert-at-point, Backspace/
-                // Delete, Home/End — where row 0 is the name and rows
-                // 1.. are the note; plus the vertical half: ↑↓ move rows,
-                // Shift+Enter (or Ctrl+Enter; Alt+Enter is caught in the
-                // Alt branch above) breaks — descend from the name, split
-                // inside the note — and ←→ flow across note line ends.
-                // Motion crosses the name/note seam; **edits never do**:
-                // Backspace at the note's top-left and Delete at the
-                // name's end are walls, so a typo can't merge status text
-                // into identity. Plain Enter commits both fields, Esc
-                // walks away.
+                // C32 (combined): Rename's editing vocabulary on the current
+                // row (`Field`), where row 0 is the name and rows 1.. are the
+                // note. Shift+Enter (or Ctrl+Enter; Alt+Enter is caught in
+                // the Alt branch above) breaks — descend from the name,
+                // split inside the note. Plain Enter commits both fields,
+                // Esc walks away.
                 let pane = *pane;
-                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
-                // Same stale-point hygiene as Rename: clamp, never slice
-                // bad. Unified rows: 0 = name, 1..=lines.len() = note.
-                *row = (*row).min(lines.len());
-                let len =
-                    if *row == 0 { name.chars().count() } else { lines[*row - 1].chars().count() };
-                *col = (*col).min(len);
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 match key.code {
                     KeyCode::Enter if shift || ctrl => {
-                        pane_edit_break(lines, row, col);
+                        Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).brk();
                     }
                     KeyCode::Enter => {
                         // Whole-text trims: an empty name clears back to
@@ -7209,100 +6705,8 @@ impl<B: PaneBackend> App<B> {
                         self.save();
                         self.mode = Mode::Normal;
                     }
-                    KeyCode::Char('u') if ctrl => {
-                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                        *cur = cur[byte_at(cur, *col)..].to_string();
-                        *col = 0;
-                    }
-                    KeyCode::Char('w') if ctrl => {
-                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                        let at = byte_at(cur, *col);
-                        let head = erase_word(&cur[..at]);
-                        *col = head.chars().count();
-                        *cur = head + &cur[at..];
-                    }
-                    KeyCode::Char(c)
-                        if key
-                            .modifiers
-                            .difference(crossterm::event::KeyModifiers::SHIFT)
-                            .is_empty() =>
-                    {
-                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                        let at = byte_at(cur, *col);
-                        cur.insert(at, c);
-                        *col += 1;
-                    }
-                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
-                    KeyCode::Backspace => {
-                        if *col > 0 {
-                            *col -= 1;
-                            let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row > 1 {
-                            // Note-internal join; row 1's left edge is the
-                            // wall — the note never merges into the name.
-                            let cur = lines.remove(*row - 1);
-                            *row -= 1;
-                            *col = lines[*row - 1].chars().count();
-                            lines[*row - 1].push_str(&cur);
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if *col < len {
-                            let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row >= 1 && *row < lines.len() {
-                            // Note-internal join; the name's end is the
-                            // wall in the other direction.
-                            let next = lines.remove(*row);
-                            lines[*row - 1].push_str(&next);
-                        }
-                    }
-                    // Motion crosses the seam — ←→ flow across row ends,
-                    // ↑↓ keep the column where they can.
-                    KeyCode::Left => {
-                        if *col > 0 {
-                            *col -= 1;
-                        } else if *row > 0 {
-                            *row -= 1;
-                            *col = if *row == 0 {
-                                name.chars().count()
-                            } else {
-                                lines[*row - 1].chars().count()
-                            };
-                        }
-                    }
-                    KeyCode::Right => {
-                        if *col < len {
-                            *col += 1;
-                        } else if *row < lines.len() {
-                            *row += 1;
-                            *col = 0;
-                        }
-                    }
-                    KeyCode::Up => {
-                        if *row > 0 {
-                            *row -= 1;
-                            let l = if *row == 0 {
-                                name.chars().count()
-                            } else {
-                                lines[*row - 1].chars().count()
-                            };
-                            *col = (*col).min(l);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if *row < lines.len() {
-                            *row += 1;
-                            *col = (*col).min(lines[*row - 1].chars().count());
-                        }
-                    }
-                    KeyCode::Home => *col = 0,
-                    KeyCode::End => *col = len,
                     KeyCode::Esc => self.mode = Mode::Normal,
-                    _ => {}
+                    _ => Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).edit(key),
                 }
                 true
             }
@@ -7910,7 +7314,7 @@ impl<B: PaneBackend> App<B> {
         // fleet dies, so a relaunch resumes immediately instead of racing a
         // lock release. (`kill_fleet`'s panic path relies on process death
         // releasing the flocks — no explicit handling needed there.)
-        self.pane_claims.clear();
+        self.detect.release_all();
         self.save();
         self.kill_fleet();
     }
@@ -8175,20 +7579,6 @@ pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/// U16: byte offset of char index `at` in `s` (clamped to the end) — the
-/// bridge between the rename cursor's char-space arithmetic and Rust's
-/// byte-indexed slicing. A name can hold multi-byte chars (an emoji, an
-/// accented word), and slicing one down the middle panics.
-fn byte_at(s: &str, at: usize) -> usize {
-    s.char_indices().nth(at).map_or(s.len(), |(b, _)| b)
-}
-
-/// C32: Shift/Ctrl/Alt+Enter in the combined editor, shared by the mode
-/// arm and the Alt-branch carve-out so the spellings can never drift. On
-/// the name row (`row` 0) it *descends* into the note — the name is
-/// single-line by contract, so "line break" there means "start writing
-/// the note", which makes name → note one continuous typing flow. On a
-/// note row it splits at the point via `note_split_line`.
 /// C27/C36: one step through `ROSTER_STATUS_CYCLE` (worst-first, with
 /// `None` = every tier at both ends so cycling never dead-ends). Shared by
 /// the roster's `Tab` and the broadcast composer's, so the two surfaces
@@ -8246,59 +7636,6 @@ fn step_status_filter(
         return past;
     }
     next
-}
-
-/// C36: split the composer's current line at the point.
-///
-/// **Capped at `BROADCAST_MAX_LINES`.** The dialog is `lines + 2` rows tall
-/// and `centered_near` clamps to the body, so without a cap a long enough
-/// message pushes its own rows — and the caret — off the bottom silently,
-/// with nothing to scroll them back. C32 caps its note for the same reason;
-/// this is that rule applied to the surface that borrowed its keys. At the
-/// cap the break is refused rather than partially applied: losing the split
-/// is recoverable, losing the text under it is not.
-fn broadcast_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
-    if lines.len() >= BROADCAST_MAX_LINES {
-        return;
-    }
-    let at = byte_at(&lines[*row], *col);
-    let tail = lines[*row].split_off(at);
-    lines.insert(*row + 1, tail);
-    *row += 1;
-    *col = 0;
-}
-
-fn pane_edit_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
-    if *row == 0 {
-        // Land at the headline's END, not at the name's column carried
-        // over: descending means "write the note now", and the writing
-        // point of an existing line is after its last character.
-        *row = 1;
-        *col = lines[0].chars().count();
-    } else {
-        let mut nrow = *row - 1;
-        note_split_line(lines, &mut nrow, col);
-        *row = nrow + 1;
-    }
-}
-
-/// C32: split the note line at the point. At `NOTE_MAX_LINES` the split
-/// is swallowed whole (no new line, nothing scrolled off the dialog);
-/// the clamps are the Rename arm's stale-point hygiene. `row`/`col` are
-/// **note-relative** (0 = the headline) — `pane_edit_break` converts from
-/// the editor's unified rows.
-fn note_split_line(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
-    if lines.len() >= NOTE_MAX_LINES {
-        return;
-    }
-    *row = (*row).min(lines.len() - 1);
-    let line = &mut lines[*row];
-    let at = byte_at(line, (*col).min(line.chars().count()));
-    let tail = line[at..].to_string();
-    line.truncate(at);
-    lines.insert(*row + 1, tail);
-    *row += 1;
-    *col = 0;
 }
 
 /// C32: wall-clock seconds for `noted_at`. A pre-1970 system clock yields
@@ -8363,20 +7700,9 @@ pub fn word_end(line: &str, col: u16, last: u16) -> u16 {
     i
 }
 
-/// U16: readline's `unix-word-rubout` over a text buffer — drop any trailing
-/// whitespace, then the whitespace-delimited word in front of it. Pure, so
-/// the boundary rule is pinned without a dialog. (The rename buffer has no
-/// cursor of its own yet, so "word behind point" is always "word at the
-/// end"; cursor motion inside the buffer stays out of scope — SPEC-ux U16.)
-pub fn erase_word(buffer: &str) -> String {
-    let mut chars: Vec<char> = buffer.chars().collect();
-    while chars.last().is_some_and(|c| c.is_whitespace()) {
-        chars.pop();
-    }
-    while chars.last().is_some_and(|c| !c.is_whitespace()) {
-        chars.pop();
-    }
-    chars.into_iter().collect()
+/// `App::find_spec`, over borrowed fields so the detector can hold `&mut App.detect` meanwhile.
+fn spec_in<'a>(ws: &'a Workspace, overlays: &'a Overlays, id: PaneId) -> Option<&'a PaneSpec> {
+    overlays.spec(id).or_else(|| ws.tabs.iter().find_map(|t| t.panes.get(&id)))
 }
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
@@ -8436,10 +7762,6 @@ pub fn display_name_live(spec: &PaneSpec, live: Option<&str>) -> String {
         .map(|f| format!(" · {f}"))
         .unwrap_or_default();
     format!("{}{cwd_tag}", spec.adapter)
-}
-
-fn strip_control(s: &str, keep_newline: bool) -> String {
-    s.chars().filter(|&c| !c.is_control() || (keep_newline && c == '\n')).collect()
 }
 
 /// P6: a pane's OSC title is untrusted text bound for roost's chrome (and,
@@ -8884,6 +8206,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::agents;
     use crate::ports::fakes::{FakePane, MemStore};
+    use crate::ports::{ClaimError, ClaimHandle};
     use std::path::PathBuf;
     use std::sync::mpsc;
 
@@ -11436,7 +10759,7 @@ pub(crate) mod tests {
         // The common shell-pane shape: an adapter with nowhere to look for a
         // session file must never arm the fs-scan fallback.
         let (app, _) = mk_rooted_app(None, None);
-        assert!(app.pending_detect.is_empty());
+        assert!(app.detect.pending.is_empty());
         assert!(app.runtimes.get(&1).unwrap().cmd.args.is_empty(), "expected a fresh launch");
     }
 
@@ -11850,23 +11173,6 @@ pub(crate) mod tests {
         let spec = app.find_spec(restored).unwrap();
         assert_eq!(spec.note.as_deref(), Some("parked: retry flaky e2e"));
         assert_eq!(spec.noted_at, Some(7));
-    }
-
-    /// U16: `unix-word-rubout`'s exact boundary rule — trailing whitespace
-    /// goes first, then one whole word; a buffer of only whitespace, or an
-    /// empty one, empties without panicking.
-    #[test]
-    fn erase_word_drops_trailing_space_then_one_word() {
-        use super::erase_word;
-        assert_eq!(erase_word("abc def"), "abc ");
-        assert_eq!(erase_word("abc def  "), "abc ");
-        assert_eq!(erase_word("abc"), "");
-        assert_eq!(erase_word("   "), "");
-        assert_eq!(erase_word(""), "");
-        // Repeated application walks back word by word, never wrapping past
-        // the start.
-        assert_eq!(erase_word(&erase_word("one two three")), "one ");
-        assert_eq!(erase_word(&erase_word(&erase_word("one two three"))), "");
     }
 
     /// U16: typing `abc` then Ctrl+W then Ctrl+U must commit the empty
@@ -13112,7 +12418,7 @@ pub(crate) mod tests {
     /// unclaimed file in that cwd whenever it was written. Agent CLIs write
     /// their session file *after* starting, so if the 2s tick lands in that
     /// gap the newest unclaimed file is a **previous conversation**, and
-    /// `set_session` commits it and drops the pane from `pending_detect` —
+    /// `set_session` commits it and drops the pane from `detect.pending` —
     /// permanently. The next quit/relaunch then resumes last week's
     /// session, which is what "it loads the wrong session" looks like.
     ///
@@ -13180,8 +12486,8 @@ pub(crate) mod tests {
         // window: the first draft did the latter, and reverting the fix
         // then left it green — it proved the scan honours a bound, not that
         // promotion supplies one. Tick once seeing a plain shell (which
-        // records `last_shell_seen`), then again seeing the agent.
-        app.pending_detect.clear();
+        // records `detect.last_shell_seen`), then again seeing the agent.
+        app.detect.pending.clear();
         app.runtimes.get_mut(&1).unwrap().observation =
             Some(crate::ports::Observation { cwd: None, agent: None });
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
@@ -13337,7 +12643,7 @@ pub(crate) mod tests {
         app.spawn_pane(1, &spec, rect);
         assert!(app.runtimes.contains_key(&1), "the same restore resumes once the claim frees");
         assert!(!app.dead.contains_key(&1), "the placeholder is gone");
-        assert!(app.pane_claims.contains_key(&1), "this instance now holds the claim");
+        assert!(app.detect.held.contains_key(&1), "this instance now holds the claim");
         assert_eq!(claims.snapshot()["detect.sess-1"], "b");
     }
 
@@ -13494,14 +12800,14 @@ pub(crate) mod tests {
             !app.dead.contains_key(&1) && app.runtimes.contains_key(&1),
             "an ordinary restore resumes"
         );
-        assert!(app.pane_claims.contains_key(&1), "the instance holds its own claim");
+        assert!(app.detect.held.contains_key(&1), "the instance holds its own claim");
 
         // Respawn the same pane on the same session — the layout-driven
         // respawn path re-runs spawn_pane with the saved session.
         let spec = app.find_spec(1).unwrap().clone();
         app.spawn_pane(1, &spec, Rect::new(0, 0, 80, 24));
         assert!(app.runtimes.contains_key(&1), "the respawn was not blocked by the held claim");
-        assert_eq!(app.pane_claims.len(), 1, "still exactly one handle for the pane");
+        assert_eq!(app.detect.held.len(), 1, "still exactly one handle for the pane");
         assert!(!app.dead.contains_key(&1));
     }
 
@@ -13515,11 +12821,11 @@ pub(crate) mod tests {
     fn respawn_fresh_releases_the_old_claim() {
         let claims = crate::ports::fakes::MemClaims::new("b");
         let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
-        assert!(app.pane_claims.contains_key(&1), "the restore claimed sess-1");
+        assert!(app.detect.held.contains_key(&1), "the restore claimed sess-1");
         assert!(claims.snapshot().contains_key("detect.sess-1"));
 
         app.respawn_focused(true);
-        assert!(!app.pane_claims.contains_key(&1), "the app-side bookkeeping is gone too");
+        assert!(!app.detect.held.contains_key(&1), "the app-side bookkeeping is gone too");
         assert!(
             !claims.snapshot().contains_key("detect.sess-1"),
             "the claim on the dropped id must be released, not held forever"
@@ -13576,14 +12882,14 @@ pub(crate) mod tests {
         let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
 
         app.spawn_float();
-        let float_id = app.float.as_ref().expect("float now exists").id;
+        let float_id = app.overlays.float_id().expect("float now exists");
         assert!(app.claim_session(float_id, "detect", "sess-2").is_ok());
-        assert!(app.pane_claims.contains_key(&float_id));
+        assert!(app.detect.held.contains_key(&float_id));
         assert!(claims.snapshot().contains_key("detect.sess-2"), "the float holds its claim");
 
         app.close_float();
         assert!(
-            !app.pane_claims.contains_key(&float_id),
+            !app.detect.held.contains_key(&float_id),
             "the float's own bookkeeping is gone too"
         );
         assert!(
@@ -13598,7 +12904,7 @@ pub(crate) mod tests {
     /// how the bound above was reopened.
     ///
     /// Pane ids are recycled (`alloc_pane_id` is max-live+1, C23), and
-    /// `last_shell_seen` — the map that supplies the promotion floor — was
+    /// `detect.last_shell_seen` — the map that supplies the promotion floor — was
     /// the one `PaneId`-keyed map `close_pane_id` did not prune. So a pane
     /// that sat at a shell prompt for hours left its stamp behind, and the
     /// next pane to take that id promoted against *that* clock instead of
@@ -13610,7 +12916,7 @@ pub(crate) mod tests {
     ///
     /// The consequence is identical to the original defect — the scan takes
     /// the newest unclaimed file in the window, `set_session` commits it and
-    /// drops the pane from `pending_detect`, so the next relaunch resumes an
+    /// drops the pane from `detect.pending`, so the next relaunch resumes an
     /// unrelated conversation, permanently.
     #[test]
     fn a_recycled_pane_id_does_not_inherit_the_dead_panes_promotion_floor() {
@@ -13649,19 +12955,19 @@ pub(crate) mod tests {
         // is seeded rather than waited for; what is under test is what
         // `close_pane_id` does with the stamp, not how it got there.
         let dead = app.spawn_child("shell", Some(dir.clone()), None).expect("room to split");
-        app.last_shell_seen.insert(dead, SystemTime::now() - Duration::from_secs(2 * 3600));
+        app.detect.last_shell_seen.insert(dead, SystemTime::now() - Duration::from_secs(2 * 3600));
         app.close_pane_id(dead);
         assert!(
-            !app.last_shell_seen.contains_key(&dead),
+            !app.detect.last_shell_seen.contains_key(&dead),
             "a closed pane's shell stamp outlived it",
         );
 
         // A new pane takes the freed id and is running its agent by the
         // first tick — never observed as a shell, so its floor can only come
-        // from whatever `last_shell_seen` still holds for this id.
+        // from whatever `detect.last_shell_seen` still holds for this id.
         let id = app.spawn_child("shell", Some(dir.clone()), None).expect("room to split");
         assert_eq!(id, dead, "the id must actually be recycled for this to test anything");
-        app.pending_detect.clear();
+        app.detect.pending.clear();
         app.runtimes.get_mut(&id).unwrap().observation =
             Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
@@ -13704,7 +13010,7 @@ pub(crate) mod tests {
             app.close_pane_id(*id);
         }
         app.apply(Action::ToggleFloat);
-        let float_id = app.float.as_ref().expect("the float is up").id;
+        let float_id = app.overlays.float_id().expect("the float is up");
         assert!(
             !parked.contains(&float_id),
             "the float took id {float_id}, which the parked tab still owns",
@@ -13854,7 +13160,7 @@ pub(crate) mod tests {
 
         app.close_pane_id(victim);
 
-        if app.float.as_ref().is_some_and(|f| f.shown) {
+        if app.overlays.float_shown() {
             assert!(
                 app.float_focused(),
                 "C22: the float is on screen but focus is on {}",
@@ -13889,7 +13195,7 @@ pub(crate) mod tests {
 
             if !app.float_focused() {
                 assert!(
-                    !app.float.as_ref().is_some_and(|f| f.shown),
+                    !app.overlays.float_shown(),
                     "{name}: the float is still drawn but focus is on {}",
                     app.focused,
                 );
@@ -13924,10 +13230,7 @@ pub(crate) mod tests {
         });
 
         assert_eq!(app.focused, float_id, "focus was borrowed, not taken");
-        assert!(
-            app.float.as_ref().is_some_and(|f| f.shown),
-            "the float is focused but no longer drawn",
-        );
+        assert!(app.overlays.float_shown(), "the float is focused but no longer drawn",);
 
         // The state that used to leak: a hidden-but-focused float becomes a
         // ghost pane in the tree the moment anything arranges by focus.
@@ -14120,12 +13423,8 @@ pub(crate) mod tests {
             assert_eq!(set.len(), ids.len(), "{ctx}: tab {i} tree lists a pane twice: {ids:?}");
             let keys: HashSet<PaneId> = tab.panes.keys().copied().collect();
             assert_eq!(set, keys, "{ctx}: tab {i} tree ids {set:?} != panes map keys {keys:?}");
-            if let Some(f) = &app.float {
-                assert!(
-                    !set.contains(&f.id),
-                    "{ctx}: tab {i} tree contains the float's id {}",
-                    f.id
-                );
+            if let Some(fid) = app.overlays.float_id() {
+                assert!(!set.contains(&fid), "{ctx}: tab {i} tree contains the float's id {fid}");
             }
             for id in ids {
                 if let Some(prev) = global.insert(id, i) {
@@ -14134,11 +13433,11 @@ pub(crate) mod tests {
             }
             inv_check_node(&tab.layout, ctx, i);
         }
-        if app.float.as_ref().is_some_and(|f| !f.shown && f.id == app.focused) {
+        if app.overlays.is_float(app.focused) && !app.overlays.float_shown() {
             panic!("{ctx}: the float is HIDDEN but still focused");
         }
         // C22 rule 1: a shown float is the focused pane.
-        if app.float.as_ref().is_some_and(|f| f.shown) {
+        if app.overlays.float_shown() {
             assert!(
                 app.float_focused(),
                 "{ctx}: the float is shown but focus is on {}",
@@ -14262,8 +13561,7 @@ pub(crate) mod tests {
                 // Leaving a shown float lands focus on its `prev_focus` first, even
                 // when the action then carries it elsewhere (a tab switch): that
                 // intermediate landing is a real focus move the property must allow.
-                let float_prev_before =
-                    app.float.as_ref().filter(|f| f.shown).map(|f| f.prev_focus);
+                let float_prev_before = app.overlays.prev();
                 let (name, action) = loop {
                     let pick = rng.below(43);
                     let d = dirs[rng.below(4) as usize];
@@ -14566,7 +13864,7 @@ pub(crate) mod tests {
                 if app.zoomed() {
                     zoom_seen += 1;
                 }
-                if app.float.as_ref().is_some_and(|f| f.shown) {
+                if app.overlays.float_shown() {
                     float_seen += 1;
                     if app.zoomed() {
                         float_and_zoom += 1;
@@ -14673,7 +13971,7 @@ pub(crate) mod tests {
 
     /// Detection must give up eventually.
     ///
-    /// `pending_detect` is only ever removed from on success
+    /// `detect.pending` is only ever removed from on success
     /// (`set_session`) or when the pane disappears. A pane whose agent
     /// never writes a session file roost can attribute — it exited early,
     /// it is an adapter with no session root reachable, or the scan keeps
@@ -14732,13 +14030,13 @@ pub(crate) mod tests {
 
         // Pending since well past any plausible agent startup, and the
         // session root is empty, so no scan will ever succeed.
-        app.pending_detect.clear();
-        app.pending_detect.insert(1, SystemTime::now() - Duration::from_secs(3600));
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, SystemTime::now() - Duration::from_secs(3600));
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
         app.tick();
 
         assert!(
-            !app.pending_detect.contains_key(&1),
+            !app.detect.pending.contains_key(&1),
             "still pending an hour on — roost will rescan the whole session root \
              every 2 seconds for the rest of the process's life",
         );
@@ -14805,7 +14103,7 @@ pub(crate) mod tests {
 
     /// The promotion floor must never be *loosened* by a later promotion.
     ///
-    /// `pending_detect.entry(id).or_insert(floor)` keeps whatever bound is
+    /// `detect.pending.entry(id).or_insert(floor)` keeps whatever bound is
     /// already there. A pane that promotes, fails to find a file (so stays
     /// pending), demotes when the agent exits, and promotes again hours
     /// later would keep the **first** floor — by then old enough to reach
@@ -14868,15 +14166,15 @@ pub(crate) mod tests {
         // Shell → agent: promoted, nothing on disk, so it stays pending.
         tick(&mut app, None);
         tick(&mut app, Some("detect"));
-        let first_floor = *app.pending_detect.get(&1).expect("pending after promotion");
+        let first_floor = *app.detect.pending.get(&1).expect("pending after promotion");
 
         // The agent exits (demote), the pane sits as a shell, then the user
         // launches it again much later.
         tick(&mut app, None);
-        app.last_shell_seen.insert(1, SystemTime::now() + Duration::from_secs(3600));
+        app.detect.last_shell_seen.insert(1, SystemTime::now() + Duration::from_secs(3600));
         tick(&mut app, Some("detect"));
 
-        let second_floor = *app.pending_detect.get(&1).expect("pending after re-promotion");
+        let second_floor = *app.detect.pending.get(&1).expect("pending after re-promotion");
         assert!(
             second_floor > first_floor,
             "the second promotion kept the first floor ({first_floor:?}), so its window \
@@ -15090,9 +14388,9 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        app.pending_detect.clear();
-        app.pending_detect.insert(1, base);
-        app.pending_detect.insert(2, base);
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, base);
+        app.detect.pending.insert(2, base);
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
         app.tick();
 
@@ -15104,6 +14402,84 @@ pub(crate) mod tests {
              global root that cannot say which project it belongs to: \
              pane1(proj-a)={a:?} pane2(proj-b)={b:?}",
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Claims port that never records a claim, so only the workspace (and
+    /// `poll`'s in-tick `adopted` set) can keep a session from a second pane.
+    struct UnrecordedClaims;
+    impl SessionClaims for UnrecordedClaims {
+        fn acquire(&self, _adapter: &str, _session: &str) -> Result<ClaimHandle, ClaimError> {
+            Err(ClaimError::Failed("claims dir unreadable".into()))
+        }
+        fn claimed(&self, _adapter: &str) -> HashSet<String> {
+            HashSet::new()
+        }
+    }
+
+    #[test]
+    fn one_new_session_file_is_adopted_by_only_one_of_two_same_cwd_panes_in_a_tick() {
+        let root = std::env::temp_dir().join(format!("roost-adopted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let base = SystemTime::now();
+        let f = root.join("only.jsonl");
+        std::fs::write(&f, "").unwrap();
+        std::fs::File::open(&f).unwrap().set_modified(base + Duration::from_millis(10)).unwrap();
+
+        let spec = || PaneSpec {
+            adapter: "unscoped".into(),
+            cwd: root.clone(),
+            session: None,
+            title: None,
+            spawned_by: None,
+            note: None,
+            noted_at: None,
+        };
+        let panes = HashMap::from([(1, spec()), (2, spec())]);
+        let layout = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("unscoped", Box::new(UnscopedAdapter(root.clone())));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(UnrecordedClaims),
+        )
+        .unwrap();
+
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, base);
+        app.detect.pending.insert(2, base);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let got: Vec<_> =
+            [1, 2].iter().filter_map(|id| app.find_spec(*id)?.session.clone()).collect();
+        assert_eq!(got.len(), 1, "one file, one adopter; got {got:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -15197,9 +14573,9 @@ pub(crate) mod tests {
         // Pane 1 "spawned" before either file existed (widest window); pane 2
         // "spawned" after file_a but before file_b — an ordering that
         // starves whichever pane is processed second if order isn't honored.
-        app.pending_detect.clear();
-        app.pending_detect.insert(1, base);
-        app.pending_detect.insert(2, base + Duration::from_millis(15));
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, base);
+        app.detect.pending.insert(2, base + Duration::from_millis(15));
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
 
         app.tick();
@@ -15297,14 +14673,14 @@ pub(crate) mod tests {
 
         // Pane 1 resumed cleanly at spawn (its "b" file exists), so only
         // pane 2 is left pending; `since` predates both files.
-        assert!(!app.pending_detect.contains_key(&1));
-        app.pending_detect.insert(2, base);
+        assert!(!app.detect.pending.contains_key(&1));
+        app.detect.pending.insert(2, base);
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
 
         app.tick();
 
         assert_eq!(app.find_spec(2).unwrap().session.as_deref(), Some("a"));
-        assert!(!app.pending_detect.contains_key(&2));
+        assert!(!app.detect.pending.contains_key(&2));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15333,7 +14709,7 @@ pub(crate) mod tests {
         assert_eq!(app.runtimes[&1].title_signal, Some(true));
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes[&1].adapter, "pi"); // persisted
-        assert!(app.pending_detect.contains_key(&1)); // queued for session detection
+        assert!(app.detect.pending.contains_key(&1)); // queued for session detection
     }
 
     #[test]
@@ -16174,7 +15550,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat); // spawn + show + focus
         let float_id = app.focused;
         app.apply(Action::ToggleFloat); // hide it again
-        assert!(!app.float.as_ref().unwrap().shown, "the float is hidden");
+        assert!(app.overlays.float_hidden(), "the float is hidden");
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         assert!(app.attention_ring().contains(&float_id), "C19 rings a hidden needy float");
 
@@ -18817,7 +18193,7 @@ pub(crate) mod tests {
         app.apply(Action::Focus(layout::Dir::Right));
         assert_eq!(app.focused, real_pane, "rule 2: back to prev_focus, not a cross-tab jump");
         assert_eq!(app.ws.active_tab, tab_before, "C31 must never fire while leaving the float");
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     // ---- C28: move the focused pane between tabs -------------------------
@@ -19394,7 +18770,7 @@ pub(crate) mod tests {
         assert_eq!(spawn_placed(&mut app, p).unwrap_err(), "--title needs --tab or --float");
         assert!(spawn_placed(&mut app, place(true, false, true)).is_err());
         assert_eq!(app.ws.tabs.len(), 1, "a refused spawn creates nothing");
-        assert!(app.popup.is_none());
+        assert!(app.overlays.popup_id().is_none());
     }
 
     #[test]
@@ -19404,11 +18780,11 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         assert_eq!(app.focused, id);
-        assert!(app.is_popup(id) && !app.is_float(id));
+        assert!(app.overlays.is_popup(id) && !app.is_float(id));
         assert!(app.runtimes.contains_key(&id));
         assert_eq!(app.display_rects()[0].id, id, "topmost");
         assert!(app.ws.tabs.iter().all(|t| !t.panes.contains_key(&id)), "never persisted");
-        assert_eq!(app.popup.as_ref().unwrap().prev_focus, below);
+        assert_eq!(app.overlays.prev().unwrap(), below);
     }
 
     #[test]
@@ -19418,7 +18794,7 @@ pub(crate) mod tests {
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         let err = spawn_placed(&mut app, place(false, false, true)).unwrap_err();
         assert_eq!(err, "a popup is already open");
-        assert!(app.is_popup(id) && app.runtimes.contains_key(&id));
+        assert!(app.overlays.is_popup(id) && app.runtimes.contains_key(&id));
     }
 
     #[test]
@@ -19428,7 +18804,7 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         app.on_pty_exit(id);
-        assert!(app.popup.is_none() && !app.runtimes.contains_key(&id));
+        assert!(app.overlays.popup_id().is_none() && !app.runtimes.contains_key(&id));
         assert_eq!(app.focused, below);
     }
 
@@ -19439,12 +18815,12 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         app.apply(Action::ToggleFloat);
-        assert!(app.popup.is_none() && !app.runtimes.contains_key(&id));
+        assert!(app.overlays.popup_id().is_none() && !app.runtimes.contains_key(&id));
         assert_eq!(app.focused, below);
         // Any tab change dismisses it too.
         spawn_placed(&mut app, place(false, false, true)).unwrap();
         app.apply(Action::NewTab);
-        assert!(app.popup.is_none());
+        assert!(app.overlays.popup_id().is_none());
     }
 
     #[test]
@@ -19453,7 +18829,7 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         spawn_placed(&mut app, place(false, false, false)).unwrap();
-        assert!(app.is_popup(id));
+        assert!(app.overlays.is_popup(id));
         assert_eq!(app.focused, id);
     }
 
@@ -19465,7 +18841,7 @@ pub(crate) mod tests {
         let scratch = app.focused;
         let popup =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
-        assert!(!app.float.as_ref().unwrap().shown, "scratch steps aside");
+        assert!(app.overlays.float_hidden(), "scratch steps aside");
         assert_eq!(app.display_rects()[0].id, popup);
         let token = app.control_token().to_string();
         let close = |app: &mut App<FakePane>, pane| {
@@ -19479,7 +18855,7 @@ pub(crate) mod tests {
             other => panic!("expected refusal, got {other:?}"),
         }
         assert!(matches!(close(&mut app, popup), Reply::Ok { .. }));
-        assert!(app.popup.is_none() && app.float.is_some());
+        assert!(app.overlays.popup_id().is_none() && app.overlays.float_id().is_some());
     }
 
     #[test]
@@ -19494,7 +18870,7 @@ pub(crate) mod tests {
             place: place(false, false, true),
         };
         app.handle_control(Request { token, method });
-        let id = app.popup.as_ref().unwrap().id;
+        let id = app.overlays.popup_id().unwrap();
         assert_eq!(app.runtimes[&id].cmd.args.last().map(String::as_str), Some("lazygit"));
         assert!(app.runtimes[&id].cmd.args.contains(&"-c".to_string()));
         assert!(!app.pending_input.contains_key(&id), "not typed into a prompt");
@@ -19522,7 +18898,7 @@ pub(crate) mod tests {
         let below = app.focused;
         spawn_placed(&mut app, place(false, false, true)).unwrap();
         app.on_click(below);
-        assert!(app.popup.is_none());
+        assert!(app.overlays.popup_id().is_none());
         assert_eq!(app.focused, below);
     }
 
@@ -19931,7 +19307,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleZoom);
         assert!(app.zoomed(), "setup: zoomed while solo");
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().is_some_and(|f| f.shown), "setup: float shown too");
+        assert!(app.overlays.float_shown(), "setup: float shown too");
         assert!(app.zoomed(), "setup: showing the float must not itself exit zoom");
 
         app.on_resize(Size::new(30, 10), (0, 0)); // too small for any of the three tiled shapes
@@ -19940,9 +19316,9 @@ pub(crate) mod tests {
         assert!(app.solo(), "the refusal must leave the tab in solo");
         assert!(app.zoomed(), "a refused Alt+g must not exit an unrelated zoom");
         assert!(
-            app.float.as_ref().is_some_and(|f| f.shown),
+            app.overlays.float_shown(),
             "nor hide an unrelated float: {:?}",
-            app.float.as_ref().map(|f| f.shown)
+            app.overlays.float_shown()
         );
         assert!(app.flash().is_some(), "the refusal must still say something");
     }
@@ -20154,14 +19530,6 @@ pub(crate) mod tests {
         // ...and demoting back to a shell drops the adoption again.
         spec.adapter = "shell".into();
         assert_eq!(display_name_live(&spec, Some("TASK-9 tests")), "shell · rqa-work");
-    }
-
-    #[test]
-    fn strip_control_drops_controls_and_optionally_keeps_newline() {
-        let s = "a\tb\x1bc\nd";
-        assert_eq!(strip_control(s, false), "abcd");
-        assert_eq!(strip_control(s, true), "abc\nd");
-        assert_eq!(strip_control("plain 日本", false), "plain 日本");
     }
 
     /// P6: an OSC title is untrusted text headed for roost's chrome and for
@@ -20813,8 +20181,8 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
         assert_ne!(float_id, real_pane);
-        assert!(app.float.as_ref().unwrap().shown);
-        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+        assert!(app.overlays.float_shown());
+        assert_eq!(app.overlays.prev().unwrap(), real_pane);
         let spec = app.find_spec(float_id).expect("float spec");
         assert_eq!(spec.adapter, "shell");
         assert_eq!(spec.title.as_deref(), Some("scratch"));
@@ -20832,7 +20200,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.apply(Action::ToggleFloat); // hide
         assert_eq!(app.focused, real_pane);
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
         assert!(app.runtimes.contains_key(&float_id), "process stays alive while hidden");
     }
 
@@ -20844,7 +20212,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat); // hide
         app.apply(Action::ToggleFloat); // show again
         assert_eq!(app.focused, float_id);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         assert_eq!(app.runtimes.len(), 2, "no second float spawned (real pane + float only)");
     }
 
@@ -20862,7 +20230,7 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.on_resize(Size::new(39, 20), (0, 0)); // body width 39 < the 40-col floor
         app.apply(Action::ToggleFloat);
-        assert!(app.float.is_none(), "must not spawn below the refusal floor");
+        assert!(app.overlays.float_id().is_none(), "must not spawn below the refusal floor");
         assert_eq!(app.flash(), Some("no room for float"));
     }
 
@@ -20907,7 +20275,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         app.apply(Action::Focus(crate::core::layout::Dir::Right));
         assert_eq!(app.focused, real_pane);
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20922,7 +20290,7 @@ pub(crate) mod tests {
             app.focused, real_pane,
             "Alt+a from the float returns to prev_focus, not a ring jump"
         );
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20930,9 +20298,9 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewTab);
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         app.apply(Action::GoToTab(0));
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20944,7 +20312,7 @@ pub(crate) mod tests {
         assert_ne!(float_id, 1);
         app.on_click(1);
         assert_eq!(app.focused, 1);
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20954,7 +20322,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.on_click(float_id);
         assert_eq!(app.focused, float_id);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
     }
 
     #[test]
@@ -20979,7 +20347,7 @@ pub(crate) mod tests {
             order.contains(&1) && order.contains(&2),
             "original panes must stay reachable: {order:?}"
         );
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20987,9 +20355,9 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         app.apply(Action::CycleLayout { forward: true });
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
         assert_eq!(app.pane_order().len(), 2, "the real 2-pane tab is untouched");
     }
 
@@ -20999,14 +20367,11 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1,2
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         app.apply(Action::QuickLaunch);
-        assert!(
-            app.float.as_ref().unwrap().shown,
-            "opening the picker alone must not hide the float"
-        );
+        assert!(app.overlays.float_shown(), "opening the picker alone must not hide the float");
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter)); // launches the first item
-        assert!(!app.float.as_ref().unwrap().shown, "picker launch (C22 rule 3) hides it");
+        assert!(app.overlays.float_hidden(), "picker launch (C22 rule 3) hides it");
         let order = app.pane_order();
         assert!(order.contains(&1) && order.contains(&2), "original panes survive: {order:?}");
     }
@@ -21047,7 +20412,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.apply(Action::ToggleZoom);
         assert!(!app.zoomed(), "must not zoom");
-        assert!(app.float.as_ref().unwrap().shown, "must not hide the float either");
+        assert!(app.overlays.float_shown(), "must not hide the float either");
         assert_eq!(app.focused, float_id);
         assert_eq!(app.flash(), Some("can't zoom the float"));
     }
@@ -21060,13 +20425,13 @@ pub(crate) mod tests {
         let float_id = app.focused;
         let undo_depth_before = app.undo.len();
         app.apply(Action::ClosePane);
-        assert!(app.float.is_none());
+        assert!(app.overlays.float_id().is_none());
         assert!(!app.runtimes.contains_key(&float_id));
         assert_eq!(app.focused, real_pane);
         assert_eq!(app.undo.len(), undo_depth_before, "scratch is not precious — no undo entry");
         assert_eq!(app.flash(), Some("scratch closed"));
         app.apply(Action::Undo); // must not somehow resurrect it
-        assert!(app.float.is_none());
+        assert!(app.overlays.float_id().is_none());
     }
 
     #[test]
@@ -21076,7 +20441,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::Working);
         app.apply(Action::ClosePane); // must close immediately, no confirm arm
-        assert!(app.float.is_none());
+        assert!(app.overlays.float_id().is_none());
         assert!(!app.runtimes.contains_key(&float_id));
     }
 
@@ -21097,7 +20462,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         app.apply(Action::ToggleFloat); // hide
         let rects = app.display_rects();
-        let float_id = app.float.as_ref().unwrap().id;
+        let float_id = app.overlays.float_id().unwrap();
         assert!(rects.iter().all(|pr| pr.id != float_id));
     }
 
@@ -21158,8 +20523,8 @@ pub(crate) mod tests {
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         app.apply(Action::JumpAttention);
         assert_eq!(app.focused, float_id);
-        assert!(app.float.as_ref().unwrap().shown);
-        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+        assert!(app.overlays.float_shown());
+        assert_eq!(app.overlays.prev().unwrap(), real_pane);
     }
 
     #[test]
@@ -21177,7 +20542,7 @@ pub(crate) mod tests {
             Reply::Err { err } => assert_eq!(err, "cannot close the scratch pane"),
             other => panic!("expected refusal, got {other:?}"),
         }
-        assert!(app.float.as_ref().unwrap().shown, "the float must survive the refused close");
+        assert!(app.overlays.float_shown(), "the float must survive the refused close");
     }
 
     /// M1: `find_spec` still learns the float (badges/rename/respawn need
@@ -21217,7 +20582,7 @@ pub(crate) mod tests {
 
     /// M1 (review round 2): `ctl_status(Some(float_id))` would leak the
     /// live status of the human's private scratch shell — same refusal,
-    /// through the same `float_refusal` helper, as close/send/read.
+    /// through the same `Overlays::refusal` helper, as close/send/read.
     #[test]
     fn control_status_of_the_float_is_refused() {
         use crate::core::control::{Method, Reply, Request};

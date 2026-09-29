@@ -39,21 +39,107 @@ use crate::infra::store::{
     WORKSPACE_LOCK,
 };
 
-const VERBS: &[&str] =
-    &["list", "status", "spawn", "fork", "send", "read", "close", "focus", "wait"];
+/// A verb option and how it consumes argv. `Text` is a value slot holding
+/// free-form prompt text, so even a recognized option name is a legal literal
+/// there; `Value` rejects that collision as a missing value.
+#[derive(Debug, PartialEq)]
+enum Opt {
+    Bool(&'static str),
+    Value(&'static str),
+    Text(&'static str),
+}
 
-/// Every verb option that consumes the next token as its value, across the
-/// whole verb table (confirmed against the `match` in `build_request`) —
+impl Opt {
+    fn name(&self) -> &'static str {
+        let (Opt::Bool(n) | Opt::Value(n) | Opt::Text(n)) = self;
+        n
+    }
+
+    fn takes_value(&self) -> bool {
+        !matches!(self, Opt::Bool(_))
+    }
+}
+
+/// One control verb. A new verb is one entry here plus its `build_request` arm
+/// (`every_registry_verb_has_a_build_request_arm` keeps the two honest).
+struct Verb {
+    name: &'static str,
+    help: &'static str,
+    /// Order is the order `reject_unknown_flags` lists them in its error.
+    opts: &'static [Opt],
+}
+
+const VERBS: &[Verb] = &[
+    Verb {
+        name: "list",
+        help: "roost list\nList every pane: id, adapter, cwd, status, …",
+        opts: &[],
+    },
+    Verb {
+        name: "status",
+        help: "roost status [PANE]\nOne pane's status, or every pane's if PANE is omitted.",
+        opts: &[],
+    },
+    Verb {
+        name: "spawn",
+        help: "roost spawn ADAPTER [--cwd DIR] [--input TEXT] [--tab [--title NAME]] [--float [--title NAME]] [--focus]\nLaunch a new pane running ADAPTER. By default it splits the focused pane and leaves your focus alone.\n--tab puts it alone in a new tab (named NAME); --float opens it as a focused popup that closes when it exits (one at a time; a shell popup runs --input as its command, like tmux display-popup -E);\n--focus moves focus to it. --tab and --float cannot be combined.",
+        opts: &[
+            Opt::Value("--cwd"),
+            Opt::Text("--input"),
+            Opt::Bool("--tab"),
+            Opt::Value("--title"),
+            Opt::Bool("--focus"),
+            Opt::Bool("--float"),
+        ],
+    },
+    Verb {
+        name: "fork",
+        help: "roost fork [PANE]\nA sibling pane in the same context; the focused pane's if PANE is omitted.",
+        opts: &[],
+    },
+    Verb {
+        name: "send",
+        help: "roost send PANE TEXT... [--enter]\nroost send --all TEXT... [--enter]\nType TEXT into PANE (or, with --all, every reachable pane). --enter also submits it.",
+        opts: &[Opt::Bool("--all"), Opt::Bool("--enter")],
+    },
+    Verb {
+        name: "read",
+        help: "roost read PANE [--tail N | --full]\nA pane's current screen (default), its last N lines, or its full scrollback.",
+        opts: &[Opt::Value("--tail"), Opt::Bool("--full")],
+    },
+    Verb {
+        name: "close",
+        help: "roost close PANE [--force]\nClose a pane; --force kills its process instead of asking it to exit.",
+        opts: &[Opt::Bool("--force")],
+    },
+    Verb {
+        name: "focus",
+        help: "roost focus PANE\nFocus a pane: switch to its tab and land focus on it (a no-op if it already is).",
+        opts: &[],
+    },
+    Verb {
+        name: "wait",
+        help: "roost wait PANE... [--until STATUS] [--timeout SEC]\nBlock until a pane reaches STATUS (default: waiting) or the timeout elapses.",
+        opts: &[Opt::Value("--until"), Opt::Value("--timeout")],
+    },
+];
+
+fn verb_spec(name: &str) -> Option<&'static Verb> {
+    VERBS.iter().find(|v| v.name == name)
+}
+
+/// Any verb's option called `name` — its kind is the same wherever it appears
+/// (`every_option_has_one_kind_across_verbs`), so the first hit is the answer.
+fn opt_spec(name: &str) -> Option<&'static Opt> {
+    VERBS.iter().flat_map(|v| v.opts).find(|o| o.name() == name)
+}
+
+/// Whether `name` is a verb option that consumes the next token as its value —
 /// shared by `positional` (which skips the value) and `strip_workspace_flag`
-/// (which must not mistake one for a positional), so the two can't drift
-/// apart by editing one and not the other.
-const VALUE_TAKING_OPTIONS: &[&str] =
-    &["--cwd", "--input", "--title", "--tail", "--until", "--timeout"];
-const BOOLEAN_OPTIONS: &[&str] =
-    &["--all", "--enter", "--full", "--force", "--tab", "--focus", "--float"];
-/// `--input` is prompt text, so even a recognized option name can be its
-/// literal value; typed options reject those collisions as missing values.
-const FREE_TEXT_VALUE_OPTIONS: &[&str] = &["--input"];
+/// (which must not mistake one for a positional).
+fn takes_value(name: &str) -> bool {
+    opt_spec(name).is_some_and(Opt::takes_value)
+}
 
 /// If the first CLI arg is a control verb, run as a client and return the exit
 /// code. Otherwise return None so `main` launches the TUI. Only a genuinely
@@ -129,7 +215,7 @@ pub fn maybe_run() -> Option<i32> {
         }
         return Some(run_ws(&args[1..]));
     }
-    if !VERBS.contains(&verb.as_str()) {
+    if verb_spec(verb).is_none() {
         // Same convention as a bad flag inside a known verb: hard error,
         // instead of falling through to the TUI (which used to seize the
         // terminal on a typo, or panic off one).
@@ -204,7 +290,7 @@ fn strip_workspace_flag(args: &[String]) -> Result<(Option<String>, Vec<String>)
                 continue;
             }
             if let Some(v) = verb {
-                if VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
+                if takes_value(a) {
                     // The option and its value travel together, untouched —
                     // the value never gets a chance to look like `-w` itself
                     // or (for `send`) like the verb's first positional.
@@ -367,22 +453,16 @@ Exit codes: 0 ok / 1 runtime error / 2 usage error / 3 `wait` timed out.";
 /// of `VERBS` here — every caller checks membership first — plus the local
 /// `ws` family, whose own dispatch hands `"ws"` straight through.
 fn verb_help(verb: &str) -> &'static str {
-    match verb {
-        "list" => "roost list\nList every pane: id, adapter, cwd, status, …",
-        "status" => "roost status [PANE]\nOne pane's status, or every pane's if PANE is omitted.",
-        "spawn" => "roost spawn ADAPTER [--cwd DIR] [--input TEXT] [--tab [--title NAME]] [--float [--title NAME]] [--focus]\nLaunch a new pane running ADAPTER. By default it splits the focused pane and leaves your focus alone.\n--tab puts it alone in a new tab (named NAME); --float opens it as a focused popup that closes when it exits (one at a time; a shell popup runs --input as its command, like tmux display-popup -E);\n--focus moves focus to it. --tab and --float cannot be combined.",
-        "fork" => "roost fork [PANE]\nA sibling pane in the same context; the focused pane's if PANE is omitted.",
-        "send" => "roost send PANE TEXT... [--enter]\nroost send --all TEXT... [--enter]\nType TEXT into PANE (or, with --all, every reachable pane). --enter also submits it.",
-        "read" => "roost read PANE [--tail N | --full]\nA pane's current screen (default), its last N lines, or its full scrollback.",
-        "close" => "roost close PANE [--force]\nClose a pane; --force kills its process instead of asking it to exit.",
-        "focus" => "roost focus PANE\nFocus a pane: switch to its tab and land focus on it (a no-op if it already is).",
-        "wait" => "roost wait PANE... [--until STATUS] [--timeout SEC]\nBlock until a pane reaches STATUS (default: waiting) or the timeout elapses.",
-        "ws" => "roost ws [ls [--json] | rm NAME | mv OLD NEW]\n\
+    if verb == "ws" {
+        return "roost ws [ls [--json] | rm NAME | mv OLD NEW]\n\
                  List every workspace (name, running/idle, tabs, panes, adapters, last saved;\n\
                  --json as a JSON array), delete an idle workspace's directory (rm), or rename\n\
                  one (mv). Read from the state root's files: no running roost is contacted,\n\
-                 and `default` can be listed but never renamed or deleted.",
-        _ => unreachable!("verb_help called with {verb:?}, not a member of VERBS"),
+                 and `default` can be listed but never renamed or deleted.";
+    }
+    match verb_spec(verb) {
+        Some(spec) => spec.help,
+        None => unreachable!("verb_help called with {verb:?}, not a member of VERBS"),
     }
 }
 
@@ -549,28 +629,24 @@ fn resolve_token(workspace_flag: Option<&str>) -> String {
 
 fn build_request(args: &[String], token: String) -> Result<serde_json::Value, String> {
     let verb = args[0].as_str();
+    let Some(spec) = verb_spec(verb) else { return Err(format!("unknown verb: {verb}")) };
     let rest = &args[1..];
     let mut m = serde_json::Map::new();
     m.insert("token".into(), token.into());
     m.insert("method".into(), verb.into());
+    // Allowed flags come from the registry, so no arm re-lists them.
+    reject_unknown_flags(spec, rest)?;
     match verb {
         "list" => {
-            reject_unknown_flags(verb, rest, &[])?;
             require_positionals(verb, rest, 0, 0, None)?;
         }
         "status" => {
-            reject_unknown_flags(verb, rest, &[])?;
             let pos = require_positionals(verb, rest, 0, 1, None)?;
             if let Some(p) = pos.first() {
                 insert_pane(&mut m, p)?;
             }
         }
         "spawn" => {
-            reject_unknown_flags(
-                verb,
-                rest,
-                &["--cwd", "--input", "--tab", "--title", "--focus", "--float"],
-            )?;
             let pos = require_positionals(verb, rest, 1, 1, Some("an ADAPTER"))?;
             let adapter = &pos[0];
             m.insert("adapter".into(), adapter.as_str().into());
@@ -590,14 +666,12 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             }
         }
         "fork" => {
-            reject_unknown_flags(verb, rest, &[])?;
             let pos = require_positionals(verb, rest, 0, 1, None)?;
             if let Some(p) = pos.first() {
                 insert_pane(&mut m, p)?;
             }
         }
         "send" => {
-            reject_unknown_flags(verb, rest, &["--all", "--enter"])?;
             let pos = positional(rest);
             if has_flag(rest, "--all") {
                 // --all replaces the PANE positional; a leading token that
@@ -620,7 +694,6 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             }
         }
         "read" => {
-            reject_unknown_flags(verb, rest, &["--tail", "--full"])?;
             let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
             insert_pane(&mut m, pane)?;
@@ -638,20 +711,17 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             m.insert("mode".into(), mode);
         }
         "close" => {
-            reject_unknown_flags(verb, rest, &["--force"])?;
             let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
             insert_pane(&mut m, pane)?;
             m.insert("force".into(), has_flag(rest, "--force").into());
         }
         "focus" => {
-            reject_unknown_flags(verb, rest, &[])?;
             let pos = require_positionals(verb, rest, 1, 1, Some("a PANE"))?;
             let pane = &pos[0];
             insert_pane(&mut m, pane)?;
         }
         "wait" => {
-            reject_unknown_flags(verb, rest, &["--until", "--timeout"])?;
             let pos = positional(rest);
             if pos.is_empty() {
                 return Err("wait needs at least one PANE".into());
@@ -726,8 +796,7 @@ fn end_of_options(args: &[String]) -> usize {
 /// sites. `--input` is exempt: its value is free-form prompt text, so even a
 /// recognized option name is a legal literal value for it.
 fn value_collides_with_flag(flag: &str, candidate: &str) -> bool {
-    !FREE_TEXT_VALUE_OPTIONS.contains(&flag)
-        && (VALUE_TAKING_OPTIONS.contains(&candidate) || BOOLEAN_OPTIONS.contains(&candidate))
+    !matches!(opt_spec(flag), Some(Opt::Text(_))) && opt_spec(candidate).is_some()
 }
 
 /// Every `--flag` in `args` ahead of `--` must be in `allowed`, or this is a
@@ -745,18 +814,23 @@ fn value_collides_with_flag(flag: &str, candidate: &str) -> bool {
 /// extra positional instead of erroring (e.g. `close` only ever reads its
 /// first positional). `send`'s positionals ARE free text — a message may
 /// itself start with `-` — so there only a recognised `--flag` counts.
-fn reject_unknown_flags(verb: &str, args: &[String], allowed: &[&str]) -> Result<(), String> {
+fn reject_unknown_flags(spec: &Verb, args: &[String]) -> Result<(), String> {
+    let verb = spec.name;
+    let allowed = |a: &str| spec.opts.iter().find(|o| o.name() == a);
     let end = end_of_options(args);
     let mut i = 0;
     while i < end {
         let a = &args[i];
         let flag_shaped = if verb == "send" { a.starts_with("--") } else { a.starts_with('-') };
-        if flag_shaped && !allowed.contains(&a.as_str()) {
-            let opts = if allowed.is_empty() { "(none)".to_string() } else { allowed.join("|") };
+        if flag_shaped && allowed(a).is_none() {
+            let opts = if spec.opts.is_empty() {
+                "(none)".to_string()
+            } else {
+                spec.opts.iter().map(Opt::name).collect::<Vec<_>>().join("|")
+            };
             return Err(format!("{verb}: unknown flag {a} (valid: {opts})"));
         }
-        let value_taking_allowed =
-            allowed.contains(&a.as_str()) && VALUE_TAKING_OPTIONS.contains(&a.as_str());
+        let value_taking_allowed = allowed(a).is_some_and(Opt::takes_value);
         if value_taking_allowed {
             if i + 1 >= end {
                 return Err(format!("{a} needs a value"));
@@ -784,7 +858,7 @@ fn positional(args: &[String]) -> Vec<String> {
         let a = &args[i];
         if a.starts_with("--") {
             // --cwd/--input/--tail/--until/--timeout take a value; skip it.
-            if VALUE_TAKING_OPTIONS.contains(&a.as_str()) {
+            if takes_value(a) {
                 i += 2;
             } else {
                 i += 1;
@@ -1368,47 +1442,24 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The invariant `reject_unknown_flags`/`flag_value`/`has_flag` all lean
-    /// on: no flag is in both `VALUE_TAKING_OPTIONS` and `BOOLEAN_OPTIONS`
-    /// (a flag can't both eat the next token and not), and every option any
-    /// verb actually accepts (mirrored here from `build_request`'s `match`)
-    /// is classified into exactly one of the two — an option added to a
-    /// verb's `allowed` list and left off both would fall through
-    /// unclassified rather than erroring loudly.
+    /// `takes_value`/`value_collides_with_flag` look an option up by name across
+    /// every verb, so the same name must mean the same kind everywhere.
     #[test]
-    fn value_taking_and_boolean_options_partition_every_verbs_allowed_flags() {
-        let overlap: Vec<&&str> = super::VALUE_TAKING_OPTIONS
-            .iter()
-            .filter(|f| super::BOOLEAN_OPTIONS.contains(f))
-            .collect();
-        assert!(overlap.is_empty(), "a flag can't be both value-taking and boolean: {overlap:?}");
-
-        let per_verb_allowed: &[(&str, &[&str])] = &[
-            ("list", &[]),
-            ("status", &[]),
-            ("spawn", &["--cwd", "--input", "--tab", "--title", "--focus", "--float"]),
-            ("fork", &[]),
-            ("send", &["--all", "--enter"]),
-            ("read", &["--tail", "--full"]),
-            ("close", &["--force"]),
-            ("focus", &[]),
-            ("wait", &["--until", "--timeout"]),
-        ];
-        assert_eq!(
-            per_verb_allowed.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
-            super::VERBS.to_vec(),
-            "keep this table in sync with build_request's match arms"
-        );
-        for (verb, allowed) in per_verb_allowed {
-            for flag in *allowed {
-                let value_taking = super::VALUE_TAKING_OPTIONS.contains(flag);
-                let boolean = super::BOOLEAN_OPTIONS.contains(flag);
-                assert!(
-                    value_taking ^ boolean,
-                    "{verb}'s {flag} must classify into exactly one of \
-                     VALUE_TAKING_OPTIONS/BOOLEAN_OPTIONS"
-                );
+    fn every_option_has_one_kind_across_verbs() {
+        let all = || VERBS.iter().flat_map(|v| v.opts);
+        for a in all() {
+            for b in all().filter(|b| b.name() == a.name()) {
+                assert_eq!(a, b, "{} is declared with two different kinds", a.name());
             }
+        }
+    }
+
+    /// A registry verb with no `build_request` arm would parse, then fail as unknown.
+    #[test]
+    fn every_registry_verb_has_a_build_request_arm() {
+        for v in VERBS {
+            let err = build_request(&argv(&[v.name]), "T".into()).err().unwrap_or_default();
+            assert!(!err.starts_with("unknown verb"), "{} has no working arm", v.name);
         }
     }
 
@@ -1417,7 +1468,7 @@ mod tests {
     /// and hand back argv with the verb still first.
     #[test]
     fn cli_workspace_flag_strips_from_every_position_of_every_verb() {
-        for verb in VERBS {
+        for verb in VERBS.iter().map(|v| v.name) {
             let (flag, rest) = strip_workspace_flag(&argv(&["-w", "x", verb])).unwrap();
             assert_eq!(flag.as_deref(), Some("x"), "-w before {verb}");
             assert_eq!(rest, vec![verb.to_string()]);
@@ -1806,9 +1857,9 @@ mod tests {
     #[test]
     fn cli_verb_help_is_distinct_and_leads_with_its_own_usage() {
         use std::collections::HashSet;
-        let texts: HashSet<&str> = super::VERBS.iter().map(|v| super::verb_help(v)).collect();
-        assert_eq!(texts.len(), super::VERBS.len(), "two verbs must not share identical help text");
-        for v in super::VERBS {
+        let texts: HashSet<&str> = VERBS.iter().map(|v| super::verb_help(v.name)).collect();
+        assert_eq!(texts.len(), VERBS.len(), "two verbs must not share identical help text");
+        for v in VERBS.iter().map(|v| v.name) {
             assert!(
                 super::verb_help(v).starts_with(&format!("roost {v}")),
                 "{v}'s help must lead with its own usage"
