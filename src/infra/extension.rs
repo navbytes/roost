@@ -162,7 +162,8 @@ fn opencode_version() -> Option<(u32, u32, u32)> {
 }
 
 fn parse_opencode_version(version: &str) -> Option<(u32, u32, u32)> {
-    let version = version.trim();
+    // v2 prints `opencode v2.0.18`; v1 prints a bare `1.18.32`.
+    let version = version.split_whitespace().last()?;
     let core = version.strip_prefix('v').unwrap_or(version).split(['-', '+']).next()?;
     let mut parts = core.split('.').map(str::parse);
     let version = (parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?);
@@ -1013,10 +1014,10 @@ mod tests {
     #[test]
     fn opencode_version_parses() {
         assert_eq!(parse_opencode_version("1.18.32\n"), Some((1, 18, 32)));
-        assert_eq!(parse_opencode_version("v2.0.18"), Some((2, 0, 18)));
+        assert_eq!(parse_opencode_version("opencode v2.0.18\n"), Some((2, 0, 18)));
         assert_eq!(parse_opencode_version("v2.0.18-beta.1+build-42"), Some((2, 0, 18)));
         assert_eq!(parse_opencode_version("1.3.4+build.7"), Some((1, 3, 4)));
-        for value in ["", "10.1", "2.0.18.1", "error 2.0.18", "local"] {
+        for value in ["", "10.1", "2.0.18.1", "opencode local"] {
             assert_eq!(parse_opencode_version(value), None);
         }
     }
