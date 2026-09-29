@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod control;
+pub mod detect;
 pub mod event;
 pub mod layout;
 pub mod session_resolver;

@@ -14,47 +14,18 @@ use crate::agents::{self, Registry};
 use crate::core::control::{
     Actor, Method, ReadMode, Reply, Request, SpawnPlace, TokenTable, UNAUTHORIZED_MSG,
 };
+use crate::core::detect::{Found, SessionDetector};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
 use crate::core::textfield::Field;
 use crate::core::workspace::{PaneSpec, Tab, TabView, Workspace};
-use crate::ports::{
-    ClaimError, ClaimHandle, ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore,
-};
+use crate::ports::{ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore};
 use crate::ui::input::{Action, Keymap};
 use crate::ui::render::state_word;
 
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Slack subtracted from a promoted pane's "last seen as a shell" bound.
-///
-/// `observe_panes` reads the process tree on a `DETECT_INTERVAL` tick, so
-/// its view can lag the truth by up to one tick: an agent that started at T
-/// may still be observed as a shell a moment later, and its session file —
-/// written at T — would then fall just outside a strict bound and never be
-/// found. A few seconds of slack absorbs that while still excluding
-/// everything a previous run left behind, which is the whole point.
-const PROMOTION_GRACE: Duration = Duration::from_secs(10);
-
-/// How long the filesystem fallback keeps looking for a pane's session file
-/// before giving up.
-///
-/// `pending_detect` was previously only cleared on success or when the pane
-/// vanished, so a pane whose agent never wrote a file roost could attribute
-/// stayed pending for the life of the process — and since no adapter
-/// overrides `detect_session`, each tick meant a full recursive walk of the
-/// whole session root (`~/.pi/agent/sessions`: every project, all history)
-/// stat-ing every file, twice a minute, forever.
-///
-/// A minute is far longer than any agent takes to create its session file,
-/// so giving up costs nothing real — and when it is wrong the failure is
-/// the safe one: the pane simply starts fresh next launch instead of
-/// resuming. The exact channel (the agent-side extension, design doc §6.1)
-/// does not go through `pending_detect` at all and keeps working after
-/// this expires.
-const DETECT_GIVE_UP: Duration = Duration::from_secs(60);
 
 /// F1: how long the "Alt keys aren't reaching roost" hint stays up after its
 /// most recent evidence (`App::alt_swallow_at`) — not since launch.
@@ -526,13 +497,8 @@ pub struct App<B: PaneBackend> {
     /// the host title (C4's workspace segment), the `status` reply and
     /// desktop notifications (D8: identity is title, env and status only).
     workspace: String,
-    /// Cross-instance session claims (D7): the port every acquire/release
-    /// goes through, plus this instance's open handles keyed by pane.
-    /// `pane_claims` carries the claimed session id beside each handle so a
-    /// respawn can tell "same session, keep the handle" from "new session,
-    /// re-claim" without asking the port twice.
-    claims: Box<dyn SessionClaims>,
-    pane_claims: HashMap<PaneId, (String, ClaimHandle)>,
+    /// Session detection state and cross-instance claims (D7).
+    detect: SessionDetector,
     store: Box<dyn StateStore>,
     /// Whether the most recent workspace save succeeded — the tab bar's
     /// right status area (C2) shows "saved ✓" while this is true and
@@ -545,24 +511,6 @@ pub struct App<B: PaneBackend> {
     /// by the terminal; (0, 0) when the host doesn't report pixels. Panes get
     /// a proportional share (`pane_pixels`) at spawn and on every resize.
     host_pixels: (u16, u16),
-    /// Freshly launched agent panes we still owe a session id.
-    pending_detect: HashMap<PaneId, SystemTime>,
-    /// When each pane was last observed running **no** agent — a plain
-    /// shell. The lower bound for a *promoted* pane's session detection.
-    ///
-    /// A pane promoted by the user typing `pi` at a shell prompt cannot own
-    /// a session file older than the last moment it was still a shell, so
-    /// this is the honest window. It used to be `SystemTime::UNIX_EPOCH` —
-    /// no bound at all — which let the scan claim the newest *unclaimed*
-    /// file in the project whenever it was written, i.e. a conversation
-    /// from days ago. See `PROMOTION_GRACE`.
-    last_shell_seen: HashMap<PaneId, SystemTime>,
-    /// Panes for which a detection candidate has already been skipped and
-    /// reported this conflict (D7: another running instance claims it).
-    /// Latched so the feed gets exactly one line per pane, not one every
-    /// tick for as long as the other workspace keeps the session — cleared
-    /// when the pane adopts a session or closes.
-    detect_conflict_latched: HashSet<PaneId>,
     last_detect: Instant,
     sock_path: Option<PathBuf>,
     /// `$HOME`, resolved once at startup — `focused_cwd()`'s `~`-abbreviation
@@ -813,9 +761,6 @@ impl<B: PaneBackend> App<B> {
             tx,
             term_size,
             host_pixels,
-            pending_detect: HashMap::new(),
-            last_shell_seen: HashMap::new(),
-            detect_conflict_latched: HashSet::new(),
             last_detect: Instant::now(),
             sock_path,
             home: dirs::home_dir(),
@@ -832,8 +777,7 @@ impl<B: PaneBackend> App<B> {
             tokens,
             ext_link_counts: HashMap::new(),
             workspace,
-            claims,
-            pane_claims: HashMap::new(),
+            detect: SessionDetector::new(claims),
             waiters: Vec::new(),
             pending_input: HashMap::new(),
             last_status: HashMap::new(),
@@ -1533,7 +1477,7 @@ impl<B: PaneBackend> App<B> {
             // claim that outlives the session it was taken for is exactly
             // the leak D7 exists to prevent, and nothing below re-claims for
             // this pane (no session survived `resolve` to claim instead).
-            self.pane_claims.remove(&id);
+            self.detect.release(id);
             // Persist the correction so the dead id isn't retried next launch.
             if let Some(s) = self.find_spec_mut(id) {
                 s.session = None;
@@ -1554,7 +1498,7 @@ impl<B: PaneBackend> App<B> {
                 // Owe this pane a session id? Watch for one (socket reports
                 // it exactly; the filesystem scan in tick() is the fallback).
                 if resolution.wants_detect {
-                    self.pending_detect.insert(id, SystemTime::now());
+                    self.detect.queue(id, SystemTime::now());
                 }
                 // C20: spawn owns the pane's "birth" line — diff_statuses
                 // deliberately stays silent on a pane's first observation.
@@ -1594,108 +1538,28 @@ impl<B: PaneBackend> App<B> {
         // Persist what each pane is actually running (live cwd, typed agent).
         self.observe_panes();
         // C20: one status-transition feed line per pane per tick, diffed
-        // against each pane's last-known status. Placed before the
-        // `pending_detect` early-return below so it always runs, whether or
-        // not any pane is mid-session-detection.
+        // against each pane's last-known status.
         self.diff_statuses();
-        if self.pending_detect.is_empty() {
-            return;
-        }
-        let mut pending: Vec<(PaneId, SystemTime)> =
-            self.pending_detect.iter().map(|(k, v)| (*k, *v)).collect();
-        // Newest spawn first: two panes launched into the same cwd share one
-        // session root, and `detect_session` just grabs the newest unclaimed
-        // file in its window. Processing oldest-first let an earlier pane's
-        // wider window see (and steal) a later pane's not-yet-claimed file,
-        // starving that pane of a session id forever (HashMap iteration order
-        // made this non-deterministic). Claiming newest-spawned-first mirrors
-        // file-creation order, so each pane gets its own file.
-        pending.sort_by_key(|(_, since)| std::cmp::Reverse(*since));
-        // Drop anything past the give-up horizon before scanning for it.
-        // Checked against the pane's own `since` rather than a separate
-        // clock so the window means the same thing here as it does in the
-        // scan: how long we have been looking for *this* pane's file.
-        let now = SystemTime::now();
-        self.pending_detect.retain(|_, since| {
-            now.duration_since(*since).map(|age| age < DETECT_GIVE_UP).unwrap_or(true)
-        });
-        pending.retain(|(id, _)| self.pending_detect.contains_key(id));
-        for (id, since) in pending.clone() {
-            let Some((spec, adapter)) = self
-                .find_spec(id)
-                .and_then(|s| self.registry.get(s.adapter.as_str()).map(|a| (s.clone(), a)))
-            else {
-                self.pending_detect.remove(&id);
-                continue;
-            };
-            // Two panes in *different projects* whose adapter gives them the
-            // same session root cannot be told apart by this scan at all:
-            // the root carries no cwd signal (codex buckets rollouts by
-            // date, `~/.codex/sessions` for every project), so the only
-            // thing separating the candidates is mtime order, which says
-            // nothing about whose they are. Decline rather than guess.
-            //
-            // **A wrong session is far worse than no session.** Losing a
-            // resume pointer costs the user a `--continue`; attaching a
-            // pane to another project's conversation corrupts work in it.
-            // Declining leaves the pane pending, so the exact channel (the
-            // agent-side extension) can still report it, and the scan
-            // retries the moment the ambiguity clears.
-            //
-            // Same-cwd concurrency is *not* ambiguous in this sense and is
-            // deliberately still allowed: both panes really are in that
-            // project, and the newest-first ordering above mirrors file
-            // creation order so each takes its own.
-            let root = adapter.session_root(&spec.cwd);
-            let ambiguous = root.is_some()
-                && pending.iter().any(|(other, _)| {
-                    *other != id
-                        && self.find_spec(*other).is_some_and(|o| {
-                            o.adapter == spec.adapter
-                                && o.cwd != spec.cwd
-                                && self
-                                    .registry
-                                    .get(o.adapter.as_str())
-                                    .and_then(|a| a.session_root(&o.cwd))
-                                    == root
-                        })
-                });
-            if ambiguous {
-                continue;
-            }
-            // Session ids already owned by other panes — never re-assign one
-            // (concurrent same-cwd launches otherwise cross-wire onto it).
-            // D7 widens the set with ids other running instances hold claims
-            // on, so detection keeps scanning past anything another workspace
-            // is already driving instead of adopting it.
-            let mut taken = session_resolver::claimed_sessions(&self.ws);
-            taken.extend(self.claims.claimed(&spec.adapter));
-            if let Some(session) = adapter.detect_session(&spec.cwd, since, &taken) {
-                // Claim before adopting (D7): between the snapshot above and
-                // now another instance may have taken it — then keep scanning
-                // on the next tick rather than adopting a claimed session.
-                // Unlike the restore conflict above (once per spawn),
-                // detection retries every tick — latched so a held candidate
-                // gets exactly one feed line per pane, not one every tick
-                // for as long as the other workspace keeps running.
-                match self.claim_session(id, &spec.adapter, &session) {
-                    Ok(()) => {
-                        self.detect_conflict_latched.remove(&id);
-                        self.set_session(id, session);
+        let (ws, float, popup) = (&self.ws, &self.float, &self.popup);
+        let found = self
+            .detect
+            .poll(SystemTime::now(), &self.registry, ws, |id| spec_in(ws, float, popup, id));
+        for f in found {
+            match f {
+                Found::Adopted { id, session, unavailable } => {
+                    if let Some(e) = unavailable {
+                        self.claim_unavailable(id, &e);
                     }
-                    Err(owner) => {
-                        if self.detect_conflict_latched.insert(id) {
-                            self.push_feed(
-                                format!(
-                                    "{}: session {session} is held by {owner} — still scanning",
-                                    self.feed_label(id)
-                                ),
-                                false,
-                                Some(id),
-                            );
-                        }
-                    }
+                    self.set_session(id, session);
                 }
+                Found::Held { id, session, owner } => self.push_feed(
+                    format!(
+                        "{}: session {session} is held by {owner} — still scanning",
+                        self.feed_label(id)
+                    ),
+                    false,
+                    Some(id),
+                ),
             }
         }
     }
@@ -1783,8 +1647,8 @@ impl<B: PaneBackend> App<B> {
 
         let mut dirty = false;
         let mut promoted: Vec<PaneId> = Vec::new();
-        // Panes observed running no agent this tick — `last_shell_seen`
-        // (collected here and written after the loop, since `find_spec_mut`
+        // Panes observed running no agent this tick, for the detector
+        // (collected here, applied after the loop, since `find_spec_mut`
         // holds `self`).
         let mut still_shell: Vec<PaneId> = Vec::new();
         // D5: adapter flips collected here and pushed into the runtimes'
@@ -1809,10 +1673,6 @@ impl<B: PaneBackend> App<B> {
             // Reflect the running agent: promote a shell that's now running pi
             // to the pi adapter; demote back to shell when the agent exits.
             let want = o.agent.unwrap_or_else(|| agents::SHELL.to_string());
-            // Not gated on a *transition*: a pane sitting at a shell prompt
-            // for an hour must keep moving this bound forward, or the
-            // window it eventually gets on promotion would reach back to
-            // whenever it last changed state.
             if want == agents::SHELL {
                 still_shell.push(id);
             }
@@ -1841,41 +1701,7 @@ impl<B: PaneBackend> App<B> {
                 rt.set_title_signal(enabled);
             }
         }
-        let now = SystemTime::now();
-        for id in still_shell {
-            self.last_shell_seen.insert(id, now);
-        }
-        // A newly-recognized agent needs its already-created session file
-        // located — it was written moments before roost noticed, so `now()`
-        // would miss it. The bound is **the last tick this pane was still a
-        // shell**, minus `PROMOTION_GRACE` for observation lag.
-        //
-        // This used to be `SystemTime::UNIX_EPOCH`, on the reasoning that a
-        // wide window "plus the taken-set finds it without cross-wiring".
-        // The taken-set does not carry that weight: `claimed_sessions` only
-        // knows ids stored on *live* panes, so a conversation from a closed
-        // pane or an earlier run is unclaimed and therefore eligible. With
-        // no lower bound the scan took the newest such file whenever it was
-        // written, `set_session` committed it, and the pane was dropped from
-        // `pending_detect` — so the mistake was permanent, and the next
-        // relaunch resumed a conversation from days ago. Reported as "it
-        // loads the wrong session"; pinned by
-        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`.
-        for id in promoted {
-            let floor = self
-                .last_shell_seen
-                .get(&id)
-                .copied()
-                .unwrap_or(now)
-                .checked_sub(PROMOTION_GRACE)
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            // `max`, not `or_insert`: the window may only ever **tighten**.
-            // A pane that promotes, finds nothing (so stays pending),
-            // demotes when the agent exits, then promotes again hours later
-            // would otherwise keep its first floor — by then old enough to
-            // reach conversations from earlier in the same session.
-            self.pending_detect.entry(id).and_modify(|f| *f = (*f).max(floor)).or_insert(floor);
-        }
+        self.detect.observe(still_shell, promoted, SystemTime::now());
         for cwd in visited {
             self.note_cwd(cwd);
         }
@@ -1994,10 +1820,7 @@ impl<B: PaneBackend> App<B> {
     /// them), but each then adds its own is-float refusal (M1) — the float
     /// is the human's private scratch shell, never a control-plane target.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
-        if let Some(f) = self.float.iter().chain(&self.popup).find(|f| f.id == id) {
-            return Some(&f.spec);
-        }
-        self.ws.tabs.iter().find_map(|t| t.panes.get(&id))
+        spec_in(&self.ws, &self.float, &self.popup, id)
     }
 
     /// The focused pane's working directory, `$HOME` abbreviated to `~`,
@@ -3067,41 +2890,9 @@ impl<B: PaneBackend> App<B> {
         self.last_status.remove(&id);
         self.needy_msgs.remove(&id);
         self.visited_waiting.remove(&id);
-        // And once more, for the two session-detection maps — the last
-        // `PaneId`-keyed state in `App` that close was not pruning, and the
-        // one where inheriting a dead pane's entry is not cosmetic.
-        //
-        // `last_shell_seen` is the floor `observe_panes` gives a promoted
-        // pane's session scan ("the last tick this pane was still a
-        // shell"). A pane that sat at a prompt for two hours leaves a
-        // two-hour-old stamp behind; a later pane taking that id and
-        // promoting before its own first shell observation — which is the
-        // normal case for a pane spawned with initial input, since it is
-        // running the agent within milliseconds — inherits it and scans two
-        // hours back. That is exactly the window
-        // `a_promoted_pane_never_claims_a_session_older_than_its_shell`
-        // exists to close, reopened through the recycled id: the scan takes
-        // the newest unclaimed file in that window, `set_session` commits
-        // it permanently, and the next relaunch resumes a stranger's
-        // conversation.
-        //
-        // `pending_detect` is the same hazard one step later: a pane closed
-        // mid-detection leaves its window keyed on the id, and `tick` only
-        // discards it if the id resolves to no spec at all — so an id
-        // recycled within the tick keeps hunting on the dead pane's clock,
-        // and can overwrite a session the new pane was resuming with an
-        // unrelated one.
-        self.last_shell_seen.remove(&id);
-        self.pending_detect.remove(&id);
-        // Same recycled-id reason once more: an inherited latch would
-        // silently swallow the new pane's own first conflict notification.
-        self.detect_conflict_latched.remove(&id);
-        // D7: drop the pane's session claim, releasing it for every other
-        // running instance. Pane ids are recycled, so an unremoved entry is
-        // not just a leak — a later pane with this id would inherit the
-        // claim (and, worse, its release-on-drop would later free a claim
-        // the new pane never took).
-        self.pane_claims.remove(&id);
+        // D7/C23: session detection state and the pane's session claim —
+        // see `SessionDetector::forget_pane` for why recycled ids matter.
+        self.detect.forget_pane(id);
         // C40: and the pull mark, for the same recycled-id reason — a mark
         // left pointing at a closed pane would be pulled by whichever pane
         // inherited the number next.
@@ -3174,42 +2965,22 @@ impl<B: PaneBackend> App<B> {
     fn set_session(&mut self, id: PaneId, session: String) {
         if let Some(spec) = self.find_spec_mut(id) {
             spec.session = Some(session);
-            self.pending_detect.remove(&id);
+            self.detect.unqueue(id);
             self.save();
         }
     }
 
-    /// D7: claim `(adapter, session)` for pane `id` across all running
-    /// instances, keeping one handle per pane in `pane_claims`. The bookkeeping
-    /// is deliberately here, not in the port: a pane respawn re-runs the
-    /// restore path, and re-acquiring while still holding the same claim is
-    /// refused by the lock itself — so the *app* releases before re-acquiring,
-    /// which is also what makes the single-instance case never self-block.
-    ///
-    /// - Same pane, same session: keep the existing handle (idempotent).
-    /// - Same pane, new session: drop the old handle, take the new claim.
-    /// - `Failed` (claims dir unreadable etc.): proceed **unclaimed** — claims
-    ///   are advisory best-effort (see `ports::ClaimError`), and a broken
-    ///   claims dir must not brick every restore.
-    /// - `Held`: refused; the caller owns the user-visible degradation.
+    /// D7: `SessionDetector::claim`, with the advisory-failure note put on
+    /// the feed so it is not fully silent.
     fn claim_session(&mut self, id: PaneId, adapter: &str, session: &str) -> Result<(), String> {
-        if self.pane_claims.get(&id).is_some_and(|(s, _)| s == session) {
-            return Ok(());
+        if let Some(e) = self.detect.claim(id, adapter, session)? {
+            self.claim_unavailable(id, &e);
         }
-        self.pane_claims.remove(&id);
-        match self.claims.acquire(adapter, session) {
-            Ok(handle) => {
-                self.pane_claims.insert(id, (session.to_string(), handle));
-                Ok(())
-            }
-            Err(ClaimError::Held(desc)) => Err(desc),
-            Err(ClaimError::Failed(e)) => {
-                // Advisory port failed, not held: proceed without a claim.
-                // The feed line keeps the failure from being fully silent.
-                self.push_feed(format!("session claim unavailable: {e}"), false, Some(id));
-                Ok(())
-            }
-        }
+        Ok(())
+    }
+
+    fn claim_unavailable(&mut self, id: PaneId, err: &str) {
+        self.push_feed(format!("session claim unavailable: {err}"), false, Some(id));
     }
 
     // -- event handling ----------------------------------------------------
@@ -4326,7 +4097,7 @@ impl<B: PaneBackend> App<B> {
             // otherwise a pane that gives up on a dead session keeps the
             // claim held, blocking every other workspace from ever
             // resuming it even though this pane no longer represents it.
-            self.pane_claims.remove(&id);
+            self.detect.release(id);
             if let Some(spec) = self.find_spec_mut(id) {
                 spec.session = None;
             }
@@ -6729,7 +6500,7 @@ impl<B: PaneBackend> App<B> {
         // D7: a float promoted to an agent claims a session like any other
         // pane (`claim_session`) — drop it here too, or a closed scratch
         // float keeps holding it for every other running instance forever.
-        self.pane_claims.remove(&id);
+        self.detect.release(id);
     }
 
     /// Kill the popup without touching focus; returns where focus was.
@@ -7637,7 +7408,7 @@ impl<B: PaneBackend> App<B> {
         // fleet dies, so a relaunch resumes immediately instead of racing a
         // lock release. (`kill_fleet`'s panic path relies on process death
         // releasing the flocks — no explicit handling needed there.)
-        self.pane_claims.clear();
+        self.detect.release_all();
         self.save();
         self.kill_fleet();
     }
@@ -8021,6 +7792,19 @@ pub fn word_end(line: &str, col: u16, last: u16) -> u16 {
         i += 1;
     }
     i
+}
+
+/// `App::find_spec`, over borrowed fields so the detector can hold `&mut App.detect` meanwhile.
+fn spec_in<'a>(
+    ws: &'a Workspace,
+    float: &'a Option<Float>,
+    popup: &'a Option<Float>,
+    id: PaneId,
+) -> Option<&'a PaneSpec> {
+    if let Some(f) = float.iter().chain(popup).find(|f| f.id == id) {
+        return Some(&f.spec);
+    }
+    ws.tabs.iter().find_map(|t| t.panes.get(&id))
 }
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
@@ -8524,6 +8308,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::agents;
     use crate::ports::fakes::{FakePane, MemStore};
+    use crate::ports::{ClaimError, ClaimHandle};
     use std::path::PathBuf;
     use std::sync::mpsc;
 
@@ -11076,7 +10861,7 @@ pub(crate) mod tests {
         // The common shell-pane shape: an adapter with nowhere to look for a
         // session file must never arm the fs-scan fallback.
         let (app, _) = mk_rooted_app(None, None);
-        assert!(app.pending_detect.is_empty());
+        assert!(app.detect.pending.is_empty());
         assert!(app.runtimes.get(&1).unwrap().cmd.args.is_empty(), "expected a fresh launch");
     }
 
@@ -12735,7 +12520,7 @@ pub(crate) mod tests {
     /// unclaimed file in that cwd whenever it was written. Agent CLIs write
     /// their session file *after* starting, so if the 2s tick lands in that
     /// gap the newest unclaimed file is a **previous conversation**, and
-    /// `set_session` commits it and drops the pane from `pending_detect` —
+    /// `set_session` commits it and drops the pane from `detect.pending` —
     /// permanently. The next quit/relaunch then resumes last week's
     /// session, which is what "it loads the wrong session" looks like.
     ///
@@ -12803,8 +12588,8 @@ pub(crate) mod tests {
         // window: the first draft did the latter, and reverting the fix
         // then left it green — it proved the scan honours a bound, not that
         // promotion supplies one. Tick once seeing a plain shell (which
-        // records `last_shell_seen`), then again seeing the agent.
-        app.pending_detect.clear();
+        // records `detect.last_shell_seen`), then again seeing the agent.
+        app.detect.pending.clear();
         app.runtimes.get_mut(&1).unwrap().observation =
             Some(crate::ports::Observation { cwd: None, agent: None });
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
@@ -12960,7 +12745,7 @@ pub(crate) mod tests {
         app.spawn_pane(1, &spec, rect);
         assert!(app.runtimes.contains_key(&1), "the same restore resumes once the claim frees");
         assert!(!app.dead.contains_key(&1), "the placeholder is gone");
-        assert!(app.pane_claims.contains_key(&1), "this instance now holds the claim");
+        assert!(app.detect.held.contains_key(&1), "this instance now holds the claim");
         assert_eq!(claims.snapshot()["detect.sess-1"], "b");
     }
 
@@ -13117,14 +12902,14 @@ pub(crate) mod tests {
             !app.dead.contains_key(&1) && app.runtimes.contains_key(&1),
             "an ordinary restore resumes"
         );
-        assert!(app.pane_claims.contains_key(&1), "the instance holds its own claim");
+        assert!(app.detect.held.contains_key(&1), "the instance holds its own claim");
 
         // Respawn the same pane on the same session — the layout-driven
         // respawn path re-runs spawn_pane with the saved session.
         let spec = app.find_spec(1).unwrap().clone();
         app.spawn_pane(1, &spec, Rect::new(0, 0, 80, 24));
         assert!(app.runtimes.contains_key(&1), "the respawn was not blocked by the held claim");
-        assert_eq!(app.pane_claims.len(), 1, "still exactly one handle for the pane");
+        assert_eq!(app.detect.held.len(), 1, "still exactly one handle for the pane");
         assert!(!app.dead.contains_key(&1));
     }
 
@@ -13138,11 +12923,11 @@ pub(crate) mod tests {
     fn respawn_fresh_releases_the_old_claim() {
         let claims = crate::ports::fakes::MemClaims::new("b");
         let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
-        assert!(app.pane_claims.contains_key(&1), "the restore claimed sess-1");
+        assert!(app.detect.held.contains_key(&1), "the restore claimed sess-1");
         assert!(claims.snapshot().contains_key("detect.sess-1"));
 
         app.respawn_focused(true);
-        assert!(!app.pane_claims.contains_key(&1), "the app-side bookkeeping is gone too");
+        assert!(!app.detect.held.contains_key(&1), "the app-side bookkeeping is gone too");
         assert!(
             !claims.snapshot().contains_key("detect.sess-1"),
             "the claim on the dropped id must be released, not held forever"
@@ -13201,12 +12986,12 @@ pub(crate) mod tests {
         app.spawn_float();
         let float_id = app.float.as_ref().expect("float now exists").id;
         assert!(app.claim_session(float_id, "detect", "sess-2").is_ok());
-        assert!(app.pane_claims.contains_key(&float_id));
+        assert!(app.detect.held.contains_key(&float_id));
         assert!(claims.snapshot().contains_key("detect.sess-2"), "the float holds its claim");
 
         app.close_float();
         assert!(
-            !app.pane_claims.contains_key(&float_id),
+            !app.detect.held.contains_key(&float_id),
             "the float's own bookkeeping is gone too"
         );
         assert!(
@@ -13221,7 +13006,7 @@ pub(crate) mod tests {
     /// how the bound above was reopened.
     ///
     /// Pane ids are recycled (`alloc_pane_id` is max-live+1, C23), and
-    /// `last_shell_seen` — the map that supplies the promotion floor — was
+    /// `detect.last_shell_seen` — the map that supplies the promotion floor — was
     /// the one `PaneId`-keyed map `close_pane_id` did not prune. So a pane
     /// that sat at a shell prompt for hours left its stamp behind, and the
     /// next pane to take that id promoted against *that* clock instead of
@@ -13233,7 +13018,7 @@ pub(crate) mod tests {
     ///
     /// The consequence is identical to the original defect — the scan takes
     /// the newest unclaimed file in the window, `set_session` commits it and
-    /// drops the pane from `pending_detect`, so the next relaunch resumes an
+    /// drops the pane from `detect.pending`, so the next relaunch resumes an
     /// unrelated conversation, permanently.
     #[test]
     fn a_recycled_pane_id_does_not_inherit_the_dead_panes_promotion_floor() {
@@ -13272,19 +13057,19 @@ pub(crate) mod tests {
         // is seeded rather than waited for; what is under test is what
         // `close_pane_id` does with the stamp, not how it got there.
         let dead = app.spawn_child("shell", Some(dir.clone()), None).expect("room to split");
-        app.last_shell_seen.insert(dead, SystemTime::now() - Duration::from_secs(2 * 3600));
+        app.detect.last_shell_seen.insert(dead, SystemTime::now() - Duration::from_secs(2 * 3600));
         app.close_pane_id(dead);
         assert!(
-            !app.last_shell_seen.contains_key(&dead),
+            !app.detect.last_shell_seen.contains_key(&dead),
             "a closed pane's shell stamp outlived it",
         );
 
         // A new pane takes the freed id and is running its agent by the
         // first tick — never observed as a shell, so its floor can only come
-        // from whatever `last_shell_seen` still holds for this id.
+        // from whatever `detect.last_shell_seen` still holds for this id.
         let id = app.spawn_child("shell", Some(dir.clone()), None).expect("room to split");
         assert_eq!(id, dead, "the id must actually be recycled for this to test anything");
-        app.pending_detect.clear();
+        app.detect.pending.clear();
         app.runtimes.get_mut(&id).unwrap().observation =
             Some(crate::ports::Observation { cwd: None, agent: Some("detect".into()) });
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
@@ -14296,7 +14081,7 @@ pub(crate) mod tests {
 
     /// Detection must give up eventually.
     ///
-    /// `pending_detect` is only ever removed from on success
+    /// `detect.pending` is only ever removed from on success
     /// (`set_session`) or when the pane disappears. A pane whose agent
     /// never writes a session file roost can attribute — it exited early,
     /// it is an adapter with no session root reachable, or the scan keeps
@@ -14355,13 +14140,13 @@ pub(crate) mod tests {
 
         // Pending since well past any plausible agent startup, and the
         // session root is empty, so no scan will ever succeed.
-        app.pending_detect.clear();
-        app.pending_detect.insert(1, SystemTime::now() - Duration::from_secs(3600));
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, SystemTime::now() - Duration::from_secs(3600));
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
         app.tick();
 
         assert!(
-            !app.pending_detect.contains_key(&1),
+            !app.detect.pending.contains_key(&1),
             "still pending an hour on — roost will rescan the whole session root \
              every 2 seconds for the rest of the process's life",
         );
@@ -14428,7 +14213,7 @@ pub(crate) mod tests {
 
     /// The promotion floor must never be *loosened* by a later promotion.
     ///
-    /// `pending_detect.entry(id).or_insert(floor)` keeps whatever bound is
+    /// `detect.pending.entry(id).or_insert(floor)` keeps whatever bound is
     /// already there. A pane that promotes, fails to find a file (so stays
     /// pending), demotes when the agent exits, and promotes again hours
     /// later would keep the **first** floor — by then old enough to reach
@@ -14491,15 +14276,15 @@ pub(crate) mod tests {
         // Shell → agent: promoted, nothing on disk, so it stays pending.
         tick(&mut app, None);
         tick(&mut app, Some("detect"));
-        let first_floor = *app.pending_detect.get(&1).expect("pending after promotion");
+        let first_floor = *app.detect.pending.get(&1).expect("pending after promotion");
 
         // The agent exits (demote), the pane sits as a shell, then the user
         // launches it again much later.
         tick(&mut app, None);
-        app.last_shell_seen.insert(1, SystemTime::now() + Duration::from_secs(3600));
+        app.detect.last_shell_seen.insert(1, SystemTime::now() + Duration::from_secs(3600));
         tick(&mut app, Some("detect"));
 
-        let second_floor = *app.pending_detect.get(&1).expect("pending after re-promotion");
+        let second_floor = *app.detect.pending.get(&1).expect("pending after re-promotion");
         assert!(
             second_floor > first_floor,
             "the second promotion kept the first floor ({first_floor:?}), so its window \
@@ -14713,9 +14498,9 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        app.pending_detect.clear();
-        app.pending_detect.insert(1, base);
-        app.pending_detect.insert(2, base);
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, base);
+        app.detect.pending.insert(2, base);
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
         app.tick();
 
@@ -14727,6 +14512,84 @@ pub(crate) mod tests {
              global root that cannot say which project it belongs to: \
              pane1(proj-a)={a:?} pane2(proj-b)={b:?}",
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Claims port that never records a claim, so only the workspace (and
+    /// `poll`'s in-tick `adopted` set) can keep a session from a second pane.
+    struct UnrecordedClaims;
+    impl SessionClaims for UnrecordedClaims {
+        fn acquire(&self, _adapter: &str, _session: &str) -> Result<ClaimHandle, ClaimError> {
+            Err(ClaimError::Failed("claims dir unreadable".into()))
+        }
+        fn claimed(&self, _adapter: &str) -> HashSet<String> {
+            HashSet::new()
+        }
+    }
+
+    #[test]
+    fn one_new_session_file_is_adopted_by_only_one_of_two_same_cwd_panes_in_a_tick() {
+        let root = std::env::temp_dir().join(format!("roost-adopted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let base = SystemTime::now();
+        let f = root.join("only.jsonl");
+        std::fs::write(&f, "").unwrap();
+        std::fs::File::open(&f).unwrap().set_modified(base + Duration::from_millis(10)).unwrap();
+
+        let spec = || PaneSpec {
+            adapter: "unscoped".into(),
+            cwd: root.clone(),
+            session: None,
+            title: None,
+            spawned_by: None,
+            note: None,
+            noted_at: None,
+        };
+        let panes = HashMap::from([(1, spec()), (2, spec())]);
+        let layout = LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![0.5, 0.5],
+            children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
+        };
+        let ws = Workspace {
+            version: 1,
+            active_tab: 0,
+            tabs: vec![Tab {
+                name: "main".into(),
+                layout,
+                panes,
+                view: TabView::Tiled,
+                focus: None,
+            }],
+        };
+        let mut registry = agents::registry();
+        registry.insert("unscoped", Box::new(UnscopedAdapter(root.clone())));
+        let (tx, _rx) = mpsc::sync_channel(64);
+        let mut app = App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(UnrecordedClaims),
+        )
+        .unwrap();
+
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, base);
+        app.detect.pending.insert(2, base);
+        app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
+        app.tick();
+
+        let got: Vec<_> =
+            [1, 2].iter().filter_map(|id| app.find_spec(*id)?.session.clone()).collect();
+        assert_eq!(got.len(), 1, "one file, one adopter; got {got:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -14820,9 +14683,9 @@ pub(crate) mod tests {
         // Pane 1 "spawned" before either file existed (widest window); pane 2
         // "spawned" after file_a but before file_b — an ordering that
         // starves whichever pane is processed second if order isn't honored.
-        app.pending_detect.clear();
-        app.pending_detect.insert(1, base);
-        app.pending_detect.insert(2, base + Duration::from_millis(15));
+        app.detect.pending.clear();
+        app.detect.pending.insert(1, base);
+        app.detect.pending.insert(2, base + Duration::from_millis(15));
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
 
         app.tick();
@@ -14920,14 +14783,14 @@ pub(crate) mod tests {
 
         // Pane 1 resumed cleanly at spawn (its "b" file exists), so only
         // pane 2 is left pending; `since` predates both files.
-        assert!(!app.pending_detect.contains_key(&1));
-        app.pending_detect.insert(2, base);
+        assert!(!app.detect.pending.contains_key(&1));
+        app.detect.pending.insert(2, base);
         app.last_detect = Instant::now() - DETECT_INTERVAL - Duration::from_secs(1);
 
         app.tick();
 
         assert_eq!(app.find_spec(2).unwrap().session.as_deref(), Some("a"));
-        assert!(!app.pending_detect.contains_key(&2));
+        assert!(!app.detect.pending.contains_key(&2));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14956,7 +14819,7 @@ pub(crate) mod tests {
         assert_eq!(app.runtimes[&1].title_signal, Some(true));
         let saved = store.0.lock().unwrap().clone().unwrap();
         assert_eq!(saved.tabs[0].panes[&1].adapter, "pi"); // persisted
-        assert!(app.pending_detect.contains_key(&1)); // queued for session detection
+        assert!(app.detect.pending.contains_key(&1)); // queued for session detection
     }
 
     #[test]
