@@ -2902,6 +2902,10 @@ fn draw_pane<B: PaneBackend>(
     spinner: char,
     now: u64,
 ) {
+    // C22: the float paints over tiled panes, and `blit_screen` only patches
+    // styles, so a default-background cell would inherit the pane beneath it.
+    // Wipe the rect first so the float reads as opaque as any other pane.
+    f.render_widget(Clear, pr.rect);
     let focused = app.focused == pr.id;
     let raw = app.is_raw(pr.id);
     let (status, name, has_title, adapter, note) = {
