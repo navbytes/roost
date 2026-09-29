@@ -81,7 +81,7 @@ fn main() -> Result<()> {
     // no-op that keeps the TUI correct even if an entry point ever skips
     // the pre-pass — e.g. `ROOST_WORKSPACE=x roost` with no flag at all.
     let roost_workspace =
-        std::env::var_os("ROOST_WORKSPACE").map(|v| v.to_string_lossy().into_owned());
+        std::env::var_os(crate::infra::ENV_WORKSPACE).map(|v| v.to_string_lossy().into_owned());
     let _ = infra::store::FsStore::init_workspace(None, roost_workspace.as_deref());
 
     // Reaching here means no args at all: launch the TUI. It needs a real

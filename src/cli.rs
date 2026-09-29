@@ -60,7 +60,7 @@ const FREE_TEXT_VALUE_OPTIONS: &[&str] = &["--input"];
 pub fn maybe_run() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let workspace_env =
-        std::env::var_os("ROOST_WORKSPACE").map(|v| v.to_string_lossy().into_owned());
+        std::env::var_os(crate::infra::ENV_WORKSPACE).map(|v| v.to_string_lossy().into_owned());
     // The status hook answers before anything else can refuse: it runs
     // inside an agent's own process on every status transition and must
     // never fail loudly (see `run_status_hook`), so a `$ROOST_WORKSPACE`
@@ -247,7 +247,7 @@ fn strip_workspace_flag(args: &[String]) -> Result<(Option<String>, Vec<String>)
 /// stdout/stderr or returns nonzero — a broken or unreachable socket must
 /// never surface as hook noise or an error in the user's Claude Code session.
 fn run_status_hook(args: &[String]) -> i32 {
-    let pane = std::env::var("ROOST_PANE").ok();
+    let pane = std::env::var(crate::infra::ENV_PANE).ok();
     // stdin is consulted only once the no-op guard has already passed:
     // outside roost ($ROOST_PANE unset) these hooks fire for every Claude
     // Code session on the machine, and the contract there is "exits 0
@@ -259,8 +259,8 @@ fn run_status_hook(args: &[String]) -> i32 {
     };
     status_hook(
         pane,
-        std::env::var("ROOST_TOKEN").unwrap_or_default(),
-        std::env::var_os("ROOST_SOCK").map(Into::into),
+        std::env::var(crate::infra::ENV_TOKEN).unwrap_or_default(),
+        std::env::var_os(crate::infra::ENV_SOCK).map(Into::into),
         args.first().map(String::as_str),
         message,
     )
@@ -406,7 +406,7 @@ fn run(args: &[String], workspace_flag: Option<&str>) -> i32 {
     // selected workspace's socket. Without a flag, `ROOST_SOCK` keeps
     // winning exactly where it does today (in-pane), and `socket_path`
     // falls back to the workspace `ROOST_WORKSPACE` named, else default.
-    let sock_env = std::env::var_os("ROOST_SOCK");
+    let sock_env = std::env::var_os(crate::infra::ENV_SOCK);
     let sock = match workspace_flag {
         Some(_) => socket_path(),
         None => sock_env.clone().map(PathBuf::from).unwrap_or_else(socket_path),
@@ -529,11 +529,11 @@ fn unreachable_message(place: &str, running: &[String], e: &std::io::Error) -> S
 /// instance, not whatever `-w` is targeting, so a cross-workspace call falls
 /// straight through to the target workspace's own fleet token on disk.
 fn resolve_token(workspace_flag: Option<&str>) -> String {
-    if let Ok(t) = std::env::var("ROOST_CONTROL_TOKEN") {
+    if let Ok(t) = std::env::var(crate::infra::ENV_CONTROL_TOKEN) {
         return t;
     }
     if workspace_flag.is_none() {
-        if let Ok(t) = std::env::var("ROOST_TOKEN") {
+        if let Ok(t) = std::env::var(crate::infra::ENV_TOKEN) {
             return t;
         }
     }
@@ -974,7 +974,7 @@ fn run_keys() -> i32 {
     // pins it). The line is for the user who never chose a directory and has
     // no way to know which of two roost would read.
     let resolved = crate::infra::config::resolve_config();
-    if std::env::var_os("ROOST_STATE").is_none() {
+    if std::env::var_os(crate::infra::ENV_STATE).is_none() {
         if resolved.exists {
             eprintln!("roost keys: reading {}", resolved.path.display());
         } else {

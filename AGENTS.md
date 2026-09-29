@@ -103,6 +103,11 @@ each adapter's own session ids.
   would wait for a status forever.
 
 <!-- >>> projectmem bridge >>> -->
+- `docs/BACKLOG.md` — the live list of deferred work and accepted limitations.
+  Read it before planning anything; append to it the moment you decide not to
+  fix something you found, with a date and line refs. Close entries by deleting
+  them.
+
 ## projectmem (MANDATORY)
 
 This project uses projectmem for persistent memory + workflow rules.
