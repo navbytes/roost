@@ -666,6 +666,24 @@ fn dim_backdrop(f: &mut Frame<'_>, body: Rect) {
     f.buffer_mut().set_style(body, Style::new().add_modifier(Modifier::DIM));
 }
 
+/// Make `rect` opaque: reset its cells, and blank any wide glyph just left of
+/// it whose second half would land on `rect`'s first column — ratatui's diff
+/// skips the cell after a wide glyph, so our border there would never reach
+/// the terminal.
+fn clear_opaque(f: &mut Frame<'_>, rect: Rect) {
+    f.render_widget(Clear, rect);
+    if rect.x > 0 {
+        let buf = f.buffer_mut();
+        for y in rect.top()..rect.bottom() {
+            if let Some(c) = buf.cell_mut((rect.x - 1, y)) {
+                if mouse::display_width(c.symbol()) > 1 {
+                    c.set_symbol(" ");
+                }
+            }
+        }
+    }
+}
+
 /// C12: the modal preamble every floating dialog shares — dim the body,
 /// clear the dialog's own cells, draw its bordered frame with `title`, and
 /// hand back the inner area for the mode-specific content. Border color is
@@ -2902,6 +2920,14 @@ fn draw_pane<B: PaneBackend>(
     spinner: char,
     now: u64,
 ) {
+    // C22: the float is the one pane painted over others, and `blit_screen`
+    // only writes the grid's cells and only patches their style — without
+    // this, cells the grid leaves alone show the pane beneath, and default
+    // fg/bg and modifiers inherit from it. §2's "Clear then default bg", not
+    // a fill. Tiled panes draw onto a freshly reset buffer and need nothing.
+    if app.is_float(pr.id) {
+        clear_opaque(f, pr.rect);
+    }
     let focused = app.focused == pr.id;
     let raw = app.is_raw(pr.id);
     let (status, name, has_title, adapter, note) = {
@@ -3675,9 +3701,9 @@ fn blit_screen(f: &mut Frame<'_>, screen: &vt100::Screen, inner: Rect) {
             let x = inner.x + col;
             let y = inner.y + row;
             let Some(out) = buf.cell_mut((x, y)) else { continue };
-            // No cell means blank, and it has to be *painted* blank: the
-            // buffer is not cleared between frames, so skipping the write
-            // would leave whatever the last frame drew there. Reachable
+            // No cell means blank, and it has to be *painted* blank: an
+            // overlay (the float) may sit on earlier content in the same
+            // frame, so skipping the write would leave whatever is there. Reachable
             // since banked scrollback rows are trimmed to their contents
             // (`Row::shrink_to_contents`) — every column past a short
             // history line answers `None` here.
@@ -7981,6 +8007,67 @@ row's — widen ADAPTER_COL",
         let content_row: String =
             (0..14).filter_map(|x| buf.cell((x, 2)).map(|c| c.symbol().to_string())).collect();
         assert!(!content_row.contains("she"), "no chrome left on the content row: {content_row:?}");
+    }
+
+    /// C22: the float is opaque. It paints over tiled panes, and `blit_screen`
+    /// only writes the cells its grid covers and only *patches* their style —
+    /// so without a wipe, float cells the grid leaves alone show the tiled
+    /// chrome beneath, and default-bg cells inherit fg/bg/modifiers from it.
+    #[test]
+    fn the_float_interior_hides_the_tiled_panes_beneath_it() {
+        use crate::ui::input::Action;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Cell;
+        use ratatui::layout::Size;
+        use ratatui::Terminal;
+
+        let mut app = mk_app(Size::new(100, 30));
+        app.apply(Action::NewPane);
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleFloat);
+        let float = app.display_rects()[0];
+        assert!(app.is_float(float.id), "float first in the display list");
+        let inner = Rect::new(
+            float.rect.x + 1,
+            float.rect.y + 1,
+            float.rect.width - 2,
+            float.rect.height - 2,
+        );
+        let snap = |app: &mut App<crate::ports::fakes::FakePane>| {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            term.backend().buffer().clone()
+        };
+        // Self-verifying: tiled chrome really lies under the float's interior.
+        app.apply(Action::ToggleFloat); // hide
+        let under = snap(&mut app);
+        assert!(
+            inner.positions().any(|p| under[p] != Cell::EMPTY),
+            "fixture must put tiled chrome under the float's interior"
+        );
+        app.apply(Action::ToggleFloat); // show again
+        let buf = snap(&mut app);
+        for p in inner.positions() {
+            assert_eq!(buf[p], Cell::EMPTY, "float interior cell {p:?} shows what is beneath it");
+        }
+    }
+
+    /// A wide glyph in the column left of an opaque rect must not swallow its
+    /// left border: ratatui's diff skips the cell after a wide glyph.
+    #[test]
+    fn clear_opaque_keeps_the_left_border_when_a_wide_glyph_abuts_it() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut term = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        term.draw(|f| {
+            f.buffer_mut().set_string(2, 1, "日", ratatui::style::Style::new());
+            let rect = Rect::new(3, 0, 5, 3);
+            super::clear_opaque(f, rect);
+            f.render_widget(ratatui::widgets::Block::bordered(), rect);
+        })
+        .unwrap();
+        assert_eq!(term.backend().buffer()[(3, 1)].symbol(), "│");
     }
 
     /// C21/C22 (amended 2026-08-11): "keeps zoom" + the float draws above
