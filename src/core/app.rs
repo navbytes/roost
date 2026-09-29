@@ -18,6 +18,7 @@ use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
+use crate::core::textfield::Field;
 use crate::core::workspace::{PaneSpec, Tab, TabView, Workspace};
 use crate::ports::{
     ClaimError, ClaimHandle, ClipboardOutcome, Observation, PaneBackend, SessionClaims, StateStore,
@@ -3502,50 +3503,13 @@ impl<B: PaneBackend> App<B> {
         // still read as the text you pasted. The point lands after the
         // insertion, ahead of whatever tail it split off.
         if let Mode::PaneEdit { name, lines, row, col, .. } = &mut self.mode {
-            if *row == 0 {
-                let clean = strip_control(text, false);
-                let at = (*col).min(name.chars().count());
-                let byte = byte_at(name, at);
-                name.insert_str(byte, &clean);
-                *col = at + clean.chars().count();
-                return;
-            }
-            let clean = text.replace("\r\n", "\n").replace('\r', "\n");
-            let clean = strip_control(&clean, true);
-            let mut nrow = (*row - 1).min(lines.len().saturating_sub(1));
-            let at = byte_at(&lines[nrow], (*col).min(lines[nrow].chars().count()));
-            let tail = lines[nrow][at..].to_string();
-            lines[nrow].truncate(at);
-            let mut parts = clean.split('\n');
-            if let Some(first) = parts.next() {
-                lines[nrow].push_str(first);
-            }
-            for part in parts {
-                if lines.len() < NOTE_MAX_LINES {
-                    nrow += 1;
-                    lines.insert(nrow, part.to_string());
-                } else {
-                    if !lines[nrow].is_empty() && !part.is_empty() {
-                        lines[nrow].push(' ');
-                    }
-                    lines[nrow].push_str(part);
-                }
-            }
-            *col = lines[nrow].chars().count();
-            lines[nrow].push_str(&tail);
-            *row = nrow + 1;
+            Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).paste(text);
             return;
         }
         if let Mode::Rename { buffer, cursor, .. } = &mut self.mode {
-            // U16: a paste lands at the point, like typing does, and leaves
-            // the point after what it inserted — a paste that always
-            // appended would be the one edit in the dialog that ignored the
-            // cursor.
-            let clean = strip_control(text, false);
-            let at = (*cursor).min(buffer.chars().count());
-            let byte = byte_at(buffer, at);
-            buffer.insert_str(byte, &clean);
-            *cursor = at + clean.chars().count();
+            // U16: a paste lands at the point, like typing does.
+            let (mut none, mut row) = (Vec::new(), 0);
+            Field::new(Some(buffer), &mut none, &mut row, cursor, 0).paste(text);
             return;
         }
         if self.modal_active() {
@@ -6839,8 +6803,8 @@ impl<B: PaneBackend> App<B> {
             // bindings below, Alt+r's own toggle-off included.
             if key.code == KeyCode::Enter {
                 match &mut self.mode {
-                    Mode::PaneEdit { lines, row, col, .. } => {
-                        pane_edit_break(lines, row, col);
+                    Mode::PaneEdit { name, lines, row, col, .. } => {
+                        Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).brk();
                         return true;
                     }
                     // C36: the composer needs the same carve-out. On
@@ -6851,7 +6815,7 @@ impl<B: PaneBackend> App<B> {
                     // design audit; C36's "keys are C32's, exactly" was an
                     // overclaim until now.
                     Mode::Broadcast { lines, row, col, .. } => {
-                        broadcast_break(lines, row, col);
+                        Field::new(None, lines, row, col, BROADCAST_MAX_LINES).brk();
                         return true;
                     }
                     _ => {}
@@ -6968,64 +6932,7 @@ impl<B: PaneBackend> App<B> {
             Mode::Normal => false,
             Mode::Rename { buffer, cursor, target } => {
                 let target = *target;
-                // U16: only Ctrl+W/Ctrl+U are real edits here — the two
-                // every line editor on the platform binds — every *other*
-                // modified char is discarded: a chord roost doesn't
-                // implement must never leave its letter behind in a name.
-                // Every edit is relative to `cursor`, the point, which is
-                // what makes Ctrl+W's readline name ("word behind point")
-                // honest.
-                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
-                let len = buffer.chars().count();
-                *cursor = (*cursor).min(len);
                 match key.code {
-                    // Ctrl+U — readline's unix-line-discard: kill from the
-                    // point back to the start, keeping the tail. (It cleared
-                    // the whole buffer before, which was the same thing when
-                    // the point was always the end.)
-                    KeyCode::Char('u') if ctrl => {
-                        *buffer = buffer[byte_at(buffer, *cursor)..].to_string();
-                        *cursor = 0;
-                    }
-                    // Ctrl+W — readline's unix-word-rubout, over the text
-                    // behind the point only; whatever follows it survives.
-                    KeyCode::Char('w') if ctrl => {
-                        let at = byte_at(buffer, *cursor);
-                        let head = erase_word(&buffer[..at]);
-                        *cursor = head.chars().count();
-                        *buffer = head + &buffer[at..];
-                    }
-                    // Shift is how an uppercase letter arrives (kitty CSI-u
-                    // spells `A` as Shift+`a`), so it is the one modifier a
-                    // plain insert may carry.
-                    KeyCode::Char(c)
-                        if key
-                            .modifiers
-                            .difference(crossterm::event::KeyModifiers::SHIFT)
-                            .is_empty() =>
-                    {
-                        buffer.insert(byte_at(buffer, *cursor), c);
-                        *cursor += 1;
-                    }
-                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
-                    // Backspace eats the char *behind* the point, Delete the
-                    // one under it — the split every text field makes, and
-                    // impossible to offer before there was a point.
-                    KeyCode::Backspace => {
-                        if *cursor > 0 {
-                            *cursor -= 1;
-                            buffer.remove(byte_at(buffer, *cursor));
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if *cursor < len {
-                            buffer.remove(byte_at(buffer, *cursor));
-                        }
-                    }
-                    KeyCode::Left => *cursor = cursor.saturating_sub(1),
-                    KeyCode::Right => *cursor = (*cursor + 1).min(len),
-                    KeyCode::Home => *cursor = 0,
-                    KeyCode::End => *cursor = len,
                     KeyCode::Enter => {
                         let text = buffer.trim().to_string();
                         // Tab is the one Rename target left (C32 absorbed
@@ -7039,25 +6946,26 @@ impl<B: PaneBackend> App<B> {
                         self.mode = Mode::Normal;
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
-                    _ => {}
+                    _ => {
+                        // U16: a single-line `Field` — no lines, so the
+                        // vertical keys and line joins are no-ops here.
+                        let (mut none, mut row) = (Vec::new(), 0);
+                        Field::new(Some(buffer), &mut none, &mut row, cursor, 0).edit(key);
+                    }
                 }
                 true
             }
             Mode::Broadcast { lines, row, col, status_filter } => {
                 // C36: C32's editing vocabulary over a plain line buffer —
-                // no name row, so `row` indexes `lines` directly and the
-                // seam rules PaneEdit needs don't apply. Enter *sends*
-                // (Shift/Ctrl+Enter breaks a line, C32's convention), Tab
-                // cycles the target filter, Esc walks away having sent
-                // nothing.
+                // no name row, so the seam rules PaneEdit needs don't apply.
+                // Enter *sends* (Shift/Ctrl+Enter breaks a line, C32's
+                // convention), Tab cycles the target filter, Esc walks away
+                // having sent nothing.
                 let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
-                *row = (*row).min(lines.len().saturating_sub(1));
-                let len = lines[*row].chars().count();
-                *col = (*col).min(len);
                 match key.code {
                     KeyCode::Enter if shift || ctrl => {
-                        broadcast_break(lines, row, col);
+                        Field::new(None, lines, row, col, BROADCAST_MAX_LINES).brk();
                     }
                     KeyCode::Enter => {
                         let text = lines.join("\n").trim().to_string();
@@ -7075,113 +6983,24 @@ impl<B: PaneBackend> App<B> {
                         // `step_status_filter`. The roster keeps it.
                         *status_filter = step_status_filter(*status_filter, back, true);
                     }
-                    KeyCode::Char('u') if ctrl => {
-                        let cur = &mut lines[*row];
-                        *cur = cur[byte_at(cur, *col)..].to_string();
-                        *col = 0;
-                    }
-                    KeyCode::Char('w') if ctrl => {
-                        let cur = &mut lines[*row];
-                        let at = byte_at(cur, *col);
-                        let head = erase_word(&cur[..at]);
-                        *col = head.chars().count();
-                        *cur = head + &cur[at..];
-                    }
-                    KeyCode::Char(c)
-                        if key
-                            .modifiers
-                            .difference(crossterm::event::KeyModifiers::SHIFT)
-                            .is_empty() =>
-                    {
-                        let cur = &mut lines[*row];
-                        let at = byte_at(cur, *col);
-                        cur.insert(at, c);
-                        *col += 1;
-                    }
-                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
-                    KeyCode::Backspace => {
-                        if *col > 0 {
-                            *col -= 1;
-                            let cur = &mut lines[*row];
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row > 0 {
-                            let cur = lines.remove(*row);
-                            *row -= 1;
-                            *col = lines[*row].chars().count();
-                            lines[*row].push_str(&cur);
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if *col < len {
-                            let cur = &mut lines[*row];
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row + 1 < lines.len() {
-                            let next = lines.remove(*row + 1);
-                            lines[*row].push_str(&next);
-                        }
-                    }
-                    KeyCode::Left => {
-                        if *col > 0 {
-                            *col -= 1;
-                        } else if *row > 0 {
-                            *row -= 1;
-                            *col = lines[*row].chars().count();
-                        }
-                    }
-                    KeyCode::Right => {
-                        if *col < len {
-                            *col += 1;
-                        } else if *row + 1 < lines.len() {
-                            *row += 1;
-                            *col = 0;
-                        }
-                    }
-                    KeyCode::Up => {
-                        if *row > 0 {
-                            *row -= 1;
-                            *col = (*col).min(lines[*row].chars().count());
-                        }
-                    }
-                    KeyCode::Down => {
-                        if *row + 1 < lines.len() {
-                            *row += 1;
-                            *col = (*col).min(lines[*row].chars().count());
-                        }
-                    }
-                    KeyCode::Home => *col = 0,
-                    KeyCode::End => *col = len,
                     KeyCode::Esc => self.mode = Mode::Normal,
-                    _ => {}
+                    _ => Field::new(None, lines, row, col, BROADCAST_MAX_LINES).edit(key),
                 }
                 true
             }
             Mode::PaneEdit { name, lines, row, col, pane } => {
-                // C32 (combined): Rename's editing vocabulary on the
-                // current row — Ctrl+U/W, insert-at-point, Backspace/
-                // Delete, Home/End — where row 0 is the name and rows
-                // 1.. are the note; plus the vertical half: ↑↓ move rows,
-                // Shift+Enter (or Ctrl+Enter; Alt+Enter is caught in the
-                // Alt branch above) breaks — descend from the name, split
-                // inside the note — and ←→ flow across note line ends.
-                // Motion crosses the name/note seam; **edits never do**:
-                // Backspace at the note's top-left and Delete at the
-                // name's end are walls, so a typo can't merge status text
-                // into identity. Plain Enter commits both fields, Esc
-                // walks away.
+                // C32 (combined): Rename's editing vocabulary on the current
+                // row (`Field`), where row 0 is the name and rows 1.. are the
+                // note. Shift+Enter (or Ctrl+Enter; Alt+Enter is caught in
+                // the Alt branch above) breaks — descend from the name,
+                // split inside the note. Plain Enter commits both fields,
+                // Esc walks away.
                 let pane = *pane;
-                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 let shift = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
-                // Same stale-point hygiene as Rename: clamp, never slice
-                // bad. Unified rows: 0 = name, 1..=lines.len() = note.
-                *row = (*row).min(lines.len());
-                let len =
-                    if *row == 0 { name.chars().count() } else { lines[*row - 1].chars().count() };
-                *col = (*col).min(len);
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                 match key.code {
                     KeyCode::Enter if shift || ctrl => {
-                        pane_edit_break(lines, row, col);
+                        Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).brk();
                     }
                     KeyCode::Enter => {
                         // Whole-text trims: an empty name clears back to
@@ -7209,100 +7028,8 @@ impl<B: PaneBackend> App<B> {
                         self.save();
                         self.mode = Mode::Normal;
                     }
-                    KeyCode::Char('u') if ctrl => {
-                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                        *cur = cur[byte_at(cur, *col)..].to_string();
-                        *col = 0;
-                    }
-                    KeyCode::Char('w') if ctrl => {
-                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                        let at = byte_at(cur, *col);
-                        let head = erase_word(&cur[..at]);
-                        *col = head.chars().count();
-                        *cur = head + &cur[at..];
-                    }
-                    KeyCode::Char(c)
-                        if key
-                            .modifiers
-                            .difference(crossterm::event::KeyModifiers::SHIFT)
-                            .is_empty() =>
-                    {
-                        let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                        let at = byte_at(cur, *col);
-                        cur.insert(at, c);
-                        *col += 1;
-                    }
-                    KeyCode::Char(_) => {} // any other chord: swallowed, not typed
-                    KeyCode::Backspace => {
-                        if *col > 0 {
-                            *col -= 1;
-                            let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row > 1 {
-                            // Note-internal join; row 1's left edge is the
-                            // wall — the note never merges into the name.
-                            let cur = lines.remove(*row - 1);
-                            *row -= 1;
-                            *col = lines[*row - 1].chars().count();
-                            lines[*row - 1].push_str(&cur);
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if *col < len {
-                            let cur = if *row == 0 { &mut *name } else { &mut lines[*row - 1] };
-                            let at = byte_at(cur, *col);
-                            cur.remove(at);
-                        } else if *row >= 1 && *row < lines.len() {
-                            // Note-internal join; the name's end is the
-                            // wall in the other direction.
-                            let next = lines.remove(*row);
-                            lines[*row - 1].push_str(&next);
-                        }
-                    }
-                    // Motion crosses the seam — ←→ flow across row ends,
-                    // ↑↓ keep the column where they can.
-                    KeyCode::Left => {
-                        if *col > 0 {
-                            *col -= 1;
-                        } else if *row > 0 {
-                            *row -= 1;
-                            *col = if *row == 0 {
-                                name.chars().count()
-                            } else {
-                                lines[*row - 1].chars().count()
-                            };
-                        }
-                    }
-                    KeyCode::Right => {
-                        if *col < len {
-                            *col += 1;
-                        } else if *row < lines.len() {
-                            *row += 1;
-                            *col = 0;
-                        }
-                    }
-                    KeyCode::Up => {
-                        if *row > 0 {
-                            *row -= 1;
-                            let l = if *row == 0 {
-                                name.chars().count()
-                            } else {
-                                lines[*row - 1].chars().count()
-                            };
-                            *col = (*col).min(l);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if *row < lines.len() {
-                            *row += 1;
-                            *col = (*col).min(lines[*row - 1].chars().count());
-                        }
-                    }
-                    KeyCode::Home => *col = 0,
-                    KeyCode::End => *col = len,
                     KeyCode::Esc => self.mode = Mode::Normal,
-                    _ => {}
+                    _ => Field::new(Some(name), lines, row, col, NOTE_MAX_LINES).edit(key),
                 }
                 true
             }
@@ -8175,20 +7902,6 @@ pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/// U16: byte offset of char index `at` in `s` (clamped to the end) — the
-/// bridge between the rename cursor's char-space arithmetic and Rust's
-/// byte-indexed slicing. A name can hold multi-byte chars (an emoji, an
-/// accented word), and slicing one down the middle panics.
-fn byte_at(s: &str, at: usize) -> usize {
-    s.char_indices().nth(at).map_or(s.len(), |(b, _)| b)
-}
-
-/// C32: Shift/Ctrl/Alt+Enter in the combined editor, shared by the mode
-/// arm and the Alt-branch carve-out so the spellings can never drift. On
-/// the name row (`row` 0) it *descends* into the note — the name is
-/// single-line by contract, so "line break" there means "start writing
-/// the note", which makes name → note one continuous typing flow. On a
-/// note row it splits at the point via `note_split_line`.
 /// C27/C36: one step through `ROSTER_STATUS_CYCLE` (worst-first, with
 /// `None` = every tier at both ends so cycling never dead-ends). Shared by
 /// the roster's `Tab` and the broadcast composer's, so the two surfaces
@@ -8246,59 +7959,6 @@ fn step_status_filter(
         return past;
     }
     next
-}
-
-/// C36: split the composer's current line at the point.
-///
-/// **Capped at `BROADCAST_MAX_LINES`.** The dialog is `lines + 2` rows tall
-/// and `centered_near` clamps to the body, so without a cap a long enough
-/// message pushes its own rows — and the caret — off the bottom silently,
-/// with nothing to scroll them back. C32 caps its note for the same reason;
-/// this is that rule applied to the surface that borrowed its keys. At the
-/// cap the break is refused rather than partially applied: losing the split
-/// is recoverable, losing the text under it is not.
-fn broadcast_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
-    if lines.len() >= BROADCAST_MAX_LINES {
-        return;
-    }
-    let at = byte_at(&lines[*row], *col);
-    let tail = lines[*row].split_off(at);
-    lines.insert(*row + 1, tail);
-    *row += 1;
-    *col = 0;
-}
-
-fn pane_edit_break(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
-    if *row == 0 {
-        // Land at the headline's END, not at the name's column carried
-        // over: descending means "write the note now", and the writing
-        // point of an existing line is after its last character.
-        *row = 1;
-        *col = lines[0].chars().count();
-    } else {
-        let mut nrow = *row - 1;
-        note_split_line(lines, &mut nrow, col);
-        *row = nrow + 1;
-    }
-}
-
-/// C32: split the note line at the point. At `NOTE_MAX_LINES` the split
-/// is swallowed whole (no new line, nothing scrolled off the dialog);
-/// the clamps are the Rename arm's stale-point hygiene. `row`/`col` are
-/// **note-relative** (0 = the headline) — `pane_edit_break` converts from
-/// the editor's unified rows.
-fn note_split_line(lines: &mut Vec<String>, row: &mut usize, col: &mut usize) {
-    if lines.len() >= NOTE_MAX_LINES {
-        return;
-    }
-    *row = (*row).min(lines.len() - 1);
-    let line = &mut lines[*row];
-    let at = byte_at(line, (*col).min(line.chars().count()));
-    let tail = line[at..].to_string();
-    line.truncate(at);
-    lines.insert(*row + 1, tail);
-    *row += 1;
-    *col = 0;
 }
 
 /// C32: wall-clock seconds for `noted_at`. A pre-1970 system clock yields
@@ -8363,22 +8023,6 @@ pub fn word_end(line: &str, col: u16, last: u16) -> u16 {
     i
 }
 
-/// U16: readline's `unix-word-rubout` over a text buffer — drop any trailing
-/// whitespace, then the whitespace-delimited word in front of it. Pure, so
-/// the boundary rule is pinned without a dialog. (The rename buffer has no
-/// cursor of its own yet, so "word behind point" is always "word at the
-/// end"; cursor motion inside the buffer stays out of scope — SPEC-ux U16.)
-pub fn erase_word(buffer: &str) -> String {
-    let mut chars: Vec<char> = buffer.chars().collect();
-    while chars.last().is_some_and(|c| c.is_whitespace()) {
-        chars.pop();
-    }
-    while chars.last().is_some_and(|c| !c.is_whitespace()) {
-        chars.pop();
-    }
-    chars.into_iter().collect()
-}
-
 fn inner_dims(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(2).max(1), rect.width.saturating_sub(2).max(1))
 }
@@ -8436,10 +8080,6 @@ pub fn display_name_live(spec: &PaneSpec, live: Option<&str>) -> String {
         .map(|f| format!(" · {f}"))
         .unwrap_or_default();
     format!("{}{cwd_tag}", spec.adapter)
-}
-
-fn strip_control(s: &str, keep_newline: bool) -> String {
-    s.chars().filter(|&c| !c.is_control() || (keep_newline && c == '\n')).collect()
 }
 
 /// P6: a pane's OSC title is untrusted text bound for roost's chrome (and,
@@ -11850,23 +11490,6 @@ pub(crate) mod tests {
         let spec = app.find_spec(restored).unwrap();
         assert_eq!(spec.note.as_deref(), Some("parked: retry flaky e2e"));
         assert_eq!(spec.noted_at, Some(7));
-    }
-
-    /// U16: `unix-word-rubout`'s exact boundary rule — trailing whitespace
-    /// goes first, then one whole word; a buffer of only whitespace, or an
-    /// empty one, empties without panicking.
-    #[test]
-    fn erase_word_drops_trailing_space_then_one_word() {
-        use super::erase_word;
-        assert_eq!(erase_word("abc def"), "abc ");
-        assert_eq!(erase_word("abc def  "), "abc ");
-        assert_eq!(erase_word("abc"), "");
-        assert_eq!(erase_word("   "), "");
-        assert_eq!(erase_word(""), "");
-        // Repeated application walks back word by word, never wrapping past
-        // the start.
-        assert_eq!(erase_word(&erase_word("one two three")), "one ");
-        assert_eq!(erase_word(&erase_word(&erase_word("one two three"))), "");
     }
 
     /// U16: typing `abc` then Ctrl+W then Ctrl+U must commit the empty
@@ -20154,14 +19777,6 @@ pub(crate) mod tests {
         // ...and demoting back to a shell drops the adoption again.
         spec.adapter = "shell".into();
         assert_eq!(display_name_live(&spec, Some("TASK-9 tests")), "shell · rqa-work");
-    }
-
-    #[test]
-    fn strip_control_drops_controls_and_optionally_keeps_newline() {
-        let s = "a\tb\x1bc\nd";
-        assert_eq!(strip_control(s, false), "abcd");
-        assert_eq!(strip_control(s, true), "abc\nd");
-        assert_eq!(strip_control("plain 日本", false), "plain 日本");
     }
 
     /// P6: an OSC title is untrusted text headed for roost's chrome and for
