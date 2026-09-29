@@ -17,6 +17,7 @@ use crate::core::control::{
 use crate::core::detect::{Found, SessionDetector};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
+use crate::core::overlay::Overlays;
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
 use crate::core::textfield::Field;
@@ -405,20 +406,6 @@ struct Waiter {
     deadline: Instant,
 }
 
-/// C22: the app-wide floating scratch pane. Lives outside every tab's
-/// layout tree — its runtime sits in the same `App::runtimes` map as any
-/// other pane, but `spec` here (not `Tab::panes`) is its source of truth,
-/// and it is never written to `workspace.json` (session-only by design).
-#[derive(Debug)]
-struct Float {
-    id: PaneId,
-    spec: PaneSpec,
-    shown: bool,
-    /// Whatever was focused right before the float last became shown —
-    /// where focus returns when it hides (C22 rules 2/3).
-    prev_focus: PaneId,
-}
-
 /// C22: below this body size the geometry formula (`App::float_rect`) has
 /// no room to place a sane rect — the toggle refuses instead.
 const MIN_FLOAT_BODY_COLS: u16 = 40;
@@ -629,17 +616,10 @@ pub struct App<B: PaneBackend> {
     /// capacity `FEED_CAP`, oldest evicted first. Session-only — never
     /// persisted.
     feed: VecDeque<FeedEntry>,
-    /// C22: the one app-wide floating scratch pane slot, spawned on first
-    /// Alt+Shift+z (Alt+f before the 2026-09-03 re-key). `None` until then.
-    float: Option<Float>,
-    /// The ephemeral `spawn --float` popup: same rect and chrome as `float`
-    /// but it is always shown (and focused), dies with its process or on
-    /// any dismissal, and is never persisted. Reuses `Float`; `shown` is
-    /// always true here. Never open together with a *shown* scratch float.
-    popup: Option<Float>,
-    /// Set only while `ctl_spawn_child` moves focus around a control
-    /// split-spawn, so that transient focus move does not dismiss the popup.
-    popup_pinned: bool,
+    /// C22/C22a: the scratch float (first Alt+Shift+z) and the `spawn
+    /// --float` popup. Their specs live here, not in `Tab::panes`; never
+    /// persisted.
+    overlays: Overlays,
     /// C23: panes currently in raw (hard pass-through) mode, by id.
     /// Per-pane, session-only — never persisted.
     raw: HashSet<PaneId>,
@@ -784,9 +764,7 @@ impl<B: PaneBackend> App<B> {
             needy_msgs: HashMap::new(),
             visited_waiting: HashSet::new(),
             feed: VecDeque::new(),
-            float: None,
-            popup: None,
-            popup_pinned: false,
+            overlays: Overlays::default(),
             raw: HashSet::new(),
             tab_focus: HashSet::new(),
             pending_yank: None,
@@ -1057,14 +1035,14 @@ impl<B: PaneBackend> App<B> {
     pub fn display_rects(&self) -> Vec<PaneRect> {
         let body = self.body_area();
         let mut v = Vec::new();
-        if let Some(f) = self.popup.iter().chain(self.float.iter().filter(|f| f.shown)).next() {
-            v.push(PaneRect { id: f.id, rect: Self::float_rect(body), collapsed: false });
+        if let Some(id) = self.overlays.top_id() {
+            v.push(PaneRect { id, rect: Self::float_rect(body), collapsed: false });
         }
         if self.zoomed {
             // C21 "keeps zoom" + C22 rule 1: while the float is shown, focus
             // belongs to it, not the zoomed pane — the real zoom target is
             // whatever was focused right before the float appeared.
-            let target = self.overlay_prev().unwrap_or(self.focused);
+            let target = self.overlays.prev().unwrap_or(self.focused);
             v.push(PaneRect { id: target, rect: body, collapsed: false });
         } else if self.solo() {
             // Unlike the zoom branch above, `f.prev_focus` is not safe to
@@ -1114,7 +1092,7 @@ impl<B: PaneBackend> App<B> {
         // are not in a live tab, and both must be counted or the id gets
         // handed out twice.
         let base = self.ws.next_pane_id();
-        let base = self.float.iter().chain(&self.popup).fold(base, |b, f| b.max(f.id + 1));
+        let base = self.overlays.next_id(base);
         // The undo stack. A parked `Closed::Tab` is re-inserted **verbatim,
         // with its original pane ids** (`undo_close`), and `spawn_active_tab`
         // then builds runtimes for them — so if one of those ids has since
@@ -1139,49 +1117,13 @@ impl<B: PaneBackend> App<B> {
 
     /// Is `id` the float's pane?
     pub fn is_float(&self, id: PaneId) -> bool {
-        self.float.as_ref().is_some_and(|f| f.id == id)
-    }
-
-    /// C22/M1: the one guard every control-plane verb that resolves a
-    /// specific pane id shares — the float is the human's private
-    /// interactive scratch shell, never a control-plane target, for
-    /// *any* verb, not just the ones an earlier pass happened to touch
-    /// (close/send/read only — status/wait/fork still reached it: a
-    /// same-uid pane reading `control.token` off disk *is* Fleet, and
-    /// `spawn_float`'s `spawned_by: None` puts the float outside every
-    /// subtree, so Fleet was never the only actor that needed refusing).
-    /// `verb` slots into "cannot {verb} the scratch pane" — ctl_close's own
-    /// wording — so every caller reads naturally without each inventing
-    /// its own phrasing. Callers check this before authz: an actor doesn't
-    /// get told "forbidden" for a pane it could never legitimately reach
-    /// anyway, it gets told the truth, unconditionally.
-    fn float_refusal(&self, id: PaneId, verb: &str) -> Option<String> {
-        self.is_float(id).then(|| format!("cannot {verb} the scratch pane"))
-    }
-
-    /// Is `id` the `spawn --float` popup's pane?
-    pub fn is_popup(&self, id: PaneId) -> bool {
-        self.popup.as_ref().is_some_and(|f| f.id == id)
+        self.overlays.is_float(id)
     }
 
     /// The scratch float or the popup — what chrome and hit-testing treat as
     /// the one pane painted over the rest. Control refusals use `is_float`.
     pub fn is_overlay(&self, id: PaneId) -> bool {
-        self.is_float(id) || self.is_popup(id)
-    }
-
-    /// Where focus returns when the shown overlay goes away, `None` when no
-    /// overlay is up.
-    fn overlay_prev(&self) -> Option<PaneId> {
-        self.popup.iter().chain(self.float.iter().filter(|f| f.shown)).next().map(|f| f.prev_focus)
-    }
-
-    fn overlay_noun(&self) -> &'static str {
-        if self.popup.is_some() {
-            "popup"
-        } else {
-            "scratch pane"
-        }
+        self.overlays.is_overlay(id)
     }
 
     /// Is an overlay (scratch float or popup) currently the focused pane?
@@ -1371,7 +1313,7 @@ impl<B: PaneBackend> App<B> {
         // stale remembered one — the rail's `▎` jumped, and two PTYs got
         // resized — then snap back on hide (review, 2026-09-10).
         if let Some(back) =
-            self.overlay_prev().filter(|p| self.ws.active_tab().panes.contains_key(p))
+            self.overlays.prev().filter(|p| self.ws.active_tab().panes.contains_key(p))
         {
             return back;
         }
@@ -1540,10 +1482,9 @@ impl<B: PaneBackend> App<B> {
         // C20: one status-transition feed line per pane per tick, diffed
         // against each pane's last-known status.
         self.diff_statuses();
-        let (ws, float, popup) = (&self.ws, &self.float, &self.popup);
-        let found = self
-            .detect
-            .poll(SystemTime::now(), &self.registry, ws, |id| spec_in(ws, float, popup, id));
+        let (ws, overlays) = (&self.ws, &self.overlays);
+        let found =
+            self.detect.poll(SystemTime::now(), &self.registry, ws, |id| spec_in(ws, overlays, id));
         for f in found {
             match f {
                 Found::Adopted { id, session, unavailable } => {
@@ -1820,7 +1761,7 @@ impl<B: PaneBackend> App<B> {
     /// them), but each then adds its own is-float refusal (M1) — the float
     /// is the human's private scratch shell, never a control-plane target.
     pub fn find_spec(&self, id: PaneId) -> Option<&PaneSpec> {
-        spec_in(&self.ws, &self.float, &self.popup, id)
+        spec_in(&self.ws, &self.overlays, id)
     }
 
     /// The focused pane's working directory, `$HOME` abbreviated to `~`,
@@ -1833,8 +1774,8 @@ impl<B: PaneBackend> App<B> {
 
     /// C22: mirrors `find_spec` — the float's spec is mutable too (rename).
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
-        if let Some(f) = self.float.iter_mut().chain(&mut self.popup).find(|f| f.id == id) {
-            return Some(&mut f.spec);
+        if let Some(spec) = self.overlays.spec_mut(id) {
+            return Some(spec);
         }
         self.ws.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
     }
@@ -1903,7 +1844,9 @@ impl<B: PaneBackend> App<B> {
         // ring this count must equal.
         self.runtimes
             .iter()
-            .filter(|(&id, rt)| rt.status() == AgentStatus::NeedsInput && !self.is_popup(id))
+            .filter(|(&id, rt)| {
+                rt.status() == AgentStatus::NeedsInput && !self.overlays.is_popup(id)
+            })
             .count()
     }
 
@@ -2209,7 +2152,7 @@ impl<B: PaneBackend> App<B> {
             // M1: `wait <float> --until idle` would be a typing oracle on
             // the human's private scratch shell — same refusal as every
             // other verb that resolves a specific pane id.
-            if let Some(msg) = self.float_refusal(p, "wait on") {
+            if let Some(msg) = self.overlays.refusal(p, "wait on") {
                 let _ = reply.send(Reply::err(msg.clone()));
                 return Err(msg);
             }
@@ -2365,7 +2308,7 @@ impl<B: PaneBackend> App<B> {
                 // `ctl_list` is the only thing that iterates — but a
                 // specific id resolves it via `find_spec` same as any
                 // other verb, so it needs the same explicit refusal.
-                if let Some(msg) = self.float_refusal(p, "get the status of") {
+                if let Some(msg) = self.overlays.refusal(p, "get the status of") {
                     return Reply::err(msg);
                 }
                 if !self.may_target(actor, p) {
@@ -2497,7 +2440,7 @@ impl<B: PaneBackend> App<B> {
         initial_input: Option<String>,
         title: Option<String>,
     ) -> Reply {
-        if self.popup.is_some() {
+        if self.overlays.popup_id().is_some() {
             return Reply::err("a popup is already open");
         }
         if !Self::float_fits(self.body_area()) {
@@ -2517,7 +2460,7 @@ impl<B: PaneBackend> App<B> {
             noted_at: None,
         };
         let id = self.alloc_pane_id();
-        self.popup = Some(Float { id, spec: spec.clone(), shown: true, prev_focus: self.focused });
+        self.overlays.open_popup(id, spec.clone(), self.focused);
         self.set_focus(id);
         // Like tmux `display-popup -E CMD`: a shell popup with input runs it
         // as the command, so the popup closes when the command does; other
@@ -2563,15 +2506,11 @@ impl<B: PaneBackend> App<B> {
         // have, and one `cycle_layout` then planted into the tab's layout
         // tree as a pane with no spec. Save and restore both halves.
         let (focused, active_tab) = (self.focused, self.ws.active_tab);
-        let float_shown = self.float.as_ref().is_some_and(|f| f.shown);
-        // A popup is the same story: pin it so the transient focus move
+        // A popup is the same story: pinned, so the transient focus move
         // below does not read as a dismissal.
-        self.popup_pinned = true;
+        let float_shown = self.overlays.pin();
         let id = self.spawn_child(adapter, cwd, owner);
-        self.popup_pinned = false;
-        if let Some(f) = &mut self.float {
-            f.shown = float_shown;
-        }
+        self.overlays.unpin(float_shown);
         // Restore the tab before focus: `set_focus`'s centralized expand
         // walks whichever tab is active *at the time it runs*, so restoring
         // `active_tab` first is what guarantees it lands on the human's tab.
@@ -2614,7 +2553,7 @@ impl<B: PaneBackend> App<B> {
         // M1: forking the float would clone its spec into a brand-new real
         // pane (and surface its cwd in `list`) — refused before authz, same
         // as every other verb that resolves a specific pane id.
-        if let Some(msg) = self.float_refusal(target, "fork") {
+        if let Some(msg) = self.overlays.refusal(target, "fork") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, target) {
@@ -2633,7 +2572,7 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "send to") {
+        if let Some(msg) = self.overlays.refusal(pane, "send to") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
@@ -2733,7 +2672,7 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "read") {
+        if let Some(msg) = self.overlays.refusal(pane, "read") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
@@ -2767,14 +2706,14 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "close") {
+        if let Some(msg) = self.overlays.refusal(pane, "close") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
             return Reply::err("forbidden: pane not in your subtree");
         }
         // The popup is not in any tab: closing it just dismisses it.
-        if self.is_popup(pane) {
+        if self.overlays.is_popup(pane) {
             self.close_popup();
             self.relayout();
             return Reply::ok(serde_json::json!({ "closed": pane }));
@@ -2805,7 +2744,7 @@ impl<B: PaneBackend> App<B> {
         if self.find_spec(pane).is_none() {
             return Reply::err("no such pane");
         }
-        if let Some(msg) = self.float_refusal(pane, "focus") {
+        if let Some(msg) = self.overlays.refusal(pane, "focus") {
             return Reply::err(msg);
         }
         if !self.may_target(actor, pane) {
@@ -2849,7 +2788,7 @@ impl<B: PaneBackend> App<B> {
         // pane actually being shown full-screen left `zoomed` set pointing
         // at a pane that no longer exists. `display_rects` resolves the real
         // target the same way; this must agree with it.
-        let zoom_target = self.overlay_prev().unwrap_or(self.focused);
+        let zoom_target = self.overlays.prev().unwrap_or(self.focused);
         if self.zoomed && id == zoom_target {
             self.exit_zoom();
         }
@@ -3107,7 +3046,7 @@ impl<B: PaneBackend> App<B> {
     /// gets no pull toward it (regression: same fix as `on_status`).
     pub fn on_pty_exit(&mut self, id: PaneId) -> Option<String> {
         // A popup lives exactly as long as its process, whatever the status.
-        if self.is_popup(id) {
+        if self.overlays.is_popup(id) {
             self.close_popup();
             return None;
         }
@@ -4381,7 +4320,7 @@ impl<B: PaneBackend> App<B> {
                 // floating full-focus surface) — refuse rather than hide it
                 // and zoom whatever's behind it.
                 if self.float_focused() {
-                    let what = if self.popup.is_some() { "popup" } else { "float" };
+                    let what = if self.overlays.popup_id().is_some() { "popup" } else { "float" };
                     self.set_flash(format!("can't zoom the {what}"));
                 } else {
                     self.toggle_zoom();
@@ -4499,11 +4438,12 @@ impl<B: PaneBackend> App<B> {
     /// would undo exactly what U9 fixed.
     fn set_focus(&mut self, id: PaneId) {
         let old = self.focused;
-        // Focus leaving the popup is a dismissal (it closes); its `prev_focus`
-        // is moot here since the caller already chose where focus goes.
-        // Before the trail below so a dead popup never becomes "go back".
-        if old != id && self.is_popup(old) && !self.popup_pinned {
-            self.drop_popup();
+        // C22 rule 1, enforced in this single writer rather than at each door
+        // (per-site copies missed C35's "go back"): leaving the popup closes
+        // it, leaving a shown float hides it — the caller already chose where
+        // focus goes. Before the trail below so a dead popup is never "go back".
+        if let Some(popup) = self.overlays.focus_moved(old, id) {
+            self.forget_overlay_pane(popup);
         }
         // C35: the trail "go back" follows. Recorded here rather than at each
         // call site precisely because this is the one chokepoint — the
@@ -4512,20 +4452,6 @@ impl<B: PaneBackend> App<B> {
         // feature that moves focus.
         if old != id && self.pane_exists(old) {
             self.alternate = Some(old);
-        }
-        // C22 rule 1: a shown float IS the focused pane, so focus landing on
-        // anything else means the float is no longer up. Enforced here, in
-        // the single writer of `self.focused`, rather than at each door: the
-        // rule was previously re-applied per call site, and the ones that
-        // forgot (C35's Alt+`` `` "go back" among them) left the float drawn
-        // over the body with the user's keystrokes going to a tiled pane
-        // underneath it. `shown` is cleared directly rather than through
-        // `hide_float`, which would re-route focus the caller has already
-        // decided.
-        if old != id && self.float_focused() && !self.is_float(id) {
-            if let Some(f) = &mut self.float {
-                f.shown = false;
-            }
         }
         self.focused = id;
         // A focused-but-collapsed stack member is invisible to the user;
@@ -4648,7 +4574,7 @@ impl<B: PaneBackend> App<B> {
         // simulation agent comparing the two, which is the comparison that
         // makes the inconsistency visible.
         if self.float_focused() {
-            self.set_flash(format!("the {} sits outside the layout", self.overlay_noun()));
+            self.set_flash(format!("the {} sits outside the layout", self.overlays.noun()));
             return;
         }
         // C21, from here rather than `apply`'s structural guard: the float
@@ -5020,7 +4946,7 @@ impl<B: PaneBackend> App<B> {
         // C22 rule 4: Alt+w on the float kills it for real, no confirm
         // guard (scratch is not precious — the whole point of the confirm
         // guard below is protecting work the float explicitly isn't).
-        if self.is_popup(self.focused) {
+        if self.overlays.is_popup(self.focused) {
             self.close_popup();
             return;
         }
@@ -5288,7 +5214,7 @@ impl<B: PaneBackend> App<B> {
     /// nowhere to send anything.
     fn move_pane_to_tab(&mut self, delta: isize) {
         if self.float_focused() {
-            self.set_flash(format!("the {} belongs to no tab", self.overlay_noun()));
+            self.set_flash(format!("the {} belongs to no tab", self.overlays.noun()));
             return;
         }
         let n = self.ws.tabs.len();
@@ -5395,7 +5321,7 @@ impl<B: PaneBackend> App<B> {
     /// tab to pull it out of.
     fn mark_pane(&mut self) {
         if self.float_focused() {
-            self.set_flash(format!("the {} belongs to no tab", self.overlay_noun()));
+            self.set_flash(format!("the {} belongs to no tab", self.overlays.noun()));
             return;
         }
         let id = self.focused;
@@ -5645,9 +5571,9 @@ impl<B: PaneBackend> App<B> {
             layout::pane_order(&tab.layout, &mut order);
             ring.extend(order.into_iter().filter(|&id| self.display_status(id) == Some(status)));
         }
-        if let Some(f) = &self.float {
-            if self.display_status(f.id) == Some(status) {
-                ring.push(f.id);
+        if let Some(id) = self.overlays.float_id() {
+            if self.display_status(id) == Some(status) {
+                ring.push(id);
             }
         }
         ring
@@ -5785,11 +5711,7 @@ impl<B: PaneBackend> App<B> {
             }
         }
         if self.is_float(target) {
-            let from = self.focused;
-            if let Some(f) = &mut self.float {
-                f.shown = true;
-                f.prev_focus = from;
-            }
+            self.overlays.show_float(self.focused);
         }
         self.set_focus(target);
     }
@@ -5946,7 +5868,7 @@ impl<B: PaneBackend> App<B> {
         let tabs: usize =
             self.ws.tabs.iter().filter(|t| !t.panes.is_empty()).map(|t| t.panes.len() + 1).sum();
         // The float rides last under a header of its own (C22/C27).
-        let fleet = tabs + if self.float.is_some() { 2 } else { 0 };
+        let fleet = tabs + if self.overlays.float_id().is_some() { 2 } else { 0 };
         let content = fleet.max(self.feed.len()).max(1);
         // The two border rows the content sits between.
         (w, (content as u16).saturating_add(2).min(cap))
@@ -6044,11 +5966,9 @@ impl<B: PaneBackend> App<B> {
             rows.push(RosterRow::Group { label: roster_group_label(i, name, panes.len()) });
             rows.extend(panes.into_iter().map(|id| RosterRow::Pane { id }));
         }
-        if let Some(f) = &self.float {
-            if shows(f.id) {
-                rows.push(RosterRow::Group { label: roster_float_label() });
-                rows.push(RosterRow::Pane { id: f.id });
-            }
+        if let Some(id) = self.overlays.float_id().filter(|&id| shows(id)) {
+            rows.push(RosterRow::Group { label: roster_float_label() });
+            rows.push(RosterRow::Pane { id });
         }
         rows
     }
@@ -6414,16 +6334,7 @@ impl<B: PaneBackend> App<B> {
             self.set_flash("no room for float");
             return;
         }
-        // The float's id comes out of the borrow before `set_focus` runs:
-        // that call needs all of `self` (the report it may send goes to the
-        // runtimes map), which `&mut self.float` would still be holding.
-        let prev = self.focused;
-        let show = self.float.as_mut().map(|f| {
-            f.shown = true;
-            f.prev_focus = prev;
-            f.id
-        });
-        match show {
+        match self.overlays.show_float(self.focused) {
             Some(id) => self.set_focus(id),
             None => self.spawn_float(),
         }
@@ -6445,7 +6356,7 @@ impl<B: PaneBackend> App<B> {
             note: None,
             noted_at: None,
         };
-        self.float = Some(Float { id, spec: spec.clone(), shown: true, prev_focus });
+        self.overlays.open_float(id, spec.clone(), prev_focus);
         self.set_focus(id);
         // display_rects, not rects: the float isn't in the tiled tree, so
         // only the zoom-aware/float-aware display list knows its rect.
@@ -6461,16 +6372,11 @@ impl<B: PaneBackend> App<B> {
     /// outside its rect. A no-op when the float isn't currently shown.
     fn hide_float(&mut self) {
         // The popup has no hidden state: every dismissal closes it.
-        if self.popup.is_some() {
+        if self.overlays.popup_id().is_some() {
             self.close_popup();
             return;
         }
-        let Some(f) = &mut self.float else { return };
-        if !f.shown {
-            return;
-        }
-        f.shown = false;
-        let back = f.prev_focus;
+        let Some(back) = self.overlays.hide_float() else { return };
         let target = self.focus_after_overlay(back);
         self.set_focus(target);
     }
@@ -6505,9 +6411,9 @@ impl<B: PaneBackend> App<B> {
 
     /// Kill the popup without touching focus; returns where focus was.
     fn drop_popup(&mut self) -> Option<PaneId> {
-        let p = self.popup.take()?;
-        self.forget_overlay_pane(p.id);
-        Some(p.prev_focus)
+        let (id, prev_focus) = self.overlays.take_popup()?;
+        self.forget_overlay_pane(id);
+        Some(prev_focus)
     }
 
     /// Close the popup and hand focus back to what it covered.
@@ -6521,9 +6427,9 @@ impl<B: PaneBackend> App<B> {
     /// C22 rule 4: Alt+w on the float kills it for real and clears the slot
     /// — unlike hiding, no undo entry (scratch is not precious).
     fn close_float(&mut self) {
-        let Some(f) = self.float.take() else { return };
-        self.forget_overlay_pane(f.id);
-        let target = self.focus_after_overlay(f.prev_focus);
+        let Some((id, prev_focus)) = self.overlays.take_float() else { return };
+        self.forget_overlay_pane(id);
+        let target = self.focus_after_overlay(prev_focus);
         self.set_focus(target);
         self.set_flash("scratch closed");
     }
@@ -7795,16 +7701,8 @@ pub fn word_end(line: &str, col: u16, last: u16) -> u16 {
 }
 
 /// `App::find_spec`, over borrowed fields so the detector can hold `&mut App.detect` meanwhile.
-fn spec_in<'a>(
-    ws: &'a Workspace,
-    float: &'a Option<Float>,
-    popup: &'a Option<Float>,
-    id: PaneId,
-) -> Option<&'a PaneSpec> {
-    if let Some(f) = float.iter().chain(popup).find(|f| f.id == id) {
-        return Some(&f.spec);
-    }
-    ws.tabs.iter().find_map(|t| t.panes.get(&id))
+fn spec_in<'a>(ws: &'a Workspace, overlays: &'a Overlays, id: PaneId) -> Option<&'a PaneSpec> {
+    overlays.spec(id).or_else(|| ws.tabs.iter().find_map(|t| t.panes.get(&id)))
 }
 
 fn inner_dims(rect: Rect) -> (u16, u16) {
@@ -12984,7 +12882,7 @@ pub(crate) mod tests {
         let mut app = mk_app_with_claims_detect(resume_ws("detect", "sess-1"), "b", claims.clone());
 
         app.spawn_float();
-        let float_id = app.float.as_ref().expect("float now exists").id;
+        let float_id = app.overlays.float_id().expect("float now exists");
         assert!(app.claim_session(float_id, "detect", "sess-2").is_ok());
         assert!(app.detect.held.contains_key(&float_id));
         assert!(claims.snapshot().contains_key("detect.sess-2"), "the float holds its claim");
@@ -13112,7 +13010,7 @@ pub(crate) mod tests {
             app.close_pane_id(*id);
         }
         app.apply(Action::ToggleFloat);
-        let float_id = app.float.as_ref().expect("the float is up").id;
+        let float_id = app.overlays.float_id().expect("the float is up");
         assert!(
             !parked.contains(&float_id),
             "the float took id {float_id}, which the parked tab still owns",
@@ -13262,7 +13160,7 @@ pub(crate) mod tests {
 
         app.close_pane_id(victim);
 
-        if app.float.as_ref().is_some_and(|f| f.shown) {
+        if app.overlays.float_shown() {
             assert!(
                 app.float_focused(),
                 "C22: the float is on screen but focus is on {}",
@@ -13297,7 +13195,7 @@ pub(crate) mod tests {
 
             if !app.float_focused() {
                 assert!(
-                    !app.float.as_ref().is_some_and(|f| f.shown),
+                    !app.overlays.float_shown(),
                     "{name}: the float is still drawn but focus is on {}",
                     app.focused,
                 );
@@ -13332,10 +13230,7 @@ pub(crate) mod tests {
         });
 
         assert_eq!(app.focused, float_id, "focus was borrowed, not taken");
-        assert!(
-            app.float.as_ref().is_some_and(|f| f.shown),
-            "the float is focused but no longer drawn",
-        );
+        assert!(app.overlays.float_shown(), "the float is focused but no longer drawn",);
 
         // The state that used to leak: a hidden-but-focused float becomes a
         // ghost pane in the tree the moment anything arranges by focus.
@@ -13528,12 +13423,8 @@ pub(crate) mod tests {
             assert_eq!(set.len(), ids.len(), "{ctx}: tab {i} tree lists a pane twice: {ids:?}");
             let keys: HashSet<PaneId> = tab.panes.keys().copied().collect();
             assert_eq!(set, keys, "{ctx}: tab {i} tree ids {set:?} != panes map keys {keys:?}");
-            if let Some(f) = &app.float {
-                assert!(
-                    !set.contains(&f.id),
-                    "{ctx}: tab {i} tree contains the float's id {}",
-                    f.id
-                );
+            if let Some(fid) = app.overlays.float_id() {
+                assert!(!set.contains(&fid), "{ctx}: tab {i} tree contains the float's id {fid}");
             }
             for id in ids {
                 if let Some(prev) = global.insert(id, i) {
@@ -13542,11 +13433,11 @@ pub(crate) mod tests {
             }
             inv_check_node(&tab.layout, ctx, i);
         }
-        if app.float.as_ref().is_some_and(|f| !f.shown && f.id == app.focused) {
+        if app.overlays.is_float(app.focused) && !app.overlays.float_shown() {
             panic!("{ctx}: the float is HIDDEN but still focused");
         }
         // C22 rule 1: a shown float is the focused pane.
-        if app.float.as_ref().is_some_and(|f| f.shown) {
+        if app.overlays.float_shown() {
             assert!(
                 app.float_focused(),
                 "{ctx}: the float is shown but focus is on {}",
@@ -13670,8 +13561,7 @@ pub(crate) mod tests {
                 // Leaving a shown float lands focus on its `prev_focus` first, even
                 // when the action then carries it elsewhere (a tab switch): that
                 // intermediate landing is a real focus move the property must allow.
-                let float_prev_before =
-                    app.float.as_ref().filter(|f| f.shown).map(|f| f.prev_focus);
+                let float_prev_before = app.overlays.prev();
                 let (name, action) = loop {
                     let pick = rng.below(43);
                     let d = dirs[rng.below(4) as usize];
@@ -13974,7 +13864,7 @@ pub(crate) mod tests {
                 if app.zoomed() {
                     zoom_seen += 1;
                 }
-                if app.float.as_ref().is_some_and(|f| f.shown) {
+                if app.overlays.float_shown() {
                     float_seen += 1;
                     if app.zoomed() {
                         float_and_zoom += 1;
@@ -15660,7 +15550,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat); // spawn + show + focus
         let float_id = app.focused;
         app.apply(Action::ToggleFloat); // hide it again
-        assert!(!app.float.as_ref().unwrap().shown, "the float is hidden");
+        assert!(app.overlays.float_hidden(), "the float is hidden");
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         assert!(app.attention_ring().contains(&float_id), "C19 rings a hidden needy float");
 
@@ -18303,7 +18193,7 @@ pub(crate) mod tests {
         app.apply(Action::Focus(layout::Dir::Right));
         assert_eq!(app.focused, real_pane, "rule 2: back to prev_focus, not a cross-tab jump");
         assert_eq!(app.ws.active_tab, tab_before, "C31 must never fire while leaving the float");
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     // ---- C28: move the focused pane between tabs -------------------------
@@ -18880,7 +18770,7 @@ pub(crate) mod tests {
         assert_eq!(spawn_placed(&mut app, p).unwrap_err(), "--title needs --tab or --float");
         assert!(spawn_placed(&mut app, place(true, false, true)).is_err());
         assert_eq!(app.ws.tabs.len(), 1, "a refused spawn creates nothing");
-        assert!(app.popup.is_none());
+        assert!(app.overlays.popup_id().is_none());
     }
 
     #[test]
@@ -18890,11 +18780,11 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         assert_eq!(app.focused, id);
-        assert!(app.is_popup(id) && !app.is_float(id));
+        assert!(app.overlays.is_popup(id) && !app.is_float(id));
         assert!(app.runtimes.contains_key(&id));
         assert_eq!(app.display_rects()[0].id, id, "topmost");
         assert!(app.ws.tabs.iter().all(|t| !t.panes.contains_key(&id)), "never persisted");
-        assert_eq!(app.popup.as_ref().unwrap().prev_focus, below);
+        assert_eq!(app.overlays.prev().unwrap(), below);
     }
 
     #[test]
@@ -18904,7 +18794,7 @@ pub(crate) mod tests {
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         let err = spawn_placed(&mut app, place(false, false, true)).unwrap_err();
         assert_eq!(err, "a popup is already open");
-        assert!(app.is_popup(id) && app.runtimes.contains_key(&id));
+        assert!(app.overlays.is_popup(id) && app.runtimes.contains_key(&id));
     }
 
     #[test]
@@ -18914,7 +18804,7 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         app.on_pty_exit(id);
-        assert!(app.popup.is_none() && !app.runtimes.contains_key(&id));
+        assert!(app.overlays.popup_id().is_none() && !app.runtimes.contains_key(&id));
         assert_eq!(app.focused, below);
     }
 
@@ -18925,12 +18815,12 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         app.apply(Action::ToggleFloat);
-        assert!(app.popup.is_none() && !app.runtimes.contains_key(&id));
+        assert!(app.overlays.popup_id().is_none() && !app.runtimes.contains_key(&id));
         assert_eq!(app.focused, below);
         // Any tab change dismisses it too.
         spawn_placed(&mut app, place(false, false, true)).unwrap();
         app.apply(Action::NewTab);
-        assert!(app.popup.is_none());
+        assert!(app.overlays.popup_id().is_none());
     }
 
     #[test]
@@ -18939,7 +18829,7 @@ pub(crate) mod tests {
         let id =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
         spawn_placed(&mut app, place(false, false, false)).unwrap();
-        assert!(app.is_popup(id));
+        assert!(app.overlays.is_popup(id));
         assert_eq!(app.focused, id);
     }
 
@@ -18951,7 +18841,7 @@ pub(crate) mod tests {
         let scratch = app.focused;
         let popup =
             spawn_placed(&mut app, place(false, false, true)).unwrap()["pane"].as_u64().unwrap();
-        assert!(!app.float.as_ref().unwrap().shown, "scratch steps aside");
+        assert!(app.overlays.float_hidden(), "scratch steps aside");
         assert_eq!(app.display_rects()[0].id, popup);
         let token = app.control_token().to_string();
         let close = |app: &mut App<FakePane>, pane| {
@@ -18965,7 +18855,7 @@ pub(crate) mod tests {
             other => panic!("expected refusal, got {other:?}"),
         }
         assert!(matches!(close(&mut app, popup), Reply::Ok { .. }));
-        assert!(app.popup.is_none() && app.float.is_some());
+        assert!(app.overlays.popup_id().is_none() && app.overlays.float_id().is_some());
     }
 
     #[test]
@@ -18980,7 +18870,7 @@ pub(crate) mod tests {
             place: place(false, false, true),
         };
         app.handle_control(Request { token, method });
-        let id = app.popup.as_ref().unwrap().id;
+        let id = app.overlays.popup_id().unwrap();
         assert_eq!(app.runtimes[&id].cmd.args.last().map(String::as_str), Some("lazygit"));
         assert!(app.runtimes[&id].cmd.args.contains(&"-c".to_string()));
         assert!(!app.pending_input.contains_key(&id), "not typed into a prompt");
@@ -19008,7 +18898,7 @@ pub(crate) mod tests {
         let below = app.focused;
         spawn_placed(&mut app, place(false, false, true)).unwrap();
         app.on_click(below);
-        assert!(app.popup.is_none());
+        assert!(app.overlays.popup_id().is_none());
         assert_eq!(app.focused, below);
     }
 
@@ -19417,7 +19307,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleZoom);
         assert!(app.zoomed(), "setup: zoomed while solo");
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().is_some_and(|f| f.shown), "setup: float shown too");
+        assert!(app.overlays.float_shown(), "setup: float shown too");
         assert!(app.zoomed(), "setup: showing the float must not itself exit zoom");
 
         app.on_resize(Size::new(30, 10), (0, 0)); // too small for any of the three tiled shapes
@@ -19426,9 +19316,9 @@ pub(crate) mod tests {
         assert!(app.solo(), "the refusal must leave the tab in solo");
         assert!(app.zoomed(), "a refused Alt+g must not exit an unrelated zoom");
         assert!(
-            app.float.as_ref().is_some_and(|f| f.shown),
+            app.overlays.float_shown(),
             "nor hide an unrelated float: {:?}",
-            app.float.as_ref().map(|f| f.shown)
+            app.overlays.float_shown()
         );
         assert!(app.flash().is_some(), "the refusal must still say something");
     }
@@ -20291,8 +20181,8 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         let float_id = app.focused;
         assert_ne!(float_id, real_pane);
-        assert!(app.float.as_ref().unwrap().shown);
-        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+        assert!(app.overlays.float_shown());
+        assert_eq!(app.overlays.prev().unwrap(), real_pane);
         let spec = app.find_spec(float_id).expect("float spec");
         assert_eq!(spec.adapter, "shell");
         assert_eq!(spec.title.as_deref(), Some("scratch"));
@@ -20310,7 +20200,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.apply(Action::ToggleFloat); // hide
         assert_eq!(app.focused, real_pane);
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
         assert!(app.runtimes.contains_key(&float_id), "process stays alive while hidden");
     }
 
@@ -20322,7 +20212,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat); // hide
         app.apply(Action::ToggleFloat); // show again
         assert_eq!(app.focused, float_id);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         assert_eq!(app.runtimes.len(), 2, "no second float spawned (real pane + float only)");
     }
 
@@ -20340,7 +20230,7 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.on_resize(Size::new(39, 20), (0, 0)); // body width 39 < the 40-col floor
         app.apply(Action::ToggleFloat);
-        assert!(app.float.is_none(), "must not spawn below the refusal floor");
+        assert!(app.overlays.float_id().is_none(), "must not spawn below the refusal floor");
         assert_eq!(app.flash(), Some("no room for float"));
     }
 
@@ -20385,7 +20275,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         app.apply(Action::Focus(crate::core::layout::Dir::Right));
         assert_eq!(app.focused, real_pane);
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20400,7 +20290,7 @@ pub(crate) mod tests {
             app.focused, real_pane,
             "Alt+a from the float returns to prev_focus, not a ring jump"
         );
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20408,9 +20298,9 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewTab);
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         app.apply(Action::GoToTab(0));
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20422,7 +20312,7 @@ pub(crate) mod tests {
         assert_ne!(float_id, 1);
         app.on_click(1);
         assert_eq!(app.focused, 1);
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20432,7 +20322,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.on_click(float_id);
         assert_eq!(app.focused, float_id);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
     }
 
     #[test]
@@ -20457,7 +20347,7 @@ pub(crate) mod tests {
             order.contains(&1) && order.contains(&2),
             "original panes must stay reachable: {order:?}"
         );
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
     }
 
     #[test]
@@ -20465,9 +20355,9 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane);
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         app.apply(Action::CycleLayout { forward: true });
-        assert!(!app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_hidden());
         assert_eq!(app.pane_order().len(), 2, "the real 2-pane tab is untouched");
     }
 
@@ -20477,14 +20367,11 @@ pub(crate) mod tests {
         let (mut app, _) = mk_app(shell_ws());
         app.apply(Action::NewPane); // panes 1,2
         app.apply(Action::ToggleFloat);
-        assert!(app.float.as_ref().unwrap().shown);
+        assert!(app.overlays.float_shown());
         app.apply(Action::QuickLaunch);
-        assert!(
-            app.float.as_ref().unwrap().shown,
-            "opening the picker alone must not hide the float"
-        );
+        assert!(app.overlays.float_shown(), "opening the picker alone must not hide the float");
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter)); // launches the first item
-        assert!(!app.float.as_ref().unwrap().shown, "picker launch (C22 rule 3) hides it");
+        assert!(app.overlays.float_hidden(), "picker launch (C22 rule 3) hides it");
         let order = app.pane_order();
         assert!(order.contains(&1) && order.contains(&2), "original panes survive: {order:?}");
     }
@@ -20525,7 +20412,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.apply(Action::ToggleZoom);
         assert!(!app.zoomed(), "must not zoom");
-        assert!(app.float.as_ref().unwrap().shown, "must not hide the float either");
+        assert!(app.overlays.float_shown(), "must not hide the float either");
         assert_eq!(app.focused, float_id);
         assert_eq!(app.flash(), Some("can't zoom the float"));
     }
@@ -20538,13 +20425,13 @@ pub(crate) mod tests {
         let float_id = app.focused;
         let undo_depth_before = app.undo.len();
         app.apply(Action::ClosePane);
-        assert!(app.float.is_none());
+        assert!(app.overlays.float_id().is_none());
         assert!(!app.runtimes.contains_key(&float_id));
         assert_eq!(app.focused, real_pane);
         assert_eq!(app.undo.len(), undo_depth_before, "scratch is not precious — no undo entry");
         assert_eq!(app.flash(), Some("scratch closed"));
         app.apply(Action::Undo); // must not somehow resurrect it
-        assert!(app.float.is_none());
+        assert!(app.overlays.float_id().is_none());
     }
 
     #[test]
@@ -20554,7 +20441,7 @@ pub(crate) mod tests {
         let float_id = app.focused;
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::Working);
         app.apply(Action::ClosePane); // must close immediately, no confirm arm
-        assert!(app.float.is_none());
+        assert!(app.overlays.float_id().is_none());
         assert!(!app.runtimes.contains_key(&float_id));
     }
 
@@ -20575,7 +20462,7 @@ pub(crate) mod tests {
         app.apply(Action::ToggleFloat);
         app.apply(Action::ToggleFloat); // hide
         let rects = app.display_rects();
-        let float_id = app.float.as_ref().unwrap().id;
+        let float_id = app.overlays.float_id().unwrap();
         assert!(rects.iter().all(|pr| pr.id != float_id));
     }
 
@@ -20636,8 +20523,8 @@ pub(crate) mod tests {
         app.runtimes.get_mut(&float_id).unwrap().set_extension_status(AgentStatus::NeedsInput);
         app.apply(Action::JumpAttention);
         assert_eq!(app.focused, float_id);
-        assert!(app.float.as_ref().unwrap().shown);
-        assert_eq!(app.float.as_ref().unwrap().prev_focus, real_pane);
+        assert!(app.overlays.float_shown());
+        assert_eq!(app.overlays.prev().unwrap(), real_pane);
     }
 
     #[test]
@@ -20655,7 +20542,7 @@ pub(crate) mod tests {
             Reply::Err { err } => assert_eq!(err, "cannot close the scratch pane"),
             other => panic!("expected refusal, got {other:?}"),
         }
-        assert!(app.float.as_ref().unwrap().shown, "the float must survive the refused close");
+        assert!(app.overlays.float_shown(), "the float must survive the refused close");
     }
 
     /// M1: `find_spec` still learns the float (badges/rename/respawn need
@@ -20695,7 +20582,7 @@ pub(crate) mod tests {
 
     /// M1 (review round 2): `ctl_status(Some(float_id))` would leak the
     /// live status of the human's private scratch shell — same refusal,
-    /// through the same `float_refusal` helper, as close/send/read.
+    /// through the same `Overlays::refusal` helper, as close/send/read.
     #[test]
     fn control_status_of_the_float_is_refused() {
         use crate::core::control::{Method, Reply, Request};
