@@ -35,7 +35,10 @@ each adapter's own session ids.
   (plans, worker scopes, handoffs, reports — historical, not specs).
 - **Releasing is PR-mergeable end to end** — bump the version everywhere
   (Cargo.toml + Cargo.lock, README badge and pin examples, landing page),
-  then touch `.github/release-request` and merge: the request workflow
+  then touch `.github/release-request` and merge — **one PR, from a
+  `release/X.Y.Z` branch**, fix commits included (release.yml publishes
+  only `release/*` merges; CI now fails any other branch that touches the
+  sentinel, since #211 needed #212 to republish): the request workflow
   dispatches Release, which builds four targets, **creates the `v*` tag
   itself** from Cargo.toml's version, publishes with SHA256SUMS.txt, and
   opens a Homebrew tap PR. **The tap update is a PR, not a push** (since

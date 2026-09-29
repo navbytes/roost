@@ -24,6 +24,20 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
+      # release.yml's preflight only publishes merges from release/* heads and
+      # only finds out after the merge (#211 needed #212); refuse it here.
+      - name: Release requests come from release/* branches
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename')
+          if grep -qx '.github/release-request' <<<"$files"; then
+            echo "::error title=Rename the branch to release/X.Y.Z::This PR changes .github/release-request, but release.yml only publishes merges from release/* branches. Push this branch as release/X.Y.Z and open the PR from there; code changes can ride along."
+            exit 1
+          fi
       - id: filter
         env:
           GH_TOKEN: ${{ github.token }}
