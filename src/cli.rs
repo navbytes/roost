@@ -44,8 +44,10 @@ const VERBS: &[&str] =
 /// shared by `positional` (which skips the value) and `strip_workspace_flag`
 /// (which must not mistake one for a positional), so the two can't drift
 /// apart by editing one and not the other.
-const VALUE_TAKING_OPTIONS: &[&str] = &["--cwd", "--input", "--tail", "--until", "--timeout"];
-const BOOLEAN_OPTIONS: &[&str] = &["--all", "--enter", "--full", "--force"];
+const VALUE_TAKING_OPTIONS: &[&str] =
+    &["--cwd", "--input", "--title", "--tail", "--until", "--timeout"];
+const BOOLEAN_OPTIONS: &[&str] =
+    &["--all", "--enter", "--full", "--force", "--tab", "--focus", "--float"];
 /// `--input` is prompt text, so even a recognized option name can be its
 /// literal value; typed options reject those collisions as missing values.
 const FREE_TEXT_VALUE_OPTIONS: &[&str] = &["--input"];
@@ -329,7 +331,7 @@ const USAGE: &str = "\
 roost — control a running instance:
   roost list
   roost status [PANE]
-  roost spawn ADAPTER [--cwd DIR] [--input TEXT]
+  roost spawn ADAPTER [--cwd DIR] [--input TEXT] [--tab [--title NAME]] [--float [--title NAME]] [--focus]
   roost fork [PANE]
   roost send PANE TEXT... [--enter]
   roost send --all TEXT... [--enter]
@@ -365,7 +367,7 @@ fn verb_help(verb: &str) -> &'static str {
     match verb {
         "list" => "roost list\nList every pane: id, adapter, cwd, status, …",
         "status" => "roost status [PANE]\nOne pane's status, or every pane's if PANE is omitted.",
-        "spawn" => "roost spawn ADAPTER [--cwd DIR] [--input TEXT]\nLaunch a new pane running ADAPTER.",
+        "spawn" => "roost spawn ADAPTER [--cwd DIR] [--input TEXT] [--tab [--title NAME]] [--float [--title NAME]] [--focus]\nLaunch a new pane running ADAPTER. By default it splits the focused pane and leaves your focus alone.\n--tab puts it alone in a new tab (named NAME); --float opens it as a focused popup that closes when it exits (one at a time; a shell popup runs --input as its command, like tmux display-popup -E);\n--focus moves focus to it. --tab and --float cannot be combined.",
         "fork" => "roost fork [PANE]\nA sibling pane in the same context; the focused pane's if PANE is omitted.",
         "send" => "roost send PANE TEXT... [--enter]\nroost send --all TEXT... [--enter]\nType TEXT into PANE (or, with --all, every reachable pane). --enter also submits it.",
         "read" => "roost read PANE [--tail N | --full]\nA pane's current screen (default), its last N lines, or its full scrollback.",
@@ -561,7 +563,11 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             }
         }
         "spawn" => {
-            reject_unknown_flags(verb, rest, &["--cwd", "--input"])?;
+            reject_unknown_flags(
+                verb,
+                rest,
+                &["--cwd", "--input", "--tab", "--title", "--focus", "--float"],
+            )?;
             let pos = require_positionals(verb, rest, 1, 1, Some("an ADAPTER"))?;
             let adapter = &pos[0];
             m.insert("adapter".into(), adapter.as_str().into());
@@ -570,6 +576,14 @@ fn build_request(args: &[String], token: String) -> Result<serde_json::Value, St
             }
             if let Some(input) = flag_value(rest, "--input")? {
                 m.insert("initial_input".into(), input.into());
+            }
+            for flag in ["tab", "focus", "float"] {
+                if has_flag(rest, &format!("--{flag}")) {
+                    m.insert(flag.into(), true.into());
+                }
+            }
+            if let Some(title) = flag_value(rest, "--title")? {
+                m.insert("title".into(), title.into());
             }
         }
         "fork" => {
@@ -1364,7 +1378,7 @@ mod tests {
         let per_verb_allowed: &[(&str, &[&str])] = &[
             ("list", &[]),
             ("status", &[]),
-            ("spawn", &["--cwd", "--input"]),
+            ("spawn", &["--cwd", "--input", "--tab", "--title", "--focus", "--float"]),
             ("fork", &[]),
             ("send", &["--all", "--enter"]),
             ("read", &["--tail", "--full"]),
@@ -1563,11 +1577,22 @@ mod tests {
     fn cli_args_build_valid_requests() {
         assert!(matches!(parse(&["list"]).method, Method::List));
         match parse(&["spawn", "pi", "--cwd", "/x", "--input", "hi there"]).method {
-            Method::Spawn { adapter, cwd, initial_input } => {
+            Method::Spawn { adapter, cwd, initial_input, .. } => {
                 assert_eq!(adapter, "pi");
                 assert_eq!(cwd.as_deref(), Some("/x"));
                 assert_eq!(initial_input.as_deref(), Some("hi there"));
             }
+            _ => panic!(),
+        }
+        match parse(&["spawn", "pi", "--tab", "--title", "ci", "--focus"]).method {
+            Method::Spawn { place, .. } => {
+                assert!(place.tab && place.focus && !place.float);
+                assert_eq!(place.title.as_deref(), Some("ci"));
+            }
+            _ => panic!(),
+        }
+        match parse(&["spawn", "shell", "--float"]).method {
+            Method::Spawn { place, .. } => assert!(place.float && !place.tab && !place.focus),
             _ => panic!(),
         }
         match parse(&["send", "3", "run", "the", "tests", "--enter"]).method {

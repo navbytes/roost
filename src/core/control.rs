@@ -29,6 +29,26 @@ pub enum ReadMode {
     Full,
 }
 
+/// `spawn`'s opt-in placement flags. Every default preserves the old
+/// behaviour (split the focused pane, never steal focus), so a client that
+/// predates them still works. `--float` is the ephemeral popup, not the
+/// scratch float.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnPlace {
+    /// The pane becomes the sole pane of a new tab.
+    #[serde(default)]
+    pub tab: bool,
+    /// Tab name (with `tab`) or popup pane title (with `float`).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Move focus to the new pane, switching tab if needed.
+    #[serde(default)]
+    pub focus: bool,
+    /// Open as a focused popup over the current view.
+    #[serde(default)]
+    pub float: bool,
+}
+
 /// A control verb. Deserialized from the socket/CLI; `Wait` is handled by the
 /// transport layer (deferred reply) and is intentionally not here yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +69,10 @@ pub enum Method {
         cwd: Option<String>,
         #[serde(default)]
         initial_input: Option<String>,
+        /// Opt-in placement; the default (all off) splits the focused pane
+        /// and leaves the human's view untouched.
+        #[serde(flatten)]
+        place: SpawnPlace,
     },
     /// Fork a sibling of `pane` (default: the actor's own pane): same adapter +
     /// cwd. (Session-branching lands with the bidirectional pi extension.)
@@ -377,10 +401,11 @@ mod tests {
                 .unwrap();
         assert_eq!(r.token, "t");
         match r.method {
-            Method::Spawn { adapter, cwd, initial_input } => {
+            Method::Spawn { adapter, cwd, initial_input, place } => {
                 assert_eq!(adapter, "pi");
                 assert_eq!(cwd.as_deref(), Some("/x"));
                 assert!(initial_input.is_none());
+                assert_eq!(place, SpawnPlace::default(), "old clients spawn as before");
             }
             _ => panic!("expected spawn"),
         }

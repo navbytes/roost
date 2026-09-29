@@ -2925,7 +2925,7 @@ fn draw_pane<B: PaneBackend>(
     // this, cells the grid leaves alone show the pane beneath, and default
     // fg/bg and modifiers inherit from it. §2's "Clear then default bg", not
     // a fill. Tiled panes draw onto a freshly reset buffer and need nothing.
-    if app.is_float(pr.id) {
+    if app.is_overlay(pr.id) {
         clear_opaque(f, pr.rect);
     }
     let focused = app.focused == pr.id;
@@ -3023,7 +3023,7 @@ fn draw_pane<B: PaneBackend>(
     // always say zero. Styled `border_style`, matching the border it sits
     // on (accent() focused, rule() when the zoomed pane draws unfocused
     // under a focused float) — never its own fixed color.
-    if app.zoomed() && !app.is_float(pr.id) {
+    if app.zoomed() && !app.is_overlay(pr.id) {
         let n = app.rects().len().saturating_sub(1);
         if let Some(title) = zoom_title_text(n, top_budget) {
             // [Amended 2026-08-21] Zoom is served first and identity yields

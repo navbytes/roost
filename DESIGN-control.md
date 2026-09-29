@@ -62,6 +62,11 @@ staying daemonless. Design those first; pick skins later (you can even ship two)
    `close_pane_by_id(id)`, `spawn` returning the id). Mechanical but touches
    several methods + their tests. **Crucially, the API must never move the
    human's focus** — that would wreck the human-takeover story (§6).
+   **[Amended 2026-09-29]** Two explicit, per-call opt-ins may move it, never a
+   default: `spawn --focus` (land focus on the new pane, switching tab if
+   needed — `ctl_focus`'s move) and `spawn --float` (a popup the caller asked
+   the human to see, focused on open). Without them a spawn, `--tab` included,
+   leaves the human's tab, zoom and focus exactly as found.
 3. **No `wait`/subscription.** The single most important ergonomic op. Built as
    a *deferred reply*: park the caller's request on the pane's next status
    transition (which `on_status` already computes), reply when it matches.
@@ -454,7 +459,7 @@ sleep-and-grep-`capture-pane` loops every tmux-orchestrator reinvents.
 
 | Op | Returns | Backs onto |
 |---|---|---|
-| `spawn(adapter, cwd?, initial_input?, tab?)` | `pane_id` | `new_pane_with` (+ return id, + type initial prompt) |
+| `spawn(adapter, cwd?, initial_input?, tab?, title?, focus?, float?)` | `pane_id` | `new_pane_with` (+ return id, + type initial prompt). CLI: `roost spawn ADAPTER [--cwd DIR] [--input TEXT] [--tab [--title NAME]] [--float [--title NAME]] [--focus]`. `--tab`: sole pane of a new tab (named NAME, else `tab{n}`), no tab switch. `--float`: ephemeral popup, DESIGN-ui C22a; on the `shell` adapter `--input` runs as `$SHELL [-l] -c INPUT` (the popup closes when it exits, like tmux `display-popup -E`) instead of being typed. `--focus`: opt-in focus move. `--float` excludes `--tab`; `--title` needs one of them. Reply shape unchanged. |
 | `fork(pane_id?)` | `pane_id` | spawn a sibling resuming a *fork* of the pane's session (self-orchestration workflow #1) |
 | `send_input(pane_id, text, submit?)` | ok | **new** `send_input_to` (the focus-relative gap) |
 | `read(pane_id, mode=screen\|tail:N\|full)` | text | `grab_text` (+ scrollback); default `screen` |
