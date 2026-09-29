@@ -1,2 +1,2 @@
-v0.1.26
-Retry publication through the required release branch after PR #211.
+v0.1.27
+Fix the OpenCode v2 plugin load error: parse `opencode v2.0.18`, share one v1/v2-compatible plugin file from v1.3.4.
