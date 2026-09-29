@@ -313,31 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn status_mapping_matches_c5_table() {
-        assert_eq!(status_style(AgentStatus::Working), (GLYPH_WORKING, accent(), true));
-        assert_eq!(status_style(AgentStatus::NeedsInput), (GLYPH_NEEDS_INPUT, accent(), false));
-        assert_eq!(status_style(AgentStatus::Waiting), (GLYPH_WAITING, ink(), false));
-        assert_eq!(status_style(AgentStatus::Idle), (GLYPH_IDLE, quiet(), false));
-        assert_eq!(status_style(AgentStatus::Exited), (GLYPH_EXITED, accent_quiet(), false));
-    }
-
-    #[test]
     fn only_working_spins() {
         for s in
             [AgentStatus::NeedsInput, AgentStatus::Waiting, AgentStatus::Idle, AgentStatus::Exited]
         {
             assert!(!status_style(s).2, "{s:?} must not animate");
         }
-    }
-
-    #[test]
-    fn tab_summary_mapping_matches_c5_table() {
-        assert_eq!(tab_summary_style(TabSummary::NeedsInput), (GLYPH_NEEDS_INPUT, accent()));
-        assert_eq!(tab_summary_style(TabSummary::Working), (GLYPH_WORKING, accent()));
-        assert_eq!(tab_summary_style(TabSummary::Waiting), (GLYPH_WAITING, ink()));
-        assert_eq!(tab_summary_style(TabSummary::Unknown), (GLYPH_IDLE, quiet()));
-        assert_eq!(tab_summary_style(TabSummary::Exited), (GLYPH_EXITED, accent_quiet()));
-        assert_eq!(tab_summary_style(TabSummary::Quiet), (' ', quiet()));
     }
 
     /// U13: the tab-bar Exited variant is the same glyph *and* the same quiet

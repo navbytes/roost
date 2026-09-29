@@ -239,6 +239,8 @@ use crate::core::status::AgentStatus;
 use crate::core::workspace::PaneId;
 use crate::infra::store::{FsStore, DEFAULT_WORKSPACE};
 
+pub const SOCKET_FILE: &str = "roost.sock";
+
 pub fn socket_path() -> PathBuf {
     // A named workspace's socket lives in its own directory (D4) — the
     // same move the ROOST_STATE branch below makes, and composing with it,
@@ -246,10 +248,10 @@ pub fn socket_path() -> PathBuf {
     // default workspace keeps that branch untouched: `$XDG_RUNTIME_DIR`,
     // with no roost subdirectory, exactly as before.
     if FsStore::workspace_name() != DEFAULT_WORKSPACE {
-        return FsStore::state_dir().join("roost.sock");
+        return FsStore::state_dir().join(SOCKET_FILE);
     }
     if let Some(dir) = std::env::var_os(crate::infra::ENV_STATE) {
-        return PathBuf::from(dir).join("roost.sock");
+        return PathBuf::from(dir).join(SOCKET_FILE);
     }
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -259,7 +261,7 @@ pub fn socket_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("roost")
         })
-        .join("roost.sock")
+        .join(SOCKET_FILE)
 }
 
 /// `sockaddr_un.sun_path` caps a unix socket path at 104 bytes on macOS/BSD,
