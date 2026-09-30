@@ -1623,7 +1623,10 @@ pub fn help_follow_top(
 /// the scroll keys have nothing to do (`Mode::Help`'s "any key closes it"
 /// then holds unamended).
 pub fn help_scroll_extent(body: Rect, keymap: &Keymap, filter: Option<&str>) -> (usize, usize) {
-    let l = help_layout(body, keymap, filter);
+    help_extent(&help_layout(body, keymap, filter))
+}
+
+fn help_extent(l: &HelpLayout) -> (usize, usize) {
     (l.height as usize, l.columns.iter().map(|c| c.len()).max().unwrap_or(0))
 }
 
@@ -2332,7 +2335,7 @@ fn draw_mode_overlay<B: PaneBackend>(
             // single source and `help_layout` the single geometry — the same
             // call `dialog_rect` above made for this rect.
             let layout = help_layout(body, app.keymap(), filter.as_deref());
-            let (visible, total) = help_scroll_extent(body, app.keymap(), filter.as_deref());
+            let (visible, total) = help_extent(&layout);
             let top = (*top).min(total.saturating_sub(visible));
             // The title says how to leave — and, only when the table doesn't
             // fit, that there is more of it and which keys reach it. A
