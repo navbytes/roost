@@ -1646,35 +1646,36 @@ mod tests {
         use crate::ports::PaneBackend;
 
         // The child has to have reached its `trap` before either half means
-        // anything — a pane still mid-exec ignores SIGHUP for the wrong
-        // reason.
-        fn settle(pt: &mut super::PtyPane) {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-                if matches!(pt.child.try_wait(), Ok(None)) && pt.pid.is_some() {
-                    // Running, with a pid to signal: far enough along.
-                    std::thread::sleep(Duration::from_millis(100));
-                    return;
-                }
+        // anything — a shell still starting up dies to SIGHUP instead of
+        // ignoring it. It says so itself: the marker file appears only after
+        // the trap is set, so no sleep has to guess how long `sh` takes.
+        let marker = |n: u8| {
+            std::env::temp_dir().join(format!("roost-hangup-ready-{}-{n}", std::process::id()))
+        };
+        fn settle(marker: &std::path::Path) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
             }
+            assert!(marker.exists(), "the child never reached its trap");
         }
 
-        let deaf = || {
+        let deaf = |marker: &std::path::Path| {
             let (tx, rx) = std::sync::mpsc::sync_channel::<AppEvent>(64);
             std::thread::spawn(move || while rx.recv().is_ok() {});
             let spec = CommandSpec::new("sh", &std::env::temp_dir())
                 .arg("-c")
-                .arg("trap '' HUP; sleep 30");
+                .arg(format!("trap '' HUP; : > '{}'; sleep 30", marker.display()));
             super::PtyPane::spawn(1, &spec, 24, 80, (0, 0), tx).ok()
         };
 
         // The close path owes the grace and pays it.
-        let Some(mut cold) = deaf() else {
+        let (m_cold, m_warm) = (marker(0), marker(1));
+        let Some(mut cold) = deaf(&m_cold) else {
             eprintln!("SKIP hangup-grace gate: no pty available");
             return;
         };
-        settle(&mut cold);
+        settle(&m_cold);
         let t = Instant::now();
         cold.kill();
         let cold_cost = t.elapsed();
@@ -1684,8 +1685,8 @@ mod tests {
         );
 
         // The shutdown path has already paid it, and must not pay again.
-        let Some(mut warm) = deaf() else { return };
-        settle(&mut warm);
+        let Some(mut warm) = deaf(&m_warm) else { return };
+        settle(&m_warm);
         warm.hangup();
         let t = Instant::now();
         warm.kill();
@@ -1695,6 +1696,8 @@ mod tests {
             "a pane roost has already hung up must go straight to SIGKILL: took {warm_cost:?} \
              (the grace is {HANGUP_GRACE:?}, and kill_fleet pays it once for the whole fleet)"
         );
+        let _ = std::fs::remove_file(m_cold);
+        let _ = std::fs::remove_file(m_warm);
     }
 
     /// The EOF sweep must not depend on winning the reap race.
