@@ -16,8 +16,7 @@ Chord table (2026-09-30): rejected. `default_chord_action` (`src/ui/input.rs`) i
 
 Found while verifying the closures below; each is a few lines, no design needed. Line refs at `8ac7359`.
 
-- [ ] **Help frame runs `help_layout` three times** (`src/ui/render.rs`: `dialog_rect` ~2102, `draw_mode_overlay` ~2334, and again inside `help_scroll_extent` ~2335), against the struct's own "twice per frame is waste" note (~1290). Derive `visible`/`total` from the layout already built at ~2334. Touches `src/ui/**`: design-supervisor audit.
-- [ ] **Keystroke path reads two pane modes as a pair twice** (`src/main.rs` ~882-883 and ~912-913: `focused_kitty` + `focused_app_cursor`). One small helper. (The mouse path already packs its three reads into `PaneMouseState`.)
+- [ ] **Help frame still runs `help_layout` twice** (`src/ui/render.rs`: `dialog_rect` ~2102 and `draw_mode_overlay` ~2334; the third, inside `help_scroll_extent`, is gone — the extent now derives from the layout in hand via `help_extent`). Removing the last needs the layout threaded out of `dialog_rect`, which is called from several places. Touches `src/ui/**`: design-supervisor audit.
 
 ## Refactors considered and closed (2026-09-30)
 
