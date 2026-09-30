@@ -13,7 +13,6 @@ A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, ...). 
 ## Structure
 - `docs/` — documentation
 - `extensions/`
-- `graphify-out/`
 - `openspec/`
 - `packaging/`
 - `scripts/` — scripts and utilities
