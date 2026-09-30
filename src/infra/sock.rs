@@ -3116,8 +3116,11 @@ mod tests {
         let map = limits.buckets.lock().unwrap();
         assert!(map.len() <= MAX_TRACKED_TOKENS, "bucket map grew past its bound: {}", map.len());
         let active = map.get("active").expect("an actively-throttled principal was evicted");
+        // A fresh bucket holds the full capacity; real elapsed time refills a
+        // drained one slowly (5/s), so "well under half" survives a stalled
+        // runner while still catching a reset.
         assert!(
-            active.tokens < 1.0,
+            active.tokens < PRINCIPAL_BUCKET_CAPACITY / 2.0,
             "active's drained state was reset by eviction: {} tokens",
             active.tokens
         );
