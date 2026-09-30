@@ -1,2 +1,2 @@
-v0.1.28
-roost spawn gains --tab [--title], --focus and a --float popup (tmux display-popup -E style); the floating pane background is opaque again.
+v0.1.29
+Fix: pi extension status connections stayed evictable, so 16+ panes could keep knocking live reporters off the socket; shared text-field, session-detection, overlay and CLI-verb modules; two timing-flaky tests fixed.
