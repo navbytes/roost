@@ -864,6 +864,20 @@ fn write_control_token(path: &std::path::Path, token: &str) {
     }
 }
 
+/// If the focused pane negotiated the kitty keyboard protocol, upgrade
+/// modified Enter from the ESC+CR fallback to the CSI-u form it asked for
+/// (Shift+Enter → CSI 13;2u, Ctrl+Enter → CSI 13;5u); if it set DECCKM,
+/// upgrade cursor keys to their SS3 application encodings. The two touch
+/// disjoint keys, so the order is immaterial.
+fn upgrade_for_focused<B: PaneBackend>(
+    app: &App<B>,
+    key: crossterm::event::KeyEvent,
+    bytes: Vec<u8>,
+) -> Vec<u8> {
+    let bytes = input::kitty_upgrade(key, bytes, app.focused_kitty());
+    input::app_cursor_upgrade(key, bytes, app.focused_app_cursor())
+}
+
 /// Handle a key that a UI mode did not consume: a global action, or bytes
 /// forwarded to the focused pane (dead panes intercept relaunch keys).
 fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent) {
@@ -879,8 +893,7 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
         if let InputResult::Action(Action::ToggleRaw) = input::translate_with(key, app.keymap()) {
             app.apply(Action::ToggleRaw);
         } else {
-            let bytes = input::kitty_upgrade(key, input::encode_raw(key), app.focused_kitty());
-            let bytes = input::app_cursor_upgrade(key, bytes, app.focused_app_cursor());
+            let bytes = upgrade_for_focused(app, key, input::encode_raw(key));
             if !bytes.is_empty() {
                 app.forward_bytes(&bytes);
             }
@@ -904,13 +917,7 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
             _ => {}
         },
         InputResult::Forward(bytes) => {
-            // If the focused pane negotiated the kitty keyboard protocol, upgrade
-            // modified Enter from the ESC+CR fallback to the CSI-u form it asked
-            // for (Shift+Enter → CSI 13;2u, Ctrl+Enter → CSI 13;5u); if it set
-            // DECCKM, upgrade cursor keys to their SS3 application encodings.
-            // The two touch disjoint keys, so the order is immaterial.
-            let bytes = input::kitty_upgrade(key, bytes, app.focused_kitty());
-            let bytes = input::app_cursor_upgrade(key, bytes, app.focused_app_cursor());
+            let bytes = upgrade_for_focused(app, key, bytes);
             app.forward_bytes(&bytes);
         }
         InputResult::Ignore => {}
