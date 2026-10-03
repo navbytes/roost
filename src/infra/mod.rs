@@ -69,6 +69,7 @@ pub mod inspect;
 pub mod notify;
 pub mod open;
 pub mod perf;
+pub mod procs;
 pub mod pty;
 pub mod qos;
 pub mod queries;

@@ -1201,8 +1201,10 @@ dependencies = [
  "libc",
  "portable-pty",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
+ "signal-hook",
  "unicode-width",
  "vt100",
 ]

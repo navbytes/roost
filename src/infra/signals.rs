@@ -22,16 +22,18 @@
 //! nothing can be promised about them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-static TERMINATING: AtomicBool = AtomicBool::new(false);
+use rustix::event::{PollFd, PollFlags, Timespec};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
-/// The only thing the handler does. `AtomicBool::store` is a single
-/// instruction on every platform roost builds for — async-signal-safe in the
-/// way `write(2)` is, unlike anything that could allocate or take a lock.
-extern "C" fn on_terminate(_sig: libc::c_int) {
-    TERMINATING.store(true, Ordering::SeqCst);
-}
+/// The flag `signal_hook::flag::register` sets from the handler: its whole
+/// handler is one `AtomicBool::store`, async-signal-safe the way `write(2)`
+/// is, and it installs with `SA_RESTART`. An `Arc` rather than a plain static
+/// because that is what the registration takes; the watchdog below stores to
+/// it directly.
+static TERMINATING: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 /// Whether a termination signal has arrived. Polled by the main loop.
 pub fn terminating() -> bool {
@@ -45,16 +47,11 @@ pub fn terminating() -> bool {
 /// from something deliberate (`kill -INT`, a job-control front end), and
 /// dropping the fleet on the floor is no better an answer there.
 pub fn install() {
-    for sig in [libc::SIGHUP, libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: `sigaction` with a plain function pointer and a zeroed
-        // mask. `on_terminate` touches nothing but a static atomic.
-        unsafe {
-            let mut act: libc::sigaction = std::mem::zeroed();
-            act.sa_sigaction = on_terminate as extern "C" fn(libc::c_int) as usize;
-            act.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut act.sa_mask);
-            libc::sigaction(sig, &act, std::ptr::null_mut());
-        }
+    for sig in [SIGHUP, SIGTERM, SIGINT] {
+        // Registration only fails for signals that can't be caught
+        // (SIGKILL/SIGSTOP) or the ones signal-hook reserves for faults
+        // (SIGSEGV and friends) — none of these three.
+        let _ = signal_hook::flag::register(sig, Arc::clone(&TERMINATING));
     }
 }
 
@@ -107,7 +104,7 @@ const HANGUP_GRACE_FOR_PANES: Duration = Duration::from_millis(200);
 /// a real hangup is noticed promptly; large enough that the thread spends
 /// its life asleep rather than spinning — the opposite of the bug it exists
 /// to catch.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const POLL_INTERVAL: Timespec = Timespec { tv_sec: 0, tv_nsec: 200_000_000 };
 
 /// Rescue roost from the one termination path `on_terminate` above cannot
 /// cover: the controlling terminal hanging up *while the main thread is
@@ -146,20 +143,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub fn watch_for_hangup() {
     std::thread::spawn(|| {
         loop {
-            let mut fds = [libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 }];
-            // SAFETY: one stack-local pollfd, a plain millisecond timeout.
-            // No pointers escape this call.
-            let ready = unsafe {
-                libc::poll(fds.as_mut_ptr(), 1, POLL_INTERVAL.as_millis() as libc::c_int)
-            };
-            if ready < 0 {
+            let stdin = rustix::stdio::stdin();
+            let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
+            if rustix::event::poll(&mut fds, Some(&POLL_INTERVAL)).is_err() {
                 // EINTR (one of the real signals above landed) or some other
                 // transient poll failure. Neither means the terminal hung
                 // up — an interrupted syscall is not a hangup — so keep
                 // watching rather than acting on it.
                 continue;
             }
-            if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR) {
                 break;
             }
         }
@@ -187,19 +180,13 @@ pub fn watch_for_hangup() {
         // exists for exactly this — the `App` and its `runtimes` map live on
         // the thread that is stuck, unreachable from here.
         for pgid in crate::infra::pty::live_pane_pgids() {
-            // SAFETY: `kill(2)` on a process group id, targeting only ids
-            // this registry was ever populated with — panes roost itself
-            // spawned and `setsid`'d (`infra::pty::register_pane_pgid`).
-            unsafe {
-                libc::kill(-pgid, libc::SIGHUP);
-            }
+            // Only ids this registry was ever populated with — panes roost
+            // itself spawned and `setsid`'d (`infra::pty::register_pane_pgid`).
+            let _ = crate::infra::procs::hangup_group(pgid);
         }
         std::thread::sleep(HANGUP_GRACE_FOR_PANES);
         for pgid in crate::infra::pty::live_pane_pgids() {
-            // SAFETY: as above.
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
+            let _ = crate::infra::procs::kill_group(pgid);
         }
 
         // `_exit`, not `std::process::exit`: the latter still runs Rust's
