@@ -2,6 +2,16 @@
 
 Deferred work and accepted limitations. Newest first within a section.
 
+## Library survey follow-ups (2026-10-03)
+
+From the "which libraries could shrink roost or make it more reliable" pass. Shipped: `cargo-deny` in CI, `rustix`/`signal-hook` behind `infra::procs`/`infra::signals`, `infra::atomic`, `base64`, grapheme-aware `textfield`, `proptest` for `layout.rs`. What was looked at and left:
+
+- **Time/date crate** — `cli.rs:1407` `rfc3339` + `civil_from_days` and `render.rs:2603` `local_hh_mm_ss` (one `localtime_r` `unsafe`) are ~45 lines, both pinned by tests. `jiff` is the only crate that fits (`time`'s local-offset lookup refuses in multithreaded programs on Unix unless you opt into unsound behaviour — not re-checked this pass). A new date-time dependency for three integers; revisit if either function bites.
+- **macOS process inspection FFI** — `inspect.rs` (`proc_pidinfo`/`sysctl KERN_PROCARGS2`/`proc_listchildpids`) and `pty.rs:477` `all_pids` (`proc_listpids`) are hand-written `unsafe`. A macOS-only `libproc` wrapper might make them safe; unverified that it covers `KERN_PROCARGS2` (argv), and `sysinfo` is heavier than the ~µs syscalls this replaced (see `inspect.rs`'s macOS module doc for the measured subprocess cost). Look before investing.
+- **Still `libc`** because rustix has no safe equivalent: `_exit` (`signals.rs:220`), the QoS calls (`qos.rs`), `getloadavg` (`perf.rs`), `localtime_r` (above).
+- **`atomic-write-file`** — not adopted; `infra::atomic` is the one in-tree implementation and its tests pin the behaviours roost depends on (0600-from-creation, symlink-resolved guest config, mode kept, temp cleaned on a failed rename).
+- **Three tests fail on a clean `HEAD` in the cloud sandbox** (this session ran as uid 0 with a user shell init that prints extra lines): `core::app::tests::spawn_with_an_unreadable_session_root_also_attempts_resume_and_keeps_the_id` (`app.rs:10776`) and `infra::extension::tests::a_write_failure_is_reported_not_swallowed` (`extension.rs:709`) rely on a permission denial, which root bypasses — both pass as `nobody`. Rework them the way `atomic.rs`'s failed-rename test does (a non-empty directory where the file goes) so they hold as root. `tests/workspaces.rs:458` `pane_env_title_and_guarded_ws_verbs` fails as `nobody` too: the pane's shell echoes `$ROOST_WORKSPACE` after init noise the assertion does not expect. Looks environmental (the value does reach the pane); not confirmed against CI.
+
 ## Code-analyzer audit (2026-09-29)
 
 Repo-wide read-only audit; no Critical findings, no secrets, no reimplemented std/dep logic. Line refs are as of `d4f9bf9` (v0.1.28). Scouts read code and grepped but did not run `cargo test`.

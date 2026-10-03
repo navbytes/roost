@@ -10,7 +10,11 @@ each adapter's own session ids.
 - TUI chrome is "ink · paper · one red" — terminal-theme-inherited, no fixed
   RGB, no fills; any `src/ui/**` change gets a design-supervisor audit.
 - Tests: `cargo test` (unit + PTY harness integration under `tests/`).
-  CI: `.github/workflows/ci.yml`.
+  CI: `.github/workflows/ci.yml`. `deny.toml` is the supply-chain policy:
+  licences/bans/sources gate in ci.yml's `deny` job, RustSec advisories run
+  in the non-gating `audit.yml` (the database moves without a commit, so a
+  gate on it would redden green branches). `cargo deny check` runs both
+  locally.
 - Conventions: single writer per file-set; effort scales to task weight;
   durable lessons/decisions get promoted to memory, not left in engagement docs.
 - **Formatting and lints are enforced** (2026-08-21, reversing the old "roost
