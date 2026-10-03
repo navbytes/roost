@@ -317,7 +317,7 @@ proptest! {
             prop_assert_eq!(check_legal(&t), Ok(()));
             prop_assert_eq!(sorted(ids(&t)), all.clone());
             let (_, shown) = stack_of(&t, target).expect("the target is in a stack after a press");
-            prop_assert_eq!(shown, target, "the pane Alt+s was pressed on stays the one shown");
+            prop_assert_eq!(shown, target, "the pane that was stacked stays the one shown");
         }
         // At the ceiling: nothing above to absorb.
         match &t {
