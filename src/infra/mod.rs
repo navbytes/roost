@@ -61,6 +61,7 @@ pub const ENV_PANE: &str = "ROOST_PANE";
 pub const ENV_WORKSPACE: &str = "ROOST_WORKSPACE";
 pub const ENV_STATE: &str = "ROOST_STATE";
 
+pub mod atomic;
 pub mod claims;
 pub mod clipboard;
 pub mod config;
