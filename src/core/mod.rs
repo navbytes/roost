@@ -7,6 +7,8 @@ pub mod control;
 pub mod detect;
 pub mod event;
 pub mod layout;
+#[cfg(test)]
+mod layout_props;
 pub mod overlay;
 pub mod session_resolver;
 pub mod status;

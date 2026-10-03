@@ -44,6 +44,10 @@ vt100 = { path = "vendor/vt100" }
 # versions/paths as the main deps above — no new third-party code.
 [dev-dependencies]
 libc = "0.2"
+# Property tests for the layout tree (src/core/layout_props.rs). Dev-only, so
+# none of it reaches the binary; `std` alone, without the fork/timeout
+# machinery the defaults add, which nothing here uses.
+proptest = { version = "1", default-features = false, features = ["std"] }
 portable-pty = "0.9"
 vt100 = { path = "vendor/vt100" }
 
