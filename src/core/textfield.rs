@@ -9,6 +9,7 @@
 //! first line's left edge and Delete at the head's end are walls.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub struct Field<'a> {
     head: Option<&'a mut String>,
@@ -100,8 +101,9 @@ impl<'a> Field<'a> {
             KeyCode::Backspace => {
                 if col > 0 {
                     let cur = self.row_mut(row);
-                    cur.remove(byte_at(cur, col - 1));
-                    *self.col -= 1;
+                    let from = prev_boundary(cur, col);
+                    cur.replace_range(byte_at(cur, from)..byte_at(cur, col), "");
+                    *self.col = from;
                 } else if row > off {
                     let cur = self.lines.remove(row - off);
                     *self.row -= 1;
@@ -112,7 +114,8 @@ impl<'a> Field<'a> {
             KeyCode::Delete => {
                 if col < len {
                     let cur = self.row_mut(row);
-                    cur.remove(byte_at(cur, col));
+                    let to = next_boundary(cur, col);
+                    cur.replace_range(byte_at(cur, col)..byte_at(cur, to), "");
                 } else if row >= off && row - off + 1 < self.lines.len() {
                     let next = self.lines.remove(row - off + 1);
                     self.lines[row - off].push_str(&next);
@@ -120,7 +123,7 @@ impl<'a> Field<'a> {
             }
             KeyCode::Left => {
                 if col > 0 {
-                    *self.col -= 1;
+                    *self.col = prev_boundary(self.row_ref(row), col);
                 } else if row > 0 {
                     *self.row -= 1;
                     *self.col = self.row_len(row - 1);
@@ -128,7 +131,7 @@ impl<'a> Field<'a> {
             }
             KeyCode::Right => {
                 if col < len {
-                    *self.col += 1;
+                    *self.col = next_boundary(self.row_ref(row), col);
                 } else if row < self.last_row() {
                     *self.row += 1;
                     *self.col = 0;
@@ -216,6 +219,36 @@ fn byte_at(s: &str, at: usize) -> usize {
     s.char_indices().nth(at).map_or(s.len(), |(b, _)| b)
 }
 
+/// The char index of the grapheme-cluster boundary before `col` — where one
+/// Left or Backspace lands. A flag, a ZWJ family or a base-plus-combining-mark
+/// is several `char`s but one thing the user sees, and the point is a char
+/// index, so stepping by one `char` would strand it inside a cluster. A `col`
+/// already inside a cluster resolves to that cluster's start. 0 at the front.
+fn prev_boundary(s: &str, col: usize) -> usize {
+    let mut start = 0;
+    for g in s.graphemes(true) {
+        let end = start + g.chars().count();
+        if end >= col {
+            return start;
+        }
+        start = end;
+    }
+    start
+}
+
+/// The char index of the first grapheme-cluster boundary after `col` — where
+/// one Right or Delete lands. The end of `s` when there is none.
+fn next_boundary(s: &str, col: usize) -> usize {
+    let mut start = 0;
+    for g in s.graphemes(true) {
+        start += g.chars().count();
+        if start > col {
+            return start;
+        }
+    }
+    start
+}
+
 /// readline's `unix-word-rubout`: drop trailing whitespace, then the one
 /// whitespace-delimited word in front of it.
 fn erase_word(buffer: &str) -> String {
@@ -286,5 +319,84 @@ mod tests {
         f.edit(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         f.edit(key(KeyCode::Char('é')));
         assert_eq!((head.as_str(), row, col), ("aéb", 0, 2));
+    }
+
+    /// One head-only field edited by `keys` starting with the point at char
+    /// `col`; returns the text and the point afterwards.
+    fn edit_head(text: &str, col: usize, keys: &[KeyCode]) -> (String, usize) {
+        let (mut head, mut none, mut row, mut col) = (text.to_string(), vec![], 0, col);
+        for k in keys {
+            Field::new(Some(&mut head), &mut none, &mut row, &mut col, 0).edit(key(*k));
+        }
+        (head, col)
+    }
+
+    // A user-perceived character is a *grapheme cluster*, and several of them
+    // are more than one `char`: a flag is two regional indicators, a family
+    // emoji is five code points joined by ZWJ, an accented letter may be a
+    // base plus a combining mark. The point is a char index, so stepping and
+    // deleting by `char` would strand it inside a cluster — Backspace on a
+    // flag left a lone regional indicator, and an arrow key "moved" without
+    // the caret moving at all.
+    const FLAG: &str = "\u{1F1FA}\u{1F1F8}"; // 🇺🇸 — 2 chars
+    const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧 — 5 chars
+    const E_ACUTE: &str = "e\u{301}"; // é as base + combining acute — 2 chars
+
+    #[test]
+    fn backspace_deletes_a_whole_cluster_not_one_code_point() {
+        for cluster in [FLAG, FAMILY, E_ACUTE] {
+            let n = cluster.chars().count();
+            let text = format!("a{cluster}");
+            assert_eq!(
+                edit_head(&text, 1 + n, &[KeyCode::Backspace]),
+                ("a".to_string(), 1),
+                "{cluster:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_removes_a_whole_cluster_not_one_code_point() {
+        for cluster in [FLAG, FAMILY, E_ACUTE] {
+            let text = format!("a{cluster}b");
+            assert_eq!(
+                edit_head(&text, 1, &[KeyCode::Delete]),
+                ("ab".to_string(), 1),
+                "{cluster:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arrows_step_over_a_whole_cluster() {
+        for cluster in [FLAG, FAMILY, E_ACUTE] {
+            let n = cluster.chars().count();
+            let text = format!("a{cluster}b");
+            assert_eq!(edit_head(&text, 1, &[KeyCode::Right]).1, 1 + n, "right over {cluster:?}");
+            assert_eq!(edit_head(&text, 1 + n, &[KeyCode::Left]).1, 1, "left over {cluster:?}");
+        }
+    }
+
+    #[test]
+    fn a_point_stranded_inside_a_cluster_resolves_to_a_boundary() {
+        // Pasted text or a stale cursor can leave the point mid-cluster
+        // (char 3 of FAMILY is the second ZWJ). Whatever the key, the point
+        // must come out on a boundary — never still inside the cluster.
+        let text = format!("a{FAMILY}");
+        // Backspace removes what is *before* the point, back to the cluster's
+        // start; the rest of the cluster stays and the point sits before it.
+        let tail: String = FAMILY.chars().skip(2).collect();
+        assert_eq!(edit_head(&text, 3, &[KeyCode::Backspace]), (format!("a{tail}"), 1));
+        assert_eq!(edit_head(&text, 3, &[KeyCode::Left]).1, 1);
+        assert_eq!(edit_head(&text, 3, &[KeyCode::Right]).1, 6);
+    }
+
+    #[test]
+    fn plain_text_still_moves_and_deletes_one_char_at_a_time() {
+        assert_eq!(edit_head("abc", 3, &[KeyCode::Backspace]), ("ab".to_string(), 2));
+        assert_eq!(edit_head("abc", 0, &[KeyCode::Delete]), ("bc".to_string(), 0));
+        assert_eq!(edit_head("a日本b", 1, &[KeyCode::Right, KeyCode::Right]).1, 3);
+        // CRLF is one cluster, but never reaches a field (strip_control drops it).
+        assert_eq!(edit_head("", 0, &[KeyCode::Left, KeyCode::Right, KeyCode::Backspace]).1, 0);
     }
 }
