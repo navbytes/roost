@@ -207,7 +207,7 @@ fn host_clipboard_bytes(
     if payload_base64.len() > cap {
         return None;
     }
-    if !payload_base64.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)) {
+    if !is_base64(payload_base64) {
         return None;
     }
     let sel: String = selection.chars().filter(|c| OSC52_SELECTIONS.contains(*c)).collect();
@@ -221,6 +221,27 @@ fn host_clipboard_bytes(
     out.extend_from_slice(payload_base64.as_bytes());
     out.push(0x07);
     Some(out)
+}
+
+/// Does `s` decode as standard-alphabet base64? Anything outside the alphabet
+/// (ESC, BEL, `;`, whitespace) fails, which is what keeps a payload from
+/// closing roost's own OSC sequence early; so does a shape no decoder could
+/// read (a lone trailing character, padding in the middle).
+///
+/// Lenient about the two things real writers disagree on — trailing padding
+/// is optional, and trailing bits need not be zero — so a clipboard write
+/// the host terminal would have accepted is not dropped here for style.
+fn is_base64(s: &str) -> bool {
+    use base64::alphabet::STANDARD as ALPHABET;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::Engine as _;
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &ALPHABET,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    LENIENT.decode(s).is_ok()
 }
 
 /// P1: how long an open synchronized-output bracket (mode 2026) may keep the
@@ -1845,13 +1866,27 @@ mod tests {
         assert_eq!(emit("7", "aGk=").unwrap(), b"\x1b]52;7;aGk=\x07".to_vec());
         // An empty payload is xterm's "clear", and a legitimate write.
         assert_eq!(emit("c", "").unwrap(), b"\x1b]52;c;\x07".to_vec());
+        // Padding is optional: "hi" is `aGk=`, and writers that drop the `=`
+        // are still clipboard writes. Relayed verbatim, not re-encoded.
+        assert_eq!(emit("c", "aGk").unwrap(), b"\x1b]52;c;aGk\x07".to_vec());
         // A payload right at the cap still goes; one byte over does not.
         assert!(emit("c", &"A".repeat(cap)).is_some());
         assert!(emit("c", &"A".repeat(cap + 1)).is_none());
 
         // Not base64 ⇒ not a clipboard write. Critically, a payload that
         // could close roost's own sequence and repaint the user's terminal.
-        for hostile in ["aGk=\x07\x1b]0;PWNED\x07", "hi there", "a;b", "\x1b[2J"] {
+        for hostile in [
+            "aGk=\x07\x1b]0;PWNED\x07",
+            "hi there",
+            "a;b",
+            "\x1b[2J",
+            "aGk=\n",
+            "?",
+            // In the alphabet, but not a shape any decoder reads.
+            "A",
+            "aG=k",
+            "====",
+        ] {
             assert!(emit("c", hostile).is_none(), "must refuse {hostile:?}");
         }
         // Same for a selection field that isn't one.

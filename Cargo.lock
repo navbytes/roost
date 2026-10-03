@@ -1196,6 +1196,7 @@ name = "roost"
 version = "0.1.29"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm",
  "dirs",
  "libc",
