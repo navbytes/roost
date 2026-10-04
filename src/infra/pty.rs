@@ -207,7 +207,7 @@ fn host_clipboard_bytes(
     if payload_base64.len() > cap {
         return None;
     }
-    if !payload_base64.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)) {
+    if !is_base64(payload_base64) {
         return None;
     }
     let sel: String = selection.chars().filter(|c| OSC52_SELECTIONS.contains(*c)).collect();
@@ -221,6 +221,27 @@ fn host_clipboard_bytes(
     out.extend_from_slice(payload_base64.as_bytes());
     out.push(0x07);
     Some(out)
+}
+
+/// Does `s` decode as standard-alphabet base64? Anything outside the alphabet
+/// (ESC, BEL, `;`, whitespace) fails, which is what keeps a payload from
+/// closing roost's own OSC sequence early; so does a shape no decoder could
+/// read (a lone trailing character, padding in the middle).
+///
+/// Lenient about the two things real writers disagree on — trailing padding
+/// is optional, and trailing bits need not be zero — so a clipboard write
+/// the host terminal would have accepted is not dropped here for style.
+fn is_base64(s: &str) -> bool {
+    use base64::alphabet::STANDARD as ALPHABET;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::Engine as _;
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &ALPHABET,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    LENIENT.decode(s).is_ok()
 }
 
 /// P1: how long an open synchronized-output bracket (mode 2026) may keep the
@@ -431,9 +452,9 @@ fn session_members(sid: u32) -> Vec<u32> {
         all_pids()
             .into_iter()
             .filter(|p| *p != sid)
-            // SAFETY: getsid(2) with a plain pid; -1 on a pid that vanished
-            // between the listing and here, which simply doesn't match.
-            .filter(|p| unsafe { libc::getsid(*p as libc::pid_t) } == sid as libc::pid_t)
+            // `None` for a pid that vanished between the listing and here,
+            // which simply doesn't match.
+            .filter(|p| super::procs::session_of(*p) == Some(sid))
             .collect()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -503,12 +524,12 @@ fn all_pids() -> Vec<u32> {
 /// exit/kill, and the watchdog reads it at most once in a process's entire
 /// life (the happy path never hangs up). A linear scan is free at that
 /// scale and the type stays legible.
-static PANE_PGIDS: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+static PANE_PGIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Record a freshly spawned pane's process group so the hangup watchdog can
 /// find it later. Called once, from `spawn`, right after the child (and
 /// therefore its group) exists.
-fn register_pane_pgid(pgid: libc::pid_t) {
+fn register_pane_pgid(pgid: u32) {
     if let Ok(mut pgids) = PANE_PGIDS.lock() {
         if !pgids.contains(&pgid) {
             pgids.push(pgid);
@@ -523,7 +544,7 @@ fn register_pane_pgid(pgid: libc::pid_t) {
 /// unrelated process by the time the watchdog ever reads it — the same pid-
 /// reuse hazard `kill`'s own comments accept elsewhere, minimized here for
 /// free since removing is no more than the same linear scan `register` did.
-fn unregister_pane_pgid(pgid: libc::pid_t) {
+fn unregister_pane_pgid(pgid: u32) {
     if let Ok(mut pgids) = PANE_PGIDS.lock() {
         pgids.retain(|&p| p != pgid);
     }
@@ -533,7 +554,7 @@ fn unregister_pane_pgid(pgid: libc::pid_t) {
 /// from under the lock rather than handed out by reference, so the caller —
 /// `infra::signals::watch_for_hangup`, signalling processes one at a time —
 /// never holds `PANE_PGIDS` while making a syscall.
-pub fn live_pane_pgids() -> Vec<libc::pid_t> {
+pub fn live_pane_pgids() -> Vec<u32> {
     PANE_PGIDS.lock().map(|pgids| pgids.clone()).unwrap_or_default()
 }
 
@@ -832,7 +853,7 @@ impl PaneBackend for PtyPane {
         // process group or init's session instead of a pane.
         if let Some(p) = pid {
             if p > 1 {
-                register_pane_pgid(p as libc::pid_t);
+                register_pane_pgid(p);
             }
         }
 
@@ -1090,10 +1111,7 @@ impl PaneBackend for PtyPane {
         // spawn dead first so a resulting EOF doesn't emit a stale event.
         self.alive.store(false, Ordering::Relaxed);
         if let Some(pid) = self.pid {
-            // Safety: kill(2) with a pid we own and a plain signal number.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGHUP);
-            }
+            let _ = super::procs::hangup(pid);
         }
     }
 
@@ -1139,12 +1157,7 @@ impl PaneBackend for PtyPane {
         // polite one. The hidden second grace was an accident of the
         // library, not a decision roost made.
         if let Some(pid) = self.pid {
-            if pid > 1 {
-                // Safety: kill(2) with a pid we own and a plain signal number.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
+            let _ = super::procs::kill(pid);
         }
         // The child is a session/process-group leader (portable-pty setsid's
         // it), so also SIGKILL the whole group — otherwise pi/claude's own
@@ -1156,16 +1169,8 @@ impl PaneBackend for PtyPane {
             // `-(pid)` as a killpg target would be 0 (roost's own process
             // group) if it were ever 0, or -1 — kill(2)'s "every process the
             // caller may signal", pid 1 being init — if it were ever 1.
-            // Neither is "the pane's own process tree," so guard rather than
-            // assume.
-            if pid > 1 {
-                // SAFETY: `kill(2)` with a plain signal number and a target
-                // the `pid > 1` guard above has already established is a
-                // real process group of ours and not 0/-1. No pointers.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
-            }
+            // `procs::kill_group` refuses both, so a bad id is a no-op here.
+            let _ = super::procs::kill_group(pid);
             // ...and then sweep the whole **session**, because the group kill
             // above provably does not cover it. An interactive shell with job
             // control puts every job in a *new* process group, so a
@@ -1185,13 +1190,10 @@ impl PaneBackend for PtyPane {
             // possible; the window is microseconds and the group kill carries
             // the identical hazard, so it is accepted rather than papered over.
             for member in session_members(pid) {
-                // SAFETY: as above — `kill(2)` on a plain pid, taken from
-                // `session_members`, which never returns 0, 1 or the
-                // leader. Worst case the pid is already gone and this is
-                // ESRCH, which is why the return value is not checked.
-                unsafe {
-                    libc::kill(member as libc::pid_t, libc::SIGKILL);
-                }
+                // `session_members` never returns 0, 1 or the leader. Worst
+                // case the pid is already gone and this is ESRCH, which is
+                // why the result is not checked.
+                let _ = super::procs::kill(member);
             }
         }
         // Reap WITHOUT blocking the UI thread indefinitely. A bare
@@ -1213,7 +1215,7 @@ impl PaneBackend for PtyPane {
         // so it no longer needs to find this pgid.
         if let Some(pid) = self.pid {
             if pid > 1 {
-                unregister_pane_pgid(pid as libc::pid_t);
+                unregister_pane_pgid(pid);
             }
         }
     }
@@ -1270,11 +1272,7 @@ impl PaneBackend for PtyPane {
         if let Some(pid) = self.pid {
             for member in session_members(pid) {
                 if member != pid {
-                    // Safety: kill(2) with a pid from this pane's own
-                    // session and a plain signal number.
-                    unsafe {
-                        libc::kill(member as libc::pid_t, libc::SIGKILL);
-                    }
+                    let _ = super::procs::kill(member);
                 }
             }
         }
@@ -1285,8 +1283,8 @@ impl PaneBackend for PtyPane {
         // kill() will reap it definitively when the pane is finally cleaned up.
         // ponytail: once try_wait confirms the reap, `pid` is a dead
         // reference the OS is free to recycle for an unrelated process —
-        // clear it so hangup()/kill(), which both already gate their raw
-        // libc::kill on `self.pid.is_some()` (and run again unconditionally
+        // clear it so hangup()/kill(), which both already gate their
+        // procs::kill on `self.pid.is_some()` (and run again unconditionally
         // on every runtime during App::shutdown), can't signal it.
         if let Ok(Some(_)) = self.child.try_wait() {
             // The sweep above already ran; this branch now only lets go of
@@ -1297,7 +1295,7 @@ impl PaneBackend for PtyPane {
             // re-signalled onto some unrelated process the kernel recycled
             // the pid for.
             if let Some(pid) = self.pid {
-                unregister_pane_pgid(pid as libc::pid_t);
+                unregister_pane_pgid(pid);
             }
             self.pid = None;
         }
@@ -1778,8 +1776,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        // Safety: SIGKILL to a pid this test created.
-        unsafe { libc::kill(bg as libc::pid_t, libc::SIGKILL) };
+        let _ = super::super::procs::kill(bg);
         pt.kill();
         assert!(!alive, "the backgrounded job {bg} outlived the pane's EOF");
     }
@@ -1869,13 +1866,27 @@ mod tests {
         assert_eq!(emit("7", "aGk=").unwrap(), b"\x1b]52;7;aGk=\x07".to_vec());
         // An empty payload is xterm's "clear", and a legitimate write.
         assert_eq!(emit("c", "").unwrap(), b"\x1b]52;c;\x07".to_vec());
+        // Padding is optional: "hi" is `aGk=`, and writers that drop the `=`
+        // are still clipboard writes. Relayed verbatim, not re-encoded.
+        assert_eq!(emit("c", "aGk").unwrap(), b"\x1b]52;c;aGk\x07".to_vec());
         // A payload right at the cap still goes; one byte over does not.
         assert!(emit("c", &"A".repeat(cap)).is_some());
         assert!(emit("c", &"A".repeat(cap + 1)).is_none());
 
         // Not base64 ⇒ not a clipboard write. Critically, a payload that
         // could close roost's own sequence and repaint the user's terminal.
-        for hostile in ["aGk=\x07\x1b]0;PWNED\x07", "hi there", "a;b", "\x1b[2J"] {
+        for hostile in [
+            "aGk=\x07\x1b]0;PWNED\x07",
+            "hi there",
+            "a;b",
+            "\x1b[2J",
+            "aGk=\n",
+            "?",
+            // In the alphabet, but not a shape any decoder reads.
+            "A",
+            "aG=k",
+            "====",
+        ] {
             assert!(emit("c", hostile).is_none(), "must refuse {hostile:?}");
         }
         // Same for a selection field that isn't one.

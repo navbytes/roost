@@ -1,0 +1,56 @@
+# cargo-deny policy — the supply-chain gate CI runs (`deny` job in
+# .github/workflows/ci.yml). Dependabot keeps versions moving; nothing
+# else checked what those versions are: a RustSec advisory against a locked
+# crate, a licence roost cannot redistribute, or a registry other than
+# crates.io all landed silently. Run it locally with `cargo deny check`.
+
+[graph]
+# The four targets release.yml builds. Without this the graph includes
+# Windows crates (winapi, windows-sys, winreg) that roost never compiles —
+# it is Unix-only — and the licence check would be judging code that does
+# not ship.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+# Vulnerabilities fail the build. Unmaintained / unsound / notice advisories
+# on *transitive* crates surface as warnings: roost cannot patch a crate it
+# only reaches through ratatui or portable-pty, and failing every branch on
+# one would train people to add blanket ignores. Add an `ignore` here only
+# with the advisory id and the reason, never to make a red run green.
+ignore = []
+
+[licenses]
+# What the locked tree uses today (`cargo deny list`). roost itself is MIT.
+# MPL-2.0 is `option-ext` (via dirs-sys): file-level copyleft, unmodified,
+# which is compatible with shipping a binary.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# Two majors of one crate usually means a dependency is lagging behind the
+# rest; worth seeing in the log, not worth failing a branch over.
+multiple-versions = "warn"
+# `vendor/vt100` is a path dependency with no version requirement, which
+# cargo-deny reads as a wildcard on a crate that could be published. It is
+# the one wildcard in the tree and a deliberate one.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

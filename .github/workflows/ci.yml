@@ -101,6 +101,27 @@ jobs:
       # deliberate: it is third-party code carrying roost patches.
       - run: cargo "+$LINT_TOOLCHAIN" clippy --all-targets -- -D warnings
 
+  deny:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Licences, bans and sources — the half of `cargo deny` that is a pure
+    # function of Cargo.lock and `deny.toml`, so it can gate a PR without a
+    # branch going red for a reason that is not in the branch. RustSec
+    # advisories are the moving half and live in `audit.yml`, which reports
+    # without gating (the same reasoning as the pinned LINT_TOOLCHAIN above).
+    #
+    # Built from source at a pinned version: a few minutes, and no third-party
+    # action to pin by hash. `--locked` so the tool's own dependencies are the
+    # ones its authors tested.
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      - run: cargo deny --locked check bans licenses sources
+
   test:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
@@ -144,7 +165,7 @@ jobs:
   result:
     name: ${{ github.workflow }} result
     if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
-    needs: [changes, lint, test]
+    needs: [changes, lint, deny, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -1,0 +1,33 @@
+name: Audit
+
+# RustSec advisories against the locked dependency tree. Not part of the
+# `CI result` gate on purpose: the advisory database changes without any
+# commit, so a gate on it would turn green branches red for a reason that is
+# not in the branch — the failure mode `LINT_TOOLCHAIN` in ci.yml pins
+# against. This runs where a result is useful instead: weekly against main,
+# and on any PR that changes what is locked (Dependabot's, usually), so a
+# bump *to* a vulnerable version is visible before it merges.
+#
+# The deterministic half of `cargo deny` (licences, bans, sources) gates in
+# ci.yml. Policy for both lives in `deny.toml`.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  pull_request:
+    paths: ['Cargo.lock', 'Cargo.toml', 'deny.toml', '.github/workflows/audit.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      - run: cargo deny --locked check advisories

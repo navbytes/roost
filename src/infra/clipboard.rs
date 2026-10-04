@@ -108,39 +108,16 @@ fn native_copy(text: &str) -> bool {
 /// why its flash says "(OSC 52)" rather than an unqualified "copied".
 #[cfg(not(test))]
 fn emit_osc52(text: &str) -> bool {
-    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    use base64::Engine as _;
+    let seq = format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text));
     let mut out = std::io::stdout();
     out.write_all(seq.as_bytes()).and_then(|()| out.flush()).is_ok()
 }
 
-/// Minimal standard base64 (no external dep).
-pub fn base64(input: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-        out.push(T[(n >> 18 & 63) as usize] as char);
-        out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{base64, copy};
+    use super::copy;
     use crate::ports::ClipboardOutcome;
-
-    #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"hello"), "aGVsbG8=");
-    }
 
     /// B2 round 2 (PR #46 review): the runtime hatch the *real* binary
     /// needs (this crate's own test build can't stand in for it — that's

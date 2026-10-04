@@ -11,12 +11,12 @@
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::core::workspace::Workspace;
+use crate::infra::atomic::{self, Perms};
 use crate::ports::StateStore;
 
 /// The name of the workspace that keeps its files in the root itself —
@@ -307,40 +307,11 @@ impl StateStore for FsStore {
             let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
         }
         let tmp = self.path.with_extension("json.tmp");
-        // Create the temp file 0600 *before* writing, so the resume tokens
-        // inside are never briefly world-readable between write and rename.
-        {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(&serde_json::to_vec_pretty(ws)?)?;
-            // **Not** `flush()`. `Write::flush` on a `std::fs::File` is a
-            // no-op — it reads like a durability barrier and is not one.
-            // Without a real fsync the rename below can reach the disk
-            // before the bytes do, so a power cut or kernel panic can leave
-            // `workspace.json` truncated or zero-length. `load()` treats an
-            // unparseable file as "no workspace", so that outcome costs the
-            // user their whole fleet: the durability gap and the
-            // discard-on-corrupt rule compound into real data loss.
-            //
-            // One fsync of a small file per save, and only the *data* — see
-            // the directory note below for why that half is best-effort.
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        // The rename's own durability, best-effort and deliberately so:
-        // losing it means the *previous* save is what comes back, which is
-        // stale but intact. That is a different and far milder failure than
-        // the truncation the data fsync above prevents, and some
-        // filesystems refuse fsync on a directory handle outright.
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
+        // 0600 from creation, fsynced before the rename — see
+        // `atomic::write_atomic` for why each step is there. The loader
+        // treats an unparseable file as "no workspace", so a torn write here
+        // costs the user their whole fleet.
+        atomic::write_atomic(&self.path, &tmp, &serde_json::to_vec_pretty(ws)?, Perms::Private)?;
         Ok(())
     }
 }

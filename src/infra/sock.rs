@@ -222,9 +222,7 @@ pub const UNSAFE_SOCKET_DIR_MSG: &str = "unsafe ownership/permissions";
 /// duplicating it.
 pub(crate) fn dir_is_private_and_ours(dir: &Path) -> bool {
     match fs::metadata(dir) {
-        // SAFETY: `geteuid(2)` takes no arguments, touches no memory and
-        // cannot fail — the one libc call with nothing to get wrong.
-        Ok(m) => m.uid() == unsafe { libc::geteuid() } && (m.mode() & 0o077) == 0,
+        Ok(m) => m.uid() == rustix::process::geteuid().as_raw() && (m.mode() & 0o077) == 0,
         Err(_) => false,
     }
 }
