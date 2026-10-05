@@ -11,6 +11,67 @@ const MODE_SYNCHRONIZED_OUTPUT: u8 = 0b0010_0000;
 // subscription flag — nothing about the grid changes when it is set; the
 // embedder reads it to decide whether this pane is owed `CSI I`/`CSI O`.
 const MODE_FOCUS_EVENT: u8 = 0b0100_0000;
+// roost: insert/replace mode, ANSI mode 4 (`CSI 4 h` / `CSI 4 l`). While set,
+// a printed character shifts the rest of the row right instead of
+// overwriting it. The last free bit of `modes`.
+const MODE_INSERT: u8 = 0b1000_0000;
+
+/// roost: a G0/G1 character set. Only the two a shell or an ncurses program
+/// ever designates: US-ASCII (`ESC ( B`) and DEC Special Graphics, the
+/// line-drawing set (`ESC ( 0`). Everything else a program might name
+/// (UK, Dutch, ...) is treated as ASCII, which is what a UTF-8 terminal does
+/// with them in practice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Charset {
+    #[default]
+    Ascii,
+    DecSpecial,
+}
+
+/// roost: DEC Special Graphics for `0x5f..=0x7e`, as xterm maps them.
+fn dec_special(c: char) -> char {
+    match c {
+        '_' => ' ',
+        '`' => '\u{25c6}',
+        'a' => '\u{2592}',
+        'b' => '\u{2409}',
+        'c' => '\u{240c}',
+        'd' => '\u{240d}',
+        'e' => '\u{240a}',
+        'f' => '\u{b0}',
+        'g' => '\u{b1}',
+        'h' => '\u{2424}',
+        'i' => '\u{240b}',
+        'j' => '\u{2518}',
+        'k' => '\u{2510}',
+        'l' => '\u{250c}',
+        'm' => '\u{2514}',
+        'n' => '\u{253c}',
+        'o' => '\u{23ba}',
+        'p' => '\u{23bb}',
+        'q' => '\u{2500}',
+        'r' => '\u{23bc}',
+        's' => '\u{23bd}',
+        't' => '\u{251c}',
+        'u' => '\u{2524}',
+        'v' => '\u{2534}',
+        'w' => '\u{252c}',
+        'x' => '\u{2502}',
+        'y' => '\u{2264}',
+        'z' => '\u{2265}',
+        '{' => '\u{3c0}',
+        '|' => '\u{2260}',
+        '}' => '\u{a3}',
+        '~' => '\u{b7}',
+        other => other,
+    }
+}
+
+/// roost: xterm's default tab stops — every eighth column, starting at 8.
+/// (Column 0 is never a useful stop; nothing is to its left.)
+fn default_tab_stops(cols: u16) -> Vec<bool> {
+    (0..cols).map(|c| c % 8 == 0 && c != 0).collect()
+}
 
 /// A side effect the processed byte stream asked for that an in-memory
 /// screen cannot carry out itself: it needs the *embedder* — the thing that
@@ -137,6 +198,15 @@ pub struct Screen {
     // (`CSI Ps b`) — SPEC-parity P19. `None` until something is printed, and
     // a REP in that state is a no-op, as the spec requires.
     last_graphic: Option<char>,
+    // roost: horizontal tab stops, one flag per column — HTS (`ESC H`) sets
+    // one at the cursor, TBC (`CSI g`) clears, HT/CHT/CBT walk them. Held
+    // here rather than on a grid because tab stops belong to the terminal:
+    // the alternate screen shares them.
+    tab_stops: Vec<bool>,
+    // roost: G0 and G1 designations (`ESC ( x`, `ESC ) x`) and whether SO has
+    // shifted G1 in. Only affects how a printed ASCII character is mapped.
+    charsets: [Charset; 2],
+    shift_out: bool,
 }
 
 impl Screen {
@@ -146,6 +216,7 @@ impl Screen {
     ) -> Self {
         let mut grid = crate::grid::Grid::new(size, scrollback_len);
         grid.allocate_rows();
+        let tab_stops = default_tab_stops(size.cols);
         Self {
             grid,
             alternate_grid: crate::grid::Grid::new(size, 0),
@@ -168,6 +239,9 @@ impl Screen {
             effects: Vec::new(),
             sync_snapshot: None,
             last_graphic: None,
+            tab_stops,
+            charsets: [Charset::Ascii; 2],
+            shift_out: false,
         }
     }
 
@@ -212,6 +286,9 @@ impl Screen {
             effects: Vec::new(),
             sync_snapshot: None,
             last_graphic: self.last_graphic,
+            tab_stops: self.tab_stops.clone(),
+            charsets: self.charsets,
+            shift_out: self.shift_out,
         }
     }
 
@@ -233,6 +310,14 @@ impl Screen {
             .set_size_reflowing(crate::grid::Size { rows, cols });
         self.alternate_grid
             .set_size(crate::grid::Size { rows, cols });
+        // roost: a wider terminal gets xterm's default stops in the new
+        // columns; stops a program set inside the old width are kept.
+        let old = self.tab_stops.len();
+        let cols = usize::from(cols.max(1));
+        self.tab_stops.truncate(cols);
+        for c in old..cols {
+            self.tab_stops.push(c % 8 == 0);
+        }
     }
 
     /// Returns the current size of the terminal.
@@ -561,6 +646,13 @@ impl Screen {
 
 impl Screen {
     fn text(&mut self, c: char) {
+        // roost: DEC Special Graphics maps the printable ASCII range `_..~`
+        // to line-drawing glyphs while G0 (or, after SO, G1) designates it.
+        let c = if self.charsets[usize::from(self.shift_out)] == Charset::DecSpecial {
+            dec_special(c)
+        } else {
+            c
+        };
         let pos = self.grid().pos();
         let size = self.grid().size();
         let attrs = self.attrs;
@@ -711,6 +803,12 @@ impl Screen {
             // character, so it is recorded here — on the path that actually
             // occupies a cell — and not for the zero-width branch above.
             self.last_graphic = Some(c);
+            // roost: insert mode opens `width` blank cells at the cursor
+            // first, so the character pushes the rest of the row right
+            // instead of overwriting it.
+            if self.mode(MODE_INSERT) {
+                self.grid_mut().insert_cells(width);
+            }
             if self
                 .grid()
                 .drawing_cell(pos)
@@ -925,7 +1023,24 @@ impl Screen {
     }
 
     fn tab(&mut self) {
-        self.grid_mut().col_tab();
+        self.cht(1);
+    }
+
+    /// The first tab stop right of `col`, or the last column if there is none
+    /// (a tab never wraps).
+    fn next_tab_stop(&self, col: u16) -> u16 {
+        let last = self.grid().size().cols - 1;
+        ((usize::from(col) + 1)..self.tab_stops.len())
+            .find(|c| self.tab_stops[*c])
+            .map_or(last, |c| u16::try_from(c).unwrap_or(last))
+    }
+
+    /// The first tab stop left of `col`, or column 0 if there is none.
+    fn prev_tab_stop(&self, col: u16) -> u16 {
+        (0..usize::from(col))
+            .rev()
+            .find(|c| self.tab_stops.get(*c).copied().unwrap_or(false))
+            .map_or(0, |c| u16::try_from(c).unwrap_or(0))
     }
 
     fn lf(&mut self) {
@@ -999,6 +1114,35 @@ impl Screen {
         self.visual_bell_count += 1;
     }
 
+    // ESC D — index: down one row, scrolling at the bottom of the region.
+    // Unlike NEL it keeps the column.
+    fn ind(&mut self) {
+        self.lf();
+    }
+
+    // ESC E — next line: IND plus a carriage return.
+    fn nel(&mut self) {
+        self.cr();
+        self.lf();
+    }
+
+    // ESC H — set a tab stop at the cursor column.
+    fn hts(&mut self) {
+        let col = usize::from(self.grid().pos().col);
+        if let Some(stop) = self.tab_stops.get_mut(col) {
+            *stop = true;
+        }
+    }
+
+    // ESC ( x / ESC ) x
+    fn designate(&mut self, slot: usize, final_byte: u8) {
+        self.charsets[slot] = if final_byte == b'0' {
+            Charset::DecSpecial
+        } else {
+            Charset::Ascii
+        };
+    }
+
     // csi codes
 
     // CSI @
@@ -1024,6 +1168,56 @@ impl Screen {
     // CSI D
     fn cub(&mut self, offset: u16) {
         self.grid_mut().col_dec(offset);
+    }
+
+    // CSI E
+    fn cnl(&mut self, offset: u16) {
+        self.grid_mut().row_inc_clamp(offset);
+        self.grid_mut().col_set(0);
+    }
+
+    // CSI F
+    fn cpl(&mut self, offset: u16) {
+        self.grid_mut().row_dec_clamp(offset);
+        self.grid_mut().col_set(0);
+    }
+
+    // CSI I — forward `count` tab stops
+    fn cht(&mut self, count: u16) {
+        for _ in 0..count {
+            let col = self.grid().pos().col;
+            let next = self.next_tab_stop(col);
+            if next == col {
+                break; // already on the last column; nothing further to find
+            }
+            self.grid_mut().col_set(next);
+        }
+    }
+
+    // CSI Z — back `count` tab stops
+    fn cbt(&mut self, count: u16) {
+        for _ in 0..count {
+            let col = self.grid().pos().col;
+            let prev = self.prev_tab_stop(col);
+            if prev == col {
+                break;
+            }
+            self.grid_mut().col_set(prev);
+        }
+    }
+
+    // CSI g — clear tab stop(s): 0 at the cursor, 3 all of them
+    fn tbc(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                let col = usize::from(self.grid().pos().col);
+                if let Some(stop) = self.tab_stops.get_mut(col) {
+                    *stop = false;
+                }
+            }
+            3 => self.tab_stops.iter_mut().for_each(|s| *s = false),
+            n => log::debug!("unhandled TBC mode: {n}"),
+        }
     }
 
     // CSI G
@@ -1112,11 +1306,17 @@ impl Screen {
     }
 
     // CSI h
-    #[allow(clippy::unused_self)]
     fn sm(&mut self, params: &vte::Params) {
-        // nothing, i think?
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!("unhandled SM mode: {}", param_str(params));
+        for param in params {
+            match param {
+                // roost: IRM, insert mode (see `MODE_INSERT`).
+                &[4] => self.set_mode(MODE_INSERT),
+                _ => {
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!("unhandled SM mode: {}", param_str(params));
+                    }
+                }
+            }
         }
     }
 
@@ -1184,11 +1384,16 @@ impl Screen {
     }
 
     // CSI l
-    #[allow(clippy::unused_self)]
     fn rm(&mut self, params: &vte::Params) {
-        // nothing, i think?
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!("unhandled RM mode: {}", param_str(params));
+        for param in params {
+            match param {
+                &[4] => self.clear_mode(MODE_INSERT),
+                _ => {
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!("unhandled RM mode: {}", param_str(params));
+                    }
+                }
+            }
         }
     }
 
@@ -1485,9 +1690,9 @@ impl vte::Perform for Screen {
             11 => self.vt(),
             12 => self.ff(),
             13 => self.cr(),
-            // we don't implement shift in/out alternate character sets, but
-            // it shouldn't count as an "error"
-            14 | 15 => {}
+            // roost: SO shifts G1 in, SI shifts G0 back (see `Charset`).
+            14 => self.shift_out = true,
+            15 => self.shift_out = false,
             _ => {
                 self.errors = self.errors.saturating_add(1);
                 log::debug!("unhandled control character: {b}");
@@ -1496,12 +1701,19 @@ impl vte::Perform for Screen {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
-        intermediates.first().map_or_else(
-            || match b {
+        match intermediates.first() {
+            None => match b {
                 b'7' => self.decsc(),
                 b'8' => self.decrc(),
                 b'=' => self.deckpam(),
                 b'>' => self.deckpnm(),
+                // roost: IND, NEL, HTS — three C1 controls in their 7-bit
+                // ESC form. Each was a silent no-op, so a program that used
+                // one left the cursor where it was and every later character
+                // landed in the wrong place.
+                b'D' => self.ind(),
+                b'E' => self.nel(),
+                b'H' => self.hts(),
                 b'M' => self.ri(),
                 b'c' => self.ris(),
                 b'g' => self.vb(),
@@ -1509,10 +1721,15 @@ impl vte::Perform for Screen {
                     log::debug!("unhandled escape code: ESC {b}");
                 }
             },
-            |i| {
+            // roost: designate G0 / G1. `0` is DEC Special Graphics; anything
+            // else (`B` US-ASCII, and the national sets nobody uses over
+            // UTF-8) is plain ASCII.
+            Some(b'(') => self.designate(0, b),
+            Some(b')') => self.designate(1, b),
+            Some(i) => {
                 log::debug!("unhandled escape code: ESC {i} {b}");
-            },
-        );
+            }
+        }
     }
 
     fn csi_dispatch(
@@ -1529,8 +1746,29 @@ impl vte::Perform for Screen {
                 'B' => self.cud(canonicalize_params_1(params, 1)),
                 'C' => self.cuf(canonicalize_params_1(params, 1)),
                 'D' => self.cub(canonicalize_params_1(params, 1)),
+                // roost: CNL / CPL — the line-oriented cursor moves.
+                'E' => self.cnl(canonicalize_params_1(params, 1)),
+                'F' => self.cpl(canonicalize_params_1(params, 1)),
                 'G' => self.cha(canonicalize_params_1(params, 1)),
                 'H' => self.cup(canonicalize_params_2(params, 1, 1)),
+                // roost: CHT, and the ECMA-48 aliases of moves already
+                // implemented: HPA = CHA, HPR = CUF, VPR = CUD, HVP = CUP.
+                // All were silently dropped, so the cursor stayed put.
+                'I' => self.cht(canonicalize_params_1(params, 1)),
+                'Z' => self.cbt(canonicalize_params_1(params, 1)),
+                '`' => self.cha(canonicalize_params_1(params, 1)),
+                'a' => self.cuf(canonicalize_params_1(params, 1)),
+                'e' => self.cud(canonicalize_params_1(params, 1)),
+                'f' => self.cup(canonicalize_params_2(params, 1, 1)),
+                'g' => self.tbc(canonicalize_params_1(params, 0)),
+                // roost: ANSI save / restore cursor, the bare `CSI s` /
+                // `CSI u`. Prompts that draw a right-aligned segment, or
+                // update one late when an async git status lands, bracket it
+                // with these; ignoring them leaves the cursor wherever the
+                // segment ended. With parameters `CSI s` is DECSLRM (margins,
+                // not implemented) and is left alone, as is any `CSI Ps u`.
+                's' if bare(params) => self.save_cursor(),
+                'u' if bare(params) => self.restore_cursor(),
                 'J' => self.ed(canonicalize_params_1(params, 0)),
                 'K' => self.el(canonicalize_params_1(params, 0)),
                 'L' => self.il(canonicalize_params_1(params, 1)),
@@ -1696,6 +1934,11 @@ impl vte::Perform for Screen {
             );
         }
     }
+}
+
+/// roost: no explicit parameter at all — `CSI s` rather than `CSI 1;5 s`.
+fn bare(params: &vte::Params) -> bool {
+    params.iter().all(|p| p.iter().all(|&v| v == 0))
 }
 
 fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {
@@ -2650,5 +2893,258 @@ mod roost_tests {
         // Wide-flag bookkeeping stayed consistent through both trips.
         p.process(b"\x1b[Hq");
         assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "q");
+    }
+
+    // -- cursor sequences a shell prompt leans on --------------------------
+    //
+    // Each of these was silently ignored: the parser dispatched the sequence
+    // to an arm that did not exist, the cursor stayed where it was, and every
+    // character that followed landed in the wrong place — stale text that
+    // nothing in the program's own output would ever overwrite. The
+    // expectations are xterm's.
+
+    fn rows(p: &crate::Parser) -> Vec<String> {
+        p.screen().rows(0, 20).map(|r| r.trim_end().to_string()).collect()
+    }
+
+    #[test]
+    fn csi_s_and_u_save_and_restore_the_cursor() {
+        // The right-aligned-prompt idiom: save, jump right, draw, restore.
+        let mut p = parser();
+        p.process(b"abc\x1b[s\x1b[10Cxyz\x1b[udef");
+        assert_eq!(row0(&p), "abcdef       xyz");
+        assert_eq!(p.screen().cursor_position(), (0, 6));
+    }
+
+    #[test]
+    fn csi_s_with_parameters_is_not_a_save() {
+        // `CSI Pl ; Pr s` is DECSLRM (left/right margins), a different
+        // sequence that happens to share the final byte. Not implemented, but
+        // it must not be mistaken for SCOSC.
+        let mut p = parser();
+        p.process(b"abc\x1b[1;5s\x1b[ux");
+        assert_eq!(row0(&p), "xbc", "nothing was saved, so the restore goes home");
+    }
+
+    #[test]
+    fn csi_u_with_a_private_prefix_is_still_the_keyboard_protocol_not_a_restore() {
+        // `CSI ? u`, `CSI > 1 u`, `CSI = 5 u`, `CSI < u` are kitty keyboard
+        // sequences; only the bare form restores the cursor.
+        let mut p = parser();
+        p.process(b"abc\x1b[s\x1b[?u\x1b[>1u\x1b[=5u\x1b[<ud");
+        assert_eq!(row0(&p), "abcd");
+    }
+
+    #[test]
+    fn ind_moves_down_keeping_the_column() {
+        let mut p = parser();
+        p.process(b"ab\x1bDcd");
+        assert_eq!(&rows(&p)[..2], ["ab", "  cd"]);
+        assert_eq!(p.screen().cursor_position(), (1, 4));
+    }
+
+    #[test]
+    fn ind_at_the_bottom_scrolls_like_a_line_feed() {
+        let mut p = parser();
+        p.process(b"1\r\n2\r\n3\r\n4\r\n5\r\n6\x1bDx");
+        // IND keeps the column: `6` left the cursor at column 1.
+        assert_eq!(&rows(&p)[..6], ["2", "3", "4", "5", "6", " x"]);
+    }
+
+    #[test]
+    fn nel_moves_to_the_start_of_the_next_row() {
+        let mut p = parser();
+        p.process(b"ab\x1bEcd");
+        assert_eq!(&rows(&p)[..2], ["ab", "cd"]);
+        assert_eq!(p.screen().cursor_position(), (1, 2));
+    }
+
+    #[test]
+    fn cnl_and_cpl_move_by_lines_to_column_one_and_clamp() {
+        let mut p = parser();
+        p.process(b"ab\x1b[2Ecd");
+        assert_eq!(&rows(&p)[..3], ["ab", "", "cd"]);
+        let mut p = parser();
+        p.process(b"\n\nab\x1b[1Fcd");
+        assert_eq!(&rows(&p)[..3], ["", "cd", "ab"]);
+        // Neither scrolls: they stop at the edge like CUD/CUU.
+        let mut p = parser();
+        p.process(b"x\x1b[99Ey");
+        assert_eq!(p.screen().cursor_position(), (5, 1));
+        p.process(b"\x1b[99Fz");
+        assert_eq!(p.screen().cursor_position(), (0, 1));
+    }
+
+    #[test]
+    fn hvp_hpa_hpr_and_vpr_are_aliases_of_moves_already_implemented() {
+        let mut p = parser();
+        p.process(b"\x1b[2;3fxy");
+        assert_eq!(&rows(&p)[..2], ["", "  xy"]);
+        let mut p = parser();
+        p.process(b"ab\x1b[5`x");
+        assert_eq!(row0(&p), "ab  x", "HPA is an absolute column, like CHA");
+        let mut p = parser();
+        p.process(b"ab\x1b[3ax");
+        assert_eq!(row0(&p), "ab   x", "HPR is relative, like CUF");
+        let mut p = parser();
+        p.process(b"ab\x1b[2ex");
+        assert_eq!(&rows(&p)[..3], ["ab", "", "  x"], "VPR is relative, like CUD");
+    }
+
+    // -- tab stops ---------------------------------------------------------
+
+    #[test]
+    fn cht_and_cbt_walk_the_default_stops() {
+        let mut p = parser();
+        p.process(b"a\x1b[Ib");
+        assert_eq!(row0(&p), "a       b", "one stop forward is column 8");
+        let mut p = parser();
+        p.process(b"\x1b[2Ib");
+        assert_eq!(row0(&p), "                b", "two stops is column 16");
+        let mut p = parser();
+        p.process(b"\t\tab\x1b[Zc");
+        assert_eq!(row0(&p), "                cb", "back one stop from col 18 is 16");
+        let mut p = parser();
+        p.process(b"abc\x1b[99Zd");
+        assert_eq!(row0(&p), "dbc", "past the first stop is column 0");
+    }
+
+    #[test]
+    fn a_tab_never_wraps_it_stops_at_the_last_column() {
+        // 20 columns: stops at 8 and 16, then nothing.
+        let mut p = parser();
+        p.process(b"\x1b[18G\tx");
+        assert!(row0(&p).ends_with('x') && row0(&p).chars().count() == 20, "x drew at column 19");
+        assert_eq!(p.screen().cursor_position().0, 0, "and the row did not change");
+    }
+
+    #[test]
+    fn hts_sets_a_stop_and_tbc_clears_one_or_all() {
+        // Clear everything, then set a single stop at column 5.
+        let mut p = parser();
+        p.process(b"\x1b[3g\x1b[6G\x1bH\r\tx");
+        assert_eq!(row0(&p), "     x");
+        // With every stop gone a tab runs to the last column.
+        let mut p = parser();
+        p.process(b"\x1b[3g\tx");
+        assert!(row0(&p).ends_with('x') && row0(&p).chars().count() == 20, "x drew at column 19");
+        // Clearing the stop at the cursor takes out only that one.
+        let mut p = parser();
+        p.process(b"\x1b[9G\x1b[0g\r\tx");
+        assert_eq!(row0(&p), "                x", "the stop at 8 is gone, so the tab lands on 16");
+    }
+
+    #[test]
+    fn tab_stops_survive_widening_and_new_columns_get_the_defaults() {
+        let mut p = parser();
+        p.process(b"\x1b[3g\x1b[6G\x1bH");
+        p.set_size(6, 40);
+        // The stop a program set is kept; the new columns carry xterm's
+        // every-eighth defaults.
+        p.process(b"\r\tx\x1b[30G\r\x1b[7G\tx");
+        assert_eq!(row0(&p).find('x'), Some(5));
+        let mut p = parser();
+        p.set_size(6, 40);
+        p.process(b"\x1b[25G\tx");
+        assert_eq!(p.screen().cursor_position().1, 33, "col 32 is a default stop in the new width");
+    }
+
+    #[test]
+    fn a_full_reset_restores_the_default_stops() {
+        let mut p = parser();
+        p.process(b"\x1b[3g\x1bc\tx");
+        assert_eq!(row0(&p), "        x");
+    }
+
+    // -- insert mode (IRM) -------------------------------------------------
+
+    #[test]
+    fn insert_mode_pushes_the_rest_of_the_row_right() {
+        let mut p = parser();
+        p.process(b"abc\r\x1b[4hX");
+        assert_eq!(row0(&p), "Xabc");
+        p.process(b"Y");
+        assert_eq!(row0(&p), "XYabc");
+    }
+
+    #[test]
+    fn replace_mode_is_the_default_and_rm_returns_to_it() {
+        let mut p = parser();
+        p.process(b"abc\r\x1b[4h\x1b[4lX");
+        assert_eq!(row0(&p), "Xbc");
+    }
+
+    #[test]
+    fn insert_mode_drops_what_falls_off_the_right_edge() {
+        let mut p = parser();
+        p.process(b"0123456789abcdefghij\r\x1b[4hXY");
+        assert_eq!(row0(&p), "XY0123456789abcdefgh");
+    }
+
+    #[test]
+    fn insert_mode_makes_room_for_a_wide_character() {
+        let mut p = parser();
+        p.process(b"abc\r\x1b[4h");
+        p.process("\u{3042}".as_bytes());
+        assert_eq!(row0(&p), "\u{3042}abc");
+        assert_eq!(p.screen().cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn a_full_reset_leaves_insert_mode() {
+        let mut p = parser();
+        p.process(b"\x1b[4h\x1bcabc\rX");
+        assert_eq!(row0(&p), "Xbc");
+    }
+
+    // -- DEC Special Graphics (line drawing) -------------------------------
+
+    #[test]
+    fn g0_line_drawing_maps_the_box_letters_until_it_is_switched_off() {
+        let mut p = parser();
+        p.process(b"\x1b(0lqqk\x1b(Blqqk");
+        assert_eq!(row0(&p), "\u{250c}\u{2500}\u{2500}\u{2510}lqqk");
+        // A whole box, the way ncurses draws one.
+        let mut p = parser();
+        p.process(b"\x1b(0lqk\r\nx x\r\nmqj\x1b(B");
+        assert_eq!(
+            &rows(&p)[..3],
+            ["\u{250c}\u{2500}\u{2510}", "\u{2502} \u{2502}", "\u{2514}\u{2500}\u{2518}"]
+        );
+    }
+
+    #[test]
+    fn so_and_si_switch_between_g0_and_g1() {
+        let mut p = parser();
+        p.process(b"\x1b)0q\x0eq\x0fq");
+        assert_eq!(row0(&p), "q\u{2500}q", "G1 is line drawing only between SO and SI");
+    }
+
+    #[test]
+    fn line_drawing_leaves_everything_it_does_not_name_alone() {
+        let mut p = parser();
+        p.process("\x1b(0A1 \u{e9}\u{3042}\x1b(B".as_bytes());
+        assert_eq!(row0(&p), "A1 \u{e9}\u{3042}");
+    }
+
+    #[test]
+    fn an_unknown_designation_is_plain_ascii() {
+        let mut p = parser();
+        p.process(b"\x1b(0\x1b(Aq");
+        assert_eq!(row0(&p), "q");
+    }
+
+    #[test]
+    fn a_repeat_under_line_drawing_repeats_the_glyph() {
+        let mut p = parser();
+        p.process(b"\x1b(0q\x1b[3b\x1b(B");
+        assert_eq!(row0(&p), "\u{2500}\u{2500}\u{2500}\u{2500}");
+    }
+
+    #[test]
+    fn a_full_reset_restores_the_ascii_sets() {
+        let mut p = parser();
+        p.process(b"\x1b(0\x1bcq");
+        assert_eq!(row0(&p), "q");
     }
 }
