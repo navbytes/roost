@@ -117,6 +117,30 @@ pub fn draw<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>) {
     // of the whole screen, so it's visually obvious which pane they affect.
     let anchor = rects.iter().find(|pr| pr.id == app.focused).map(|pr| pr.rect).unwrap_or(body);
     draw_mode_overlay(f, app, body, anchor, spinner);
+    // Last, so no later writer inherits the flag.
+    skip_covered_cells(f.buffer_mut());
+}
+
+/// Never send a cell a wide glyph covers. ratatui's diff sends the cell after a
+/// VS16 emoji (`⚙️`) and its crossterm backend prints it with no cursor move,
+/// as if the emoji advanced one column; on a host that advances two (Ghostty,
+/// kitty, WezTerm) the rest of that run lands a column right — ghost glyphs
+/// and border gaps that only a resize repaints. Skipped, the next cell sent
+/// is two columns on and gets an absolute move. Plain wide glyphs already
+/// diff this way.
+fn skip_covered_cells(buf: &mut ratatui::buffer::Buffer) {
+    use ratatui::buffer::{CellDiffOption, CellWidth};
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let w = buf[(x, y)].symbol().cell_width().max(1);
+            for covered in x + 1..x.saturating_add(w).min(area.right()) {
+                buf[(covered, y)].set_diff_option(CellDiffOption::Skip);
+            }
+            x = x.saturating_add(w);
+        }
+    }
 }
 
 /// ux P3-16: what `draw` shows instead of nothing when the terminal is
@@ -691,7 +715,7 @@ fn clear_opaque(f: &mut Frame<'_>, rect: Rect) {
 /// interaction surface); no BOLD (§2 bold policy).
 fn modal_frame(f: &mut Frame<'_>, body: Rect, rect: Rect, title: Line<'static>) -> Rect {
     dim_backdrop(f, body);
-    f.render_widget(Clear, rect);
+    clear_opaque(f, rect);
     let block =
         Block::bordered().title(title).border_type(BorderType::Plain).border_style(theme::accent());
     let inner = block.inner(rect);
@@ -8087,6 +8111,23 @@ row's — widen ADAPTER_COL",
         assert_eq!(term.backend().buffer()[(3, 1)].symbol(), "│");
     }
 
+    /// Same guard for modals: `draw`'s `skip_covered_cells` would otherwise
+    /// never send a modal's left border under a pane emoji's second half.
+    #[test]
+    fn a_modal_keeps_its_left_border_when_a_vs16_glyph_abuts_it() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut term = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        term.draw(|f| {
+            f.buffer_mut().set_string(2, 1, "\u{2699}\u{fe0f}", ratatui::style::Style::new());
+            super::modal_frame(f, Rect::new(0, 0, 12, 3), Rect::new(3, 0, 5, 3), "".into());
+            super::skip_covered_cells(f.buffer_mut());
+        })
+        .unwrap();
+        assert_eq!(term.backend().buffer()[(3, 1)].symbol(), "│");
+    }
+
     /// C21/C22 (amended 2026-08-11): "keeps zoom" + the float draws above
     /// it (C22) — the title belongs to the tiled zoom target alone, never
     /// the float's own border, even though both are live at once.
@@ -8903,6 +8944,64 @@ row's — widen ADAPTER_COL",
             blit_row("日本語x".as_bytes(), 10, 5),
             vec!["日", " ", "本", " ", " ", " ", " ", " ", " ", " "],
         );
+    }
+
+    /// Ghosts after scrolling past an emoji-presentation sequence (`⚙️`):
+    /// the bytes roost's real terminal path writes must leave the host showing
+    /// exactly the frame roost drew. The host is vt100, which advances two
+    /// columns for `⚙️` like Ghostty, kitty and WezTerm do. Before the fix the
+    /// row after the gear landed one column right and its last cell wiped the
+    /// pane's right border — the reported gaps — and the tab name did the same
+    /// to the tab bar.
+    #[test]
+    fn vs16_emoji_leave_no_ghosts_on_a_host_that_draws_them_two_wide() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::layout::Size;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+        use std::{cell::RefCell, io, rc::Rc};
+
+        // The bytes the terminal would have received.
+        struct Tap(Rc<RefCell<Vec<u8>>>);
+        impl io::Write for Tap {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.borrow_mut().write(b)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (w, h) = (40, 8);
+        let mut app = mk_app(Size::new(w, h));
+        let inner = app.display_rects()[0].rect.inner(ratatui::layout::Margin::new(1, 1));
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let opts = TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, w, h)) };
+        let backend = CrosstermBackend::new(Tap(bytes.clone()));
+        let mut term = Terminal::with_options(backend, opts).unwrap();
+        let mut host = vt100::Parser::new(h, w, 0);
+        let mut frame = |app: &mut App<crate::ports::fakes::FakePane>| {
+            let want = term.draw(|f| super::draw(f, app)).unwrap().buffer.clone();
+            host.process(&bytes.take());
+            for y in 0..h {
+                let want: Vec<&str> = (0..w).map(|x| want[(x, y)].symbol()).collect();
+                let got: Vec<String> = (0..w)
+                    .map(|x| host.screen().cell(y, x).unwrap().contents())
+                    .map(|s| if s.is_empty() { " ".into() } else { s })
+                    .collect();
+                assert_eq!(got, want, "host row {y} differs from the frame roost drew");
+            }
+        };
+
+        let mut grid = vt100::Parser::new(inner.height, inner.width, 0);
+        grid.process("abcdefghijklmnopqrstuvwxyz0123456789ab\r\n".repeat(5).as_bytes());
+        app.runtimes.get_mut(&1).unwrap().parser = Some(grid);
+        app.ws.active_tab_mut().name = "abcdefgh".into();
+        frame(&mut app);
+
+        let grid = app.runtimes.get_mut(&1).unwrap().parser.as_mut().unwrap();
+        grid.process("\u{2699}\u{fe0f} Running tests\r\n\u{2705} done\r\n".as_bytes());
+        app.ws.active_tab_mut().name = "\u{2699}\u{fe0f} build".into();
+        frame(&mut app);
     }
 
     /// C10 (2026-08-20): a flash is not a hint. It must reach the user
