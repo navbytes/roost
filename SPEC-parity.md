@@ -593,6 +593,33 @@ Every peer ships search; roost's only history export is `roost read --full`.
 `grab_all_text`, jumps setting the (P14-vetted) offset; a dump-to-editor verb
 can start as a thin affordance over the existing control-plane read.
 
+### P22 · FIXED · Med — ordinary cursor, tab, insert-mode and line-drawing sequences silently ignored
+*Fixed in `vendor/vt100`: `CSI s`/`CSI u` (ANSI save/restore cursor), `ESC D`
+(IND), `ESC E` (NEL), `CSI E`/`F` (CNL/CPL), `CSI f` (HVP), `` CSI ` ``/`a`/`e`
+(HPA/HPR/VPR), `CSI I`/`Z` (CHT/CBT), `ESC H` (HTS), `CSI g` (TBC), insert mode
+(`CSI 4 h`/`l`) and the DEC Special Graphics charset (`ESC ( 0`, `ESC ) 0`,
+SO/SI). Expectations are xterm's; each has a test in `screen.rs`'s
+`roost_tests`, and breaking one of them (HTS, default stops on widening,
+insert mode, `CSI s` with parameters) fails the intended test.*
+Reported as intermittent leftover characters in a pane, mostly right after
+opening a tab, that a `clear` removes and a window resize does not — which
+puts them in the pane's own grid, not the host's. Measured against the
+parser: OSC 7/133/1337, DCS, APC, SOS/PM and every `>`/`=`/`?`-prefixed CSI a
+shell or prompt framework sends at startup were swallowed correctly, but the
+sequences above fell through to the unhandled arm. A cursor move that does
+nothing leaves every later character in the wrong place, and nothing in the
+program's output ever overwrites it. `CSI s`/`CSI u` is the plausible culprit
+for a prompt that draws a right-aligned segment, or fills one in late when an
+async git status arrives.
+**Not confirmed as the cause of that report** — the reporter's shell was not
+captured when this landed. They are bugs regardless: each is a sequence xterm
+handles and `TERM=xterm-256color` advertises.
+**Known limits.** `CSI Pl ; Pr s` is DECSLRM (left/right margins), which is
+not implemented and is deliberately not mistaken for a save. DECSC/DECRC save
+the cursor and attributes but not the designated charsets, as upstream's did.
+Tab stops live on the terminal, not on either grid, so the alternate screen
+shares them. DECALN (`ESC # 8`) is still ignored.
+
 ## Not applicable — peer failure classes roost's architecture rules out
 Daemon/attach crashes (no daemon by design) · session-resurrection duplicates
 (single-instance lock + claimed-session set) · scrollback-serialization
