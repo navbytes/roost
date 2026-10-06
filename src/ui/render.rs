@@ -1955,7 +1955,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             // own stated rule ("Alt+click gets its own row because it is a
             // chord"), applied to the mouse verb that is now also one.
             reference("mouse", "wheel scrolls · click focuses · drag/2x/3x/shift selects"),
-            bare("Alt+click / o", "open the URL under the pointer / copy cursor"),
+            bare("Alt+click / o", "open the link or path under the pointer / copy cursor"),
         ],
     },
     HelpGroup {

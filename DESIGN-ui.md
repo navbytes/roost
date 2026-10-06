@@ -2000,7 +2000,7 @@ said, and counts.]*
 |---|---|
 | `status` | `⠋ working ◆ needs you ○ waiting · idle ✕ exited` |
 | `mouse` | `wheel scrolls · click focuses · drag selects` |
-| `Alt+click` | `open the URL under the pointer` |
+| `Alt+click` | `open the link or path under the pointer` |
 
 - **Why a legend at all:** the glyph set (the Working spinner plus `◆○·✕`) is
   the product's core language (C5) — every badge, tab summary and feed line
@@ -3121,14 +3121,14 @@ walked one cell at a time. Added:
   `0`/`$` included (C9 amendment above; C15/§8's row reads
   `copy mode (hjkl w b e 0 $ v V y) / scroll mode`).
 
-**[Amended 2026-07-27, SPEC-ux U19 — `o` opens the URL under the cursor]:**
+**[Amended 2026-07-27, SPEC-ux U19 — `o` opens the link or path under the cursor]:**
 copy mode gains one more key. Alt+click has always opened a URL, but no
 keyboard path opened one at all, so the single most common thing an agent
 prints — a link — was reachable only by leaving the keyboard. `o` looks up
-`App::url_at` at the cursor cell and, on a hit, stashes it in
+`App::target_at` at the cursor cell and, on a hit, stashes it in
 `pending_open` for the composition root to hand to the browser (core does
 no I/O — the same split `pending_yank` uses); on a miss it flashes
-`no URL under the cursor` rather than no-opping silently. Either way the
+`nothing to open under the cursor` rather than no-opping silently. Either way the
 mode stays open: opening a link is not a reason to lose your selection.
 Hint pair `o open`; help row `Alt+click / o`.
 
@@ -6951,7 +6951,7 @@ Alt chord ends it. Reachable from the C15 overlay's `Alt+c / Alt+PgUp` row.]
 [Amended 2026-07-27, SPEC-ux U17/U19/U20/U25 — mode-local keys. None of
 these are Alt chords, so none join the table above; they are listed here so
 the canonical page still knows they exist. Copy mode (C24): `w`/`b`/`e`
-word motions, `V` line select, `o` open the URL under the cursor, alongside
+word motions, `V` line select, `o` open the link or path under the cursor, alongside
 the pre-existing `0`/`$`. Picker (C14): `1`..`9` launch that row. Feed
 (C20): `Enter` focuses the selected entry's pane, and the long-implemented
 `PgUp`/`PgDn`/`q` are now advertised. Every one of them is reachable from

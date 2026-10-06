@@ -669,11 +669,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                                 let outcome = infra::clipboard::copy(&text);
                                 app.flash_copy(text.chars().count(), outcome);
                             }
-                            // U19: and copy mode's `o` stashes a URL the same
-                            // way — the browser is I/O, so it happens out here.
-                            if let Some(url) = app.take_pending_open() {
-                                infra::open::open_url(&url);
-                            }
+                            // U19: and copy mode's `o` stashes a target the same
+                            // way — the handler is I/O, so it happens out here.
+                            open_pending(&mut app);
                         }
                         Event::Mouse(me) => handle_mouse(&mut app, me),
                         // P10: roost's window changed focus — the focused pane
@@ -924,6 +922,16 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
     }
 }
 
+/// Run the target copy mode's `o` staged; a miss or a failed spawn flashes.
+fn open_pending<B: PaneBackend>(app: &mut App<B>) {
+    let Some(target) = app.take_pending_open() else { return };
+    match infra::open::open_target(app.keymap().openers(), target) {
+        Ok(true) => {}
+        Ok(false) => app.set_flash("nothing to open under the cursor"),
+        Err(msg) => app.set_flash(msg),
+    }
+}
+
 /// Route mouse events. Tab-bar clicks switch tabs. Over a pane: a left press
 /// focuses it; wheel and (for mouse-aware apps) clicks/drags are forwarded to
 /// the inner app, otherwise the wheel scrolls roost's own scrollback.
@@ -1102,18 +1110,24 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         && !pane.collapsed
     {
         let (r, c) = inner_cell(pane.rect, me.column, me.row);
-        if let Some(url) = app.url_at(pane.id, r, c) {
-            // S3 (PR #46 code review): opening a URL is its own complete
-            // gesture over *this* pane, latched by the P20 logic above like
-            // any other press — it must not leave a different pane's
-            // lingering native-selection highlight around for a later,
-            // unrelated drag/release on this latch to extend or re-copy.
-            // (A miss falls through to the ordinary click path below, whose
-            // `on_click` already clears a foreign-pane selection — see the
-            // "Alt-click that misses" bullet in C29.)
-            app.selection = None;
-            infra::open::open_url(&url);
-            return;
+        if let Some(target) = app.target_at(pane.id, r, c) {
+            let opened = infra::open::open_target(app.keymap().openers(), target);
+            // A path no rule opens falls through to the ordinary click path.
+            if opened != Ok(false) {
+                // S3 (PR #46 code review): opening is its own complete
+                // gesture over *this* pane, latched by the P20 logic above like
+                // any other press — it must not leave a different pane's
+                // lingering native-selection highlight around for a later,
+                // unrelated drag/release on this latch to extend or re-copy.
+                // (A miss falls through to the ordinary click path below, whose
+                // `on_click` already clears a foreign-pane selection — see the
+                // "Alt-click that misses" bullet in C29.)
+                app.selection = None;
+                if let Err(msg) = opened {
+                    app.set_flash(msg);
+                }
+                return;
+            }
         }
     }
 
@@ -2602,9 +2616,7 @@ mod tests {
                         let outcome = infra::clipboard::copy(&text);
                         app.flash_copy(text.chars().count(), outcome);
                     }
-                    if let Some(url) = app.take_pending_open() {
-                        infra::open::open_url(&url);
-                    }
+                    open_pending(&mut app);
                     app.quit = false;
                     sent += 1;
                 }
