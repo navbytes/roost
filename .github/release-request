@@ -1,2 +1,2 @@
-v0.1.29
-Fix: pi extension status connections stayed evictable, so 16+ panes could keep knocking live reporters off the socket; shared text-field, session-detection, overlay and CLI-verb modules; two timing-flaky tests fixed.
+v0.1.30
+Alt+click and copy-mode o now open file and directory paths with a command you set in config.json's new "open" array (see the README's Openers section), and rows with wide emoji no longer leave ghost characters or border gaps after scrolling in Ghostty, kitty and WezTerm.
