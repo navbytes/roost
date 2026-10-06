@@ -2366,6 +2366,11 @@ program emitted and roost did not reproduce. Two such changes land here:
   roost may write a symbol into a cell another glyph already spans; a wide
   glyph clipped by the drawn area's edge degrades to a space rather than
   emitting a two-column symbol that would suppress the border's own cell.
+  Since 2026-10-06 `draw` enforces this at the diff: its last pass,
+  `skip_covered_cells`, marks every cell a wide glyph spans as never sent —
+  VS16 sequences (`⚙️`) included, whose covered cell ratatui otherwise prints
+  without a cursor move, drifting the rest of the row on hosts that draw them
+  two wide.
 - `cell_style` maps SGR 2 and 9 to `Modifier::DIM` and `CROSSED_OUT` (P16).
   These were dropped end to end, so dimmed secondary text rendered at full
   weight — the pane asserting emphasis the program never asked for.

@@ -34,3 +34,12 @@ From the `/code-refactor` survey. #224 shipped the four that passed the deletion
 - **`PaneBackend` capabilities snapshot** (`src/ports.rs`): the mode queries are not consumed together on the trait (except the pair above, which is a `main.rs` helper, not a trait change), each is mostly its doc comment, and ~23 test sites would churn. Revisit at 8+ modes.
 - **`set_focus` FocusTrail** (`src/core/app.rs`): `alternate` has 5 sites and `visited_waiting` 7 (also cleared with `last_status`/`needy_msgs` on pane death, ~1568/~2831), and both rules need `App` lookups (`pane_exists`, `display_status`); the interface would be as big as the two fields. The C22 part already moved to `Overlays::focus_moved`.
 - **Neighbor-finding math** (`src/core/layout.rs` ~547-602 vs `src/ui/mouse.rs` ~105-134): look-alikes. `neighbor` ranks `(!overlaps, gap, centre distance)` across gaps (`gap >= 0`, does not skip collapsed panes); `seam_at` needs exact adjacency, a 2-cell hit band, and skips collapsed panes. Only a 3-line span expression is common.
+
+## Wide-glyph follow-ups (2026-10-06)
+
+From the ghost glyph and border gap fix (`skip_covered_cells`, `src/ui/render.rs:131`).
+
+- **Accepted limitation: hosts that advance one column for VS16 emoji.** Terminals that move the cursor only one column for `⚙️` (VTE-based, possibly Alacritty; unverified) can show one stale cell after each changed VS16 emoji, because the covered cell is no longer sent. A fix that works on both kinds of host needs a crossterm-backend wrapper that writes the covered cell *before* the emoji. ratatui's diff order cannot do that.
+- **vt100 splits ZWJ sequences.** `🧑‍💻` becomes `🧑`+ZWJ, then `💻` in a cell of its own (`vendor/vt100/src/screen.rs:713` appends only width-0 chars; `💻` takes the width>0 path at :801). That is 4 columns, where unicode-width, Claude Code and Ghostty count 2. This is the suspect for Claude Code rows drifting inside the grid. The reported "becausevery" is still unexplained.
+- **`cell_to_char`/`char_to_cell` count zero-width codepoints as a column** (`src/core/app.rs:7426-7444`, `.max(1)`). Every ZWJ or combining mark shifts URL and word hit-testing one column right for the rest of the row. VS16 comes out right only by coincidence.
+- **Styling on a wide glyph's second column is never sent.** A copy-mode cursor (`src/ui/render.rs:3692`), a selection edge or a search hit that starts on a covered column styles a cell the diff skips. This predates `skip_covered_cells`, which plain wide glyphs already got.

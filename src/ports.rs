@@ -434,6 +434,9 @@ pub mod fakes {
         /// `Some`, so a test can mutate `grab`/`rows` mid-gesture and prove
         /// the freeze holds.
         frozen: Option<(String, Vec<String>)>,
+        /// Test knob: a real grid for `screen()` to show, so render tests can
+        /// draw actual pane content. `None` draws an empty pane, as before.
+        pub parser: Option<vt100::Parser>,
     }
 
     impl PaneBackend for FakePane {
@@ -473,6 +476,7 @@ pub mod fakes {
                 ext_link: false,
                 title_signal: None,
                 frozen: None,
+                parser: None,
             })
         }
         fn process_output(&mut self, _bytes: &[u8]) {
@@ -544,7 +548,7 @@ pub mod fakes {
             self.cursor_shape
         }
         fn screen(&self) -> Option<&vt100::Screen> {
-            None
+            self.parser.as_ref().map(vt100::Parser::screen)
         }
         /// U9: models the real backend's clamp-and-read-back — the stored
         /// offset is what the "grid" (`scroll_total` banked rows) accepted,
