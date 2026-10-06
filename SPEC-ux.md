@@ -392,9 +392,9 @@ was a dead click. The flag comes from a new `PaneRuntime::row_wrapped`
 (default false), read off the *presented* frame like `grab_text` so the join
 agrees with what is on screen; the vendored `Screen::row_wrapped` already
 existed and is now pinned by a vendor-side test (a newline is not a wrap; a
-merely-full row is not a wrap). `o` in copy mode opens the URL under the
+merely-full row is not a wrap). `o` in copy mode opens the link or path under the
 cursor via `pending_open` (core does no I/O), flashing
-`no URL under the cursor` on a miss and never leaving the mode
+`nothing to open under the cursor` on a miss and never leaving the mode
 (C24 amended 2026-07-27).
 **Known bound (unchanged by this fix, sharpened by P15's landing):** the
 column a click or the copy cursor carries is a *cell* index, while the row
@@ -543,7 +543,7 @@ short terminals instead of capping content.
 **Fixed** (the merge option, not the scroll one): `HELP_KEYS` gains three
 reference rows after `Alt+q` — `status ● working ◆ needs you ○ waiting ·
 idle ✕ exited`, `mouse wheel scrolls · click focuses · drag selects`, and
-`Alt+click open the URL under the pointer` (its own row: it is a chord).
+`Alt+click open the link or path under the pointer` (its own row: it is a chord).
 Paid for by merging three natural chord pairs — `Alt+s / Alt+o`,
 `Alt+z / Alt+f`, `Alt+w / Alt+u` — so C15's ≤20-row cap holds unchanged at
 exactly 20. Scrolling was rejected: it would force arrow/PgUp/PgDn carve-outs

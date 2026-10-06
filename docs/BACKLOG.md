@@ -2,6 +2,15 @@
 
 Deferred work and accepted limitations. Newest first within a section.
 
+## Configurable openers (2026-10-06)
+
+Shipped: top-level `"open"` rules in `config.json` (`src/core/open.rs`, `src/infra/open.rs`). Left:
+
+- **Paths with spaces are not detected** — the token is the whitespace run from `word_bounds_at` (`src/core/app.rs` ~7455), so `my file.rs` is two tokens.
+- **Handler exit status is not reported** — `infra::open::spawn` reaps in a thread and drops the status, so a terminal editor (`nvim`, stdin is null) fails silently once it has started; only a failed spawn flashes.
+- **`stat` blocks the main loop** on a hung network mount (`src/infra/open.rs` `stat`, called from the Alt+click path in `src/main.rs` `handle_mouse` and `open_pending`). Thread + timeout if it bites.
+- **No `host` filter and no user-defined regex matchers** — rules match on kind/ext only; no regex crate was added for this.
+
 ## Library survey follow-ups (2026-10-03)
 
 From the "which libraries could shrink roost or make it more reliable" pass. Shipped: `cargo-deny` in CI, `rustix`/`signal-hook` behind `infra::procs`/`infra::signals`, `infra::atomic`, `base64`, grapheme-aware `textfield`, `proptest` for `layout.rs`. What was looked at and left:

@@ -740,6 +740,8 @@ enum Override {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Keymap {
     overrides: HashMap<Chord, Override>,
+    /// config.json's `"open"` rules ride along: same file, same diagnostics.
+    openers: Vec<crate::core::open::OpenRule>,
 }
 
 /// What `Keymap::parse` has to say about a `config.json`, split by whether
@@ -781,6 +783,10 @@ impl Diagnostics {
 }
 
 impl Keymap {
+    pub fn openers(&self) -> &[crate::core::open::OpenRule] {
+        &self.openers
+    }
+
     /// Parse config.json's contents. Never fails outright: invalid JSON,
     /// `"keys"` not an object, an unparseable chord, a non-string value, and
     /// an unknown action name are all non-fatal — the offending entry is
@@ -855,6 +861,7 @@ impl Keymap {
                 diagnostics.problems.push(format!("{source}: \"keys\" must be an object — ignored"))
             }
         }
+        keymap.openers = crate::core::open::parse_rules(&value, source, &mut diagnostics.problems);
         // Now that every entry is merged, ask the only question worth
         // warning about: is the displaced action reachable at all any more?
         // `effective_bindings` is the same defaults-plus-overrides merge
@@ -2090,6 +2097,19 @@ mod tests {
             translate_with(alt_shift(KeyCode::Char('z')), &keymap),
             InputResult::Action(Action::ToggleFloat)
         ));
+    }
+
+    /// `"open"` rules share the file and the diagnostics: a bad one is a
+    /// problem (so `roost keys` fails), the good ones and the keys still load.
+    #[test]
+    fn open_rules_load_beside_keys_and_report_into_the_same_diagnostics() {
+        let json = r#"{"keys": {"alt+g": "quit"},
+            "open": [{"kind":"dir","run":["code","{path}"]}, {"kind":"nope","run":["x"]}]}"#;
+        let (keymap, diagnostics) = Keymap::parse(json, "config.json");
+        assert_eq!(keymap.openers().len(), 1);
+        assert_eq!(diagnostics.problems.len(), 1);
+        assert!(diagnostics.problems[0].contains("open[1]"), "{:?}", diagnostics.problems);
+        assert!(!keymap.overrides.is_empty());
     }
 
     /// The "unless it was also remapped" half: a chord reassigned to a

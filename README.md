@@ -185,6 +185,71 @@ directory, by design — you named it, so there is nothing to report. Named
 workspaces [share the root config](#workspaces); a `config.json` inside a
 workspace's own directory replaces it wholesale for that workspace.
 
+### Openers
+
+`Alt+click` (or `o` in copy mode) on a URL opens it in your browser. A top-level
+`"open"` array in `config.json` adds handlers for paths on screen too, and can
+override the URL one. Rules are tried in order, first match wins:
+
+```jsonc
+{
+  "open": [
+    { "kind": "dir",  "run": ["code", "{path}"] },
+    { "kind": "file", "ext": ["pdf", "png"], "run": ["open", "{path}"] },
+    { "kind": "file", "run": ["code", "--goto", "{path}{loc}"] }
+  ]
+}
+```
+
+- `kind` is `url`, `file` or `dir`; `ext` (file only, optional, no dot,
+  case-insensitive) narrows a file rule to those extensions.
+- `run` is an argv, never a shell line. `{path}`, `{line}`, `{col}`, `{loc}`
+  (file/dir) and `{url}` (url) are substituted per argument; `{line}`/`{col}`
+  are empty when the text had no `:12:3` suffix, and `{loc}` is `:12:3`, `:12`
+  or empty, so `{path}{loc}` never leaves a dangling `::`. `{path}` is the
+  canonical, symlink-resolved absolute path (`/tmp` shows up as
+  `/private/tmp` on macOS), and `ext` is matched against that same path. The
+  program (`run[0]`) must be literal.
+- A placeholder must be the only thing in its argument besides plain text
+  (`{path}`, `{path}{loc}`, `--goto={path}{loc}`): an argument containing a
+  placeholder and whitespace or any of `' " \` ; $ | & ( ) < > \` is refused.
+  Shells, `python -c`, `osascript -e`, `tmux new-window` and similar re-parse
+  a code string, so a path inside one is code — pass it as a separate argument
+  instead, e.g. `["sh", "-c", "gui-editor \"$1\"", "_", "{path}"]`. roost
+  cannot know which programs interpret their arguments, so this check is by
+  shape only: never write a rule that makes some program evaluate a string
+  built from `{path}`. A placeholder that is the whole code argument
+  (`["sh", "-c", "{path}"]`, `["tmux", "new-window", "{path}"]`,
+  `["ssh", "h", "{path}"]`) makes the path's own characters code and is
+  unsupported. Likewise a rule whose program *executes* the file
+  (`python3 {path}` for `py`, `bash {path}`, `x-terminal-emulator -e {path}`,
+  `gnome-terminal -- {path}`, `xargs`, `sudo`) runs whatever matching file a
+  cloned repo or a printed path supplies — don't use those for untrusted
+  content.
+- A path is matched only if it exists: absolute, `~/…`, `./…`, `../…`, or a bare
+  token containing `/` or an extension. No rule, no open: the click behaves as
+  it always did. Without any file/dir rule roost does not look for paths at all.
+- Launchers — `open`, `xdg-open`, `gio`, `kde-open`, `gnome-open`, `handlr`,
+  `exo-open`, `mimeopen`, `wslview`, `rifle`, `cygstart`, `gvfs-open`,
+  `kioclient` — and the wrappers `env`, `nohup`, `nice`, `timeout`, `arch` are
+  refused anywhere in `run` (including inside a `sh -c` string) for a `dir` rule or a `file` rule without `ext`: a `.app` bundle is a
+  directory and `open` would launch it. List the extensions instead. Whatever
+  the handler, roost also refuses to open anything ending in `.app`,
+  `.command`, `.workflow`, `.terminal`, `.tool`, `.jar`, `.fileloc`, `.inetloc`
+  or `.desktop` and flashes why. Not blocked: an executable file with no
+  extension (it cannot be recognised by name, so keep ext-less file rules to
+  handlers that don't execute their argument), and `.pkg`, `.dmg`,
+  `.prefPane`, `.saver`, `.action`, `.mobileconfig`, which prompt the user
+  first.
+- Bad rules are skipped and reported like bad keys (startup toast, activity
+  feed, `roost keys`). A handler that fails to start flashes `open: <prog> not found`.
+
+Limits: handlers are **GUI programs only** — they run detached with no
+terminal, so `nvim` and friends will not work. Paths containing spaces are not
+detected. Relative paths resolve against the pane's working directory as roost
+last read it from the pane's process (about every 2 seconds), so right after
+a `cd` they can still resolve against the old directory.
+
 ### Environment
 
 roost has no flags for any of this — the whole outside-the-TUI surface is

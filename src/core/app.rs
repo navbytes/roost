@@ -17,6 +17,7 @@ use crate::core::control::{
 use crate::core::detect::{Found, SessionDetector};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
+use crate::core::open::{Kind, Target};
 use crate::core::overlay::Overlays;
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
@@ -644,7 +645,7 @@ pub struct App<B: PaneBackend> {
     /// composition root to hand it to the browser — same core-does-no-I/O
     /// split as `pending_yank` above (the Alt+click path opens directly in
     /// `main.rs`, because it already runs there).
-    pending_open: Option<String>,
+    pending_open: Option<Target>,
     /// P20: the pane a mouse gesture latched onto at button-down, held
     /// until the matching release — so a drag that crosses a pane border
     /// doesn't switch target mid-gesture (which would leave the origin app
@@ -1155,9 +1156,9 @@ impl<B: PaneBackend> App<B> {
         self.pending_yank.take()
     }
 
-    /// U19: take (clearing) the URL copy mode's `o` asked to open — see
+    /// U19: take (clearing) the target copy mode's `o` asked to open — see
     /// `pending_open`. Polled beside the yank, once per tick.
-    pub fn take_pending_open(&mut self) -> Option<String> {
+    pub fn take_pending_open(&mut self) -> Option<Target> {
         self.pending_open.take()
     }
 
@@ -3372,7 +3373,7 @@ impl<B: PaneBackend> App<B> {
     }
 
     /// C29: double-click — select the whitespace-delimited word under (row,
-    /// col), the same tokenizer `find_url_at` uses (`word_bounds_at`,
+    /// col), the same tokenizer `find_target_at` uses (`word_bounds_at`,
     /// cell-aware per B1). No word there (whitespace, or past the row's
     /// trimmed content) **clears the selection outright** (D3) rather than
     /// degrading to a single-point (anchor == cursor) selection: a
@@ -3625,15 +3626,21 @@ impl<B: PaneBackend> App<B> {
             .map(|(m, _, _)| m.as_str())
     }
 
-    /// The URL under inner cell (row, col) of pane `id`, if any — for
-    /// Alt+click-to-open and copy mode's `o`.
+    /// The URL — or, only when a file/dir opener is configured, the
+    /// path-looking token (not yet stat'd) — under inner cell (row, col) of
+    /// pane `id`, for Alt+click-to-open and copy mode's `o`.
     ///
     /// U19: reads the whole *wrapped run* the row belongs to, not one grid
     /// row. Agents print long CI/GitHub links into narrow panes constantly;
     /// reading only the clicked row would open a wrapped link's first-row
     /// fragment and dead-click everywhere below the break.
-    pub fn url_at(&self, id: PaneId, row: u16, col: u16) -> Option<String> {
+    pub fn target_at(&self, id: PaneId, row: u16, col: u16) -> Option<Target> {
         let rt = self.runtimes.get(&id)?;
+        let paths = if self.keymap.openers().iter().any(|r| r.kind != Kind::Url) {
+            self.find_spec(id).map(|s| (s.cwd.as_path(), self.home.as_deref()))
+        } else {
+            None
+        };
         let (rows, width) = self.pane_inner_dims(id);
         // Walk back to the run's first row, then collect forward through it.
         let mut first = row;
@@ -3650,7 +3657,7 @@ impl<B: PaneBackend> App<B> {
             }
             r += 1;
         }
-        url_in_wrapped_rows(&run, width as usize, (row - first) as usize, col as usize)
+        target_in_wrapped_rows(&run, width as usize, (row - first) as usize, col as usize, paths)
     }
 
     // -- mouse -------------------------------------------------------------
@@ -6895,17 +6902,17 @@ impl<B: PaneBackend> App<B> {
                             dragging: false,
                         });
                     }
-                    // U19: `o` opens the URL under the cursor — keyboard
+                    // U19: `o` opens the URL/path under the cursor — keyboard
                     // parity for a verb that was mouse-only (Alt+click), so
                     // a link an agent printed is reachable without ever
-                    // leaving the keyboard. Wrapped links included: `url_at`
+                    // leaving the keyboard. Wrapped links included: `target_at`
                     // joins the run either way.
                     KeyCode::Char('o') => {
                         let focused = self.focused;
                         let (r, c) = *cursor;
-                        match self.url_at(focused, r, c) {
-                            Some(url) => self.pending_open = Some(url),
-                            None => self.set_flash("no URL under the cursor"),
+                        match self.target_at(focused, r, c) {
+                            Some(t) => self.pending_open = Some(t),
+                            None => self.set_flash("nothing to open under the cursor"),
                         }
                     }
                     KeyCode::Char('y') | KeyCode::Enter => {
@@ -7444,11 +7451,11 @@ fn char_to_cell(line: &str, idx: usize) -> usize {
 }
 
 /// The whitespace-delimited run containing grid CELL column `cell` of
-/// `line` — the shared tokenizer `find_url_at` (URL validation layered on
+/// `line` — the shared tokenizer `find_target_at` (URL validation layered on
 /// top) and double-click word selection (`App::select_word_at`) both walk,
 /// so the two can never disagree about where a token starts and ends.
 /// Converts to char space via `cell_to_char` before walking (B1) and
-/// returns **char** indices — `find_url_at`'s own char-based slicing wants
+/// returns **char** indices — `find_target_at`'s own char-based slicing wants
 /// exactly that, and `select_word_at` converts back with `char_to_cell`.
 /// `None` when `cell` sits on whitespace or past the line's
 /// (trailing-space-trimmed) end — there is no token there to grab.
@@ -7469,20 +7476,24 @@ fn word_bounds_at(line: &str, cell: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// Find an http(s) URL that covers grid CELL column `col` in `line` (B1: a
-/// cell column, not a char index — see `cell_to_char`). The URL is the
-/// surrounding non-whitespace run, with wrapping/trailing punctuation
-/// stripped. Pure, so it's unit-tested.
-pub fn find_url_at(line: &str, col: usize) -> Option<String> {
+/// Where relative paths resolve (the pane's cwd) and what `~/` means.
+type PathCtx<'a> = (&'a Path, Option<&'a Path>);
+
+/// Find an http(s) URL — or, with `paths`, a path-looking token — that
+/// covers grid CELL column `col` in `line` (B1: a cell column, not a char
+/// index — see `cell_to_char`). The URL is the surrounding non-whitespace
+/// run, with wrapping/trailing punctuation stripped. Pure, so it's
+/// unit-tested.
+pub fn find_target_at(line: &str, col: usize, paths: Option<PathCtx<'_>>) -> Option<Target> {
     let (start, end) = word_bounds_at(line, col)?;
     let token: String = line.chars().skip(start).take(end - start + 1).collect();
     // Strip wrapping brackets/quotes and trailing sentence punctuation.
     let trimmed = token.trim_matches(|c: char| "()[]{}<>\"'`.,;:!?".contains(c));
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        Some(trimmed.to_string())
-    } else {
-        None
+        return Some(Target::Url(trimmed.to_string()));
     }
+    let (cwd, home) = paths?;
+    crate::core::open::path_in_token(&token, cwd, home)
 }
 
 /// U25: the feed entry the overlay's cursor is on — `offset` counts back
@@ -7495,7 +7506,7 @@ pub fn feed_selected(feed: &VecDeque<FeedEntry>, offset: usize) -> Option<&FeedE
 }
 
 /// U19: stitch one wrapped run of grid rows back into the single logical
-/// line the program printed, and return the URL under a cell of it. `run`
+/// line the program printed, and return the target under a cell of it. `run`
 /// holds the run's rows in order as `grab_text` returns them (trailing
 /// spaces trimmed), `width` is the pane's inner column count, and
 /// `(row, col)` is the clicked cell — `row` indexed *within the run*.
@@ -7505,7 +7516,13 @@ pub fn feed_selected(feed: &VecDeque<FeedEntry>, offset: usize) -> Option<&FeedE
 /// and only keeps the column arithmetic exact; where a tail really was
 /// blank, the restored spaces correctly keep the two rows' tokens apart
 /// instead of fusing them into one nonsense word.
-pub fn url_in_wrapped_rows(run: &[String], width: usize, row: usize, col: usize) -> Option<String> {
+pub fn target_in_wrapped_rows(
+    run: &[String],
+    width: usize,
+    row: usize,
+    col: usize,
+    paths: Option<PathCtx<'_>>,
+) -> Option<Target> {
     let mut line = String::new();
     let mut at = None;
     for (i, text) in run.iter().enumerate() {
@@ -7519,7 +7536,7 @@ pub fn url_in_wrapped_rows(run: &[String], width: usize, row: usize, col: usize)
             }
         }
     }
-    find_url_at(&line, at?)
+    find_target_at(&line, at?, paths)
 }
 
 /// U18: the global `Action` that *enters* each mode — press that chord while
@@ -7561,7 +7578,7 @@ fn mode_entry_action(mode: &Mode) -> Option<Action> {
 ///
 /// Columns are char offsets, not grid cells: a row containing wide (CJK /
 /// emoji) glyphs ahead of a hit highlights that many cells to the left of
-/// it. Same bounded, documented drift `find_url_at` carries (SPEC-ux U19);
+/// it. Same bounded, documented drift `find_target_at` carries (SPEC-ux U19);
 /// the fix for both is one cell→char map per row, and it belongs with U24's
 /// wide-char work rather than here.
 pub fn find_matches(lines: &[String], needle: &str) -> Vec<(usize, usize)> {
@@ -11580,7 +11597,7 @@ pub(crate) mod tests {
     }
 
     /// Double-click selects the whitespace-delimited word under the
-    /// pointer — the same tokenizer `find_url_at` uses (`word_bounds_at`).
+    /// pointer — the same tokenizer `find_target_at` uses (`word_bounds_at`).
     #[test]
     fn select_word_at_grabs_the_whitespace_delimited_word() {
         let (mut app, _) = mk_app(shell_ws());
@@ -11873,21 +11890,37 @@ pub(crate) mod tests {
         assert!(app.selection.is_none(), "Copy mode starts with no inherited selection");
     }
 
+    fn url(t: Option<Target>) -> Option<String> {
+        match t {
+            Some(Target::Url(u)) => Some(u),
+            _ => None,
+        }
+    }
+
     #[test]
     fn find_url_detects_and_trims() {
-        use super::find_url_at;
+        use super::find_target_at;
         let line = "see https://example.com/path for details";
         // click anywhere within the URL (cols 4..=28) returns it
-        assert_eq!(find_url_at(line, 4).as_deref(), Some("https://example.com/path"));
-        assert_eq!(find_url_at(line, 20).as_deref(), Some("https://example.com/path"));
+        assert_eq!(url(find_target_at(line, 4, None)).as_deref(), Some("https://example.com/path"));
+        assert_eq!(
+            url(find_target_at(line, 20, None)).as_deref(),
+            Some("https://example.com/path")
+        );
         // click on surrounding words → nothing
-        assert_eq!(find_url_at(line, 0), None); // "see"
-        assert_eq!(find_url_at(line, 30), None); // "for"
-                                                 // trailing punctuation and wrapping parens are stripped
-        assert_eq!(find_url_at("(https://a.co).", 3).as_deref(), Some("https://a.co"));
-        assert_eq!(find_url_at("go to https://a.co!", 10).as_deref(), Some("https://a.co"));
+        assert_eq!(url(find_target_at(line, 0, None)), None); // "see"
+        assert_eq!(url(find_target_at(line, 30, None)), None); // "for"
+                                                               // trailing punctuation and wrapping parens are stripped
+        assert_eq!(
+            url(find_target_at("(https://a.co).", 3, None)).as_deref(),
+            Some("https://a.co")
+        );
+        assert_eq!(
+            url(find_target_at("go to https://a.co!", 10, None)).as_deref(),
+            Some("https://a.co")
+        );
         // non-http tokens ignored
-        assert_eq!(find_url_at("ftp://x.co here", 2), None);
+        assert_eq!(url(find_target_at("ftp://x.co here", 2, None)), None);
     }
 
     /// U19: a URL that ran off the end of one row and continued on the next
@@ -11912,11 +11945,11 @@ pub(crate) mod tests {
             rt.wrapped = vec![false, false, false, true, false];
         }
         // From the first row...
-        assert_eq!(app.url_at(id, 3, 5).as_deref(), Some(whole.as_str()));
+        assert_eq!(url(app.target_at(id, 3, 5)).as_deref(), Some(whole.as_str()));
         // ...and from the continuation row, which must not be a dead click.
-        assert_eq!(app.url_at(id, 4, 2).as_deref(), Some(whole.as_str()));
+        assert_eq!(url(app.target_at(id, 4, 2)).as_deref(), Some(whole.as_str()));
         // A token past the URL on the continuation row is still not a URL.
-        assert_eq!(app.url_at(id, 4, 12), None); // "and"
+        assert_eq!(url(app.target_at(id, 4, 12)), None); // "and"
     }
 
     /// U19: an unwrapped row is still read alone — the join must not fuse
@@ -11931,8 +11964,43 @@ pub(crate) mod tests {
             rt.rows = vec!["https://a.co/x".into(), "trailing".into()];
             rt.wrapped = vec![false, false];
         }
-        assert_eq!(app.url_at(id, 0, 3).as_deref(), Some("https://a.co/x"));
-        assert_eq!(app.url_at(id, 1, 0), None);
+        assert_eq!(url(app.target_at(id, 0, 3)).as_deref(), Some("https://a.co/x"));
+        assert_eq!(url(app.target_at(id, 1, 0)), None);
+    }
+
+    /// Openers: paths are only looked for when a file/dir rule exists, are
+    /// found by cell column past wide glyphs, and join across a wrap.
+    #[test]
+    fn target_at_finds_paths_only_when_a_file_or_dir_rule_exists() {
+        let (mut app, _) = mk_app(shell_ws());
+        let id = app.focused;
+        let cwd = app.find_spec(id).unwrap().cwd.clone();
+        let (_, width) = app.pane_inner_dims(id);
+        let w = width as usize;
+        let head = "see src/";
+        let row0 = format!("{head}{}", "x".repeat(w - head.len()));
+        {
+            let rt = app.runtimes.get_mut(&id).unwrap();
+            rt.rows = vec!["\u{8868} ./a.rs:7 https://a.co".into(), row0, "yz.rs end".into()];
+            rt.wrapped = vec![false, true, false];
+        }
+        assert_eq!(app.target_at(id, 0, 3), None, "no file rule: zero behaviour change");
+        assert!(app.target_at(id, 0, 18).is_some(), "URLs still found");
+        let rules = r#"{"open":[{"kind":"dir","run":["code","{path}"]}]}"#;
+        app.set_keymap(crate::ui::input::Keymap::parse(rules, "c.json").0);
+        // the CJK glyph is two cells wide, so `./a.rs` starts at cell 3
+        let want =
+            Target::Path { path: cwd.join("./a.rs"), line: Some(7), col: None, is_dir: false };
+        assert_eq!(app.target_at(id, 0, 3), Some(want));
+        assert_eq!(app.target_at(id, 0, 1), None);
+        let joined = Target::Path {
+            path: cwd.join(format!("src/{}yz.rs", "x".repeat(w - head.len()))),
+            line: None,
+            col: None,
+            is_dir: false,
+        };
+        assert_eq!(app.target_at(id, 1, 6), Some(joined.clone()));
+        assert_eq!(app.target_at(id, 2, 0), Some(joined));
     }
 
     /// U19: the join's column arithmetic and its padding rule, in isolation
@@ -11940,25 +12008,28 @@ pub(crate) mod tests {
     /// fusing them into one nonsense word.
     #[test]
     fn url_in_wrapped_rows_maps_columns_and_restores_trimmed_tails() {
-        use super::url_in_wrapped_rows;
+        use super::target_in_wrapped_rows;
         // A real wrap: the first row is full to the pane's last column
         // (17 of 17), so nothing was trimmed and nothing is padded back.
         let run = vec!["https://a.co/very".to_string(), "long/path tail".to_string()];
         let joined = "https://a.co/verylong/path";
-        assert_eq!(url_in_wrapped_rows(&run, 17, 0, 0).as_deref(), Some(joined));
-        assert_eq!(url_in_wrapped_rows(&run, 17, 1, 0).as_deref(), Some(joined));
+        assert_eq!(url(target_in_wrapped_rows(&run, 17, 0, 0, None)).as_deref(), Some(joined));
+        assert_eq!(url(target_in_wrapped_rows(&run, 17, 1, 0, None)).as_deref(), Some(joined));
         // Column arithmetic: the second row's column 4 is index 21 of the
         // join — still inside the link, and past it lands on "tail".
-        assert_eq!(url_in_wrapped_rows(&run, 17, 1, 4).as_deref(), Some(joined));
-        assert_eq!(url_in_wrapped_rows(&run, 17, 1, 10), None); // "tail"
-                                                                // A row whose tail really was blank keeps the tokens apart: the
-                                                                // padding restores exactly what `grab_text` trimmed, so the two
-                                                                // rows never fuse into one nonsense word.
+        assert_eq!(url(target_in_wrapped_rows(&run, 17, 1, 4, None)).as_deref(), Some(joined));
+        assert_eq!(url(target_in_wrapped_rows(&run, 17, 1, 10, None)), None); // "tail"
+                                                                              // A row whose tail really was blank keeps the tokens apart: the
+                                                                              // padding restores exactly what `grab_text` trimmed, so the two
+                                                                              // rows never fuse into one nonsense word.
         let run = vec!["https://a.co".to_string(), "notpartofit".to_string()];
-        assert_eq!(url_in_wrapped_rows(&run, 40, 0, 0).as_deref(), Some("https://a.co"));
-        assert_eq!(url_in_wrapped_rows(&run, 40, 1, 0), None);
+        assert_eq!(
+            url(target_in_wrapped_rows(&run, 40, 0, 0, None)).as_deref(),
+            Some("https://a.co")
+        );
+        assert_eq!(url(target_in_wrapped_rows(&run, 40, 1, 0, None)), None);
         // A click past the end of the run's rows finds nothing, no panic.
-        assert_eq!(url_in_wrapped_rows(&run, 40, 9, 0), None);
+        assert_eq!(url(target_in_wrapped_rows(&run, 40, 9, 0, None)), None);
     }
 
     /// U19: `o` in copy mode opens the URL under the cursor — keyboard
@@ -11975,7 +12046,7 @@ pub(crate) mod tests {
         app.handle_mode_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         app.handle_mode_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         app.handle_mode_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
-        assert_eq!(app.take_pending_open().as_deref(), Some("https://a.co/x"));
+        assert_eq!(url(app.take_pending_open()).as_deref(), Some("https://a.co/x"));
         assert!(app.take_pending_open().is_none(), "taking it clears it");
         assert!(matches!(app.mode, Mode::Copy { .. }), "opening a URL never exits the mode");
 
@@ -11983,7 +12054,7 @@ pub(crate) mod tests {
         app.handle_mode_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
         app.handle_mode_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert!(app.take_pending_open().is_none());
-        assert_eq!(app.flash(), Some("no URL under the cursor"));
+        assert_eq!(app.flash(), Some("nothing to open under the cursor"));
     }
 
     /// U20: `1..9` launches that row directly — the picker was arrows-and-
