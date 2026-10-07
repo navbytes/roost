@@ -2,6 +2,11 @@
 
 Deferred work and accepted limitations. Newest first within a section.
 
+## Release preflight depends on a PR index that can miss (2026-10-07)
+
+- **Accepted limitation until it recurs.** `release.yml`'s `Require an authorized release PR` step (`.github/workflows/release.yml:62-71`) trusts `commits/$GITHUB_SHA/pulls`. For v0.1.30's merge commit 314e2c7 that returned `[]` (REST and GraphQL, still empty a day later) although #236's own record looked like #229's, so the release failed with nothing published. Workaround in AGENTS.md (`release/<version>-republish` PR, #237).
+- **Idea:** fall back inside the gate to a merged PR found by `gh pr list --state merged --search <sha>`, or by the `(#N)` in the commit subject checked via `pulls/<n>` where `merge_commit_sha == $GITHUB_SHA`. Caveats: the fix itself must ship inside a `release/*` PR (a non-release commit cannot pass the gate), and it loosens an authorization gate, so the fallback must keep the merged/base/same-repo/`release/` checks.
+
 ## Configurable openers (2026-10-06)
 
 Shipped: top-level `"open"` rules in `config.json` (`src/core/open.rs`, `src/infra/open.rs`). Left:
