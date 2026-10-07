@@ -926,8 +926,9 @@ fn handle_key<B: PaneBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent)
 fn open_pending<B: PaneBackend>(app: &mut App<B>) {
     let Some(target) = app.take_pending_open() else { return };
     match infra::open::open_target(app.keymap().openers(), target) {
-        Ok(true) => {}
-        Ok(false) => app.set_flash("nothing to open under the cursor"),
+        Ok(infra::open::Outcome::Opened) => {}
+        Ok(infra::open::Outcome::NoRule) => app.set_flash(infra::open::NO_RULE_HINT),
+        Ok(infra::open::Outcome::Missing) => app.set_flash("nothing to open under the cursor"),
         Err(msg) => app.set_flash(msg),
     }
 }
@@ -1112,8 +1113,11 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         let (r, c) = inner_cell(pane.rect, me.column, me.row);
         if let Some(target) = app.target_at(pane.id, r, c) {
             let opened = infra::open::open_target(app.keymap().openers(), target);
-            // A path no rule opens falls through to the ordinary click path.
-            if opened != Ok(false) {
+            // A path no rule opens falls through to the ordinary click path
+            // (after the hint, if it exists).
+            if opened == Ok(infra::open::Outcome::NoRule) {
+                app.set_flash(infra::open::NO_RULE_HINT);
+            } else if opened != Ok(infra::open::Outcome::Missing) {
                 // S3 (PR #46 code review): opening is its own complete
                 // gesture over *this* pane, latched by the P20 logic above like
                 // any other press — it must not leave a different pane's
@@ -2761,6 +2765,35 @@ mod tests {
         handle_mouse(&mut app, alt_click);
 
         assert!(app.selection.is_none(), "the URL-open cleared the other pane's stale selection");
+    }
+
+    /// Alt+click on an existing path no rule handles flashes the hint; prose
+    /// and paths that do not exist stay silent.
+    #[test]
+    fn alt_click_on_an_unhandled_existing_path_flashes_a_hint() {
+        let dir = std::env::temp_dir().join(format!("roost-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "").unwrap();
+        let mut app = mk_app();
+        let id = app.focused;
+        let r = app.display_rects().iter().find(|p| p.id == id).unwrap().rect;
+        let row = format!("prose {} {}/nope.txt", file.display(), dir.display());
+        app.runtimes.get_mut(&id).unwrap().rows = vec![row];
+        let alt_click = |col: usize| {
+            let mut ev = click(r.x + 1 + col as u16, r.y + 1);
+            ev.modifiers = KeyModifiers::ALT;
+            ev
+        };
+        // Seed a sentinel before each click: a hint overwrites it, a silent click leaves it.
+        let missing_col = 8 + file.display().to_string().len() + 3;
+        for (col, hint) in [(1, false), (missing_col, false), (8, true)] {
+            app.set_flash("sentinel");
+            handle_mouse(&mut app, alt_click(col));
+            let want = if hint { infra::open::NO_RULE_HINT } else { "sentinel" };
+            assert_eq!(app.flash(), Some(want), "col {col}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// C29: a plain click — including on a *different* pane than the one

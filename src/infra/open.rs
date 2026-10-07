@@ -14,14 +14,27 @@ fn stat(target: Target) -> Option<Target> {
     Some(Target::Path { path, line, col, is_dir })
 }
 
-/// `Ok(true)` handled, `Ok(false)` nothing to open here (no such path, or no
-/// rule for it — the caller falls through to an ordinary click), `Err` a
-/// short message for the flash when the handler could not be started.
-pub fn open_target(rules: &[OpenRule], target: Target) -> Result<bool, String> {
-    let Some(target) = stat(target) else { return Ok(false) };
+/// Flash for an existing path that no rule opens; without it a zero-config
+/// Alt+click on a path is silent and indistinguishable from a miss.
+pub const NO_RULE_HINT: &str = "no opener rule for this path (see README Openers)";
+
+/// What `open_target` did. The caller falls through to an ordinary click on
+/// anything but `Opened`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Opened,
+    /// The path exists but no rule handles it.
+    NoRule,
+    /// No such path.
+    Missing,
+}
+
+/// `Err` is a short message for the flash when the handler could not be started.
+pub fn open_target(rules: &[OpenRule], target: Target) -> Result<Outcome, String> {
+    let Some(target) = stat(target) else { return Ok(Outcome::Missing) };
     match select(rules, &target)? {
-        Some(argv) => spawn(&argv).map(|()| true),
-        None => Ok(false),
+        Some(argv) => spawn(&argv).map(|()| Outcome::Opened),
+        None => Ok(Outcome::NoRule),
     }
 }
 
@@ -93,12 +106,18 @@ mod tests {
         assert_eq!(stat(p(dir.join("missing.txt"))), None);
 
         let dir_rule = OpenRule { kind: Kind::Dir, ext: vec![], run: vec!["code".into()] };
-        assert_eq!(open_target(std::slice::from_ref(&dir_rule), p(dir.join("sub"))), Ok(true));
-        // no matching rule, or no such path: fall through to the ordinary click
-        assert_eq!(open_target(&[dir_rule], p(dir.join("a.txt"))), Ok(false));
-        assert_eq!(open_target(&[], p(dir.join("missing.txt"))), Ok(false));
+        let opened = Ok(Outcome::Opened);
+        assert_eq!(open_target(std::slice::from_ref(&dir_rule), p(dir.join("sub"))), opened);
+        // an existing path nothing handles (no rules, or an ext filter) earns the hint...
+        let ext_rule =
+            OpenRule { kind: Kind::File, ext: vec!["pdf".into()], run: vec!["x".into()] };
+        assert_eq!(open_target(&[dir_rule], p(dir.join("a.txt"))), Ok(Outcome::NoRule));
+        assert_eq!(open_target(&[ext_rule], p(dir.join("a.txt"))), Ok(Outcome::NoRule));
+        assert_eq!(open_target(&[], p(dir.join("a.txt"))), Ok(Outcome::NoRule));
+        // ...prose (no such path) stays silent
+        assert_eq!(open_target(&[], p(dir.join("missing.txt"))), Ok(Outcome::Missing));
         // URLs keep the default handler with no rules
-        assert_eq!(open_target(&[], Target::Url("https://a.co".into())), Ok(true));
+        assert_eq!(open_target(&[], Target::Url("https://a.co".into())), opened);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

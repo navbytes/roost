@@ -254,6 +254,10 @@ pub fn path_in_token(token: &str, cwd: &Path, home: Option<&Path>) -> Option<Tar
             (rest, line, col) = (head, Some(l), Some(n));
         }
     }
+    // A stray `/` or `//` exists and is a dir, so it would hint on every slash.
+    if rest.chars().all(|c| c == '/') {
+        return None;
+    }
     let path = if rest.starts_with('/') {
         PathBuf::from(rest)
     } else if let Some(sub) = rest.strip_prefix("~/") {
@@ -309,6 +313,11 @@ mod tests {
         assert_eq!(path(".gitignore").map(|t| t.0), Some(p("/proj/.gitignore")));
         assert_eq!(path(".."), None);
         assert_eq!(path("."), None);
+        // separators alone are not a path
+        assert_eq!(path("/"), None);
+        assert_eq!(path("//"), None);
+        assert_eq!(path("/:3"), None);
+        assert!(path("/tmp").is_some() && path("/tmp/x").is_some());
     }
 
     /// Sentence-final `.` is trimmed, but never from `.`/`..` path components.
