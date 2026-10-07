@@ -17,7 +17,7 @@ use crate::core::control::{
 use crate::core::detect::{Found, SessionDetector};
 use crate::core::event::AppEvent;
 use crate::core::layout::{self, LayoutNode, PaneId, PaneRect, SplitDir};
-use crate::core::open::{Kind, Target};
+use crate::core::open::Target;
 use crate::core::overlay::Overlays;
 use crate::core::session_resolver;
 use crate::core::status::AgentStatus;
@@ -3626,9 +3626,10 @@ impl<B: PaneBackend> App<B> {
             .map(|(m, _, _)| m.as_str())
     }
 
-    /// The URL — or, only when a file/dir opener is configured, the
-    /// path-looking token (not yet stat'd) — under inner cell (row, col) of
-    /// pane `id`, for Alt+click-to-open and copy mode's `o`.
+    /// The URL or path-looking token (not yet stat'd) under inner cell
+    /// (row, col) of pane `id`, for Alt+click-to-open and copy mode's `o`.
+    /// Paths are found even with no rule so the caller can hint that none
+    /// matched; the stat only runs on that click, in infra.
     ///
     /// U19: reads the whole *wrapped run* the row belongs to, not one grid
     /// row. Agents print long CI/GitHub links into narrow panes constantly;
@@ -3636,11 +3637,7 @@ impl<B: PaneBackend> App<B> {
     /// fragment and dead-click everywhere below the break.
     pub fn target_at(&self, id: PaneId, row: u16, col: u16) -> Option<Target> {
         let rt = self.runtimes.get(&id)?;
-        let paths = if self.keymap.openers().iter().any(|r| r.kind != Kind::Url) {
-            self.find_spec(id).map(|s| (s.cwd.as_path(), self.home.as_deref()))
-        } else {
-            None
-        };
+        let paths = self.find_spec(id).map(|s| (s.cwd.as_path(), self.home.as_deref()));
         let (rows, width) = self.pane_inner_dims(id);
         // Walk back to the run's first row, then collect forward through it.
         let mut first = row;
@@ -11968,10 +11965,10 @@ pub(crate) mod tests {
         assert_eq!(url(app.target_at(id, 1, 0)), None);
     }
 
-    /// Openers: paths are only looked for when a file/dir rule exists, are
-    /// found by cell column past wide glyphs, and join across a wrap.
+    /// Openers: paths are found with or without rules (so a missing rule can
+    /// be hinted), by cell column past wide glyphs, and join across a wrap.
     #[test]
-    fn target_at_finds_paths_only_when_a_file_or_dir_rule_exists() {
+    fn target_at_finds_paths_by_cell_column_and_across_wraps() {
         let (mut app, _) = mk_app(shell_ws());
         let id = app.focused;
         let cwd = app.find_spec(id).unwrap().cwd.clone();
@@ -11984,8 +11981,9 @@ pub(crate) mod tests {
             rt.rows = vec!["\u{8868} ./a.rs:7 https://a.co".into(), row0, "yz.rs end".into()];
             rt.wrapped = vec![false, true, false];
         }
-        assert_eq!(app.target_at(id, 0, 3), None, "no file rule: zero behaviour change");
-        assert!(app.target_at(id, 0, 18).is_some(), "URLs still found");
+        assert!(app.target_at(id, 0, 3).is_some(), "paths found with no rule, for the hint");
+        assert!(matches!(app.target_at(id, 0, 18), Some(Target::Url(_))), "URLs still found");
+        assert_eq!(app.target_at(id, 0, 1), None, "a wide glyph is not a path");
         let rules = r#"{"open":[{"kind":"dir","run":["code","{path}"]}]}"#;
         app.set_keymap(crate::ui::input::Keymap::parse(rules, "c.json").0);
         // the CJK glyph is two cells wide, so `./a.rs` starts at cell 3

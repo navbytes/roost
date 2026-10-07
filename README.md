@@ -201,6 +201,9 @@ override the URL one. Rules are tried in order, first match wins:
 }
 ```
 
+An `Alt+click` (or `o`) on an existing file or directory that no rule matches
+flashes a hint instead of doing nothing.
+
 - `kind` is `url`, `file` or `dir`; `ext` (file only, optional, no dot,
   case-insensitive) narrows a file rule to those extensions.
 - `run` is an argv, never a shell line. `{path}`, `{line}`, `{col}`, `{loc}`
