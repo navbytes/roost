@@ -231,7 +231,9 @@ flashes a hint instead of doing nothing.
   content.
 - A path is matched only if it exists: absolute, `~/…`, `./…`, `../…`, or a bare
   token containing `/` or an extension. No rule, no open: the click behaves as
-  it always did. Without any file/dir rule roost does not look for paths at all.
+  it always did (apart from the hint above). URLs and prose are never stat'd; a
+  path is stat'd only on the clicked token, on `Alt+click` or `o`, even with no
+  rules configured.
 - Launchers — `open`, `xdg-open`, `gio`, `kde-open`, `gnome-open`, `handlr`,
   `exo-open`, `mimeopen`, `wslview`, `rifle`, `cygstart`, `gvfs-open`,
   `kioclient` — and the wrappers `env`, `nohup`, `nice`, `timeout`, `arch` are

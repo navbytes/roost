@@ -2785,12 +2785,14 @@ mod tests {
             ev.modifiers = KeyModifiers::ALT;
             ev
         };
-        handle_mouse(&mut app, alt_click(1)); // "prose"
-        assert_eq!(app.flash(), None);
-        handle_mouse(&mut app, alt_click(8 + file.display().to_string().len() + 3)); // missing
-        assert_eq!(app.flash(), None);
-        handle_mouse(&mut app, alt_click(8)); // the existing file
-        assert_eq!(app.flash(), Some(infra::open::NO_RULE_HINT));
+        // Seed a sentinel before each click: a hint overwrites it, a silent click leaves it.
+        let missing_col = 8 + file.display().to_string().len() + 3;
+        for (col, hint) in [(1, false), (missing_col, false), (8, true)] {
+            app.set_flash("sentinel");
+            handle_mouse(&mut app, alt_click(col));
+            let want = if hint { infra::open::NO_RULE_HINT } else { "sentinel" };
+            assert_eq!(app.flash(), Some(want), "col {col}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
