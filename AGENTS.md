@@ -83,6 +83,17 @@ each adapter's own session ids.
   of `vX.Y.Z everywhere: …` (v0.1.13, commit cb4747c). Nothing downstream
   breaks — the release keys off Cargo.toml — but the log stops being
   readable by release.
+  **If the Release request preflight fails because GitHub returns no PR for
+  the merge commit** (v0.1.30, 2026-10-06: #236 merged as 314e2c7, run
+  37487323302 died in `release / preflight`, no tag/artifacts/tap PR):
+  confirm with `gh api repos/navbytes/roost/commits/<sha>/pulls -q length`
+  (0 = the gate cannot pass). Re-running, dispatching from `main` and any
+  new non-release commit hit the same lookup and fail too; do not mint a new
+  version to retry. Republish: branch `release/<version>-republish` from
+  `main` (CI checks only the `release/` prefix), append one line to
+  `.github/release-request`, leave the version and Cargo files alone, open
+  the PR ready, merge, then confirm tag, assets and tap PR (#237 did this
+  for v0.1.30; tap PR #17).
 - **Agent tooling is generated, not tracked** (2026-09-20): `.agents/` was a
   byte-identical mirror of `.claude/skills/`, and `.projectmem/`'s
   `summary.md`, `issues/` and `viz.html` are rebuilt from `events.jsonl` —

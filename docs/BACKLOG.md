@@ -2,6 +2,11 @@
 
 Deferred work and accepted limitations. Newest first within a section.
 
+## Release preflight depends on a PR index that can miss (2026-10-07)
+
+- **Accepted limitation until it recurs.** `release.yml`'s `Require an authorized release PR` step (`.github/workflows/release.yml:62-71`) trusts `commits/$GITHUB_SHA/pulls`. For v0.1.30's merge commit 314e2c7 that returned `[]` (REST and GraphQL, still empty a day later) although #236's own record looked like #229's, so the release failed with nothing published. Workaround in AGENTS.md (`release/<version>-republish` PR, #237).
+- **Idea:** fall back inside the gate to a merged PR found by `gh pr list --state merged --search <sha>`, or by the `(#N)` in the commit subject checked via `pulls/<n>` where `merge_commit_sha == $GITHUB_SHA`. Caveats: the fix itself must ship inside a `release/*` PR (a non-release commit cannot pass the gate), and it loosens an authorization gate, so the fallback must keep the merged/base/same-repo/`release/` checks.
+
 ## Configurable openers (2026-10-06)
 
 Shipped: top-level `"open"` rules in `config.json` (`src/core/open.rs`, `src/infra/open.rs`). Left:
@@ -52,3 +57,7 @@ From the ghost glyph and border gap fix (`skip_covered_cells`, `src/ui/render.rs
 - **vt100 splits ZWJ sequences.** `🧑‍💻` becomes `🧑`+ZWJ, then `💻` in a cell of its own (`vendor/vt100/src/screen.rs:713` appends only width-0 chars; `💻` takes the width>0 path at :801). That is 4 columns, where unicode-width, Claude Code and Ghostty count 2. This is the suspect for Claude Code rows drifting inside the grid. The reported "becausevery" is still unexplained.
 - **`cell_to_char`/`char_to_cell` count zero-width codepoints as a column** (`src/core/app.rs:7426-7444`, `.max(1)`). Every ZWJ or combining mark shifts URL and word hit-testing one column right for the rest of the row. VS16 comes out right only by coincidence.
 - **Styling on a wide glyph's second column is never sent.** A copy-mode cursor (`src/ui/render.rs:3692`), a selection edge or a search hit that starts on a covered column styles a cell the diff skips. This predates `skip_covered_cells`, which plain wide glyphs already got.
+
+## Armed close vs mouse flashes (2026-10-07)
+
+- **A mouse-set flash can replace an armed close/quit prompt while the second press still fires.** `CONFIRM_WINDOW` (`src/core/app.rs:323`) keeps Alt+w/Alt+q armed for 3 s and the prompt flash carries the same window (U22: prompt and armed close must match). The flash slot is single, so any flash set from a mouse action overwrites the prompt without cancelling the arm, and the Alt+click path (`src/main.rs` ~1118) does not cancel it either. Found by the design audit of the opener-hint PR; it predates that PR, which only added one more way to reach it (Alt+click on a path with no rule). Fix when it matters: have mouse-triggered flashes (or `handle_mouse` itself) disarm a pending confirm.
