@@ -1,3 +1,2 @@
-v0.1.30
-Alt+click and copy-mode o now open file and directory paths with a command you set in config.json's new "open" array (see the README's Openers section), and rows with wide emoji no longer leave ghost characters or border gaps after scrolling in Ghostty, kitty and WezTerm.
-republish: the first publish attempt (run 37487323302, commit 314e2c7) failed its preflight because GitHub returned no PR association for that commit; nothing was published.
+v0.1.31
+Alt+click on a file or folder path with no matching opener rule now shows a hint instead of silently doing nothing.
