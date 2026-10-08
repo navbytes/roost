@@ -176,14 +176,16 @@ every change, atomic writes) — alongside the control socket, token and audit
 log. Delete it to start clean.
 
 **Config** is the other half and goes somewhere else, because it is the half
-you write by hand: `config.json` lives in `~/.config/roost/` (on macOS,
-`~/Library/Application Support/roost/`). roost still reads an older one from
-the state dir beside `workspace.json`, so nothing breaks if you already have
-one there — but `~/.config` is where a new one belongs, and `roost keys`
-prints the exact path it uses. Under `ROOST_STATE` the search stops in that
-directory, by design — you named it, so there is nothing to report. Named
-workspaces [share the root config](#workspaces); a `config.json` inside a
-workspace's own directory replaces it wholesale for that workspace.
+you write by hand: `config.json` lives in `~/.config/roost/` on Linux and in
+`~/Library/Application Support/roost/` on macOS — `~/.config/roost` is **not**
+read on macOS (roost warns if a file sits there). roost still reads an older
+one from the state dir beside `workspace.json`. `roost keys` prints the exact
+path it uses, and every rule or key it rejected, *before* the key table. The
+file is read once at startup: restart roost after editing. Under `ROOST_STATE`
+the search stops in that directory, by design — you named it, so there is
+nothing to report. Named workspaces [share the root config](#workspaces); a
+`config.json` inside a workspace's own directory replaces it wholesale for
+that workspace.
 
 ### Openers
 
@@ -202,7 +204,8 @@ override the URL one. Rules are tried in order, first match wins:
 ```
 
 An `Alt+click` (or `o`) on an existing file or directory that no rule matches
-flashes a hint instead of doing nothing.
+flashes a hint instead of doing nothing. If it says "no opener rule", run
+`roost keys`: it names the config file read and any rule it rejected.
 
 - `kind` is `url`, `file` or `dir`; `ext` (file only, optional, no dot,
   case-insensitive) narrows a file rule to those extensions.

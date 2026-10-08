@@ -16,7 +16,7 @@ fn stat(target: Target) -> Option<Target> {
 
 /// Flash for an existing path that no rule opens; without it a zero-config
 /// Alt+click on a path is silent and indistinguishable from a miss.
-pub const NO_RULE_HINT: &str = "no opener rule for this path (see README Openers)";
+pub const NO_RULE_HINT: &str = "no opener rule for this path (run roost keys)";
 
 /// What `open_target` did. The caller falls through to an ordinary click on
 /// anything but `Opened`.

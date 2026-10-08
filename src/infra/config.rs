@@ -159,7 +159,31 @@ pub fn load_keymap() -> (Keymap, Diagnostics) {
             shadowed.display()
         ));
     }
+    // `$ROOST_STATE` names the directory outright, so a stray file elsewhere is moot.
+    if std::env::var_os(crate::infra::ENV_STATE).is_none() {
+        let stray = unread_home_config(dirs::home_dir(), &resolved.path, &|p| p.is_file());
+        diagnostics.notices.extend(stray);
+    }
     (keymap, diagnostics)
+}
+
+/// `~/.config/roost/config.json` is where a macOS user naturally puts the
+/// file, and where roost does not look: say so instead of ignoring it.
+/// `None` when it is absent or is the file already being read (Linux).
+fn unread_home_config(
+    home: Option<PathBuf>,
+    read: &Path,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
+    let stray = home?.join(".config").join("roost").join(FILE);
+    if stray == read || !exists(&stray) {
+        return None;
+    }
+    Some(format!(
+        "{} exists but roost does not read it on this platform; it reads {} — move it",
+        stray.display(),
+        read.display()
+    ))
 }
 
 fn load_keymap_from(path: &Path) -> (Keymap, Diagnostics) {
@@ -255,6 +279,24 @@ mod tests {
             Resolved { path: state(), exists: true, shadowed: None },
             "a file cannot shadow itself"
         );
+    }
+
+    #[test]
+    fn a_home_dot_config_file_roost_does_not_read_is_reported() {
+        let home = || Some(PathBuf::from("/home/u"));
+        let stray = PathBuf::from("/home/u/.config/roost/config.json");
+        let read = PathBuf::from("/lib/roost/config.json");
+        let msg =
+            unread_home_config(home(), &read, &present(std::slice::from_ref(&stray))).unwrap();
+        assert!(msg.contains("exists but roost does not read it"), "{msg}");
+        assert!(msg.contains(&read.display().to_string()), "{msg}");
+        // Absent, or already the file read (Linux): silent.
+        assert_eq!(unread_home_config(home(), &read, &present(&[])), None);
+        assert_eq!(
+            unread_home_config(home(), &stray, &present(std::slice::from_ref(&stray))),
+            None
+        );
+        assert_eq!(unread_home_config(None, &read, &present(&[stray])), None);
     }
 
     // --- named workspaces (pure: explicit paths, no env) ---

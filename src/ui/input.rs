@@ -767,6 +767,7 @@ pub struct Diagnostics {
 impl Diagnostics {
     /// Nothing at all to report — the quiet case a valid, unremarkable
     /// config produces.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.problems.is_empty() && self.notices.is_empty()
     }

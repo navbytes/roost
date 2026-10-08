@@ -1035,20 +1035,11 @@ fn run_keys() -> i32 {
     }
     rows.sort();
 
-    // Tab-separated and *not* column-padded. Padding before a tab looks
-    // tidier in a terminal and quietly breaks the thing this format is for:
-    // `cut -f1` would hand back `"Alt+q     "`. A caller who wants columns
-    // has `column -t`; a caller who wants fields cannot un-pad them.
-    for (chord, action, note) in &rows {
-        if note.is_empty() {
-            println!("{chord}\t{action}");
-        } else {
-            println!("{chord}\t{action}\t{note}");
-        }
-    }
-
+    // Diagnostics come before the table: under `2>&1 | head` the table's ~50
+    // rows otherwise push them out of sight. stderr, so stdout still pipes cleanly.
+    //
     // Where the file is — the question this command was getting asked and
-    // could not answer. stderr, so the table above still pipes cleanly.
+    // could not answer.
     //
     // Not under `$ROOST_STATE`: setting it *is* naming the directory, so
     // there is nothing to discover, and "a clean config says nothing on
@@ -1067,11 +1058,7 @@ fn run_keys() -> i32 {
         }
     }
 
-    if diagnostics.is_empty() {
-        return 0;
-    }
-    // Diagnostics to stderr so the table above still pipes cleanly. Both
-    // channels print — a notice is worth reading — but only a **problem**
+    // Both channels print — a notice is worth reading — but only a **problem**
     // sets the exit code. README's contract is precise about this: a
     // non-zero exit means "an entry roost had to skip", so a dotfile test
     // can gate on it. A config that displaced a default did nothing wrong
@@ -1080,6 +1067,18 @@ fn run_keys() -> i32 {
     // case the escape hatch exists for.
     for d in diagnostics.all() {
         eprintln!("roost keys: {d}");
+    }
+
+    // Tab-separated and *not* column-padded. Padding before a tab looks
+    // tidier in a terminal and quietly breaks the thing this format is for:
+    // `cut -f1` would hand back `"Alt+q     "`. A caller who wants columns
+    // has `column -t`; a caller who wants fields cannot un-pad them.
+    for (chord, action, note) in &rows {
+        if note.is_empty() {
+            println!("{chord}\t{action}");
+        } else {
+            println!("{chord}\t{action}\t{note}");
+        }
     }
     if diagnostics.problems.is_empty() {
         0
