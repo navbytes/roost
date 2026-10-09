@@ -3129,8 +3129,8 @@ prints — a link — was reachable only by leaving the keyboard. `o` looks up
 `pending_open` for the composition root to hand to the browser (core does
 no I/O — the same split `pending_yank` uses); on a miss it flashes
 `nothing to open under the cursor` rather than no-opping silently (an existing
-file or directory no opener rule handles flashes `no opener rule for this path (see
-README Openers)` instead; Alt+click flashes the same hint, then falls through to the
+file or directory no opener rule handles flashes `no opener rule for this path (run
+roost keys)` instead; Alt+click flashes the same hint, then falls through to the
 ordinary click). Either way the
 mode stays open: opening a link is not a reason to lose your selection.
 Hint pair `o open`; help row `Alt+click / o`.

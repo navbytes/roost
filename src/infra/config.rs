@@ -45,6 +45,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::app::abbreviate_home;
 use crate::infra::store::{FsStore, DEFAULT_WORKSPACE};
 use crate::ui::input::{Diagnostics, Keymap};
 
@@ -148,18 +149,53 @@ fn resolve_in(state: PathBuf, xdg: Option<PathBuf>, exists: &dyn Fn(&Path) -> bo
 pub fn load_keymap() -> (Keymap, Diagnostics) {
     let resolved = resolve_config();
     let (keymap, mut diagnostics) = load_keymap_from(&resolved.path);
-    if let Some(shadowed) = resolved.shadowed {
-        // A notice, not a problem: both files are valid, roost read one, and
-        // nothing the config asked for was skipped. Problems gate `roost
-        // keys`' exit code and this must not — but staying *silent* about an
-        // edited file that has no effect is how someone loses an afternoon.
-        diagnostics.notices.push(format!(
+    // `$ROOST_STATE` names the directory outright, so a stray file elsewhere is moot.
+    let stray_home =
+        if std::env::var_os(crate::infra::ENV_STATE).is_none() { dirs::home_dir() } else { None };
+    diagnostics.notices.extend(resolution_notices(&resolved, stray_home));
+    (keymap, diagnostics)
+}
+
+/// What the resolution hid, as notices. Not problems: both files are valid,
+/// roost read one, and nothing the config asked for was skipped. Problems gate
+/// `roost keys`' exit code and these must not — but staying *silent* about an
+/// edited file that has no effect is how someone loses an afternoon.
+/// `home` is `None` when the stray-file check does not apply (`$ROOST_STATE`).
+fn resolution_notices(resolved: &Resolved, home: Option<PathBuf>) -> Vec<String> {
+    let mut notices = Vec::new();
+    if let Some(shadowed) = &resolved.shadowed {
+        notices.push(format!(
             "{} is the one being read; {} also exists and is ignored",
             resolved.path.display(),
             shadowed.display()
         ));
     }
-    (keymap, diagnostics)
+    notices.extend(unread_home_config(home.as_deref(), resolved));
+    notices
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// `~/.config/roost/config.json` is where a macOS user naturally puts the
+/// file, and where roost does not look: say so instead of ignoring it.
+/// `None` when it is absent, is the file being read (Linux, or a symlinked
+/// dir), or is already reported as the shadowed file.
+fn unread_home_config(home: Option<&Path>, resolved: &Resolved) -> Option<String> {
+    let home = home?;
+    let stray = home.join(".config").join("roost").join(FILE);
+    let shadowed = resolved.shadowed.as_deref().is_some_and(|s| same_file(&stray, s));
+    if !stray.is_file() || shadowed || same_file(&stray, &resolved.path) {
+        return None;
+    }
+    // Action first: the toast clips on the right.
+    let dir = resolved.path.parent().unwrap_or(&resolved.path);
+    Some(format!(
+        "move {} to {}/ (not read here)",
+        abbreviate_home(&stray, Some(home)),
+        abbreviate_home(dir, Some(home))
+    ))
 }
 
 fn load_keymap_from(path: &Path) -> (Keymap, Diagnostics) {
@@ -255,6 +291,87 @@ mod tests {
             Resolved { path: state(), exists: true, shadowed: None },
             "a file cannot shadow itself"
         );
+    }
+
+    /// A scratch HOME on the real filesystem (the check stats and canonicalizes);
+    /// returns (home, the unread `~/.config` file's path) with that file written.
+    fn scratch_home(tag: &str) -> (PathBuf, PathBuf) {
+        let home = std::env::temp_dir().join(format!("roost-cfg-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let stray = home.join(".config/roost").join(FILE);
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "{}").unwrap();
+        (home, stray)
+    }
+
+    #[test]
+    fn a_home_dot_config_file_roost_does_not_read_is_reported_action_first() {
+        let (home, _) = scratch_home("unread");
+        let read = Resolved {
+            path: home.join("Library/Application Support/roost").join(FILE),
+            exists: false,
+            shadowed: None,
+        };
+        let notices = resolution_notices(&read, Some(home.clone()));
+        assert_eq!(
+            notices,
+            vec![
+                "move ~/.config/roost/config.json to ~/Library/Application Support/roost/ \
+                  (not read here)"
+            ],
+        );
+        // `$ROOST_STATE` (home withheld) and an absent file are silent.
+        assert!(resolution_notices(&read, None).is_empty());
+        assert!(unread_home_config(Some(&home.join("nowhere")), &read).is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Linux, state-dir and `~/.config` both present: `resolve_in` already
+    /// names the loser as shadowed, so a second notice would repeat it.
+    #[test]
+    fn a_stray_file_already_reported_as_shadowed_gets_no_second_notice() {
+        let (home, stray) = scratch_home("shadowed");
+        let read = Resolved {
+            path: home.join("state/roost").join(FILE),
+            exists: true,
+            shadowed: Some(stray),
+        };
+        let notices = resolution_notices(&read, Some(home.clone()));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("also exists and is ignored"), "{notices:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A named workspace's local file shadows the default resolution, which
+    /// may itself be the `~/.config` file.
+    #[test]
+    fn the_named_workspace_shadowed_default_gets_no_second_notice() {
+        let (home, stray) = scratch_home("named");
+        let local = home.join("state/roost/workspaces/a").join(FILE);
+        let named = resolve_named(
+            Resolved { path: stray, exists: true, shadowed: None },
+            local.clone(),
+            &|p| p == local,
+        );
+        assert_eq!(resolution_notices(&named, Some(home.clone())).len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// macOS with `~/.config/roost` symlinked to the directory roost reads:
+    /// same file, nothing is unread.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_dir_is_the_same_file_not_a_stray() {
+        let (home, _) = scratch_home("symlink");
+        let real = home.join("Library/Application Support/roost");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join(FILE), "{}").unwrap();
+        let link = home.join(".config/roost");
+        std::fs::remove_dir_all(&link).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let read = Resolved { path: real.join(FILE), exists: true, shadowed: None };
+        assert!(resolution_notices(&read, Some(home.clone())).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // --- named workspaces (pure: explicit paths, no env) ---

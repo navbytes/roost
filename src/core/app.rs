@@ -8073,7 +8073,7 @@ fn alt_hint_line(term_program: Option<&str>) -> &'static str {
 /// Pure decision behind `App::focused_cwd`: abbreviate a `$HOME`-rooted path
 /// to `~`, split out so it's testable without depending on the real
 /// environment's home directory.
-fn abbreviate_home(cwd: &Path, home: Option<&Path>) -> String {
+pub(crate) fn abbreviate_home(cwd: &Path, home: Option<&Path>) -> String {
     match home {
         Some(home) if !home.as_os_str().is_empty() => match cwd.strip_prefix(home) {
             Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),

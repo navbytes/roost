@@ -394,8 +394,8 @@ agrees with what is on screen; the vendored `Screen::row_wrapped` already
 existed and is now pinned by a vendor-side test (a newline is not a wrap; a
 merely-full row is not a wrap). `o` in copy mode opens the link or path under the
 cursor via `pending_open` (core does no I/O), flashing
-`nothing to open under the cursor` on a miss (`no opener rule for this path (see
-README Openers)` for an existing path no rule handles, also flashed by Alt+click)
+`nothing to open under the cursor` on a miss (`no opener rule for this path (run
+roost keys)` for an existing path no rule handles, also flashed by Alt+click)
 and never leaving the mode
 (C24 amended 2026-07-27).
 **Known bound (unchanged by this fix, sharpened by P15's landing):** the

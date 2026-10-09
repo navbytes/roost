@@ -430,6 +430,26 @@ fn keys_reports_bad_config_entries_on_stderr_and_exits_nonzero() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Diagnostics lead: a reader running `roost keys 2>&1 | head` must see them,
+/// not ~50 table rows.
+#[test]
+fn keys_prints_diagnostics_before_the_table() {
+    let dir = state_with_config("order", Some(r#"{"keys": {"alt+g": "no_such_action"}}"#));
+    let o = Command::new("sh")
+        .arg("-c")
+        .arg(r#""$ROOST_BIN" keys 2>&1"#)
+        .env("ROOST_BIN", env!("CARGO_BIN_EXE_roost"))
+        .env("ROOST_STATE", &dir)
+        .env("ROOST_SOCK", DEAD_SOCK)
+        .output()
+        .expect("run roost keys");
+    let text = out(&o);
+    let diag = text.find("no_such_action").expect("the problem is printed");
+    let row = text.find("Alt+g\t").expect("the table is printed");
+    assert!(diag < row, "diagnostics must precede the table:\n{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The exit code answers **"did roost have to skip something?"** — nothing
 /// weaker. A remap that displaces a bound default is the ordinary use of
 /// the escape hatch: roost did exactly what the file asked, so the gate a

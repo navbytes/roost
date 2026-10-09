@@ -61,3 +61,8 @@ From the ghost glyph and border gap fix (`skip_covered_cells`, `src/ui/render.rs
 ## Armed close vs mouse flashes (2026-10-07)
 
 - **A mouse-set flash can replace an armed close/quit prompt while the second press still fires.** `CONFIRM_WINDOW` (`src/core/app.rs:323`) keeps Alt+w/Alt+q armed for 3 s and the prompt flash carries the same window (U22: prompt and armed close must match). The flash slot is single, so any flash set from a mouse action overwrites the prompt without cancelling the arm, and the Alt+click path (`src/main.rs` ~1118) does not cancel it either. Found by the design audit of the opener-hint PR; it predates that PR, which only added one more way to reach it (Alt+click on a path with no rule). Fix when it matters: have mouse-triggered flashes (or `handle_mouse` itself) disarm a pending confirm.
+
+## Config discoverability (2026-10-09)
+
+- **No contract says which startup flash wins the single flash slot.** The order lives only in comments at `src/main.rs` ~519 and ~546 (config problems beat notices; extension-install flashes are set later). Pin it in a spec if a fourth source appears.
+- **Accepted: the unread `~/.config/roost/config.json` notice flashes on every launch** until the file is moved or deleted (`src/infra/config.rs`, `unread_home_config`). The cure is the notice's own advice.
