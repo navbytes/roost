@@ -27,7 +27,7 @@ these defaults.
 | Key | Action |
 |---|---|
 | `Alt+n` | new shell pane (auto split direction) |
-| `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
+| `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, omp, shell |
 | `Alt+arrow` / `Alt+hjkl` | move focus (expands stacked panes) |
 | `Alt+-` / `Alt+=` | resize height: shrink / grow (vim's Ctrl-w `−`/`+`) |
 | `Alt+<` / `Alt+>` | resize width: shrink / grow (vim's Ctrl-w `<`/`>`) |

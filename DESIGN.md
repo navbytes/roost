@@ -57,7 +57,7 @@ Single-process TUI, one thread per PTY reader plus a main event loop.
 │  PaneRuntime (the disposable state)                       │
 │    portable-pty child + reader thread + vt100::Parser     │
 │                                                           │
-│  Adapters: pi, claude, opencode, shell (generic)          │
+│  Adapters: pi, omp, claude, opencode, shell (generic)     │
 │  Status listener: unix socket for extension events        │
 └───────────────────────────────────────────────────────────┘
 ```

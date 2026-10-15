@@ -4,15 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>roost — session-native terminal multiplexer</title>
-<meta name="description" content="roost is a session-native terminal multiplexer for six AI agent CLIs — pi, Claude Code, Codex, Gemini, opencode, your shell. Quit, reboot, run roost — every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon.">
+<meta name="description" content="roost is a session-native terminal multiplexer for seven AI agent CLIs — pi, omp, Claude Code, Codex, Gemini, opencode, your shell. Quit, reboot, run roost — every tab, split, and stacked pane comes back, each agent resumed into its exact session. No daemon.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="roost — session-native terminal multiplexer">
-<meta property="og:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for six AI agent CLIs, with no daemon.">
+<meta property="og:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for seven AI agent CLIs, with no daemon.">
 <meta property="og:image" content="https://navbytes.github.io/roost/roost-hero.png">
 <meta property="og:url" content="https://navbytes.github.io/roost/">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="roost — session-native terminal multiplexer">
-<meta name="twitter:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for six AI agent CLIs, with no daemon.">
+<meta name="twitter:description" content="Processes are disposable. Sessions are precious. Full workspace resurrection for seven AI agent CLIs, with no daemon.">
 <meta name="twitter:image" content="https://navbytes.github.io/roost/roost-hero.png">
 <!-- favicon is a hand-synced copy of #bird-mark below (data URIs can't <use> in-page symbols) — body+belly+beak only, no eyes; keep both in sync when the mark changes -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><ellipse cx='8' cy='8' rx='8' ry='7' fill='%23FF6666'/><ellipse cx='8' cy='11.5' rx='5.5' ry='3.5' fill='%23FFFAFA'/><circle cx='5.5' cy='6.5' r='1.3' fill='%23111111'/><circle cx='10.5' cy='6.5' r='1.3' fill='%23111111'/><polygon points='6.6,8.2 9.4,8.2 8,10' fill='%23FFA500'/></svg>">
@@ -64,7 +64,7 @@
         <span style="display:block;color:var(--color-accent)">Sessions are <span style="white-space:nowrap">precious.<span class="cursor-blink" aria-hidden="true">▍</span></span></span>
       </h1>
       <p style="font-size:clamp(17px,1.5vw,20px);line-height:1.6;max-width:60ch;margin:32px 0 0;color:color-mix(in srgb, var(--color-text) 82%, transparent)">
-        roost is a terminal multiplexer for AI agent CLIs — pi, Claude Code, Codex, Gemini, opencode, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — every tab, split, and stacked pane comes back, each agent resumed into its exact session.
+        roost is a terminal multiplexer for AI agent CLIs — pi, omp, Claude Code, Codex, Gemini, opencode, your shell. Quit it, reboot your Mac, run <code style="font-family:var(--font-mono);font-size:0.92em;background:var(--color-surface);padding:1px 6px;border:1px solid var(--color-divider)">roost</code> — every tab, split, and stacked pane comes back, each agent resumed into its exact session.
       </p>
       <p style="font-family:var(--font-mono);font-size:13px;line-height:1.6;max-width:60ch;margin:10px 0 0;color:color-mix(in srgb, var(--color-text) 55%, transparent)">
         No daemon. No detach. roost resurrects the desk, not the sentence being typed on it.
@@ -334,7 +334,7 @@
         <div style="border:2px solid var(--color-text);font-family:var(--font-mono);font-size:13px">
           <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>core/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">pure domain</span></div>
           <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>ports.rs</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">trait boundaries</span></div>
-          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between;gap:10px"><span style="flex-shrink:0">agents/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent);text-align:right">pi · claude · shell · codex · gemini · opencode</span></div>
+          <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between;gap:10px"><span style="flex-shrink:0">agents/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent);text-align:right">pi · omp · claude · shell · codex · gemini · opencode</span></div>
           <div style="padding:12px 16px;border-bottom:1px solid var(--color-divider);display:flex;justify-content:space-between"><span>infra/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">real I/O at the edges</span></div>
           <div style="padding:12px 16px;display:flex;justify-content:space-between"><span>ui/</span><span style="color:color-mix(in srgb,var(--color-text) 55%,transparent)">ratatui rendering</span></div>
         </div>
@@ -442,6 +442,15 @@
         <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">opencode</h3>
         <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">Every session lives in one global SQLite database, not separate files — so there's no filesystem detection at all. roost resumes only by the session id it already has on record.</p>
         <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">opencode</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">opencode --session &lt;id&gt;</span></div>
+      </div>
+      <div class="adapter-card" style="padding:28px;border-right:2px solid var(--color-text);border-bottom:2px solid var(--color-text)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <svg class="icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5h16v11H4z"/><path d="M8 20.5h8"/><path d="M12 16.5v4"/></svg>
+          <span class="tag tag-neutral">Extension</span>
+        </div>
+        <h3 style="font-family:var(--font-mono);font-weight:800;font-size:24px;margin:0 0 12px">omp</h3>
+        <p style="font-size:14.5px;line-height:1.6;margin:0 0 18px;color:color-mix(in srgb, var(--color-text) 76%, transparent)">oh-my-pi, the pi fork, with its own shipped extension: exact status including omp's tool-approval and plan-review prompts, and a session id re-reported on <code style="font-family:var(--font-mono);font-size:0.9em">/new</code>, <code style="font-family:var(--font-mono);font-size:0.9em">/resume</code> and <code style="font-family:var(--font-mono);font-size:0.9em">/fork</code>. Subagent transcripts are never mistaken for sessions.</p>
+        <div style="font-family:var(--font-mono);font-size:12.5px;line-height:1.9;color:color-mix(in srgb, var(--color-text) 70%, transparent);border-top:1px solid var(--color-divider);padding-top:14px">launch&nbsp;&nbsp;<span style="color:var(--color-text)">omp</span><br>resume&nbsp;&nbsp;<span style="color:var(--color-text)">omp --resume &lt;id&gt;</span></div>
       </div>
     </div>
   </section>

@@ -6,8 +6,8 @@
 //! roost's socket protocol changes (e.g. the per-pane token, which roost now
 //! *requires*: a stale integration's messages are dropped).
 //!
-//! On startup we install/update both automatically, but only when the tool
-//! is actually set up (we never create `~/.pi` or `~/.claude` ourselves), and
+//! On startup we install/update these automatically, but only when the tool
+//! is actually set up (we never create `~/.pi`, `~/.omp` or `~/.claude` ourselves), and
 //! only when the on-disk copy is missing or differs. Two independent knobs
 //! suppress this entirely — see `ext_install_disabled`:
 //! - `ROOST_NO_EXT_INSTALL`: user-facing — "I manage this myself".
@@ -15,8 +15,8 @@
 //!   "this run must not touch anything outside itself", already set on every
 //!   roost `tests/harness/mod.rs` spawns.
 //!
-//! All three write into the operator's real, often dotfiles-managed
-//! `~/.pi`/`~/.claude`/`~/.config/opencode` regardless of `ROOST_STATE` — an
+//! Every one writes into the operator's real, often dotfiles-managed
+//! `~/.pi`/`~/.omp`/`~/.claude`/`~/.config/opencode` regardless of `ROOST_STATE` — an
 //! isolated *workspace*
 //! is not an isolated *machine*, so `ROOST_STATE` alone does not suppress
 //! this (deliberate: someone running two concurrent, equally-real roost
@@ -30,6 +30,10 @@
 //!
 //! - pi: a single file we own outright (`~/.pi/agent/extensions/roost.ts`) —
 //!   compare-and-overwrite, see `ensure_pi_extension`.
+//! - omp (oh-my-pi): the same shape under its own tree
+//!   (`~/.omp/agent/extensions/roost.ts`, a different file from pi's — omp's
+//!   event set differs), see `ensure_omp_extension`; both share
+//!   `ensure_extension_file`.
 //! - Claude Code: three hook entries inside `~/.claude/settings.json`, a file
 //!   the *user* owns and may already have their own content in — merge, not
 //!   overwrite, see `ensure_claude_hooks`.
@@ -46,8 +50,8 @@ use std::path::{Path, PathBuf};
 
 use crate::infra::atomic::{self, Perms};
 
-/// Whether any install path (`ensure_pi_extension`, `ensure_claude_hooks`,
-/// `ensure_opencode_plugin`) must no-op — see the module doc for what each of
+/// Whether any install path (`ensure_pi_extension`, `ensure_omp_extension`,
+/// `ensure_claude_hooks`, `ensure_opencode_plugin`) must no-op — see the module doc for what each of
 /// the two knobs means.
 /// Checked before either function even resolves `dirs::home_dir()`, not just
 /// before it writes: the bug this exists to fix was a real, global
@@ -63,30 +67,54 @@ const BUNDLED: &str = include_str!("../../extensions/roost.ts");
 /// Ensure `~/.pi/agent/extensions/roost.ts` matches this build. Returns a short
 /// message to surface when it installed or updated the file, else None.
 pub fn ensure_pi_extension() -> Option<String> {
+    ensure_extension_file("pi", &[".pi", "agent"], BUNDLED)
+}
+
+/// The omp extension source, embedded at build time like `BUNDLED`. A separate
+/// file from the pi one: omp's event set differs (see its header comment).
+const BUNDLED_OMP: &str = include_str!("../../extensions/omp-roost.ts");
+
+/// Ensure `~/.omp/agent/extensions/roost.ts` matches this build — the same
+/// contract as `ensure_pi_extension`, for oh-my-pi. omp auto-discovers
+/// `~/.omp/agent/extensions/*.ts` (not pi's directory, so nothing double-loads)
+/// and derives the extension's name from the file name, hence `roost.ts`.
+pub fn ensure_omp_extension() -> Option<String> {
+    ensure_extension_file("omp", &[".omp", "agent"], BUNDLED_OMP)
+}
+
+/// Shared body of the pi/omp installers: a single file roost owns outright at
+/// `~/<agent_dir…>/extensions/roost.ts`, written (atomically) only when it is
+/// missing or differs, and only when the tool's agent dir already exists —
+/// never created by us.
+fn ensure_extension_file(tool: &str, agent_dir: &[&str], body: &str) -> Option<String> {
     if ext_install_disabled() {
         return None;
     }
-    let agent_dir = dirs::home_dir()?.join(".pi").join("agent");
-    // Only touch things when pi is present — never create ~/.pi ourselves.
-    if !agent_dir.is_dir() {
+    let mut dir = dirs::home_dir()?;
+    dir.extend(agent_dir);
+    // Only touch things when the tool is present — never create its dir ourselves.
+    if !dir.is_dir() {
         return None;
     }
-    let ext_dir = agent_dir.join("extensions");
+    let ext_dir = dir.join("extensions");
     let target = ext_dir.join("roost.ts");
 
     let existing = std::fs::read_to_string(&target).ok();
-    if existing.as_deref() == Some(BUNDLED) {
+    if existing.as_deref() == Some(body) {
         return None; // already current
     }
     let updating = existing.is_some();
 
     std::fs::create_dir_all(&ext_dir).ok()?;
-    write_atomic(&target, BUNDLED)?;
+    write_atomic(&target, body)?;
 
     Some(if updating {
-        "updated the roost pi extension to match this build".into()
+        format!("updated the roost {tool} extension to match this build")
     } else {
-        "installed the roost pi extension (~/.pi/agent/extensions/roost.ts)".into()
+        format!(
+            "installed the roost {tool} extension (~/{}/extensions/roost.ts)",
+            agent_dir.join("/")
+        )
     })
 }
 
@@ -833,14 +861,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Fixture `$HOME` with `.pi/agent`, `.claude` and `.config/opencode`
-    /// present — ready to receive an install — so a test run against it
+    /// Fixture `$HOME` with `.pi/agent`, `.omp/agent`, `.claude` and
+    /// `.config/opencode` present — ready to receive an install — so a test run against it
     /// proves whichever gate is under test is what stopped the write, not
     /// "tool not present" (the other, unrelated reason the `ensure_*`
     /// functions no-op).
     fn ready_fixture_home(name: &str) -> PathBuf {
         let dir = scratch_dir(name);
         std::fs::create_dir_all(dir.join(".pi").join("agent")).unwrap();
+        std::fs::create_dir_all(dir.join(".omp").join("agent")).unwrap();
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::create_dir_all(dir.join(".config").join("opencode")).unwrap();
         dir
@@ -874,23 +903,33 @@ mod tests {
     /// or `clipboard`'s own env-mutating unit tests elsewhere in this same
     /// binary — a pre-existing, accepted risk, not one this test adds.
     #[test]
-    fn host_io_gate_blocks_all_three_installs_even_when_all_three_tools_are_present() {
+    fn host_io_gate_blocks_every_install_even_when_every_tool_is_present() {
         let home = ready_fixture_home("host-io-gate");
         std::env::remove_var("ROOST_NO_EXT_INSTALL");
 
         // Phase 1: gate on, ROOST_NO_EXT_INSTALL deliberately left unset —
         // a pass here proves ROOST_TEST_NO_HOST_IO alone is sufficient.
         std::env::set_var("ROOST_TEST_NO_HOST_IO", "1");
-        let (pi_gated, claude_gated, oc_gated) = with_home(&home, || {
-            (ensure_pi_extension(), ensure_claude_hooks(), ensure_opencode_plugin())
+        let (pi_gated, omp_gated, claude_gated, oc_gated) = with_home(&home, || {
+            (
+                ensure_pi_extension(),
+                ensure_omp_extension(),
+                ensure_claude_hooks(),
+                ensure_opencode_plugin(),
+            )
         });
         assert!(pi_gated.is_none(), "pi extension installed despite the gate: {pi_gated:?}");
+        assert!(omp_gated.is_none(), "omp extension installed despite the gate: {omp_gated:?}");
         assert!(
             claude_gated.is_none(),
             "Claude Code hooks installed despite the gate: {claude_gated:?}"
         );
         assert!(oc_gated.is_none(), "opencode plugin installed despite the gate: {oc_gated:?}");
         assert!(!home.join(".pi/agent/extensions/roost.ts").exists(), "pi extension file written");
+        assert!(
+            !home.join(".omp/agent/extensions/roost.ts").exists(),
+            "omp extension file written"
+        );
         assert!(!home.join(".claude/settings.json").exists(), "settings.json written");
         // The gate must stop the opencode install before even the mkdir —
         // a stray (empty) plugin dir would be litter in a gated run.
@@ -900,21 +939,81 @@ mod tests {
         // actually install — proves phase 1 passed *because of* the gate,
         // not because the fixture was never "ready" (e.g. a typo'd path).
         std::env::remove_var("ROOST_TEST_NO_HOST_IO");
-        let (pi_msg, claude_msg, oc_msg) = with_home(&home, || {
-            (ensure_pi_extension(), ensure_claude_hooks(), ensure_opencode_plugin())
+        let (pi_msg, omp_msg, claude_msg, oc_msg) = with_home(&home, || {
+            (
+                ensure_pi_extension(),
+                ensure_omp_extension(),
+                ensure_claude_hooks(),
+                ensure_opencode_plugin(),
+            )
         });
         let pi_msg = pi_msg.expect("pi extension should install once the gate is off");
         assert!(pi_msg.contains("installed"), "{pi_msg}");
+        let omp_msg = omp_msg.expect("omp extension should install once the gate is off");
+        assert!(omp_msg.contains("installed"), "{omp_msg}");
         let claude_msg = claude_msg.expect("claude hooks should install once the gate is off");
         assert!(claude_msg.contains("installed"), "{claude_msg}");
         let oc_msg = oc_msg.expect("opencode plugin should install once the gate is off");
         assert!(oc_msg.contains("installed"), "{oc_msg}");
         assert!(home.join(".pi/agent/extensions/roost.ts").exists());
+        assert!(home.join(".omp/agent/extensions/roost.ts").exists());
         assert!(home.join(".claude/settings.json").exists());
         // Which one depends on the opencode on this machine's PATH.
         let plugin = home.join(".config/opencode/plugin");
         assert!(plugin.join("opencode-plugin.ts").exists() || plugin.join("roost/tui.ts").exists());
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- pi / omp extension installers (shared `ensure_extension_file`) ----
+
+    #[test]
+    fn omp_installs_updates_and_is_idempotent() {
+        let home = scratch_dir("omp-install");
+        std::fs::create_dir_all(home.join(".omp").join("agent")).unwrap();
+        std::env::remove_var("ROOST_NO_EXT_INSTALL");
+        std::env::remove_var("ROOST_TEST_NO_HOST_IO");
+        let target = home.join(".omp/agent/extensions/roost.ts");
+
+        let msg = with_home(&home, ensure_omp_extension).expect("fresh install");
+        assert_eq!(msg, "installed the roost omp extension (~/.omp/agent/extensions/roost.ts)");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), BUNDLED_OMP);
+        assert!(no_tmp_litter(&home.join(".omp/agent/extensions")));
+        assert!(
+            with_home(&home, ensure_omp_extension).is_none(),
+            "an unchanged second run is silent"
+        );
+
+        std::fs::write(&target, "// an older build's extension").unwrap();
+        let msg = with_home(&home, ensure_omp_extension).expect("stale copy is replaced");
+        assert_eq!(msg, "updated the roost omp extension to match this build");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), BUNDLED_OMP);
+        // pi's tree is untouched: omp has its own file, nothing double-loads.
+        assert!(!home.join(".pi").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn omp_is_a_no_op_when_omp_is_not_set_up() {
+        let home = scratch_dir("omp-no-tool");
+        std::fs::create_dir_all(home.join(".pi").join("agent")).unwrap();
+        std::env::remove_var("ROOST_NO_EXT_INSTALL");
+        std::env::remove_var("ROOST_TEST_NO_HOST_IO");
+        let msg = with_home(&home, ensure_omp_extension);
+        assert!(msg.is_none(), "absent omp must be a silent no-op: {msg:?}");
+        assert!(!home.join(".omp").exists(), "must never create ~/.omp");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pi_message_shapes_survive_the_shared_helper() {
+        let home = scratch_dir("pi-shared");
+        std::fs::create_dir_all(home.join(".pi").join("agent")).unwrap();
+        std::env::remove_var("ROOST_NO_EXT_INSTALL");
+        std::env::remove_var("ROOST_TEST_NO_HOST_IO");
+        let msg = with_home(&home, ensure_pi_extension).expect("fresh install");
+        assert_eq!(msg, "installed the roost pi extension (~/.pi/agent/extensions/roost.ts)");
+        assert!(with_home(&home, ensure_pi_extension).is_none());
         let _ = std::fs::remove_dir_all(&home);
     }
 
