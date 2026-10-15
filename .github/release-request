@@ -1,2 +1,2 @@
-v0.1.31
-Alt+click on a file or folder path with no matching opener rule now shows a hint instead of silently doing nothing.
+v0.1.32
+New omp (oh-my-pi) adapter: launch and resume omp panes, with a bundled status extension installed into ~/.omp/agent/extensions. `roost keys` now prints config diagnostics first and warns about an unread ~/.config file.
