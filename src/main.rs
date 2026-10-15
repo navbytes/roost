@@ -548,6 +548,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     if let Some(msg) = infra::extension::ensure_pi_extension() {
         app.set_flash(msg);
     }
+    // And oh-my-pi (omp): its own extension in ~/.omp/agent/extensions/.
+    // Same opt-outs, and only when ~/.omp/agent already exists.
+    if let Some(msg) = infra::extension::ensure_omp_extension() {
+        app.set_flash(msg);
+    }
     // Same idea for Claude Code: merge roost's status hooks into
     // ~/.claude/settings.json. No-op when Claude Code isn't set up or
     // ROOST_NO_EXT_INSTALL is set — see infra::extension module docs.

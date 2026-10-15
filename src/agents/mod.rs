@@ -1,12 +1,14 @@
 //! Per-tool adapters: each knows how to launch its CLI fresh, resume a
 //! specific session, detect a new session's id, and interpret status signals.
 //!
-//! Design doc §6. The pi adapter is the v1 flagship; `shell` is the generic
-//! fallback for arbitrary commands.
+//! Design doc §6. The pi adapter is the v1 flagship (omp, the oh-my-pi fork,
+//! is its own adapter: different session layout, bucket encoding and
+//! extension API); `shell` is the generic fallback for arbitrary commands.
 
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod omp;
 pub mod opencode;
 pub mod pi;
 pub mod shell;
@@ -90,7 +92,7 @@ pub trait AgentAdapter: Send + Sync {
 
     /// Command to resume the given session id in `cwd`. Default:
     /// `launch(cwd)` plus `resume_flag()` then the bare id — covers every
-    /// "program [--]flag id" resume shape here (pi, claude, codex, gemini,
+    /// "program [--]flag id" resume shape here (pi, omp, claude, codex, gemini,
     /// opencode). `shell` ignores the session id entirely and overrides this
     /// directly instead.
     fn resume(&self, cwd: &Path, session: &str) -> CommandSpec {
@@ -266,6 +268,7 @@ fn adapter_specs() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(codex::CodexAdapter),
         Box::new(gemini::GeminiAdapter),
         Box::new(opencode::OpencodeAdapter),
+        Box::new(omp::OmpAdapter),
         Box::new(shell::ShellAdapter),
     ]
 }

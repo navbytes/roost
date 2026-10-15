@@ -4,7 +4,7 @@
 
 **Processes are disposable. Sessions are precious.**
 
-A session-native terminal multiplexer for AI agent CLIs (pi, Claude Code, codex, gemini, opencode, shell) — no daemon, ever.
+A session-native terminal multiplexer for AI agent CLIs (pi, omp, Claude Code, codex, gemini, opencode, shell) — no daemon, ever.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust&logoColor=white)](Cargo.toml)
@@ -267,7 +267,7 @@ six variables, set on the command that launches it:
 |---|---|
 | `ROOST_STATE=DIR` | use `DIR` as the state dir: an independent workspace, config and control socket (above). Created if missing |
 | `ROOST_WORKSPACE=NAME` | launch directly into the named workspace instead of `default` (same as `-w NAME`; see Workspaces) |
-| `ROOST_NO_EXT_INSTALL=1` | don't install or update the pi extension and Claude Code hooks in `~/.pi` / `~/.claude` (below) |
+| `ROOST_NO_EXT_INSTALL=1` | don't install or update the pi / omp extensions and Claude Code hooks in `~/.pi` / `~/.omp` / `~/.claude` (below) |
 | `ROOST_NO_QOS=1` | don't raise input-thread scheduling priority on macOS (below) |
 | `ROOST_DEBUG=1` | append control-plane diagnostics — dropped socket lines, shed connections — to `<state>/roost.log`. Any value enables it; the file is written only when there is something to say, and never to the TUI's own output |
 | `ROOST_WATCHDOG=1` | run the stall watchdog: if the event loop stops ticking for 3s, write one line to `<state>/watchdog.log` and, on macOS, an all-threads backtrace beside it (below). Any value enables it; off by default |
@@ -315,7 +315,7 @@ Every shortcut lives on `Alt`. These twelve get you through a session:
 | Key | Action |
 |---|---|
 | `Alt+n` | new shell pane (auto split direction) |
-| `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, shell |
+| `Alt+Enter` | quick-launch picker: pi, claude, codex, gemini, opencode, omp, shell |
 | `Alt+arrow` / `Alt+hjkl` | move focus |
 | `Alt+w` | close pane (twice to confirm when the agent is busy) |
 | `Alt+t`, `Alt+1..9` | new tab / go to tab |
@@ -476,6 +476,14 @@ Status arrives two ways:
      question ("Which database should I use?") is reported as needs-you
      too, question attached — heuristic (trailing `?` on the final line),
      self-healing, and self-explanatory since the text rides along.
+   - omp (oh-my-pi): [`extensions/omp-roost.ts`](extensions/omp-roost.ts) —
+     installed as `~/.omp/agent/extensions/roost.ts` at startup when
+     `~/.omp/agent` exists (same `ROOST_NO_EXT_INSTALL` opt-out). A separate
+     file from pi's because omp's events differ: the turn end is `agent_end`
+     (its `willContinue` flag filters auto-retries and continuations), omp's
+     own tool-approval and plan-review prompts report needs-you directly, and
+     `/new`/`/resume`/`/fork` re-report the session id. In-process subagents
+     never report; only the pane's main session does.
    - Claude Code: roost installs/updates three hooks into
      `~/.claude/settings.json` automatically at startup when Claude Code is
      present (same `ROOST_NO_EXT_INSTALL` opt-out). The needs-you hook
@@ -493,7 +501,7 @@ Status arrives two ways:
 
 Each pane also carries a faint **corner badge**, top-right (iTerm2-style):
 `name · adapter glyph` — the name is its `Alt+r` title, or the adapter name
-(pi, claude, codex, gemini, opencode, or shell) when unnamed, and the glyph is the pane's live
+(pi, claude, codex, gemini, opencode, omp, or shell) when unnamed, and the glyph is the pane's live
 status. A cell TUI can't do true translucency, so it's rendered dim rather
 than see-through; the inner app's content still draws underneath it. A pane
 with an `Alt+r` note adds a `¶` here — and on the focused pane, the
@@ -525,6 +533,7 @@ truecolor included. Full design spec: [`DESIGN-ui.md`](DESIGN-ui.md).
 | Adapter | Launch | Resume | Session detection |
 |---|---|---|---|
 | `pi` | `pi` | `pi --session <id>` | socket handshake, or newest file under `~/.pi/agent/sessions/` |
+| `omp` | `omp` | `omp --resume <id>` | socket handshake, or newest file under `~/.omp/agent/sessions/<encoded-cwd>/` (a session id is resumable from any project's bucket; subagent transcripts nested inside a bucket are ignored) |
 | `claude` | `claude` | `claude --resume <id>` | newest `*.jsonl` under `~/.claude/projects/<encoded-cwd>/` |
 | `shell` | `$SHELL` | relaunch in saved cwd | — |
 | `codex` | `codex` | `codex resume <SESSION_ID>` | newest `*.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` (date-bucketed, not cwd-bucketed — detection cannot be scoped to a working directory) |
@@ -614,7 +623,7 @@ src/
     event.rs     event vocabulary (PTY output, exit, socket events)
   ports.rs     trait boundaries: PaneBackend, StateStore, Notifier
                (+ fakes for tests: FakePane, MemStore, RecordingNotifier)
-  agents/      domain adapters per CLI: pi, claude, shell (AgentAdapter)
+  agents/      domain adapters per CLI: pi, omp, claude, codex, gemini, opencode, shell (AgentAdapter)
   infra/       production port implementations — all real I/O
     pty.rs       PaneBackend via portable-pty + vt100
     store.rs     StateStore via atomic workspace.json writes
@@ -645,7 +654,7 @@ M3 status socket + badges ✓ · M4 stacks + resize ✓ · M5 picker, rename,
 scroll, notifications ✓ · fleet features (jump, feed, zoom, float, raw mode,
 keyboard copy, layouts, broadcast) ✓ · mouse, wheel routing and link-opening ✓ ·
 native mouse selection ✓ · a drag holds the view still so you copy what you
-highlighted ✓ · adapters for pi, Claude Code, shell, codex, gemini and
+highlighted ✓ · adapters for pi, omp, Claude Code, shell, codex, gemini and
 opencode ✓ · a small `config.json` to remap or disable individual keys ✓.
 What's left is deferred scope and deliberate choices, no known-broken
 defects — full detail: [ROADMAP.md](ROADMAP.md).
