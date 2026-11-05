@@ -2355,6 +2355,11 @@ itself is folded to one line first (`dead_reason`): portable-pty's
 multi-line PATH-search failure, whose last line dumps the whole `$PATH`,
 reads `spawning pi: pi not found on $PATH`.
 
+**[Amended 2026-11-05, a short bar on a narrow pane]** Where the full
+action bar would clip, it switches to the hint bar's terse vocabulary —
+`✕ exited — ↵ relaunch · f fresh · y copy resume · Alt+w close` — so every
+action survives in roughly two thirds of the width (`dead_bar_fit`).
+
 ### C17 — Copy-mode selection
 
 **Current:** `render.rs:365–368` + `highlight_selection()` `:428–446` —
