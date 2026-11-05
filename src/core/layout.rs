@@ -739,10 +739,11 @@ pub fn rail_window(rail_height: u16, n: usize, shown: usize) -> RailWindow {
 /// rows make (boxed only when there's height to afford it). Three regimes,
 /// tried in order:
 ///
-/// 1. **Spaced** — a blank row under the header and one above every pane
-///    row — chosen only when every row still fits: `1 + 2*n <= rail_height`.
-///    Rows land at `rail.y + 2 + 2*i`, so the last is at `rail.y + 2*n`,
-///    which is exactly why that predicate is the fit test. By construction
+/// 1. **Spaced** — two rows per pane, drawn as a two-line card
+///    (`render::draw_rail`, amended 2026-11-05) — chosen only when every
+///    pane still fits: `1 + 2*n <= rail_height`. Pane `i` owns
+///    `rail.y + 1 + 2*i` and `rail.y + 2 + 2*i`, so the last row is at
+///    `rail.y + 2*n`, which is exactly why that predicate is the fit test. By construction
 ///    the spaced case never overflows, so it needs no `…` markers.
 /// 2. **Contiguous** — today's layout, rows at `rail.y + 1 + i` — when
 ///    spacing doesn't fit but every row still does.
@@ -751,7 +752,7 @@ pub fn rail_window(rail_height: u16, n: usize, shown: usize) -> RailWindow {
 ///    either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RailLayout {
-    /// Regime 1: every row got a blank line of its own.
+    /// Regime 1: every pane gets two rows (a two-line card).
     pub spaced: bool,
     pub window: RailWindow,
 }
