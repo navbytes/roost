@@ -2,6 +2,13 @@
 
 Deferred work and accepted limitations. Newest first within a section.
 
+## Claude panes whose cwd drifts from the session's project (2026-11-05)
+
+Fixed: resume and `session_state` now find the transcript under any `~/.claude/projects/*` and run `claude --resume` from the project's own directory (`locate` / `resume_cwd` in `src/agents/claude.rs`). Left:
+
+- **File-scan detection still keys on the pane's cwd** — `detect_session` (trait default, `src/agents/mod.rs`) scans only `projects/<encode(spec.cwd)>/`. If Claude Code changes directory before its first transcript write and roost observes the new cwd first (`observe_panes`, `src/core/app.rs` ~1607), a fresh pane with no hook handshake never learns its id. The Claude hook handshake reports the id directly, so only the fallback is affected.
+- **A session whose project directory was deleted** (a removed worktree) resumes from the pane's stored cwd; `claude --resume` there cannot find it. Nothing better to do without a directory to stand in.
+
 ## omp adapter (2026-10-15)
 
 Shipped: `src/agents/omp.rs`, `extensions/omp-roost.ts`, `ensure_omp_extension` in `src/infra/extension.rs`. Accepted limitations:
