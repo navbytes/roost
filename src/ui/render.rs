@@ -3430,6 +3430,88 @@ fn rail_glyph_row_spans(
     ]
 }
 
+/// [2026-11-05] C43 glyph-tier cards: in the spaced regime the glyph tier's
+/// second slot (formerly a blank spacer) carries the rest of the name, so a
+/// 12-column rail reads about twice as much of it. Line 1 is
+/// `rail_glyph_row_spans`'s shape — marker, glyph, id, name — with the name
+/// broken at the last space, `·`, `-`, `_` or `/` that fits; line 2 is
+/// indented under the id and holds the remainder, `…`-cut at the edge. No detail and no
+/// state word: there is no room for either, and the glyph already carries
+/// the state, as it always has at this tier.
+fn rail_glyph_card_spans(
+    focused: bool,
+    status: Option<AgentStatus>,
+    id: layout::PaneId,
+    name: &str,
+    spinner: char,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let (base_glyph, glyph_style, spins) = row_status_style(status);
+    let glyph = if spins { spinner } else { base_glyph };
+    let marker = if focused {
+        Span::styled(theme::MARKER_ACTIVE.to_string(), theme::accent())
+    } else {
+        Span::raw(" ")
+    };
+    let room = layout::RAIL_GLYPH_COLS.saturating_sub(2); // marker + glyph
+    let lead = format!(" {id} ");
+    let lead_w = mouse::display_width(&lead);
+    let (first, rest) = wrap_once(name, room.saturating_sub(lead_w));
+    // Line 2 sits under the id (marker + glyph + one space) and runs to the
+    // rail's edge, as line 1 does — a column of air here would cost
+    // `roost (2)` its disambiguating `)`.
+    const INDENT: u16 = 3;
+    let room2 = layout::RAIL_GLYPH_COLS.saturating_sub(INDENT);
+    let second = elide_to(&rest, room2);
+    let style = collapsed_name_style(status, focused);
+    let pad1 = room.saturating_sub(lead_w + mouse::display_width(&first));
+    let top = vec![
+        marker,
+        Span::styled(glyph.to_string(), glyph_style),
+        Span::styled(format!("{lead}{first}{}", " ".repeat(pad1 as usize)), style),
+    ];
+    let bottom = if second.is_empty() {
+        vec![]
+    } else {
+        vec![Span::raw(" ".repeat(INDENT as usize)), Span::styled(second, style)]
+    };
+    (top, bottom)
+}
+
+/// Split `text` into what fits `room` columns and the remainder, breaking
+/// after the last space or separator (`·`, `-`, `_`, `/`) that fits — a
+/// space is dropped at the break, a separator kept on the first half — and
+/// mid-word only when nothing earlier would do. Pure.
+fn wrap_once(text: &str, room: u16) -> (String, String) {
+    if mouse::display_width(text) <= room {
+        return (text.to_string(), String::new());
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut w = 0u16;
+    let mut fit = 0; // chars that fit
+    let mut brk: Option<usize> = None; // first-half length at the last break
+    for (i, ch) in chars.iter().enumerate() {
+        let cw = mouse::display_width(&ch.to_string());
+        if w + cw > room {
+            // A space right at the overflow point is a clean break too.
+            if *ch == ' ' {
+                brk = Some(i);
+            }
+            break;
+        }
+        w += cw;
+        fit = i + 1;
+        match ch {
+            ' ' => brk = Some(i),
+            '·' | '-' | '_' | '/' => brk = Some(i + 1),
+            _ => {}
+        }
+    }
+    let cut = brk.filter(|&b| b > 0).unwrap_or(fit);
+    let first: String = chars[..cut].iter().collect();
+    let rest: String = chars[cut..].iter().collect();
+    (first.trim_end().to_string(), rest.trim_start().to_string())
+}
+
 /// [2026-11-05] C43 card rows: what a rail card's second line says, fitted
 /// to `room` columns. For a pane the user named, `adapter · cwd` (the name
 /// hides both); else the cwd alone — an untitled name already carries the
@@ -3581,13 +3663,9 @@ fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, sp
     // a column of its own. Same two slots per pane, so `rail_row_at`
     // (which already gives both slots to the pane) is unchanged.
     let cards = rl.spaced && rail.width > layout::RAIL_GLYPH_COLS;
-    let first_slot = if cards {
-        rail.y + 1
-    } else if rl.spaced {
-        rail.y + 2
-    } else {
-        rail.y + 1 + u16::from(w.more_above)
-    };
+    // The glyph tier's cards spend the second slot on the name's remainder.
+    let glyph_cards = rl.spaced && rail.width <= layout::RAIL_GLYPH_COLS;
+    let first_slot = if rl.spaced { rail.y + 1 } else { rail.y + 1 + u16::from(w.more_above) };
     for (i, &id) in rows.iter().skip(w.top).take(w.len).enumerate() {
         let row = Rect::new(rail.x, first_slot + i as u16 * pitch, rail.width, 1);
         let focused = shown == id;
@@ -3608,6 +3686,13 @@ fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, sp
                 noted,
                 spinner,
             );
+            f.render_widget(Paragraph::new(Line::from(top)), row);
+            let below = Rect::new(rail.x, row.y + 1, rail.width, 1);
+            f.render_widget(Paragraph::new(Line::from(bottom)), below);
+            continue;
+        }
+        if glyph_cards {
+            let (top, bottom) = rail_glyph_card_spans(focused, Some(status), id, &name, spinner);
             f.render_widget(Paragraph::new(Line::from(top)), row);
             let below = Rect::new(rail.x, row.y + 1, rail.width, 1);
             f.render_widget(Paragraph::new(Line::from(bottom)), below);
@@ -5677,6 +5762,46 @@ mod tests {
         let narrow = text(&narrow);
         assert!(!narrow.contains('~'), "{narrow:?}");
         assert!(narrow.contains("raw · idle"), "{narrow:?}");
+    }
+
+    /// [2026-11-05] C43 glyph-tier cards: the name breaks at a separator
+    /// and its remainder fills the second slot, under the id.
+    #[test]
+    fn rail_glyph_card_spans_wrap_the_name_onto_the_second_line() {
+        let text = |spans: &[ratatui::text::Span<'_>]| {
+            spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        };
+        let (top, bottom) =
+            super::rail_glyph_card_spans(false, Some(AgentStatus::Idle), 3, "shell · roost", '|');
+        assert_eq!(text(&top).trim_end(), format!(" {} 3 shell ·", text(&top[1..2])));
+        assert_eq!(text(&bottom), "   roost");
+        assert!(mouse::display_width(&text(&top)) <= crate::core::layout::RAIL_GLYPH_COLS);
+
+        // A name that fits stays on line 1 and leaves line 2 empty.
+        let (_, bottom) =
+            super::rail_glyph_card_spans(false, Some(AgentStatus::Idle), 3, "api", '|');
+        assert!(bottom.is_empty());
+
+        // A long remainder is cut with `…` inside the rail.
+        let (_, bottom) = super::rail_glyph_card_spans(
+            true,
+            Some(AgentStatus::Idle),
+            3,
+            "claude · review-pr-247-sidebar",
+            '|',
+        );
+        let b = text(&bottom);
+        assert!(b.ends_with('…'), "{b:?}");
+        assert!(mouse::display_width(&b) <= crate::core::layout::RAIL_GLYPH_COLS);
+    }
+
+    #[test]
+    fn wrap_once_breaks_at_spaces_and_separators_before_mid_word() {
+        assert_eq!(super::wrap_once("api", 7), ("api".into(), String::new()));
+        assert_eq!(super::wrap_once("api server", 7), ("api".into(), "server".into()));
+        assert_eq!(super::wrap_once("review-pr-247", 7), ("review-".into(), "pr-247".into()));
+        assert_eq!(super::wrap_once("abcdefghij", 7), ("abcdefg".into(), "hij".into()));
+        assert_eq!(super::wrap_once("api servers", 3), ("api".into(), "servers".into()));
     }
 
     #[test]

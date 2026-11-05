@@ -6632,6 +6632,22 @@ no longer a blank row under the header. The contiguous and windowed
 regimes, and the glyph tier, are unchanged — a card needs the spaced
 regime's second row, and spacing is still the first thing to give up.
 
+**[Amended 2026-11-05, glyph-tier cards — Naveen asked that names wrap
+rather than the rail widen.]** The glyph tier (`RAIL_GLYPH_COLS`, 12
+columns, the 80-column rail) now takes cards too, of its own shape: the
+spaced regime's second row carries the **rest of the name**, not a detail
+and a word. Line 1 is the old glyph row — marker · glyph · id · name — with
+the name broken after the last space, `·`, `-`, `_` or `/` that fits
+(mid-word only when none does); line 2 is indented under the id and runs
+to the rail's edge, `…`-cut (`rail_glyph_card_spans`, `wrap_once`). A name
+that fits line 1 leaves line 2 empty. Roughly twice the name is now
+readable at 80 columns (`api server` where `api serv` was). No state word
+and no detail: neither fits, and the glyph already carries the state at
+this tier, as it always has. Same two slots per pane, so `rail_row_at` is
+unchanged; the contiguous and windowed regimes keep the one-line glyph
+row. herdr, the nearest peer, drops names entirely in its collapsed
+sidebar (number + glyph); this keeps them.
+
 **Keys inside a solo tab.** Every chord keeps its `Action`; only dispatch
 is solo-aware:
 
