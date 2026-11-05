@@ -3430,6 +3430,121 @@ fn rail_glyph_row_spans(
     ]
 }
 
+/// [2026-11-05] C43 card rows: what a rail card's second line says, fitted
+/// to `room` columns. The parked note's headline when there is one (`¶`,
+/// C32's marker — the reason the pane was parked beats where it lives),
+/// cut at its end; else, for a pane the user named, `adapter · cwd` (the
+/// name hides both); else the cwd alone — an untitled name already carries
+/// the adapter and the directory's last component, and the fuller path
+/// tells two `shell · roost`s in different `roost`s apart. A path is cut
+/// from the **left** (`…/claude/roost`): its tail is the part that names
+/// the place.
+fn rail_card_detail(
+    note: Option<&str>,
+    titled_adapter: Option<&str>,
+    cwd: Option<&str>,
+    room: u16,
+) -> String {
+    if let Some(headline) = note.and_then(|n| n.lines().next()).filter(|l| !l.trim().is_empty()) {
+        return elide_to(&format!("¶ {}", headline.trim()), room);
+    }
+    let prefix = titled_adapter.map(|a| format!("{a} · ")).unwrap_or_default();
+    match cwd {
+        Some(c) => {
+            let prefix_w = mouse::display_width(&prefix);
+            if prefix_w + 2 > room {
+                return elide_to(titled_adapter.unwrap_or(c), room);
+            }
+            format!("{prefix}{}", elide_left(c, room - prefix_w))
+        }
+        None => elide_to(prefix.trim_end_matches(" · "), room),
+    }
+}
+
+/// `elide_to`'s mirror: keep the **tail** of `text` within `room` columns,
+/// `…`-marked at the front.
+fn elide_left(text: &str, room: u16) -> String {
+    if mouse::display_width(text) <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut tail = String::new();
+    let mut w = 0u16;
+    for ch in chars.iter().rev() {
+        let cw = mouse::display_width(&ch.to_string());
+        if w + cw > room - 1 {
+            break;
+        }
+        tail.insert(0, *ch);
+        w += cw;
+    }
+    format!("…{tail}")
+}
+
+/// [2026-11-05] C43 card rows at the labelled tier: line 1 is marker ·
+/// glyph · name, the name getting every remaining column (elided with `…`);
+/// line 2 is indented under the name — the quiet detail on the left, the
+/// state word right-aligned on every card alike (`raw ·` before it in raw
+/// mode). The detail sheds first: it is cut to leave the word its column
+/// plus a gap, and dropped outright when not even a few characters of it
+/// would fit. Pure, so the shape is testable without a `Frame`.
+fn rail_card_spans(
+    width: u16,
+    focused: bool,
+    status: Option<AgentStatus>,
+    name: &str,
+    detail: impl Fn(u16) -> String,
+    raw: bool,
+    spinner: char,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let (base_glyph, glyph_style, spins) = row_status_style(status);
+    let glyph = if spins { spinner } else { base_glyph };
+    let marker = if focused {
+        Span::styled(theme::MARKER_ACTIVE.to_string(), theme::accent())
+    } else {
+        Span::raw(" ")
+    };
+    // marker + glyph + the space before the name.
+    const LEAD: u16 = 3;
+    let name = elide_to(name, width.saturating_sub(LEAD + 1));
+    let top = vec![
+        marker,
+        Span::styled(glyph.to_string(), glyph_style),
+        Span::styled(format!(" {name}"), collapsed_name_style(status, focused)),
+    ];
+
+    let word =
+        if raw { format!("raw · {}", row_word(status)) } else { row_word(status).to_string() };
+    let indent = " ".repeat(LEAD as usize);
+    let word_w = mouse::display_width(&word);
+    // The detail's room: everything between the indent and the word, less
+    // one column of gap and one trailing column of air.
+    let room = width.saturating_sub(LEAD + word_w + SEGMENT_GAP_COLS + 1);
+    let detail = if room >= 4 { elide_to(&detail(room), room) } else { String::new() };
+    let pad = width
+        .saturating_sub(LEAD + mouse::display_width(&detail) + word_w + 1)
+        .max(u16::from(!detail.is_empty()) * SEGMENT_GAP_COLS);
+    let mut bottom = vec![Span::raw(indent)];
+    if !detail.is_empty() {
+        bottom.push(Span::styled(detail, theme::quiet()));
+    }
+    bottom.push(Span::raw(" ".repeat(pad as usize)));
+    bottom.push(Span::styled(format!("{word} "), theme::quiet()));
+    (top, clip_line(bottom, width))
+}
+
+/// Clip a line's spans to `width` columns (the card's bottom line can only
+/// overrun on a rail narrower than its word, which the labelled tier's
+/// 20-column floor never is — this is the belt to that brace).
+fn clip_line(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    let parts: Vec<(String, Style)> =
+        spans.into_iter().map(|s| (s.content.into_owned(), s.style)).collect();
+    clip_spans(&parts, width)
+}
+
 /// C43: the solo-view rail — row 0 the header, then one row per
 /// `rail_rows()` id, top-aligned, recomputed every frame from the
 /// workspace (renames, status flips and closes show up live, same as the
@@ -3460,13 +3575,43 @@ fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, sp
     let rl = layout::rail_layout(rail.height, rows.len(), shown_i);
     let w = rl.window;
     let pitch: u16 = if rl.spaced { 2 } else { 1 };
-    let first_slot = if rl.spaced { rail.y + 2 } else { rail.y + 1 + u16::from(w.more_above) };
+    // [2026-11-05] Card rows: in the spaced regime at the labelled tier,
+    // the row that used to be a blank spacer carries a second, quiet line
+    // instead — so the name gets the whole first line and the state word
+    // a column of its own. Same two slots per pane, so `rail_row_at`
+    // (which already gives both slots to the pane) is unchanged.
+    let cards = rl.spaced && rail.width > layout::RAIL_GLYPH_COLS;
+    let first_slot = if cards {
+        rail.y + 1
+    } else if rl.spaced {
+        rail.y + 2
+    } else {
+        rail.y + 1 + u16::from(w.more_above)
+    };
     for (i, &id) in rows.iter().skip(w.top).take(w.len).enumerate() {
         let row = Rect::new(rail.x, first_slot + i as u16 * pitch, rail.width, 1);
         let focused = shown == id;
         let status = app.display_status(id).unwrap_or(AgentStatus::Exited);
         let spec = app.find_spec(id);
         let name = if spec.is_some() { app.chrome_name(id) } else { "?".into() };
+        if cards {
+            let note = spec.and_then(|s| s.note.as_deref());
+            let titled = spec.filter(|s| s.title.is_some()).map(|s| s.adapter.as_str());
+            let cwd = app.pane_cwd(id);
+            let (top, bottom) = rail_card_spans(
+                rail.width,
+                focused,
+                Some(status),
+                &name,
+                |room| rail_card_detail(note, titled, cwd.as_deref(), room),
+                app.is_raw(id),
+                spinner,
+            );
+            f.render_widget(Paragraph::new(Line::from(top)), row);
+            let below = Rect::new(rail.x, row.y + 1, rail.width, 1);
+            f.render_widget(Paragraph::new(Line::from(bottom)), below);
+            continue;
+        }
         let spans = if rail.width <= layout::RAIL_GLYPH_COLS {
             rail_glyph_row_spans(focused, Some(status), id, &name, spinner)
         } else {
@@ -5463,6 +5608,59 @@ mod tests {
     /// longer answers "which pane is that" in the one view where every other
     /// pane is off screen, so the name rides beside it. A short id + name
     /// fits `RAIL_GLYPH_COLS` (12) whole.
+    #[test]
+    fn rail_card_detail_prefers_the_note_then_the_named_panes_adapter() {
+        let d = |n, a, c| super::rail_card_detail(n, a, c, 40);
+        assert_eq!(d(Some("fix ci\nmore"), Some("claude"), Some("~/x")), "¶ fix ci");
+        assert_eq!(d(None, Some("claude"), Some("~/x")), "claude · ~/x");
+        assert_eq!(d(None, None, Some("~/x")), "~/x");
+        assert_eq!(d(Some("  "), None, Some("~/x")), "~/x", "a blank note is no note");
+        // A path keeps its tail.
+        assert_eq!(
+            super::rail_card_detail(None, None, Some("/home/claude/roost"), 10),
+            "…ude/roost"
+        );
+        assert_eq!(
+            super::rail_card_detail(None, Some("shell"), Some("/home/claude/roost"), 14),
+            "shell · …roost"
+        );
+    }
+
+    #[test]
+    fn rail_card_spans_keep_the_word_and_shed_the_detail() {
+        let text = |spans: &[ratatui::text::Span<'_>]| {
+            spans.iter().map(|s| s.content.to_string()).collect::<String>()
+        };
+        let (top, bottom) = super::rail_card_spans(
+            24,
+            true,
+            Some(AgentStatus::Waiting),
+            "a rather long pane name here",
+            |room| super::rail_card_detail(None, None, Some("~/code/some/deep/dir"), room),
+            false,
+            '⠋',
+        );
+        let (top, bottom) = (text(&top), text(&bottom));
+        assert!(top.ends_with('…'), "the name is elided, not clipped: {top:?}");
+        assert!(super::mouse::display_width(&top) <= 24);
+        assert_eq!(super::mouse::display_width(&bottom), 24, "{bottom:?}");
+        assert!(bottom.trim_end().ends_with(super::row_word(Some(AgentStatus::Waiting))));
+        assert!(bottom.contains('…'), "the detail is elided to make room: {bottom:?}");
+        // A rail too narrow for any detail keeps just the word.
+        let (_, narrow) = super::rail_card_spans(
+            18,
+            false,
+            Some(AgentStatus::Idle),
+            "x",
+            |_| "~/abc".into(),
+            true,
+            '⠋',
+        );
+        let narrow = text(&narrow);
+        assert!(!narrow.contains('~'), "{narrow:?}");
+        assert!(narrow.contains("raw · idle"), "{narrow:?}");
+    }
+
     #[test]
     fn rail_glyph_row_spans_carries_the_id_and_the_name() {
         let spans = super::rail_glyph_row_spans(
@@ -7511,14 +7709,16 @@ row's — widen ADAPTER_COL",
                 "no room for the right segment here: {header_row:?}"
             );
             // C43 breathing room: at this fixture's rail height (28 body
-            // rows for 3 panes) the spaced regime engages, so the marker's
-            // absolute row is `rail.y + 2 + 2*i`, not the old `2 + i`.
+            // rows for 3 panes) the spaced regime engages — as two-line
+            // cards at this labelled-tier width (2026-11-05), so the
+            // marker's absolute row is `rail.y + 1 + 2*i`, the card's
+            // first line, not the old `2 + i`.
             // Derived from the same `rail_layout` seam `draw_rail` reads,
             // rather than re-deriving the pitch by hand.
             let rail = app.rail_area().expect("solo view carries a rail");
             let rl = layout::rail_layout(rail.height, rows.len(), i);
             assert!(rl.spaced, "this fixture's height is exactly the case breathing room targets");
-            let marker_y = rail.y + 2 + 2 * i as u16;
+            let marker_y = rail.y + 1 + 2 * i as u16;
             let marker_row: String = (0..rw)
                 .filter_map(|x| buf.cell((x, marker_y)).map(|c| c.symbol().to_string()))
                 .collect();
@@ -7571,7 +7771,7 @@ row's — widen ADAPTER_COL",
         // spaced regime engages, so rows start at row 3 with a pitch of 2 —
         // same geometry the C43 solo-view fixture above pins at this size.
         let rail_row: String = (0..rw)
-            .filter_map(|x| buf.cell((x, 1 + 2 + 2 * i as u16)).map(|c| c.symbol().to_string()))
+            .filter_map(|x| buf.cell((x, 1 + 1 + 2 * i as u16)).map(|c| c.symbol().to_string()))
             .collect();
         assert!(rail_row.contains(&want), "the rail row carries the suffixed name: {rail_row:?}");
 
@@ -7608,7 +7808,7 @@ row's — widen ADAPTER_COL",
     /// `rail.y + 2 + 2*i`, with a genuinely blank row between each — nothing
     /// painted into the gap, not merely "no marker there".
     #[test]
-    fn a_spaced_rail_draws_rows_two_apart_with_a_blank_row_between() {
+    fn a_spaced_rail_draws_two_line_cards() {
         use crate::core::layout;
         use crate::ui::input::Action;
         use ratatui::backend::TestBackend;
@@ -7628,25 +7828,23 @@ row's — widen ADAPTER_COL",
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| super::draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
+        let line = |y: u16| -> String {
+            (0..rw).filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string())).collect()
+        };
 
         for i in 0..3u16 {
-            let pane_row_y = rail.y + 2 + 2 * i;
-            let gap_row_y = pane_row_y - 1;
-            let pane_row: String = (0..rw)
-                .filter_map(|x| buf.cell((x, pane_row_y)).map(|c| c.symbol().to_string()))
-                .collect();
+            let id = app.rail_rows()[i as usize];
+            let name_row = line(rail.y + 1 + 2 * i);
+            let detail_row = line(rail.y + 2 + 2 * i);
             assert!(
-                !pane_row.trim().is_empty(),
-                "row {pane_row_y} (pane {i}) is unexpectedly blank"
+                name_row.contains(&app.chrome_name(id)),
+                "card {i}'s first line is its name: {name_row:?}"
             );
-            let gap: String = (0..rw)
-                .filter_map(|x| buf.cell((x, gap_row_y)).map(|c| c.symbol().to_string()))
-                .collect();
-            assert_eq!(
-                gap.trim(),
-                "",
-                "row {gap_row_y} (the gap above pane row {i}) is not blank: {gap:?}"
+            assert!(
+                detail_row.trim_end().ends_with(super::row_word(app.display_status(id))),
+                "card {i}'s second line ends in its state word: {detail_row:?}"
             );
+            assert!(detail_row.starts_with("   "), "the detail is indented under the name");
         }
     }
 
