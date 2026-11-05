@@ -2340,9 +2340,11 @@ background.
 **[Amended 2026-11-05, the spawn error wraps]** The `spawn failed: …` line
 word-wraps to the pane's inner width (one column of air each side) instead
 of clipping; the cause is the tail of the reason, so clipping cut exactly
-the half that answers "why". The reason itself is folded to one line first
-(`dead_reason`): portable-pty's multi-line PATH-search failure, whose last
-line dumps the whole `$PATH`, reads `… because: not found on $PATH`.
+the half that answers "why". The action bar wins the space: the error gets
+at most `inner height − 1` rows, its last kept row `…`-marked. The reason
+itself is folded to one line first (`dead_reason`): portable-pty's
+multi-line PATH-search failure, whose last line dumps the whole `$PATH`,
+reads `spawning pi: pi not found on $PATH`.
 
 ### C17 — Copy-mode selection
 

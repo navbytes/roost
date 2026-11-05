@@ -26,11 +26,11 @@ const STUCK_WORKING: Duration = Duration::from_secs(45);
 const ACTIVE_WINDOW: Duration = Duration::from_secs(2);
 /// [2026-11-05] Output this soon after a PTY resize is the child repainting
 /// for its new size (SIGWINCH: a shell redraws its prompt, a TUI agent its
-/// whole screen), not work — so it does not count as activity. Without it,
-/// every split, close, zoom or terminal resize lit a spinner on each idle
-/// neighbour and logged an `idle → working` feed line for it. A pane that
-/// really is busy keeps producing past the window and promotes on the next
-/// chunk; one that was already Working stays so on its earlier output.
+/// whole screen), not work — so for a pane at rest it does not count as
+/// activity. Without it, every split, close, zoom or terminal resize lit a
+/// spinner on each idle neighbour and logged an `idle → working` feed line
+/// for it. A pane already producing output is never suppressed (so a long
+/// resize burst cannot decay it), and a pane's first output always counts.
 const RESIZE_REPAINT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +106,13 @@ impl StatusTracker {
     }
 
     pub fn on_output(&mut self) {
-        if self.resized_at.is_some_and(|t| t.elapsed() < RESIZE_REPAINT) {
-            return; // the resize repaint, not activity
+        // The resize repaint, not activity — but only for a pane that is at
+        // rest and has spoken before: a busy pane keeps refreshing through a
+        // resize burst (a terminal drag can outlast ACTIVE_WINDOW), and a
+        // pane's very first output still marks it as having run.
+        let repaint = self.resized_at.is_some_and(|t| t.elapsed() < RESIZE_REPAINT);
+        if repaint && self.last_output.is_some() && !self.recent_output() {
+            return;
         }
         self.last_output = Some(Instant::now());
     }
@@ -472,13 +477,30 @@ mod tests {
     /// once the window has passed counts as usual.
     #[test]
     fn a_resize_repaint_is_not_activity() {
+        let quiet = Instant::now().checked_sub(ACTIVE_WINDOW);
         let mut t = StatusTracker::new();
+        t.last_output = quiet; // spoke once, at rest since
         t.on_resize();
         t.on_output(); // the prompt redraw
-        assert_eq!(t.current(), AgentStatus::Idle);
+        assert_eq!(t.current(), AgentStatus::Waiting, "no phantom spinner");
         t.resized_at = Instant::now().checked_sub(RESIZE_REPAINT);
         t.on_output(); // real output, after the repaint window
         assert_eq!(t.current(), AgentStatus::Working);
+
+        // A pane's first output counts even inside the window.
+        let mut fresh = StatusTracker::new();
+        fresh.on_resize();
+        fresh.on_output();
+        assert_eq!(fresh.current(), AgentStatus::Working);
+
+        // A busy pane keeps refreshing through a resize burst: its output is
+        // never dropped while it is already active.
+        let mut busy = StatusTracker::new();
+        busy.on_output();
+        busy.on_resize();
+        busy.last_output = Instant::now().checked_sub(Duration::from_millis(1900));
+        busy.on_output();
+        assert!(busy.last_output.unwrap().elapsed() < Duration::from_millis(100), "refreshed");
     }
 
     #[test]

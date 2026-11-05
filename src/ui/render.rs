@@ -3146,8 +3146,21 @@ fn draw_pane<B: PaneBackend>(
             // the reason (`spawning pi: … not found on $PATH`), so a pane
             // narrower than the message used to cut off exactly the part
             // that answers "why". One column of air each side, as before.
+            // The action bar below wins the space: the error gets at most
+            // `inner.height - 1` rows, its last kept row `…`-marked.
             let text = format!("spawn failed: {err}");
-            for (row, _) in wrap_line(&text, inner.width.saturating_sub(2)) {
+            let room = usize::from(inner.height.saturating_sub(1));
+            let mut rows: Vec<String> = wrap_line(&text, inner.width.saturating_sub(2))
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect();
+            if rows.len() > room {
+                rows.truncate(room);
+                if let Some(last) = rows.last_mut() {
+                    *last = elide_to(&format!("{last} …"), inner.width.saturating_sub(2));
+                }
+            }
+            for row in rows {
                 lines.push(Line::from(Span::styled(format!(" {row} "), theme::accent())));
             }
         }

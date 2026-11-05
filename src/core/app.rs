@@ -8131,7 +8131,8 @@ pub(crate) fn abbreviate_home(cwd: &Path, home: Option<&Path>) -> String {
 /// spawn pi because:\nNo viable candidates found in PATH "…"`). Drawn on
 /// the one-line dead-pane bar, the newline went nowhere and the PATH dump
 /// pushed the actual answer off the row. `one_line_spawn_reason` folds it to
-/// one line and swaps the dump for `not found on $PATH`.
+/// one line and swaps the dump for `not found on $PATH`
+/// (`spawning pi: pi not found on $PATH`).
 fn dead_reason(e: &anyhow::Error) -> String {
     let full = one_line_spawn_reason(&format!("{e:#}"));
     if full.chars().count() <= DEAD_REASON_CAP {
@@ -8158,6 +8159,15 @@ fn one_line_spawn_reason(full: &str) -> String {
         .collect();
     if causes.is_empty() {
         head.to_string()
+    } else if causes == ["not found on $PATH"] {
+        // The only cause: say it once — `spawning pi: pi not found on $PATH`,
+        // not `… Unable to spawn pi because: not found on $PATH`.
+        match head.split_once("Unable to spawn ") {
+            Some((pre, rest)) if rest.ends_with(" because:") => {
+                format!("{pre}{} not found on $PATH", rest.trim_end_matches(" because:"))
+            }
+            _ => format!("{head} not found on $PATH"),
+        }
     } else {
         format!("{head} {}", causes.join("; "))
     }
@@ -15181,10 +15191,7 @@ pub(crate) mod tests {
             "Unable to spawn pi because:\nNo viable candidates found in PATH \"/usr/bin:/bin\""
         )
         .context("spawning pi");
-        assert_eq!(
-            dead_reason(&err),
-            "spawning pi: Unable to spawn pi because: not found on $PATH"
-        );
+        assert_eq!(dead_reason(&err), "spawning pi: pi not found on $PATH");
         // Other candidates' reasons survive, joined on one line.
         assert_eq!(
             one_line_spawn_reason(
