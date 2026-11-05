@@ -379,10 +379,10 @@ pub fn rail_row_at(
     let shown_i = rows.iter().position(|&id| id == shown).unwrap_or(0);
     let rl = crate::core::layout::rail_layout(rail.height, rows.len(), shown_i);
     let i = if rl.spaced {
-        // Each blank row pads the pane row directly below it, so it belongs
-        // to that row like a list item's padding — only the header (slot 0)
-        // hits nothing. Gap `1 + 2*i` and pane row `2 + 2*i` both floor-divide
-        // to row `i`: `(slot - 1) / 2`.
+        // Each pane owns two slots — `1 + 2*i` and `2 + 2*i` (a card's two
+        // lines at the labelled tier; a gap and the row it pads at the glyph
+        // tier) — and both floor-divide to row `i`: `(slot - 1) / 2`. Only
+        // the header (slot 0) hits nothing.
         slot.checked_sub(1)? / 2
     } else {
         // The `…` markers own the first and/or last body slot when the
@@ -1274,11 +1274,10 @@ mod tests {
         assert_eq!(rail_row_at(rail, &rows, 14, 0, 4), Some(14), "the shown row is reachable");
     }
 
-    /// C43 breathing room: in a spaced rail every pane row sits at
-    /// `rail.y + 2 + 2*i`, with a blank gap row above the first one and
-    /// between every pair. Only the header hits nothing — each gap row
-    /// belongs to the pane row it pads, so a click there resolves to the
-    /// same id as clicking the pane row itself.
+    /// C43 breathing room: in a spaced rail every pane owns the two slots
+    /// `rail.y + 1 + 2*i` and `rail.y + 2 + 2*i` (a two-line card at the
+    /// labelled tier; a gap and the row it pads at the glyph tier). Only the
+    /// header hits nothing — a click on either slot resolves to the same id.
     #[test]
     fn rail_row_at_a_spaced_rail_resolves_panes_and_their_padding_gaps_to_the_same_id() {
         // height 10, n=3: 1 + 2*3 = 7 <= 10, so this is the spaced regime.

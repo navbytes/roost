@@ -1773,6 +1773,13 @@ impl<B: PaneBackend> App<B> {
         Some(abbreviate_home(cwd, self.home.as_deref()))
     }
 
+    /// C43 (2026-11-05): any pane's working directory, `~`-abbreviated the
+    /// same way as `focused_cwd` — the solo rail's detail line.
+    pub fn pane_cwd(&self, id: PaneId) -> Option<String> {
+        let cwd = &self.find_spec(id)?.cwd;
+        Some(abbreviate_home(cwd, self.home.as_deref()))
+    }
+
     /// C22: mirrors `find_spec` — the float's spec is mutable too (rename).
     fn find_spec_mut(&mut self, id: PaneId) -> Option<&mut PaneSpec> {
         if let Some(spec) = self.overlays.spec_mut(id) {
@@ -5794,6 +5801,21 @@ impl<B: PaneBackend> App<B> {
     /// drawable; the milder failure (drawable, but none of the three canned
     /// shapes clear the floor) names the toggle instead — C25's own
     /// pre-solo wording pointed at `Alt+s`, which solo itself refuses.
+    /// [2026-11-05] C25: `Alt+g` names the stop it landed on — four shapes
+    /// on one key, two of which (main + stack, all-stack) can look alike at
+    /// a glance, and nothing said which one you were on or that the ring
+    /// had wrapped. `layout: main+stack (2/4)`; the position is what
+    /// teaches that the cycle has four stops and where the wrap is.
+    fn flash_layout_stop(&mut self, idx: usize) {
+        let name = match idx {
+            0 => "grid",
+            1 => "main+stack",
+            2 => "all-stack",
+            _ => "solo",
+        };
+        self.set_flash(format!("layout: {name} ({}/{LAYOUT_CYCLE_LEN})", idx + 1));
+    }
+
     fn cycle_layout(&mut self, forward: bool) {
         let order = self.pane_order();
         if order.len() < 2 {
@@ -5820,6 +5842,7 @@ impl<B: PaneBackend> App<B> {
                 }
                 self.enter_solo();
                 self.layout_cycle = (idx + 1) % LAYOUT_CYCLE_LEN as usize;
+                self.flash_layout_stop(idx);
                 return;
             }
             let node = arrangement_for(idx, &order, focused);
@@ -5839,6 +5862,7 @@ impl<B: PaneBackend> App<B> {
                 self.ws.active_tab_mut().layout = node;
                 self.ws.active_tab_mut().view = TabView::Tiled;
                 self.layout_cycle = (idx + 1) % LAYOUT_CYCLE_LEN as usize;
+                self.flash_layout_stop(idx);
                 return;
             }
         }
@@ -19358,7 +19382,8 @@ pub(crate) mod tests {
             before,
             "solo is a view, not a tree edit — the untileable tree is left exactly as it was"
         );
-        assert!(app.flash().is_none(), "landing on solo succeeds; it doesn't refuse");
+        // Landing on solo succeeds; it doesn't refuse — the flash names the stop.
+        assert_eq!(app.flash(), Some("layout: solo (4/4)"));
     }
 
     #[test]

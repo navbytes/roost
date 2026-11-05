@@ -3352,6 +3352,13 @@ as it was, not one of the three canned shapes, so there is no new ring
 position to record); leaving via `Alt+g`/`Alt+Shift+g` advances it like any
 other step. See C43 for the full model and C37 for the wrap this displaces.
 
+**[Amended 2026-11-05, the cycle names its stop]** A successful `Alt+g` /
+`Alt+Shift+g` flashes the stop it landed on and its place in the ring —
+`layout: grid (1/4)`, `main+stack (2/4)`, `all-stack (3/4)`, `solo
+(4/4)` — the names C25 and the keymap overlay already use. Main + stack and all-stack can look alike at a glance, and nothing
+said which one you were on or where the ring wraps. Refusals keep their
+own C38 flashes.
+
 ### C26 — Tab undo: scope statement — [Added 2026-07-22, fleet features]
 
 **Current = already implemented.** Verified in the working tree: the undo
@@ -6605,6 +6612,25 @@ row it pads: the gap at `rail.y + 1 + 2*i` and the pane row at `rail.y + 2 +
 so a click on either lands the same focus change. In the spaced regime only
 the header (`slot == 0`) hits nothing now; the contiguous and windowed
 regimes are unchanged — they have no gap rows to reinterpret.
+
+**[Amended 2026-11-05, cards — Naveen asked for a better sidebar.]** At
+the labelled tier the spaced regime's blank row is no longer blank: each
+pane is a two-line card. Line 1 is `▎` marker · glyph · name, the name
+taking every remaining column (`…`-elided). Line 2, indented under the
+name, is a quiet detail on the left and the state word right-aligned
+(`raw · ` before it in raw mode) — on every card alike, where the
+one-line C8 row used to shed `adapter · word` on some rows and not
+others, so the column read as random. The detail is `adapter · cwd` for
+a pane the user named, else the cwd; a path is cut from the left
+(`…/claude/roost`) because its tail names the place (`rail_card_detail`,
+`rail_card_spans`). A parked note leads the detail as C8's `ink()` `¶`
+marker only — C32's reveal-on-visit rule keeps its text to the focused
+pane's badge. The card's first line sits on
+the old gap row (`rail.y + 1 + 2*i`), so the two slots per pane and
+`mouse::rail_row_at`'s `(slot − 1) / 2` hit-test are unchanged; there is
+no longer a blank row under the header. The contiguous and windowed
+regimes, and the glyph tier, are unchanged — a card needs the spaced
+regime's second row, and spacing is still the first thing to give up.
 
 **Keys inside a solo tab.** Every chord keeps its `Action`; only dispatch
 is solo-aware:
