@@ -6652,6 +6652,28 @@ unchanged; the contiguous and windowed regimes keep the one-line glyph
 row. herdr, the nearest peer, drops names entirely in its collapsed
 sidebar (number + glyph); this keeps them.
 
+**[Amended 2026-11-05, drag to resize — Naveen asked for herdr's
+drag-to-resize.]** A left press on the rail's edge (the shown pane's left
+border, the column just right of the rail) starts a width drag; the edge
+follows the pointer and the PTY reflows as it moves, the same live
+behaviour as a U21 seam drag, and like one it moves no focus. The width
+snaps to a tier the rail can draw (`layout::snap_rail_cols`): below 16
+columns (the midpoint between the tiers) it lands on the glyph tier's 12,
+from 16 up on the labelled tier, clamped to `[20, 40]` and to whatever
+leaves the pane 40 columns — a body under 60 columns has no labelled width
+that does, so it keeps the glyph tier, as the automatic width already
+does. `validate_and_repair` drops a persisted value outside `{12} ∪
+[20, 40]` back to automatic. It persists as `Workspace::rail_cols` (absent
+from `workspace.json` when unset) and applies to every solo tab; a body
+under 40 columns still has no rail, preference or not. Dragging back onto
+the automatic `rail_width` clears the preference — that is the reset, so
+there is no extra key. A drag whose release never arrives (let go over the
+tab strip, or a modal taking the mouse) ends at the next press and never
+outlives the rail (`App::rail_dragging`). herdr's range is 18–36 with a 26 default; roost's
+automatic width stays what it was. The **[Tried 2026-09-20, reverted]**
+content-fit width under `rail_width` is not revived: a dragged width is
+fixed until the next drag, so it cannot jitter with an agent's title.
+
 **Keys inside a solo tab.** Every chord keeps its `Action`; only dispatch
 is solo-aware:
 

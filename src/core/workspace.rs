@@ -81,6 +81,11 @@ pub struct Workspace {
     pub version: u32,
     pub active_tab: usize,
     pub tabs: Vec<Tab>,
+    /// C43 (amended 2026-11-05): the solo rail's width as the user last
+    /// dragged it, `None` for the automatic `layout::rail_width`. Absent
+    /// from `workspace.json` when unset, so old saves round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rail_cols: Option<u16>,
 }
 
 impl Workspace {
@@ -100,6 +105,7 @@ impl Workspace {
             },
         );
         Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -144,6 +150,16 @@ impl Workspace {
     /// minimal shell spec so it renders and spawns instead of being a blank
     /// hole. A well-formed workspace is unchanged. Also clamps `active_tab`.
     pub fn validate_and_repair(&mut self) {
+        // C43: a hand-edited rail width the drag could never produce is
+        // dropped back to automatic rather than pinning an odd tier.
+        if self.rail_cols.is_some_and(|c| {
+            c != crate::core::layout::RAIL_GLYPH_COLS
+                && !(crate::core::layout::RAIL_LABELLED_MIN_COLS
+                    ..=crate::core::layout::RAIL_MAX_COLS)
+                    .contains(&c)
+        }) {
+            self.rail_cols = None;
+        }
         // A pane id keys `runtimes` globally, so one id in two positions —
         // repeated inside a tree, or shared between two tabs — means both
         // draw and type through a single PTY, `tab_of` answers with
@@ -435,14 +451,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "a workspace always has at least one tab")]
     fn active_tab_on_an_empty_workspace_panics_clearly_not_via_underflow() {
-        let empty = Workspace { version: 1, active_tab: 0, tabs: Vec::new() };
+        let empty = Workspace { rail_cols: None, version: 1, active_tab: 0, tabs: Vec::new() };
         let _ = empty.active_tab();
     }
 
     #[test]
     #[should_panic(expected = "a workspace always has at least one tab")]
     fn active_tab_mut_on_an_empty_workspace_panics_clearly_not_via_underflow() {
-        let mut empty = Workspace { version: 1, active_tab: 0, tabs: Vec::new() };
+        let mut empty = Workspace { rail_cols: None, version: 1, active_tab: 0, tabs: Vec::new() };
         let _ = empty.active_tab_mut();
     }
 
@@ -557,6 +573,24 @@ mod tests {
         let old_json = r#"{"name":"main","layout":{"pane":1},"panes":{}}"#;
         let old: Tab = serde_json::from_str(old_json).expect("an old tab still loads");
         assert_eq!(old.focus, None);
+    }
+
+    /// C43: a persisted rail width the drag could not have produced goes
+    /// back to automatic; one it could have survives, and none round-trips
+    /// with no key at all.
+    #[test]
+    fn validate_and_repair_drops_an_impossible_rail_width() {
+        let mut ws = Workspace::default_in(PathBuf::from("/tmp"));
+        for (bad, good) in [(0, 12), (15, 20), (41, 40)] {
+            ws.rail_cols = Some(bad);
+            ws.validate_and_repair();
+            assert_eq!(ws.rail_cols, None, "{bad} is not a drawable rail width");
+            ws.rail_cols = Some(good);
+            ws.validate_and_repair();
+            assert_eq!(ws.rail_cols, Some(good));
+        }
+        ws.rail_cols = None;
+        assert!(!serde_json::to_string(&ws).unwrap().contains("rail_cols"));
     }
 
     /// A hand-edited or corrupted `workspace.json` can name a `focus` that

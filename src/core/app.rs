@@ -656,6 +656,10 @@ pub struct App<B: PaneBackend> {
     /// button-down like `mouse_latch` and for the same reason — the pointer
     /// leaves the two-cell border almost immediately once the drag starts.
     resize_drag: Option<crate::ui::mouse::Seam>,
+    /// C43 (amended 2026-11-05): a left-drag on the solo rail's edge is in
+    /// progress — latched at button-down for the same reason as
+    /// `resize_drag`.
+    rail_drag: bool,
     /// C29: the last left click's (pane, row, col, count, at), for native
     /// selection's double/triple-click detection. Crossterm reports no
     /// click count — see `click_count`.
@@ -772,6 +776,7 @@ impl<B: PaneBackend> App<B> {
             pending_open: None,
             mouse_latch: None,
             resize_drag: None,
+            rail_drag: false,
             last_click: None,
             pending_copy: None,
             host_out: Vec::new(),
@@ -1058,7 +1063,7 @@ impl<B: PaneBackend> App<B> {
             // is now showing. `solo_shown` resolves it the same way
             // `close_pane_id`'s U11 fallback and `hide_float`/`close_float`
             // do instead.
-            v.push(layout::solo_rects(body, self.solo_shown()).1);
+            v.push(layout::solo_rects(body, self.solo_shown(), self.ws.rail_cols).1);
         } else {
             v.extend(self.rects());
         }
@@ -1265,6 +1270,51 @@ impl<B: PaneBackend> App<B> {
         self.resize_drag.is_some()
     }
 
+    /// C43 (amended 2026-11-05, drag to resize): a left press on the
+    /// rail's edge — the shown pane's left border, the column just right of
+    /// the rail — starts a width drag. Like a seam drag it moves no focus.
+    pub fn begin_rail_drag(&mut self, col: u16, row: u16) -> bool {
+        self.rail_drag = false;
+        let Some(rail) = self.rail_area() else { return false };
+        let on_edge = col == rail.x + rail.width && row >= rail.y && row < rail.y + rail.height;
+        self.rail_drag = on_edge;
+        on_edge
+    }
+
+    /// The pointer moved during a rail drag: put the rail's edge under it,
+    /// snapped to a width the rail can draw (`layout::snap_rail_cols`). A
+    /// width that lands back on the automatic one clears the preference,
+    /// so dragging back is how you reset it.
+    pub fn drag_rail(&mut self, col: u16) {
+        if !self.rail_drag {
+            return;
+        }
+        let body = self.body_area();
+        let want = layout::snap_rail_cols(col.saturating_sub(body.x), body.width);
+        let pref = (want != layout::rail_width(body.width)).then_some(want);
+        if pref != self.ws.rail_cols {
+            self.ws.rail_cols = pref;
+            self.relayout();
+        }
+    }
+
+    /// The rail drag ended: save once, not per drag event (as
+    /// `end_seam_drag`).
+    pub fn end_rail_drag(&mut self) {
+        if std::mem::take(&mut self.rail_drag) {
+            self.save();
+        }
+    }
+
+    /// A latch only counts while a rail is actually drawn: one left set
+    /// by a release that never reached `handle_mouse`'s rail block (let go
+    /// over the tab strip, a modal or copy mode taking the mouse, a release
+    /// outside the window) must not swallow a later seam or selection drag
+    /// in a tiled or zoomed tab. The next press clears it for good.
+    pub fn rail_dragging(&self) -> bool {
+        self.rail_drag && self.rail_area().is_some()
+    }
+
     pub fn pane_order(&self) -> Vec<PaneId> {
         let mut v = Vec::new();
         layout::pane_order(&self.ws.active_tab().layout, &mut v);
@@ -1280,7 +1330,7 @@ impl<B: PaneBackend> App<B> {
             return None;
         }
         let body = self.body_area();
-        let rw = layout::rail_width(body.width);
+        let rw = layout::rail_width_pref(body.width, self.ws.rail_cols);
         (rw > 0).then_some(Rect { x: body.x, y: body.y, width: rw, height: body.height })
     }
 
@@ -12698,6 +12748,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -12834,6 +12885,7 @@ pub(crate) mod tests {
             },
         );
         Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -12918,6 +12970,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -12983,6 +13036,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -14245,6 +14299,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -14373,6 +14428,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -14468,6 +14524,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -14605,6 +14662,7 @@ pub(crate) mod tests {
             children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
         };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -14688,6 +14746,7 @@ pub(crate) mod tests {
             children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
         };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -14785,6 +14844,7 @@ pub(crate) mod tests {
             children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
         };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -14886,6 +14946,7 @@ pub(crate) mod tests {
             children: vec![LayoutNode::Pane(1), LayoutNode::Pane(2)],
         };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -16199,6 +16260,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -17671,6 +17733,7 @@ pub(crate) mod tests {
         }
         let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 0, from: None };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -17719,6 +17782,7 @@ pub(crate) mod tests {
         }
         let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 2, from: None };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -17768,6 +17832,7 @@ pub(crate) mod tests {
         let panes0 = HashMap::from([(1u64, spec())]);
         let panes1 = HashMap::from([(4u64, spec()), (5, spec()), (6, spec()), (7, spec())]);
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![
@@ -17842,6 +17907,7 @@ pub(crate) mod tests {
             },
         );
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -17911,6 +17977,7 @@ pub(crate) mod tests {
         }
         let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -17959,6 +18026,7 @@ pub(crate) mod tests {
         }
         let layout = LayoutNode::Stack { children: vec![1, 2, 3], expanded: 1, from: None };
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -18077,6 +18145,7 @@ pub(crate) mod tests {
         let (layout0, panes0) = row(&[1, 2]);
         let (layout1, panes1) = row(&[10, 11, 12]);
         Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![
@@ -18377,6 +18446,7 @@ pub(crate) mod tests {
             panes1.insert(id, spec());
         }
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![

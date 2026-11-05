@@ -1008,6 +1008,33 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
         return;
     }
 
+    // C43 (amended 2026-11-05): dragging the rail's edge resizes it. Ahead
+    // of the rail block below, because the pointer crosses into the rail
+    // while narrowing it and that block would swallow the drag. A float
+    // drawn over the edge keeps its own clicks.
+    if matches!(me.kind, MouseEventKind::Down(_)) {
+        app.end_rail_drag(); // a stale latch (see `rail_dragging`) ends here
+    }
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left)
+            if !mouse::hit_test(&app.display_rects(), me.column, me.row)
+                .is_some_and(|pr| app.is_overlay(pr.id))
+                && app.begin_rail_drag(me.column, me.row) =>
+        {
+            app.release_mouse_gesture();
+            return;
+        }
+        MouseEventKind::Drag(_) if app.rail_dragging() => {
+            app.drag_rail(me.column);
+            return;
+        }
+        MouseEventKind::Up(_) if app.rail_dragging() => {
+            app.end_rail_drag();
+            return;
+        }
+        _ => {}
+    }
+
     // C43: the solo-view rail — a left press on a row focuses that pane
     // (`on_click`, the tab strip's and roster's own click-to-focus rule);
     // every other event inside the rail (wheel included) is consumed and
@@ -1877,6 +1904,49 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    /// C43 (amended 2026-11-05): drag the solo rail's edge to widen it, and
+    /// drag it back to the automatic width to clear the preference.
+    #[test]
+    fn dragging_the_rail_edge_resizes_the_solo_rail() {
+        let mut app = mk_app();
+        app.apply(Action::NewPane);
+        app.apply(Action::ToggleSolo);
+        let rail = app.rail_area().expect("solo draws a rail at this width");
+        let auto = rail.width;
+        let edge = rail.x + rail.width;
+        let row = rail.y + 2;
+
+        handle_mouse(&mut app, click(edge, row));
+        assert!(app.rail_dragging(), "a press on the rail's edge starts a drag");
+        handle_mouse(&mut app, drag_to(rail.x + 30, row));
+        handle_mouse(&mut app, release_at(rail.x + 30, row));
+        assert!(!app.rail_dragging(), "the release ends it");
+        assert_eq!(app.ws.rail_cols, Some(30), "the width is remembered");
+        assert_eq!(app.rail_area().unwrap().width, 30);
+        let shown = app.solo_shown();
+        let pane = app.display_rects().into_iter().find(|p| p.id == shown).unwrap().rect;
+        assert_eq!(pane.x, rail.x + 30, "the shown pane starts where the rail ends");
+
+        // Dragging back onto the automatic width clears the preference.
+        handle_mouse(&mut app, click(rail.x + 30, row));
+        handle_mouse(&mut app, drag_to(rail.x + auto, row));
+        handle_mouse(&mut app, release_at(rail.x + auto, row));
+        assert_eq!(app.ws.rail_cols, None);
+
+        // A press inside the rail is still a row click, not a drag.
+        handle_mouse(&mut app, click(rail.x + 2, row));
+        assert!(!app.rail_dragging());
+
+        // A drag whose release never arrives does not outlive the rail: in
+        // a tiled tab the latch is dead, and the next press clears it.
+        handle_mouse(&mut app, click(rail.x + auto, row));
+        assert!(app.rail_dragging());
+        app.apply(Action::ToggleSolo); // back to tiled, mid-drag
+        assert!(!app.rail_dragging(), "no rail, no rail drag");
+        handle_mouse(&mut app, drag_to(rail.x + 30, row));
+        assert_eq!(app.ws.rail_cols, None, "a tiled drag never touches the rail width");
     }
 
     /// U21: press the seam between two side-by-side panes, drag right, and
