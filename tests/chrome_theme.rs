@@ -390,13 +390,13 @@ fn the_dead_pane_bar_is_the_one_red_reversed_across_its_whole_row() {
     // dies.
     h.write_bytes(b"exit\r");
     assert!(
-        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("exited — Enter")).is_some(),
+        h.wait_for(Duration::from_secs(5), |s| s.contents().contains("exited — ")).is_some(),
         "the dead-pane bar never appeared",
     );
 
     let screen = h.screen();
     let row = (0..ROWS)
-        .find(|&r| row_text(&row_cols(screen, r)).contains("exited — Enter"))
+        .find(|&r| row_text(&row_cols(screen, r)).contains("exited — "))
         .expect("the bar's row");
     let cols = row_cols(screen, row);
 

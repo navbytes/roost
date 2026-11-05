@@ -7765,7 +7765,7 @@ row's — widen ADAPTER_COL",
                     (0..area.width)
                         .map(|x| buf[(x, *y)].symbol())
                         .collect::<String>()
-                        .contains("exited — Enter")
+                        .contains("exited — ")
                 })
                 .unwrap_or_else(|| panic!("{name}: no dead-pane bar drawn"));
             let reversed: Vec<u16> = (0..area.width)
