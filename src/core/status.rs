@@ -24,6 +24,14 @@ use std::time::{Duration, Instant};
 const STUCK_WORKING: Duration = Duration::from_secs(45);
 /// Output within this window counts as "actively producing".
 const ACTIVE_WINDOW: Duration = Duration::from_secs(2);
+/// [2026-11-05] Output this soon after a PTY resize is the child repainting
+/// for its new size (SIGWINCH: a shell redraws its prompt, a TUI agent its
+/// whole screen), not work — so for a pane at rest it does not count as
+/// activity. Without it, every split, close, zoom or terminal resize lit a
+/// spinner on each idle neighbour and logged an `idle → working` feed line
+/// for it. A pane already producing output is never suppressed (so a long
+/// resize burst cannot decay it), and a pane's first output always counts.
+const RESIZE_REPAINT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -41,6 +49,8 @@ pub enum AgentStatus {
 
 pub struct StatusTracker {
     last_output: Option<Instant>,
+    /// When the pane's PTY was last resized — see `RESIZE_REPAINT`.
+    resized_at: Option<Instant>,
     exited: bool,
     /// Exact status pushed by an extension/hook, plus when it arrived.
     extension_status: Option<AgentStatus>,
@@ -83,6 +93,7 @@ impl StatusTracker {
     pub fn new() -> Self {
         Self {
             last_output: None,
+            resized_at: None,
             exited: false,
             extension_status: None,
             ext_at: None,
@@ -95,7 +106,21 @@ impl StatusTracker {
     }
 
     pub fn on_output(&mut self) {
+        // The resize repaint, not activity — but only for a pane that is at
+        // rest and has spoken before: a busy pane keeps refreshing through a
+        // resize burst (a terminal drag can outlast ACTIVE_WINDOW), and a
+        // pane's very first output still marks it as having run.
+        let repaint = self.resized_at.is_some_and(|t| t.elapsed() < RESIZE_REPAINT);
+        if repaint && self.last_output.is_some() && !self.recent_output() {
+            return;
+        }
         self.last_output = Some(Instant::now());
+    }
+
+    /// The pane's PTY changed size; output in the next `RESIZE_REPAINT` is
+    /// its repaint.
+    pub fn on_resize(&mut self) {
+        self.resized_at = Some(Instant::now());
     }
 
     /// The pane emitted a bell (0x07). Recorded as a heuristic attention
@@ -447,6 +472,37 @@ mod tests {
     /// rendering, a resize repaint. This is the bug itself: byte noise used
     /// to repaint ● Working for 1-2s on every one of those, though the
     /// extension (whose agent_start/agent_settled are exact) reported nothing.
+    /// [2026-11-05] A SIGWINCH repaint right after a resize is not work: an
+    /// idle shell redrawing its prompt must not light the spinner. Output
+    /// once the window has passed counts as usual.
+    #[test]
+    fn a_resize_repaint_is_not_activity() {
+        let quiet = Instant::now().checked_sub(ACTIVE_WINDOW);
+        let mut t = StatusTracker::new();
+        t.last_output = quiet; // spoke once, at rest since
+        t.on_resize();
+        t.on_output(); // the prompt redraw
+        assert_eq!(t.current(), AgentStatus::Waiting, "no phantom spinner");
+        t.resized_at = Instant::now().checked_sub(RESIZE_REPAINT);
+        t.on_output(); // real output, after the repaint window
+        assert_eq!(t.current(), AgentStatus::Working);
+
+        // A pane's first output counts even inside the window.
+        let mut fresh = StatusTracker::new();
+        fresh.on_resize();
+        fresh.on_output();
+        assert_eq!(fresh.current(), AgentStatus::Working);
+
+        // A busy pane keeps refreshing through a resize burst: its output is
+        // never dropped while it is already active.
+        let mut busy = StatusTracker::new();
+        busy.on_output();
+        busy.on_resize();
+        busy.last_output = Instant::now().checked_sub(Duration::from_millis(1900));
+        busy.on_output();
+        assert!(busy.last_output.unwrap().elapsed() < Duration::from_millis(100), "refreshed");
+    }
+
     #[test]
     fn fresh_output_does_not_override_resting_while_link_is_live() {
         let mut t = StatusTracker::new();

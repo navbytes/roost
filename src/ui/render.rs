@@ -205,7 +205,7 @@ fn hint_pairs(
     let alt = |actions: &'static [Action], spelling: &'static str, d: &'static str| {
         // The hint bar has its own fit/yield machinery (pairs drop whole from
         // the right), so a long label needs no elision here — C9 absorbs it.
-        help_key_text(&HelpKey::Family(spelling, actions), "", &b).map(|k| (k, d))
+        help_key_text(&HelpKey::Family(spelling, actions), &b).map(|k| (k, d))
     };
     match mode {
         // C24: keyboard cursor + mouse drag — every Copy-mode key is on this
@@ -1036,16 +1036,48 @@ fn picker_dialog_width(cwds: &[std::path::PathBuf]) -> u16 {
 /// terminal size.
 ///
 /// So: pad to the 18-column grid when the key fits it, and otherwise fall
-/// back to exactly one space. Rows under 18 render byte-identically to
-/// before; only the ones that were broken move. `elide_key` and
+/// back to exactly one space. [Superseded 2026-11-05: a key wider than the
+/// grid is now shortened to fit it (`fit_help_key`), so every description
+/// starts on the same column; the one-space floor stays as a backstop.] `fit_help_key` and
 /// `help_content_width` both measure through here, so the extra column is
 /// accounted for in the floor rather than smuggled past it — see
 /// `HELP_COL_FLOOR`, which had to be corrected in the same pass: it read 80
 /// where the dialog can only draw 77, and this extra column was what finally
 /// made three columns of slop matter.
 fn help_key_prefix(key: &str) -> String {
-    let pad = (18usize).saturating_sub(mouse::display_width(key) as usize).max(1);
-    format!(" {key}{}", " ".repeat(pad))
+    let key = fit_help_key(key);
+    let pad = usize::from(HELP_KEY_COL + 1).saturating_sub(mouse::display_width(&key) as usize);
+    format!(" {key}{}", " ".repeat(pad.max(1)))
+}
+
+/// [2026-11-05] C15: the key column's width. Every description starts one
+/// column past it, so the overlay reads as two columns. It used to be a
+/// minimum (`{key:<18}`), and the six default keys wider than 17 pushed
+/// their descriptions off the column — the mark/pull row by eight. It
+/// cannot grow instead: the widest description already meets the 80-column
+/// floor (`HELP_COL_FLOOR`) at this width.
+const HELP_KEY_COL: u16 = 17;
+
+/// [2026-11-05] C15: a key wider than `HELP_KEY_COL` is shortened with
+/// `…` rather than allowed to push its description out of line — at a
+/// `" / "` chord boundary when one fits (no chord shown half-spelled),
+/// else at a word boundary, else mid-word. Display-only: filtering and
+/// `↵` still read the row's full key.
+fn fit_help_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if mouse::display_width(key) <= HELP_KEY_COL {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    for sep in [" / ", " "] {
+        let parts: Vec<&str> = key.split(sep).collect();
+        if let Some(cut) = (1..parts.len())
+            .rev()
+            .map(|n| format!("{} …", parts[..n].join(sep)))
+            .find(|c| mouse::display_width(c) <= HELP_KEY_COL)
+        {
+            return std::borrow::Cow::Owned(cut);
+        }
+    }
+    std::borrow::Cow::Owned(elide_to(key, HELP_KEY_COL))
 }
 
 /// F1: the chord table with no config.json applied — what `HelpKey::Family`
@@ -1089,10 +1121,13 @@ fn join_chords(actions: &[Action], bindings: &[(String, Action)]) -> Option<Stri
 /// measured rather than reasoned.
 ///
 /// So it is derived here rather than restated, because the derivation is the
-/// part that was wrong.
+/// part that was wrong. [2026-11-05] Test-only now: `fit_help_key` bounds
+/// the key column, and the floor tests pin every row against this.
+#[cfg(test)]
 const HELP_COL_FLOOR: u16 = HELP_FLOOR_COLS - HELP_DIALOG_CHROME;
 
 /// The terminal width C15's floor is written against.
+#[cfg(test)]
 const HELP_FLOOR_COLS: u16 = 80;
 
 /// What `help_layout` adds to a column of content: a border each side, and
@@ -1100,48 +1135,20 @@ const HELP_FLOOR_COLS: u16 = 80;
 /// The key column already opens with a space, which is the left-hand air.
 const HELP_DIALOG_CHROME: u16 = 3;
 
-/// C34/C15: keep a resolved key column inside the floor by eliding **the
-/// key**, never the description.
+/// C34/C15: an enumerated chord family is unbounded (disabling `Alt+←`
+/// alone makes the focus row spell eight chords), so a resolved key column
+/// is kept inside the floor by eliding **the key**, never the description —
+/// `fit_help_key`, applied where every row is drawn and measured
+/// (`help_key_prefix`). (Found by the design-supervisor audit of C34.)
 ///
-/// Before C34 a row's key was authored text of known width, so the floor
-/// was a thing you checked once. It is derived now, and an enumerated
-/// family is unbounded: disabling `Alt+←` alone makes the focus row spell
-/// eight chords and pushes its column to 107, which at an 80-column
-/// terminal clips the description — the exact failure C15's width rule
-/// exists to prevent, reintroduced by the mechanism meant to make the row
-/// truthful. (Found by the design-supervisor audit of C34, measured rather
-/// than predicted.)
-///
-/// The key yields because the description is the row's irreplaceable half:
-/// a reader who sees two of eight chords still learns what the row is for
-/// and can widen the terminal for the rest, while a clipped description
-/// teaches nothing at any width. Elision lands on a `" / "` boundary so a
-/// chord is never shown half-spelled, and `…` marks that more exist. A
-/// single chord that still doesn't fit is left alone: that is authored
-/// width, not something this function created.
-fn elide_key(key: String, desc: &str) -> String {
-    let fits = |k: &str| {
-        mouse::display_width(&help_key_prefix(k)) + mouse::display_width(desc) <= HELP_COL_FLOOR
-    };
-    if fits(&key) {
-        return key;
-    }
-    let parts: Vec<&str> = key.split(" / ").collect();
-    (1..parts.len())
-        .rev()
-        .map(|n| format!("{} …", parts[..n].join(" / ")))
-        .find(|candidate| fits(candidate))
-        .unwrap_or(key)
-}
-
 /// F1: a row's key column, resolved against the live keymap.
-fn help_key_text(key: &HelpKey, desc: &str, bindings: &[(String, Action)]) -> Option<String> {
+fn help_key_text(key: &HelpKey, bindings: &[(String, Action)]) -> Option<String> {
     match key {
         // Authored text of known width — the control-CLI block and the
         // legends. Not elided: it names no chord this function resolved, so
         // there is no " / " here that is safe to cut.
         HelpKey::Text(s) | HelpKey::Reference(s) => Some((*s).to_string()),
-        HelpKey::Chords(actions) => join_chords(actions, bindings).map(|k| elide_key(k, desc)),
+        HelpKey::Chords(actions) => join_chords(actions, bindings),
         HelpKey::Family(spelling, actions) => {
             let live = join_chords(actions, bindings)?;
             // The compact spelling is a display shorthand for the default
@@ -1151,7 +1158,7 @@ fn help_key_text(key: &HelpKey, desc: &str, bindings: &[(String, Action)]) -> Op
             if join_chords(actions, default_bindings()).as_deref() == Some(live.as_str()) {
                 Some((*spelling).to_string())
             } else {
-                Some(elide_key(live, desc))
+                Some(live)
             }
         }
     }
@@ -1273,7 +1280,7 @@ fn help_lines(keymap: &Keymap, filter: &str) -> Vec<HelpLine> {
             .rows
             .iter()
             .filter_map(|r| {
-                help_key_text(&r.key, r.desc, &bindings)
+                help_key_text(&r.key, &bindings)
                     .map(|k| HelpLine::Row(k, r.desc, help_row_kind(&r.key)))
             })
             .filter(|l| help_row_matches(l, filter))
@@ -1544,7 +1551,7 @@ fn draw_help_columns(
                 // rather than a column of its own: `help_key_prefix` opens
                 // with one, `❯` is single-width, and the row measures the
                 // same either way — so the palette's mark cannot widen the
-                // dialog, cannot re-trip `elide_key`, and cannot move
+                // dialog, cannot re-trip `fit_help_key`, and cannot move
                 // `HELP_COL_FLOOR`. The glyph is C14's picker marker and
                 // C27's roster marker, the same "↵ acts on this row" idiom
                 // in its third overlay, so nothing new is being taught.
@@ -1560,7 +1567,7 @@ fn draw_help_columns(
                     // column, and the `Paragraph` used to clip it mid-word
                     // with nothing to show for it — on the one surface
                     // whose whole job is being readable when you are lost.
-                    // `elide_key` already does this for the key column.
+                    // `fit_help_key` already does this for the key column.
                     let room = width.saturating_sub(mouse::display_width(&key));
                     // In the palette the cursor skips rows `↵` cannot run, so
                     // those rows' keys step down to the quiet red and the row
@@ -3142,7 +3149,27 @@ fn draw_pane<B: PaneBackend>(
     if status == AgentStatus::Exited && inner.height > 0 {
         let mut lines: Vec<Line<'_>> = Vec::new();
         if let Some(err) = app.dead.get(&pr.id) {
-            lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
+            // [2026-11-05] Wrapped, not clipped: the cause is the tail of
+            // the reason (`spawning pi: … not found on $PATH`), so a pane
+            // narrower than the message used to cut off exactly the part
+            // that answers "why". One column of air each side, as before.
+            // The action bar below wins the space: the error gets at most
+            // `inner.height - 1` rows, its last kept row `…`-marked.
+            let text = format!("spawn failed: {err}");
+            let room = usize::from(inner.height.saturating_sub(1));
+            let mut rows: Vec<String> = wrap_line(&text, inner.width.saturating_sub(2))
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect();
+            if rows.len() > room {
+                rows.truncate(room);
+                if let Some(last) = rows.last_mut() {
+                    *last = elide_to(&format!("{last} …"), inner.width.saturating_sub(2));
+                }
+            }
+            for row in rows {
+                lines.push(Line::from(Span::styled(format!(" {row} "), theme::accent())));
+            }
         }
         let resumable = app.resume_command_line(pr.id).is_some();
         lines.push(Line::from(Span::raw(dead_bar_text(
@@ -5811,9 +5838,11 @@ mod tests {
                 _ => None,
             })
             .expect("a focus row");
-        assert!(focus.ends_with(" …"), "elision is marked: {focus}");
-        for chord in focus.trim_end_matches(" …").split(" / ") {
-            assert!(chord.starts_with("Alt+"), "no chord is cut mid-spelling: {focus}");
+        let drawn = super::help_key_prefix(&focus);
+        let drawn = drawn.trim();
+        assert!(drawn.ends_with(" …"), "elision is marked: {drawn}");
+        for chord in drawn.trim_end_matches(" …").split(" / ") {
+            assert!(chord.starts_with("Alt+"), "no chord is cut mid-spelling: {drawn}");
         }
         // And the description survived intact — it is the half that cannot
         // be reconstructed by widening the terminal.
@@ -5822,6 +5851,22 @@ mod tests {
                 if d == "move focus (←/→ continue to next/prev tab at an edge)")
         });
         assert!(full, "the description is never what yields");
+    }
+
+    /// [2026-11-05] Every description starts on one column: a key wider
+    /// than the key column is shortened, never allowed to push its row out.
+    #[test]
+    fn every_help_description_starts_on_one_column() {
+        for line in help_lines(&Keymap::default(), "") {
+            let HelpLine::Row(k, _, _) = line else { continue };
+            let prefix = super::help_key_prefix(&k);
+            assert_eq!(
+                super::mouse::display_width(&prefix),
+                super::HELP_KEY_COL + 2,
+                "{k:?} drew as {prefix:?}"
+            );
+            assert!(super::mouse::display_width(&prefix) < super::HELP_COL_FLOOR);
+        }
     }
 
     /// C34/D2: C9's attention segment is the jump chord's discoverability
@@ -5941,11 +5986,8 @@ mod tests {
         // in what the reader sees.
         let bindings = input::effective_bindings(&Keymap::default());
         let tabs = HELP_GROUPS.iter().find(|g| g.title == "TABS").expect("a TABS group");
-        let keys: Vec<String> = tabs
-            .rows
-            .iter()
-            .filter_map(|r| super::help_key_text(&r.key, r.desc, &bindings))
-            .collect();
+        let keys: Vec<String> =
+            tabs.rows.iter().filter_map(|r| super::help_key_text(&r.key, &bindings)).collect();
         let step = keys.iter().position(|k| k == "Alt+m / Alt+Shift+m").expect("the step row");
         let carry = keys.iter().position(|k| k.starts_with("Alt+i /")).expect("the carry row");
         assert_eq!(carry, step + 1, "the carry pair sits directly under the step pair");
@@ -6580,7 +6622,7 @@ mod tests {
     /// **costs no column** — it spends the space `help_key_prefix` already
     /// opens every key column with. That last clause is the one worth
     /// gating: the alternative (a marker column of its own) would widen
-    /// every row by one, which re-trips `elide_key` and moves
+    /// every row by one, which re-trips `fit_help_key` and moves
     /// `HELP_COL_FLOOR` — the exact accounting C38/C39 had to correct twice
     /// already. Compare the drawn row against the unfiltered overlay's own
     /// width for the same query, so the check is a measurement rather than
@@ -6857,7 +6899,7 @@ row's — widen ADAPTER_COL",
             .rows
             .iter()
             .filter_map(|r| {
-                super::help_key_text(&r.key, r.desc, &bindings).map(|k| format!("{k} {}", r.desc))
+                super::help_key_text(&r.key, &bindings).map(|k| format!("{k} {}", r.desc))
             })
             .collect::<Vec<_>>()
             .join("\n");
