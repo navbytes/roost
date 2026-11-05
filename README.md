@@ -383,7 +383,8 @@ CLI-only escape hatch — all Alt-only, same layer as everything above.
   fourth pane type here, just an ephemeral one.
 - **Solo view (`Alt+Shift+t`).** One pane at a time, full width, with the
   rest of the tab listed in a rail beside it — click a row, or `Alt+↑/↓`,
-  to switch what's shown; `Alt+Shift+↑/↓` reorders the rail. A pure view
+  to switch what's shown; `Alt+Shift+↑/↓` reorders the rail; drag the
+  rail's edge to resize it (drag it back to the default width to reset). A pure view
   transform like zoom, and persisted per tab (a solo tab comes back solo).
   `Alt+Shift+t` again tiles it back — refused only if the tiled tree
   wouldn't fit the current terminal. It's also the fourth stop of the

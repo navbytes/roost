@@ -81,6 +81,11 @@ pub struct Workspace {
     pub version: u32,
     pub active_tab: usize,
     pub tabs: Vec<Tab>,
+    /// C43 (amended 2026-11-05): the solo rail's width as the user last
+    /// dragged it, `None` for the automatic `layout::rail_width`. Absent
+    /// from `workspace.json` when unset, so old saves round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rail_cols: Option<u16>,
 }
 
 impl Workspace {
@@ -100,6 +105,7 @@ impl Workspace {
             },
         );
         Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![Tab {
@@ -435,14 +441,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "a workspace always has at least one tab")]
     fn active_tab_on_an_empty_workspace_panics_clearly_not_via_underflow() {
-        let empty = Workspace { version: 1, active_tab: 0, tabs: Vec::new() };
+        let empty = Workspace { rail_cols: None, version: 1, active_tab: 0, tabs: Vec::new() };
         let _ = empty.active_tab();
     }
 
     #[test]
     #[should_panic(expected = "a workspace always has at least one tab")]
     fn active_tab_mut_on_an_empty_workspace_panics_clearly_not_via_underflow() {
-        let mut empty = Workspace { version: 1, active_tab: 0, tabs: Vec::new() };
+        let mut empty = Workspace { rail_cols: None, version: 1, active_tab: 0, tabs: Vec::new() };
         let _ = empty.active_tab_mut();
     }
 

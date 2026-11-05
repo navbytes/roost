@@ -664,11 +664,45 @@ pub fn rail_width(body_width: u16) -> u16 {
     }
 }
 
+/// C43 (amended 2026-11-05, drag to resize): the widest a dragged rail may
+/// get, and the columns the shown pane always keeps beside it.
+pub const RAIL_MAX_COLS: u16 = 40;
+pub const RAIL_PANE_MIN_COLS: u16 = 40;
+/// The labelled tier's narrowest width — `rail_width`'s own clamp floor.
+pub const RAIL_LABELLED_MIN_COLS: u16 = 20;
+
+/// C43 (amended 2026-11-05): the rail width the user asked for by dragging
+/// its edge, snapped to what the rail can draw. There are two tiers, not a
+/// continuum: below the midpoint between them a drag lands on the glyph
+/// tier (`RAIL_GLYPH_COLS`), above it on the labelled tier, clamped to
+/// `[RAIL_LABELLED_MIN_COLS, RAIL_MAX_COLS]` and to whatever leaves the
+/// pane `RAIL_PANE_MIN_COLS`. A body too narrow for any labelled width
+/// gets the glyph tier. Pure.
+pub fn snap_rail_cols(want: u16, body_width: u16) -> u16 {
+    let max = body_width.saturating_sub(RAIL_PANE_MIN_COLS).min(RAIL_MAX_COLS);
+    if want < (RAIL_GLYPH_COLS + RAIL_LABELLED_MIN_COLS) / 2 || max < RAIL_LABELLED_MIN_COLS {
+        RAIL_GLYPH_COLS
+    } else {
+        want.clamp(RAIL_LABELLED_MIN_COLS, max)
+    }
+}
+
+/// C43: the rail width at `body_width`, honouring a dragged width (`pref`,
+/// persisted as `Workspace::rail_cols`) when there is a rail at all. Below
+/// 40 columns there is still none — a preference never conjures one.
+pub fn rail_width_pref(body_width: u16, pref: Option<u16>) -> u16 {
+    match pref {
+        Some(p) if rail_width(body_width) > 0 => snap_rail_cols(p, body_width),
+        _ => rail_width(body_width),
+    }
+}
+
 /// C43: the rail width and the solo-shown pane's rect for a `body` area —
 /// the rail along the left edge, the focused pane taking the rest. Never
-/// collapsed: a solo pane is always the one thing on screen.
-pub fn solo_rects(body: Rect, focused: PaneId) -> (u16, PaneRect) {
-    let rw = rail_width(body.width);
+/// collapsed: a solo pane is always the one thing on screen. `pref` is the
+/// dragged width, if any (`rail_width_pref`).
+pub fn solo_rects(body: Rect, focused: PaneId, pref: Option<u16>) -> (u16, PaneRect) {
+    let rw = rail_width_pref(body.width, pref);
     let rect = Rect { x: body.x + rw, y: body.y, width: body.width - rw, height: body.height };
     (rw, PaneRect { id: focused, rect, collapsed: false })
 }
@@ -2180,6 +2214,25 @@ mod tests {
     }
 
     #[test]
+    fn snap_rail_cols_lands_on_a_drawable_tier() {
+        // Below the midpoint between the tiers: the glyph tier.
+        assert_eq!(snap_rail_cols(3, 120), RAIL_GLYPH_COLS);
+        assert_eq!(snap_rail_cols(15, 120), RAIL_GLYPH_COLS);
+        // Above it: the labelled tier, never under its floor.
+        assert_eq!(snap_rail_cols(16, 120), RAIL_LABELLED_MIN_COLS);
+        assert_eq!(snap_rail_cols(28, 120), 28);
+        // Never past the cap, and the pane keeps its 40 columns.
+        assert_eq!(snap_rail_cols(70, 200), RAIL_MAX_COLS);
+        assert_eq!(snap_rail_cols(50, 70), 30);
+        // Too narrow for any labelled width: the glyph tier.
+        assert_eq!(snap_rail_cols(30, 55), RAIL_GLYPH_COLS);
+        // No rail below 40 columns, preference or not.
+        assert_eq!(rail_width_pref(39, Some(30)), 0);
+        assert_eq!(rail_width_pref(120, None), rail_width(120));
+        assert_eq!(rail_width_pref(80, Some(30)), 30);
+    }
+
+    #[test]
     fn rail_width_steps_through_its_three_tiers() {
         assert_eq!(rail_width(39), 0, "below 40: no room to spare");
         assert_eq!(rail_width(40), RAIL_GLYPH_COLS);
@@ -2192,7 +2245,7 @@ mod tests {
     #[test]
     fn solo_rects_pane_keeps_at_least_80_columns_from_100_up() {
         for w in 100..=240u16 {
-            let (rw, pr) = solo_rects(Rect::new(0, 0, w, 40), 1);
+            let (rw, pr) = solo_rects(Rect::new(0, 0, w, 40), 1, None);
             assert_eq!(rw + pr.rect.width, w, "rail + pane account for the whole width");
             assert!(pr.rect.width >= 80, "at {w} cols the pane rect is only {}", pr.rect.width);
         }
@@ -2200,7 +2253,7 @@ mod tests {
 
     #[test]
     fn solo_rects_pane_sits_right_of_the_rail() {
-        let (rw, pr) = solo_rects(Rect::new(2, 3, 120, 30), 7);
+        let (rw, pr) = solo_rects(Rect::new(2, 3, 120, 30), 7, None);
         assert_eq!(pr.id, 7);
         assert!(!pr.collapsed);
         assert_eq!(pr.rect, Rect { x: 2 + rw, y: 3, width: 120 - rw, height: 30 });

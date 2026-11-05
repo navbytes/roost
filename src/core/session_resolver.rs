@@ -195,6 +195,7 @@ mod tests {
         let mut tab2_panes = HashMap::new();
         tab2_panes.insert(3, pane(Some("b")));
         let ws = Workspace {
+            rail_cols: None,
             version: 1,
             active_tab: 0,
             tabs: vec![
