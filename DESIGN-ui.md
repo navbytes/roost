@@ -3354,8 +3354,8 @@ other step. See C43 for the full model and C37 for the wrap this displaces.
 
 **[Amended 2026-11-05, the cycle names its stop]** A successful `Alt+g` /
 `Alt+Shift+g` flashes the stop it landed on and its place in the ring —
-`layout: grid (1/4)`, `main + stack (2/4)`, `all stack (3/4)`, `solo
-(4/4)`. Main + stack and all-stack can look alike at a glance, and nothing
+`layout: grid (1/4)`, `main+stack (2/4)`, `all-stack (3/4)`, `solo
+(4/4)` — the names C25 and the keymap overlay already use. Main + stack and all-stack can look alike at a glance, and nothing
 said which one you were on or where the ring wraps. Refusals keep their
 own C38 flashes.
 
@@ -6617,13 +6617,15 @@ regimes are unchanged — they have no gap rows to reinterpret.
 the labelled tier the spaced regime's blank row is no longer blank: each
 pane is a two-line card. Line 1 is `▎` marker · glyph · name, the name
 taking every remaining column (`…`-elided). Line 2, indented under the
-name, is a quiet detail on the left and the state word right-aligned —
-on every card alike, where the one-line C8 row used to shed `adapter ·
-word` on some rows and not others, so the column read as random. The
-detail is the parked note's headline (`¶ …`) when there is one, else
-`adapter · cwd` for a pane the user named, else the cwd; a path is cut
-from the left (`…/claude/roost`) because its tail names the place
-(`rail_card_detail`, `rail_card_spans`). The card's first line sits on
+name, is a quiet detail on the left and the state word right-aligned
+(`raw · ` before it in raw mode) — on every card alike, where the
+one-line C8 row used to shed `adapter · word` on some rows and not
+others, so the column read as random. The detail is `adapter · cwd` for
+a pane the user named, else the cwd; a path is cut from the left
+(`…/claude/roost`) because its tail names the place (`rail_card_detail`,
+`rail_card_spans`). A parked note leads the detail as C8's `ink()` `¶`
+marker only — C32's reveal-on-visit rule keeps its text to the focused
+pane's badge. The card's first line sits on
 the old gap row (`rail.y + 1 + 2*i`), so the two slots per pane and
 `mouse::rail_row_at`'s `(slot − 1) / 2` hit-test are unchanged; there is
 no longer a blank row under the header. The contiguous and windowed

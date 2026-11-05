@@ -3431,23 +3431,15 @@ fn rail_glyph_row_spans(
 }
 
 /// [2026-11-05] C43 card rows: what a rail card's second line says, fitted
-/// to `room` columns. The parked note's headline when there is one (`¶`,
-/// C32's marker — the reason the pane was parked beats where it lives),
-/// cut at its end; else, for a pane the user named, `adapter · cwd` (the
-/// name hides both); else the cwd alone — an untitled name already carries
-/// the adapter and the directory's last component, and the fuller path
-/// tells two `shell · roost`s in different `roost`s apart. A path is cut
-/// from the **left** (`…/claude/roost`): its tail is the part that names
-/// the place.
-fn rail_card_detail(
-    note: Option<&str>,
-    titled_adapter: Option<&str>,
-    cwd: Option<&str>,
-    room: u16,
-) -> String {
-    if let Some(headline) = note.and_then(|n| n.lines().next()).filter(|l| !l.trim().is_empty()) {
-        return elide_to(&format!("¶ {}", headline.trim()), room);
-    }
+/// to `room` columns. For a pane the user named, `adapter · cwd` (the name
+/// hides both); else the cwd alone — an untitled name already carries the
+/// adapter and the directory's last component, and the fuller path tells
+/// two `shell · roost`s in different `roost`s apart. A path is cut from the
+/// **left** (`…/claude/roost`): its tail is the part that names the place.
+/// A parked note is *not* read out here — C32's reveal-on-visit rule keeps
+/// note text to the focused pane's badge; the card shows only the `¶`
+/// marker (`rail_card_spans`).
+fn rail_card_detail(titled_adapter: Option<&str>, cwd: Option<&str>, room: u16) -> String {
     let prefix = titled_adapter.map(|a| format!("{a} · ")).unwrap_or_default();
     match cwd {
         Some(c) => {
@@ -3491,6 +3483,7 @@ fn elide_left(text: &str, room: u16) -> String {
 /// mode). The detail sheds first: it is cut to leave the word its column
 /// plus a gap, and dropped outright when not even a few characters of it
 /// would fit. Pure, so the shape is testable without a `Frame`.
+#[allow(clippy::too_many_arguments)] // C8's row shape, as `collapsed_row_spans`
 fn rail_card_spans(
     width: u16,
     focused: bool,
@@ -3498,6 +3491,7 @@ fn rail_card_spans(
     name: &str,
     detail: impl Fn(u16) -> String,
     raw: bool,
+    noted: bool,
     spinner: char,
 ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let (base_glyph, glyph_style, spins) = row_status_style(status);
@@ -3522,12 +3516,18 @@ fn rail_card_spans(
     let word_w = mouse::display_width(&word);
     // The detail's room: everything between the indent and the word, less
     // one column of gap and one trailing column of air.
-    let room = width.saturating_sub(LEAD + word_w + SEGMENT_GAP_COLS + 1);
+    // C32/C8: a parked note shows as the `¶` marker only, in its own
+    // `ink()` span so it stays findable in a column of quiet words.
+    let mark_w: u16 = if noted { 2 } else { 0 }; // "¶ "
+    let room = width.saturating_sub(LEAD + mark_w + word_w + SEGMENT_GAP_COLS + 1);
     let detail = if room >= 4 { elide_to(&detail(room), room) } else { String::new() };
     let pad = width
-        .saturating_sub(LEAD + mouse::display_width(&detail) + word_w + 1)
-        .max(u16::from(!detail.is_empty()) * SEGMENT_GAP_COLS);
+        .saturating_sub(LEAD + mark_w + mouse::display_width(&detail) + word_w + 1)
+        .max(u16::from(!detail.is_empty() || noted) * SEGMENT_GAP_COLS);
     let mut bottom = vec![Span::raw(indent)];
+    if noted {
+        bottom.push(Span::styled("¶ ", theme::ink()));
+    }
     if !detail.is_empty() {
         bottom.push(Span::styled(detail, theme::quiet()));
     }
@@ -3595,7 +3595,7 @@ fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, sp
         let spec = app.find_spec(id);
         let name = if spec.is_some() { app.chrome_name(id) } else { "?".into() };
         if cards {
-            let note = spec.and_then(|s| s.note.as_deref());
+            let noted = spec.is_some_and(|s| s.note.is_some());
             let titled = spec.filter(|s| s.title.is_some()).map(|s| s.adapter.as_str());
             let cwd = app.pane_cwd(id);
             let (top, bottom) = rail_card_spans(
@@ -3603,8 +3603,9 @@ fn draw_rail<B: PaneBackend>(f: &mut Frame<'_>, app: &mut App<B>, rail: Rect, sp
                 focused,
                 Some(status),
                 &name,
-                |room| rail_card_detail(note, titled, cwd.as_deref(), room),
+                |room| rail_card_detail(titled, cwd.as_deref(), room),
                 app.is_raw(id),
+                noted,
                 spinner,
             );
             f.render_widget(Paragraph::new(Line::from(top)), row);
@@ -5609,21 +5610,36 @@ mod tests {
     /// pane is off screen, so the name rides beside it. A short id + name
     /// fits `RAIL_GLYPH_COLS` (12) whole.
     #[test]
-    fn rail_card_detail_prefers_the_note_then_the_named_panes_adapter() {
-        let d = |n, a, c| super::rail_card_detail(n, a, c, 40);
-        assert_eq!(d(Some("fix ci\nmore"), Some("claude"), Some("~/x")), "¶ fix ci");
-        assert_eq!(d(None, Some("claude"), Some("~/x")), "claude · ~/x");
-        assert_eq!(d(None, None, Some("~/x")), "~/x");
-        assert_eq!(d(Some("  "), None, Some("~/x")), "~/x", "a blank note is no note");
+    fn rail_card_detail_names_the_adapter_only_for_a_named_pane() {
+        assert_eq!(super::rail_card_detail(Some("claude"), Some("~/x"), 40), "claude · ~/x");
+        assert_eq!(super::rail_card_detail(None, Some("~/x"), 40), "~/x");
         // A path keeps its tail.
+        assert_eq!(super::rail_card_detail(None, Some("/home/claude/roost"), 10), "…ude/roost");
         assert_eq!(
-            super::rail_card_detail(None, None, Some("/home/claude/roost"), 10),
-            "…ude/roost"
-        );
-        assert_eq!(
-            super::rail_card_detail(None, Some("shell"), Some("/home/claude/roost"), 14),
+            super::rail_card_detail(Some("shell"), Some("/home/claude/roost"), 14),
             "shell · …roost"
         );
+    }
+
+    /// C32: a card never reads a parked note out — only the `¶` marker, in
+    /// `ink()`, with the usual detail after it.
+    #[test]
+    fn a_noted_card_shows_the_marker_not_the_note() {
+        let (_, bottom) = super::rail_card_spans(
+            24,
+            false,
+            Some(AgentStatus::Idle),
+            "api",
+            |room| super::rail_card_detail(Some("shell"), Some("~/x"), room),
+            false,
+            true,
+            '⠋',
+        );
+        let mark = bottom.iter().find(|s| s.content == "¶ ").expect("the ¶ marker");
+        assert_eq!(mark.style, theme::ink());
+        let text: String = bottom.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("¶ shell · ~/x"), "{text:?}");
+        assert_eq!(super::mouse::display_width(&text), 24);
     }
 
     #[test]
@@ -5636,7 +5652,8 @@ mod tests {
             true,
             Some(AgentStatus::Waiting),
             "a rather long pane name here",
-            |room| super::rail_card_detail(None, None, Some("~/code/some/deep/dir"), room),
+            |room| super::rail_card_detail(None, Some("~/code/some/deep/dir"), room),
+            false,
             false,
             '⠋',
         );
@@ -5654,6 +5671,7 @@ mod tests {
             "x",
             |_| "~/abc".into(),
             true,
+            false,
             '⠋',
         );
         let narrow = text(&narrow);
@@ -7768,8 +7786,9 @@ row's — widen ADAPTER_COL",
         let rows = app.rail_rows();
         let i = rows.iter().position(|&id| id == shown).expect("the shown pane is a rail row");
         // Header on row 1; at this size (28 body rows for 3 panes) the
-        // spaced regime engages, so rows start at row 3 with a pitch of 2 —
-        // same geometry the C43 solo-view fixture above pins at this size.
+        // spaced regime engages as two-line cards, so names start at row 2
+        // with a pitch of 2 — same geometry the C43 solo-view fixture above
+        // pins at this size.
         let rail_row: String = (0..rw)
             .filter_map(|x| buf.cell((x, 1 + 1 + 2 * i as u16)).map(|c| c.symbol().to_string()))
             .collect();
@@ -7803,10 +7822,10 @@ row's — widen ADAPTER_COL",
         assert_eq!(rw, fixed, "the labelled tier is always the fixed clamp, never content-fit");
     }
 
-    /// C43 breathing room: at a height where the spacing predicate holds
-    /// (`1 + 2*n <= rail_height`), the rail's pane rows land at
-    /// `rail.y + 2 + 2*i`, with a genuinely blank row between each — nothing
-    /// painted into the gap, not merely "no marker there".
+    /// C43 cards (2026-11-05): at a height where the spacing predicate holds
+    /// (`1 + 2*n <= rail_height`) and the rail is at the labelled tier, each
+    /// pane is two lines — its name at `rail.y + 1 + 2*i`, then an indented
+    /// detail line ending in its state word at `rail.y + 2 + 2*i`.
     #[test]
     fn a_spaced_rail_draws_two_line_cards() {
         use crate::core::layout;

@@ -5804,13 +5804,13 @@ impl<B: PaneBackend> App<B> {
     /// [2026-11-05] C25: `Alt+g` names the stop it landed on — four shapes
     /// on one key, two of which (main + stack, all-stack) can look alike at
     /// a glance, and nothing said which one you were on or that the ring
-    /// had wrapped. `layout: main + stack (2/4)`; the position is what
+    /// had wrapped. `layout: main+stack (2/4)`; the position is what
     /// teaches that the cycle has four stops and where the wrap is.
     fn flash_layout_stop(&mut self, idx: usize) {
         let name = match idx {
             0 => "grid",
-            1 => "main + stack",
-            2 => "all stack",
+            1 => "main+stack",
+            2 => "all-stack",
             _ => "solo",
         };
         self.set_flash(format!("layout: {name} ({}/{LAYOUT_CYCLE_LEN})", idx + 1));
