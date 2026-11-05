@@ -380,8 +380,7 @@ pub fn rail_row_at(
     let rl = crate::core::layout::rail_layout(rail.height, rows.len(), shown_i);
     let i = if rl.spaced {
         // Each pane owns two slots — `1 + 2*i` and `2 + 2*i` (a card's two
-        // lines at the labelled tier; a gap and the row it pads at the glyph
-        // tier) — and both floor-divide to row `i`: `(slot - 1) / 2`. Only
+        // lines, at either tier) — and both floor-divide to row `i`: `(slot - 1) / 2`. Only
         // the header (slot 0) hits nothing.
         slot.checked_sub(1)? / 2
     } else {
@@ -1275,8 +1274,8 @@ mod tests {
     }
 
     /// C43 breathing room: in a spaced rail every pane owns the two slots
-    /// `rail.y + 1 + 2*i` and `rail.y + 2 + 2*i` (a two-line card at the
-    /// labelled tier; a gap and the row it pads at the glyph tier). Only the
+    /// `rail.y + 1 + 2*i` and `rail.y + 2 + 2*i` (a two-line card, at
+    /// either tier). Only the
     /// header hits nothing — a click on either slot resolves to the same id.
     #[test]
     fn rail_row_at_a_spaced_rail_resolves_panes_and_their_padding_gaps_to_the_same_id() {

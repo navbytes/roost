@@ -3455,6 +3455,9 @@ fn rail_glyph_card_spans(
     let room = layout::RAIL_GLYPH_COLS.saturating_sub(2); // marker + glyph
     let lead = format!(" {id} ");
     let lead_w = mouse::display_width(&lead);
+    // An id of 8+ digits would leave the name no room on line 1 (it all
+    // moves to line 2); ids are recycled small (`Workspace::next_pane_id`),
+    // so that is accepted rather than special-cased.
     let (first, rest) = wrap_once(name, room.saturating_sub(lead_w));
     // Line 2 sits under the id (marker + glyph + one space) and runs to the
     // rail's edge, as line 1 does — a column of air here would cost
@@ -3506,10 +3509,15 @@ fn wrap_once(text: &str, room: u16) -> (String, String) {
             _ => {}
         }
     }
-    let cut = brk.filter(|&b| b > 0).unwrap_or(fit);
+    // A break that would leave line 1 mostly empty costs more than
+    // a mid-word cut does (`a-` / `verylongname`), so take it only once
+    // it uses a third of the room.
+    let cut = brk.filter(|&b| b > 0 && b * 3 >= fit).unwrap_or(fit);
     let first: String = chars[..cut].iter().collect();
     let rest: String = chars[cut..].iter().collect();
-    (first.trim_end().to_string(), rest.trim_start().to_string())
+    // Line 2 never opens on the separator it was broken at.
+    let rest = rest.trim_start_matches(|c: char| c == ' ' || "·-_/".contains(c));
+    (first.trim_end().to_string(), rest.to_string())
 }
 
 /// [2026-11-05] C43 card rows: what a rail card's second line says, fitted
@@ -3630,8 +3638,8 @@ fn clip_line(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
 /// C43: the solo-view rail — row 0 the header, then one row per
 /// `rail_rows()` id, top-aligned, recomputed every frame from the
 /// workspace (renames, status flips and closes show up live, same as the
-/// roster). Rows get a blank line of breathing room above them when every
-/// one still fits with the spacing; below that they close up contiguous;
+/// roster). Each pane gets two rows — a two-line card — when every one
+/// still fits with the spacing; below that they close up contiguous;
 /// below that the window follows the shown row and an `…` marks whichever
 /// end still has rows behind it (`layout::rail_layout`, which wraps
 /// `rail_window` for the last two regimes) — so the `▎` marker is never off
@@ -5775,6 +5783,17 @@ mod tests {
             super::rail_glyph_card_spans(false, Some(AgentStatus::Idle), 3, "shell · roost", '|');
         assert_eq!(text(&top).trim_end(), format!(" {} 3 shell ·", text(&top[1..2])));
         assert_eq!(text(&bottom), "   roost");
+
+        // A two-digit id narrows line 1; the remainder still reads clean.
+        let (top, bottom) = super::rail_glyph_card_spans(
+            false,
+            Some(AgentStatus::Idle),
+            12,
+            "shell · tmp (2)",
+            '|',
+        );
+        assert!(text(&top).contains("12 shell"), "{:?}", text(&top));
+        assert_eq!(text(&bottom), "   tmp (2)");
         assert!(mouse::display_width(&text(&top)) <= crate::core::layout::RAIL_GLYPH_COLS);
 
         // A name that fits stays on line 1 and leaves line 2 empty.
@@ -5802,6 +5821,11 @@ mod tests {
         assert_eq!(super::wrap_once("review-pr-247", 7), ("review-".into(), "pr-247".into()));
         assert_eq!(super::wrap_once("abcdefghij", 7), ("abcdefg".into(), "hij".into()));
         assert_eq!(super::wrap_once("api servers", 3), ("api".into(), "servers".into()));
+        // A break this early would waste line 1; cut mid-word instead.
+        assert_eq!(super::wrap_once("a-verylongname", 7), ("a-veryl".into(), "ongname".into()));
+        // Line 2 never opens on the separator it broke at.
+        assert_eq!(super::wrap_once("review-pr", 6), ("review".into(), "pr".into()));
+        assert_eq!(super::wrap_once("shell · tmp (2)", 6), ("shell".into(), "tmp (2)".into()));
     }
 
     #[test]
