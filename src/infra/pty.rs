@@ -1082,6 +1082,12 @@ impl PaneBackend for PtyPane {
             return;
         }
         self.pixels = pixels;
+        // `relayout` resizes every pane on every layout change, most of them
+        // to the size they already have — only a real change makes the
+        // child repaint.
+        if self.parser.screen().size() != (rows, cols) {
+            self.status.on_resize();
+        }
         let _ = self.master.resize(PtySize {
             rows,
             cols,

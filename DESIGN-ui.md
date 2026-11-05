@@ -1571,6 +1571,15 @@ intent (neutral elevated treatment, no reserved hue), expressed as a reversal
 of the terminal's own pair, which is guaranteed contrasty in any theme. Timing
 and precedence remain untouched.
 
+**[Amended 2026-11-05, close teaches undo]** An interactive close (`Alt+w`)
+that recorded an undo entry flashes what it closed and the live reopen
+chord: `closed {display name} · Alt+u reopens`, or `closed tab {name} ·
+Alt+u reopens` when the pane was its tab's last. With undo unbound the
+clause drops (C34). A control-plane close flashes nothing — it is not the
+user's action. A consumed confirm arm's prompt is replaced by this notice on
+the ordinary `FLASH_WINDOW` (U22's "dies with its arm" still holds: the
+prompt itself is gone).
+
 ### C11 — Alt-key warning
 
 **Current:** `render.rs:45–54` — Black on Yellow.
@@ -1964,6 +1973,12 @@ together:
   plus the widest cwd label, plus another gap) is otherwise untouched —
   same 2-column gaps, same pre-U20 32-column floor.
 
+**[Amended 2026-11-05, a not-found row is refused]** Launching a row that
+carries the `not found` suffix (Enter, its digit, or a click) no longer
+spawns a pane that can only die: the picker stays up and flashes
+`{id} not found on $PATH — install it first` (C38). Same predicate as the
+suffix (`adapter_installed`), so the list and the launch cannot disagree.
+
 ### C15 — Help overlay
 
 **Current:** `render.rs:194–237` — Double/Cyan; keys Yellow BOLD, desc Gray.
@@ -2321,6 +2336,13 @@ last output at normal video across the rest of the row (the supervisor's D1).
 C17's neighbouring rule is worth naming here: this bar is chrome painted *over* program output, and `REVERSED`
 composes with whatever the dead pane last drew rather than assuming a
 background.
+
+**[Amended 2026-11-05, the spawn error wraps]** The `spawn failed: …` line
+word-wraps to the pane's inner width (one column of air each side) instead
+of clipping; the cause is the tail of the reason, so clipping cut exactly
+the half that answers "why". The reason itself is folded to one line first
+(`dead_reason`): portable-pty's multi-line PATH-search failure, whose last
+line dumps the whole `$PATH`, reads `… because: not found on $PATH`.
 
 ### C17 — Copy-mode selection
 

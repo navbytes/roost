@@ -5020,8 +5020,30 @@ impl<B: PaneBackend> App<B> {
         }
         // The actual removal (kill the runtime, capture undo, fix up
         // tab/focus bookkeeping) is close_pane_id's job — shared with the
-        // control interface. This wrapper only adds the confirm guard above.
-        self.close_pane_id(id);
+        // control interface. This wrapper only adds the confirm guard above
+        // and the flash below.
+        let name = self.display_name(id);
+        let recorded = self.find_spec(id).is_some(); // close_pane_id keeps a spec'd pane for undo
+        if self.close_pane_id(id) && recorded {
+            self.flash_closed(name);
+        }
+    }
+
+    /// [2026-11-05] U2 + discoverability: an interactive close names what it
+    /// closed and teaches the chord that brings it back — `Alt+u` was only
+    /// reachable through the keymap overlay, so the one recovery path for a
+    /// fat-fingered `Alt+w` went unused by anyone who had not read it.
+    /// Keyboard-only: a control-plane close (`roost close`) is someone
+    /// else's action and flashes nothing. Called only after a close that
+    /// recorded an undo entry, which is what's on top of the stack now.
+    fn flash_closed(&mut self, name: String) {
+        let what = match self.undo.last() {
+            Some(Closed::Tab { tab, .. }) => format!("closed tab {}", tab.name),
+            Some(Closed::Pane { .. }) => format!("closed {name}"),
+            None => return,
+        };
+        let reopen = self.chord_clause(Action::Undo, |c| format!(" · {c} reopens"));
+        self.set_flash(format!("{what}{reopen}"));
     }
 
     /// Alt+q. U1: quitting kills every pane's process at once, so it gets
@@ -6226,6 +6248,17 @@ impl<B: PaneBackend> App<B> {
         // not a string with a marker glued onto it.
         let ids = self.picker_filtered_ids();
         let Some(&adapter) = ids.get(index) else { return };
+        // [2026-11-05] C38: a row already marked `not found` is refused
+        // where it is, picker still up, rather than launched into a dead
+        // pane that only says the same thing after the fact and then has
+        // to be closed. Same predicate the row's suffix is drawn from, so
+        // the list and the launch cannot disagree about it.
+        if !adapter_installed(adapter, &self.registry) {
+            self.set_flash(format!(
+                "{adapter} {PICKER_MISSING_SUFFIX} on $PATH — install it first"
+            ));
+            return;
+        }
         let cwd = self.picker_cwd();
         self.mode = Mode::Normal;
         self.exit_zoom(); // C21: "picker launch" is a structural action
@@ -8092,14 +8125,42 @@ pub(crate) fn abbreviate_home(cwd: &Path, home: Option<&Path>) -> String {
 /// an answer. Capped and truncated on a char boundary — same shape as
 /// `pty::sanitize_for_host` — so a pathological chain still reads as one
 /// line in the bar instead of spilling past it.
+///
+/// [Added 2026-11-05] portable-pty's "not on `$PATH`" failure is a
+/// multi-line message whose last line dumps the entire `$PATH` (`Unable to
+/// spawn pi because:\nNo viable candidates found in PATH "…"`). Drawn on
+/// the one-line dead-pane bar, the newline went nowhere and the PATH dump
+/// pushed the actual answer off the row. `one_line_spawn_reason` folds it to
+/// one line and swaps the dump for `not found on $PATH`.
 fn dead_reason(e: &anyhow::Error) -> String {
-    let full = format!("{e:#}");
+    let full = one_line_spawn_reason(&format!("{e:#}"));
     if full.chars().count() <= DEAD_REASON_CAP {
         return full;
     }
     let mut truncated: String = full.chars().take(DEAD_REASON_CAP.saturating_sub(1)).collect();
     truncated.push('…');
     truncated
+}
+
+/// portable-pty's PATH-search failure ends with this line, followed by the
+/// whole quoted `$PATH`.
+const NO_PATH_CANDIDATES: &str = "No viable candidates found in PATH";
+
+/// `dead_reason`'s line folding: every line of the chain joined into one,
+/// the cause lines after the first separated by `; `, and portable-pty's
+/// `$PATH` dump replaced with `not found on $PATH`. A single-line reason
+/// comes back unchanged.
+fn one_line_spawn_reason(full: &str) -> String {
+    let mut lines = full.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(head) = lines.next() else { return String::new() };
+    let causes: Vec<&str> = lines
+        .map(|l| if l.starts_with(NO_PATH_CANDIDATES) { "not found on $PATH" } else { l })
+        .collect();
+    if causes.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head} {}", causes.join("; "))
+    }
 }
 
 /// QA-2: validate a spawn's cwd BEFORE a pane is created for it, so a
@@ -8670,7 +8731,9 @@ pub(crate) mod tests {
         assert_eq!(app.runtimes.len(), 2);
         app.apply(Action::ClosePane);
         assert_eq!(app.runtimes.len(), 1, "closed on the first press");
-        assert_eq!(app.flash(), None, "and armed nothing");
+        // Armed nothing: the flash is the close notice, not a confirm prompt.
+        assert!(app.confirm_close.is_none(), "and armed nothing");
+        assert!(app.flash().is_some_and(|f| f.starts_with("closed ")), "{:?}", app.flash());
     }
 
     /// …but the guard is kept everywhere it earns its keep. An **agent**
@@ -8794,6 +8857,36 @@ pub(crate) mod tests {
         assert_eq!(app.runtimes.len(), 2);
     }
 
+    /// [2026-11-05] An interactive close names what it closed and the
+    /// chord that reopens it — remapped chords included; with undo
+    /// unbound, the clause drops rather than teaching a dead key.
+    #[test]
+    fn closing_a_pane_flashes_the_reopen_chord() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewPane);
+        let name = app.display_name(app.focused);
+        app.apply(Action::ClosePane);
+        assert_eq!(app.flash(), Some(format!("closed {name} · Alt+u reopens").as_str()));
+
+        let (keymap, _) = Keymap::parse(r#"{"keys": {"alt+u": "disable"}}"#, "config.json");
+        app.set_keymap(keymap);
+        app.apply(Action::NewPane);
+        let name = app.display_name(app.focused);
+        app.apply(Action::ClosePane);
+        assert_eq!(app.flash(), Some(format!("closed {name}").as_str()));
+    }
+
+    /// Closing the last pane of a non-last tab closes the tab; the notice
+    /// says so.
+    #[test]
+    fn closing_a_tabs_last_pane_flashes_the_tab() {
+        let (mut app, _) = mk_app(shell_ws());
+        app.apply(Action::NewTab);
+        let name = app.ws.active_tab().name.clone();
+        app.apply(Action::ClosePane);
+        assert_eq!(app.flash(), Some(format!("closed tab {name} · Alt+u reopens").as_str()));
+    }
+
     #[test]
     fn confirm_flash_lives_exactly_as_long_as_its_confirm_window() {
         // U22: FLASH_WINDOW (2s) < CONFIRM_WINDOW (3s), so a confirm prompt
@@ -8808,7 +8901,9 @@ pub(crate) mod tests {
         app.apply(Action::ClosePane); // armed
         assert_eq!(app.flash.as_ref().unwrap().2, CONFIRM_WINDOW);
         app.apply(Action::ClosePane); // confirmed ⇒ closed, prompt gone
-        assert_eq!(app.flash(), None);
+                                      // …replaced by the ordinary close notice, on the ordinary window.
+        assert!(app.flash().is_some_and(|f| f.starts_with("closed ")), "{:?}", app.flash());
+        assert_eq!(app.flash.as_ref().unwrap().2, FLASH_WINDOW);
         app.set_flash("copied 3 chars");
         assert_eq!(app.flash.as_ref().unwrap().2, FLASH_WINDOW);
     }
@@ -12266,7 +12361,7 @@ pub(crate) mod tests {
     /// happen in `App::registry` (what `adapter_installed` actually
     /// consults), not in what rows get drawn.
     #[test]
-    fn picker_filtered_annotates_uninstalled_adapters_but_launch_still_spawns_the_raw_id() {
+    fn picker_filtered_annotates_uninstalled_adapters_and_refuses_to_launch_them() {
         let mut registry = agents::registry();
         registry.insert("pi", Box::new(NeverInstalledAdapter));
         let (tx, _rx) = mpsc::sync_channel(64);
@@ -12286,21 +12381,26 @@ pub(crate) mod tests {
 
         app.apply(Action::QuickLaunch);
         let rows = app.picker_filtered();
+        let panes_before = app.runtimes.len();
         app.handle_mode_key(key('1')); // row 1 = index 0 = "pi" (agents::picker_ids() order)
-        let spawned = app.find_spec(app.focused).map(|s| s.adapter.clone());
 
         assert_eq!(rows[0], "pi not found", "pi's substituted launch program can never resolve");
+        // [2026-11-05] C38: the not-found row is refused in place — no dead
+        // pane, picker still up, and the flash names the raw id (never the
+        // annotated display text).
+        assert_eq!(app.runtimes.len(), panes_before, "nothing spawned");
+        assert!(matches!(app.mode, Mode::Picker { .. }), "the picker stays up");
+        assert_eq!(app.flash(), Some("pi not found on $PATH — install it first"));
         // ShellAdapter resolves an absolute $SHELL (or /bin/bash fallback)
         // path directly, not via a $PATH scan — real, unmodified, and
         // guaranteed to exist on any machine this suite already assumes one
         // on (the harness's `pgrep -P`, every shell-spawning test, ...).
         let shell_at = crate::agents::picker_ids().iter().position(|&id| id == "shell").unwrap();
         assert_eq!(rows[shell_at], "shell", "resolved via an absolute path, not $PATH");
-        assert_eq!(
-            spawned,
-            Some("pi".to_string()),
-            "launch used the raw id, not the annotated text"
-        );
+        // An installed row still launches its raw id.
+        app.handle_mode_key(key(char::from_digit(shell_at as u32 + 1, 10).unwrap()));
+        let spawned = app.find_spec(app.focused).map(|s| s.adapter.clone());
+        assert_eq!(spawned, Some("shell".to_string()), "launch used the raw id");
     }
 
     /// The picker opens on the first *installed* adapter, which depends on
@@ -15075,6 +15175,29 @@ pub(crate) mod tests {
     /// P0-3: a pathological chain is capped, not left to blow past the
     /// dead-pane bar — truncated on a char boundary so a multi-byte glyph
     /// is never split.
+    #[test]
+    fn dead_reason_folds_portable_ptys_path_dump_into_one_line() {
+        let err = anyhow::anyhow!(
+            "Unable to spawn pi because:\nNo viable candidates found in PATH \"/usr/bin:/bin\""
+        )
+        .context("spawning pi");
+        assert_eq!(
+            dead_reason(&err),
+            "spawning pi: Unable to spawn pi because: not found on $PATH"
+        );
+        // Other candidates' reasons survive, joined on one line.
+        assert_eq!(
+            one_line_spawn_reason(
+                "spawning pi: Unable to spawn pi because:\n/bin/pi exists but is not executable\n\
+                 No viable candidates found in PATH \"/bin\""
+            ),
+            "spawning pi: Unable to spawn pi because: /bin/pi exists but is not executable; \
+             not found on $PATH"
+        );
+        // A one-line chain is untouched.
+        assert_eq!(one_line_spawn_reason("spawning x: boom"), "spawning x: boom");
+    }
+
     #[test]
     fn dead_reason_caps_a_long_chain_on_a_char_boundary() {
         let err =

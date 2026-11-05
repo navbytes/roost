@@ -3142,7 +3142,14 @@ fn draw_pane<B: PaneBackend>(
     if status == AgentStatus::Exited && inner.height > 0 {
         let mut lines: Vec<Line<'_>> = Vec::new();
         if let Some(err) = app.dead.get(&pr.id) {
-            lines.push(Line::from(Span::styled(format!(" spawn failed: {err} "), theme::accent())));
+            // [2026-11-05] Wrapped, not clipped: the cause is the tail of
+            // the reason (`spawning pi: … not found on $PATH`), so a pane
+            // narrower than the message used to cut off exactly the part
+            // that answers "why". One column of air each side, as before.
+            let text = format!("spawn failed: {err}");
+            for (row, _) in wrap_line(&text, inner.width.saturating_sub(2)) {
+                lines.push(Line::from(Span::styled(format!(" {row} "), theme::accent())));
+            }
         }
         let resumable = app.resume_command_line(pr.id).is_some();
         lines.push(Line::from(Span::raw(dead_bar_text(
