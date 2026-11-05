@@ -3172,10 +3172,8 @@ fn draw_pane<B: PaneBackend>(
             }
         }
         let resumable = app.resume_command_line(pr.id).is_some();
-        lines.push(Line::from(Span::raw(dead_bar_text(
-            resumable,
-            input::chord_for(app.keymap(), Action::ClosePane).as_deref(),
-        ))));
+        let close = input::chord_for(app.keymap(), Action::ClosePane);
+        lines.push(Line::from(Span::raw(dead_bar_fit(resumable, close.as_deref(), inner.width))));
         let n = lines.len() as u16;
         let y = inner.y + inner.height.saturating_sub(n);
         let overlay = Rect::new(inner.x, y, inner.width, n.min(inner.height));
@@ -3204,6 +3202,21 @@ fn dead_bar_text(resumable: bool, close_chord: Option<&str>) -> String {
         " {} exited — Enter: relaunch/resume · f: fresh (drops resume){copy_hint}{close} ",
         theme::GLYPH_EXITED
     )
+}
+
+/// [2026-11-05] C16 at narrow widths: the full bar is ~76 columns, and a
+/// pane narrower than that clipped it mid-word (`f: fresh (drops resum`),
+/// losing the close and copy clauses entirely. Below its width the bar
+/// switches to the hint bar's own terse vocabulary — `↵ relaunch`,
+/// `f fresh` — which keeps every action in about half the room.
+fn dead_bar_fit(resumable: bool, close_chord: Option<&str>, width: u16) -> String {
+    let full = dead_bar_text(resumable, close_chord);
+    if mouse::display_width(&full) <= width {
+        return full;
+    }
+    let copy = if resumable { " · y copy resume" } else { "" };
+    let close = close_chord.map(|c| format!(" · {c} close")).unwrap_or_default();
+    format!(" {} exited — ↵ relaunch · f fresh{copy}{close} ", theme::GLYPH_EXITED)
 }
 
 /// C8: one collapsed stack row's spans for the given width — marker, status
@@ -5112,6 +5125,19 @@ mod tests {
 
     /// C16: the overlay bar's two variants — the resumable one inserts
     /// `y: copy resume` before close, mirroring the hint bar's order.
+    #[test]
+    fn dead_bar_shortens_instead_of_clipping_on_a_narrow_pane() {
+        let full = super::dead_bar_text(true, Some("Alt+w"));
+        let w = super::mouse::display_width(&full);
+        assert_eq!(super::dead_bar_fit(true, Some("Alt+w"), w), full, "fits ⇒ unchanged");
+        let short = super::dead_bar_fit(true, Some("Alt+w"), w - 1);
+        assert!(super::mouse::display_width(&short) + 20 < w, "{short:?}");
+        for clause in ["↵ relaunch", "f fresh", "y copy resume", "Alt+w close"] {
+            assert!(short.contains(clause), "{clause} kept: {short:?}");
+        }
+        assert!(!super::dead_bar_fit(false, None, 40).contains("close"), "unbound drops");
+    }
+
     #[test]
     fn dead_bar_text_offers_copy_resume_only_when_resumable() {
         assert_eq!(
