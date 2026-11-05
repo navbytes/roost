@@ -8314,6 +8314,48 @@ pub(crate) mod tests {
         (app, store)
     }
 
+    /// An adapter whose launch program always resolves (`/bin/sh`), for
+    /// tests that launch picker rows: the picker refuses a row whose program
+    /// is not on `$PATH`, and which agent CLIs a CI runner has installed is
+    /// not what those tests are about.
+    struct InstalledAs(&'static str);
+    impl agents::AgentAdapter for InstalledAs {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn launch(&self, cwd: &Path) -> agents::CommandSpec {
+            agents::CommandSpec::new("/bin/sh", cwd)
+        }
+        fn resume(&self, cwd: &Path, _session: &str) -> agents::CommandSpec {
+            self.launch(cwd)
+        }
+        fn resume_flag(&self) -> &'static str {
+            "--resume" // unused: resume() overridden above
+        }
+    }
+
+    /// `mk_app`, with every picker adapter installed (`InstalledAs`).
+    fn mk_app_all_installed(ws: Workspace) -> App<FakePane> {
+        let mut registry = agents::registry();
+        for id in agents::picker_ids() {
+            registry.insert(id, Box::new(InstalledAs(id)));
+        }
+        let (tx, _rx) = mpsc::sync_channel(64);
+        App::<FakePane>::new(
+            ws,
+            registry,
+            Box::new(MemStore::default()),
+            tx,
+            Size::new(100, 30),
+            (0, 0),
+            None,
+            TokenTable::new().unwrap(),
+            "default".into(),
+            Box::new(crate::ports::fakes::MemClaims::default()),
+        )
+        .unwrap()
+    }
+
     fn shell_ws() -> Workspace {
         Workspace::default_in(PathBuf::from("/tmp"))
     }
@@ -11632,7 +11674,7 @@ pub(crate) mod tests {
     #[test]
     fn quick_launch_picker_spawns_selected_adapter() {
         use crossterm::event::{KeyCode, KeyEvent};
-        let (mut app, _) = mk_app(shell_ws());
+        let mut app = mk_app_all_installed(shell_ws());
         app.apply(Action::QuickLaunch);
         assert!(matches!(app.mode, Mode::Picker { .. }));
         // From row 0, not from wherever this machine's $PATH puts the
@@ -11641,8 +11683,7 @@ pub(crate) mod tests {
         // pick item 1 ("claude")
         app.handle_mode_key(KeyEvent::from(KeyCode::Down));
         app.handle_mode_key(KeyEvent::from(KeyCode::Enter));
-        let id = app.focused;
-        assert_eq!(app.runtimes[&id].cmd.program, "claude");
+        assert_eq!(app.find_spec(app.focused).map(|s| s.adapter.clone()), Some("claude".into()));
     }
 
     #[test]
@@ -12167,7 +12208,7 @@ pub(crate) mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let items = crate::agents::picker_ids();
         assert!(items.len() >= 2, "this test needs a picker with a second row");
-        let (mut app, _) = mk_app(shell_ws());
+        let mut app = mk_app_all_installed(shell_ws());
         let before = app.runtimes.len();
         app.apply(Action::QuickLaunch);
         app.handle_mode_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
@@ -12284,7 +12325,7 @@ pub(crate) mod tests {
     #[test]
     fn picker_click_still_lands_on_the_right_row_after_filtering() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let (mut app, _) = mk_app(shell_ws());
+        let mut app = mk_app_all_installed(shell_ws());
         app.apply(Action::QuickLaunch);
         app.handle_mode_key(key('l')); // → [claude, shell]
         let rect = crate::ui::render::modal_rect(&app).expect("the picker draws a dialog");
