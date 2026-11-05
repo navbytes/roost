@@ -1274,6 +1274,7 @@ impl<B: PaneBackend> App<B> {
     /// rail's edge — the shown pane's left border, the column just right of
     /// the rail — starts a width drag. Like a seam drag it moves no focus.
     pub fn begin_rail_drag(&mut self, col: u16, row: u16) -> bool {
+        self.rail_drag = false;
         let Some(rail) = self.rail_area() else { return false };
         let on_edge = col == rail.x + rail.width && row >= rail.y && row < rail.y + rail.height;
         self.rail_drag = on_edge;
@@ -1305,8 +1306,13 @@ impl<B: PaneBackend> App<B> {
         }
     }
 
+    /// A latch only counts while a rail is actually drawn: one left set
+    /// by a release that never reached `handle_mouse`'s rail block (let go
+    /// over the tab strip, a modal or copy mode taking the mouse, a release
+    /// outside the window) must not swallow a later seam or selection drag
+    /// in a tiled or zoomed tab. The next press clears it for good.
     pub fn rail_dragging(&self) -> bool {
-        self.rail_drag
+        self.rail_drag && self.rail_area().is_some()
     }
 
     pub fn pane_order(&self) -> Vec<PaneId> {

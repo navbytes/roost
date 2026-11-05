@@ -1012,6 +1012,9 @@ fn handle_mouse<B: PaneBackend>(app: &mut App<B>, me: crossterm::event::MouseEve
     // of the rail block below, because the pointer crosses into the rail
     // while narrowing it and that block would swallow the drag. A float
     // drawn over the edge keeps its own clicks.
+    if matches!(me.kind, MouseEventKind::Down(_)) {
+        app.end_rail_drag(); // a stale latch (see `rail_dragging`) ends here
+    }
     match me.kind {
         MouseEventKind::Down(MouseButton::Left)
             if !mouse::hit_test(&app.display_rects(), me.column, me.row)
@@ -1935,6 +1938,15 @@ mod tests {
         // A press inside the rail is still a row click, not a drag.
         handle_mouse(&mut app, click(rail.x + 2, row));
         assert!(!app.rail_dragging());
+
+        // A drag whose release never arrives does not outlive the rail: in
+        // a tiled tab the latch is dead, and the next press clears it.
+        handle_mouse(&mut app, click(rail.x + auto, row));
+        assert!(app.rail_dragging());
+        app.apply(Action::ToggleSolo); // back to tiled, mid-drag
+        assert!(!app.rail_dragging(), "no rail, no rail drag");
+        handle_mouse(&mut app, drag_to(rail.x + 30, row));
+        assert_eq!(app.ws.rail_cols, None, "a tiled drag never touches the rail width");
     }
 
     /// U21: press the seam between two side-by-side panes, drag right, and

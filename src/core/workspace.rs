@@ -150,6 +150,16 @@ impl Workspace {
     /// minimal shell spec so it renders and spawns instead of being a blank
     /// hole. A well-formed workspace is unchanged. Also clamps `active_tab`.
     pub fn validate_and_repair(&mut self) {
+        // C43: a hand-edited rail width the drag could never produce is
+        // dropped back to automatic rather than pinning an odd tier.
+        if self.rail_cols.is_some_and(|c| {
+            c != crate::core::layout::RAIL_GLYPH_COLS
+                && !(crate::core::layout::RAIL_LABELLED_MIN_COLS
+                    ..=crate::core::layout::RAIL_MAX_COLS)
+                    .contains(&c)
+        }) {
+            self.rail_cols = None;
+        }
         // A pane id keys `runtimes` globally, so one id in two positions —
         // repeated inside a tree, or shared between two tabs — means both
         // draw and type through a single PTY, `tab_of` answers with
@@ -563,6 +573,24 @@ mod tests {
         let old_json = r#"{"name":"main","layout":{"pane":1},"panes":{}}"#;
         let old: Tab = serde_json::from_str(old_json).expect("an old tab still loads");
         assert_eq!(old.focus, None);
+    }
+
+    /// C43: a persisted rail width the drag could not have produced goes
+    /// back to automatic; one it could have survives, and none round-trips
+    /// with no key at all.
+    #[test]
+    fn validate_and_repair_drops_an_impossible_rail_width() {
+        let mut ws = Workspace::default_in(PathBuf::from("/tmp"));
+        for (bad, good) in [(0, 12), (15, 20), (41, 40)] {
+            ws.rail_cols = Some(bad);
+            ws.validate_and_repair();
+            assert_eq!(ws.rail_cols, None, "{bad} is not a drawable rail width");
+            ws.rail_cols = Some(good);
+            ws.validate_and_repair();
+            assert_eq!(ws.rail_cols, Some(good));
+        }
+        ws.rail_cols = None;
+        assert!(!serde_json::to_string(&ws).unwrap().contains("rail_cols"));
     }
 
     /// A hand-edited or corrupted `workspace.json` can name a `focus` that
