@@ -2264,6 +2264,15 @@ Found by the design audit of the padding fix, which measured the rendered row
 rather than trusting the arithmetic; the padding bug itself was found by a
 simulation agent stressing the design floor. Neither found the other's half.
 
+**[Amended 2026-11-05, one key column — Naveen's call]** Every
+description starts on the same column. A key wider than the 17-column key
+column is shortened with `…` (`fit_help_key`): at a `" / "` chord boundary
+when one fits, else at a word, else mid-word. The column cannot widen
+instead: the widest description already meets `HELP_COL_FLOOR` at this
+width. On the default keymap six rows shorten, e.g. `Alt+m …` (next /
+previous tab) and `Alt+Shift+x …` (mark / pull). The description still
+names both verbs, and filtering still matches the full key.
+
 ### C30 — Sub-two-row floor notice — [Added 2026-08-06]
 
 **Current:** `render.rs:24–29` (`draw_too_small`) — when `area.height < 2`,
