@@ -1,2 +1,2 @@
-v0.1.32
-New omp (oh-my-pi) adapter: launch and resume omp panes, with a bundled status extension installed into ~/.omp/agent/extensions. `roost keys` now prints config diagnostics first and warns about an unread ~/.config file.
+v0.1.33
+Solo sidebar: two-line pane cards, names wrap onto the second line at 80 columns, and drag the sidebar's edge to resize it. Alt+g names the layout it lands on. Readable spawn errors, the picker refuses missing agents, close teaches undo, no resize spinner. Claude panes resume from their own project when the pane's cwd moved.
